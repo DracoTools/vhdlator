@@ -90,6 +90,7 @@ class VhdlSymbol final {
     VhdlType* m_returnTypep = nullptr;
     int m_position = 0;  // Enumeration literal position, or record element index
     bool m_predefined = false;  // Comes from std.standard rather than source
+    bool m_hasBody = false;  // A subprogram whose body has been seen
 
     VL_UNCOPYABLE(VhdlSymbol);
 
@@ -113,16 +114,19 @@ public:
     void position(int pos) { m_position = pos; }
     bool predefined() const { return m_predefined; }
     void predefined(bool flag) { m_predefined = flag; }
+    bool hasBody() const { return m_hasBody; }
+    void hasBody(bool flag) { m_hasBody = flag; }
 
     const std::vector<VhdlType*>& paramTypes() const { return m_paramTypes; }
     void addParamType(VhdlType* typep) { m_paramTypes.push_back(typep); }
     VhdlType* returnTypep() const { return m_returnTypep; }
     void returnTypep(VhdlType* typep) { m_returnTypep = typep; }
 
-    // A subprogram or enumeration literal may share its name with others
+    // A subprogram or enumeration literal may share its name with others, and
+    // so may an alias of one (6.6.2)
     bool isOverloadable() const {
         return m_kind == VhdlSymKind::FUNCTION || m_kind == VhdlSymKind::PROCEDURE
-               || m_kind == VhdlSymKind::ENUM_LITERAL;
+               || m_kind == VhdlSymKind::ENUM_LITERAL || m_kind == VhdlSymKind::ALIAS;
     }
     // Something an expression can read
     bool isObject() const {

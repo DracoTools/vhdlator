@@ -378,9 +378,33 @@
 %Error: t/t_vhdl_parse.vhd:48:20: Cannot find type 'std_logic_vector'
 %Error: t/t_vhdl_parse.vhd:49:20: Cannot find type 'std_logic'
 %Error: t/t_vhdl_parse.vhd:53:18: Cannot find type 'unsigned'
+%Error: t/t_vhdl_parse.vhd:53:59: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:54:36: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:55:18: Cannot find type 'std_logic_vector'
 %Error: t/t_vhdl_parse.vhd:58:18: Cannot find type 'std_logic'
 %Error: t/t_vhdl_parse.vhd:58:37: Cannot find type 'std_logic'
+%Error: t/t_vhdl_parse.vhd:65:12: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:66:27: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:67:16: Cannot find declaration of 'idle'
+%Error: t/t_vhdl_parse.vhd:70:14: Cannot find declaration of 'idle'
+%Error: t/t_vhdl_parse.vhd:71:16: Ambiguous operator "/=": 6 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:71:31: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:71:50: Cannot find declaration of 'running'
+%Error: t/t_vhdl_parse.vhd:72:14: Cannot find declaration of 'running'
+%Error: t/t_vhdl_parse.vhd:73:22: Ambiguous operator "+": 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:75:26: No visible subprogram 'cnt' takes 1 argument(s) of these types
+%Error: t/t_vhdl_parse.vhd:75:30: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:77:20: Cannot find declaration of 'done'
+%Error: t/t_vhdl_parse.vhd:79:20: Cannot find declaration of 'idle'
+%Error: t/t_vhdl_parse.vhd:86:28: Cannot find declaration of 'running'
+%Error: t/t_vhdl_parse.vhd:86:11: Ambiguous character literal '1': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:86:41: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:88:6: No visible subprogram 'q' takes 1 argument(s) of these types
+%Error: t/t_vhdl_parse.vhd:88:14: No visible subprogram 'd' takes 1 argument(s) of these types
+%Error: t/t_vhdl_parse.vhd:89:14: No visible subprogram 'd' takes 1 argument(s) of these types
+%Error: t/t_vhdl_parse.vhd:90:13: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:97:24: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_parse.vhd:108:30: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
 %Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 1 file(s)
 ... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to

@@ -119,6 +119,9 @@ bool VhdlSymbol::homographOf(const VhdlSymbol* otherp) const {
     if (m_name != otherp->name()) return false;
     // Only overloadables escape hiding, and only when their signatures differ
     if (!isOverloadable() || !otherp->isOverloadable()) return true;
+    // An alias may rename a subprogram, and its signature is not known until
+    // the alias target is resolved, so never call it a homograph (6.6.2)
+    if (m_kind == VhdlSymKind::ALIAS || otherp->kind() == VhdlSymKind::ALIAS) return false;
     if (m_kind != otherp->kind()) return true;
     if (m_paramTypes.size() != otherp->paramTypes().size()) return false;
     for (size_t i = 0; i < m_paramTypes.size(); ++i) {
@@ -156,27 +159,30 @@ void VhdlScope::lookupLocal(const std::string& name, std::vector<VhdlSymbol*>& o
 }
 
 void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) const {
-    // Walk outwards. The innermost region that declares the name wins, but an
-    // overloadable name keeps gathering, since outer overloads stay visible
-    // unless a homograph hides them (12.3).
-    bool sawNonOverloadable = false;
+    // Directly visible declarations first. The innermost region that declares
+    // the name with something not overloadable wins outright, since that
+    // hides everything outside it (12.3).
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         const size_t before = out.size();
         scopep->lookupLocal(name, out);
         for (size_t i = before; i < out.size(); ++i) {
-            if (!out[i]->isOverloadable()) sawNonOverloadable = true;
+            if (!out[i]->isOverloadable()) return;
         }
-        if (sawNonOverloadable) return;  // Hides everything outside
     }
-    if (!out.empty()) return;  // Directly visible declarations win over use clauses
 
-    // Nothing declared: fall back on what use clauses made potentially visible
+    // Then everything use clauses made potentially visible (12.4). These are
+    // gathered from every enclosing region, not just the nearest one: a
+    // package that declares its own "=" does not thereby hide the predefined
+    // "=" of every other type, because overloads coexist.
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         for (const VhdlScope* const usedp : scopep->m_usedp) {
             usedp->lookupLocal(name, out);
         }
-        if (!out.empty()) return;
     }
+
+    // The same region may be reached by more than one route
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
 }
 
 void VhdlScope::addUse(VhdlScope* scopep) {

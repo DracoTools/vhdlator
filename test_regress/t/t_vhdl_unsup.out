@@ -2,6 +2,9 @@
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: t/t_vhdl_unsup.vhd:12:19: Cannot find type 'std_logic_vector'
 %Error: t/t_vhdl_unsup.vhd:16:18: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_unsup.vhd:16:61: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_unsup.vhd:21:32: No visible subprogram 'std_logic_vector' takes 1 argument(s) of these types
+%Error: t/t_vhdl_unsup.vhd:21:49: Ambiguous operator "+": 2 visible declarations match, and the context does not decide between them
 %Error: VHDL lowering is not yet implemented; analyzed 2 design unit(s) from 1 file(s)
 ... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to

@@ -33,6 +33,7 @@ namespace {
 bool s_built = false;
 VhdlScope* s_stdLibp = nullptr;
 VhdlScope* s_standardp = nullptr;
+VhdlScope* s_textiop = nullptr;
 
 VhdlType* s_booleanp = nullptr;
 VhdlType* s_bitp = nullptr;
@@ -55,6 +56,9 @@ VhdlType* s_fileOpenStatusp = nullptr;
 VhdlType* s_univIntp = nullptr;
 VhdlType* s_univRealp = nullptr;
 VhdlType* s_errorp = nullptr;
+VhdlType* s_linep = nullptr;
+VhdlType* s_textp = nullptr;
+VhdlType* s_sidep = nullptr;
 
 FileLine* stdFileline() {
     static FileLine* s_flp = nullptr;
@@ -120,6 +124,13 @@ VhdlType* makeArray(VhdlScope* scopep, const std::string& name, VhdlType* indexp
     return typep;
 }
 
+void addObject(VhdlScope* scopep, VhdlSymKind kind, const std::string& name, VhdlType* typep) {
+    VhdlSymbol* const symp = VhdlSymTab::newSymbol(kind, name, nullptr);
+    symp->typep(typep);
+    symp->predefined(true);
+    scopep->insert(symp);
+}
+
 // Declare one predefined operator or function
 void addFunc(VhdlScope* scopep, const std::string& name, VhdlType* returnp,
              const std::vector<VhdlType*>& params) {
@@ -127,6 +138,14 @@ void addFunc(VhdlScope* scopep, const std::string& name, VhdlType* returnp,
     for (VhdlType* const typep : params) symp->addParamType(typep);
     symp->returnTypep(returnp);
     symp->typep(returnp);
+    symp->predefined(true);
+    scopep->insert(symp);
+}
+
+void addProc(VhdlScope* scopep, const std::string& name,
+             const std::vector<VhdlType*>& params) {
+    VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::PROCEDURE, name, nullptr);
+    for (VhdlType* const typep : params) symp->addParamType(typep);
     symp->predefined(true);
     scopep->insert(symp);
 }
@@ -159,6 +178,7 @@ std::vector<std::string> characterLiterals() {
 
 VhdlScope* V3VhdlStd::standardScope() { return s_standardp; }
 VhdlScope* V3VhdlStd::stdLibScope() { return s_stdLibp; }
+VhdlScope* V3VhdlStd::textioScope() { return s_textiop; }
 VhdlType* V3VhdlStd::booleanType() { return s_booleanp; }
 VhdlType* V3VhdlStd::bitType() { return s_bitp; }
 VhdlType* V3VhdlStd::characterType() { return s_characterp; }
@@ -176,7 +196,8 @@ VhdlType* V3VhdlStd::errorType() { return s_errorp; }
 
 void V3VhdlStd::clear() {
     s_built = false;
-    s_stdLibp = s_standardp = nullptr;
+    s_stdLibp = s_standardp = s_textiop = nullptr;
+    s_linep = s_textp = s_sidep = nullptr;
     s_booleanp = s_bitp = s_characterp = s_severityp = nullptr;
     s_integerp = s_realp = s_timep = s_delayp = nullptr;
     s_naturalp = s_positivep = s_stringp = nullptr;
@@ -396,7 +417,65 @@ void V3VhdlStd::build() {
         s_standardp->insert(symp);
     }
 
+    buildTextio();
     UINFO(4, "Built std.standard with " << s_standardp->direct().size() << " declarations");
+}
+
+//######################################################################
+// Package TEXTIO (16.4)
+
+void V3VhdlStd::buildTextio() {
+    s_textiop = VhdlSymTab::newScope(nullptr, "textio");
+    s_stdLibp->addNamed("textio", s_textiop);
+
+    // type LINE is access STRING;  type TEXT is file of STRING;
+    s_linep = VhdlSymTab::newType(VhdlTypeKind::ACCESS, "line", stdFileline());
+    s_linep->designatedp(s_stringp);
+    addObject(s_textiop, VhdlSymKind::TYPE, "line", s_linep);
+    s_textp = VhdlSymTab::newType(VhdlTypeKind::FILE, "text", stdFileline());
+    s_textp->designatedp(s_stringp);
+    addObject(s_textiop, VhdlSymKind::TYPE, "text", s_textp);
+    s_sidep = makeEnum(s_textiop, "side", {"right", "left"});
+    VhdlType* const widthp = makeSubtype(s_textiop, "width", s_naturalp, 0, 2147483647LL);
+    for (VhdlType* const typep : {s_linep, s_textp, s_sidep}) {
+        addImplicitOperators(s_textiop, typep);
+    }
+
+    addFunc(s_textiop, "justify", s_stringp, {s_stringp, s_sidep, widthp});
+    addObject(s_textiop, VhdlSymKind::FILE, "input", s_textp);
+    addObject(s_textiop, VhdlSymKind::FILE, "output", s_textp);
+
+    addProc(s_textiop, "readline", {s_textp, s_linep});
+    addProc(s_textiop, "writeline", {s_textp, s_linep});
+    addProc(s_textiop, "tee", {s_textp, s_linep});
+    addFunc(s_textiop, "endfile", s_booleanp, {s_textp});
+    addFunc(s_textiop, "endline", s_booleanp, {s_linep});
+
+    // READ, WRITE and their VHDL-2008 radix forms, over the predefined types
+    // the LRM lists (16.4). Each has a form with and without a GOOD flag.
+    for (VhdlType* const typep :
+         {s_bitp, s_bitVecp, s_booleanp, s_characterp, s_integerp, s_realp, s_timep,
+          s_stringp}) {
+        addProc(s_textiop, "read", {s_linep, typep});
+        addProc(s_textiop, "read", {s_linep, typep, s_booleanp});
+        addProc(s_textiop, "write", {s_linep, typep});
+        addProc(s_textiop, "write", {s_linep, typep, s_sidep, widthp});
+        addProc(s_textiop, "sread", {s_linep, typep, s_naturalp});
+    }
+    for (VhdlType* const typep : {s_bitVecp, s_stringp}) {
+        for (const char* const op : {"hread", "hwrite", "oread", "owrite", "bread", "bwrite"}) {
+            addProc(s_textiop, op, {s_linep, typep});
+            addProc(s_textiop, op, {s_linep, typep, s_booleanp});
+        }
+    }
+    addProc(s_textiop, "swrite", {s_linep, s_stringp});
+    addProc(s_textiop, "swrite", {s_linep, s_stringp, s_sidep, widthp});
+    addFunc(s_textiop, "to_string", s_stringp, {s_timep});
+    addFunc(s_textiop, "to_string", s_stringp, {s_realp});
+    addFunc(s_textiop, "to_string", s_stringp, {s_realp, s_naturalp});
+    addFunc(s_textiop, "to_string", s_stringp, {s_realp, s_stringp});
+
+    UINFO(4, "Built std.textio with " << s_textiop->direct().size() << " declarations");
 }
 
 void V3VhdlStd::selfTest() {

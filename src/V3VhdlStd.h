@@ -44,6 +44,7 @@ public:
     static VhdlScope* standardScope() VL_MT_DISABLED;
     // The scope of library STD, in which STANDARD is named
     static VhdlScope* stdLibScope() VL_MT_DISABLED;
+    static VhdlScope* textioScope() VL_MT_DISABLED;
 
     // The predefined types, for the analyzer to reach for directly
     static VhdlType* booleanType() VL_MT_DISABLED;
@@ -66,6 +67,11 @@ public:
     static void addImplicitOperators(VhdlScope* scopep, VhdlType* typep) VL_MT_DISABLED;
 
     static void clear() VL_MT_DISABLED;
+
+private:
+    static void buildTextio() VL_MT_DISABLED;
+
+public:
     static void selfTest() VL_MT_DISABLED;
 };
 
