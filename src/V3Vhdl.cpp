@@ -40,6 +40,7 @@
 
 #include "V3File.h"
 #include "V3Global.h"
+#include "V3VhdlLib.h"
 #include "V3VhdlParse.h"
 #include "V3VhdlScan.h"
 
@@ -134,6 +135,7 @@ void V3Vhdl::parseFile(FileLine* fl, const string& filename, const string& libna
     AstVhdlDesignFile* const filep = parser.parse(foundname);
     UINFO(3, "Parsed " << foundname << ", " << parser.errCount() << " syntax error(s)");
     if (v3Global.opt.dumpLevel("vhdl-parse") != 0) filep->dumpTree(std::cout, "  ", 0);
+    V3VhdlLib::addFile(filep);
     s_designFiles.push_back(filep);
 }
 
@@ -143,20 +145,28 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp) {
     if (!anyRead()) return;  // No VHDL in this design; nothing to do
     UINFO(2, __FUNCTION__ << ": " << s_filenames.size() << " VHDL file(s)");
 
-    size_t units = 0;
-    for (const AstVhdlDesignFile* const filep : s_designFiles) {
-        for (AstNode* nodep = filep->unitsp(); nodep; nodep = nodep->nextp()) ++units;
+    // Order the design units so each follows what it depends on (13.5)
+    V3VhdlLib::computeOrder();
+    const std::vector<AstNodeVhdlUnit*>& order = V3VhdlLib::ordered();
+    if (v3Global.opt.dumpLevel("vhdl-units") != 0) {
+        for (const AstNodeVhdlUnit* const unitp : order) {
+            std::cout << unitp->fileline()->filename() << ":" << unitp->fileline()->lineno()
+                      << ": " << unitp->typeName() << " " << unitp->libname() << "."
+                      << unitp->name() << "\n";
+        }
     }
 
-    // M2+ : order the design units by dependency, analyze them, and lower the
-    // result into rootp. Until then the parse tree has served its purpose.
+    // M3+ : resolve names, check types, and lower the result into rootp. Until
+    // then the parse tree has served its purpose.
+    const size_t units = order.size();
+    V3VhdlLib::clear();
     for (AstVhdlDesignFile* const filep : s_designFiles) {
         VL_DO_DANGLING(filep->deleteTree(), filep);
     }
     s_designFiles.clear();
 
     v3Global.rootp()->fileline()->v3error(
-        "VHDL analysis is not yet implemented; parsed "
+        "VHDL analysis is not yet implemented; ordered "
         << units << " design unit(s) from " << s_filenames.size()
         << " file(s)\n... The VHDL frontend is under development;"
            " Verilog and SystemVerilog are unaffected.");

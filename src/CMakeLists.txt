@@ -200,6 +200,7 @@ set(HEADERS
     V3Unroll.h
     V3VariableOrder.h
     V3Vhdl.h
+    V3VhdlLib.h
     V3VhdlParse.h
     V3VhdlScan.h
     V3Waiver.h
@@ -378,6 +379,7 @@ set(COMMON_SOURCES
     V3UnrollGen.cpp
     V3VariableOrder.cpp
     V3Vhdl.cpp
+    V3VhdlLib.cpp
     V3VhdlParse.cpp
     V3VhdlScan.cpp
     V3Waiver.cpp

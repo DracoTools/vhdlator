@@ -368,7 +368,7 @@
   1:4:3:2:2:2: VHDLNAME (EO) {f110bk}  l
   1:4:3:3: VHDLNAME (FO) {f110bw}  note
   1:4:3: VHDLWAIT (GO) {f111af}
-%Error: VHDL analysis is not yet implemented; parsed 4 design unit(s) from 1 file(s)
+%Error: VHDL analysis is not yet implemented; ordered 4 design unit(s) from 1 file(s)
 ... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: Exiting due to
