@@ -1,0 +1,5 @@
+%Error: obj_vlt/t_vhdl_lex_nongraphic_bad/t_vhdl_lex_nongraphic_bad.vhd:2:27: Non-graphic character in string literal
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: obj_vlt/t_vhdl_lex_nongraphic_bad/t_vhdl_lex_nongraphic_bad.vhd:3:10: Non-graphic character in extended identifier
+%Error: obj_vlt/t_vhdl_lex_nongraphic_bad/t_vhdl_lex_nongraphic_bad.vhd:4:27: Non-graphic character in bit string literal
+%Error: Exiting due to

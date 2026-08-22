@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_parse_bad.vhd:14:12: Label at 'end' is 'wrongname' but the construct is named 't'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_parse_bad.vhd:19:13: Syntax error: expected ')' after the port clause, found :
+%Error: t/t_vhdl_parse_bad.vhd:20:13: Syntax error: expected 'is' after the entity name, found ;
+%Error: t/t_vhdl_parse_bad.vhd:31:21: Syntax error: expected 'of' after the architecture name, found ;
+%Error: t/t_vhdl_parse_bad.vhd:32:1: Syntax error: expected 'end' to close the architecture, found <end of file>
+%Error: Exiting due to

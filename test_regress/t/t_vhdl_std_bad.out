@@ -1,0 +1,3 @@
+%Error: Unknown VHDL standard specified: 2007... Suggested alternative: '2000'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

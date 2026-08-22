@@ -29,6 +29,7 @@
 #include "V3PreShell.h"
 #include "V3Stats.h"
 #include "V3ThreadPool.h"
+#include "V3Vhdl.h"
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -141,6 +142,11 @@ void V3Global::readFiles() {
     }
 
     // v3Global.rootp()->dumpTreeFile(v3Global.debugFilename("parse.tree"));
+    V3Error::abortIfErrors();
+
+    // Analyze the VHDL design units read above and lower them into the netlist.
+    // Must precede V3LinkCells, which binds cells across both languages.
+    V3Vhdl::analyzeAndLower(v3Global.rootp());
     V3Error::abortIfErrors();
 
     if (!v3Global.opt.preprocOnly() || v3Global.opt.preprocResolve()) {

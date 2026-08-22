@@ -1,0 +1,17 @@
+%Error: t/t_vhdl_lex_bad.vhd:12:28: Base of a based literal must be between 2 and 16, got 20
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_lex_bad.vhd:13:28: Based literal has no digits
+%Error: t/t_vhdl_lex_bad.vhd:14:28: Digit '2' is not valid in base 2
+%Error: t/t_vhdl_lex_bad.vhd:15:28: Expected '#' to close based literal
+%Error: t/t_vhdl_lex_bad.vhd:17:28: Exponent has no digits
+%Error: t/t_vhdl_lex_bad.vhd:18:28: Exponent of an integer literal may not be negative
+%Error: t/t_vhdl_lex_bad.vhd:19:28: Integer literal is too large to represent: 99999999999999999999999
+%Error: t/t_vhdl_lex_bad.vhd:21:27: Decimal bit string literal may only contain digits, got 'X'
+%Error: t/t_vhdl_lex_bad.vhd:22:27: Signed bit string literal may not be empty when a length is given
+%Error: t/t_vhdl_lex_bad.vhd:23:28: Bit string literal does not fit in 8 bits; truncating would discard '1'
+%Error: t/t_vhdl_lex_bad.vhd:24:28: Unsupported: Width of bit string literal exceeds implementation limit: 32222222222
+%Error: t/t_vhdl_lex_bad.vhd:26:10: Identifier may not contain two consecutive underlines
+%Error: t/t_vhdl_lex_bad.vhd:27:10: Identifier may not end with an underline
+%Error: t/t_vhdl_lex_bad.vhd:29:23: Unexpected character in VHDL source: '$' (0x24)
+%Error: t/t_vhdl_lex_bad.vhd:29:24: Syntax error: expected an expression, found ;
+%Error: Exiting due to

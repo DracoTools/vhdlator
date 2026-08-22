@@ -1,0 +1,12 @@
+%Error: t/t_vhdl_lex_unterm_bad.vhd:11:10: Unterminated extended identifier, expected a closing backslash
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_lex_unterm_bad.vhd:12:3: Syntax error: expected ':' after the object names, found signal
+%Error: t/t_vhdl_lex_unterm_bad.vhd:12:10: Extended identifier may not be empty
+%Error: t/t_vhdl_lex_unterm_bad.vhd:13:27: Unterminated string literal, expected closing '"'
+%Error: t/t_vhdl_lex_unterm_bad.vhd:14:3: Syntax error: expected ';' after the declaration, found constant
+%Error: t/t_vhdl_lex_unterm_bad.vhd:14:30: Malformed character literal, expected a closing apostrophe
+%Error: t/t_vhdl_lex_unterm_bad.vhd:15:3: Syntax error: expected a concurrent statement, found constant
+%Error: t/t_vhdl_lex_unterm_bad.vhd:15:30: Malformed character literal
+%Error: t/t_vhdl_lex_unterm_bad.vhd:16:27: Unterminated bit string literal, expected closing '"'
+%Error: t/t_vhdl_lex_unterm_bad.vhd:19:1: Syntax error: expected 'end' to close the architecture, found <end of file>
+%Error: Exiting due to

@@ -1,0 +1,4 @@
+%Error: VHDL analysis is not yet implemented; parsed 2 design unit(s) from 1 file(s)
+... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

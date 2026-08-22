@@ -529,6 +529,7 @@ PY_PROGRAMS = \
   nodist/uvm_pkg_packer \
   nodist/verilator_bisect \
   nodist/verilator_saif_diff \
+  nodist/vhdl_corpus.py \
   src/.gdbinit.py \
   src/astgen \
   src/bisonpre \

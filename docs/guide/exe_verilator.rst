@@ -2094,6 +2094,20 @@ Summary:
 
    Displays program version and exits.
 
+.. option:: --vhdl-std <std>
+
+   Selects which revision of the VHDL standard (IEEE 1076) applies to VHDL
+   source files, that is those with a :file:`.vhd` or :file:`.vhdl` extension.
+
+   Accepted values are ``1993``, ``2000``, ``2002``, ``2008`` and ``2019``,
+   each of which may also be written in the abbreviated form (``93``, ``00``,
+   ``02``, ``08``, ``19``) or the full IEEE form (``1076-2008``). The default
+   is ``2008``.
+
+   To apply a VHDL revision to files with some other extension, use
+   :vlopt:`--language` with the full IEEE form, for example ``--language
+   1076-2008``.
+
 .. option:: --vpi
 
    Enable the use of VPI and linking against the :file:`verilated_vpi.cpp` files.

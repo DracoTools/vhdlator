@@ -1895,6 +1895,30 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
         showVersion(false);
         v3Global.vlExit(0);
     });
+    DECL_OPTION("-vhdl-std", CbVal, [this, fl](const char* valp) {
+        // Accept both the bare year ("2008", "08") and the IEEE form ("1076-2008")
+        static const std::map<const std::string, V3LangCode> stds{
+            {"93", V3LangCode::L1076_1993},        {"1993", V3LangCode::L1076_1993},
+            {"1076-1993", V3LangCode::L1076_1993}, {"00", V3LangCode::L1076_2000},
+            {"2000", V3LangCode::L1076_2000},      {"1076-2000", V3LangCode::L1076_2000},
+            {"02", V3LangCode::L1076_2002},        {"2002", V3LangCode::L1076_2002},
+            {"1076-2002", V3LangCode::L1076_2002}, {"08", V3LangCode::L1076_2008},
+            {"2008", V3LangCode::L1076_2008},      {"1076-2008", V3LangCode::L1076_2008},
+            {"19", V3LangCode::L1076_2019},        {"2019", V3LangCode::L1076_2019},
+            {"1076-2019", V3LangCode::L1076_2019}};
+        const auto it = stds.find(valp);
+        if (it == stds.end()) {
+            VSpellCheck spell;
+            for (const auto& pair : stds) spell.pushCandidate(pair.first);
+            fl->v3error("Unknown VHDL standard specified: " << valp
+                                                            << spell.bestCandidateMsg(valp));
+            return;
+        }
+        m_vhdlStd = it->second;
+        // Re-map the VHDL extensions to the newly selected revision
+        addLangExt(".vhd", m_vhdlStd);
+        addLangExt(".vhdl", m_vhdlStd);
+    });
     DECL_OPTION("-vpi", OnOff, &m_vpi);
 
     DECL_OPTION("-Wall", CbCall, []() { FileLine::globalWarnOff(V3ErrorCode::I_LINT, false); });
@@ -2311,6 +2335,7 @@ V3Options::V3Options() {
     m_xInitial = "unique";
 
     m_defaultLanguage = V3LangCode::mostRecent();
+    m_vhdlStd = V3LangCode::mostRecentVhdl();
 
     VName::maxLength(128);  // Linux filename limits 256; leave half for prefix
 
@@ -2319,6 +2344,10 @@ V3Options::V3Options() {
     addLibExtV("");  // So include "filename.v" will find the same file
     addLibExtV(".v");
     addLibExtV(".sv");
+    // Default VHDL extensions. Unlike the Verilog ones these are not added to
+    // +libext+, as VHDL binds design units through libraries, not filenames.
+    addLangExt(".vhd", m_vhdlStd);
+    addLangExt(".vhdl", m_vhdlStd);
     // Default -I
     addIncDirFallback(".");  // Looks better than {long_cwd_path}/...
 }

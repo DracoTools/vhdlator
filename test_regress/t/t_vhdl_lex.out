@@ -1,0 +1,322 @@
+t/t_vhdl_lex.vhd:11:1: entity
+t/t_vhdl_lex.vhd:11:8: identifier t
+t/t_vhdl_lex.vhd:11:10: is
+t/t_vhdl_lex.vhd:12:1: end
+t/t_vhdl_lex.vhd:12:5: entity
+t/t_vhdl_lex.vhd:12:11: ;
+t/t_vhdl_lex.vhd:14:1: architecture
+t/t_vhdl_lex.vhd:14:14: identifier rtl
+t/t_vhdl_lex.vhd:14:18: of
+t/t_vhdl_lex.vhd:14:21: identifier t
+t/t_vhdl_lex.vhd:14:23: is
+t/t_vhdl_lex.vhd:16:3: signal
+t/t_vhdl_lex.vhd:16:10: identifier mixedcase
+t/t_vhdl_lex.vhd:16:20: :
+t/t_vhdl_lex.vhd:16:22: identifier bit
+t/t_vhdl_lex.vhd:16:25: ;
+t/t_vhdl_lex.vhd:17:3: signal
+t/t_vhdl_lex.vhd:17:10: identifier mixedcase_2
+t/t_vhdl_lex.vhd:17:22: :
+t/t_vhdl_lex.vhd:17:24: identifier bit
+t/t_vhdl_lex.vhd:17:27: ;
+t/t_vhdl_lex.vhd:19:3: signal
+t/t_vhdl_lex.vhd:19:10: identifier \Bus\
+t/t_vhdl_lex.vhd:19:16: :
+t/t_vhdl_lex.vhd:19:18: identifier bit
+t/t_vhdl_lex.vhd:19:21: ;
+t/t_vhdl_lex.vhd:20:3: signal
+t/t_vhdl_lex.vhd:20:10: identifier \bus\
+t/t_vhdl_lex.vhd:20:16: :
+t/t_vhdl_lex.vhd:20:18: identifier bit
+t/t_vhdl_lex.vhd:20:21: ;
+t/t_vhdl_lex.vhd:21:3: signal
+t/t_vhdl_lex.vhd:21:10: identifier \a\b\
+t/t_vhdl_lex.vhd:21:17: :
+t/t_vhdl_lex.vhd:21:19: identifier bit
+t/t_vhdl_lex.vhd:21:22: ;
+t/t_vhdl_lex.vhd:24:3: constant
+t/t_vhdl_lex.vhd:24:12: identifier i1
+t/t_vhdl_lex.vhd:24:15: :
+t/t_vhdl_lex.vhd:24:17: identifier integer
+t/t_vhdl_lex.vhd:24:25: :=
+t/t_vhdl_lex.vhd:24:28: integer literal 12
+t/t_vhdl_lex.vhd:24:30: ;
+t/t_vhdl_lex.vhd:25:3: constant
+t/t_vhdl_lex.vhd:25:12: identifier i2
+t/t_vhdl_lex.vhd:25:15: :
+t/t_vhdl_lex.vhd:25:17: identifier integer
+t/t_vhdl_lex.vhd:25:25: :=
+t/t_vhdl_lex.vhd:25:28: integer literal 123456
+t/t_vhdl_lex.vhd:25:35: ;
+t/t_vhdl_lex.vhd:26:3: constant
+t/t_vhdl_lex.vhd:26:12: identifier i3
+t/t_vhdl_lex.vhd:26:15: :
+t/t_vhdl_lex.vhd:26:17: identifier integer
+t/t_vhdl_lex.vhd:26:25: :=
+t/t_vhdl_lex.vhd:26:28: integer literal 1000000
+t/t_vhdl_lex.vhd:26:31: ;
+t/t_vhdl_lex.vhd:27:3: constant
+t/t_vhdl_lex.vhd:27:12: identifier r1
+t/t_vhdl_lex.vhd:27:15: :
+t/t_vhdl_lex.vhd:27:17: identifier real
+t/t_vhdl_lex.vhd:27:22: :=
+t/t_vhdl_lex.vhd:27:25: real literal 12.0 = 12
+t/t_vhdl_lex.vhd:27:29: ;
+t/t_vhdl_lex.vhd:28:3: constant
+t/t_vhdl_lex.vhd:28:12: identifier r2
+t/t_vhdl_lex.vhd:28:15: :
+t/t_vhdl_lex.vhd:28:17: identifier real
+t/t_vhdl_lex.vhd:28:22: :=
+t/t_vhdl_lex.vhd:28:25: real literal 3.1415926 = 3.1415926
+t/t_vhdl_lex.vhd:28:35: ;
+t/t_vhdl_lex.vhd:29:3: constant
+t/t_vhdl_lex.vhd:29:12: identifier r3
+t/t_vhdl_lex.vhd:29:15: :
+t/t_vhdl_lex.vhd:29:17: identifier real
+t/t_vhdl_lex.vhd:29:22: :=
+t/t_vhdl_lex.vhd:29:25: real literal 1.34e-12 = 1.34e-12
+t/t_vhdl_lex.vhd:29:33: ;
+t/t_vhdl_lex.vhd:30:3: constant
+t/t_vhdl_lex.vhd:30:12: identifier r4
+t/t_vhdl_lex.vhd:30:15: :
+t/t_vhdl_lex.vhd:30:17: identifier real
+t/t_vhdl_lex.vhd:30:22: :=
+t/t_vhdl_lex.vhd:30:25: real literal 6.023e+24 = 6.023e+24
+t/t_vhdl_lex.vhd:30:34: ;
+t/t_vhdl_lex.vhd:33:3: constant
+t/t_vhdl_lex.vhd:33:12: identifier b1
+t/t_vhdl_lex.vhd:33:15: :
+t/t_vhdl_lex.vhd:33:17: identifier integer
+t/t_vhdl_lex.vhd:33:25: :=
+t/t_vhdl_lex.vhd:33:28: integer literal 255
+t/t_vhdl_lex.vhd:33:40: ;
+t/t_vhdl_lex.vhd:34:3: constant
+t/t_vhdl_lex.vhd:34:12: identifier b2
+t/t_vhdl_lex.vhd:34:15: :
+t/t_vhdl_lex.vhd:34:17: identifier integer
+t/t_vhdl_lex.vhd:34:25: :=
+t/t_vhdl_lex.vhd:34:28: integer literal 255
+t/t_vhdl_lex.vhd:34:34: ;
+t/t_vhdl_lex.vhd:35:3: constant
+t/t_vhdl_lex.vhd:35:12: identifier b3
+t/t_vhdl_lex.vhd:35:15: :
+t/t_vhdl_lex.vhd:35:17: identifier integer
+t/t_vhdl_lex.vhd:35:25: :=
+t/t_vhdl_lex.vhd:35:28: integer literal 255
+t/t_vhdl_lex.vhd:35:36: ;
+t/t_vhdl_lex.vhd:36:3: constant
+t/t_vhdl_lex.vhd:36:12: identifier b4
+t/t_vhdl_lex.vhd:36:15: :
+t/t_vhdl_lex.vhd:36:17: identifier integer
+t/t_vhdl_lex.vhd:36:25: :=
+t/t_vhdl_lex.vhd:36:28: integer literal 224
+t/t_vhdl_lex.vhd:36:35: ;
+t/t_vhdl_lex.vhd:37:3: constant
+t/t_vhdl_lex.vhd:37:12: identifier b5
+t/t_vhdl_lex.vhd:37:15: :
+t/t_vhdl_lex.vhd:37:17: identifier real
+t/t_vhdl_lex.vhd:37:22: :=
+t/t_vhdl_lex.vhd:37:25: real literal 16#F.FF#e+2 = 4095
+t/t_vhdl_lex.vhd:37:36: ;
+t/t_vhdl_lex.vhd:40:3: constant
+t/t_vhdl_lex.vhd:40:12: identifier c1
+t/t_vhdl_lex.vhd:40:15: :
+t/t_vhdl_lex.vhd:40:17: identifier character
+t/t_vhdl_lex.vhd:40:27: :=
+t/t_vhdl_lex.vhd:40:30: character literal 'A'
+t/t_vhdl_lex.vhd:40:33: ;
+t/t_vhdl_lex.vhd:41:3: constant
+t/t_vhdl_lex.vhd:41:12: identifier c2
+t/t_vhdl_lex.vhd:41:15: :
+t/t_vhdl_lex.vhd:41:17: identifier character
+t/t_vhdl_lex.vhd:41:27: :=
+t/t_vhdl_lex.vhd:41:30: character literal '''
+t/t_vhdl_lex.vhd:41:33: ;
+t/t_vhdl_lex.vhd:42:3: constant
+t/t_vhdl_lex.vhd:42:12: identifier c3
+t/t_vhdl_lex.vhd:42:15: :
+t/t_vhdl_lex.vhd:42:17: identifier character
+t/t_vhdl_lex.vhd:42:27: :=
+t/t_vhdl_lex.vhd:42:30: character literal ' '
+t/t_vhdl_lex.vhd:42:33: ;
+t/t_vhdl_lex.vhd:45:3: constant
+t/t_vhdl_lex.vhd:45:12: identifier s1
+t/t_vhdl_lex.vhd:45:15: :
+t/t_vhdl_lex.vhd:45:17: identifier string
+t/t_vhdl_lex.vhd:45:24: :=
+t/t_vhdl_lex.vhd:45:27: string literal "Setup time is too short"
+t/t_vhdl_lex.vhd:45:52: ;
+t/t_vhdl_lex.vhd:46:3: constant
+t/t_vhdl_lex.vhd:46:12: identifier s2
+t/t_vhdl_lex.vhd:46:15: :
+t/t_vhdl_lex.vhd:46:17: identifier string
+t/t_vhdl_lex.vhd:46:24: :=
+t/t_vhdl_lex.vhd:46:27: string literal ""
+t/t_vhdl_lex.vhd:46:29: ;
+t/t_vhdl_lex.vhd:47:3: constant
+t/t_vhdl_lex.vhd:47:12: identifier s3
+t/t_vhdl_lex.vhd:47:15: :
+t/t_vhdl_lex.vhd:47:17: identifier string
+t/t_vhdl_lex.vhd:47:24: :=
+t/t_vhdl_lex.vhd:47:27: string literal """
+t/t_vhdl_lex.vhd:47:31: ;
+t/t_vhdl_lex.vhd:50:3: constant
+t/t_vhdl_lex.vhd:50:12: identifier v1
+t/t_vhdl_lex.vhd:50:15: :
+t/t_vhdl_lex.vhd:50:17: identifier bit_vector
+t/t_vhdl_lex.vhd:50:28: :=
+t/t_vhdl_lex.vhd:50:31: bit string literal B"111111111111"
+t/t_vhdl_lex.vhd:50:48: ;
+t/t_vhdl_lex.vhd:51:3: constant
+t/t_vhdl_lex.vhd:51:12: identifier v2
+t/t_vhdl_lex.vhd:51:15: :
+t/t_vhdl_lex.vhd:51:17: identifier bit_vector
+t/t_vhdl_lex.vhd:51:28: :=
+t/t_vhdl_lex.vhd:51:31: bit string literal X"111111111111"
+t/t_vhdl_lex.vhd:51:37: ;
+t/t_vhdl_lex.vhd:52:3: constant
+t/t_vhdl_lex.vhd:52:12: identifier v3
+t/t_vhdl_lex.vhd:52:15: :
+t/t_vhdl_lex.vhd:52:17: identifier bit_vector
+t/t_vhdl_lex.vhd:52:28: :=
+t/t_vhdl_lex.vhd:52:31: bit string literal O"111111111"
+t/t_vhdl_lex.vhd:52:37: ;
+t/t_vhdl_lex.vhd:53:3: constant
+t/t_vhdl_lex.vhd:53:12: identifier v4
+t/t_vhdl_lex.vhd:53:15: :
+t/t_vhdl_lex.vhd:53:17: identifier bit_vector
+t/t_vhdl_lex.vhd:53:28: :=
+t/t_vhdl_lex.vhd:53:31: bit string literal X"011101110111"
+t/t_vhdl_lex.vhd:53:37: ;
+t/t_vhdl_lex.vhd:54:3: constant
+t/t_vhdl_lex.vhd:54:12: identifier v5
+t/t_vhdl_lex.vhd:54:15: :
+t/t_vhdl_lex.vhd:54:17: identifier string
+t/t_vhdl_lex.vhd:54:24: :=
+t/t_vhdl_lex.vhd:54:27: bit string literal O"010111"
+t/t_vhdl_lex.vhd:54:33: ;
+t/t_vhdl_lex.vhd:55:3: constant
+t/t_vhdl_lex.vhd:55:12: identifier v6
+t/t_vhdl_lex.vhd:55:15: :
+t/t_vhdl_lex.vhd:55:17: identifier string
+t/t_vhdl_lex.vhd:55:24: :=
+t/t_vhdl_lex.vhd:55:27: bit string literal SX"0011WWWW"
+t/t_vhdl_lex.vhd:55:33: ;
+t/t_vhdl_lex.vhd:56:3: constant
+t/t_vhdl_lex.vhd:56:12: identifier v7
+t/t_vhdl_lex.vhd:56:15: :
+t/t_vhdl_lex.vhd:56:17: identifier bit_vector
+t/t_vhdl_lex.vhd:56:28: :=
+t/t_vhdl_lex.vhd:56:31: bit string literal D"100011"
+t/t_vhdl_lex.vhd:56:36: ;
+t/t_vhdl_lex.vhd:57:3: constant
+t/t_vhdl_lex.vhd:57:12: identifier v8
+t/t_vhdl_lex.vhd:57:15: :
+t/t_vhdl_lex.vhd:57:17: identifier string
+t/t_vhdl_lex.vhd:57:24: :=
+t/t_vhdl_lex.vhd:57:27: bit string literal B"0000000000X1"
+t/t_vhdl_lex.vhd:57:35: ;
+t/t_vhdl_lex.vhd:58:3: constant
+t/t_vhdl_lex.vhd:58:12: identifier v9
+t/t_vhdl_lex.vhd:58:15: :
+t/t_vhdl_lex.vhd:58:17: identifier string
+t/t_vhdl_lex.vhd:58:24: :=
+t/t_vhdl_lex.vhd:58:27: bit string literal SB"XXXXXXXXXXX1"
+t/t_vhdl_lex.vhd:58:35: ;
+t/t_vhdl_lex.vhd:59:3: constant
+t/t_vhdl_lex.vhd:59:12: identifier v10
+t/t_vhdl_lex.vhd:59:16: :
+t/t_vhdl_lex.vhd:59:18: identifier string
+t/t_vhdl_lex.vhd:59:25: :=
+t/t_vhdl_lex.vhd:59:28: bit string literal X"00001111----"
+t/t_vhdl_lex.vhd:59:36: ;
+t/t_vhdl_lex.vhd:60:3: constant
+t/t_vhdl_lex.vhd:60:12: identifier v11
+t/t_vhdl_lex.vhd:60:16: :
+t/t_vhdl_lex.vhd:60:18: identifier string
+t/t_vhdl_lex.vhd:60:25: :=
+t/t_vhdl_lex.vhd:60:28: bit string literal SX"11111111----"
+t/t_vhdl_lex.vhd:60:36: ;
+t/t_vhdl_lex.vhd:61:3: constant
+t/t_vhdl_lex.vhd:61:12: identifier v12
+t/t_vhdl_lex.vhd:61:16: :
+t/t_vhdl_lex.vhd:61:18: identifier bit_vector
+t/t_vhdl_lex.vhd:61:29: :=
+t/t_vhdl_lex.vhd:61:32: bit string literal D"000000001101"
+t/t_vhdl_lex.vhd:61:39: ;
+t/t_vhdl_lex.vhd:62:3: constant
+t/t_vhdl_lex.vhd:62:12: identifier v13
+t/t_vhdl_lex.vhd:62:16: :
+t/t_vhdl_lex.vhd:62:18: identifier string
+t/t_vhdl_lex.vhd:62:25: :=
+t/t_vhdl_lex.vhd:62:28: bit string literal SX"110000000000"
+t/t_vhdl_lex.vhd:62:40: ;
+t/t_vhdl_lex.vhd:63:1: begin
+t/t_vhdl_lex.vhd:65:3: assert
+t/t_vhdl_lex.vhd:65:10: identifier i1
+t/t_vhdl_lex.vhd:65:12: '
+t/t_vhdl_lex.vhd:65:13: identifier image
+t/t_vhdl_lex.vhd:65:19: /=
+t/t_vhdl_lex.vhd:65:22: string literal ""
+t/t_vhdl_lex.vhd:65:25: severity
+t/t_vhdl_lex.vhd:65:34: identifier note
+t/t_vhdl_lex.vhd:65:38: ;
+t/t_vhdl_lex.vhd:66:3: assert
+t/t_vhdl_lex.vhd:66:10: identifier bit
+t/t_vhdl_lex.vhd:66:13: '
+t/t_vhdl_lex.vhd:66:14: identifier high
+t/t_vhdl_lex.vhd:66:19: =
+t/t_vhdl_lex.vhd:66:21: character literal '1'
+t/t_vhdl_lex.vhd:66:25: severity
+t/t_vhdl_lex.vhd:66:34: identifier note
+t/t_vhdl_lex.vhd:66:38: ;
+t/t_vhdl_lex.vhd:68:3: process
+t/t_vhdl_lex.vhd:68:11: is
+t/t_vhdl_lex.vhd:69:5: variable
+t/t_vhdl_lex.vhd:69:14: identifier v
+t/t_vhdl_lex.vhd:69:16: :
+t/t_vhdl_lex.vhd:69:18: identifier integer
+t/t_vhdl_lex.vhd:69:26: :=
+t/t_vhdl_lex.vhd:69:29: integer literal 0
+t/t_vhdl_lex.vhd:69:30: ;
+t/t_vhdl_lex.vhd:70:3: begin
+t/t_vhdl_lex.vhd:71:5: identifier v
+t/t_vhdl_lex.vhd:71:7: :=
+t/t_vhdl_lex.vhd:71:10: identifier v
+t/t_vhdl_lex.vhd:71:12: +
+t/t_vhdl_lex.vhd:71:14: integer literal 1
+t/t_vhdl_lex.vhd:71:15: ;
+t/t_vhdl_lex.vhd:72:5: if
+t/t_vhdl_lex.vhd:72:8: identifier v
+t/t_vhdl_lex.vhd:72:10: /=
+t/t_vhdl_lex.vhd:72:13: integer literal 0
+t/t_vhdl_lex.vhd:72:15: and
+t/t_vhdl_lex.vhd:72:19: identifier v
+t/t_vhdl_lex.vhd:72:21: >=
+t/t_vhdl_lex.vhd:72:24: integer literal 1
+t/t_vhdl_lex.vhd:72:26: and
+t/t_vhdl_lex.vhd:72:30: identifier v
+t/t_vhdl_lex.vhd:72:32: <=
+t/t_vhdl_lex.vhd:72:35: integer literal 2
+t/t_vhdl_lex.vhd:72:37: then
+t/t_vhdl_lex.vhd:73:7: identifier v
+t/t_vhdl_lex.vhd:73:9: :=
+t/t_vhdl_lex.vhd:73:12: identifier v
+t/t_vhdl_lex.vhd:73:14: **
+t/t_vhdl_lex.vhd:73:17: integer literal 2
+t/t_vhdl_lex.vhd:73:18: ;
+t/t_vhdl_lex.vhd:74:5: end
+t/t_vhdl_lex.vhd:74:9: if
+t/t_vhdl_lex.vhd:74:11: ;
+t/t_vhdl_lex.vhd:75:5: wait
+t/t_vhdl_lex.vhd:75:9: ;
+t/t_vhdl_lex.vhd:76:3: end
+t/t_vhdl_lex.vhd:76:7: process
+t/t_vhdl_lex.vhd:76:14: ;
+t/t_vhdl_lex.vhd:77:1: end
+t/t_vhdl_lex.vhd:77:5: architecture
+t/t_vhdl_lex.vhd:77:17: ;
+%Error: VHDL analysis is not yet implemented; parsed 0 design unit(s) from 1 file(s)
+... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

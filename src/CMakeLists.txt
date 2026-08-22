@@ -51,6 +51,7 @@ set(HEADERS
     V3AstNodeExpr.h
     V3AstNodeOther.h
     V3AstNodeStmt.h
+    V3AstNodeVhdl.h
     V3AstPatterns.h
     V3AstUserAllocator.h
     V3Begin.h
@@ -198,6 +199,9 @@ set(HEADERS
     V3Unknown.h
     V3Unroll.h
     V3VariableOrder.h
+    V3Vhdl.h
+    V3VhdlParse.h
+    V3VhdlScan.h
     V3Waiver.h
     V3Width.h
     V3WidthCommit.h
@@ -218,6 +222,7 @@ set(COMMON_SOURCES
     V3AssertNfa.cpp
     V3AssertPre.cpp
     V3Ast.cpp
+    V3AstNodeVhdl.cpp
     V3AstNodes.cpp
     V3Begin.cpp
     V3Branch.cpp
@@ -372,6 +377,9 @@ set(COMMON_SOURCES
     V3Unroll.cpp
     V3UnrollGen.cpp
     V3VariableOrder.cpp
+    V3Vhdl.cpp
+    V3VhdlParse.cpp
+    V3VhdlScan.cpp
     V3Waiver.cpp
     V3Width.cpp
     V3WidthCommit.cpp
@@ -404,7 +412,8 @@ add_custom_command(
     COMMAND ${PYTHON3}
     ARGS
         ${ASTGEN} -I "${srcdir}" --astdef V3AstNodeDType.h --astdef
-        V3AstNodeExpr.h --astdef V3AstNodeOther.h --astdef V3AstNodeStmt.h
+        V3AstNodeExpr.h --astdef V3AstNodeOther.h --astdef V3AstNodeStmt.h --astdef
+        V3AstNodeVhdl.h
         --dfgdef V3DfgVertices.h --classes
 )
 list(
@@ -516,7 +525,8 @@ foreach(astgen_name ${ASTGENERATED_NAMES})
         COMMAND ${PYTHON3}
         ARGS
             ${ASTGEN} -I "${srcdir}" --astdef V3AstNodeDType.h --astdef
-            V3AstNodeExpr.h --astdef V3AstNodeOther.h --astdef V3AstNodeStmt.h
+            V3AstNodeExpr.h --astdef V3AstNodeOther.h --astdef V3AstNodeStmt.h --astdef
+        V3AstNodeVhdl.h
             --dfgdef V3DfgVertices.h ${astgen_name}.cpp
     )
     list(APPEND GENERATED_FILES ${astgen_name}__gen.cpp)

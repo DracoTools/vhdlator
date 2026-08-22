@@ -388,6 +388,7 @@ private:
     // Language is now held in FileLine, on a per-node basis. However we still
     // have a concept of the default language at a global level.
     V3LangCode  m_defaultLanguage;      // main switch: --language
+    V3LangCode  m_vhdlStd;              // main switch: --vhdl-std
 
     // MEMBERS (optimizations)
     bool m_fAcycSimp;    // main switch: -fno-acyc-simp: acyclic pre-optimizations
@@ -839,6 +840,7 @@ public:
                     const string& errmsg);
     string filePathLookedMsg(FileLine* fl, const string& modname);
     V3LangCode fileLanguage(const string& filename);
+    V3LangCode vhdlStd() const VL_MT_SAFE { return m_vhdlStd; }
     static bool fileStatNormal(const string& filename);
 
     // METHODS (other OS)

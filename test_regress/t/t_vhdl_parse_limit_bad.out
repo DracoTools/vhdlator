@@ -1,0 +1,23 @@
+%Error: t/t_vhdl_parse_limit_bad.vhd:12:9: Syntax error: expected an expression, found ;
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_parse_limit_bad.vhd:13:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:14:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:15:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:16:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:17:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:18:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:19:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:20:9: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:21:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:22:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:23:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:24:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:25:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:26:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:27:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:28:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:29:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:30:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:31:10: Syntax error: expected an expression, found ;
+%Error: t/t_vhdl_parse_limit_bad.vhd:31:10: Too many syntax errors; not reporting further errors in this file
+%Error: Exiting due to
