@@ -353,6 +353,9 @@ RAW_OBJS_PCH_ASTNOMT = \
   V3UnrollGen.o \
   V3Vhdl.o \
   V3VhdlLib.o \
+  V3VhdlSem.o \
+  V3VhdlStd.o \
+  V3VhdlSym.o \
   V3VhdlParse.o \
   V3VhdlScan.o \
   V3Width.o \

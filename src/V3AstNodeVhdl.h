@@ -35,6 +35,9 @@
 #define VL_NOT_FINAL  // This #define fixes broken code folding in the IDE
 #endif
 
+class VhdlSymbol;
+class VhdlType;
+
 // === Attribute enums ========================================================
 
 // Interface object class (6.5.2) and mode (6.5.2)
@@ -118,6 +121,7 @@ public:
 class AstNodeVhdlDecl VL_NOT_FINAL : public AstNodeVhdl {
     // A declarative item (clause 6)
     std::string m_name;  // Declared simple name
+    VhdlSymbol* m_vhdlSymp = nullptr;  // The symbol analysis created for it
 
 protected:
     AstNodeVhdlDecl(VNType t, FileLine* fl, const std::string& name)
@@ -128,18 +132,30 @@ public:
     ASTGEN_MEMBERS_AstNodeVhdlDecl;
     std::string name() const override VL_MT_STABLE { return m_name; }
     void name(const std::string& name) override { m_name = name; }
+    VhdlSymbol* vhdlSymp() const { return m_vhdlSymp; }
+    void vhdlSymp(VhdlSymbol* symp) { m_vhdlSymp = symp; }
 };
 
 class AstNodeVhdlExpr VL_NOT_FINAL : public AstNodeVhdl {
     // Anything that may appear where an expression is expected. VHDL cannot
     // tell a function call from an array index or a type conversion until
     // names are resolved (8.1), so several of these stay deliberately vague.
+    //
+    // Analysis fills in what the expression denotes and what type it has.
+    // Neither is an Ast pointer, so astgen leaves them alone.
+    VhdlType* m_vhdlTypep = nullptr;  // Type, once analysis has run
+    VhdlSymbol* m_vhdlSymp = nullptr;  // What a name or call resolved to
+
 protected:
     AstNodeVhdlExpr(VNType t, FileLine* fl)
         : AstNodeVhdl{t, fl} {}
 
 public:
     ASTGEN_MEMBERS_AstNodeVhdlExpr;
+    VhdlType* vhdlTypep() const { return m_vhdlTypep; }
+    void vhdlTypep(VhdlType* typep) { m_vhdlTypep = typep; }
+    VhdlSymbol* vhdlSymp() const { return m_vhdlSymp; }
+    void vhdlSymp(VhdlSymbol* symp) { m_vhdlSymp = symp; }
 };
 
 class AstNodeVhdlStmt VL_NOT_FINAL : public AstNodeVhdl {
@@ -514,7 +530,11 @@ class AstVhdlSubtypeInd final : public AstNodeVhdl {
     // @astgen op1 := resolutionp : Optional[AstNodeVhdlExpr]
     // @astgen op2 := typeMarkp : Optional[AstNodeVhdlExpr]
     // @astgen op3 := constraintp : Optional[AstNodeVhdl]  // Range or index/record constraint
+    VhdlType* m_vhdlTypep = nullptr;  // The subtype analysis derived
+
 public:
+    VhdlType* vhdlTypep() const { return m_vhdlTypep; }
+    void vhdlTypep(VhdlType* typep) { m_vhdlTypep = typep; }
     AstVhdlSubtypeInd(FileLine* fl, AstNodeVhdlExpr* typeMarkp)
         : ASTGEN_SUPER_VhdlSubtypeInd(fl) {
         this->typeMarkp(typeMarkp);

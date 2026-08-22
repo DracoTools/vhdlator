@@ -316,7 +316,7 @@ t/t_vhdl_lex.vhd:76:14: ;
 t/t_vhdl_lex.vhd:77:1: end
 t/t_vhdl_lex.vhd:77:5: architecture
 t/t_vhdl_lex.vhd:77:17: ;
-%Error: VHDL analysis is not yet implemented; ordered 0 design unit(s) from 1 file(s)
+%Error: VHDL lowering is not yet implemented; analyzed 0 design unit(s) from 1 file(s)
 ... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: Exiting due to

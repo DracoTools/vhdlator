@@ -368,7 +368,19 @@
   1:4:3:2:2:2: VHDLNAME (EO) {f110bk}  l
   1:4:3:3: VHDLNAME (FO) {f110bw}  note
   1:4:3: VHDLWAIT (GO) {f111af}
-%Error: VHDL analysis is not yet implemented; ordered 4 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+%Error: t/t_vhdl_parse.vhd:16:52: Cannot find type 'std_logic_vector'
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_parse.vhd:18:9: Cannot find type 'std_logic'
+%Error: t/t_vhdl_parse.vhd:21:23: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_parse.vhd:45:20: Cannot find type 'std_logic'
+%Error: t/t_vhdl_parse.vhd:46:20: Cannot find type 'std_logic'
+%Error: t/t_vhdl_parse.vhd:47:20: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_parse.vhd:48:20: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_parse.vhd:49:20: Cannot find type 'std_logic'
+%Error: t/t_vhdl_parse.vhd:53:18: Cannot find type 'unsigned'
+%Error: t/t_vhdl_parse.vhd:55:18: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_parse.vhd:58:18: Cannot find type 'std_logic'
+%Error: t/t_vhdl_parse.vhd:58:37: Cannot find type 'std_logic'
+%Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 1 file(s)
+... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to

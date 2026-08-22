@@ -201,6 +201,10 @@ set(HEADERS
     V3VariableOrder.h
     V3Vhdl.h
     V3VhdlLib.h
+    V3VhdlSem.h
+    V3VhdlStd.h
+    V3VhdlSym.h
+    V3VhdlType.h
     V3VhdlParse.h
     V3VhdlScan.h
     V3Waiver.h
@@ -380,6 +384,9 @@ set(COMMON_SOURCES
     V3VariableOrder.cpp
     V3Vhdl.cpp
     V3VhdlLib.cpp
+    V3VhdlSem.cpp
+    V3VhdlStd.cpp
+    V3VhdlSym.cpp
     V3VhdlParse.cpp
     V3VhdlScan.cpp
     V3Waiver.cpp

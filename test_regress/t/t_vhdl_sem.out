@@ -1,0 +1,54 @@
+VHDLPACKAGE work.p
+  enumeration literal a : opcode_t
+  function add1 : integer (integer)
+    parameter x : integer
+  function add1 : real (real)
+    parameter x : real
+  enumeration literal b : opcode_t
+  type byte_t : byte_t
+  enumeration literal c : opcode_t
+  enumeration literal done : state_t
+  type freq_t : freq_t
+  physical unit hz : freq_t
+  enumeration literal idle : state_t
+  constant k : integer
+  physical unit khz : freq_t
+  type level_t : level_t
+  attribute mark : boolean
+  type matrix_t : matrix_t
+  physical unit mhz : freq_t
+  constant name : string
+  type nibble_t : nibble_t
+  type opcode_t : opcode_t
+  type point_t : point_t
+  type ptr_t : ptr_t
+  enumeration literal running : state_t
+  type small_t : small_t
+  type state_t : state_t
+  procedure swap (integer, integer)
+    parameter a : integer
+    parameter b : integer
+  type text_t : text_t
+  type word_t : word_t
+VHDLPACKAGEBODY work.p
+  function add1 : integer (integer)
+    variable v : integer
+    parameter x : integer
+  function add1 : real (real)
+    parameter x : real
+  procedure swap (integer, integer)
+    parameter a : integer
+    parameter b : integer
+    variable t : integer
+VHDLENTITY work.t
+  port clk : bit
+  port q : array of bit
+  generic width : positive
+VHDLARCHITECTURE work.rtl
+  signal count : natural
+  signal flag : boolean
+  shared variable total : integer
+%Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 1 file(s)
+... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

@@ -41,6 +41,7 @@
 #include "V3File.h"
 #include "V3Global.h"
 #include "V3VhdlLib.h"
+#include "V3VhdlSem.h"
 #include "V3VhdlParse.h"
 #include "V3VhdlScan.h"
 
@@ -156,9 +157,13 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp) {
         }
     }
 
-    // M3+ : resolve names, check types, and lower the result into rootp. Until
-    // then the parse tree has served its purpose.
+    // Give the parse tree meaning: scopes, symbols and types
+    V3VhdlSem::analyze(order);
+
+    // M5+ : lower the analyzed tree into rootp. Until then it has served its
+    // purpose.
     const size_t units = order.size();
+    V3VhdlSem::clear();
     V3VhdlLib::clear();
     for (AstVhdlDesignFile* const filep : s_designFiles) {
         VL_DO_DANGLING(filep->deleteTree(), filep);
@@ -166,7 +171,7 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp) {
     s_designFiles.clear();
 
     v3Global.rootp()->fileline()->v3error(
-        "VHDL analysis is not yet implemented; ordered "
+        "VHDL lowering is not yet implemented; analyzed "
         << units << " design unit(s) from " << s_filenames.size()
         << " file(s)\n... The VHDL frontend is under development;"
            " Verilog and SystemVerilog are unaffected.");

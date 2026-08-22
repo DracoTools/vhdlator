@@ -114,6 +114,9 @@
 #include "V3Unknown.h"
 #include "V3Unroll.h"
 #include "V3VariableOrder.h"
+#include "V3VhdlLib.h"
+#include "V3VhdlScan.h"
+#include "V3VhdlStd.h"
 #include "V3Waiver.h"
 #include "V3Width.h"
 #include "V3WidthCommit.h"
@@ -749,6 +752,9 @@ static bool verilate(const string& argString) {
         V3Broken::selfTest();
         V3Control::selfTest();
         V3ThreadPool::selfTest();
+        V3VhdlScan::selfTest();
+        V3VhdlLib::selfTest();
+        V3VhdlStd::selfTest();
         UINFO(2, "selfTest done");
     }
 

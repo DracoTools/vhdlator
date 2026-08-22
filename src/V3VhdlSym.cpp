@@ -1,0 +1,199 @@
+// -*- mode: C++; c-file-style: "cc-mode" -*-
+//*************************************************************************
+// DESCRIPTION: Verilator: VHDL symbols, scopes and visibility
+//
+// Code available from: https://verilator.org
+//
+//*************************************************************************
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of either the GNU Lesser General Public License Version 3
+// or the Perl Artistic License Version 2.0.
+// SPDX-FileCopyrightText: 2026-2026 Wilson Snyder
+// SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
+//
+//*************************************************************************
+
+#include "V3PchAstNoMT.h"  // VL_MT_DISABLED_CODE_UNIT
+
+#include "V3VhdlSym.h"
+
+#include "V3Global.h"
+
+#include <algorithm>
+#include <memory>
+#include <sstream>
+
+VL_DEFINE_DEBUG_FUNCTIONS;
+
+//######################################################################
+// Arena
+
+namespace {
+std::vector<std::unique_ptr<VhdlType>> s_types;
+std::vector<std::unique_ptr<VhdlSymbol>> s_symbols;
+std::vector<std::unique_ptr<VhdlScope>> s_scopes;
+}  // namespace
+
+VhdlType* VhdlSymTab::newType(VhdlTypeKind kind, const std::string& name, FileLine* fl) {
+    s_types.emplace_back(new VhdlType{kind, name, fl});
+    return s_types.back().get();
+}
+
+VhdlSymbol* VhdlSymTab::newSymbol(VhdlSymKind kind, const std::string& name, AstNode* declp) {
+    s_symbols.emplace_back(new VhdlSymbol{kind, name, declp});
+    return s_symbols.back().get();
+}
+
+VhdlScope* VhdlSymTab::newScope(VhdlScope* parentp, const std::string& name) {
+    s_scopes.emplace_back(new VhdlScope{parentp, name});
+    return s_scopes.back().get();
+}
+
+void VhdlSymTab::clear() {
+    s_scopes.clear();
+    s_symbols.clear();
+    s_types.clear();
+}
+
+//######################################################################
+// VhdlType
+
+std::string VhdlType::prettyName() const {
+    if (!m_name.empty()) return m_name;
+    switch (m_kind) {
+    case VhdlTypeKind::ERROR: return "<error>";
+    case VhdlTypeKind::UNIVERSAL_INTEGER: return "universal_integer";
+    case VhdlTypeKind::UNIVERSAL_REAL: return "universal_real";
+    case VhdlTypeKind::ARRAY: {
+        std::string out = "array of ";
+        out += m_elementp ? m_elementp->prettyName() : "<unknown>";
+        return out;
+    }
+    case VhdlTypeKind::RECORD: return "<anonymous record>";
+    case VhdlTypeKind::ACCESS:
+        return "access " + (m_designatedp ? m_designatedp->prettyName() : "<unknown>");
+    case VhdlTypeKind::FILE:
+        return "file of " + (m_designatedp ? m_designatedp->prettyName() : "<unknown>");
+    default: return "<anonymous type>";
+    }
+}
+
+//######################################################################
+// VhdlSymbol
+
+const char* VhdlSymbol::kindName() const {
+    switch (m_kind) {
+    case VhdlSymKind::ERROR: return "erroneous declaration";
+    case VhdlSymKind::TYPE: return "type";
+    case VhdlSymKind::CONSTANT: return "constant";
+    case VhdlSymKind::SIGNAL: return "signal";
+    case VhdlSymKind::VARIABLE: return "variable";
+    case VhdlSymKind::SHARED_VARIABLE: return "shared variable";
+    case VhdlSymKind::FILE: return "file";
+    case VhdlSymKind::GENERIC: return "generic";
+    case VhdlSymKind::PORT: return "port";
+    case VhdlSymKind::PARAMETER: return "parameter";
+    case VhdlSymKind::ENUM_LITERAL: return "enumeration literal";
+    case VhdlSymKind::PHYSICAL_UNIT: return "physical unit";
+    case VhdlSymKind::FUNCTION: return "function";
+    case VhdlSymKind::PROCEDURE: return "procedure";
+    case VhdlSymKind::RECORD_ELEMENT: return "record element";
+    case VhdlSymKind::ALIAS: return "alias";
+    case VhdlSymKind::ATTRIBUTE: return "attribute";
+    case VhdlSymKind::LABEL: return "label";
+    case VhdlSymKind::LIBRARY: return "library";
+    case VhdlSymKind::PACKAGE: return "package";
+    case VhdlSymKind::ENTITY: return "entity";
+    case VhdlSymKind::ARCHITECTURE: return "architecture";
+    case VhdlSymKind::CONFIGURATION: return "configuration";
+    case VhdlSymKind::COMPONENT: return "component";
+    case VhdlSymKind::CONTEXT: return "context";
+    case VhdlSymKind::LOOP_PARAMETER: return "loop parameter";
+    case VhdlSymKind::GENERATE_PARAMETER: return "generate parameter";
+    }
+    return "declaration";  // LCOV_EXCL_LINE
+}
+
+bool VhdlSymbol::homographOf(const VhdlSymbol* otherp) const {
+    if (m_name != otherp->name()) return false;
+    // Only overloadables escape hiding, and only when their signatures differ
+    if (!isOverloadable() || !otherp->isOverloadable()) return true;
+    if (m_kind != otherp->kind()) return true;
+    if (m_paramTypes.size() != otherp->paramTypes().size()) return false;
+    for (size_t i = 0; i < m_paramTypes.size(); ++i) {
+        const VhdlType* const ap = m_paramTypes[i];
+        const VhdlType* const bp = otherp->paramTypes()[i];
+        if (ap && bp && ap->base() != bp->base()) return false;
+    }
+    // A function's result type is part of its signature (12.3)
+    if (m_returnTypep && otherp->returnTypep()
+        && m_returnTypep->base() != otherp->returnTypep()->base()) {
+        return false;
+    }
+    return true;
+}
+
+//######################################################################
+// VhdlScope
+
+VhdlSymbol* VhdlScope::insert(VhdlSymbol* symp) {
+    VhdlSymbol* hiddenp = nullptr;
+    const auto range = m_direct.equal_range(symp->name());
+    for (auto it = range.first; it != range.second; ++it) {
+        if (symp->homographOf(it->second)) {
+            hiddenp = it->second;
+            break;
+        }
+    }
+    m_direct.emplace(symp->name(), symp);
+    return hiddenp;
+}
+
+void VhdlScope::lookupLocal(const std::string& name, std::vector<VhdlSymbol*>& out) const {
+    const auto range = m_direct.equal_range(name);
+    for (auto it = range.first; it != range.second; ++it) out.push_back(it->second);
+}
+
+void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) const {
+    // Walk outwards. The innermost region that declares the name wins, but an
+    // overloadable name keeps gathering, since outer overloads stay visible
+    // unless a homograph hides them (12.3).
+    bool sawNonOverloadable = false;
+    for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
+        const size_t before = out.size();
+        scopep->lookupLocal(name, out);
+        for (size_t i = before; i < out.size(); ++i) {
+            if (!out[i]->isOverloadable()) sawNonOverloadable = true;
+        }
+        if (sawNonOverloadable) return;  // Hides everything outside
+    }
+    if (!out.empty()) return;  // Directly visible declarations win over use clauses
+
+    // Nothing declared: fall back on what use clauses made potentially visible
+    for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
+        for (const VhdlScope* const usedp : scopep->m_usedp) {
+            usedp->lookupLocal(name, out);
+        }
+        if (!out.empty()) return;
+    }
+}
+
+void VhdlScope::addUse(VhdlScope* scopep) {
+    if (!scopep) return;
+    if (std::find(m_usedp.begin(), m_usedp.end(), scopep) == m_usedp.end()) {
+        m_usedp.push_back(scopep);
+    }
+}
+
+void VhdlScope::addNamed(const std::string& name, VhdlScope* scopep) {
+    m_named[name] = scopep;
+}
+
+VhdlScope* VhdlScope::findNamed(const std::string& name) const {
+    for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
+        const auto it = scopep->m_named.find(name);
+        if (it != scopep->m_named.end()) return it->second;
+    }
+    return nullptr;
+}

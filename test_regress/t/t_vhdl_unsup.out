@@ -1,4 +1,7 @@
-%Error: VHDL analysis is not yet implemented; ordered 2 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+%Error: t/t_vhdl_unsup.vhd:11:19: Cannot find type 'std_logic'
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_unsup.vhd:12:19: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_unsup.vhd:16:18: Cannot find type 'std_logic_vector'
+%Error: VHDL lowering is not yet implemented; analyzed 2 design unit(s) from 1 file(s)
+... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to
