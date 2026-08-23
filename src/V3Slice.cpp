@@ -62,8 +62,10 @@ class SliceVisitor final : public VNVisitor {
 
     // STATE - for current visit position (use VL_RESTORER)
     AstNode* m_assignp = nullptr;  // Assignment we are under
+    AstScope* m_scopep = nullptr;  // Scope we are under, for temporaries
     bool m_assignError = false;  // True if the current assign already has an error
     bool m_okInitArray = false;  // Allow InitArray children
+    int m_tempNum = 0;  // Number for the next temporary
 
     // METHODS
     AstNodeExpr* cloneAndSel(AstNodeExpr* const nodep, int elements, int elemIdx,
@@ -240,6 +242,71 @@ class SliceVisitor final : public VNVisitor {
         return newp;
     }
 
+    // The variable a reference ultimately reaches, through selects
+    static const AstVar* rootVarp(const AstNode* nodep) {
+        while (nodep) {
+            if (const AstNodeVarRef* const refp = VN_CAST(nodep, NodeVarRef)) return refp->varp();
+            if (const AstArraySel* const selp = VN_CAST(nodep, ArraySel)) {
+                nodep = selp->fromp();
+            } else if (const AstSliceSel* const selp = VN_CAST(nodep, SliceSel)) {
+                nodep = selp->fromp();
+            } else if (const AstSel* const selp = VN_CAST(nodep, Sel)) {
+                nodep = selp->fromp();
+            } else if (const AstMemberSel* const selp = VN_CAST(nodep, MemberSel)) {
+                nodep = selp->fromp();
+            } else if (const AstStructSel* const selp = VN_CAST(nodep, StructSel)) {
+                nodep = selp->fromp();
+            } else if (const AstCMethodHard* const methp = VN_CAST(nodep, CMethodHard)) {
+                // How an element of a dynamic array or a queue is selected
+                nodep = methp->fromp();
+            } else {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+    // Whether expanding this assignment element by element could read an
+    // element the expansion has already written. An assignment is evaluated
+    // in full before any of it is assigned (IEEE 1800-2023 10.7), which
+    // element-at-a-time assignment only preserves when the two sides do not
+    // touch the same variable.
+    static bool selfOverlaps(AstNodeAssign* nodep) {
+        if (!VN_IS(nodep, Assign)) return false;  // Only immediate writes can bite
+        // A whole-array copy reads element i to write element i, whatever the
+        // two sides name, so the order cannot matter
+        if (VN_IS(nodep->rhsp(), NodeVarRef)) return false;
+        const AstVar* const lhsVarp = rootVarp(nodep->lhsp());
+        // Where the destination cannot be named -- an element of a dynamic
+        // array, say -- leave the assignment as it was rather than rewriting
+        // it into another the same question would be asked of
+        if (!lhsVarp) return false;
+        return nodep->rhsp()->exists(
+            [lhsVarp](const AstNodeVarRef* refp) { return refp->varp() == lhsVarp; });
+    }
+
+    // Assign through a temporary, so that the whole right-hand side is
+    // computed before any of the destination changes
+    void insertTemp(AstNodeAssign* nodep) {
+        FileLine* const flp = nodep->fileline();
+        AstNodeDType* const dtypep = nodep->lhsp()->dtypep();
+        const std::string name = "__Vslicetmp" + cvtToStr(m_tempNum++);
+        AstVar* const varp = new AstVar{flp, VVarType::BLOCKTEMP, name, dtypep};
+        varp->funcLocal(false);
+        m_scopep->modp()->addStmtsp(varp);
+        AstVarScope* const vscp = new AstVarScope{flp, m_scopep, varp};
+        m_scopep->addVarsp(vscp);
+        AstNodeExpr* const rhsp = nodep->rhsp()->unlinkFrBack();
+        AstNodeExpr* const lhsp = nodep->lhsp()->unlinkFrBack();
+        AstAssign* const fillp
+            = new AstAssign{flp, new AstVarRef{flp, vscp, VAccess::WRITE}, rhsp};
+        AstAssign* const usep
+            = new AstAssign{flp, lhsp, new AstVarRef{flp, vscp, VAccess::READ}};
+        fillp->addNext(usep);
+        nodep->replaceWith(fillp);
+        VL_DO_DANGLING(nodep->deleteTree(), nodep);
+    }
+
     bool assignOptimize(AstNodeAssign* nodep) {
         // Return true if did optimization
         AstNodeDType* const dtp = nodep->lhsp()->dtypep()->skipRefp();
@@ -309,6 +376,13 @@ class SliceVisitor final : public VNVisitor {
         VL_RESTORER(m_okInitArray);  // Set in assignOptimize
         m_assignError = false;
         m_assignp = nodep;
+        if (m_scopep && VN_IS(nodep->lhsp()->dtypep()->skipRefp(), UnpackArrayDType)
+            && selfOverlaps(nodep)) {
+            // The two new assignments are iterated in turn, and neither of
+            // them overlaps itself, so this happens at most once per assign
+            insertTemp(nodep);
+            return;
+        }
         if (assignOptimize(nodep)) return;
         iterateChildren(nodep);
     }
@@ -382,6 +456,11 @@ class SliceVisitor final : public VNVisitor {
     void visit(AstEqCase* nodep) override { expandBiOp(nodep); }
     void visit(AstNeqCase* nodep) override { expandBiOp(nodep); }
 
+    void visit(AstScope* nodep) override {
+        VL_RESTORER(m_scopep);
+        m_scopep = nodep;
+        iterateChildren(nodep);
+    }
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
 
 public:
