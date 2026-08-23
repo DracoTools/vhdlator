@@ -2101,13 +2101,23 @@ private:
         if (!symp) return;
         if (!nodep->hasBody()) return;  // A declaration alone emits nothing
         if (m_funcs.count(symp)) return;  // Its declaration already made one
+        // A subprogram with an unconstrained parameter is a template: each
+        // call site got a copy with the lengths it supplies, and only those
+        // copies are emitted. Emitting the template as well would mean
+        // deciding a length it does not have.
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                && !typep->isConstrainedArray()) {
+                return;
+            }
+        }
         // An overloaded name needs a distinct one in the emitted code
         const std::string name = uniqueName(symp);
         AstNodeFTask* ftaskp = nullptr;
         if (nodep->isFunction()) {
             AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
             funcp->fvarp(new AstVar{flp, VVarType::PORT, name, VFlagChildDType{},
-                                    lowerType(symp->returnTypep(), flp)});
+                                    lowerType(returnType(nodep, symp), flp)});
             ftaskp = funcp;
         } else {
             ftaskp = new AstTask{flp, name, nullptr};
@@ -2141,6 +2151,55 @@ private:
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
         m_ftaskp = nullptr;  // The task itself belongs to the module
         addStmt(ftaskp);
+    }
+
+    // The subtype a function returns. VHDL lets it be unconstrained -- the
+    // length comes from whatever the body returns -- so where the declaration
+    // does not say, the return statements do (4.2.1).
+    static VhdlType* returnType(AstVhdlSubprogDecl* nodep, const VhdlSymbol* symp) {
+        VhdlType* const declaredp = symp->returnTypep();
+        if (!declaredp || declaredp->base()->kind() != VhdlTypeKind::ARRAY
+            || declaredp->isConstrainedArray()) {
+            return declaredp;
+        }
+        VhdlType* foundp = nullptr;
+        findReturnType(nodep->stmtsp(), foundp);
+        if (foundp) return foundp;
+        // Where the returned expression has no length of its own -- "return v
+        // and m", whose operator gives a result as long as its operands --
+        // a parameter of the same type does
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (typep && typep->base() == declaredp->base() && typep->isConstrainedArray()) {
+                return const_cast<VhdlType*>(typep);
+            }
+        }
+        return declaredp;
+    }
+    static void findReturnType(AstNode* stmtsp, VhdlType*& foundp) {
+        for (AstNode* p = stmtsp; p && !foundp; p = p->nextp()) {
+            if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+                if (retp->valuep() && retp->valuep()->vhdlTypep()
+                    && retp->valuep()->vhdlTypep()->isConstrainedArray()) {
+                    foundp = retp->valuep()->vhdlTypep();
+                }
+                continue;
+            }
+            if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
+                for (AstNode* ap = ifp->altsp(); ap && !foundp; ap = ap->nextp()) {
+                    findReturnType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp);
+                }
+                continue;
+            }
+            if (AstVhdlCase* const casep = VN_CAST(p, VhdlCase)) {
+                for (AstNode* ap = casep->altsp(); ap && !foundp; ap = ap->nextp()) {
+                    findReturnType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp);
+                }
+                continue;
+            }
+            if (AstVhdlLoop* const loopp = VN_CAST(p, VhdlLoop)) {
+                findReturnType(loopp->stmtsp(), foundp);
+            }
+        }
     }
 
     // Two subprograms may share a name and differ only in their parameters,

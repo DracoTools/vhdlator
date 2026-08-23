@@ -40,6 +40,7 @@
 #include <vector>
 
 class AstNode;
+class AstVhdlSubprogDecl;
 class FileLine;
 
 //============================================================================
@@ -107,6 +108,7 @@ class VhdlSymbol final {
     VhdlValue m_value;
     bool m_deferred = false;  // A deferred constant, whose value is in the body
     VhdlSymbol* m_aliasp = nullptr;  // What an alias denotes (6.6)
+    AstVhdlSubprogDecl* m_bodyp = nullptr;  // A subprogram's body, for copying
 
     VL_UNCOPYABLE(VhdlSymbol);
 
@@ -134,6 +136,9 @@ public:
     void hasBody(bool flag) { m_hasBody = flag; }
     bool deferred() const { return m_deferred; }
     void deferred(bool flag) { m_deferred = flag; }
+
+    AstVhdlSubprogDecl* bodyp() const { return m_bodyp; }
+    void bodyp(AstVhdlSubprogDecl* nodep) { m_bodyp = nodep; }
 
     VhdlSymbol* aliasp() const { return m_aliasp; }
     void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }

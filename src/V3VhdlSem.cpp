@@ -695,6 +695,12 @@ public:
 
     void analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
 
+    // Give a subprogram the parameter subtypes one call site supplies, and
+    // analyze it as if it had been written that way (see specialize())
+    VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
+                                     const std::vector<VhdlType*>& actualTypes,
+                                     const std::string& name) VL_MT_DISABLED;
+
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
     // Declarations
@@ -963,8 +969,10 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         reusep->hasBody(true);
         reusep->innerp(innerp);
         nodep->vhdlSymp(reusep);
+        if (nodep->hasBody()) reusep->bodyp(nodep);
     } else {
         nodep->vhdlSymp(symp);
+        if (nodep->hasBody()) symp->bodyp(nodep);
         declare(symp, nodep->fileline());
     }
 
@@ -1293,10 +1301,203 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
 //######################################################################
 // V3VhdlSem
 
+//######################################################################
+// Making one copy of a subprogram
+
+// Everything the analyzer cached on a node belongs to the original, so a copy
+// starts clean and is analyzed from scratch
+class VhdlUnanalyzeVisitor final : public VNVisitor {
+    void visit(AstNodeVhdlExpr* nodep) override {
+        nodep->vhdlTypep(nullptr);
+        nodep->vhdlSymp(nullptr);
+        iterateChildren(nodep);
+    }
+    void visit(AstVhdlSubtypeInd* nodep) override {
+        nodep->vhdlTypep(nullptr);
+        iterateChildren(nodep);
+    }
+    void visit(AstNodeVhdlDecl* nodep) override {
+        nodep->vhdlSymp(nullptr);
+        iterateChildren(nodep);
+    }
+    void visit(AstVhdlLoop* nodep) override {
+        nodep->vhdlSymp(nullptr);
+        iterateChildren(nodep);
+    }
+    void visit(AstVhdlGenerate* nodep) override {
+        nodep->vhdlSymp(nullptr);
+        iterateChildren(nodep);
+    }
+    void visit(AstNode* nodep) override { iterateChildren(nodep); }
+
+public:
+    explicit VhdlUnanalyzeVisitor(AstNode* nodep) { iterateAndNextNull(nodep); }
+    ~VhdlUnanalyzeVisitor() override = default;
+};
+
+VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
+                                                 VhdlScope* regionp,
+                                                 const std::vector<VhdlType*>& actualTypes,
+                                                 const std::string& name) {
+    AstVhdlSubprogDecl* const copyp = originalp->cloneTree(false);
+    copyp->name(name);
+    VhdlUnanalyzeVisitor{copyp};
+    // Each parameter is declared with the subtype the call supplies. Setting
+    // the resolved type on the indication is enough: resolveSubtype takes it
+    // as already worked out, which is exactly what a written-out constraint
+    // would have produced.
+    size_t i = 0;
+    for (AstNode* p = copyp->paramsp(); p; p = p->nextp(), ++i) {
+        AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+        if (i >= actualTypes.size() || !actualTypes[i]) continue;
+        if (!ifp->subtypep()) continue;
+        VhdlType* const paramp = originalp->paramsp()
+                                     ? nullptr
+                                     : nullptr;  // Unused; kept for clarity
+        (void)paramp;
+        ifp->subtypep()->vhdlTypep(actualTypes[i]);
+    }
+    // Analyze the copy in the region the original was declared in, so it sees
+    // exactly the names the original did
+    VhdlScope* const savedp = m_scopep;
+    VhdlType* const savedReturnp = m_returnTypep;
+    m_scopep = regionp;
+    m_returnTypep = nullptr;
+    iterate(copyp);
+    m_scopep = savedp;
+    m_returnTypep = savedReturnp;
+    // The copy belongs beside the original, so lowering finds it
+    originalp->addNextHere(copyp);
+    return copyp->vhdlSymp();
+}
+
+//######################################################################
+// Specialization of unconstrained subprograms
+//
+// VHDL writes "function reverse (v : std_logic_vector) return
+// std_logic_vector" once, and every call gives the parameter a length of its
+// own. An event-driven simulator carries that length on the value, in a
+// runtime descriptor read on every operation -- which is a large part of why
+// those simulators are slow, and exactly what a compiler must not do.
+//
+// So each distinct set of actual lengths gets its own copy of the subprogram,
+// written as if the parameters had been declared with those lengths, and
+// analyzed from scratch. Everything downstream then sees an ordinary
+// subprogram whose every bound is known: 'LENGTH folds, ranges fold, and the
+// body emits the same code a hand-written fixed-width version would.
+//
+// This is what the plan calls tier one, and it is where all of numeric_std
+// lands: those functions are written against unconstrained operands, but
+// every call site has a static width.
+
+class VhdlSpecVisitor final : public VNVisitor {
+    // STATE
+    VhdlSemVisitor& m_sem;
+    // Subprogram and actual types -> the copy made for them
+    std::map<std::string, VhdlSymbol*> m_specializations;
+    int m_count = 0;
+    bool m_madeOne = false;
+
+    VL_UNCOPYABLE(VhdlSpecVisitor);
+
+public:
+    explicit VhdlSpecVisitor(VhdlSemVisitor& sem)
+        : m_sem{sem} {}
+    ~VhdlSpecVisitor() override = default;
+
+    // Returns true if it made a copy, so the caller can look at the copies
+    bool pass(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+        m_madeOne = false;
+        for (AstNodeVhdlUnit* const unitp : unitsp) iterate(unitp);
+        return m_madeOne;
+    }
+    void passOver(AstNode* nodep) {
+        m_madeOne = false;
+        iterateAndNextNull(nodep);
+    }
+    bool madeOne() const { return m_madeOne; }
+
+private:
+    void visit(AstNode* nodep) override { iterateChildren(nodep); }
+    void visit(AstVhdlCall* nodep) override {
+        iterateChildren(nodep);
+        trySpecialize(nodep, nodep->vhdlSymp(), nodep->argsp());
+    }
+
+    // Whether a subprogram has a parameter or result whose length is not
+    // known until it is called
+    static bool needsSpecializing(const VhdlSymbol* symp) {
+        if (!symp) return false;
+        if (symp->kind() != VhdlSymKind::FUNCTION && symp->kind() != VhdlSymKind::PROCEDURE) {
+            return false;
+        }
+        if (symp->predefined() || !symp->bodyp()) return false;
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                && !typep->isConstrainedArray()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
+        if (!needsSpecializing(symp)) return;
+        // The actual types, which must all be known for the copy to be made
+        std::vector<VhdlType*> actualTypes;
+        size_t i = 0;
+        for (AstNode* p = argsp; p; p = p->nextp(), ++i) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp() || i >= symp->paramTypes().size()) return;
+            VhdlType* typep = asp->actualp()->vhdlTypep();
+            // Only a length that is known is worth specializing on
+            if (symp->paramTypes()[i]
+                && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::ARRAY) {
+                if (!typep || !typep->isConstrainedArray()) return;
+                // A length of two billion is an index subtype's range, not an
+                // object's; specializing on it would be meaningless and would
+                // make the copy's own bounds checks fire
+                const int64_t length = typep->dimLength(0);
+                if (length <= 0 || length > (1 << 20)) return;
+            }
+            actualTypes.push_back(typep);
+        }
+        if (actualTypes.size() != symp->paramTypes().size()) return;
+
+        std::string key = symp->name();
+        for (const VhdlType* const typep : actualTypes) {
+            key += "|" + std::to_string(reinterpret_cast<uintptr_t>(typep));
+        }
+        const auto it = m_specializations.find(key);
+        if (it != m_specializations.end()) {
+            nodep->vhdlSymp(it->second);
+            return;
+        }
+        AstVhdlSubprogDecl* const bodyp = symp->bodyp();
+        VhdlScope* const regionp = symp->innerp() ? symp->innerp()->parentp() : nullptr;
+        if (!bodyp || !regionp) return;
+        const std::string name = symp->name() + "__V" + std::to_string(++m_count);
+        VhdlSymbol* const newp = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, name);
+        m_specializations.emplace(key, newp);
+        if (newp) {
+            nodep->vhdlSymp(newp);
+            m_madeOne = true;
+        }
+    }
+};
+
 bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     V3VhdlStd::build();
     VhdlSemVisitor visitor;
     visitor.analyzeUnits(unitsp);
+    // Give every call to an unconstrained subprogram a copy with the lengths
+    // it supplies. A copy may itself call one, so repeat until nothing new
+    // appears; the bound is defensive, since a chain that never settles is a
+    // recursion on data-dependent lengths, which has no static answer.
+    VhdlSpecVisitor specializer{visitor};
+    for (int round = 0; round < 20; ++round) {
+        if (!specializer.pass(unitsp)) break;
+    }
     return !visitor.errored();
 }
 
