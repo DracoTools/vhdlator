@@ -1015,16 +1015,26 @@ private:
         if (typep && typep->base()->kind() == VhdlTypeKind::RECORD) {
             return lowerRecordAggregate(nodep, typep, flp);
         }
-        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
-            || !typep->isConstrainedArray()) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) {
             unsup(flp, "aggregate of this type");
             return nullptr;
         }
-        const VhdlType* const indexp = typep->indexTypes()[0];
-        const int64_t left = indexp->left();
-        const int64_t right = indexp->right();
-        const int64_t step = indexp->ascending() ? 1 : -1;
-        const int64_t count = indexp->length();
+        // Where the context gives no constraint -- an aggregate standing as
+        // an operand, or returned from a function whose result is
+        // unconstrained -- the aggregate's own elements fix its index range
+        // (9.3.3.3)
+        int64_t left = 0;
+        int64_t step = 1;
+        int64_t count = 0;
+        if (typep->isConstrainedArray()) {
+            const VhdlType* const indexp = typep->indexTypes()[0];
+            left = indexp->left();
+            step = indexp->ascending() ? 1 : -1;
+            count = indexp->length();
+        } else if (!ownConstraint(nodep, typep, left, step, count)) {
+            unsup(flp, "aggregate of this type");
+            return nullptr;
+        }
         if (count <= 0 || count > 65536) {
             unsup(flp, "aggregate of this size");
             return nullptr;
@@ -1075,8 +1085,14 @@ private:
                 }
             }
         }
-        // Left to right is most significant to least, as a vector reads
+        // An array of packed elements is a vector, and its aggregate a
+        // concatenation with the leftmost element most significant. An array
+        // of anything else is unpacked, and its aggregate an assignment
+        // pattern, which is the only form that can carry element values.
+        const bool packed = typep->base()->elementp()
+                            && elementPacks(typep->base()->elementp());
         AstNodeExpr* outp = nullptr;
+        AstNode* itemsp = nullptr;
         for (int64_t i = 0; i < count; ++i) {
             AstNodeVhdlExpr* const valuep
                 = byIndex[static_cast<size_t>(i)] ? byIndex[static_cast<size_t>(i)] : othersp;
@@ -1086,10 +1102,83 @@ private:
             }
             AstNodeExpr* const elemp = lowerExpr(valuep);
             if (!elemp) return nullptr;
-            outp = outp ? new AstConcat{flp, outp, elemp} : elemp;
+            if (packed) {
+                outp = outp ? new AstConcat{flp, outp, elemp} : elemp;
+            } else {
+                itemsp = AstNode::addNextNull(
+                    itemsp, new AstPatMember{flp, elemp, nullptr, nullptr});
+            }
         }
-        (void)right;
-        return outp;
+        if (packed) return outp;
+        return itemsp ? new AstPattern{flp, itemsp} : nullptr;
+    }
+
+    // The index range an aggregate gives itself when nothing else does. A
+    // positional aggregate starts at its index subtype's left; a named one
+    // spans its choices (9.3.3.3). An "others" needs a constraint from
+    // somewhere, so there is nothing to work out.
+    // How many elements one positional association supplies: usually one, but
+    // VHDL-2008 lets a value of the aggregate's own type stand for a whole
+    // slice of it (9.3.3.3)
+    static int64_t elementSpan(AstNodeVhdlExpr* valuep, const VhdlType* arrayTypep) {
+        if (!valuep || !arrayTypep) return 1;
+        const VhdlType* const typep = valuep->vhdlTypep();
+        if (!typep || typep->base() != arrayTypep->base()) return 1;
+        if (!typep->isConstrainedArray() || typep->dimensions() != 1) return -1;
+        return typep->dimLength(0);
+    }
+
+    bool ownConstraint(AstVhdlAggregate* nodep, VhdlType* typep, int64_t& left, int64_t& step,
+                       int64_t& count) {
+        if (typep->dimensions() != 1) return false;
+        const VhdlType* const indexp = typep->base()->indexTypes().empty()
+                                           ? nullptr
+                                           : typep->base()->indexTypes()[0];
+        if (!indexp || !indexp->bounded()) return false;
+        int64_t positional = 0;
+        bool named = false;
+        int64_t lowest = INT64_MAX;
+        int64_t highest = INT64_MIN;
+        for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
+            AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+            if (!eap->choicesp()) {
+                const int64_t span = elementSpan(eap->valuep(), typep);
+                if (span < 0) return false;
+                positional += span;
+                continue;
+            }
+            for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+                AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                if (chp->isOthers()) return false;
+                named = true;
+                int64_t lo = 0;
+                int64_t hi = 0;
+                if (AstVhdlRange* const rp = chp->rangep()) {
+                    const VhdlValue a = V3VhdlEval::eval(rp->leftp());
+                    const VhdlValue b = V3VhdlEval::eval(rp->rightp());
+                    if (!a.isInt() || !b.isInt()) return false;
+                    lo = std::min(a.toInt(), b.toInt());
+                    hi = std::max(a.toInt(), b.toInt());
+                } else {
+                    const VhdlValue v = V3VhdlEval::eval(chp->valuep());
+                    if (!v.isInt()) return false;
+                    lo = hi = v.toInt();
+                }
+                lowest = std::min(lowest, lo);
+                highest = std::max(highest, hi);
+            }
+        }
+        step = indexp->ascending() ? 1 : -1;
+        if (named) {
+            if (lowest > highest) return false;
+            left = step > 0 ? lowest : highest;
+            count = highest - lowest + 1;
+        } else {
+            if (positional <= 0) return false;
+            left = indexp->left();
+            count = positional;
+        }
+        return count > 0 && count <= 65536;
     }
 
     // A record aggregate lays its elements out in declaration order, which is
