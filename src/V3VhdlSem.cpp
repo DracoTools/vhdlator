@@ -747,6 +747,7 @@ private:
     int64_t aggregateLength(AstVhdlAggregate* nodep) VL_MT_DISABLED;
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
     VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
+    VhdlType* convertedType(VhdlType* top, AstVhdlAssoc* argp) VL_MT_DISABLED;
     VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
@@ -1441,6 +1442,9 @@ private:
             return false;
         }
         if (symp->predefined() || !symp->bodyp()) return false;
+        // A subprogram the frontend emits as a native operation is never
+        // compiled, so making copies of it is wasted work
+        if (V3VhdlStd::isIntrinsicName(symp->name())) return false;
         for (const VhdlType* const typep : symp->paramTypes()) {
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
                 && !typep->isConstrainedArray()) {
@@ -2292,7 +2296,10 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                                            + " is outside the range of " + what + ", which is "
                                            + rangeText(symp->typep()));
             }
-            return symp->typep();
+            // A conversion between closely related array types keeps the
+            // operand's length (9.3.6), so "unsigned(v)" is as long as v even
+            // though UNSIGNED itself is unconstrained
+            return convertedType(symp->typep(), VN_CAST(nodep->argsp(), VhdlAssoc));
         }
     }
 
@@ -2530,6 +2537,25 @@ int64_t VhdlSemVisitor::elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayType
     VhdlType* const typep = valuep->vhdlTypep();
     if (!typep || typep->base() != arrayTypep->base()) return 1;
     return staticLength(valuep);
+}
+
+// The subtype a type conversion yields: the type mark's own, unless that is
+// an unconstrained array and the operand has a length to lend it (9.3.6)
+VhdlType* VhdlSemVisitor::convertedType(VhdlType* top, AstVhdlAssoc* argp) {
+    if (!top || top->base()->kind() != VhdlTypeKind::ARRAY || top->isConstrainedArray()) {
+        return top;
+    }
+    if (!argp || !argp->actualp()) return top;
+    VhdlType* const fromp = argp->actualp()->vhdlTypep();
+    if (!fromp || !fromp->isConstrainedArray()
+        || fromp->dimensions() != top->base()->indexTypes().size()) {
+        return top;
+    }
+    VhdlType* const outp = cloneSubtype(top, argp->fileline());
+    outp->clearIndexTypes();
+    for (VhdlType* const idxp : fromp->indexTypes()) outp->addIndexType(idxp);
+    outp->unconstrained(false);
+    return outp;
 }
 
 // The subtype an aggregate gives itself, or null where its own elements do

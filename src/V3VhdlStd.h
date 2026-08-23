@@ -62,6 +62,13 @@ public:
     static VhdlType* universalRealType() VL_MT_DISABLED;
     static VhdlType* errorType() VL_MT_DISABLED;
 
+    // Whether a subprogram of that name is emitted as a native operation
+    // rather than compiled. The frontend recognises the arithmetic of the
+    // IEEE packages instead of running it, so those bodies are never used --
+    // and specializing them per call site would be wasted work that also
+    // renames them out of recognition.
+    static bool isIntrinsicName(const std::string& name) VL_MT_DISABLED;
+
     // Declare the operators a type declaration implicitly brings with it
     // (5.2.6, 9.2). Called for every user-defined type as well.
     static void addImplicitOperators(VhdlScope* scopep, VhdlType* typep) VL_MT_DISABLED;

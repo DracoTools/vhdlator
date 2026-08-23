@@ -129,6 +129,10 @@ void V3LinkLevel::timescaling(const ModVec& mods) {
         if (!v3Global.opt.timeOverrideUnit().isNone()) modp->timeunit(unit);
         if (modp->timeunit().isNone()) {
             if (modTimedp  // Got previous
+                // A VHDL module always has a timescale, since the language
+                // fixes the unit of TIME, so the design having one says
+                // nothing about whether a Verilog module meant to
+                && !modTimedp->fileline()->language().vhdl()
                 && !dunitTimed
                 && (  // unit doesn't already include an override
                     v3Global.opt.timeOverrideUnit().isNone()

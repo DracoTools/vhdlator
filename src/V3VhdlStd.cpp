@@ -243,6 +243,26 @@ void V3VhdlStd::clear() {
 //######################################################################
 // Implicit operators (5.2.6, 9.2)
 
+bool V3VhdlStd::isIntrinsicName(const std::string& name) {
+    static const std::vector<std::string> NAMES{
+        "to_integer",     "to_unsigned",   "to_signed",       "resize",
+        "shift_left",     "shift_right",   "rotate_left",     "rotate_right",
+        "and_reduce",     "or_reduce",     "xor_reduce",      "nand_reduce",
+        "nor_reduce",     "xnor_reduce",   "maximum",         "minimum",
+        "to_stdlogicvector", "to_stdulogicvector", "to_bitvector", "to_bit",
+        "to_stdulogic",   "to_stdlogic",   "to_x01",          "to_01",
+        "to_ux01",        "rising_edge",   "falling_edge",    "now",
+        "write",          "writeline",     "readline",        "read",
+        "hwrite",         "owrite",        "bwrite",          "swrite",
+        "hread",          "oread",         "bread",           "tee",
+        "file_open",      "file_close",    "flush",           "endfile",
+        "deallocate",     "stop",          "finish"};
+    for (const std::string& candidate : NAMES) {
+        if (candidate == name) return true;
+    }
+    return false;
+}
+
 void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
     if (!typep || typep->isError()) return;
     VhdlType* const boolp = s_booleanp;

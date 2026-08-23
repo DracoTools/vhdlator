@@ -268,6 +268,34 @@ class LinkCellsVisitor final : public VNVisitor {
         const VSymEnt* const foundp = libSymp->findIdFallback(modName);
         return foundp ? VN_AS(foundp->nodep(), NodeModule) : nullptr;
     }
+    // Rename an instance's pins to the spelling the module uses, where the
+    // instance and the module come from different languages (VHDL is case
+    // insensitive; Verilog is not)
+    static void matchNamesAcrossLanguages(AstCell* nodep) {
+        AstNodeModule* const modp = nodep->modp();
+        if (!modp) return;
+        const bool modVhdl = modp->fileline()->language().vhdl();
+        const bool cellVhdl = nodep->fileline()->language().vhdl();
+        if (modVhdl == cellVhdl) return;  // One language: its own rules apply
+        // What the module calls each of its ports and parameters
+        std::map<std::string, std::string> byLower;
+        for (AstNode* itemp = modp->stmtsp(); itemp; itemp = itemp->nextp()) {
+            if (const AstPort* const portp = VN_CAST(itemp, Port)) {
+                byLower.emplace(VString::downcase(portp->name()), portp->name());
+            } else if (const AstVar* const varp = VN_CAST(itemp, Var)) {
+                if (varp->isParam()) byLower.emplace(VString::downcase(varp->name()), varp->name());
+            }
+        }
+        for (AstPin* pinp = nodep->pinsp(); pinp; pinp = VN_AS(pinp->nextp(), Pin)) {
+            const auto it = byLower.find(VString::downcase(pinp->name()));
+            if (it != byLower.end()) pinp->name(it->second);
+        }
+        for (AstPin* pinp = nodep->paramsp(); pinp; pinp = VN_AS(pinp->nextp(), Pin)) {
+            const auto it = byLower.find(VString::downcase(pinp->name()));
+            if (it != byLower.end()) pinp->name(it->second);
+        }
+    }
+
     AstNodeModule* findModuleSym(const string& modName, const string& libname) {
         // Given module and library to start search in, resolve using config library choices
         AstNodeModule* foundp;
@@ -298,7 +326,16 @@ class LinkCellsVisitor final : public VNVisitor {
         if (foundp) return foundp;
         // Then search global
         foundp = findModuleLibSym(modName, "__GLOBAL");
-        return foundp;
+        if (foundp) return foundp;
+        // A VHDL design unit's name is case insensitive and is held folded to
+        // lower case, so a Verilog instance of one may spell it any way
+        const std::string lower = VString::downcase(modName);
+        if (lower != modName) {
+            foundp = findModuleLibSym(lower, libname);
+            if (!foundp) foundp = findModuleLibSym(lower, "__GLOBAL");
+            if (foundp && foundp->fileline()->language().vhdl()) return foundp;
+        }
+        return nullptr;
     }
 
     AstNodeModule* resolveModule(AstNode* nodep, const string& modName, const string& libname) {
@@ -675,6 +712,11 @@ class LinkCellsVisitor final : public VNVisitor {
         }
         if (nodep->modp()) {
             nodep->modName(nodep->modp()->name());
+            // Where one language instantiates the other, the two spellings of
+            // a port or generic need not agree: VHDL identifiers are case
+            // insensitive and are held folded to lower case. Settle on the
+            // module's spelling here, before anything matches on the name.
+            matchNamesAcrossLanguages(nodep);
             // Note what pins exist
             std::unordered_set<string> ports;  // Symbol table of all connected port names
             for (AstPin* pinp = nodep->pinsp(); pinp; pinp = VN_AS(pinp->nextp(), Pin)) {

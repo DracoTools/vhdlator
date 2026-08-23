@@ -22,6 +22,7 @@ Verilator User's Guide
 
    verilating.rst
    connecting.rst
+   mixed-language.rst
    simulating.rst
    contributing.rst
    faq.rst

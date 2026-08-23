@@ -65,6 +65,49 @@ Verilator implements a full IEEE 1800-2023 compliant preprocessor,
 including triple-quoted strings, and \`ifdef expressions.
 
 
+VHDL 2008 (IEEE 1076-2008) Support
+----------------------------------
+
+Verilator reads VHDL as well as Verilog. Files with a :file:`.vhd` or
+:file:`.vhdl` extension are taken as VHDL, and :vlopt:`--vhdl-std` selects
+the revision that applies to them; the default is VHDL-2008.
+
+.. code-block:: bash
+
+     verilator --binary --timing counter.vhd --top counter
+
+Nothing else is needed to use the standard libraries. ``library std`` is
+always available, and a context or use clause naming a package of ``library
+ieee``, such as ``ieee.numeric_std``, causes Verilator to read the IEEE
+package it ships and whatever that package depends on. Pass
+:vlopt:`--no-std-vhdl` to supply your own copies instead.
+
+Supported are entities and architectures, packages and package bodies,
+context declarations, configurations, all the standard type classes
+(enumeration, integer, floating point, physical, array, record, access and
+file), subprograms with all four parameter classes, all the concurrent and
+sequential statements, blocks, ``for``/``if``/``case`` generate statements,
+component and direct entity instantiation, aliases, attributes, and the
+predefined libraries ``std.standard``, ``std.textio``, ``std.env``, and IEEE
+``std_logic_1164``, ``numeric_std``, ``numeric_bit``,
+``numeric_std_unsigned``, ``math_real`` and ``math_complex``.
+
+A VHDL design that suspends — a process with no sensitivity list, ``wait``
+in any of its forms, or an ``after`` delay — needs :vlopt:`--timing`, the
+same as the equivalent Verilog does. Synthesizable VHDL, where every process
+has a sensitivity list, does not.
+
+VHDL is not case sensitive, so a signal declared ``Count`` is the same
+signal as ``COUNT``. Verilator lowercases basic identifiers, and that is the
+spelling that appears in traces, in the generated C++, and to VPI. Extended
+identifiers, written between backslashes, keep their case and are distinct
+from every basic identifier.
+
+See :ref:`VHDL Limitations` for where the compiled model diverges from
+the LRM, and :doc:`mixed-language` for instantiating VHDL from Verilog and
+Verilog from VHDL.
+
+
 Verilog AMS Support
 -------------------
 
@@ -365,6 +408,51 @@ Coverage
 Verilator partially supports SystemVerilog functional coverage with
 ``covergroup``, ``coverpoint``, bins, cross coverage, and transition bins.
 See :ref:`Covergroup Coverage`.
+
+
+.. _VHDL Limitations:
+
+VHDL Limitations
+----------------
+
+Verilator compiles VHDL to a statically scheduled two-state model, the same
+one it compiles Verilog to. That is where the speed comes from, and it has
+consequences the LRM does not allow for. They are listed here so that a
+design that depends on one of them can be recognized as such.
+
+**Metavalues do not exist at run time.** The nine values of ``std_ulogic``
+are mapped when the model is built: ``'1'`` and ``'H'`` become 1, ``'0'``
+and ``'L'`` become 0, ``'Z'`` becomes Z, and ``'U'``, ``'W'`` and ``'-'``
+become X, which Verilator then eliminates exactly as it eliminates Verilog's
+X. So a comparison such as ``if s = 'U'`` is never true at run time, and an
+uninitialized signal reads as 0 rather than reporting ``'U'``. Use
+:vlopt:`--x-initial` ``unique`` for randomized initial state, which is the
+closest analogue of VHDL's ``'U'`` default. Metavalues in *static*
+expressions are exact, so a constant or generic comparison against ``'U'``
+folds correctly at compile time.
+
+**Inertial delay is not modelled.** An ``after`` clause lowers to a
+Verilog-style non-blocking delay, which is transport-like. VHDL's default
+inertial pulse rejection, and an explicit ``reject`` clause, do not remove
+short pulses.
+
+**The delta cycle count is not observable.** Verilator settles combinational
+logic in a converge loop rather than counting deltas. Ordering within a
+simulation time step follows VHDL's rule that a signal assignment takes
+effect at the end of the step, but no construct can observe how many delta
+cycles a step took.
+
+**Unconstrained values are sometimes slower.** Where the length of an
+unconstrained array is fixed at the call site — which is every call into
+``ieee.numeric_std`` in real code — the subprogram is specialized to that
+length and runs at the speed of hand-written Verilog. Where the length is
+not known until the value is computed, as for ``integer'image``, the value
+is carried dynamically instead. Both are correct; only the second allocates.
+
+**Arithmetic on a width not known until run time.** Verilator emits
+fixed-width operations, so arithmetic whose operand width is only known
+during execution is not available. This is reachable only by doing
+arithmetic on a value whose length came from a run-time computation.
 
 
 Encrypted Verilog
