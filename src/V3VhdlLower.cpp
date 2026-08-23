@@ -166,12 +166,41 @@ private:
             // Counted in the primary unit, which for TIME is femtoseconds
             return new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
                                      VNumRange{63, 0}, -1};
-        case VhdlTypeKind::ARRAY: return lowerArrayType(typep, flp);
+        case VhdlTypeKind::ARRAY:
+            // STRING is text, not a vector of characters: it is what LINE
+            // points at and what textio reads and writes (16.4)
+            if (isStringType(basep)) return new AstBasicDType{flp, VBasicDTypeKwd::STRING};
+            return lowerArrayType(typep, flp);
         case VhdlTypeKind::RECORD: return lowerRecordType(basep, flp);
+        case VhdlTypeKind::FILE:
+            // A file object is a descriptor, exactly as Verilog's is
+            return new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED};
+        case VhdlTypeKind::ACCESS:
+            // An access to STRING is a LINE, which is a string of its own.
+            // Other access types wait on the general dynamic-object work.
+            if (basep->designatedp() && isStringType(basep->designatedp()->base())) {
+                return new AstBasicDType{flp, VBasicDTypeKwd::STRING};
+            }
+            unsup(flp, "access type '" + basep->prettyName() + "'");
+            return newLogicDType(flp, 1);
         default:
             unsup(flp, "type '" + basep->prettyName() + "'");
             return newLogicDType(flp, 1);
         }
+    }
+
+    // A LINE is an access to STRING, which is how textio passes text about
+    static bool isLineType(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        return basep->kind() == VhdlTypeKind::ACCESS && basep->designatedp()
+               && isStringType(basep->designatedp()->base());
+    }
+
+    // Whether a type is STRING, or a subtype of it
+    static bool isStringType(const VhdlType* typep) {
+        const VhdlType* const strp = V3VhdlStd::stringType();
+        return typep && strp && typep->base() == strp->base();
     }
 
     static AstNodeDType* newLogicDType(FileLine* flp, int bits) {
@@ -352,7 +381,7 @@ private:
                 break;
             case VhdlObjKind::VARIABLE:
             case VhdlObjKind::SHARED_VARIABLE: varType = VVarType::VAR; break;
-            case VhdlObjKind::FILE: unsup(flp, "file object"); return;
+            case VhdlObjKind::FILE: varType = VVarType::VAR; break;
             }
             AstVar* const varp = newVar(symp, varType, flp);
             // A VHDL process variable keeps its value between activations, so
@@ -365,9 +394,15 @@ private:
             addStmt(varp);
             return;
         }
+        if (AstVhdlConfigSpec* const cfgp = VN_CAST(nodep, VhdlConfigSpec)) {
+            recordBinding(cfgp->specp(), cfgp->bindingp());
+            return;
+        }
         if (VN_IS(nodep, VhdlTypeDecl) || VN_IS(nodep, VhdlSubtypeDecl)
             || VN_IS(nodep, VhdlAttrDecl) || VN_IS(nodep, VhdlAttrSpec)
-            || VN_IS(nodep, VhdlComponentDecl) || VN_IS(nodep, VhdlContextItem)) {
+            || VN_IS(nodep, VhdlComponentDecl) || VN_IS(nodep, VhdlContextItem)
+            || VN_IS(nodep, VhdlDisconnectSpec) || VN_IS(nodep, VhdlGroupDecl)
+            || VN_IS(nodep, VhdlGroupTemplate)) {
             return;  // Nothing to emit: analysis already used these
         }
         if (VN_IS(nodep, VhdlAliasDecl)) return;  // Names, not storage
@@ -481,6 +516,11 @@ private:
             return new AstVarRef{flp, it->second, VAccess::READ};
         }
         if (symp->hasValue()) return lowerValue(symp->value(), symp->typep(), flp);
+        // OUTPUT and INPUT of std.textio are the standard streams (16.4)
+        if (symp->kind() == VhdlSymKind::FILE && symp->predefined()) {
+            if (symp->name() == "output") return new AstConst{flp, AstConst::Signed32{}, 1};
+            if (symp->name() == "input") return new AstConst{flp, AstConst::Signed32{}, 0};
+        }
         unsup(flp, std::string{symp->kindName()} + " '" + symp->name() + "'");
         return nullptr;
     }
@@ -891,6 +931,11 @@ private:
                                 AstVhdlCall* nodep, FileLine* flp) {
         const std::string& name = symp->name();
         VhdlType* const resultp = nodep->vhdlTypep();
+        // NOW is the current simulation time, which VHDL counts in the
+        // primary unit of TIME (16.3) and Verilator in the design's precision
+        if (name == "now" && args.empty()) {
+            return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
+        }
         if (args.empty()) return nullptr;
         AstNodeExpr* const firstp = lowerExpr(args[0]);
         if (!firstp) return nullptr;
@@ -1544,6 +1589,30 @@ private:
         return testp;
     }
 
+    // A configuration specification says which entity a component instance is
+    // to be built from (7.3), which is the same choice a configuration
+    // declaration makes, written inside the architecture instead.
+    void recordBinding(AstVhdlEntitySpec* specp, AstVhdlBinding* bindingp) {
+        if (!specp || !bindingp || !bindingp->unitp()) return;
+        std::vector<std::string> parts;
+        if (!flattenName(bindingp->unitp(), parts) || parts.empty()) return;
+        const std::string entity = parts.back();
+        if (specp->all() || specp->others()) {
+            // "for all : comp" and "for others : comp" name the component,
+            // which the specification's class carries
+            if (!specp->entityClass().empty()) m_bindings[specp->entityClass()] = entity;
+            return;
+        }
+        for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
+            if (const AstVhdlName* const namep = VN_CAST(p, VhdlName)) {
+                m_instanceBindings[namep->name()] = entity;
+            }
+        }
+        if (!specp->entityClass().empty()) m_bindings[specp->entityClass()] = entity;
+    }
+    std::map<std::string, std::string> m_bindings;  // Component -> entity
+    std::map<std::string, std::string> m_instanceBindings;  // Label -> entity
+
     // An instance binds to the entity of the same name, which is VHDL's
     // default binding rule (7.3.3)
     void lowerInstance(AstVhdlInstance* nodep) {
@@ -1553,7 +1622,17 @@ private:
             unsup(flp, "instantiated unit name");
             return;
         }
-        const std::string modName = parts.back();
+        std::string modName = parts.back();
+        // A configuration specification may have said which entity this
+        // component or instance is built from (7.3)
+        const std::string label = nodep->label();
+        const auto instIt = m_instanceBindings.find(label);
+        if (!label.empty() && instIt != m_instanceBindings.end()) {
+            modName = instIt->second;
+        } else {
+            const auto compIt = m_bindings.find(modName);
+            if (compIt != m_bindings.end()) modName = compIt->second;
+        }
         AstPin* pinsp = nullptr;
         int pinNum = 0;
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
@@ -1566,10 +1645,9 @@ private:
             AstPin* const pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++pinNum);
             if (pinp) paramsp = AstNode::addNext(paramsp, pinp);
         }
-        const std::string label
-            = nodep->label().empty() ? "__Vinst" + std::to_string(++m_processNum)
-                                     : nodep->label();
-        addStmt(new AstCell{flp, flp, label, modName, pinsp, paramsp, nullptr});
+        const std::string instName
+            = label.empty() ? "__Vinst" + std::to_string(++m_processNum) : label;
+        addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
     }
 
     AstPin* lowerAssoc(AstVhdlAssoc* nodep, int pinNum) {
@@ -1890,6 +1968,26 @@ private:
             && (symp->name() == "stop" || symp->name() == "finish")) {
             return new AstFinish{flp};
         }
+        if (symp) {
+            std::vector<AstNodeVhdlExpr*> args;
+            if (callp) {
+                for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+                    AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                    if (asp && asp->actualp()) args.push_back(asp->actualp());
+                }
+            }
+            // std_logic_1164 declares its own WRITE and HWRITE for the logic
+            // types, so a textio operation is recognised by what it operates
+            // on -- a LINE or a file -- as well as by being predefined
+            const bool textio
+                = symp->predefined()
+                  || (!args.empty() && args[0]->vhdlTypep()
+                      && (isLineType(args[0]->vhdlTypep())
+                          || args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::FILE));
+            if (textio) {
+                if (AstNode* const outp = lowerTextioProc(symp->name(), args, flp)) return outp;
+            }
+        }
         const auto it = symp ? m_funcs.find(symp) : m_funcs.end();
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
             unsup(flp, "procedure call to '"
@@ -1987,6 +2085,113 @@ private:
         // A bare "wait" suspends for good: the process never resumes, so
         // whatever follows it never runs again
         return new AstWait{flp, new AstConst{flp, AstConst::BitFalse{}}, nullptr};
+    }
+
+    // The procedures of std.textio and the implicit file operations (5.5.2,
+    // 16.4). A LINE is a string here, so building one is string concatenation
+    // and writing it is a formatted write -- neither needs a runtime object.
+    AstNode* lowerTextioProc(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
+                             FileLine* flp) {
+        if (name == "file_open") return lowerFileOpen(args, flp);
+        if (name == "file_close" && args.size() == 1) {
+            AstNodeExpr* const filep = lowerExpr(args[0]);
+            return filep ? new AstFClose{flp, filep} : nullptr;
+        }
+        if (name == "flush" && args.size() == 1) {
+            AstNodeExpr* const filep = lowerExpr(args[0]);
+            return filep ? new AstFFlush{flp, filep} : nullptr;
+        }
+        if (name == "readline" && args.size() == 2) {
+            // "readline(f, l)" fills the line buffer from the file
+            AstNodeExpr* const filep = lowerExpr(args[0]);
+            AstNodeExpr* const linep = lowerExpr(args[1]);
+            if (!filep || !linep) return nullptr;
+            return new AstAssign{flp, linep, new AstFGetS{flp, linep->cloneTree(false), filep}};
+        }
+        if (name == "writeline" || name == "tee") {
+            if (args.size() != 2) return nullptr;
+            AstNodeExpr* const filep = lowerExpr(args[0]);
+            AstNodeExpr* const linep = lowerExpr(args[1]);
+            if (!filep || !linep) return nullptr;
+            // Write the buffer, then empty it, as writeline does (16.4)
+            AstNode* const outp = new AstDisplay{flp, VDisplayType::DT_WRITE, "%s\n", filep,
+                                                 linep->cloneTree(false)};
+            return AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}}));
+        }
+        if (name == "deallocate" && args.size() == 1) {
+            AstNodeExpr* const linep = lowerExpr(args[0]);
+            if (!linep) return nullptr;
+            return new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}};
+        }
+        // WRITE and its radix forms append to the line buffer
+        std::string radix;
+        if (name == "write" || name == "swrite") {
+            radix = "";
+        } else if (name == "hwrite") {
+            radix = "%h";
+        } else if (name == "owrite") {
+            radix = "%o";
+        } else if (name == "bwrite") {
+            radix = "%b";
+        } else {
+            return nullptr;
+        }
+        if (args.size() < 2) return nullptr;
+        AstNodeExpr* const linep = lowerExpr(args[0]);
+        AstNodeExpr* const valuep = lowerExpr(args[1]);
+        if (!linep || !valuep) return nullptr;
+        const std::string format
+            = radix.empty() ? formatFor(args[1]->vhdlTypep()) : radix;
+        AstNodeExpr* textp = new AstSFormatF{flp, format, false, valuep};
+        // VHDL writes hexadecimal in upper case (16.4)
+        if (radix == "%h") textp = new AstToUpperN{flp, textp};
+        return new AstAssign{flp, linep,
+                             new AstConcatN{flp, linep->cloneTree(false), textp}};
+    }
+
+    // FILE_OPEN in both its forms (5.5.2). The open kind decides the mode,
+    // and the status form reports whether the file was there.
+    AstNode* lowerFileOpen(std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
+        size_t first = 0;
+        AstNodeVhdlExpr* statusp = nullptr;
+        if (args.size() >= 3 && args[0]->vhdlTypep()
+            && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::ENUM
+            && args[1]->vhdlTypep()
+            && args[1]->vhdlTypep()->base()->kind() == VhdlTypeKind::FILE) {
+            statusp = args[0];
+            first = 1;
+        }
+        if (args.size() < first + 2) return nullptr;
+        AstNodeExpr* const filep = lowerExpr(args[first]);
+        AstNodeExpr* const namep = lowerExpr(args[first + 1]);
+        if (!filep || !namep) return nullptr;
+        // READ_MODE, WRITE_MODE, APPEND_MODE (16.3)
+        std::string mode = "r";
+        if (args.size() > first + 2) {
+            const VhdlValue kind = V3VhdlEval::eval(args[first + 2]);
+            if (kind.isInt()) mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
+        }
+        AstNode* outp = new AstAssign{
+            flp, filep,
+            new AstFOpen{flp, namep, new AstConst{flp, AstConst::String{}, mode}}};
+        if (statusp) {
+            // OPEN_OK is zero, NAME_ERROR the second value (16.3)
+            AstNodeExpr* const statusRefp = lowerExpr(statusp);
+            if (statusRefp) {
+                outp = AstNode::addNext(
+                    outp,
+                    static_cast<AstNode*>(new AstAssign{
+                        flp, statusRefp,
+                        new AstCond{flp,
+                                    new AstNeq{flp, filep->cloneTree(false),
+                                               new AstConst{flp, AstConst::Signed32{}, 0}},
+                                    new AstConst{flp, AstConst::WidthedValue{}, 2, 0},
+                                    new AstConst{flp, AstConst::WidthedValue{}, 2, 1}}}));
+            }
+        }
+        return outp;
     }
 
     // "assert c report m severity s" is a check plus a message (10.3)
@@ -2236,6 +2441,8 @@ private:
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_funcs.clear();
+        m_bindings.clear();
+        m_instanceBindings.clear();
         m_prefix.clear();
         m_stmtsp = nullptr;
         m_processNum = 0;
