@@ -1,0 +1,10 @@
+// DESCRIPTION: Verilator: Verilog Test module
+//
+// This file ONLY is placed under the Creative Commons Public Domain.
+// SPDX-FileCopyrightText: 2026 Wilson Snyder
+// SPDX-License-Identifier: CC0-1.0
+
+`verilator_config
+
+vhdl_export -module "t_vhdl_export" -function "vhdl_square"
+vhdl_export -module "t_vhdl_export" -task "vhdl_minmax"

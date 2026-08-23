@@ -92,8 +92,8 @@ predefined libraries ``std.standard``, ``std.textio``, ``std.env``, and IEEE
 ``std_logic_1164``, ``numeric_std``, ``numeric_bit``,
 ``numeric_std_unsigned``, ``math_real`` and ``math_complex``.
 
-A VHDL design that suspends — a process with no sensitivity list, ``wait``
-in any of its forms, or an ``after`` delay — needs :vlopt:`--timing`, the
+A VHDL design that suspends -- a process with no sensitivity list, ``wait``
+in any of its forms, or an ``after`` delay -- needs :vlopt:`--timing`, the
 same as the equivalent Verilog does. Synthesizable VHDL, where every process
 has a sensitivity list, does not.
 
@@ -443,8 +443,8 @@ effect at the end of the step, but no construct can observe how many delta
 cycles a step took.
 
 **Unconstrained values are sometimes slower.** Where the length of an
-unconstrained array is fixed at the call site — which is every call into
-``ieee.numeric_std`` in real code — the subprogram is specialized to that
+unconstrained array is fixed at the call site -- which is every call into
+``ieee.numeric_std`` in real code -- the subprogram is specialized to that
 length and runs at the speed of hand-written Verilog. Where the length is
 not known until the value is computed, as for ``integer'image``, the value
 is carried dynamically instead. Both are correct; only the second allocates.

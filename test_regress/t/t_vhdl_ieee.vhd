@@ -19,25 +19,32 @@ entity t_vhdl_ieee is
         rst  : in  std_logic;
         en   : in  std_logic;
         q    : out std_logic_vector(7 downto 0);
-        odd  : out std_logic);
+        odd  : out std_logic;
+        acc  : out integer);
 end entity;
 
 architecture rtl of t_vhdl_ieee is
   signal c : unsigned(7 downto 0);
+  -- to_integer returns an INTEGER, so this must be able to run past 255;
+  -- if the conversion kept the vector's width the sum would wrap at 8 bits
+  signal a : integer := 0;
 begin
 
   process (clk, rst) is
   begin
     if rst = '1' then
       c <= (others => '0');
+      a <= 0;
     elsif rising_edge(clk) then
       if en = '1' then
         c <= c + 1;
+        a <= a + to_integer(c);
       end if;
     end if;
   end process;
 
   q   <= std_logic_vector(c);
   odd <= c(0);
+  acc <= a;
 
 end architecture;

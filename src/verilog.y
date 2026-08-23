@@ -266,6 +266,7 @@ BISONPRE_VERSION(3.7,%define api.header.include {"V3ParseBison.h"})
 %token<fl>              yVLT_TRACING_OFF            "tracing_off"
 %token<fl>              yVLT_TRACING_ON             "tracing_on"
 %token<fl>              yVLT_VERILATOR_LIB          "verilator_lib"
+%token<fl>              yVLT_VHDL_EXPORT            "vhdl_export"
 
 %token<fl>              yVLT_D_BLOCK    "--block"
 %token<fl>              yVLT_D_CONTENTS "--contents"
@@ -8487,6 +8488,8 @@ vltItem:
                         { V3Control::addFsmRegisterWrapper($<fl>1, *$2, *$3, *$4, *$5, *$6, *$7); }
         |       yVLT_VERILATOR_LIB vltDModule
                         { V3Control::addModulePragma(*$2, VPragmaType::VERILATOR_LIB); }
+        |       yVLT_VHDL_EXPORT vltDModuleE vltDFTaskE
+                        { V3Control::addVhdlExport($<fl>1, *$2, *$3); v3Global.dpi(true); }
         ;
 
 vltOffFront<errcodeen>:

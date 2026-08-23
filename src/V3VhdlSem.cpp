@@ -39,6 +39,7 @@
 #include "V3VhdlSym.h"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <string>
 #include <utility>
@@ -712,6 +713,9 @@ private:
     void visit(AstVhdlComponentDecl* nodep) override;
     void visit(AstVhdlAliasDecl* nodep) override;
     void visit(AstVhdlAttrDecl* nodep) override;
+    void visit(AstVhdlAttrSpec* nodep) override;
+    bool parseForeign(const std::string& text, FileLine* flp, std::string& cnamer,
+                      bool& dpir);
     void visit(AstVhdlContextItem* nodep) override;
     // Regions
     void visit(AstVhdlProcess* nodep) override;
@@ -1056,6 +1060,119 @@ void VhdlSemVisitor::visit(AstVhdlAttrDecl* nodep) {
     symp->typep(resolveTypeMark(nodep->typeMarkp()));
     nodep->vhdlSymp(symp);
     declare(symp, nodep->fileline());
+}
+
+// An attribute specification gives an attribute a value for named entities
+// (7.2). Most attributes are of interest only to the tool that defined them
+// and are carried no further, but FOREIGN is the language's own way of saying
+// that a subprogram is implemented outside VHDL (16.2), so it is acted on.
+void VhdlSemVisitor::visit(AstVhdlAttrSpec* nodep) {
+    iterateAndNextNull(nodep->valuep());
+    if (nodep->name() != "foreign") return;
+    AstVhdlEntitySpec* const specp = nodep->specp();
+    if (!specp) return;
+    const std::string cls = specp->entityClass();
+    if (cls == "architecture") {
+        nodep->v3warn(E_UNSUPPORTED,
+                      "Unsupported: FOREIGN attribute on an architecture; only a subprogram "
+                      "may be implemented outside VHDL here");
+        return;
+    }
+    if (cls != "function" && cls != "procedure") {
+        err(nodep->fileline(),
+            "The FOREIGN attribute may only be given to a function or a procedure");
+        return;
+    }
+    const VhdlValue val = V3VhdlEval::eval(nodep->valuep());
+    if (!val.isStr()) {
+        err(nodep->fileline(), "The FOREIGN attribute's value must be a static string");
+        return;
+    }
+    if (specp->others() || specp->all()) {
+        err(nodep->fileline(), "The FOREIGN attribute must name the subprogram it applies to, "
+                               "since each one binds to a C symbol of its own");
+        return;
+    }
+    std::string cname;
+    bool dpi = false;
+    if (!parseForeign(val.toStr(), nodep->fileline(), cname, dpi)) return;
+    const VhdlSymKind want
+        = cls == "function" ? VhdlSymKind::FUNCTION : VhdlSymKind::PROCEDURE;
+    for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
+        AstNodeVhdlExpr* const namep = VN_AS(p, NodeVhdlExpr);
+        std::vector<std::string> parts;
+        if (!flatten(namep, parts) || parts.size() != 1) {
+            err(namep->fileline(), "The FOREIGN attribute names a subprogram declared here");
+            continue;
+        }
+        std::vector<VhdlSymbol*> found;
+        lookup(parts[0], found);
+        int marked = 0;
+        for (VhdlSymbol* const symp : found) {
+            VhdlSymbol* const realp = symp->resolved();
+            if (realp->kind() != want) continue;
+            realp->foreignName(cname);
+            realp->foreignDpi(dpi);
+            ++marked;
+        }
+        if (!marked) {
+            err(namep->fileline(),
+                "Cannot find the " + cls + " '" + parts[0] + "' the FOREIGN attribute names");
+        } else if (marked > 1) {
+            err(namep->fileline(), "'" + parts[0]
+                                       + "' is overloaded, so the FOREIGN attribute cannot say "
+                                         "which declaration it applies to");
+        }
+        v3Global.dpi(true);
+    }
+}
+
+// The content of a FOREIGN string is implementation defined (16.2). Accepted
+// are GHDL's convention, so that source written for it needs no change, and an
+// explicit "DPI-C" form that shares one C model with a SystemVerilog
+// testbench. A bare symbol name is taken as VHPIDIRECT.
+bool VhdlSemVisitor::parseForeign(const std::string& text, FileLine* flp, std::string& cnamer,
+                                  bool& dpir) {
+    std::vector<std::string> words;
+    std::string word;
+    for (const char c : text) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!word.empty()) words.push_back(word);
+            word.clear();
+        } else {
+            word += c;
+        }
+    }
+    if (!word.empty()) words.push_back(word);
+    if (words.empty()) {
+        err(flp, "The FOREIGN attribute's value is empty");
+        return false;
+    }
+    std::string kind = words[0];
+    for (char& c : kind) c = std::toupper(static_cast<unsigned char>(c));
+    size_t first = 1;
+    if (kind == "VHPIDIRECT") {
+        dpir = false;
+    } else if (kind == "DPI-C" || kind == "DPI") {
+        dpir = true;
+    } else {
+        // A bare name, which GHDL also accepts
+        dpir = false;
+        first = 0;
+    }
+    // GHDL allows "VHPIDIRECT <library> <symbol>". Verilator links statically,
+    // so the library name has nothing to name and is ignored.
+    if (words.size() - first > 2) {
+        err(flp, "The FOREIGN attribute's value has more words than 'VHPIDIRECT [library] "
+                 "symbol'");
+        return false;
+    }
+    if (words.size() == first) {
+        err(flp, "The FOREIGN attribute's value names no C symbol");
+        return false;
+    }
+    cnamer = words.back();
+    return true;
 }
 
 //######################################################################

@@ -119,8 +119,8 @@ and its port ``q``:
      Counter u3 (.q(x));
 
 Inside the generated model, the C++ identifier and the trace name for a VHDL
-object are its lowercased spelling. A VHDL extended identifier — written
-between backslashes, as in ``\My Signal\`` — keeps its case and is a
+object are its lowercased spelling. A VHDL extended identifier -- written
+between backslashes, as in ``\My Signal\`` -- keeps its case and is a
 distinct name; the usual signal-name escaping described under
 :ref:`language limitations` then applies to any character C++ cannot take.
 
@@ -199,7 +199,8 @@ mixed design:
 
      import "DPI-C" function int c_popcount(input int v);
 
-Both resolve to the C symbol ``c_popcount`` linked into the model.
+Both resolve to the C symbol ``c_popcount`` linked into the model. See
+:doc:`connecting-vhdl` for the details of the foreign interface.
 
 
 Limitations

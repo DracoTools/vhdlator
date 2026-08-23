@@ -163,6 +163,7 @@ vnum    {vnum1}|{vnum2}|{vnum3}|{vnum4}|{vnum5}
   "tracing_off"         { FL; return yVLT_TRACING_OFF; }
   "tracing_on"          { FL; return yVLT_TRACING_ON; }
   "verilator_lib"       { FL; return yVLT_VERILATOR_LIB; }
+  "vhdl_export"         { FL; return yVLT_VHDL_EXPORT; }
 
   -?"-block"            { FL; return yVLT_D_BLOCK; }
   -?"-contents"         { FL; return yVLT_D_CONTENTS; }

@@ -184,6 +184,7 @@ class V3ControlFTask final {
     V3ControlVarResolver m_vars;  // Variables in function/task
     bool m_noinline = false;  // Don't inline function/task
     bool m_public = false;  // Public function/task
+    bool m_vhdlExport = false;  // Callable from C over the DPI ABI
 
 public:
     V3ControlFTask() = default;
@@ -191,6 +192,7 @@ public:
         // Don't overwrite true with false
         if (f.m_noinline) m_noinline = true;
         if (f.m_public) m_public = true;
+        if (f.m_vhdlExport) m_vhdlExport = true;
         m_params.update(f.m_params);
         m_ports.update(f.m_ports);
         m_vars.update(f.m_vars);
@@ -203,12 +205,20 @@ public:
 
     void setNoInline(bool set) { m_noinline = set; }
     void setPublic(bool set) { m_public = set; }
+    void setVhdlExport(bool set) { m_vhdlExport = set; }
 
     void apply(AstNodeFTask* ftaskp) const {
         if (m_noinline)
             ftaskp->addStmtsp(new AstPragma{ftaskp->fileline(), VPragmaType::NO_INLINE_TASK});
         if (m_public)
             ftaskp->addStmtsp(new AstPragma{ftaskp->fileline(), VPragmaType::PUBLIC_TASK});
+        if (m_vhdlExport && !ftaskp->dpiExport()) {
+            // The same node an "export \"DPI-C\"" declaration would have
+            // marked. VHDL has no syntax of its own for this, so it is said in
+            // the control file and the VHDL stays portable to other tools.
+            ftaskp->dpiExport(true);
+            ftaskp->cname(ftaskp->name());
+        }
     }
 };
 
@@ -931,6 +941,14 @@ void V3Control::addInline(FileLine* fl, const string& module, const string& ftas
             V3ControlResolver::s().modules().at(module).ftasks().at(ftask).setNoInline(on);
         }
     }
+}
+
+void V3Control::addVhdlExport(FileLine* fl, const string& module, const string& ftask) {
+    if (ftask.empty()) {
+        fl->v3error("vhdl_export requires -function or -task naming the subprogram to export");
+        return;
+    }
+    V3ControlResolver::s().modules().at(module).ftasks().at(ftask).setVhdlExport(true);
 }
 
 void V3Control::addModulePragma(const string& module, VPragmaType pragma) {

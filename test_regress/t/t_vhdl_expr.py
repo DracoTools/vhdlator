@@ -12,10 +12,9 @@ import vltest_bootstrap
 test.scenarios('linter')
 
 # Every expression here has exactly one interpretation once the context is
-# taken into account, so analysis must report nothing beyond the placeholder
-# that says lowering is still to come.
+# taken into account, so analysis must report nothing at all.
 test.top_filename = "t/t_vhdl_expr.vhd"
 
-test.lint(fails=True, expect_filename=test.golden_filename)
+test.lint()
 
 test.passes()

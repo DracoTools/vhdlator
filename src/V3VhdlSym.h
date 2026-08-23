@@ -108,6 +108,10 @@ class VhdlSymbol final {
     VhdlValue m_value;
     bool m_deferred = false;  // A deferred constant, whose value is in the body
     VhdlSymbol* m_aliasp = nullptr;  // What an alias denotes (6.6)
+    // A subprogram given the FOREIGN attribute (16.2) binds to a C symbol
+    // instead of having a body here. The string says which, and which ABI.
+    std::string m_foreignName;
+    bool m_foreignDpi = false;  // Bound with the DPI-C ABI, not VHPIDIRECT
     AstVhdlSubprogDecl* m_bodyp = nullptr;  // A subprogram's body, for copying
 
     VL_UNCOPYABLE(VhdlSymbol);
@@ -139,6 +143,12 @@ public:
 
     AstVhdlSubprogDecl* bodyp() const { return m_bodyp; }
     void bodyp(AstVhdlSubprogDecl* nodep) { m_bodyp = nodep; }
+
+    const std::string& foreignName() const { return m_foreignName; }
+    void foreignName(const std::string& name) { m_foreignName = name; }
+    bool isForeign() const { return !m_foreignName.empty(); }
+    bool foreignDpi() const { return m_foreignDpi; }
+    void foreignDpi(bool flag) { m_foreignDpi = flag; }
 
     VhdlSymbol* aliasp() const { return m_aliasp; }
     void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }

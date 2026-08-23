@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -100,6 +101,7 @@ class VhdlLowerVisitor final {
     AstNode* m_stmtsp = nullptr;
     AstNodeFTask* m_ftaskp = nullptr;  // Subprogram being built, if any
     std::map<const VhdlSymbol*, AstNodeFTask*> m_funcs;  // Subprogram -> what it became
+    std::set<const VhdlSymbol*> m_emitting;  // Subprograms being emitted, to stop recursion
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::string m_prefix;  // Name prefix for declarations inside a process
@@ -158,7 +160,10 @@ private:
             return newLogicDType(flp, bitsFor(basep->literals().size()));
         case VhdlTypeKind::INTEGER:
         case VhdlTypeKind::UNIVERSAL_INTEGER:
-            return new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED};
+            // Verilog's "integer" is four-state and VHDL's has no metavalues
+            // at all, so "int" is the closer of the two -- and it is the type
+            // DPI can carry across to C
+            return new AstBasicDType{flp, VBasicDTypeKwd::INT, VSigning::SIGNED};
         case VhdlTypeKind::FLOATING:
         case VhdlTypeKind::UNIVERSAL_REAL:
             return new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE};
@@ -522,7 +527,8 @@ private:
             if (symp->name() == "now") {
                 return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
             }
-            const auto funcIt = m_funcs.find(symp);
+            auto funcIt = m_funcs.find(symp);
+            if (funcIt == m_funcs.end() && emitOnDemand(symp)) funcIt = m_funcs.find(symp);
             if (funcIt != m_funcs.end() && VN_IS(funcIt->second, Func)) {
                 AstFuncRef* const refp = new AstFuncRef{flp, funcIt->second->name(), nullptr};
                 refp->taskp(funcIt->second);
@@ -912,6 +918,41 @@ private:
         return valuep;
     }
 
+    // A subprogram declared in a package is not emitted with the package --
+    // a package holds no state of its own here -- so the first call to one
+    // emits it into the module that calls it, and later calls find it. The
+    // same path serves a subprogram declared in an enclosing region that has
+    // not been reached yet.
+    AstNodeFTask* emitOnDemand(VhdlSymbol* symp) {
+        if (!symp) return nullptr;
+        AstVhdlSubprogDecl* declp = symp->bodyp();
+        if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        if (!declp) return nullptr;
+        if (m_emitting.count(symp)) return nullptr;  // A recursive call, mid-emission
+        m_emitting.insert(symp);
+        {
+            VL_RESTORER(m_ftaskp);
+            VL_RESTORER_COPY(m_prefix);
+            m_ftaskp = nullptr;
+            m_prefix.clear();
+            lowerSubprogram(declp);
+        }
+        m_emitting.erase(symp);
+        auto it = m_funcs.find(symp);
+        if (it != m_funcs.end()) return it->second;
+        // The body may carry a symbol of its own; the call's symbol is what
+        // later lookups use, so record it under that too
+        VhdlSymbol* const bodySymp = declp->vhdlSymp();
+        if (bodySymp && bodySymp != symp) {
+            it = m_funcs.find(bodySymp);
+            if (it != m_funcs.end()) {
+                m_funcs.emplace(symp, it->second);
+                return it->second;
+            }
+        }
+        return nullptr;
+    }
+
     AstNodeExpr* lowerFuncCall(AstVhdlCall* nodep, FileLine* flp) {
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (!symp) {
@@ -924,7 +965,8 @@ private:
             if (asp && asp->actualp()) args.push_back(asp->actualp());
         }
         if (AstNodeExpr* const outp = lowerIntrinsic(symp, args, nodep, flp)) return outp;
-        const auto it = m_funcs.find(symp);
+        auto it = m_funcs.find(symp);
+        if (it == m_funcs.end() && emitOnDemand(symp)) it = m_funcs.find(symp);
         if (it != m_funcs.end() && VN_IS(it->second, Func)) {
             AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
             refp->taskp(it->second);
@@ -954,9 +996,17 @@ private:
         if (!firstp) return nullptr;
 
         if (name == "to_integer") {
-            return isSignedType(args[0]->vhdlTypep())
-                       ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
-                       : static_cast<AstNodeExpr*>(new AstUnsigned{flp, firstp});
+            // The operand's bits, read with its own signedness ...
+            AstNodeExpr* const valuep
+                = isSignedType(args[0]->vhdlTypep())
+                      ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
+                      : static_cast<AstNodeExpr*>(new AstUnsigned{flp, firstp});
+            // ... widened to INTEGER, which is what the function returns.
+            // Leaving it at the operand's width instead would make an
+            // ordinary "acc + to_integer(v)" add two different widths.
+            AstNodeExpr* const widep = new AstCastSize{
+                flp, valuep, new AstConst{flp, AstConst::Unsized32{}, VL_IDATASIZE}};
+            return new AstSigned{flp, widep};
         }
         if (name == "to_unsigned" || name == "to_signed" || name == "resize") {
             if (args.size() < 2) return nullptr;
@@ -2143,7 +2193,8 @@ private:
                 if (AstNode* const outp = lowerTextioProc(symp->name(), args, flp)) return outp;
             }
         }
-        const auto it = symp ? m_funcs.find(symp) : m_funcs.end();
+        auto it = symp ? m_funcs.find(symp) : m_funcs.end();
+        if (it == m_funcs.end() && symp && emitOnDemand(symp)) it = m_funcs.find(symp);
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
             unsup(flp, "procedure call to '"
                            + (symp ? symp->name() : std::string{"<name>"}) + "'");
@@ -2460,8 +2511,12 @@ private:
         FileLine* const flp = nodep->fileline();
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (!symp) return;
-        if (!nodep->hasBody()) return;  // A declaration alone emits nothing
         if (m_funcs.count(symp)) return;  // Its declaration already made one
+        if (symp->isForeign()) {
+            lowerForeignSubprogram(nodep, symp);
+            return;
+        }
+        if (!nodep->hasBody()) return;  // A declaration alone emits nothing
         // A subprogram with an unconstrained parameter is a template: each
         // call site got a copy with the lengths it supplies, and only those
         // copies are emitted. Emitting the template as well would mean
@@ -2477,8 +2532,7 @@ private:
         AstNodeFTask* ftaskp = nullptr;
         if (nodep->isFunction()) {
             AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
-            funcp->fvarp(new AstVar{flp, VVarType::PORT, name, VFlagChildDType{},
-                                    lowerType(returnType(nodep, symp), flp)});
+            funcp->fvarp(newReturnVar(name, lowerType(returnType(nodep, symp), flp), flp));
             ftaskp = funcp;
         } else {
             ftaskp = new AstTask{flp, name, nullptr};
@@ -2511,6 +2565,89 @@ private:
         for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
         m_ftaskp = nullptr;  // The task itself belongs to the module
+        addStmt(ftaskp);
+    }
+
+    // The variable a function's result comes back in. V3LinkDot makes one for
+    // Verilog, from the return type the parser left on the node; here the type
+    // is already known, so the variable is made outright and must carry the
+    // same marks V3LinkDot would have given it.
+    static AstVar* newReturnVar(const std::string& name, AstNodeDType* dtypep, FileLine* flp) {
+        AstVar* const varp
+            = new AstVar{flp, VVarType::PORT, name, VFlagChildDType{}, dtypep};
+        varp->direction(VDirection::OUTPUT);
+        varp->declDirection(VDirection::OUTPUT);
+        varp->funcLocal(true);
+        varp->funcReturn(true);
+        varp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        varp->trace(false);  // Not user visible
+        return varp;
+    }
+
+    // A subprogram given the FOREIGN attribute (16.2) is implemented in C. It
+    // becomes exactly the node an "import \"DPI-C\"" declaration produces, so
+    // V3Task generates the same wrapper, does the same marshalling, and writes
+    // the same __Dpi.h entry -- and one C function can serve a VHDL and a
+    // SystemVerilog testbench in one model. Verilator links statically, so
+    // there is no dlopen and the C++ compiler can inline across the boundary.
+    void lowerForeignSubprogram(AstVhdlSubprogDecl* nodep, VhdlSymbol* symp) {
+        FileLine* const flp = nodep->fileline();
+        if (nodep->hasBody()) {
+            flp->v3error("Subprogram '" + symp->name()
+                         + "' has the FOREIGN attribute, so it must not also have a body");
+            return;
+        }
+        // The C name is what the FOREIGN string said; the VHDL name may be
+        // spelled differently and may be overloaded
+        const std::string name = uniqueName(symp);
+        AstNodeFTask* ftaskp = nullptr;
+        if (nodep->isFunction()) {
+            AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+            VhdlType* const retp = symp->returnTypep();
+            if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
+                && !retp->isConstrainedArray()) {
+                flp->v3error("A foreign function must return a constrained type, as C has no "
+                             "way to say how long the result is");
+                VL_DO_DANGLING(funcp->deleteTree(), funcp);
+                return;
+            }
+            funcp->fvarp(newReturnVar(name, lowerType(retp, flp), flp));
+            ftaskp = funcp;
+        } else {
+            // Not dpiTask: that makes the C function return the int a
+            // SystemVerilog task uses to say it was disabled. A VHDL
+            // procedure cannot be disabled, and both GHDL's VHPIDIRECT and a
+            // SystemVerilog "function void" give a void C function, which is
+            // what lets one C model serve both languages.
+            ftaskp = new AstTask{flp, name, nullptr};
+        }
+        ftaskp->dpiImport(true);
+        ftaskp->cname(symp->foreignName());
+        ftaskp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        for (AstNode* p = nodep->paramsp(); p; p = p->nextp()) {
+            AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            VhdlSymbol* const psymp = ifp->vhdlSymp();
+            if (!psymp) continue;
+            if (psymp->typep() && psymp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                && !psymp->typep()->isConstrainedArray()) {
+                ifp->v3warn(E_UNSUPPORTED, "Unsupported: unconstrained parameter '" + ifp->name()
+                                               + "' of a foreign subprogram");
+                continue;
+            }
+            AstVar* const varp = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
+                                            lowerType(psymp->typep(), flp)};
+            switch (ifp->mode()) {
+            case VhdlMode::OUT: varp->direction(VDirection::OUTPUT); break;
+            case VhdlMode::INOUT:
+            case VhdlMode::BUFFER: varp->direction(VDirection::INOUT); break;
+            default: varp->direction(VDirection::INPUT); break;
+            }
+            varp->declDirection(varp->direction());
+            varp->funcLocal(true);
+            m_vars.emplace(psymp, varp);
+            ftaskp->addStmtsp(varp);
+        }
+        m_funcs.emplace(symp, ftaskp);
         addStmt(ftaskp);
     }
 
@@ -2596,6 +2733,7 @@ private:
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_funcs.clear();
+        m_emitting.clear();
         m_bindings.clear();
         m_instanceBindings.clear();
         m_prefix.clear();

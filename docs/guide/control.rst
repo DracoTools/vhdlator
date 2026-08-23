@@ -372,3 +372,18 @@ The grammar of control commands is as follows:
    Internal use only. Marks the specified module as being a stub for a library
    created by :vlopt:`--lib-create` (including when created with
    :vlopt:`--hierarchical`). Required for special internal processing.
+
+.. option:: vhdl_export -module "<modulename>" (-function | -task) "<name>"
+
+   Makes a VHDL subprogram callable from C, in the way an ``export "DPI-C"``
+   declaration does for SystemVerilog. VHDL has no syntax of its own for
+   saying this, so it is said here and the VHDL source stays portable to
+   other tools.
+
+   ``-function`` names a VHDL function and ``-task`` a VHDL procedure. The C
+   symbol is the subprogram's name, lowercased as VHDL spells it. An
+   overloaded subprogram cannot be exported, since the C name would not say
+   which of them was meant.
+
+   The C side calls ``svSetScope`` first, to say which instance of the
+   design the call runs in. See :doc:`connecting-vhdl`.

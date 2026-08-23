@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_export_bad.vlt:10:1: vhdl_export requires -function or -task naming the subprogram to export
+   10 | vhdl_export -module "t_vhdl_export_bad"
+      | ^~~~~~~~~~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

@@ -22,7 +22,9 @@ int main(int argc, char** argv) {
     topp->eval();
     topp->rst = 0;
 
+    unsigned expectAcc = 0;
     for (int cycle = 1; cycle <= 300; ++cycle) {
+        expectAcc += (cycle - 1) & 0xff;  // the value c held before this edge
         topp->clk = 1;
         topp->eval();
         topp->clk = 0;
@@ -37,6 +39,14 @@ int main(int argc, char** argv) {
         }
         if (topp->odd != (want & 1)) {
             if (errors < 5) printf("%%Error: cycle %d: odd bit is wrong\n", cycle);
+            ++errors;
+        }
+        // to_integer gives an INTEGER, so the sum runs well past 255
+        if (topp->acc != static_cast<int>(expectAcc)) {
+            if (errors < 5) {
+                printf("%%Error: cycle %d: acc is %d, expected %d\n", cycle, (int)topp->acc,
+                       (int)expectAcc);
+            }
             ++errors;
         }
     }

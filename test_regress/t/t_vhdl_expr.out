@@ -1,6 +1,0 @@
-%Error: t/t_vhdl_expr.vhd:67:11: Unsupported: VHDL call to 'f' cannot be lowered yet
-        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_expr.vhd:68:12: Unsupported: VHDL call to 'f' cannot be lowered yet
-%Error: t/t_vhdl_expr.vhd:70:10: Unsupported: VHDL function 'g' cannot be lowered yet
-%Error: t/t_vhdl_expr.vhd:71:11: Unsupported: VHDL function 'g' cannot be lowered yet
-%Error: Exiting due to
