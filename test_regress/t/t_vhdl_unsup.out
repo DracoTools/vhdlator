@@ -1,6 +1,4 @@
 %Error: t/t_vhdl_unsup.vhd:18:8: Unsupported: VHDL file object cannot be lowered yet
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_unsup.vhd:23:12: Unsupported: VHDL process with no sensitivity list cannot be lowered yet
-%Error: t/t_vhdl_unsup.vhd:26:5: Unsupported: VHDL wait statement cannot be lowered yet
 %Error: t/t_vhdl_unsup.vhd:30:10: Unsupported: VHDL rotate operator cannot be lowered yet
 %Error: Exiting due to

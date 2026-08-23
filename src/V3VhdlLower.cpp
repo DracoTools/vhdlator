@@ -966,8 +966,11 @@ private:
     AstNodeExpr* lowerAggregate(AstVhdlAggregate* nodep) {
         FileLine* const flp = nodep->fileline();
         VhdlType* const typep = nodep->vhdlTypep();
+        if (typep && typep->base()->kind() == VhdlTypeKind::RECORD) {
+            return lowerRecordAggregate(nodep, typep, flp);
+        }
         if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
-            || !typep->isConstrainedArray() || typep->dimensions() != 1) {
+            || !typep->isConstrainedArray()) {
             unsup(flp, "aggregate of this type");
             return nullptr;
         }
@@ -1040,6 +1043,55 @@ private:
             outp = outp ? new AstConcat{flp, outp, elemp} : elemp;
         }
         (void)right;
+        return outp;
+    }
+
+    // A record aggregate lays its elements out in declaration order, which is
+    // how the packed structure it lowers to is laid out (9.3.3.2)
+    AstNodeExpr* lowerRecordAggregate(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp) {
+        const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
+        if (elems.empty()) {
+            unsup(flp, "aggregate of an empty record");
+            return nullptr;
+        }
+        std::vector<AstNodeVhdlExpr*> byElem(elems.size(), nullptr);
+        AstNodeVhdlExpr* othersp = nullptr;
+        size_t position = 0;
+        for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
+            AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+            if (!eap->choicesp()) {
+                if (position < byElem.size()) byElem[position] = eap->valuep();
+                ++position;
+                continue;
+            }
+            for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+                AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                if (chp->isOthers()) {
+                    othersp = eap->valuep();
+                    continue;
+                }
+                const AstVhdlName* const namep = VN_CAST(chp->valuep(), VhdlName);
+                if (!namep) {
+                    unsup(chp->fileline(), "record aggregate choice");
+                    return nullptr;
+                }
+                for (size_t i = 0; i < elems.size(); ++i) {
+                    if (elems[i]->name() == namep->name()) byElem[i] = eap->valuep();
+                }
+            }
+        }
+        // The first element is the most significant, as the structure packs
+        AstNodeExpr* outp = nullptr;
+        for (size_t i = 0; i < elems.size(); ++i) {
+            AstNodeVhdlExpr* const valuep = byElem[i] ? byElem[i] : othersp;
+            if (!valuep) {
+                unsup(flp, "record aggregate with element '" + elems[i]->name() + "' unset");
+                return nullptr;
+            }
+            AstNodeExpr* const memberp = lowerExpr(valuep);
+            if (!memberp) return nullptr;
+            outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
+        }
         return outp;
     }
 
@@ -1150,7 +1202,8 @@ private:
                 addStmt(new AstInitial{flp, lowerStmts(nodep->stmtsp())});
             }
         }
-        if (!sentreep) return;  // Already reported
+        if (!sentreep && nodep->hasSensList()) return;  // Already reported
+        if (!sentreep && !bodyp) return;
         addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, sentreep, bodyp});
     }
 
@@ -1229,10 +1282,15 @@ private:
     AstSenTree* sensitivity(AstVhdlProcess* nodep) {
         FileLine* const flp = nodep->fileline();
         if (!nodep->hasSensList()) {
-            // A process with no list runs until it waits, which needs the
-            // suspendable-process support of --timing
-            unsup(flp, "process with no sensitivity list");
-            return nullptr;
+            // A process with no list runs its statements over and over,
+            // suspending only where it waits (11.3). That is Verilog's
+            // "always" with no event control, which needs the suspendable
+            // processes of --timing.
+            if (!v3Global.opt.timing().isTrue()) {
+                unsup(flp, "process that waits without --timing");
+                return nullptr;
+            }
+            return nullptr;  // No sensitivity: the waits inside do the work
         }
         if (nodep->sensAll() || !nodep->sensp()) {
             return new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Combo{}}};
@@ -1365,8 +1423,12 @@ private:
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
         if (!lhsp) return;
         AstNodeExpr* rhsp = nullptr;
+        AstNode* delayp = nullptr;
         switch (nodep->kind()) {
-        case VhdlAssignKind::SIMPLE: rhsp = waveformValue(nodep->wavesp()); break;
+        case VhdlAssignKind::SIMPLE:
+            rhsp = waveformValue(nodep->wavesp());
+            delayp = waveformDelay(nodep->wavesp());
+            break;
         case VhdlAssignKind::CONDITIONAL: rhsp = conditionalValue(nodep); break;
         case VhdlAssignKind::SELECTED: rhsp = selectedValue(nodep); break;
         }
@@ -1374,16 +1436,27 @@ private:
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
             return;
         }
-        addStmt(new AstAlways{new AstAssignW{flp, lhsp, rhsp}});
+        addStmt(new AstAlways{new AstAssignW{flp, lhsp, rhsp, delayp}});
     }
 
     AstNodeExpr* waveformValue(AstVhdlWaveform* wfp) {
         if (!wfp || !wfp->valuep()) return nullptr;
-        if (wfp->nextp() || wfp->afterp()) {
-            unsup(wfp->fileline(), "delayed concurrent assignment");
+        if (wfp->nextp()) {
+            unsup(wfp->fileline(), "concurrent assignment of a multi-element waveform");
             return nullptr;
         }
         return lowerExpr(wfp->valuep());
+    }
+
+    // The delay of a concurrent assignment, if it has one (11.6)
+    AstNode* waveformDelay(AstVhdlWaveform* wfp) {
+        if (!wfp || !wfp->afterp()) return nullptr;
+        if (!v3Global.opt.timing().isTrue()) {
+            unsup(wfp->fileline(), "'after' delay without --timing");
+            return nullptr;
+        }
+        AstNodeExpr* const timep = lowerExpr(wfp->afterp());
+        return timep ? new AstDelay{wfp->fileline(), timep, false} : nullptr;
     }
 
     // "q <= a when c else b" is a conditional expression (11.6)
@@ -1629,10 +1702,7 @@ private:
         if (AstVhdlReturn* const retp = VN_CAST(nodep, VhdlReturn)) {
             return new AstReturn{flp, retp->valuep() ? lowerExpr(retp->valuep()) : nullptr};
         }
-        if (VN_IS(nodep, VhdlWait)) {
-            unsup(flp, "wait statement");
-            return nullptr;
-        }
+        if (AstVhdlWait* const waitp = VN_CAST(nodep, VhdlWait)) return lowerWait(waitp);
         if (AstVhdlProcCall* const callp = VN_CAST(nodep, VhdlProcCall)) {
             return lowerProcCall(callp);
         }
@@ -1812,9 +1882,17 @@ private:
         AstVhdlCall* const callp = VN_CAST(nodep->callp(), VhdlCall);
         AstNodeVhdlExpr* const namep = callp ? callp->prefixp() : nodep->callp();
         VhdlSymbol* const symp = callp ? callp->vhdlSymp() : nodep->callp()->vhdlSymp();
+        // std.env's control procedures are the simulator, not VHDL (16.5).
+        // Both end the run here: STOP means "suspend", which only an
+        // interactive simulator can offer.
+        if (symp && symp->predefined()
+            && (symp->name() == "stop" || symp->name() == "finish")) {
+            return new AstFinish{flp};
+        }
         const auto it = symp ? m_funcs.find(symp) : m_funcs.end();
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
-            unsup(flp, "procedure call");
+            unsup(flp, "procedure call to '"
+                           + (symp ? symp->name() : std::string{"<name>"}) + "'");
             return nullptr;
         }
         AstTaskRef* const refp = new AstTaskRef{flp, it->second->name(), nullptr};
@@ -1830,29 +1908,109 @@ private:
         return new AstStmtExpr{flp, refp};
     }
 
+    // The sensitivity a list of signal names gives
+    AstSenTree* sensitivityOf(AstNode* sensp, FileLine* flp) {
+        AstSenItem* itemsp = nullptr;
+        for (AstNode* p = sensp; p; p = p->nextp()) {
+            AstNodeExpr* const exprp = lowerExpr(VN_AS(p, NodeVhdlExpr));
+            if (!exprp) continue;
+            itemsp
+                = AstNode::addNext(itemsp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE, exprp});
+        }
+        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
+    }
+
+    // The sensitivity a condition implies: every signal it reads, which is
+    // what "wait until" waits on when no list is written (10.2)
+    static AstSenTree* sensitivityOfExpr(const AstNodeExpr* condp, FileLine* flp) {
+        std::vector<AstVar*> varps;
+        collectVars(condp, varps);
+        AstSenItem* itemsp = nullptr;
+        for (AstVar* const varp : varps) {
+            itemsp = AstNode::addNext(
+                itemsp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE,
+                                       new AstVarRef{flp, varp, VAccess::READ}});
+        }
+        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
+    }
+
+    static void collectVars(const AstNode* nodep, std::vector<AstVar*>& out) {
+        if (!nodep) return;
+        if (const AstVarRef* const refp = VN_CAST(nodep, VarRef)) {
+            AstVar* const varp = refp->varp();
+            if (varp && std::find(out.begin(), out.end(), varp) == out.end()) out.push_back(varp);
+        }
+        collectVars(nodep->op1p(), out);
+        collectVars(nodep->op2p(), out);
+        collectVars(nodep->op3p(), out);
+        collectVars(nodep->op4p(), out);
+        collectVars(nodep->nextp(), out);
+    }
+
+    // A wait statement suspends the process until something happens (10.2).
+    // Each of its three clauses has a direct equivalent, and the combination
+    // "until C" already implies waiting for the signals C reads.
+    AstNode* lowerWait(AstVhdlWait* nodep) {
+        FileLine* const flp = nodep->fileline();
+        if (!v3Global.opt.timing().isTrue()) {
+            unsup(flp, "wait statement without --timing");
+            return nullptr;
+        }
+        if (nodep->condp() && nodep->timeoutp()) {
+            unsup(flp, "wait with both a condition and a timeout");
+            return nullptr;
+        }
+        if (nodep->condp()) {
+            // "wait until C" always suspends, and resumes when an event makes
+            // C true (10.2). Verilog's wait(C) returns at once if C is
+            // already true, which for "wait until clk = '1'" written while
+            // the clock is high would spin without advancing time. So the
+            // process is suspended on an event first, and only then waits.
+            AstNodeExpr* const condp = lowerCondition(nodep->condp());
+            if (!condp) return nullptr;
+            AstSenTree* sensp = sensitivityOf(nodep->sensp(), flp);
+            if (!sensp) sensp = sensitivityOfExpr(condp, flp);
+            if (!sensp) return new AstWait{flp, condp, nullptr};
+            AstNode* const outp = new AstEventControl{flp, sensp, nullptr};
+            return AstNode::addNext(outp, static_cast<AstNode*>(
+                                              new AstWait{flp, condp, nullptr}));
+        }
+        if (nodep->timeoutp()) {
+            AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
+            return timep ? new AstDelay{flp, timep, false} : nullptr;
+        }
+        if (nodep->sensp()) {
+            AstSenTree* const sensp = sensitivityOf(nodep->sensp(), flp);
+            return sensp ? new AstEventControl{flp, sensp, nullptr} : nullptr;
+        }
+        // A bare "wait" suspends for good: the process never resumes, so
+        // whatever follows it never runs again
+        return new AstWait{flp, new AstConst{flp, AstConst::BitFalse{}}, nullptr};
+    }
+
     // "assert c report m severity s" is a check plus a message (10.3)
     AstNode* lowerAssert(AstVhdlAssert* nodep) {
         FileLine* const flp = nodep->fileline();
-        AstNode* actionp = nullptr;
-        std::string text = nodep->isReport() ? "" : "Assertion violation";
-        if (nodep->reportp()) {
-            const VhdlValue val = V3VhdlEval::eval(nodep->reportp());
-            if (val.isStr()) {
-                text = val.toStr();
-            } else {
-                text = nodep->isReport() ? "report" : "Assertion violation";
-            }
-        }
         // The severity decides whether the run stops (10.3)
         int64_t severity = nodep->isReport() ? 0 : 2;  // NOTE : ERROR
         if (nodep->severityp()) {
             const VhdlValue val = V3VhdlEval::eval(nodep->severityp());
             if (val.isInt()) severity = val.toInt();
         }
-        const char* const levels[] = {"Note", "Warning", "Error", "Failure"};
-        const std::string prefix
-            = std::string{"["} + levels[severity < 0 || severity > 3 ? 2 : severity] + "] ";
-        actionp = new AstDisplay{flp, VDisplayType::DT_DISPLAY, prefix + text, nullptr, nullptr};
+        static const char* const LEVELS[] = {"note", "warning", "error", "failure"};
+        const char* const levelp = LEVELS[severity < 0 || severity > 3 ? 2 : severity];
+        // The shape simulators print, so that a run can be diffed against one
+        std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
+                             + std::to_string(flp->firstColumn()) + ":@%0t:(report "
+                             + levelp + "): ";
+        AstNodeExpr* argsp = new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
+        if (nodep->reportp()) {
+            argsp = AstNode::addNext(argsp, lowerMessage(nodep->reportp(), format));
+        } else {
+            format += "Assertion violation";
+        }
+        AstNode* actionp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY, format, nullptr, argsp};
         if (severity >= 2) {
             actionp = AstNode::addNext(actionp,
                                        static_cast<AstNode*>(new AstStop{flp, severity >= 3}));
@@ -1860,6 +2018,77 @@ private:
         if (nodep->isReport() || !nodep->condp()) return actionp;
         return new AstIf{flp, new AstLogNot{flp, lowerCondition(nodep->condp())}, actionp,
                          nullptr};
+    }
+
+    // The message of a report or assertion, built as a format string and its
+    // arguments rather than as a string value.
+    //
+    // VHDL builds such a message by concatenating text with 'IMAGE of a
+    // value, which in an event-driven simulator means allocating strings at
+    // run time. Turning the whole expression into one $display avoids that
+    // entirely: the text becomes part of the format and each value a
+    // conversion, which is how Verilog testbenches already print.
+    AstNodeExpr* lowerMessage(AstNodeVhdlExpr* nodep, std::string& format) {
+        if (!nodep) return nullptr;
+        // A message that is entirely static is just text
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        if (val.isStr()) {
+            appendLiteral(format, val.toStr());
+            return nullptr;
+        }
+        if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
+            if (binp->op() == VhdlBinaryOp::CONCAT) {
+                AstNodeExpr* const leftp = lowerMessage(binp->lhsp(), format);
+                AstNodeExpr* const rightp = lowerMessage(binp->rhsp(), format);
+                return AstNode::addNextNull(leftp, rightp);
+            }
+        }
+        if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
+            return lowerMessage(qp->valuep(), format);
+        }
+        // 'IMAGE and TO_STRING both turn a value into text
+        AstNodeVhdlExpr* valuep = nodep;
+        if (AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
+            if (attrp->name() == "image" && attrp->argp()) valuep = attrp->argp();
+        } else if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            const VhdlSymbol* const symp = callp->vhdlSymp();
+            if (symp && symp->name() == "to_string") {
+                if (AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc)) {
+                    if (asp->actualp() && !asp->nextp()) valuep = asp->actualp();
+                }
+            }
+        }
+        AstNodeExpr* const exprp = lowerExpr(valuep);
+        if (!exprp) {
+            appendLiteral(format, "<?>");
+            return nullptr;
+        }
+        format += formatFor(valuep->vhdlTypep());
+        return exprp;
+    }
+
+    // Text that goes into a format string must not be read as a conversion
+    static void appendLiteral(std::string& format, const std::string& text) {
+        for (const char c : text) {
+            if (c == '%') format += '%';
+            format += c;
+        }
+    }
+
+    // How a value of that type reads
+    static std::string formatFor(const VhdlType* typep) {
+        if (!typep) return "%0d";
+        const VhdlType* const basep = typep->base();
+        switch (basep->kind()) {
+        case VhdlTypeKind::FLOATING:
+        case VhdlTypeKind::UNIVERSAL_REAL: return "%g";
+        case VhdlTypeKind::PHYSICAL: return "%0t";
+        case VhdlTypeKind::ARRAY:
+            // A vector of logic reads in binary, as VHDL prints it
+            return basep->elementp() && enumIsLogic(basep->elementp()->base()) ? "%b" : "%0d";
+        case VhdlTypeKind::ENUM: return enumIsLogic(basep) ? "%b" : "%0d";
+        default: return "%0d";
+        }
     }
 
     // A subprogram becomes a function or a task. VHDL's own rule that a
@@ -1938,6 +2167,13 @@ private:
         FileLine* const flp = entp->fileline();
         const std::string libname = entp->libname().empty() ? "work" : entp->libname();
         m_modp = new AstModule{flp, entp->name(), libname};
+        // VHDL counts time in its primary unit, which for TIME is the
+        // femtosecond (16.3), so that is the module's time unit, and the
+        // design's precision must be at least as fine. Verilator keeps the
+        // finest of the two, so a mixed-language design does not lose VHDL's
+        // resolution.
+        m_modp->timeunit(VTimescale::TS_1FS);
+        m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_funcs.clear();
         m_prefix.clear();

@@ -16,7 +16,7 @@ test.scenarios('linter')
 # in what any expression evaluates to shows up as a diff.
 test.top_filename = "t/t_vhdl_static.vhd"
 
-test.lint(fails=True,
+test.lint(fails=False,
           verilator_flags2=["--dump-vhdl-syms"],
           expect_filename=test.golden_filename)
 
