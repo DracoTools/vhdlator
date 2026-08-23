@@ -128,6 +128,7 @@ public:
     }
 
     void lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
 private:
     // METHODS - diagnostics
@@ -2269,6 +2270,8 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // (7.3.3), which is what keeping the newest one gives.
     std::map<std::string, AstVhdlEntity*> entities;
     std::map<std::string, AstVhdlArchitecture*> archs;
+    std::map<std::string, std::string> chosen;  // Entity -> architecture a configuration picked
+    std::map<std::string, AstVhdlArchitecture*> namedArchs;  // "lib.entity.arch" -> it
     std::vector<std::string> order;  // Entities, in the order they arrived
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         const std::string lib = unitp->libname().empty() ? "work" : unitp->libname();
@@ -2281,6 +2284,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             std::vector<std::string> parts;
             if (!flattenName(archp->entityNamep(), parts) || parts.empty()) continue;
             archs[lib + "." + parts.back()] = archp;
+            namedArchs[lib + "." + parts.back() + "." + archp->name()] = archp;
             continue;
         }
         if (VN_IS(unitp, VhdlPackage) || VN_IS(unitp, VhdlPackageBody)
@@ -2289,16 +2293,44 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             // are used where they are referenced rather than emitted here
             continue;
         }
-        if (VN_IS(unitp, VhdlConfiguration)) {
-            unsup(unitp->fileline(), "configuration declaration");
+        if (AstVhdlConfiguration* const cfgp = VN_CAST(unitp, VhdlConfiguration)) {
+            // A configuration says which architecture an entity is to be
+            // built from (3.4). Recording that choice is all it takes to
+            // honour the common form; the default binding, which takes the
+            // architecture analyzed last, applies where none says otherwise.
+            std::vector<std::string> parts;
+            if (!flattenName(cfgp->entityNamep(), parts) || parts.empty()) continue;
+            const std::string arch = topArchitectureOf(cfgp->blockConfigp());
+            if (!arch.empty()) chosen[lib + "." + parts.back()] = arch;
             continue;
         }
         unsup(unitp->fileline(), std::string{"design unit "} + unitp->typeName());
     }
     for (const std::string& key : order) {
-        const auto archIt = archs.find(key);
-        lowerEntity(entities[key], archIt == archs.end() ? nullptr : archIt->second);
+        AstVhdlArchitecture* archp = nullptr;
+        const auto pickIt = chosen.find(key);
+        if (pickIt != chosen.end()) {
+            const auto namedIt = namedArchs.find(key + "." + pickIt->second);
+            if (namedIt != namedArchs.end()) archp = namedIt->second;
+        }
+        if (!archp) {
+            const auto archIt = archs.find(key);
+            if (archIt != archs.end()) archp = archIt->second;
+        }
+        lowerEntity(entities[key], archp);
     }
+}
+
+// The architecture a configuration's outermost block configuration names
+std::string VhdlLowerVisitor::topArchitectureOf(AstVhdlBlockConfig* nodep) {
+    if (!nodep) return "";
+    // The outermost block specification of a configuration names the
+    // architecture (3.4.2), and the parser records it as an entity
+    // specification's single name
+    const AstVhdlEntitySpec* const specp = VN_CAST(nodep->specp(), VhdlEntitySpec);
+    if (!specp) return "";
+    const AstVhdlName* const namep = VN_CAST(specp->namesp(), VhdlName);
+    return namep ? namep->name() : "";
 }
 
 //######################################################################
