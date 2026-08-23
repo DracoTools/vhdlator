@@ -746,6 +746,7 @@ private:
                         const std::string& what) VL_MT_DISABLED;
     int64_t aggregateLength(AstVhdlAggregate* nodep) VL_MT_DISABLED;
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
+    VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
     VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
@@ -1067,9 +1068,17 @@ void VhdlSemVisitor::visit(AstVhdlProcess* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
+    // The maps are written outside the block's own region, since they name
+    // what is visible where the block appears (11.2)
+    if (nodep->headerp()) {
+        analyzeAssociations(nodep->headerp()->genericMapp(), nullptr);
+        analyzeAssociations(nodep->headerp()->portMapp(), nullptr);
+    }
     pushScope(nodep->name().empty() ? "block" : nodep->name());
     if (nodep->headerp()) {
+        m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->genericsp());
+        m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->portsp());
     }
     iterateAndNextNull(nodep->declsp());
@@ -2152,6 +2161,13 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             analyzeExpr(eap->valuep(), elemTypep);
             checkValueInRange(eap->valuep(), elemTypep, "an element of this aggregate");
         }
+        // Where the context imposes no constraint -- an aggregate standing as
+        // an operand, or returned where the result subtype is unconstrained
+        // -- the aggregate's own elements fix its index range (9.3.3.3), and
+        // settling that here means everything downstream sees a real subtype
+        if (!wantp->isConstrainedArray() && wantp->dimensions() == 1) {
+            if (VhdlType* const ownp = aggregateSubtype(nodep, wantp)) wantp = ownp;
+        }
         // Whatever the context, an index named by a choice must be a value of
         // the array's index subtype: "(0 => 'a')" is not a STRING, which is
         // indexed by POSITIVE, however the aggregate is used (9.3.3.3)
@@ -2514,6 +2530,63 @@ int64_t VhdlSemVisitor::elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayType
     VhdlType* const typep = valuep->vhdlTypep();
     if (!typep || typep->base() != arrayTypep->base()) return 1;
     return staticLength(valuep);
+}
+
+// The subtype an aggregate gives itself, or null where its own elements do
+// not settle one -- which is what an "others" choice means (9.3.3.3)
+VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) {
+    VhdlType* const indexp
+        = typep->base()->indexTypes().empty() ? nullptr : typep->base()->indexTypes()[0];
+    if (!indexp || !indexp->bounded()) return nullptr;
+    int64_t positional = 0;
+    bool named = false;
+    int64_t lowest = INT64_MAX;
+    int64_t highest = INT64_MIN;
+    for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
+        AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+        if (!eap->choicesp()) {
+            const int64_t span = elementSpan(eap->valuep(), typep);
+            if (span < 0) return nullptr;
+            positional += span;
+        }
+        for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+            if (chp->isOthers()) return nullptr;
+            named = true;
+            int64_t lo = 0;
+            int64_t hi = 0;
+            if (AstVhdlRange* const rp = chp->rangep()) {
+                const RangeInfo info = analyzeRange(rp, indexp);
+                if (!info.left.isInt() || !info.right.isInt()) return nullptr;
+                lo = std::min(info.left.toInt(), info.right.toInt());
+                hi = std::max(info.left.toInt(), info.right.toInt());
+            } else {
+                const VhdlValue v = V3VhdlEval::eval(chp->valuep());
+                if (!v.isInt()) return nullptr;
+                lo = hi = v.toInt();
+            }
+            lowest = std::min(lowest, lo);
+            highest = std::max(highest, hi);
+        }
+    }
+    int64_t left = 0;
+    int64_t right = 0;
+    if (named) {
+        if (lowest > highest) return nullptr;
+        left = indexp->ascending() ? lowest : highest;
+        right = indexp->ascending() ? highest : lowest;
+    } else {
+        if (positional <= 0) return nullptr;
+        left = indexp->left();
+        right = indexp->ascending() ? left + positional - 1 : left - positional + 1;
+    }
+    VhdlType* const outp = cloneSubtype(typep, nodep->fileline());
+    VhdlType* const newIndexp = cloneSubtype(indexp, nodep->fileline());
+    newIndexp->setBounds(left, right, indexp->ascending());
+    outp->clearIndexTypes();
+    outp->addIndexType(newIndexp);
+    outp->unconstrained(false);
+    return outp;
 }
 
 // How many elements an aggregate has, or -1 where "others" or a non-static

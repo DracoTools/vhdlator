@@ -516,6 +516,19 @@ private:
             return new AstVarRef{flp, it->second, VAccess::READ};
         }
         if (symp->hasValue()) return lowerValue(symp->value(), symp->typep(), flp);
+        // A function of no arguments is called by naming it, with no
+        // parentheses, so a name may be a call (4.2.2.1)
+        if (symp->kind() == VhdlSymKind::FUNCTION && symp->paramTypes().empty()) {
+            if (symp->name() == "now") {
+                return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
+            }
+            const auto funcIt = m_funcs.find(symp);
+            if (funcIt != m_funcs.end() && VN_IS(funcIt->second, Func)) {
+                AstFuncRef* const refp = new AstFuncRef{flp, funcIt->second->name(), nullptr};
+                refp->taskp(funcIt->second);
+                return refp;
+            }
+        }
         // OUTPUT and INPUT of std.textio are the standard streams (16.4)
         if (symp->kind() == VhdlSymKind::FILE && symp->predefined()) {
             if (symp->name() == "output") return new AstConst{flp, AstConst::Signed32{}, 1};
@@ -1262,9 +1275,14 @@ private:
             return;
         }
         if (AstVhdlBlock* const blockp = VN_CAST(nodep, VhdlBlock)) {
-            // A block is a scope, not a construct of its own; its guard and
-            // its header are for later milestones
-            if (blockp->guardp() || blockp->headerp()) unsup(flp, "guarded block");
+            // A block is a declarative region, not a construct of its own, so
+            // its declarations and statements belong to the module (11.2).
+            // A guard, or a header giving the block its own generics and
+            // ports, makes it more than that.
+            if (blockp->guardp()) unsup(flp, "guarded block");
+            if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
+                lowerBlockHeader(headerp);
+            }
             for (AstNode* p = blockp->declsp(); p; p = p->nextp()) lowerDecl(p);
             for (AstNode* p = blockp->stmtsp(); p; p = p->nextp()) {
                 lowerConcurrent(VN_AS(p, NodeVhdlStmt));
@@ -1292,6 +1310,54 @@ private:
             return;
         }
         unsup(flp, std::string{"concurrent statement "} + nodep->typeName());
+    }
+
+    // A block may give itself generics and ports (11.2). It is not a module
+    // of its own -- it is elaborated where it stands -- so each generic
+    // becomes a constant with the value the map supplies, and each port a
+    // signal wired to its actual.
+    void lowerBlockHeader(AstVhdlBlockHeader* nodep) {
+        lowerBlockInterface(nodep->genericsp(), nodep->genericMapp(), true);
+        lowerBlockInterface(nodep->portsp(), nodep->portMapp(), false);
+    }
+    void lowerBlockInterface(AstNode* formalsp, AstNode* mapp, bool isGeneric) {
+        // The actual for each formal, by position or by name
+        std::vector<AstVhdlAssoc*> assocs;
+        for (AstNode* p = mapp; p; p = p->nextp()) assocs.push_back(VN_AS(p, VhdlAssoc));
+        size_t position = 0;
+        for (AstNode* p = formalsp; p; p = p->nextp(), ++position) {
+            AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            VhdlSymbol* const symp = ifp->vhdlSymp();
+            if (!symp) continue;
+            FileLine* const flp = ifp->fileline();
+            AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+            addStmt(varp);
+            AstNodeVhdlExpr* actualp = nullptr;
+            for (size_t i = 0; i < assocs.size(); ++i) {
+                const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
+                if (namep ? namep->name() == symp->name() : i == position) {
+                    actualp = assocs[i]->actualp();
+                    break;
+                }
+            }
+            if (!actualp) {
+                if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
+                continue;
+            }
+            AstNodeExpr* const valuep = lowerExpr(actualp);
+            if (!valuep) continue;
+            if (isGeneric) {
+                varp->valuep(valuep);
+                continue;
+            }
+            // An "out" port drives its actual; anything else is driven by it
+            AstNodeExpr* const portRefp = new AstVarRef{flp, varp, VAccess::READ};
+            if (ifp->mode() == VhdlMode::OUT || ifp->mode() == VhdlMode::BUFFER) {
+                addStmt(new AstAlways{new AstAssignW{flp, valuep, portRefp}});
+            } else {
+                addStmt(new AstAlways{new AstAssignW{flp, portRefp, valuep}});
+            }
+        }
     }
 
     // A process becomes an always block. Which sensitivity it gets is the
