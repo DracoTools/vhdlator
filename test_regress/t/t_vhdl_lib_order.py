@@ -18,7 +18,7 @@ test.scenarios('linter')
 test.top_filename = "t/t_vhdl_lib_order.vhd"
 test.v_other_filenames = ["t/t_vhdl_lib_order_b.vhd", "t/t_vhdl_lib_order_c.vhd"]
 
-test.lint(fails=True,
+test.lint(fails=False,
           verilator_flags2=["--dump-vhdl-units"],
           expect_filename=test.golden_filename)
 

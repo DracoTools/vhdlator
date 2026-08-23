@@ -2,6 +2,4 @@
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: t/t_vhdl_lib_bad.vhd:17:1: Circular dependency between design units: 'work.circ_a' and 'work.circ_b'
 %Error: t/t_vhdl_lib_bad.vhd:25:1: Design unit 'work.nowhere' not found, needed by 'work.t'
-%Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to

@@ -399,6 +399,5 @@
 %Error: t/t_vhdl_parse.vhd:88:14: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:89:14: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:90:13: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
-%Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+%Error: t/t_vhdl_parse.vhd:93:63: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: Exiting due to

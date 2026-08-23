@@ -589,7 +589,11 @@ class UndrivenVisitor final : public VNVisitorConst {
                                                << " (IEEE 1800-2023 6.5): "
                                                << nodep->prettyNameQ());
             } else if (m_inContAssign && !nodep->varp()->varType().isContAssignable()
-                       && !nodep->fileline()->language().systemVerilog()) {
+                       && !nodep->fileline()->language().systemVerilog()
+                       // A VHDL signal may be driven by a process or by a
+                       // concurrent assignment; the language makes no
+                       // distinction between a variable and a net (6.4.2.3)
+                       && !nodep->fileline()->language().vhdl()) {
                 nodep->v3warn(CONTASSREG,
                               "Continuous assignment to reg, perhaps intended wire"
                                   << " (IEEE 1364-2005 6.1; Verilog only, legal in SV): "

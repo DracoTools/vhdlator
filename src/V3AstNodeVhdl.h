@@ -1071,6 +1071,7 @@ class AstVhdlGenerate final : public AstNodeVhdlStmt {
     // @astgen op3 := altsp : List[AstVhdlGenerateBody]
     std::string m_paramName;  // for-generate parameter
     const VhdlLoopKind m_kind;  // FOR, or LOOP standing for if/case
+    VhdlSymbol* m_vhdlSymp = nullptr;  // The parameter the generate declares
 
 public:
     AstVhdlGenerate(FileLine* fl, VhdlLoopKind kind)
@@ -1080,6 +1081,8 @@ public:
     VhdlLoopKind kind() const { return m_kind; }
     std::string paramName() const { return m_paramName; }
     void paramName(const std::string& s) { m_paramName = s; }
+    VhdlSymbol* vhdlSymp() const { return m_vhdlSymp; }
+    void vhdlSymp(VhdlSymbol* symp) { m_vhdlSymp = symp; }
 };
 
 class AstVhdlIf final : public AstNodeVhdlStmt {
@@ -1119,6 +1122,7 @@ class AstVhdlLoop final : public AstNodeVhdlStmt {
     // @astgen op3 := stmtsp : List[AstNodeVhdlStmt]
     const VhdlLoopKind m_kind;
     std::string m_paramName;  // FOR loop parameter
+    VhdlSymbol* m_vhdlSymp = nullptr;  // The parameter the loop declares
 
 public:
     AstVhdlLoop(FileLine* fl, VhdlLoopKind kind)
@@ -1128,6 +1132,8 @@ public:
     VhdlLoopKind kind() const { return m_kind; }
     std::string paramName() const { return m_paramName; }
     void paramName(const std::string& s) { m_paramName = s; }
+    VhdlSymbol* vhdlSymp() const { return m_vhdlSymp; }
+    void vhdlSymp(VhdlSymbol* symp) { m_vhdlSymp = symp; }
 };
 
 class AstVhdlNext final : public AstNodeVhdlStmt {

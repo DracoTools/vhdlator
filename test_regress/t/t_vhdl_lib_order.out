@@ -2,7 +2,3 @@ t/t_vhdl_lib_order_c.vhd:9: VHDLPACKAGE work.helper
 t/t_vhdl_lib_order.vhd:12: VHDLENTITY work.t
 t/t_vhdl_lib_order.vhd:15: VHDLARCHITECTURE work.rtl
 t/t_vhdl_lib_order_b.vhd:9: VHDLPACKAGEBODY work.helper
-%Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 3 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
-        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: Exiting due to

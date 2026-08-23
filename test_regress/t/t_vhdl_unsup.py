@@ -11,9 +11,9 @@ import vltest_bootstrap
 
 test.scenarios('linter')
 
-# A .vhd file must be routed to the VHDL frontend, not the Verilog one. Until
-# that frontend lands, it reports cleanly rather than emitting Verilog syntax
-# errors. Also covers --vhdl-std selecting the revision.
+# Constructs the frontend understands but cannot lower yet. Each must say so
+# clearly rather than be mis-compiled. Also covers --vhdl-std selecting the
+# revision.
 test.top_filename = "t/t_vhdl_unsup.vhd"
 
 test.lint(fails=True,

@@ -15,6 +15,4 @@
 %Error: t/t_vhdl_bounds_bad.vhd:51:14: A timeout may not be negative, but this one is -1000000 fs
 %Error: t/t_vhdl_bounds_bad.vhd:56:16: This waveform element takes effect no later than the one before it, so it would never be seen
 %Error: t/t_vhdl_bounds_bad.vhd:62:13: Dimension 3 of attribute 'length is out of range; vec_t has 1 dimension(s)
-%Error: VHDL lowering is not yet implemented; analyzed 2 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to

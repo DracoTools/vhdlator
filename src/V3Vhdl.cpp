@@ -41,6 +41,7 @@
 #include "V3File.h"
 #include "V3Global.h"
 #include "V3VhdlLib.h"
+#include "V3VhdlLower.h"
 #include "V3VhdlSem.h"
 #include "V3VhdlParse.h"
 #include "V3VhdlScan.h"
@@ -120,6 +121,10 @@ void V3Vhdl::parseFile(FileLine* fl, const string& filename, const string& libna
     FileLine* const flp = new FileLine{foundname};
     flp->language(v3Global.opt.fileLanguage(foundname));
     flp->lineno(1);
+    // An ascending range is how VHDL usually writes an index, so warning
+    // about one would fire on nearly every design. Every fileline the scanner
+    // makes copies this setting, so it covers the whole source.
+    flp->warnOff(V3ErrorCode::ASCRANGE, true);
 
     if (v3Global.opt.dumpLevel("vhdl-tokens") != 0) {
         // Scanner-level debug: dump the token stream and go no further
@@ -158,21 +163,18 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp) {
     }
 
     // Give the parse tree meaning: scopes, symbols and types
-    V3VhdlSem::analyze(order);
+    const bool analyzed = V3VhdlSem::analyze(order);
 
-    // M5+ : lower the analyzed tree into rootp. Until then it has served its
-    // purpose.
-    const size_t units = order.size();
+    // Then rewrite it as the AST the rest of Verilator works on. Lowering a
+    // tree that failed analysis would report the same problems a second time
+    // in less useful terms, so it only runs on a clean one.
+    if (analyzed) V3VhdlLower::lower(order, rootp);
+
+    // The VHDL tree has served its purpose; nothing downstream may see one
     V3VhdlSem::clear();
     V3VhdlLib::clear();
     for (AstVhdlDesignFile* const filep : s_designFiles) {
         VL_DO_DANGLING(filep->deleteTree(), filep);
     }
     s_designFiles.clear();
-
-    v3Global.rootp()->fileline()->v3error(
-        "VHDL lowering is not yet implemented; analyzed "
-        << units << " design unit(s) from " << s_filenames.size()
-        << " file(s)\n... The VHDL frontend is under development;"
-           " Verilog and SystemVerilog are unaffected.");
 }

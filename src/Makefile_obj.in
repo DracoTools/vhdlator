@@ -354,6 +354,7 @@ RAW_OBJS_PCH_ASTNOMT = \
   V3Vhdl.o \
   V3VhdlEval.o \
   V3VhdlLib.o \
+  V3VhdlLower.o \
   V3VhdlSem.o \
   V3VhdlStd.o \
   V3VhdlSym.o \

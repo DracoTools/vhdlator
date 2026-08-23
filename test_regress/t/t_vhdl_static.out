@@ -40,7 +40,7 @@ VHDLENTITY work.t_vhdl_static
 VHDLARCHITECTURE work.rtl
   signal s : state_t
   signal v : byte_vec_t
-%Error: VHDL lowering is not yet implemented; analyzed 3 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+%Error: t/t_vhdl_static.vhd:68:3: Unsupported: VHDL process with no sensitivity list cannot be lowered yet
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_static.vhd:77:5: Unsupported: VHDL wait statement cannot be lowered yet
 %Error: Exiting due to

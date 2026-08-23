@@ -202,6 +202,7 @@ set(HEADERS
     V3Vhdl.h
     V3VhdlEval.h
     V3VhdlLib.h
+    V3VhdlLower.h
     V3VhdlSem.h
     V3VhdlStd.h
     V3VhdlSym.h
@@ -386,6 +387,7 @@ set(COMMON_SOURCES
     V3Vhdl.cpp
     V3VhdlEval.cpp
     V3VhdlLib.cpp
+    V3VhdlLower.cpp
     V3VhdlSem.cpp
     V3VhdlStd.cpp
     V3VhdlSym.cpp

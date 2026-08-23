@@ -78,6 +78,7 @@ class VhdlSemVisitor final : public VNVisitor {
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
     bool m_inPackageBody = false;
+    int m_ifacePos = 0;  // Position of the interface element being declared
     bool m_errored = false;
 
     VL_UNCOPYABLE(VhdlSemVisitor);
@@ -722,6 +723,7 @@ private:
     void visit(AstVhdlReturn* nodep) override;
     void visit(AstVhdlProcCall* nodep) override;
     void visit(AstVhdlNext* nodep) override;
+    void visit(AstVhdlInstance* nodep) override;
 
     VhdlType* loopParamType(const RangeInfo& info, FileLine* flp) VL_MT_DISABLED;
     void analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) VL_MT_DISABLED;
@@ -743,6 +745,8 @@ private:
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
+    void analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep) VL_MT_DISABLED;
+    static VhdlType* formalAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
     // Expressions (clauses 8, 9, 12.5)
@@ -889,6 +893,8 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
     case VhdlIfaceKind::PACKAGE: kind = VhdlSymKind::PACKAGE; break;
     }
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(kind, nodep->name(), nodep);
+    // Its place in the clause, so that a positional association finds it
+    symp->position(m_ifacePos++);
     if (nodep->kind() == VhdlIfaceKind::TYPE) {
         // A generic type stands for whatever the instantiation supplies, so
         // give it a type of its own that matches nothing else yet (6.5.5)
@@ -976,7 +982,9 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
 void VhdlSemVisitor::visit(AstVhdlComponentDecl* nodep) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::COMPONENT, nodep->name(), nodep);
     VhdlScope* const innerp = pushScope(nodep->name());
+    m_ifacePos = 0;
     iterateAndNextNull(nodep->genericsp());
+    m_ifacePos = 0;
     iterateAndNextNull(nodep->portsp());
     popScope();
     symp->innerp(innerp);
@@ -1071,6 +1079,7 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::GENERATE_PARAMETER,
                                                        nodep->paramName(), nodep);
         symp->typep(loopParamType(info, nodep->fileline()));
+        nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
     }
     iterateAndNextNull(nodep->exprp());
@@ -1079,8 +1088,13 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlGenerateBody* nodep) {
+    // The condition is an expression, not a statement, so it needs analyzing
+    // rather than iterating: iterating would leave its names unresolved
+    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    for (AstNode* p = nodep->choicesp(); p; p = p->nextp()) {
+        analyzeChoice(VN_AS(p, VhdlChoice), nullptr);
+    }
     pushScope(nodep->name().empty() ? "generate body" : nodep->name());
-    iterateAndNextNull(nodep->condp());
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
     popScope();
@@ -1095,6 +1109,7 @@ void VhdlSemVisitor::visit(AstVhdlLoop* nodep) {
         VhdlSymbol* const symp
             = VhdlSymTab::newSymbol(VhdlSymKind::LOOP_PARAMETER, nodep->paramName(), nodep);
         symp->typep(loopParamType(info, nodep->fileline()));
+        nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
         iterateAndNextNull(nodep->stmtsp());
         popScope();
@@ -1235,7 +1250,9 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         VhdlScope* const unitScopep = pushScope(unitp->name());
 
         if (AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity)) {
+            m_ifacePos = 0;
             iterateAndNextNull(entp->genericsp());
+            m_ifacePos = 0;
             iterateAndNextNull(entp->portsp());
             iterateAndNextNull(entp->declsp());
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
@@ -2772,6 +2789,88 @@ void VhdlSemVisitor::visit(AstVhdlReturn* nodep) {
         return;
     }
     analyzeExpr(nodep->valuep(), m_returnTypep);
+}
+
+// An instance associates actuals with the formals of the component or entity
+// it names (6.5.7.1). Resolving the unit first gives every actual the type its
+// formal has, which is what lets the bounds of a port be checked here rather
+// than after elaboration.
+void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
+    std::vector<std::string> parts;
+    VhdlScope* unitScopep = nullptr;
+    if (flatten(nodep->unitp(), parts) && !parts.empty()) {
+        if (parts.size() > 1) {
+            // "entity lib.name" names the entity directly (11.7)
+            std::string lib = parts[0];
+            if (lib == "work") lib = m_libname;
+            const auto it = m_unitScopes.find(lib + "." + parts.back());
+            if (it != m_unitScopes.end()) unitScopep = it->second;
+        } else {
+            std::vector<VhdlSymbol*> found;
+            lookup(parts.back(), found);
+            for (VhdlSymbol* const symp : found) {
+                if (symp->kind() == VhdlSymKind::COMPONENT
+                    || symp->kind() == VhdlSymKind::ENTITY) {
+                    nodep->unitp()->vhdlSymp(symp);
+                    unitScopep = symp->innerp();
+                    break;
+                }
+            }
+            if (!unitScopep) {
+                // Default binding is to the entity of the same name (7.3.3),
+                // which may not have been analyzed into this library yet
+                const auto it = m_unitScopes.find(m_libname + "." + parts.back());
+                if (it != m_unitScopes.end()) unitScopep = it->second;
+            }
+        }
+    }
+    analyzeAssociations(nodep->genericMapp(), unitScopep);
+    analyzeAssociations(nodep->portMapp(), unitScopep);
+}
+
+// Each actual takes the type of the formal it is associated with, by position
+// or by name
+void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep) {
+    int position = 0;
+    for (AstNode* p = assocsp; p; p = p->nextp()) {
+        AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+        if (!asp->actualp()) {
+            ++position;
+            continue;
+        }
+        VhdlType* formalTypep = nullptr;
+        if (unitScopep) {
+            if (const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName)) {
+                std::vector<VhdlSymbol*> found;
+                unitScopep->lookupLocal(namep->name(), found);
+                if (!found.empty()) {
+                    asp->formalp()->vhdlSymp(found[0]);
+                    formalTypep = found[0]->typep();
+                }
+            } else if (!asp->formalp()) {
+                formalTypep = formalAt(unitScopep, position);
+            }
+        }
+        analyzeExpr(asp->actualp(), formalTypep);
+        if (formalTypep) {
+            checkValueInRange(asp->actualp(), formalTypep, "this association");
+            checkArrayValue(asp->actualp(), formalTypep, "this association");
+        }
+        ++position;
+    }
+}
+
+// The formal at one position. A component's declarations are held in a map,
+// so the order comes from the declaration node rather than the scope.
+VhdlType* VhdlSemVisitor::formalAt(VhdlScope* scopep, int position) {
+    for (const auto& pair : scopep->direct()) {
+        VhdlSymbol* const symp = pair.second;
+        if (symp->position() == position
+            && (symp->kind() == VhdlSymKind::PORT || symp->kind() == VhdlSymKind::GENERIC)) {
+            return symp->typep();
+        }
+    }
+    return nullptr;
 }
 
 void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) { analyzeExpr(nodep->callp(), nullptr); }

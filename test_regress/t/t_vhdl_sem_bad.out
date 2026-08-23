@@ -4,6 +4,4 @@
 %Error: t/t_vhdl_sem_bad.vhd:18:31: Cannot find 'nowhere' in this context
 %Error: t/t_vhdl_sem_bad.vhd:21:12: Declaration of 'dup' conflicts with the constant of the same name declared in this region
 %Error: t/t_vhdl_sem_bad.vhd:23:14: 'k' is a constant, but a resolution function is required here
-%Error: VHDL lowering is not yet implemented; analyzed 1 design unit(s) from 1 file(s)
-... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to
