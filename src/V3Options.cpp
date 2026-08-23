@@ -882,6 +882,9 @@ string V3Options::getStdPackagePath() {
 string V3Options::getStdWaiverPath() {
     return V3Os::filenameJoin(getenvVERILATOR_ROOT(), "include", "verilated_std_waiver.vlt");
 }
+string V3Options::getVhdlLibPath(const string& libname) {
+    return V3Os::filenameJoin(getenvVERILATOR_ROOT(), "include", "vhdl", libname);
+}
 
 string V3Options::getSupported(const string& var) {
     // If update below, also update V3Options::showVersion()
@@ -1766,9 +1769,11 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
     });
     DECL_OPTION("-std", CbOnOff, [this](bool flag) {
         m_stdPackage = flag;
+        m_stdVhdl = flag;
         m_stdWaiver = flag;
     });
     DECL_OPTION("-std-package", OnOff, &m_stdPackage);
+    DECL_OPTION("-std-vhdl", OnOff, &m_stdVhdl);
     DECL_OPTION("-std-waiver", OnOff, &m_stdWaiver);
     DECL_OPTION("-stop-fail", OnOff, &m_stopFail);
     DECL_OPTION("-structs-packed", CbOnOff, [this, fl](bool flag) {

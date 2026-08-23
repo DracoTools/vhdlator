@@ -46,6 +46,9 @@
 #include "V3VhdlParse.h"
 #include "V3VhdlScan.h"
 
+#include "V3Os.h"
+
+#include <set>
 #include <string>
 #include <vector>
 
@@ -91,6 +94,145 @@ void dumpToken(const VhdlToken& token) {
     std::cout << "\n";
 }
 }  // namespace
+
+//######################################################################
+// The libraries Verilator ships
+//
+// A design that says "library ieee; use ieee.numeric_std.all" expects those
+// packages to be there, exactly as a SystemVerilog one expects "std::". The
+// IEEE P1076 working group publishes the standard packages under Apache-2.0,
+// so Verilator can ship the normative sources rather than reimplement them.
+//
+// They are read on demand: a design that uses nothing but STD.STANDARD parses
+// nothing extra, and one that uses NUMERIC_STD reads it and the package it
+// depends on. Loading everything would cost every VHDL compile about half a
+// second for packages most designs never mention.
+
+namespace {
+
+struct VhdlBundledUnit final {
+    const char* namep;  // Package name, lowercased
+    const char* dependsp;  // Space separated packages it needs first
+    const char* filesp;  // Space separated sources, declaration before body
+};
+
+// The IEEE library. Order within each entry matters: a package declaration
+// must be analyzed before its body.
+const VhdlBundledUnit VHDL_IEEE_UNITS[] = {
+    {"std_logic_1164", "", "std_logic_1164.vhdl std_logic_1164-body.vhdl"},
+    {"numeric_std", "std_logic_1164", "numeric_std.vhdl numeric_std-body.vhdl"},
+    {"numeric_bit", "", "numeric_bit.vhdl numeric_bit-body.vhdl"},
+    {"numeric_std_unsigned", "numeric_std",
+     "numeric_std_unsigned.vhdl numeric_std_unsigned-body.vhdl"},
+    {"numeric_bit_unsigned", "numeric_bit",
+     "numeric_bit_unsigned.vhdl numeric_bit_unsigned-body.vhdl"},
+    {"math_real", "", "math_real.vhdl math_real-body.vhdl"},
+    {"math_complex", "math_real", "math_complex.vhdl math_complex-body.vhdl"},
+    {"std_logic_textio", "std_logic_1164", "std_logic_textio.vhdl"},
+    {"fixed_float_types", "", "fixed_float_types.vhdl"},
+    {"fixed_generic_pkg", "fixed_float_types numeric_std math_real",
+     "fixed_generic_pkg.vhdl fixed_generic_pkg-body.vhdl"},
+    {"fixed_pkg", "fixed_generic_pkg", "fixed_pkg.vhdl"},
+    {"float_generic_pkg", "fixed_float_types numeric_std math_real fixed_pkg",
+     "float_generic_pkg.vhdl float_generic_pkg-body.vhdl"},
+    {"float_pkg", "float_generic_pkg", "float_pkg.vhdl"},
+};
+
+std::vector<std::string> splitWords(const std::string& text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t end = text.find(' ', pos);
+        if (end == std::string::npos) {
+            out.push_back(text.substr(pos));
+            break;
+        }
+        if (end > pos) out.push_back(text.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+// Which packages of a shipped library the source names.
+//
+// Scanning the whole tree rather than just the context clauses is deliberate:
+// a package may be named by a use clause inside a declarative part (12.4), by
+// a context declaration (13.3), or by a selected name written out in full
+// with no use clause at all, and all three have to bring the package in.
+class VhdlLibraryScanner final : public VNVisitorConst {
+    const std::string m_libname;
+    std::set<std::string>& m_wanted;
+
+    void visit(AstVhdlSelected* nodep) override {
+        // Walk down to the leftmost name, which is the library
+        const AstVhdlSelected* innerp = nodep;
+        while (VN_IS(innerp->prefixp(), VhdlSelected)) {
+            innerp = VN_AS(innerp->prefixp(), VhdlSelected);
+        }
+        const AstVhdlName* const libp = VN_CAST(innerp->prefixp(), VhdlName);
+        const AstVhdlName* const pkgp = VN_CAST(innerp->suffixp(), VhdlName);
+        if (libp && pkgp && libp->name() == m_libname) m_wanted.insert(pkgp->name());
+        iterateChildrenConst(nodep);
+    }
+    void visit(AstNode* nodep) override { iterateChildrenConst(nodep); }
+
+public:
+    VhdlLibraryScanner(AstNode* nodep, const std::string& libname, std::set<std::string>& wanted)
+        : m_libname{libname}
+        , m_wanted{wanted} {
+        iterateAndNextConstNull(nodep);
+    }
+    ~VhdlLibraryScanner() override = default;
+};
+
+void V3Vhdl::gatherWanted(const AstNodeVhdlUnit* unitp, const std::string& libname,
+                          std::set<std::string>& wanted) {
+    VhdlLibraryScanner{const_cast<AstNodeVhdlUnit*>(unitp), libname, wanted};
+}
+
+void V3Vhdl::loadBundledLibraries(VInFilter* filterp) {
+    if (!v3Global.opt.stdVhdl()) return;
+    std::set<std::string> wanted;
+    for (const AstVhdlDesignFile* const filep : s_designFiles) {
+        for (AstNode* unitp = filep->unitsp(); unitp; unitp = unitp->nextp()) {
+            gatherWanted(VN_AS(unitp, NodeVhdlUnit), "ieee", wanted);
+        }
+    }
+    if (wanted.empty()) return;
+
+    // Follow what each wants, so that using NUMERIC_STD brings STD_LOGIC_1164
+    std::set<std::string> loaded;
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (const VhdlBundledUnit& unit : VHDL_IEEE_UNITS) {
+            if (!wanted.count(unit.namep) || loaded.count(unit.namep)) continue;
+            bool ready = true;
+            for (const std::string& dep : splitWords(unit.dependsp)) {
+                if (!loaded.count(dep)) {
+                    wanted.insert(dep);
+                    ready = false;
+                }
+            }
+            if (!ready) {
+                progress = true;
+                continue;
+            }
+            loaded.insert(unit.namep);
+            progress = true;
+            for (const std::string& file : splitWords(unit.filesp)) {
+                const std::string path
+                    = V3Os::filenameJoin(V3Options::getVhdlLibPath("ieee"), file);
+                FileLine* const flp = new FileLine{FileLine::builtInFilename()};
+                parseFile(flp, path, "ieee", filterp,
+                          "Cannot find the IEEE VHDL library Verilator ships;"
+                          " use --no-std-vhdl to compile without it: ");
+            }
+        }
+    }
+}
 
 //######################################################################
 // V3Vhdl methods
@@ -147,9 +289,12 @@ void V3Vhdl::parseFile(FileLine* fl, const string& filename, const string& libna
 
 bool V3Vhdl::anyRead() { return !s_filenames.empty(); }
 
-void V3Vhdl::analyzeAndLower(AstNetlist* rootp) {
+void V3Vhdl::analyzeAndLower(AstNetlist* rootp, VInFilter* filterp) {
     if (!anyRead()) return;  // No VHDL in this design; nothing to do
     UINFO(2, __FUNCTION__ << ": " << s_filenames.size() << " VHDL file(s)");
+
+    // Bring in the libraries Verilator ships, for whatever the design uses
+    loadBundledLibraries(filterp);
 
     // Order the design units so each follows what it depends on (13.5)
     V3VhdlLib::computeOrder();

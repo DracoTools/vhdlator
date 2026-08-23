@@ -288,6 +288,7 @@ private:
     bool m_savable = false;         // main switch: --savable
     VOptionBool m_schedZeroDelay;  // main switch: --sched-zero-delay
     bool m_stdPackage = true;       // main switch: --std-package
+    bool m_stdVhdl = true;          // main switch: --std-vhdl
     bool m_stdWaiver = true;        // main switch: --std-waiver
     bool m_structsPacked = false;   // main switch: --structs-packed
     bool m_systemC = false;         // main switch: --sc: System C instead of simple C++
@@ -505,6 +506,7 @@ public:
     bool stats() const { return m_stats; }
     bool statsVars() const { return m_statsVars; }
     bool stdPackage() const { return m_stdPackage; }
+    bool stdVhdl() const { return m_stdVhdl; }
     bool stdWaiver() const { return m_stdWaiver; }
     bool structsPacked() const { return m_structsPacked; }
     bool assertOn() const { return m_assert; }  // assertOn as __FILE__ may be defined
@@ -826,6 +828,8 @@ public:
     static string getenvVERILATOR_SOLVER();
     static string getStdPackagePath();
     static string getStdWaiverPath();
+    // Directory holding the VHDL libraries Verilator ships
+    static string getVhdlLibPath(const string& libname);
     static string getSupported(const string& var);
     static bool systemCSystemWide();
     static bool systemCFound();  // SystemC installed, or environment points to it

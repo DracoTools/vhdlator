@@ -22,7 +22,11 @@
 
 #include "V3Error.h"
 
+#include <set>
+#include <string>
+
 class AstNetlist;
+class AstNodeVhdlUnit;
 class FileLine;
 class VInFilter;
 
@@ -47,7 +51,14 @@ public:
 
     // Analyze every design unit read so far and lower it into the Verilator
     // AST under rootp. No-op when no VHDL was read.
-    static void analyzeAndLower(AstNetlist* rootp) VL_MT_DISABLED;
+    static void analyzeAndLower(AstNetlist* rootp, VInFilter* filterp) VL_MT_DISABLED;
+
+private:
+    // Read the packages of the libraries Verilator ships that the design asks
+    // for, and whatever those need in turn
+    static void loadBundledLibraries(VInFilter* filterp) VL_MT_DISABLED;
+    static void gatherWanted(const AstNodeVhdlUnit* unitp, const std::string& libname,
+                             std::set<std::string>& wanted) VL_MT_DISABLED;
 };
 
 #endif  // Guard

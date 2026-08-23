@@ -317,7 +317,10 @@ private:
             addStmt(varp);
             return;
         }
-        AstVar* const varp = newVar(symp, VVarType::PORT, flp);
+        // A VHDL port is a signal, which a process may assign as readily as a
+        // concurrent statement, so it is a variable with a direction rather
+        // than Verilog's PORT, which is a net
+        AstVar* const varp = newVar(symp, VVarType::VAR, flp);
         switch (nodep->mode()) {
         case VhdlMode::IN: varp->direction(VDirection::INPUT); break;
         case VhdlMode::OUT: varp->direction(VDirection::OUTPUT); break;
@@ -434,7 +437,29 @@ private:
         if (AstVhdlQualified* const p = VN_CAST(nodep, VhdlQualified)) {
             return lowerExpr(p->valuep());
         }
+        if (AstVhdlAttrName* const p = VN_CAST(nodep, VhdlAttrName)) return lowerAttr(p);
         unsup(flp, std::string{"expression "} + nodep->typeName());
+        return nullptr;
+    }
+
+    // The attributes that mean something at run time. Everything static has
+    // already folded, so what is left either reads a value or asks about a
+    // signal's history, and the latter needs the postponed region of M7.
+    AstNodeExpr* lowerAttr(AstVhdlAttrName* nodep) {
+        FileLine* const flp = nodep->fileline();
+        const std::string& attr = nodep->name();
+        AstNodeExpr* const argp = nodep->argp() ? lowerExpr(nodep->argp()) : nullptr;
+        // An enumeration value is its own position, and a position its own
+        // value, so 'POS and 'VAL are identities in the emitted code (16.2.3)
+        if (attr == "pos" || attr == "val") {
+            if (argp) return argp;
+        } else if (attr == "succ" || attr == "rightof") {
+            if (argp) return new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        } else if (attr == "pred" || attr == "leftof") {
+            if (argp) return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        }
+        if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+        unsup(flp, "attribute '" + attr);
         return nullptr;
     }
 
@@ -478,15 +503,16 @@ private:
     AstNodeExpr* lowerUnary(AstVhdlUnary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
-        if (symp && !symp->predefined()) {
-            unsup(flp, "user-defined unary operator");
+        VhdlType* const otypep = nodep->lhsp()->vhdlTypep();
+        // std_logic_1164 declares "not" for STD_ULOGIC itself, so an operator
+        // over a logic type is one of the intrinsics even when it is explicit
+        if (symp && !symp->predefined() && !isIeeeOperator(symp, otypep, nullptr)) {
+            unsup(flp, "user-defined unary operator \"" + symp->name() + "\"");
             return nullptr;
         }
         AstNodeExpr* const lhsp = lowerExpr(nodep->lhsp());
         if (!lhsp) return nullptr;
-        const bool real = nodep->lhsp()->vhdlTypep()
-                          && nodep->lhsp()->vhdlTypep()->base()->kind()
-                                 == VhdlTypeKind::FLOATING;
+        const bool real = otypep && otypep->base()->kind() == VhdlTypeKind::FLOATING;
         switch (nodep->op()) {
         case VhdlUnaryOp::IDENTITY: return lhsp;
         case VhdlUnaryOp::NEGATE:
@@ -727,19 +753,85 @@ private:
                     unsup(flp, "slice by an attribute range");
                     return nullptr;
                 }
-                return new AstSelExtract{flp, fromp, lowerExpr(rp->leftp()),
-                                         lowerExpr(rp->rightp())};
+                AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+                AstNodeExpr* const rightp = lowerExpr(rp->rightp());
+                if (!leftp || !rightp) {
+                    VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                    return nullptr;
+                }
+                // A slice whose bounds move together but keep their width --
+                // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
+                // writes both ends, so the width has to be recovered from
+                // them before Verilator's fixed-width form can be used.
+                if (!VN_IS(leftp, Const) || !VN_IS(rightp, Const)) {
+                    if (AstNodeExpr* const selp
+                        = indexedSlice(rp, fromp, leftp, rightp, flp)) {
+                        return selp;
+                    }
+                }
+                return new AstSelExtract{flp, fromp, leftp, rightp};
             }
             AstNodeExpr* outp = fromp;
             for (AstNode* p = nodep->argsp(); p; p = p->nextp()) {
                 AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                 if (!asp || !asp->actualp()) continue;
-                outp = new AstSelBit{flp, outp, lowerExpr(asp->actualp())};
+                AstNodeExpr* const indexp = lowerExpr(asp->actualp());
+                if (!indexp) {
+                    VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;
+                }
+                outp = new AstSelBit{flp, outp, indexp};
             }
             return outp;
         }
         // Otherwise a function call
         return lowerFuncCall(nodep, flp);
+    }
+
+    // Peel "expr + k" or "expr - k" down to its base, accumulating the
+    // constant offset
+    static AstNodeVhdlExpr* peelOffset(AstNodeVhdlExpr* nodep, int64_t& offset) {
+        while (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
+            const bool add = binp->op() == VhdlBinaryOp::ADD;
+            if (!add && binp->op() != VhdlBinaryOp::SUB) break;
+            const VhdlValue rhs = V3VhdlEval::eval(binp->rhsp());
+            if (!rhs.isInt()) break;
+            offset += add ? rhs.toInt() : -rhs.toInt();
+            nodep = binp->lhsp();
+        }
+        return nodep;
+    }
+
+    // The indexed part select a moving slice becomes, or null if its bounds
+    // do not move together
+    AstNodeExpr* indexedSlice(AstVhdlRange* rp, AstNodeExpr* fromp, AstNodeExpr* leftp,
+                              AstNodeExpr* rightp, FileLine* flp) {
+        int64_t leftOff = 0;
+        int64_t rightOff = 0;
+        AstNodeVhdlExpr* const leftBasep = peelOffset(rp->leftp(), leftOff);
+        AstNodeVhdlExpr* const rightBasep = peelOffset(rp->rightp(), rightOff);
+        if (leftBasep == rightBasep) {
+            // Same expression node on both ends, as in v(i + 7 downto i)
+        } else {
+            AstNodeExpr* const ap = lowerExpr(leftBasep);
+            AstNodeExpr* const bp = lowerExpr(rightBasep);
+            const bool same = ap && bp && ap->sameTree(bp);
+            if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
+            if (bp) VL_DO_DANGLING(bp->deleteTree(), bp);
+            if (!same) return nullptr;
+        }
+        const bool downto = rp->dir() == VhdlDir::DOWNTO;
+        const int64_t width = downto ? leftOff - rightOff + 1 : rightOff - leftOff + 1;
+        if (width < 1 || width > (1 << 20)) return nullptr;
+        AstNodeExpr* const widthp
+            = new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(width)};
+        // The select counts up from the low end and down from the high one
+        if (downto) {
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return new AstSelMinus{flp, fromp, leftp, widthp};
+        }
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        return new AstSelPlus{flp, fromp, leftp, widthp};
     }
 
     // A type conversion between closely related types (9.3.6). Between
@@ -1360,12 +1452,17 @@ private:
                     unsup(flp, "non-static range choice");
                     return nullptr;
                 }
-                onep = new AstAnd{
-                    flp,
-                    new AstGteS{flp, lowerExpr(selp), lowerValue(lo, lo.typep(), flp)},
-                    new AstLteS{flp, lowerExpr(selp), lowerValue(hi, hi.typep(), flp)}};
+                AstNodeExpr* const sel1p = lowerExpr(selp);
+                AstNodeExpr* const sel2p = lowerExpr(selp);
+                if (!sel1p || !sel2p) return nullptr;
+                onep = new AstAnd{flp,
+                                  new AstGteS{flp, sel1p, lowerValue(lo, lo.typep(), flp)},
+                                  new AstLteS{flp, sel2p, lowerValue(hi, hi.typep(), flp)}};
             } else if (chp->valuep()) {
-                onep = new AstEq{flp, lowerExpr(selp), lowerExpr(chp->valuep())};
+                AstNodeExpr* const selValp = lowerExpr(selp);
+                AstNodeExpr* const chValp = lowerExpr(chp->valuep());
+                if (!selValp || !chValp) return nullptr;
+                onep = new AstEq{flp, selValp, chValp};
             }
             if (!onep) continue;
             testp = testp ? new AstOr{flp, testp, onep} : onep;

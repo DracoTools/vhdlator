@@ -12,9 +12,9 @@ import collections
 
 test.scenarios('dist')
 
-Tabs_Exempt_Re = r'(\.out$)|(/fstcpp)|(Makefile)|(\.mk$)|(\.mk\.in$)|test_regress/t/t_preproc\.v|install-sh'
+Tabs_Exempt_Re = r'(\.out$)|(/fstcpp)|(/vhdl/)|(Makefile)|(\.mk$)|(\.mk\.in$)|test_regress/t/t_preproc\.v|install-sh'
 
-Unicode_Exempt_Re = r'(Changes$|CONTRIBUTORS$|LICENSES?|contributors.rst$|spelling.txt$|ci-rtlmeter-report.py)'
+Unicode_Exempt_Re = r'(Changes$|CONTRIBUTORS$|LICENSES?|contributors.rst$|spelling.txt$|ci-rtlmeter-report.py|/vhdl/)'
 
 
 def get_source_files():
@@ -92,7 +92,8 @@ for filename in sorted(files.keys()):
 
     if (re.search(r'[ \t]\n', contents)
             or re.search(r'\n\n+$', contents)):  # Regexp repeated below
-        eol_ws_exempt = ('spelling.txt' in filename or '/gtkwave/' in filename)
+        eol_ws_exempt = ('spelling.txt' in filename or '/gtkwave/' in filename
+                         or '/vhdl/' in filename)
         if eol_ws_exempt:
             continue
         if 'HARNESS_UPDATE_GOLDEN' in os.environ:

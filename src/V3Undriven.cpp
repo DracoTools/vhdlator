@@ -245,7 +245,10 @@ public:
                     << procWritep()->warnContextSecondary());
         }
         const AstNode* const initp = nodep->hasUserInit() ? initStaticp() : initialp();
-        if (initp && contAssignp() && !nodep->isClassMember() && !nodep->isFuncLocal()) {
+        // A VHDL signal's initial value is its state before anything drives
+        // it, and says nothing about how it is driven afterwards (6.4.2.3)
+        if (initp && contAssignp() && !nodep->isClassMember() && !nodep->isFuncLocal()
+            && !nodep->fileline()->language().vhdl()) {
             initp->v3warn(E_CONTASSINIT, "Continuous assignment to variable with initial value: "
                                              << nodep->prettyNameQ() << '\n'
                                              << initp->warnMore()

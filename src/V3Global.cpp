@@ -146,7 +146,7 @@ void V3Global::readFiles() {
 
     // Analyze the VHDL design units read above and lower them into the netlist.
     // Must precede V3LinkCells, which binds cells across both languages.
-    V3Vhdl::analyzeAndLower(v3Global.rootp());
+    V3Vhdl::analyzeAndLower(v3Global.rootp(), &filter);
     V3Error::abortIfErrors();
 
     if (!v3Global.opt.preprocOnly() || v3Global.opt.preprocResolve()) {

@@ -34,6 +34,7 @@ EXEMPT_FILES_LIST = """
     docs/spelling.txt
     docs/verilated.dox
     include/fstcpp
+    include/vhdl
     include/vltstd
     install-sh
     src/mkinstalldirs

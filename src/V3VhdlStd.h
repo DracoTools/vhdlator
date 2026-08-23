@@ -70,6 +70,7 @@ public:
 
 private:
     static void buildTextio() VL_MT_DISABLED;
+    static void buildEnv() VL_MT_DISABLED;
 
 public:
     static void selfTest() VL_MT_DISABLED;

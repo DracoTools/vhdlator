@@ -1773,7 +1773,16 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
                     nodep->vhdlSymp(objects[0]);
                     return objects[0]->typep() ? objects[0]->typep() : V3VhdlStd::errorType();
                 }
-                return pick(nodep, found, wantp, "declaration of '" + parts.back() + "'");
+                // Written without arguments, the name can only denote a
+                // parameterless declaration: "std.env.stop" is the STOP that
+                // takes none, not the one that takes a status (4.2.2.1)
+                std::vector<VhdlSymbol*> callables;
+                for (VhdlSymbol* const symp : found) {
+                    if (symp->paramTypes().empty()) callables.push_back(symp);
+                }
+                if (callables.empty()) callables = found;
+                return pick(nodep, callables, wantp,
+                            "declaration of '" + parts.back() + "'");
             }
         }
     }

@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_ieee.vhd:18:20: Cannot find type 'std_logic'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_ieee.vhd:19:20: Cannot find type 'std_logic'
+%Error: t/t_vhdl_ieee.vhd:20:20: Cannot find type 'std_logic'
+%Error: t/t_vhdl_ieee.vhd:21:20: Cannot find type 'std_logic_vector'
+%Error: t/t_vhdl_ieee.vhd:22:20: Cannot find type 'std_logic'
+%Error: t/t_vhdl_ieee.vhd:26:14: Cannot find type 'unsigned'
+%Error: t/t_vhdl_ieee.vhd:32:23: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+%Error: t/t_vhdl_ieee.vhd:41:11: No visible subprogram 'c' takes 1 argument(s) of these types
+%Error: Exiting due to

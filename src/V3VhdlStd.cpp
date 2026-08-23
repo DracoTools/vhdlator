@@ -59,6 +59,7 @@ VhdlType* s_errorp = nullptr;
 VhdlType* s_linep = nullptr;
 VhdlType* s_textp = nullptr;
 VhdlType* s_sidep = nullptr;
+VhdlScope* s_envp = nullptr;
 
 FileLine* stdFileline() {
     static FileLine* s_flp = nullptr;
@@ -230,6 +231,7 @@ void V3VhdlStd::clear() {
     s_built = false;
     s_stdLibp = s_standardp = s_textiop = nullptr;
     s_linep = s_textp = s_sidep = nullptr;
+    s_envp = nullptr;
     s_booleanp = s_bitp = s_characterp = s_severityp = nullptr;
     s_integerp = s_realp = s_timep = s_delayp = nullptr;
     s_naturalp = s_positivep = s_stringp = nullptr;
@@ -506,11 +508,26 @@ void V3VhdlStd::build() {
     }
 
     buildTextio();
+    buildEnv();
     UINFO(4, "Built std.standard with " << s_standardp->direct().size() << " declarations");
 }
 
 //######################################################################
 // Package TEXTIO (16.4)
+
+// Package ENV of library STD (16.5). Built in code rather than shipped as a
+// source, because its three subprograms are simulator control -- there is no
+// VHDL that could implement them.
+void V3VhdlStd::buildEnv() {
+    s_envp = VhdlSymTab::newScope(nullptr, "env");
+    s_stdLibp->addNamed("env", s_envp);
+    addProcN(s_envp, "stop", {});
+    addProcN(s_envp, "stop", {{"status", s_integerp}});
+    addProcN(s_envp, "finish", {});
+    addProcN(s_envp, "finish", {{"status", s_integerp}});
+    addFuncN(s_envp, "resolution_limit", s_delayp ? s_delayp : s_timep, {});
+    UINFO(4, "Built std.env with " << s_envp->direct().size() << " declarations");
+}
 
 void V3VhdlStd::buildTextio() {
     s_textiop = VhdlSymTab::newScope(nullptr, "textio");

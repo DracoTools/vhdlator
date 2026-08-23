@@ -1767,12 +1767,20 @@ Summary:
 .. option:: --no-std
 
    Prevents parsing standard input files, alias for
-   :vlopt:`--no-std-package`, :vlopt:`--no-std-waiver`. This may be
+   :vlopt:`--no-std-package`, :vlopt:`--no-std-vhdl`,
+   :vlopt:`--no-std-waiver`. This may be
    extended to prevent reading other standardized files in future versions.
 
 .. option:: --no-std-package
 
    Prevents parsing standard `std::` package file.
+
+.. option:: --no-std-vhdl
+
+   Prevents reading the VHDL libraries Verilator ships. Without this option,
+   a design whose context clause names a package of library `ieee`, such as
+   `ieee.numeric_std`, has that package and whatever it depends on read
+   automatically; use this option to supply your own copies instead.
 
 .. option:: --no-std-waiver
 

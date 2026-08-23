@@ -17,7 +17,7 @@ test.scenarios('linter')
 test.top_filename = "t/t_vhdl_parse.vhd"
 
 test.lint(fails=True,
-          verilator_flags2=["--dump-vhdl-parse", "--dump-tree-addrids"],
+          verilator_flags2=["--dump-vhdl-parse", "--dump-tree-addrids", "--no-std-vhdl"],
           expect_filename=test.golden_filename)
 
 test.passes()
