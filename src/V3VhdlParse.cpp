@@ -1563,12 +1563,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseGenerate(const std::string& label) {
         nodep = new AstVhdlGenerate{flp, VhdlLoopKind::FOR};
         nodep->paramName(identifier("a generate parameter name"));
         expect(VhdlTokType::KWD_IN, "'in' in a for generate");
-        AstNodeVhdl* const rangep = parseDiscreteRange();
-        if (AstVhdlRange* const rp = VN_CAST(rangep, VhdlRange)) {
-            nodep->rangep(rp);
-        } else if (rangep) {
-            VL_DO_DANGLING(rangep->deleteTree(), rangep);
-        }
+        nodep->rangep(parseDiscreteRange());
         expect(VhdlTokType::KWD_GENERATE, "'generate' after the range");
         nodep->addAltsp(parseGenerateBody());
     } else if (check(VhdlTokType::KWD_IF)) {
@@ -1812,13 +1807,8 @@ AstNodeVhdlStmt* V3VhdlParse::parseLoop(const std::string& label) {
         nodep = new AstVhdlLoop{flp, VhdlLoopKind::FOR};
         nodep->paramName(identifier("a loop parameter name"));
         expect(VhdlTokType::KWD_IN, "'in' in a for loop");
-        AstNodeVhdl* const rangep = parseDiscreteRange();
-        if (AstVhdlRange* const rp = VN_CAST(rangep, VhdlRange)) {
-            nodep->rangep(rp);
-        } else if (rangep) {
-            // A subtype indication used as the range; keep its constraint if any
-            VL_DO_DANGLING(rangep->deleteTree(), rangep);
-        }
+        // Either "1 to 5" or a subtype indication such as "integer range 1 to 5"
+        nodep->rangep(parseDiscreteRange());
     } else {
         nodep = new AstVhdlLoop{flp, VhdlLoopKind::LOOP};
     }
@@ -2075,26 +2065,12 @@ AstVhdlChoice* V3VhdlParse::parseChoices() {
     do {
         FileLine* const flp = here();
         if (check(VhdlTokType::KWD_OTHERS)) {
-            listp = AstNode::addNextNull(listp, new AstVhdlChoice{flp, nullptr});
+            listp = AstNode::addNextNull(listp, new AstVhdlChoice{flp, nullptr, true});
             continue;
         }
         if (looksLikeRange()) {
-            AstNodeVhdl* const rangep = parseDiscreteRange();
-            // A choice holds an expression; wrap the range so it survives
-            AstVhdlChoice* const choicep = new AstVhdlChoice{flp, nullptr};
-            if (AstVhdlRange* const rp = VN_CAST(rangep, VhdlRange)) {
-                if (rp->attrp() && !rp->leftp()) {
-                    choicep->exprp(rp->attrp()->unlinkFrBack());
-                    VL_DO_DANGLING(rp->deleteTree(), rp);
-                } else {
-                    // Keep the range by hanging it off a call-free wrapper
-                    choicep->exprp(new AstVhdlCall{flp, new AstVhdlName{flp, "range"}});
-                    VN_AS(choicep->exprp(), VhdlCall)->addArgsp(rp);
-                }
-            } else if (rangep) {
-                VL_DO_DANGLING(rangep->deleteTree(), rangep);
-            }
-            listp = AstNode::addNextNull(listp, choicep);
+            listp = AstNode::addNextNull(listp,
+                                         new AstVhdlChoice{flp, parseDiscreteRange()});
             continue;
         }
         AstNodeVhdlExpr* const exprp = parseExpression();

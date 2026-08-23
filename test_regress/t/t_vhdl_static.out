@@ -1,0 +1,46 @@
+VHDLPACKAGE work.p
+  enumeration literal 'a' : opcode_t
+  enumeration literal 'b' : opcode_t
+  enumeration literal 'c' : opcode_t
+  constant asc_c : boolean = false
+  constant bool_c : boolean = false
+  enumeration literal busy : state_t
+  type byte_t : byte_t range 0 to 255
+  type byte_vec_t : byte_vec_t (7 downto 0)
+  constant char_c : character = 'x'
+  constant delay_c : time = 1000000000 fs
+  constant dim2_c : integer = 3
+  enumeration literal done : state_t
+  type freq_t : freq_t range 0 hz to 1000000 hz
+  physical unit ghz : freq_t = 1000000000 hz
+  constant high_c : integer = 255
+  physical unit hz : freq_t = 1 hz
+  enumeration literal idle : state_t
+  constant image_c : string = "n=42"
+  physical unit khz : freq_t = 1000 hz
+  constant left_c : integer = 7
+  constant len_c : integer = 8
+  type level_t : level_t range -1.50000 to 1.50000
+  constant mask_c : integer = 255
+  type matrix_t : matrix_t (0 to 1, 0 to 2)
+  physical unit mhz : freq_t = 1000000 hz
+  constant modulo_c : integer = 2
+  constant neg_c : integer = -85
+  type opcode_t : opcode_t range 'a' to 'c'
+  constant pos_c : integer = 2
+  constant real_c : real = 2.50000
+  constant remain_c : integer = -1
+  type small_t : small_t range 1 to 8
+  type state_t : state_t range idle to done
+  constant succ_c : state_t = busy
+  constant value_c : integer = 17
+  constant width_c : integer = 8
+  type word_t : word_t (<>)
+VHDLENTITY work.t_vhdl_static
+VHDLARCHITECTURE work.rtl
+  signal s : state_t
+  signal v : byte_vec_t
+%Error: VHDL lowering is not yet implemented; analyzed 3 design unit(s) from 1 file(s)
+... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

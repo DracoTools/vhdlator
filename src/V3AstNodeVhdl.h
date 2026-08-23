@@ -303,15 +303,22 @@ public:
 };
 
 class AstVhdlChoice final : public AstNodeVhdl {
-    // choice (9.3.3.1): an expression, a discrete range, or "others"
-    // @astgen op1 := exprp : Optional[AstNodeVhdlExpr]  // Absent means "others"
+    // choice (9.3.3.1): a simple expression, a discrete range, an element
+    // simple name, or "others"
+    // @astgen op1 := exprp : Optional[AstNodeVhdl]  // Expression or range
+    const bool m_isOthers;
+
 public:
-    AstVhdlChoice(FileLine* fl, AstNodeVhdlExpr* exprp)
-        : ASTGEN_SUPER_VhdlChoice(fl) {
+    AstVhdlChoice(FileLine* fl, AstNodeVhdl* exprp, bool isOthers = false)
+        : ASTGEN_SUPER_VhdlChoice(fl)
+        , m_isOthers{isOthers} {
         this->exprp(exprp);
     }
     ASTGEN_MEMBERS_AstVhdlChoice;
-    bool isOthers() const { return !exprp(); }
+    bool isOthers() const { return m_isOthers; }
+    // The expression form, for the common case where a choice is a value
+    AstNodeVhdlExpr* valuep() const { return VN_CAST(exprp(), NodeVhdlExpr); }
+    AstVhdlRange* rangep() const { return VN_CAST(exprp(), VhdlRange); }
 };
 
 class AstVhdlContextItem final : public AstNodeVhdl {
@@ -1059,7 +1066,7 @@ public:
 class AstVhdlGenerate final : public AstNodeVhdlStmt {
     // for/if/case generate_statement (11.8). The alternatives carry the
     // conditions or choices; a for-generate uses paramName and rangep.
-    // @astgen op1 := rangep : Optional[AstVhdlRange]  // for-generate
+    // @astgen op1 := rangep : Optional[AstNodeVhdl]  // for-generate: a discrete range
     // @astgen op2 := exprp : Optional[AstNodeVhdlExpr]  // case-generate selector
     // @astgen op3 := altsp : List[AstVhdlGenerateBody]
     std::string m_paramName;  // for-generate parameter
@@ -1108,7 +1115,7 @@ public:
 class AstVhdlLoop final : public AstNodeVhdlStmt {
     // loop_statement (10.10), in its bare, while and for forms
     // @astgen op1 := condp : Optional[AstNodeVhdlExpr]  // WHILE
-    // @astgen op2 := rangep : Optional[AstVhdlRange]  // FOR
+    // @astgen op2 := rangep : Optional[AstNodeVhdl]  // FOR: a discrete range
     // @astgen op3 := stmtsp : List[AstNodeVhdlStmt]
     const VhdlLoopKind m_kind;
     std::string m_paramName;  // FOR loop parameter

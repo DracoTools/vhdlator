@@ -1,48 +1,39 @@
 VHDLPACKAGE work.p
-  enumeration literal a : opcode_t
+  enumeration literal 'a' : opcode_t
+  enumeration literal 'b' : opcode_t
+  enumeration literal 'c' : opcode_t
   function add1 : integer (integer)
     parameter x : integer
   function add1 : real (real)
     parameter x : real
-  enumeration literal b : opcode_t
-  type byte_t : byte_t
-  enumeration literal c : opcode_t
+  type byte_t : byte_t range 0 to 255
   enumeration literal done : state_t
-  type freq_t : freq_t
-  physical unit hz : freq_t
+  type freq_t : freq_t range 0 hz to 1000000 hz
+  physical unit hz : freq_t = 1 hz
   enumeration literal idle : state_t
-  constant k : integer
-  physical unit khz : freq_t
-  type level_t : level_t
+  constant k : integer = 42
+  physical unit khz : freq_t = 1000 hz
+  type level_t : level_t range -1.00000 to 1.00000
   attribute mark : boolean
-  type matrix_t : matrix_t
-  physical unit mhz : freq_t
-  constant name : string
-  type nibble_t : nibble_t
-  type opcode_t : opcode_t
+  type matrix_t : matrix_t (0 to 3, 0 to 3)
+  physical unit mhz : freq_t = 1000000 hz
+  constant name : string = "hello"
+  type nibble_t : nibble_t (3 downto 0)
+  type opcode_t : opcode_t range 'a' to 'c'
   type point_t : point_t
   type ptr_t : ptr_t
   enumeration literal running : state_t
-  type small_t : small_t
-  type state_t : state_t
+  type small_t : small_t range 0 to 15
+  type state_t : state_t range idle to done
   procedure swap (integer, integer)
     parameter a : integer
     parameter b : integer
   type text_t : text_t
-  type word_t : word_t
+  type word_t : word_t (<>)
 VHDLPACKAGEBODY work.p
-  function add1 : integer (integer)
-    variable v : integer
-    parameter x : integer
-  function add1 : real (real)
-    parameter x : real
-  procedure swap (integer, integer)
-    parameter a : integer
-    parameter b : integer
-    variable t : integer
 VHDLENTITY work.t
   port clk : bit
-  port q : array of bit
+  port q : bit_vector
   generic width : positive
 VHDLARCHITECTURE work.rtl
   signal count : natural

@@ -217,157 +217,158 @@
   1:4:3:1:4:2:4:1:2:2: VHDLAGGREGATE (JI) {f71at}
   1:4:3:1:4:2:4:1:2:2:1: VHDLELEMASSOC (KI) {f71au}
   1:4:3:1:4:2:4:1:2:2:1:1: VHDLCHOICE (LI) {f71au}
-  1:4:3:1:4:2:4:1:2:2:1:1:1: VHDLATTRNAME (MI) {f71av}  range
-  1:4:3:1:4:2:4:1:2:2:1:1:1:1: VHDLNAME (NI) {f71au}  d
-  1:4:3:1:4:2:4:1:2:2:1:2: VHDLLITERAL (OI) {f71bf}  0 [character]
-  1:4:3:1:4:2:4:1:4: VHDLSIGASSIGN (PI) {f71bp} [simple]
-  1:4:3:1:4:2:4:1:4:1: VHDLNAME (QI) {f71bp}  state
-  1:4:3:1:4:2:4:1:4:2: VHDLWAVEFORM (RI) {f71by}
-  1:4:3:1:4:2:4:1:4:2:1: VHDLNAME (SI) {f71by}  running
-  1:4:3:1:4:2: VHDLALTERNATIVE (TI) {f72ao}
-  1:4:3:1:4:2:1: VHDLCHOICE (UI) {f72ao}
-  1:4:3:1:4:2:1:1: VHDLNAME (VI) {f72ao}  running
-  1:4:3:1:4:2:4: VHDLSIGASSIGN (WI) {f73al} [simple]
-  1:4:3:1:4:2:4:1: VHDLNAME (XI) {f73al}  cnt
-  1:4:3:1:4:2:4:2: VHDLWAVEFORM (YI) {f73as}
-  1:4:3:1:4:2:4:2:1: VHDLBINARY (ZI) {f73aw} [+]
-  1:4:3:1:4:2:4:2:1:1: VHDLNAME (AJ) {f73as}  cnt
-  1:4:3:1:4:2:4:2:1:2: VHDLLITERAL (BJ) {f73ay}  1 [integer]
-  1:4:3:1:4:2:4: VHDLLOOP (CJ) {f74al}
-  1:4:3:1:4:2:4:2: VHDLRANGE (DJ) {f74au} [to]
-  1:4:3:1:4:2:4:2:1: VHDLLITERAL (EJ) {f74au}  0 [integer]
-  1:4:3:1:4:2:4:2:2: VHDLLITERAL (FJ) {f74az}  3 [integer]
-  1:4:3:1:4:2:4:3: VHDLNEXT (GJ) {f75an}
-  1:4:3:1:4:2:4:3:1: VHDLBINARY (HJ) {f75be} [=]
-  1:4:3:1:4:2:4:3:1:1: VHDLCALL (IJ) {f75ba}
-  1:4:3:1:4:2:4:3:1:1:1: VHDLNAME (JJ) {f75ax}  cnt
-  1:4:3:1:4:2:4:3:1:1:2: VHDLASSOC (KJ) {f75bb}
-  1:4:3:1:4:2:4:3:1:1:2:2: VHDLNAME (LJ) {f75bb}  i
-  1:4:3:1:4:2:4:3:1:2: VHDLLITERAL (MJ) {f75bg}  1 [character]
-  1:4:3:1:4:2:4: VHDLSIGASSIGN (NJ) {f77al} [simple]
-  1:4:3:1:4:2:4:1: VHDLNAME (OJ) {f77al}  state
-  1:4:3:1:4:2:4:2: VHDLWAVEFORM (PJ) {f77au}
-  1:4:3:1:4:2:4:2:1: VHDLNAME (QJ) {f77au}  done
-  1:4:3:1:4:2: VHDLALTERNATIVE (RJ) {f78ao}
-  1:4:3:1:4:2:1: VHDLCHOICE (SJ) {f78ao}
-  1:4:3:1:4:2:4: VHDLSIGASSIGN (TJ) {f79al} [simple]
-  1:4:3:1:4:2:4:1: VHDLNAME (UJ) {f79al}  state
-  1:4:3:1:4:2:4:2: VHDLWAVEFORM (VJ) {f79au}
-  1:4:3:1:4:2:4:2:1: VHDLNAME (WJ) {f79au}  idle
-  1:4: VHDLSIGASSIGN (XJ) {f85ad} [simple]
-  1:4:1: VHDLNAME (YJ) {f85ad}  q
-  1:4:2: VHDLWAVEFORM (ZJ) {f85ai}
-  1:4:2:1: VHDLCALL (AK) {f85ay}
-  1:4:2:1:1: VHDLNAME (BK) {f85ai}  std_logic_vector
-  1:4:2:1:2: VHDLASSOC (CK) {f85az}
-  1:4:2:1:2:2: VHDLNAME (DK) {f85az}  cnt
-  1:4: VHDLSIGASSIGN (EK) {f86ad} [conditional]
-  1:4:1: VHDLNAME (FK) {f86ad}  busy
-  1:4:3: VHDLALTERNATIVE (GK) {f86ad}
-  1:4:3:2: VHDLBINARY (HK) {f86ba} [=]
-  1:4:3:2:1: VHDLNAME (IK) {f86au}  state
-  1:4:3:2:2: VHDLNAME (JK) {f86bc}  running
-  1:4:3:3: VHDLWAVEFORM (KK) {f86al}
-  1:4:3:3:1: VHDLLITERAL (LK) {f86al}  1 [character]
-  1:4:3: VHDLALTERNATIVE (MK) {f86bp}
-  1:4:3:3: VHDLWAVEFORM (NK) {f86bp}
-  1:4:3:3:1: VHDLLITERAL (OK) {f86bp}  0 [character]
-  1:4: VHDLSIGASSIGN (PK) {f87ad} [selected]
-  1:4:1: VHDLCALL (QK) {f88ag}
-  1:4:1:1: VHDLNAME (RK) {f88af}  q
-  1:4:1:2: VHDLASSOC (SK) {f88ah}
-  1:4:1:2:2: VHDLLITERAL (TK) {f88ah}  0 [integer]
-  1:4:3: VHDLALTERNATIVE (UK) {f88an}
-  1:4:3:1: VHDLCHOICE (VK) {f88ax}
-  1:4:3:1:1: VHDLLITERAL (WK) {f88ax}  00 [string]
-  1:4:3:3: VHDLWAVEFORM (XK) {f88an}
-  1:4:3:3:1: VHDLCALL (YK) {f88ao}
-  1:4:3:3:1:1: VHDLNAME (ZK) {f88an}  d
-  1:4:3:3:1:2: VHDLASSOC (AL) {f88ap}
-  1:4:3:3:1:2:2: VHDLLITERAL (BL) {f88ap}  0 [integer]
-  1:4:3: VHDLALTERNATIVE (CL) {f89an}
-  1:4:3:1: VHDLCHOICE (DL) {f89ax}
-  1:4:3:1:1: VHDLLITERAL (EL) {f89ax}  01 [string]
-  1:4:3:3: VHDLWAVEFORM (FL) {f89an}
-  1:4:3:3:1: VHDLCALL (GL) {f89ao}
-  1:4:3:3:1:1: VHDLNAME (HL) {f89an}  d
-  1:4:3:3:1:2: VHDLASSOC (IL) {f89ap}
-  1:4:3:3:1:2:2: VHDLLITERAL (JL) {f89ap}  1 [integer]
-  1:4:3: VHDLALTERNATIVE (KL) {f90an}
-  1:4:3:1: VHDLCHOICE (LL) {f90ax}
-  1:4:3:3: VHDLWAVEFORM (ML) {f90an}
-  1:4:3:3:1: VHDLLITERAL (NL) {f90an}  0 [character]
-  1:4:4: VHDLNAME (OL) {f87ai}  sel
-  1:4: VHDLGENERATE (PL) {f92aj}  gen
-  1:4:1: VHDLRANGE (QL) {f92as} [to]
-  1:4:1:1: VHDLLITERAL (RL) {f92as}  0 [integer]
-  1:4:1:2: VHDLBINARY (SL) {f92bc} [-]
-  1:4:1:2:1: VHDLNAME (TL) {f92ax}  width
-  1:4:1:2:2: VHDLLITERAL (UL) {f92bd}  1 [integer]
-  1:4:3: VHDLGENERATEBODY (VL) {f93af}
-  1:4:3:4: VHDLINSTANCE (WL) {f93am}  inst
-  1:4:3:4:1: VHDLNAME (XL) {f93aw}  sub
-  1:4:3:4:2: VHDLASSOC (YL) {f93bn}
-  1:4:3:4:2:1: VHDLNAME (ZL) {f93bn}  n
-  1:4:3:4:2:2: VHDLNAME (AM) {f93bs}  i
-  1:4:3:4:3: VHDLASSOC (BM) {f93cf}
-  1:4:3:4:3:1: VHDLNAME (CM) {f93cf}  a
-  1:4:3:4:3:2: VHDLCALL (DM) {f93cl}
-  1:4:3:4:3:2:1: VHDLNAME (EM) {f93ck}  d
-  1:4:3:4:3:2:2: VHDLASSOC (FM) {f93cm}
-  1:4:3:4:3:2:2:2: VHDLNAME (GM) {f93cm}  i
-  1:4:3:4:3: VHDLASSOC (HM) {f93cq}
-  1:4:3:4:3:1: VHDLNAME (IM) {f93cq}  y
-  1:4:3:4:3:2: VHDLOPEN (JM) {f93cz}
-  1:4: VHDLGENERATE (KM) {f96ak}  cond
-  1:4:3: VHDLGENERATEBODY (LM) {f97af}
-  1:4:3:1: VHDLBINARY (MM) {f96at} [>]
-  1:4:3:1:1: VHDLNAME (NM) {f96an}  width
-  1:4:3:1:2: VHDLLITERAL (OM) {f96av}  4 [integer]
-  1:4:3:4: VHDLASSERT (PM) {f97af}
-  1:4:3:4:1: VHDLBINARY (QM) {f97ay} [=]
-  1:4:3:4:1:1: VHDLBINARY (RM) {f97as} [mod]
-  1:4:3:4:1:1:1: VHDLNAME (SM) {f97am}  width
-  1:4:3:4:1:1:2: VHDLLITERAL (TM) {f97aw}  2 [integer]
-  1:4:3:4:1:2: VHDLLITERAL (UM) {f97ba}  0 [integer]
-  1:4:3:4:2: VHDLLITERAL (VM) {f97bj}  even only [string]
-  1:4:3:4:3: VHDLNAME (WM) {f97ce}  warning
-  1:4:3: VHDLGENERATEBODY (XM) {f99af}
-  1:4:3:4: VHDLASSERT (YM) {f99af}
-  1:4:3:4:1: VHDLNAME (ZM) {f99am}  false
-  1:4:3:4:3: VHDLNAME (AN) {f99bb}  note
-  1:4: VHDLPROCESS (BN) {f103ak}  stim [sens=none]
-  1:4:2: VHDLOBJECTDECL (CN) {f104ao}  l [variable]
-  1:4:2:1: VHDLSUBTYPEIND (DN) {f104as}
-  1:4:2:1:2: VHDLNAME (EN) {f104as}  integer
-  1:4:2:2: VHDLLITERAL (FN) {f104bd}  0 [integer]
-  1:4:3: VHDLWAIT (GN) {f106af}
-  1:4:3:2: VHDLCALL (HN) {f106bb}
-  1:4:3:2:1: VHDLNAME (IN) {f106aq}  rising_edge
-  1:4:3:2:2: VHDLASSOC (JN) {f106bc}
-  1:4:3:2:2:2: VHDLNAME (KN) {f106bc}  clk
-  1:4:3: VHDLWAIT (LN) {f107af}
-  1:4:3:3: VHDLLITERAL (MN) {f107ao}  10 [physical]
-  1:4:3:3:1: VHDLNAME (NN) {f107ar}  ns
-  1:4:3: VHDLWAIT (ON) {f108af}
-  1:4:3:1: VHDLNAME (PN) {f108an}  d
-  1:4:3:1: VHDLNAME (QN) {f108aq}  rst
-  1:4:3:2: VHDLBINARY (RN) {f108be} [=]
-  1:4:3:2:1: VHDLNAME (SN) {f108ba}  rst
-  1:4:3:2:2: VHDLLITERAL (TN) {f108bg}  0 [character]
-  1:4:3: VHDLVARASSIGN (UN) {f109af}
-  1:4:3:1: VHDLNAME (VN) {f109af}  l
-  1:4:3:2: VHDLBINARY (WN) {f109am} [+]
-  1:4:3:2:1: VHDLNAME (XN) {f109ak}  l
-  1:4:3:2:2: VHDLLITERAL (YN) {f109ao}  1 [integer]
-  1:4:3: VHDLASSERT (ZN) {f110af}
-  1:4:3:2: VHDLBINARY (AO) {f110au} [&]
-  1:4:3:2:1: VHDLLITERAL (BO) {f110am}  tick  [string]
-  1:4:3:2:2: VHDLATTRNAME (CO) {f110bd}  image
-  1:4:3:2:2:1: VHDLNAME (DO) {f110aw}  integer
-  1:4:3:2:2:2: VHDLNAME (EO) {f110bk}  l
-  1:4:3:3: VHDLNAME (FO) {f110bw}  note
-  1:4:3: VHDLWAIT (GO) {f111af}
+  1:4:3:1:4:2:4:1:2:2:1:1:1: VHDLRANGE (MI) {f71au} [attribute]
+  1:4:3:1:4:2:4:1:2:2:1:1:1:3: VHDLATTRNAME (NI) {f71av}  range
+  1:4:3:1:4:2:4:1:2:2:1:1:1:3:1: VHDLNAME (OI) {f71au}  d
+  1:4:3:1:4:2:4:1:2:2:1:2: VHDLLITERAL (PI) {f71bf}  0 [character]
+  1:4:3:1:4:2:4:1:4: VHDLSIGASSIGN (QI) {f71bp} [simple]
+  1:4:3:1:4:2:4:1:4:1: VHDLNAME (RI) {f71bp}  state
+  1:4:3:1:4:2:4:1:4:2: VHDLWAVEFORM (SI) {f71by}
+  1:4:3:1:4:2:4:1:4:2:1: VHDLNAME (TI) {f71by}  running
+  1:4:3:1:4:2: VHDLALTERNATIVE (UI) {f72ao}
+  1:4:3:1:4:2:1: VHDLCHOICE (VI) {f72ao}
+  1:4:3:1:4:2:1:1: VHDLNAME (WI) {f72ao}  running
+  1:4:3:1:4:2:4: VHDLSIGASSIGN (XI) {f73al} [simple]
+  1:4:3:1:4:2:4:1: VHDLNAME (YI) {f73al}  cnt
+  1:4:3:1:4:2:4:2: VHDLWAVEFORM (ZI) {f73as}
+  1:4:3:1:4:2:4:2:1: VHDLBINARY (AJ) {f73aw} [+]
+  1:4:3:1:4:2:4:2:1:1: VHDLNAME (BJ) {f73as}  cnt
+  1:4:3:1:4:2:4:2:1:2: VHDLLITERAL (CJ) {f73ay}  1 [integer]
+  1:4:3:1:4:2:4: VHDLLOOP (DJ) {f74al}
+  1:4:3:1:4:2:4:2: VHDLRANGE (EJ) {f74au} [to]
+  1:4:3:1:4:2:4:2:1: VHDLLITERAL (FJ) {f74au}  0 [integer]
+  1:4:3:1:4:2:4:2:2: VHDLLITERAL (GJ) {f74az}  3 [integer]
+  1:4:3:1:4:2:4:3: VHDLNEXT (HJ) {f75an}
+  1:4:3:1:4:2:4:3:1: VHDLBINARY (IJ) {f75be} [=]
+  1:4:3:1:4:2:4:3:1:1: VHDLCALL (JJ) {f75ba}
+  1:4:3:1:4:2:4:3:1:1:1: VHDLNAME (KJ) {f75ax}  cnt
+  1:4:3:1:4:2:4:3:1:1:2: VHDLASSOC (LJ) {f75bb}
+  1:4:3:1:4:2:4:3:1:1:2:2: VHDLNAME (MJ) {f75bb}  i
+  1:4:3:1:4:2:4:3:1:2: VHDLLITERAL (NJ) {f75bg}  1 [character]
+  1:4:3:1:4:2:4: VHDLSIGASSIGN (OJ) {f77al} [simple]
+  1:4:3:1:4:2:4:1: VHDLNAME (PJ) {f77al}  state
+  1:4:3:1:4:2:4:2: VHDLWAVEFORM (QJ) {f77au}
+  1:4:3:1:4:2:4:2:1: VHDLNAME (RJ) {f77au}  done
+  1:4:3:1:4:2: VHDLALTERNATIVE (SJ) {f78ao}
+  1:4:3:1:4:2:1: VHDLCHOICE (TJ) {f78ao}
+  1:4:3:1:4:2:4: VHDLSIGASSIGN (UJ) {f79al} [simple]
+  1:4:3:1:4:2:4:1: VHDLNAME (VJ) {f79al}  state
+  1:4:3:1:4:2:4:2: VHDLWAVEFORM (WJ) {f79au}
+  1:4:3:1:4:2:4:2:1: VHDLNAME (XJ) {f79au}  idle
+  1:4: VHDLSIGASSIGN (YJ) {f85ad} [simple]
+  1:4:1: VHDLNAME (ZJ) {f85ad}  q
+  1:4:2: VHDLWAVEFORM (AK) {f85ai}
+  1:4:2:1: VHDLCALL (BK) {f85ay}
+  1:4:2:1:1: VHDLNAME (CK) {f85ai}  std_logic_vector
+  1:4:2:1:2: VHDLASSOC (DK) {f85az}
+  1:4:2:1:2:2: VHDLNAME (EK) {f85az}  cnt
+  1:4: VHDLSIGASSIGN (FK) {f86ad} [conditional]
+  1:4:1: VHDLNAME (GK) {f86ad}  busy
+  1:4:3: VHDLALTERNATIVE (HK) {f86ad}
+  1:4:3:2: VHDLBINARY (IK) {f86ba} [=]
+  1:4:3:2:1: VHDLNAME (JK) {f86au}  state
+  1:4:3:2:2: VHDLNAME (KK) {f86bc}  running
+  1:4:3:3: VHDLWAVEFORM (LK) {f86al}
+  1:4:3:3:1: VHDLLITERAL (MK) {f86al}  1 [character]
+  1:4:3: VHDLALTERNATIVE (NK) {f86bp}
+  1:4:3:3: VHDLWAVEFORM (OK) {f86bp}
+  1:4:3:3:1: VHDLLITERAL (PK) {f86bp}  0 [character]
+  1:4: VHDLSIGASSIGN (QK) {f87ad} [selected]
+  1:4:1: VHDLCALL (RK) {f88ag}
+  1:4:1:1: VHDLNAME (SK) {f88af}  q
+  1:4:1:2: VHDLASSOC (TK) {f88ah}
+  1:4:1:2:2: VHDLLITERAL (UK) {f88ah}  0 [integer]
+  1:4:3: VHDLALTERNATIVE (VK) {f88an}
+  1:4:3:1: VHDLCHOICE (WK) {f88ax}
+  1:4:3:1:1: VHDLLITERAL (XK) {f88ax}  00 [string]
+  1:4:3:3: VHDLWAVEFORM (YK) {f88an}
+  1:4:3:3:1: VHDLCALL (ZK) {f88ao}
+  1:4:3:3:1:1: VHDLNAME (AL) {f88an}  d
+  1:4:3:3:1:2: VHDLASSOC (BL) {f88ap}
+  1:4:3:3:1:2:2: VHDLLITERAL (CL) {f88ap}  0 [integer]
+  1:4:3: VHDLALTERNATIVE (DL) {f89an}
+  1:4:3:1: VHDLCHOICE (EL) {f89ax}
+  1:4:3:1:1: VHDLLITERAL (FL) {f89ax}  01 [string]
+  1:4:3:3: VHDLWAVEFORM (GL) {f89an}
+  1:4:3:3:1: VHDLCALL (HL) {f89ao}
+  1:4:3:3:1:1: VHDLNAME (IL) {f89an}  d
+  1:4:3:3:1:2: VHDLASSOC (JL) {f89ap}
+  1:4:3:3:1:2:2: VHDLLITERAL (KL) {f89ap}  1 [integer]
+  1:4:3: VHDLALTERNATIVE (LL) {f90an}
+  1:4:3:1: VHDLCHOICE (ML) {f90ax}
+  1:4:3:3: VHDLWAVEFORM (NL) {f90an}
+  1:4:3:3:1: VHDLLITERAL (OL) {f90an}  0 [character]
+  1:4:4: VHDLNAME (PL) {f87ai}  sel
+  1:4: VHDLGENERATE (QL) {f92aj}  gen
+  1:4:1: VHDLRANGE (RL) {f92as} [to]
+  1:4:1:1: VHDLLITERAL (SL) {f92as}  0 [integer]
+  1:4:1:2: VHDLBINARY (TL) {f92bc} [-]
+  1:4:1:2:1: VHDLNAME (UL) {f92ax}  width
+  1:4:1:2:2: VHDLLITERAL (VL) {f92bd}  1 [integer]
+  1:4:3: VHDLGENERATEBODY (WL) {f93af}
+  1:4:3:4: VHDLINSTANCE (XL) {f93am}  inst
+  1:4:3:4:1: VHDLNAME (YL) {f93aw}  sub
+  1:4:3:4:2: VHDLASSOC (ZL) {f93bn}
+  1:4:3:4:2:1: VHDLNAME (AM) {f93bn}  n
+  1:4:3:4:2:2: VHDLNAME (BM) {f93bs}  i
+  1:4:3:4:3: VHDLASSOC (CM) {f93cf}
+  1:4:3:4:3:1: VHDLNAME (DM) {f93cf}  a
+  1:4:3:4:3:2: VHDLCALL (EM) {f93cl}
+  1:4:3:4:3:2:1: VHDLNAME (FM) {f93ck}  d
+  1:4:3:4:3:2:2: VHDLASSOC (GM) {f93cm}
+  1:4:3:4:3:2:2:2: VHDLNAME (HM) {f93cm}  i
+  1:4:3:4:3: VHDLASSOC (IM) {f93cq}
+  1:4:3:4:3:1: VHDLNAME (JM) {f93cq}  y
+  1:4:3:4:3:2: VHDLOPEN (KM) {f93cz}
+  1:4: VHDLGENERATE (LM) {f96ak}  cond
+  1:4:3: VHDLGENERATEBODY (MM) {f97af}
+  1:4:3:1: VHDLBINARY (NM) {f96at} [>]
+  1:4:3:1:1: VHDLNAME (OM) {f96an}  width
+  1:4:3:1:2: VHDLLITERAL (PM) {f96av}  4 [integer]
+  1:4:3:4: VHDLASSERT (QM) {f97af}
+  1:4:3:4:1: VHDLBINARY (RM) {f97ay} [=]
+  1:4:3:4:1:1: VHDLBINARY (SM) {f97as} [mod]
+  1:4:3:4:1:1:1: VHDLNAME (TM) {f97am}  width
+  1:4:3:4:1:1:2: VHDLLITERAL (UM) {f97aw}  2 [integer]
+  1:4:3:4:1:2: VHDLLITERAL (VM) {f97ba}  0 [integer]
+  1:4:3:4:2: VHDLLITERAL (WM) {f97bj}  even only [string]
+  1:4:3:4:3: VHDLNAME (XM) {f97ce}  warning
+  1:4:3: VHDLGENERATEBODY (YM) {f99af}
+  1:4:3:4: VHDLASSERT (ZM) {f99af}
+  1:4:3:4:1: VHDLNAME (AN) {f99am}  false
+  1:4:3:4:3: VHDLNAME (BN) {f99bb}  note
+  1:4: VHDLPROCESS (CN) {f103ak}  stim [sens=none]
+  1:4:2: VHDLOBJECTDECL (DN) {f104ao}  l [variable]
+  1:4:2:1: VHDLSUBTYPEIND (EN) {f104as}
+  1:4:2:1:2: VHDLNAME (FN) {f104as}  integer
+  1:4:2:2: VHDLLITERAL (GN) {f104bd}  0 [integer]
+  1:4:3: VHDLWAIT (HN) {f106af}
+  1:4:3:2: VHDLCALL (IN) {f106bb}
+  1:4:3:2:1: VHDLNAME (JN) {f106aq}  rising_edge
+  1:4:3:2:2: VHDLASSOC (KN) {f106bc}
+  1:4:3:2:2:2: VHDLNAME (LN) {f106bc}  clk
+  1:4:3: VHDLWAIT (MN) {f107af}
+  1:4:3:3: VHDLLITERAL (NN) {f107ao}  10 [physical]
+  1:4:3:3:1: VHDLNAME (ON) {f107ar}  ns
+  1:4:3: VHDLWAIT (PN) {f108af}
+  1:4:3:1: VHDLNAME (QN) {f108an}  d
+  1:4:3:1: VHDLNAME (RN) {f108aq}  rst
+  1:4:3:2: VHDLBINARY (SN) {f108be} [=]
+  1:4:3:2:1: VHDLNAME (TN) {f108ba}  rst
+  1:4:3:2:2: VHDLLITERAL (UN) {f108bg}  0 [character]
+  1:4:3: VHDLVARASSIGN (VN) {f109af}
+  1:4:3:1: VHDLNAME (WN) {f109af}  l
+  1:4:3:2: VHDLBINARY (XN) {f109am} [+]
+  1:4:3:2:1: VHDLNAME (YN) {f109ak}  l
+  1:4:3:2:2: VHDLLITERAL (ZN) {f109ao}  1 [integer]
+  1:4:3: VHDLASSERT (AO) {f110af}
+  1:4:3:2: VHDLBINARY (BO) {f110au} [&]
+  1:4:3:2:1: VHDLLITERAL (CO) {f110am}  tick  [string]
+  1:4:3:2:2: VHDLATTRNAME (DO) {f110bd}  image
+  1:4:3:2:2:1: VHDLNAME (EO) {f110aw}  integer
+  1:4:3:2:2:2: VHDLNAME (FO) {f110bk}  l
+  1:4:3:3: VHDLNAME (GO) {f110bw}  note
+  1:4:3: VHDLWAIT (HO) {f111af}
 %Error: t/t_vhdl_parse.vhd:16:52: Cannot find type 'std_logic_vector'
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: t/t_vhdl_parse.vhd:18:9: Cannot find type 'std_logic'
@@ -383,17 +384,12 @@
 %Error: t/t_vhdl_parse.vhd:55:18: Cannot find type 'std_logic_vector'
 %Error: t/t_vhdl_parse.vhd:58:18: Cannot find type 'std_logic'
 %Error: t/t_vhdl_parse.vhd:58:37: Cannot find type 'std_logic'
-%Error: t/t_vhdl_parse.vhd:65:12: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
 %Error: t/t_vhdl_parse.vhd:66:27: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
 %Error: t/t_vhdl_parse.vhd:67:16: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:70:14: Cannot find declaration of 'idle'
-%Error: t/t_vhdl_parse.vhd:71:16: Ambiguous operator "/=": 6 visible declarations match, and the context does not decide between them
-%Error: t/t_vhdl_parse.vhd:71:31: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
 %Error: t/t_vhdl_parse.vhd:71:50: Cannot find declaration of 'running'
 %Error: t/t_vhdl_parse.vhd:72:14: Cannot find declaration of 'running'
-%Error: t/t_vhdl_parse.vhd:73:22: Ambiguous operator "+": 2 visible declarations match, and the context does not decide between them
 %Error: t/t_vhdl_parse.vhd:75:26: No visible subprogram 'cnt' takes 1 argument(s) of these types
-%Error: t/t_vhdl_parse.vhd:75:30: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
 %Error: t/t_vhdl_parse.vhd:77:20: Cannot find declaration of 'done'
 %Error: t/t_vhdl_parse.vhd:79:20: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:86:28: Cannot find declaration of 'running'
@@ -403,8 +399,6 @@
 %Error: t/t_vhdl_parse.vhd:88:14: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:89:14: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:90:13: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
-%Error: t/t_vhdl_parse.vhd:97:24: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
-%Error: t/t_vhdl_parse.vhd:108:30: Ambiguous operator "=": 2 visible declarations match, and the context does not decide between them
 %Error: VHDL lowering is not yet implemented; analyzed 4 design unit(s) from 1 file(s)
 ... The VHDL frontend is under development; Verilog and SystemVerilog are unaffected.
 %Error: Exiting due to

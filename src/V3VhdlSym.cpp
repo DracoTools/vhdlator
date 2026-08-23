@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <iomanip>
 #include <sstream>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -61,6 +62,9 @@ void VhdlSymTab::clear() {
 
 std::string VhdlType::prettyName() const {
     if (!m_name.empty()) return m_name;
+    // An anonymous subtype reads best as the type it constrains, so that a
+    // diagnostic about my_vec1(1 to 10) names my_vec1
+    if (isSubtype() && m_base) return m_base->prettyName();
     switch (m_kind) {
     case VhdlTypeKind::ERROR: return "<error>";
     case VhdlTypeKind::UNIVERSAL_INTEGER: return "universal_integer";
@@ -77,6 +81,35 @@ std::string VhdlType::prettyName() const {
         return "file of " + (m_designatedp ? m_designatedp->prettyName() : "<unknown>");
     default: return "<anonymous type>";
     }
+}
+
+//######################################################################
+// VhdlValue
+
+std::string VhdlValue::prettyName() const {
+    std::ostringstream os;
+    switch (m_kind) {
+    case VhdlValKind::UNKNOWN: return "<not static>";
+    case VhdlValKind::REAL:
+        // Always with a decimal point, so a real never reads as an integer
+        os << std::showpoint << m_real;
+        return os.str();
+    case VhdlValKind::STR: return '"' + m_str + '"';
+    case VhdlValKind::INT: break;
+    }
+    // An enumeration value reads back as its literal, and a physical value
+    // with the name of its primary unit, so that diagnostics quote what the
+    // user wrote rather than an internal number
+    if (m_typep && m_typep->base()->kind() == VhdlTypeKind::ENUM) {
+        const std::vector<VhdlSymbol*>& lits = m_typep->base()->literals();
+        if (m_int >= 0 && m_int < static_cast<int64_t>(lits.size())) return lits[m_int]->name();
+    }
+    os << m_int;
+    if (m_typep && m_typep->base()->kind() == VhdlTypeKind::PHYSICAL
+        && !m_typep->base()->units().empty()) {
+        os << ' ' << m_typep->base()->units().front().first;
+    }
+    return os.str();
 }
 
 //######################################################################
@@ -122,7 +155,11 @@ bool VhdlSymbol::homographOf(const VhdlSymbol* otherp) const {
     // An alias may rename a subprogram, and its signature is not known until
     // the alias target is resolved, so never call it a homograph (6.6.2)
     if (m_kind == VhdlSymKind::ALIAS || otherp->kind() == VhdlSymKind::ALIAS) return false;
-    if (m_kind != otherp->kind()) return true;
+    // A procedure has no result and a function has one, so the two can never
+    // share a profile. An enumeration literal is a parameterless function
+    // returning its own type (5.2.2), so it compares like one.
+    const bool procedure = m_kind == VhdlSymKind::PROCEDURE;
+    if (procedure != (otherp->kind() == VhdlSymKind::PROCEDURE)) return false;
     if (m_paramTypes.size() != otherp->paramTypes().size()) return false;
     for (size_t i = 0; i < m_paramTypes.size(); ++i) {
         const VhdlType* const ap = m_paramTypes[i];
@@ -144,10 +181,19 @@ VhdlSymbol* VhdlScope::insert(VhdlSymbol* symp) {
     VhdlSymbol* hiddenp = nullptr;
     const auto range = m_direct.equal_range(symp->name());
     for (auto it = range.first; it != range.second; ++it) {
-        if (symp->homographOf(it->second)) {
-            hiddenp = it->second;
-            break;
+        if (!symp->homographOf(it->second)) continue;
+        // An implicit declaration of a predefined operation is hidden by an
+        // explicit homograph in the same region (12.3). NUMERIC_STD relies on
+        // this: it declares "=" for UNSIGNED itself, alongside the one the
+        // array type declaration brought with it.
+        if (it->second->predefined() && !symp->predefined()) {
+            m_direct.erase(it);
+            m_direct.emplace(symp->name(), symp);
+            return nullptr;
         }
+        if (symp->predefined() && !it->second->predefined()) return nullptr;  // Already hidden
+        hiddenp = it->second;
+        break;
     }
     m_direct.emplace(symp->name(), symp);
     return hiddenp;

@@ -34,11 +34,14 @@
 #include "V3VhdlSem.h"
 
 #include "V3Global.h"
+#include "V3VhdlEval.h"
 #include "V3VhdlStd.h"
 #include "V3VhdlSym.h"
 
+#include <algorithm>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -71,6 +74,10 @@ class VhdlSemVisitor final : public VNVisitor {
     std::map<std::string, AstNodeVhdlUnit*> m_primaryUnits;  // "lib.unit" -> the unit
     std::string m_libname;  // Library of the unit being analyzed
     VhdlType* m_returnTypep = nullptr;  // Result type of the enclosing function
+    // A package body continues the package declaration's declarative region
+    // (12.1), so what it declares completes an earlier declaration rather
+    // than making a second one
+    bool m_inPackageBody = false;
     bool m_errored = false;
 
     VL_UNCOPYABLE(VhdlSemVisitor);
@@ -139,6 +146,9 @@ class VhdlSemVisitor final : public VNVisitor {
         }
         for (VhdlSymbol* const symp : found) {
             if (symp->kind() == wantKind) return symp;
+            // An alias denotes what it was declared for, and may stand
+            // wherever that could (6.6.1)
+            if (symp->aliasp() && symp->aliasp()->kind() == wantKind) return symp->aliasp();
         }
         if (found.empty()) {
             err(namep->fileline(), std::string{"Cannot find "} + what + " '" + parts.back() + "'");
@@ -181,6 +191,218 @@ class VhdlSemVisitor final : public VNVisitor {
         return false;
     }
 
+    // METHODS - ranges and static bounds (5.2.1, 9.4)
+
+    // What analyzing a discrete range found. The bounds are values rather
+    // than expressions because a type is not fully known until they have been
+    // folded: an index range decides an array's length, which in turn decides
+    // whether V3VhdlLower can emit a packed array at all.
+    struct RangeInfo final {
+        VhdlType* typep = nullptr;  // Type of the values in the range
+        VhdlValue left;
+        VhdlValue right;
+        bool ascending = true;
+        bool unbounded = false;  // Written "<>", so deliberately unconstrained
+        bool valid = false;  // There was a range to analyze
+    };
+
+    // A discrete range in any of its spellings: "left to right", a type mark
+    // standing for its own range, a subtype indication, "t range <>", or a
+    // range attribute name.
+    RangeInfo analyzeRange(AstNode* rangep, VhdlType* wantp) {
+        RangeInfo info;
+        if (!rangep) return info;
+        if (VN_IS(rangep, VhdlBox)) {
+            info.typep = wantp;
+            info.unbounded = true;
+            info.valid = true;
+            return info;
+        }
+        if (AstVhdlSubtypeInd* const sip = VN_CAST(rangep, VhdlSubtypeInd)) {
+            info.typep = resolveSubtype(sip);
+            info.unbounded = VN_IS(sip->constraintp(), VhdlBox);
+            info.valid = true;
+            takeBoundsFrom(info, info.typep);
+            return info;
+        }
+        AstVhdlRange* const rp = VN_CAST(rangep, VhdlRange);
+        if (!rp) return info;
+        info.valid = true;
+        if (AstNodeVhdlExpr* const namep = rp->attrp()) {
+            // A type mark used as a range, or prefix'RANGE (16.2.4)
+            bool reversed = false;
+            VhdlType* const typep = rangeOfName(namep, reversed);
+            if (!typep) return info;
+            info.typep = typep;
+            takeBoundsFrom(info, typep);
+            if (reversed) {
+                std::swap(info.left, info.right);
+                info.ascending = !info.ascending;
+            }
+            return info;
+        }
+        // "left to right": both bounds are of one type, which the context may
+        // already fix. Analyze the bound that can stand alone first, so a
+        // universal literal on the other side takes its type from it.
+        VhdlType* leftp = analyzeExpr(rp->leftp(), wantp);
+        VhdlType* rightp
+            = analyzeExpr(rp->rightp(), wantp ? wantp : (leftp && !leftp->isUniversal() ? leftp
+                                                                                       : nullptr));
+        VhdlType* typep = wantp;
+        if (!typep || typep->isError()) typep = (rightp && !rightp->isUniversal()) ? rightp : leftp;
+        // A range of universal integers indexes with INTEGER (5.3.2.1)
+        if (typep && typep->kind() == VhdlTypeKind::UNIVERSAL_INTEGER) {
+            typep = V3VhdlStd::integerType();
+        } else if (typep && typep->kind() == VhdlTypeKind::UNIVERSAL_REAL) {
+            typep = V3VhdlStd::realType();
+        }
+        info.typep = typep;
+        info.ascending = rp->dir() == VhdlDir::TO;
+        info.left = evalChecked(rp->leftp());
+        info.right = evalChecked(rp->rightp());
+        if (info.left.known() && !info.left.typep()) info.left.typep(typep);
+        if (info.right.known() && !info.right.typep()) info.right.typep(typep);
+        return info;
+    }
+
+    // Fill a RangeInfo from a type that already carries its own range
+    static void takeBoundsFrom(RangeInfo& info, const VhdlType* typep) {
+        if (!typep || !typep->bounded()) return;
+        const bool isReal = typep->base()->kind() == VhdlTypeKind::FLOATING;
+        VhdlType* const nonConstp = const_cast<VhdlType*>(typep);
+        info.left = isReal ? VhdlValue::mkReal(typep->leftReal(), nonConstp)
+                           : VhdlValue::mkInt(typep->left(), nonConstp);
+        info.right = isReal ? VhdlValue::mkReal(typep->rightReal(), nonConstp)
+                            : VhdlValue::mkInt(typep->right(), nonConstp);
+        info.ascending = typep->ascending();
+    }
+
+    // The type whose range a name denotes: a type mark denotes its own, and
+    // prefix'RANGE the range of the prefix (16.2.4)
+    VhdlType* rangeOfName(AstNodeVhdlExpr* namep, bool& reversed) {
+        reversed = false;
+        AstVhdlAttrName* const attrp = VN_CAST(namep, VhdlAttrName);
+        if (!attrp) return resolveTypeMark(namep);
+        if (attrp->name() == "reverse_range") {
+            reversed = true;
+        } else if (attrp->name() != "range") {
+            err(namep->fileline(), "Attribute '" + attrp->name() + "' does not denote a range");
+            return nullptr;
+        }
+        analyzeExpr(attrp, nullptr);  // Resolves the prefix
+        VhdlType* typep = attrp->prefixp() ? attrp->prefixp()->vhdlTypep() : nullptr;
+        if (!typep || typep->isError()) return nullptr;
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
+        return dimensionOf(attrp, typep);
+    }
+
+    // The index type an array attribute asks about, honouring its optional
+    // dimension argument (16.2.4)
+    VhdlType* dimensionOf(AstVhdlAttrName* nodep, VhdlType* typep) {
+        int64_t dim = 1;
+        if (nodep->argp()) {
+            analyzeExpr(nodep->argp(), V3VhdlStd::integerType());
+            const VhdlValue arg = V3VhdlEval::eval(nodep->argp());
+            if (!arg.isInt()) {
+                err(nodep->argp()->fileline(), "The dimension of attribute '" + nodep->name()
+                                                   + " must be a locally static integer");
+                return nullptr;
+            }
+            dim = arg.toInt();
+        }
+        const int64_t dims = static_cast<int64_t>(typep->indexTypes().size());
+        if (dim < 1 || dim > dims) {
+            err(nodep->fileline(), "Dimension " + std::to_string(dim) + " of attribute '"
+                                       + nodep->name() + " is out of range; "
+                                       + typep->prettyName() + " has " + std::to_string(dims)
+                                       + " dimension(s)");
+            return nullptr;
+        }
+        return typep->indexTypes()[static_cast<size_t>(dim - 1)];
+    }
+
+    // Fold an analyzed expression, reporting the failures that are errors in
+    // themselves rather than merely a value that is not static
+    VhdlValue evalChecked(AstNodeVhdlExpr* nodep) {
+        std::string why;
+        const VhdlValue val = V3VhdlEval::eval(nodep, &why);
+        if (!why.empty() && nodep) err(nodep->fileline(), why);
+        return val;
+    }
+
+    // A fresh anonymous subtype of the range's type, constrained by it. This
+    // is what an index constraint and a range constraint both produce.
+    VhdlType* makeRangeSubtype(const RangeInfo& info, FileLine* flp) {
+        VhdlType* const basep = info.typep;
+        if (!basep || basep->isError()) return V3VhdlStd::errorType();
+        VhdlType* const outp = cloneSubtype(basep, flp);
+        applyRange(outp, info);
+        return outp;
+    }
+
+    // A distinct subtype of the same type, sharing its shape
+    static VhdlType* cloneSubtype(VhdlType* basep, FileLine* flp) {
+        VhdlType* const outp = VhdlSymTab::newType(basep->kind(), "", flp);
+        outp->base(basep->base());
+        outp->elementp(basep->elementp());
+        outp->designatedp(basep->designatedp());
+        for (VhdlType* const idxp : basep->indexTypes()) outp->addIndexType(idxp);
+        for (VhdlSymbol* const elemp : basep->elements()) outp->addElement(elemp);
+        outp->resolutionp(basep->resolutionp());
+        outp->unconstrained(basep->unconstrained());
+        outp->copyBounds(basep);
+        return outp;
+    }
+
+    // Give a type the bounds a range found, where they folded
+    static void applyRange(VhdlType* outp, const RangeInfo& info) {
+        if (!outp) return;
+        if (info.unbounded) {
+            outp->unbound();
+            return;
+        }
+        if (!info.left.known() || !info.right.known()) {
+            outp->unbound();  // Not static: the bounds arrive at elaboration
+            return;
+        }
+        if (outp->base()->kind() == VhdlTypeKind::FLOATING) {
+            outp->setRealBounds(info.left.toReal(), info.right.toReal(), info.ascending);
+        } else if (info.left.isInt() && info.right.isInt()) {
+            outp->setBounds(info.left.toInt(), info.right.toInt(), info.ascending);
+        }
+    }
+
+    // How a type's range reads in a diagnostic
+    static std::string rangeText(const VhdlType* typep) {
+        if (!typep || !typep->bounded()) return "";
+        VhdlType* const nonConstp = const_cast<VhdlType*>(typep);
+        const bool isReal = typep->base()->kind() == VhdlTypeKind::FLOATING;
+        const VhdlValue lo = isReal ? VhdlValue::mkReal(typep->leftReal(), nonConstp)
+                                    : VhdlValue::mkInt(typep->left(), nonConstp);
+        const VhdlValue hi = isReal ? VhdlValue::mkReal(typep->rightReal(), nonConstp)
+                                    : VhdlValue::mkInt(typep->right(), nonConstp);
+        return lo.prettyName() + (typep->ascending() ? " to " : " downto ") + hi.prettyName();
+    }
+
+    // A choice must denote a value of the index range it selects from (9.3.3.3)
+    void checkChoiceInRange(FileLine* flp, const VhdlValue& val, VhdlType* typep) {
+        if (!typep || !typep->bounded() || !val.known()) return;
+        if (V3VhdlEval::inRange(val, typep)) return;
+        err(flp, "Choice " + val.prettyName() + " is outside the index range, which is "
+                     + rangeText(typep));
+    }
+
+    // Complain when a static value cannot belong to the subtype it is given
+    // to (5.2.1). Silent whenever either the value or the range is unknown,
+    // so that only a certain violation is reported.
+    void checkValueInRange(AstNodeVhdlExpr* nodep, VhdlType* typep, const std::string& what) {
+        if (!nodep || !typep || !typep->bounded() || !typep->isScalar()) return;
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        if (!val.known() || V3VhdlEval::inRange(val, typep)) return;
+        err(nodep->fileline(), "Value " + val.prettyName() + " is outside the range of " + what
+                                   + ", which is " + rangeText(typep));
+    }
+
     // METHODS - types
 
     // Resolve a type mark to the type it names
@@ -197,37 +419,123 @@ class VhdlSemVisitor final : public VNVisitor {
     VhdlType* resolveSubtype(AstVhdlSubtypeInd* nodep) {
         if (!nodep) return V3VhdlStd::errorType();
         if (nodep->vhdlTypep()) return nodep->vhdlTypep();
-        VhdlType* basep = nullptr;
-        if (AstVhdlCall* const callp = VN_CAST(nodep->typeMarkp(), VhdlCall)) {
-            // The parser could not tell "std_logic_vector(7 downto 0)" from a
-            // call, so a constrained type mark arrives as one (8.1)
-            basep = resolveTypeMark(callp->prefixp());
-        } else {
-            basep = resolveTypeMark(nodep->typeMarkp());
-        }
+        // The parser could not tell "std_logic_vector(7 downto 0)" from a
+        // call, so a constrained type mark arrives as one (8.1)
+        AstVhdlCall* const callp = VN_CAST(nodep->typeMarkp(), VhdlCall);
+        VhdlType* const basep
+            = callp ? resolveTypeMark(callp->prefixp()) : resolveTypeMark(nodep->typeMarkp());
         if (!basep || basep->isError()) {
             nodep->vhdlTypep(V3VhdlStd::errorType());
             return nodep->vhdlTypep();
         }
-        VhdlType* typep = basep;
-        const bool constrained = nodep->constraintp() || VN_IS(nodep->typeMarkp(), VhdlCall);
-        if (constrained) {
-            // A constrained subtype is a distinct subtype of the same type
-            typep = VhdlSymTab::newType(basep->kind(), "", nodep->fileline());
-            typep->base(basep->base());
-            typep->elementp(basep->elementp());
-            typep->designatedp(basep->designatedp());
-            for (VhdlType* const idxp : basep->indexTypes()) typep->addIndexType(idxp);
-            for (VhdlSymbol* const elemp : basep->elements()) typep->addElement(elemp);
-            typep->resolutionp(basep->resolutionp());
+        AstNodeVhdl* const constraintp = nodep->constraintp();
+        AstNode* const callArgsp = callp ? callp->argsp() : nullptr;
+        if (!constraintp && !callArgsp && !nodep->resolutionp()) {
+            nodep->vhdlTypep(basep);
+            return basep;
+        }
+        // A constrained subtype is a distinct subtype of the same type
+        VhdlType* const typep = cloneSubtype(basep, nodep->fileline());
+        // Set before applying the constraint, so that a subtype indication
+        // mentioning itself stops rather than recursing
+        nodep->vhdlTypep(typep);
+        if (constraintp || callArgsp) {
+            applyConstraint(typep, basep, constraintp, callArgsp, nodep->fileline());
         }
         if (nodep->resolutionp()) {
             VhdlSymbol* const resp
                 = lookupOne(nodep->resolutionp(), VhdlSymKind::FUNCTION, "resolution function");
             if (resp) typep->resolutionp(resp);
         }
-        nodep->vhdlTypep(typep);
         return typep;
+    }
+
+    // Apply a range, index or record constraint to a fresh subtype (5.3.2.1,
+    // 6.3). 'callArgsp' carries the index constraint of a type mark that the
+    // parser had to record as a call.
+    void applyConstraint(VhdlType* typep, VhdlType* basep, AstNodeVhdl* constraintp,
+                         AstNode* callArgsp, FileLine* flp) {
+        if (VN_IS(constraintp, VhdlBox)) {
+            // "positive range <>" leaves the array unconstrained but keeps
+            // POSITIVE's own range, which every index must still satisfy
+            typep->unconstrained(true);
+            return;
+        }
+        if (AstVhdlRange* const rp = VN_CAST(constraintp, VhdlRange)) {
+            // A range constraint narrows a scalar type (5.2.1)
+            const RangeInfo info = analyzeRange(rp, basep->isScalar() ? basep : nullptr);
+            applyRange(typep, info);
+            checkSubrange(typep, basep, flp);
+            return;
+        }
+        // Otherwise an index constraint, over the array's dimensions
+        AstNode* firstp = callArgsp;
+        if (AstVhdlIndexConstraint* const icp = VN_CAST(constraintp, VhdlIndexConstraint)) {
+            firstp = icp->rangesp();
+        }
+        if (!firstp) return;
+        if (basep->base()->kind() != VhdlTypeKind::ARRAY) {
+            // A parenthesized type mark that is not an array is a conversion
+            // or a call the caller mistook for a subtype; leave it alone
+            return;
+        }
+        std::vector<VhdlType*> indexes;
+        const std::vector<VhdlType*>& baseIndexes = basep->base()->indexTypes();
+        size_t dim = 0;
+        for (AstNode* rp = firstp; rp; rp = rp->nextp()) {
+            if (AstVhdlIndexConstraint* const nestedp = VN_CAST(rp, VhdlIndexConstraint)) {
+                // "t(3 downto 0)(7 downto 0)" constrains the element too
+                VhdlType* const elemp = typep->elementp();
+                if (elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY) {
+                    VhdlType* const newElemp = cloneSubtype(elemp, flp);
+                    applyConstraint(newElemp, elemp, nestedp, nullptr, flp);
+                    typep->elementp(newElemp);
+                }
+                continue;
+            }
+            VhdlType* const wantp = dim < baseIndexes.size() ? baseIndexes[dim] : nullptr;
+            const RangeInfo info = analyzeRange(rp, wantp);
+            if (!info.valid) continue;
+            VhdlType* idxp = info.typep ? info.typep : wantp;
+            if (!info.unbounded && info.left.known() && info.right.known()) {
+                idxp = makeRangeSubtype(info, flp);
+                checkSubrange(idxp, wantp, flp);
+            } else if (idxp && idxp->bounded() && info.valid && !info.unbounded) {
+                // A range whose bounds did not fold constrains nothing static
+                idxp = cloneSubtype(idxp, flp);
+                idxp->unbound();
+            }
+            indexes.push_back(idxp ? idxp : V3VhdlStd::integerType());
+            ++dim;
+        }
+        if (indexes.empty()) return;
+        if (!baseIndexes.empty() && indexes.size() != baseIndexes.size()) {
+            err(flp, "Index constraint gives " + std::to_string(indexes.size())
+                         + " dimension(s), but " + basep->prettyName() + " has "
+                         + std::to_string(baseIndexes.size()));
+        }
+        typep->clearIndexTypes();
+        bool unconstrained = false;
+        for (VhdlType* const idxp : indexes) {
+            typep->addIndexType(idxp);
+            if (!idxp->bounded()) unconstrained = true;
+        }
+        typep->unconstrained(unconstrained);
+    }
+
+    // A subtype's range must lie within the range it narrows (5.2.1)
+    void checkSubrange(const VhdlType* typep, const VhdlType* basep, FileLine* flp) {
+        if (!typep || !basep || !typep->bounded() || !basep->bounded()) return;
+        if (typep->isNull()) return;  // A null range names no value at all
+        if (basep->base()->kind() == VhdlTypeKind::FLOATING) {
+            if (typep->lowReal() >= basep->lowReal() && typep->highReal() <= basep->highReal()) {
+                return;
+            }
+        } else if (typep->low() >= basep->low() && typep->high() <= basep->high()) {
+            return;
+        }
+        err(flp, "Range " + rangeText(typep) + " is outside the range of "
+                     + basep->prettyName() + ", which is " + rangeText(basep));
     }
 
     // Build the type a type definition describes (clause 5)
@@ -241,8 +549,9 @@ class VhdlSemVisitor final : public VNVisitor {
             int pos = 0;
             for (AstNode* litp = enump->literalsp(); litp; litp = litp->nextp()) {
                 AstVhdlEnumLiteral* const elp = VN_AS(litp, VhdlEnumLiteral);
-                VhdlSymbol* const symp
-                    = VhdlSymTab::newSymbol(VhdlSymKind::ENUM_LITERAL, elp->name(), elp);
+                VhdlSymbol* const symp = VhdlSymTab::newSymbol(
+                    VhdlSymKind::ENUM_LITERAL,
+                    elp->isChar() ? vhdlCharLitName(elp->name()) : elp->name(), elp);
                 symp->typep(typep);
                 symp->returnTypep(typep);
                 symp->position(pos++);
@@ -255,14 +564,22 @@ class VhdlSemVisitor final : public VNVisitor {
         }
         if (AstVhdlNumericType* const nump = VN_CAST(defp, VhdlNumericType)) {
             // Integer or floating, depending on the bounds (5.2.3, 5.2.5)
-            const bool isReal = rangeIsReal(nump->rangep());
+            const RangeInfo info = analyzeRange(nump->rangep(), nullptr);
+            const bool isReal = rangeIsReal(nump->rangep()) || info.left.isReal()
+                                || info.right.isReal();
             VhdlType* const typep = VhdlSymTab::newType(
                 isReal ? VhdlTypeKind::FLOATING : VhdlTypeKind::INTEGER, name, flp);
+            applyRange(typep, info);
+            if (!typep->bounded() && nump->rangep()) {
+                err(flp, "The bounds of type '" + name + "' must be locally static");
+            }
             return typep;
         }
         if (AstVhdlPhysicalType* const physp = VN_CAST(defp, VhdlPhysicalType)) {
             VhdlType* const typep = VhdlSymTab::newType(VhdlTypeKind::PHYSICAL, name, flp);
-            int64_t primary = 1;
+            // The range is in units of the primary unit, so it folds before
+            // any unit name exists (5.2.4)
+            applyRange(typep, analyzeRange(physp->rangep(), nullptr));
             bool first = true;
             for (AstNode* unitp = physp->unitsp(); unitp; unitp = unitp->nextp()) {
                 AstVhdlUnitDecl* const udp = VN_AS(unitp, VhdlUnitDecl);
@@ -270,7 +587,26 @@ class VhdlSemVisitor final : public VNVisitor {
                     = VhdlSymTab::newSymbol(VhdlSymKind::PHYSICAL_UNIT, udp->name(), udp);
                 symp->typep(typep);
                 udp->vhdlSymp(symp);
-                typep->addUnit(udp->name(), first ? primary : 0);
+                int64_t scale = 1;
+                if (first) {
+                    // The primary unit is one of itself by definition
+                    symp->value(VhdlValue::mkInt(1, typep));
+                } else {
+                    // A secondary unit is a multiple of one already declared,
+                    // so its value folds against the units seen so far
+                    analyzeExpr(udp->valuep(), typep);
+                    const VhdlValue val = V3VhdlEval::eval(udp->valuep());
+                    if (val.isInt()) {
+                        scale = val.toInt();
+                        symp->value(VhdlValue::mkInt(scale, typep));
+                    } else {
+                        err(udp->fileline(), "The value of physical unit '" + udp->name()
+                                                 + "' must be a locally static multiple of a "
+                                                   "unit already declared");
+                        scale = 0;
+                    }
+                }
+                typep->addUnit(udp->name(), scale);
                 first = false;
                 declare(symp, udp->fileline());
             }
@@ -280,12 +616,16 @@ class VhdlSemVisitor final : public VNVisitor {
             VhdlType* const typep = VhdlSymTab::newType(VhdlTypeKind::ARRAY, name, flp);
             bool unconstrained = false;
             for (AstNode* idxp = arrp->indexp()->rangesp(); idxp; idxp = idxp->nextp()) {
-                if (AstVhdlSubtypeInd* const sip = VN_CAST(idxp, VhdlSubtypeInd)) {
-                    typep->addIndexType(resolveSubtype(sip));
-                    if (VN_IS(sip->constraintp(), VhdlBox)) unconstrained = true;
-                } else {
-                    typep->addIndexType(V3VhdlStd::integerType());
+                const RangeInfo info = analyzeRange(idxp, nullptr);
+                VhdlType* indexTypep = info.typep;
+                if (!info.unbounded && info.left.known() && info.right.known()) {
+                    // "array (0 to 7)" gives a constrained array type, whose
+                    // index subtype is anonymous (5.3.2.1)
+                    indexTypep = makeRangeSubtype(info, flp);
                 }
+                if (!indexTypep) indexTypep = V3VhdlStd::integerType();
+                if (info.unbounded || !indexTypep->bounded()) unconstrained = true;
+                typep->addIndexType(indexTypep);
             }
             typep->unconstrained(unconstrained);
             typep->elementp(resolveSubtype(arrp->elementp()));
@@ -365,6 +705,7 @@ private:
     void visit(AstVhdlComponentDecl* nodep) override;
     void visit(AstVhdlAliasDecl* nodep) override;
     void visit(AstVhdlAttrDecl* nodep) override;
+    void visit(AstVhdlContextItem* nodep) override;
     // Regions
     void visit(AstVhdlProcess* nodep) override;
     void visit(AstVhdlBlock* nodep) override;
@@ -382,7 +723,26 @@ private:
     void visit(AstVhdlProcCall* nodep) override;
     void visit(AstVhdlNext* nodep) override;
 
+    VhdlType* loopParamType(const RangeInfo& info, FileLine* flp) VL_MT_DISABLED;
+    void analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) VL_MT_DISABLED;
+    VhdlType* analyzeIndexedName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
+    VhdlType* analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
+    int64_t staticLength(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    void checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
+                         const std::string& what) VL_MT_DISABLED;
+    void checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
+    void checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) VL_MT_DISABLED;
+    void checkWaveform(AstNode* wavesp) VL_MT_DISABLED;
+    void checkDelay(AstNodeVhdlExpr* nodep, const char* what) VL_MT_DISABLED;
+    void checkAggregate(AstVhdlAggregate* nodep, VhdlType* typep,
+                        const std::string& what) VL_MT_DISABLED;
+    int64_t aggregateLength(AstVhdlAggregate* nodep) VL_MT_DISABLED;
+    int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
+    VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                 FileLine* flp) VL_MT_DISABLED;
+    static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
+    void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
     // Expressions (clauses 8, 9, 12.5)
@@ -397,6 +757,8 @@ private:
     VhdlType* analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) VL_MT_DISABLED;
+    static bool bindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
+                            std::vector<int>& formalOf) VL_MT_DISABLED;
     VhdlType* analyzeSelected(AstVhdlSelected* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wantp) VL_MT_DISABLED;
@@ -417,12 +779,29 @@ private:
     struct CandSet final {
         std::vector<VhdlType*> types;  // Empty when the context decides
         enum class Need : uint8_t { ANY, ARRAY, ACCESS, COMPOSITE } need = Need::ANY;
+        // The distinct characters of a string literal. Only an array whose
+        // element type has a literal for each of them can be its type, which
+        // is what tells "101" apart as a BIT_VECTOR and not a BOOLEAN_VECTOR
+        // (9.3.2).
+        std::string chars;
     };
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
     static bool exactMatch(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
+    // True when every reading of an operand is of a universal type
+    static bool allUniversal(const CandSet& cands) VL_MT_DISABLED;
+    // The distinct characters of a string literal, in no particular order
+    static std::string distinctChars(const std::string& text) VL_MT_DISABLED;
+    // True if an array's element type is an enumeration with a literal for
+    // every one of those characters
+    static bool elementHasChars(const VhdlType* arrayp,
+                                const std::string& chars) VL_MT_DISABLED;
+    // Where every operand is universal, nothing asks for a conversion, so the
+    // universal operator is the one meant (9.3.2). Narrows in place.
+    static void preferUniversal(std::vector<VhdlSymbol*>& cands,
+                                const std::vector<const CandSet*>& operands) VL_MT_DISABLED;
 };
 
 //######################################################################
@@ -460,11 +839,42 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
     case VhdlObjKind::SHARED_VARIABLE: kind = VhdlSymKind::SHARED_VARIABLE; break;
     case VhdlObjKind::FILE: kind = VhdlSymKind::FILE; break;
     }
-    VhdlSymbol* const symp = VhdlSymTab::newSymbol(kind, nodep->name(), nodep);
-    symp->typep(resolveSubtype(nodep->subtypep()));
-    nodep->vhdlSymp(symp);
-    declare(symp, nodep->fileline());
-    if (nodep->defaultp()) analyzeExpr(nodep->defaultp(), symp->typep());
+    VhdlSymbol* symp = nullptr;
+    // A package body gives a deferred constant its value; that completes the
+    // declaration in the package, it does not make a new one (6.4.2.2)
+    if (m_inPackageBody && kind == VhdlSymKind::CONSTANT && nodep->defaultp()) {
+        std::vector<VhdlSymbol*> found;
+        m_scopep->lookup(nodep->name(), found);
+        for (VhdlSymbol* const otherp : found) {
+            if (otherp->kind() == VhdlSymKind::CONSTANT && otherp->deferred()) {
+                symp = otherp;
+                symp->deferred(false);
+                break;
+            }
+        }
+    }
+    if (symp) {
+        nodep->vhdlSymp(symp);
+    } else {
+        symp = VhdlSymTab::newSymbol(kind, nodep->name(), nodep);
+        symp->typep(resolveSubtype(nodep->subtypep()));
+        nodep->vhdlSymp(symp);
+        declare(symp, nodep->fileline());
+    }
+    if (nodep->defaultp()) {
+        analyzeExpr(nodep->defaultp(), symp->typep());
+        symp->typep(constrainFromValue(symp->typep(), nodep->defaultp(), nodep->fileline()));
+        checkValueInRange(nodep->defaultp(), symp->typep(),
+                          std::string{symp->kindName()} + " '" + nodep->name() + "'");
+        checkArrayValue(nodep->defaultp(), symp->typep(),
+                        std::string{symp->kindName()} + " '" + nodep->name() + "'");
+        // A constant with a static value is what every later fold builds on
+        if (kind == VhdlSymKind::CONSTANT) symp->value(V3VhdlEval::eval(nodep->defaultp()));
+    } else if (kind == VhdlSymKind::CONSTANT) {
+        // A constant declared with no value in a package declaration is
+        // deferred; its value comes with the package body (6.4.2.2)
+        symp->deferred(true);
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
@@ -512,7 +922,7 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             ifp->name(), ifp);
         psymp->typep(typep);
         ifp->vhdlSymp(psymp);
-        symp->addParamType(typep);
+        symp->addParam(ifp->name(), typep, ifp->defaultp() != nullptr);
         declare(psymp, ifp->fileline());
     }
     if (nodep->isFunction()) {
@@ -533,6 +943,9 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
     if (nodep->hasBody()) {
         std::vector<VhdlSymbol*> local;
         outerp->lookupLocal(nodep->name(), local);
+        // In a package body the declaration being completed is in the package
+        // declaration, one region out (12.1)
+        if (local.empty() && m_inPackageBody) outerp->lookup(nodep->name(), local);
         for (VhdlSymbol* const otherp : local) {
             if (!otherp->hasBody() && symp->homographOf(otherp)) {
                 reusep = otherp;
@@ -574,8 +987,50 @@ void VhdlSemVisitor::visit(AstVhdlComponentDecl* nodep) {
 void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::ALIAS, nodep->name(), nodep);
     if (nodep->subtypep()) symp->typep(resolveSubtype(nodep->subtypep()));
+    // Record what the alias denotes, so that an alias of a type may be used
+    // as a type mark and an alias of an object as an object (6.6)
+    std::vector<std::string> parts;
+    if (flatten(nodep->targetp(), parts) && !parts.empty()) {
+        VhdlScope* scopep = m_scopep;
+        bool viaScope = parts.size() > 1;
+        for (size_t i = 0; i + 1 < parts.size() && viaScope; ++i) {
+            VhdlScope* const nextp = scopep ? scopep->findNamed(parts[i]) : nullptr;
+            if (!nextp) {
+                viaScope = false;
+            } else {
+                scopep = nextp;
+            }
+        }
+        std::vector<VhdlSymbol*> found;
+        if (viaScope && scopep) {
+            scopep->lookupLocal(parts.back(), found);
+        } else {
+            lookup(parts.back(), found);
+        }
+        // An overloaded name aliases every one of its declarations at once,
+        // so only an unambiguous target is worth recording here
+        if (found.size() == 1) {
+            symp->aliasp(found[0]);
+            if (!symp->typep() && found[0]->typep()) symp->typep(found[0]->typep());
+        }
+    }
     nodep->vhdlSymp(symp);
     declare(symp, nodep->fileline());
+    // Aliasing a type implicitly aliases everything the type declaration
+    // brought with it, so its enumeration literals become visible too (6.6.3)
+    VhdlSymbol* const targetp = symp->aliasp();
+    if (targetp && targetp->kind() == VhdlSymKind::TYPE && targetp->typep()
+        && targetp->typep()->base()->kind() == VhdlTypeKind::ENUM) {
+        for (VhdlSymbol* const litp : targetp->typep()->base()->literals()) {
+            VhdlSymbol* const litAliasp
+                = VhdlSymTab::newSymbol(VhdlSymKind::ALIAS, litp->name(), nodep);
+            litAliasp->aliasp(litp);
+            litAliasp->typep(litp->typep());
+            litAliasp->returnTypep(litp->typep());
+            litAliasp->position(litp->position());
+            m_scopep->insert(litAliasp);
+        }
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlAttrDecl* nodep) {
@@ -607,14 +1062,17 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
+    // The range is named outside the generate's own region, but the parameter
+    // it declares is inside it (11.8)
+    RangeInfo info;
+    if (nodep->kind() == VhdlLoopKind::FOR) info = analyzeRange(nodep->rangep(), nullptr);
     pushScope(nodep->name().empty() ? "generate" : nodep->name());
     if (nodep->kind() == VhdlLoopKind::FOR) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::GENERATE_PARAMETER,
                                                        nodep->paramName(), nodep);
-        symp->typep(V3VhdlStd::integerType());
+        symp->typep(loopParamType(info, nodep->fileline()));
         declare(symp, nodep->fileline());
     }
-    iterateAndNextNull(nodep->rangep());
     iterateAndNextNull(nodep->exprp());
     iterateAndNextNull(nodep->altsp());
     popScope();
@@ -630,17 +1088,27 @@ void VhdlSemVisitor::visit(AstVhdlGenerateBody* nodep) {
 
 void VhdlSemVisitor::visit(AstVhdlLoop* nodep) {
     if (nodep->kind() == VhdlLoopKind::FOR) {
-        // The loop parameter is declared by the loop itself (10.10)
+        // The loop parameter is declared by the loop itself, and its subtype
+        // is that of the discrete range (10.10)
+        const RangeInfo info = analyzeRange(nodep->rangep(), nullptr);
         pushScope("loop");
         VhdlSymbol* const symp
             = VhdlSymTab::newSymbol(VhdlSymKind::LOOP_PARAMETER, nodep->paramName(), nodep);
-        symp->typep(V3VhdlStd::integerType());
+        symp->typep(loopParamType(info, nodep->fileline()));
         declare(symp, nodep->fileline());
-        iterateChildren(nodep);
+        iterateAndNextNull(nodep->stmtsp());
         popScope();
         return;
     }
     iterateChildren(nodep);
+}
+
+// The subtype of a loop or generate parameter: the range's type, narrowed to
+// the range itself where it is static (10.10, 11.8)
+VhdlType* VhdlSemVisitor::loopParamType(const RangeInfo& info, FileLine* flp) {
+    if (!info.typep || info.typep->isError()) return V3VhdlStd::integerType();
+    if (!info.left.known() || !info.right.known()) return info.typep;
+    return makeRangeSubtype(info, flp);
 }
 
 //######################################################################
@@ -673,38 +1141,47 @@ void VhdlSemVisitor::setupUnitContext(AstNodeVhdlUnit* unitp) {
         if (it != m_primaryUnits.end()) contexts.insert(contexts.begin(), it->second->contextp());
     }
 
-    for (AstNode* listp : contexts)
-    for (AstNode* itemp = listp; itemp; itemp = itemp->nextp()) {
-        AstVhdlContextItem* const ctxp = VN_AS(itemp, VhdlContextItem);
-        for (AstNode* namep = ctxp->namesp(); namep; namep = namep->nextp()) {
-            std::vector<std::string> parts;
-            AstNodeVhdlExpr* const exprp = VN_AS(namep, NodeVhdlExpr);
-            if (ctxp->kind() == VhdlContextKind::LIBRARY) {
-                const AstVhdlName* const lnp = VN_CAST(exprp, VhdlName);
-                if (lnp) m_scopep->addNamed(lnp->name(), libScope(lnp->name()));
-                continue;
-            }
-            // A use clause: "use lib.unit.all" or "use lib.unit.item"
-            if (!flattenUse(exprp, parts) || parts.size() < 2) continue;
-            std::string lib = parts[0];
-            if (lib == "work") lib = m_libname;
-            VhdlScope* targetp = nullptr;
-            const auto it = m_unitScopes.find(lib + "." + parts[1]);
-            if (it != m_unitScopes.end()) {
-                targetp = it->second;
-            } else {
-                // A package Verilator supplies, such as STD.TEXTIO
-                targetp = libScope(lib)->findNamed(parts[1]);
-            }
-            if (!targetp) continue;  // Not one of ours, or not yet analyzed
-            m_scopep->addNamed(parts[1], targetp);
-            // "use pkg.all" makes everything potentially visible; a selective
-            // use clause is treated the same, which is over-permissive but
-            // never rejects a legal design
-            m_scopep->addUse(targetp);
+    for (AstNode* listp : contexts) {
+        for (AstNode* itemp = listp; itemp; itemp = itemp->nextp()) {
+            applyContextItem(VN_AS(itemp, VhdlContextItem));
         }
     }
 }
+
+// A library clause names a library; a use clause makes a package's
+// declarations potentially visible (13.2). Both may appear in a context
+// clause and, for a use clause, in any declarative part as well (12.4).
+void VhdlSemVisitor::applyContextItem(AstVhdlContextItem* ctxp) {
+    for (AstNode* namep = ctxp->namesp(); namep; namep = namep->nextp()) {
+        std::vector<std::string> parts;
+        AstNodeVhdlExpr* const exprp = VN_AS(namep, NodeVhdlExpr);
+        if (ctxp->kind() == VhdlContextKind::LIBRARY) {
+            const AstVhdlName* const lnp = VN_CAST(exprp, VhdlName);
+            if (lnp) m_scopep->addNamed(lnp->name(), libScope(lnp->name()));
+            continue;
+        }
+        // A use clause: "use lib.unit.all" or "use lib.unit.item"
+        if (!flattenUse(exprp, parts) || parts.size() < 2) continue;
+        std::string lib = parts[0];
+        if (lib == "work") lib = m_libname;
+        VhdlScope* targetp = nullptr;
+        const auto it = m_unitScopes.find(lib + "." + parts[1]);
+        if (it != m_unitScopes.end()) {
+            targetp = it->second;
+        } else {
+            // A package Verilator supplies, such as STD.TEXTIO
+            targetp = libScope(lib)->findNamed(parts[1]);
+        }
+        if (!targetp) continue;  // Not one of ours, or not yet analyzed
+        m_scopep->addNamed(parts[1], targetp);
+        // "use pkg.all" makes everything potentially visible; a selective
+        // use clause is treated the same, which is over-permissive but
+        // never rejects a legal design
+        m_scopep->addUse(targetp);
+    }
+}
+
+void VhdlSemVisitor::visit(AstVhdlContextItem* nodep) { applyContextItem(nodep); }
 
 // Print a region and everything declared in it, for --dump-vhdl-syms
 void VhdlSemVisitor::dumpScope(const VhdlScope* scopep, const std::string& indent) {
@@ -713,6 +1190,27 @@ void VhdlSemVisitor::dumpScope(const VhdlScope* scopep, const std::string& inden
         if (symp->predefined()) continue;  // std.standard would drown the rest
         std::cout << indent << symp->kindName() << " " << symp->name();
         if (symp->typep()) std::cout << " : " << symp->typep()->prettyName();
+        // A type's range and a constant's value are what static evaluation
+        // worked out, so they are the interesting part of the dump
+        if (symp->kind() == VhdlSymKind::TYPE && symp->typep()) {
+            const VhdlType* const typep = symp->typep();
+            if (typep->bounded()) {
+                std::cout << " range " << rangeText(typep);
+            } else if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+                std::cout << " (";
+                bool first = true;
+                for (const VhdlType* const idxp : typep->indexTypes()) {
+                    if (!first) std::cout << ", ";
+                    first = false;
+                    // An unconstrained array has no range of its own, however
+                    // bounded its index subtype may be
+                    const bool known = idxp && idxp->bounded() && !typep->unconstrained();
+                    std::cout << (known ? rangeText(idxp) : "<>");
+                }
+                std::cout << ")";
+            }
+        }
+        if (symp->hasValue()) std::cout << " = " << symp->value().prettyName();
         if (symp->kind() == VhdlSymKind::FUNCTION || symp->kind() == VhdlSymKind::PROCEDURE) {
             std::cout << " (";
             for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
@@ -761,6 +1259,8 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         } else if (AstVhdlPackageBody* const bodyp = VN_CAST(unitp, VhdlPackageBody)) {
             const auto it = m_unitScopes.find(lib + "." + lower(unitp->name()));
             if (it != m_unitScopes.end()) m_scopep->addUse(it->second);
+            VL_RESTORER(m_inPackageBody);
+            m_inPackageBody = true;
             iterateAndNextNull(bodyp->declsp());
         } else {
             iterateChildren(unitp);
@@ -807,14 +1307,10 @@ bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
             || top->kind() == VhdlTypeKind::UNIVERSAL_REAL)) {
         return true;
     }
-    if (top->kind() == VhdlTypeKind::UNIVERSAL_INTEGER
-        && fromp->kind() == VhdlTypeKind::INTEGER) {
-        return true;
-    }
-    if (top->kind() == VhdlTypeKind::UNIVERSAL_REAL
-        && fromp->kind() == VhdlTypeKind::FLOATING) {
-        return true;
-    }
+    // The conversion goes one way only: a universal value becomes an INTEGER
+    // or a REAL where the context asks for one, but an INTEGER never becomes
+    // universal (9.3.6). That asymmetry is what makes "x = 0" mean the
+    // INTEGER "=" rather than the universal one when x is an INTEGER.
     return false;
 }
 
@@ -829,16 +1325,21 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
         case VhdlLitKind::CHARACTER: {
             // A character literal may belong to several enumeration types
             std::vector<VhdlSymbol*> found;
-            lookup(litp->text(), found);
+            lookup(vhdlCharLitName(litp->text()), found);
             for (const VhdlSymbol* const symp : found) {
                 if (symp->kind() == VhdlSymKind::ENUM_LITERAL) out.types.push_back(symp->typep());
             }
             return;
         }
         case VhdlLitKind::STRING:
-        case VhdlLitKind::BITSTRING:
             // A string literal is always an array, never a single element
             out.need = CandSet::Need::ARRAY;
+            out.chars = distinctChars(litp->text());
+            return;
+        case VhdlLitKind::BITSTRING:
+            out.need = CandSet::Need::ARRAY;
+            // Whatever its base, a bit string is written in ones and zeros
+            out.chars = "01";
             return;
         case VhdlLitKind::NULLLIT: out.need = CandSet::Need::ACCESS; return;
         default: break;
@@ -847,6 +1348,23 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
     if (VN_IS(nodep, VhdlAggregate)) {
         out.need = CandSet::Need::COMPOSITE;
         return;
+    }
+    if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
+        // A name may denote several overloaded declarations, as ERROR denotes
+        // both a SEVERITY_LEVEL and, inside STD_LOGIC_1164's body, an MVL9PLUS.
+        // Committing to one here would report an ambiguity the surrounding
+        // expression is about to resolve.
+        std::vector<VhdlSymbol*> found;
+        lookup(namep->isChar() ? vhdlCharLitName(namep->name()) : namep->name(), found);
+        for (const VhdlSymbol* const symp : found) {
+            if (symp->isOverloadable() && !symp->paramTypes().empty()) continue;
+            if (symp->kind() == VhdlSymKind::TYPE) continue;
+            VhdlType* const typep = symp->returnTypep() ? symp->returnTypep() : symp->typep();
+            if (typep) out.types.push_back(typep);
+        }
+        std::sort(out.types.begin(), out.types.end());
+        out.types.erase(std::unique(out.types.begin(), out.types.end()), out.types.end());
+        if (!out.types.empty()) return;
     }
     // An operator or a call has as many possible types as it has applicable
     // overloads. Gathering them without committing is what lets the context
@@ -896,7 +1414,9 @@ bool VhdlSemVisitor::anyMatches(const CandSet& cands, const VhdlType* wantp) {
     if (!wantp) return true;
     switch (cands.need) {
     case CandSet::Need::ARRAY:
-        return wantp->kind() == VhdlTypeKind::ARRAY || wantp->isError();
+        if (wantp->isError()) return true;
+        if (wantp->kind() != VhdlTypeKind::ARRAY) return false;
+        return elementHasChars(wantp, cands.chars);
     case CandSet::Need::ACCESS:
         return wantp->kind() == VhdlTypeKind::ACCESS || wantp->isError();
     case CandSet::Need::COMPOSITE: return wantp->isComposite() || wantp->isError();
@@ -905,13 +1425,68 @@ bool VhdlSemVisitor::anyMatches(const CandSet& cands, const VhdlType* wantp) {
     return true;  // LCOV_EXCL_LINE
 }
 
+std::string VhdlSemVisitor::distinctChars(const std::string& text) {
+    std::string out;
+    for (const char c : text) {
+        if (out.find(c) == std::string::npos) out += c;
+    }
+    return out;
+}
+
+bool VhdlSemVisitor::elementHasChars(const VhdlType* arrayp, const std::string& chars) {
+    if (chars.empty()) return true;
+    const VhdlType* const elemp = arrayp->base()->elementp();
+    if (!elemp) return true;
+    if (elemp->base()->kind() != VhdlTypeKind::ENUM) return false;
+    for (const char c : chars) {
+        const std::string want = vhdlCharLitName(std::string(1, c));
+        bool found = false;
+        for (const VhdlSymbol* const litp : elemp->base()->literals()) {
+            if (litp->name() == want) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+bool VhdlSemVisitor::allUniversal(const CandSet& cands) {
+    if (cands.types.empty()) return false;
+    for (const VhdlType* const typep : cands.types) {
+        if (!typep || !typep->isUniversal()) return false;
+    }
+    return true;
+}
+
+void VhdlSemVisitor::preferUniversal(std::vector<VhdlSymbol*>& cands,
+                                     const std::vector<const CandSet*>& operands) {
+    if (cands.size() < 2) return;
+    for (const CandSet* const setp : operands) {
+        if (!allUniversal(*setp)) return;
+    }
+    // 3 < 2 is a comparison of universal integers, not of INTEGERs that the
+    // literals were converted to, so the universal "<" is what it denotes
+    std::vector<VhdlSymbol*> universal;
+    for (VhdlSymbol* const symp : cands) {
+        bool ok = !symp->paramTypes().empty();
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (!typep || !typep->isUniversal()) ok = false;
+        }
+        if (ok) universal.push_back(symp);
+    }
+    if (universal.size() == 1) cands.swap(universal);
+}
+
 bool VhdlSemVisitor::exactMatch(const CandSet& cands, const VhdlType* wantp) {
     if (cands.types.empty()) return true;  // The context settles it either way
     for (const VhdlType* const typep : cands.types) {
         if (!typep || !wantp) continue;
-        // A literal of universal type converts implicitly, so it is no less
-        // exact a match than a named type would be (9.3.2)
-        if (typep->isUniversal() && typesMatch(typep, wantp)) return true;
+        // Exact means "needs no implicit conversion", so a universal literal
+        // is exact only against a universal parameter. Callers rank overloads
+        // by how many operands are exact, which is what makes 2 * 500 ns the
+        // universal "*" rather than the INTEGER one (9.3.2).
         if (typep->base() == wantp->base()) return true;
     }
     return false;
@@ -933,15 +1508,20 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         if (!narrowed.empty()) cands.swap(narrowed);
     }
     if (cands.size() > 1) {
-        // Several interpretations remain. Prefer an exact result-type match
-        // over a universal one before giving up.
-        std::vector<VhdlSymbol*> exact;
+        // Several interpretations remain. Where the context names a type,
+        // prefer the reading that gives exactly it rather than one that
+        // converts; where there is no context at all, prefer the universal
+        // reading, which is what a literal means on its own (9.3.2).
+        std::vector<VhdlSymbol*> preferred;
         for (VhdlSymbol* const symp : cands) {
             VhdlType* const resultp = symp->returnTypep() ? symp->returnTypep() : symp->typep();
-            if (wantp && resultp && resultp->base() == wantp->base()) exact.push_back(symp);
+            if (!resultp) continue;
+            if (wantp ? resultp->base() == wantp->base() : resultp->isUniversal()) {
+                preferred.push_back(symp);
+            }
         }
-        if (exact.size() == 1) {
-            cands.swap(exact);
+        if (preferred.size() == 1) {
+            cands.swap(preferred);
         } else {
             err(nodep->fileline(),
                 "Ambiguous " + what + ": " + std::to_string(cands.size())
@@ -956,8 +1536,9 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
 }
 
 VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
+    const std::string key = nodep->isChar() ? vhdlCharLitName(nodep->name()) : nodep->name();
     std::vector<VhdlSymbol*> found;
-    lookup(nodep->name(), found);
+    lookup(key, found);
     if (found.empty()) {
         err(nodep->fileline(), "Cannot find declaration of '" + nodep->name() + "'");
         return V3VhdlStd::errorType();
@@ -1019,7 +1600,7 @@ VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp)
         // A character literal denotes an enumeration literal, and may belong
         // to several enumeration types at once
         std::vector<VhdlSymbol*> found;
-        lookup(nodep->text(), found);
+        lookup(vhdlCharLitName(nodep->text()), found);
         std::vector<VhdlSymbol*> lits;
         for (VhdlSymbol* const symp : found) {
             if (symp->kind() == VhdlSymKind::ENUM_LITERAL) lits.push_back(symp);
@@ -1035,7 +1616,7 @@ VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp)
     case VhdlLitKind::BITSTRING:
         // A string or bit string literal takes its type from the context; if
         // none is given it is a STRING (9.3.2)
-        if (wantp && wantp->kind() == VhdlTypeKind::ARRAY) return wantp;
+        if (wantp && wantp->base()->kind() == VhdlTypeKind::ARRAY) return wantp;
         return nodep->kind() == VhdlLitKind::STRING ? V3VhdlStd::stringType()
                                                     : V3VhdlStd::bitVectorType();
     case VhdlLitKind::NULLLIT:
@@ -1057,14 +1638,14 @@ VhdlType* VhdlSemVisitor::analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) {
         if (symp->kind() != VhdlSymKind::FUNCTION) continue;
         if (symp->paramTypes().size() != 1) continue;
         if (!anyMatches(ocands, symp->paramTypes()[0])) continue;
-        const bool isExact = exactMatch(ocands, symp->paramTypes()[0]);
-        (isExact ? exact : loose).push_back(symp);
+        (exactMatch(ocands, symp->paramTypes()[0]) ? exact : loose).push_back(symp);
     }
     std::vector<VhdlSymbol*> cands = exact.empty() ? loose : exact;
+    preferUniversal(cands, {&ocands});
+    if (!ocands.types.empty() && ocands.types[0] && ocands.types[0]->isError()) {
+        return V3VhdlStd::errorType();
+    }
     if (cands.empty()) {
-        if (!ocands.types.empty() && ocands.types[0] && ocands.types[0]->isError()) {
-            return V3VhdlStd::errorType();
-        }
         err(nodep->fileline(), "No visible operator \"" + op + "\" matches this use");
         analyzeExpr(nodep->lhsp(), nullptr);
         return V3VhdlStd::errorType();
@@ -1089,21 +1670,32 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
     lookup(op, found);
     // Prefer operators whose parameter types match exactly; only if none do
     // is an implicit conversion from a universal type considered (9.3.2)
-    std::vector<VhdlSymbol*> exact;
-    std::vector<VhdlSymbol*> loose;
+    // Score each applicable operator by how many of its operands need no
+    // implicit conversion, and keep only the best. That is what tells
+    // "2 * 500 ns" apart: the universal "*" fits both operands exactly, while
+    // the INTEGER one would have to convert the literal (9.3.2).
+    std::vector<VhdlSymbol*> cands;
+    int best = -1;
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() != VhdlSymKind::FUNCTION) continue;
         if (symp->paramTypes().size() != 2) continue;
         if (!anyMatches(lcands, symp->paramTypes()[0])) continue;
         if (!anyMatches(rcands, symp->paramTypes()[1])) continue;
-        const bool isExact = exactMatch(lcands, symp->paramTypes()[0])
-                             && exactMatch(rcands, symp->paramTypes()[1]);
-        (isExact ? exact : loose).push_back(symp);
+        const int score = (exactMatch(lcands, symp->paramTypes()[0]) ? 1 : 0)
+                          + (exactMatch(rcands, symp->paramTypes()[1]) ? 1 : 0);
+        if (score > best) {
+            best = score;
+            cands.clear();
+        }
+        if (score == best) cands.push_back(symp);
     }
-    std::vector<VhdlSymbol*> cands = exact.empty() ? loose : exact;
+    preferUniversal(cands, {&lcands, &rcands});
     const bool sawError = (!lcands.types.empty() && lcands.types[0] && lcands.types[0]->isError())
                           || (!rcands.types.empty() && rcands.types[0]
                               && rcands.types[0]->isError());
+    // An operand that is already in error matches everything, so anything
+    // said about this operator would be about the earlier mistake
+    if (sawError) return V3VhdlStd::errorType();
     if (cands.empty()) {
         if (!sawError) {
             err(nodep->fileline(),
@@ -1210,38 +1802,68 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         }
     }
     if (!prefixTypep) prefixTypep = analyzeExpr(nodep->prefixp(), nullptr);
-    if (nodep->argp()) analyzeExpr(nodep->argp(), nullptr);
+    // Record what the prefix denotes, so that folding an attribute later does
+    // not have to work it out again
+    if (nodep->prefixp() && !nodep->prefixp()->vhdlTypep()) {
+        nodep->prefixp()->vhdlTypep(prefixTypep);
+    }
 
     const std::string& attr = nodep->name();
-    // Attributes yielding a value of the prefix type (16.2.3, 16.2.4)
+    const bool isArray = prefixTypep && prefixTypep->base()->kind() == VhdlTypeKind::ARRAY;
+
+    // Attributes of an array ask about one of its index ranges; those of any
+    // other type about the type's own range (16.2.3, 16.2.4)
     if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
-        || attr == "leftof" || attr == "rightof" || attr == "pred" || attr == "succ"
-        || attr == "val" || attr == "value") {
-        if (prefixTypep && prefixTypep->kind() == VhdlTypeKind::ARRAY) {
-            return prefixTypep->indexTypes().empty() ? V3VhdlStd::integerType()
-                                                     : prefixTypep->indexTypes()[0];
+        || attr == "ascending" || attr == "length" || attr == "range"
+        || attr == "reverse_range" || attr == "element") {
+        // The argument of one of these is a dimension, not a value
+        VhdlType* rangeTypep = prefixTypep;
+        if (isArray) {
+            rangeTypep = dimensionOf(nodep, prefixTypep);
+            if (!rangeTypep) return V3VhdlStd::errorType();
+        } else if (nodep->argp()) {
+            analyzeExpr(nodep->argp(), V3VhdlStd::integerType());
         }
+        if (attr == "element") {
+            return isArray && prefixTypep->base()->elementp() ? prefixTypep->base()->elementp()
+                                                              : V3VhdlStd::errorType();
+        }
+        if (attr == "length") return V3VhdlStd::integerType();
+        if (attr == "ascending") return V3VhdlStd::booleanType();
+        return rangeTypep ? rangeTypep : V3VhdlStd::errorType();
+    }
+    // Attributes taking a value of the prefix type, or giving one (16.2.3)
+    if (attr == "pos" || attr == "succ" || attr == "pred" || attr == "leftof"
+        || attr == "rightof") {
+        if (nodep->argp()) analyzeExpr(nodep->argp(), prefixTypep);
+        if (attr == "pos") return V3VhdlStd::integerType();
         return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
     }
-    if (attr == "pos" || attr == "length" || attr == "ascending_length") {
-        return V3VhdlStd::integerType();
+    if (attr == "val") {
+        if (nodep->argp()) analyzeExpr(nodep->argp(), V3VhdlStd::integerType());
+        return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
     }
-    if (attr == "ascending" || attr == "event" || attr == "active" || attr == "quiet"
-        || attr == "stable") {
-        return V3VhdlStd::booleanType();
-    }
-    if (attr == "image" || attr == "instance_name" || attr == "path_name"
-        || attr == "simple_name") {
+    if (attr == "image") {
+        if (nodep->argp()) analyzeExpr(nodep->argp(), prefixTypep);
         return V3VhdlStd::stringType();
     }
-    if (attr == "last_value" || attr == "delayed" || attr == "driving_value") {
+    if (attr == "value") {
+        if (nodep->argp()) analyzeExpr(nodep->argp(), V3VhdlStd::stringType());
+        return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
+    }
+    if (nodep->argp()) analyzeExpr(nodep->argp(), nullptr);
+    if (attr == "event" || attr == "active" || attr == "quiet" || attr == "stable"
+        || attr == "driving") {
+        return V3VhdlStd::booleanType();
+    }
+    if (attr == "instance_name" || attr == "path_name" || attr == "simple_name") {
+        return V3VhdlStd::stringType();
+    }
+    if (attr == "last_value" || attr == "delayed" || attr == "driving_value"
+        || attr == "transaction" || attr == "base") {
         return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
     }
     if (attr == "last_event" || attr == "last_active") return V3VhdlStd::timeType();
-    if (attr == "driving") return V3VhdlStd::booleanType();
-    if (attr == "base" || attr == "element" || attr == "range" || attr == "reverse_range") {
-        return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
-    }
     // A user-defined attribute (7.2)
     std::vector<VhdlSymbol*> found;
     lookup(attr, found);
@@ -1281,15 +1903,43 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             subp->elementp(wantp->base()->elementp());
             elemTypep = subp;
         }
+        // Every choice is an index value or a range of them (9.3.3.3). What
+        // the choices must *cover* depends on the context, so that check
+        // belongs to the caller: an aggregate standing as an operand takes
+        // its index range from its own choices, not from the operand type.
+        VhdlType* const indexTypep
+            = wantp->indexTypes().empty() ? nullptr : wantp->indexTypes()[0];
         for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
             AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
             for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
                 AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
-                if (chp->exprp()) analyzeExpr(chp->exprp(), nullptr);
+                if (chp->isOthers()) continue;
+                if (AstVhdlRange* const rp = chp->rangep()) {
+                    analyzeRange(rp, indexTypep);
+                } else if (AstNodeVhdlExpr* const valuep = chp->valuep()) {
+                    analyzeExpr(valuep, indexTypep);
+                }
             }
             // An element may itself be an array of the same type, as in
             // "(others => (others => '0'))", so try the element type first
             analyzeExpr(eap->valuep(), elemTypep);
+            checkValueInRange(eap->valuep(), elemTypep, "an element of this aggregate");
+        }
+        // Whatever the context, an index named by a choice must be a value of
+        // the array's index subtype: "(0 => 'a')" is not a STRING, which is
+        // indexed by POSITIVE, however the aggregate is used (9.3.3.3)
+        VhdlType* const baseIndexp = wantp->base()->indexTypes().empty()
+                                         ? nullptr
+                                         : wantp->base()->indexTypes()[0];
+        if (baseIndexp && wantp->dimensions() == 1) {
+            for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
+                for (AstNode* cp = VN_AS(elemp, VhdlElemAssoc)->choicesp(); cp; cp = cp->nextp()) {
+                    AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                    if (chp->isOthers() || chp->rangep() || !chp->valuep()) continue;
+                    checkChoiceInRange(chp->valuep()->fileline(),
+                                       V3VhdlEval::eval(chp->valuep()), baseIndexp);
+                }
+            }
         }
         return wantp;
     }
@@ -1301,13 +1951,12 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
         VhdlType* fieldp = nullptr;
         if (eap->choicesp()) {
             const AstVhdlChoice* const chp = eap->choicesp();
-            const AstVhdlName* const namep
-                = chp->exprp() ? VN_CAST(chp->exprp(), VhdlName) : nullptr;
+            const AstVhdlName* const namep = VN_CAST(chp->valuep(), VhdlName);
             if (namep) {
                 for (VhdlSymbol* const symp : elems) {
                     if (symp->name() == namep->name()) fieldp = symp->typep();
                 }
-            } else if (!chp->exprp()) {
+            } else if (chp->isOthers()) {
                 // "others => x" covers whatever is left
                 fieldp = elems.empty() ? nullptr : elems.back()->typep();
             }
@@ -1320,12 +1969,48 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
     return wantp;
 }
 
+// Work out which formal each actual is for. Positional associations come
+// first and take the formals in order; a named one names its formal. Any
+// formal left without an actual must have a default (6.5.7.1). Returns false
+// if the actuals cannot be bound to this subprogram at all.
+bool VhdlSemVisitor::bindActuals(const VhdlSymbol* symp,
+                                 const std::vector<AstVhdlAssoc*>& assocs,
+                                 std::vector<int>& formalOf) {
+    const size_t formals = symp->paramTypes().size();
+    formalOf.assign(assocs.size(), -1);
+    std::vector<bool> filled(formals, false);
+    bool named = false;
+    for (size_t i = 0; i < assocs.size(); ++i) {
+        AstVhdlAssoc* const asp = assocs[i];
+        const AstVhdlName* const formalNamep
+            = asp ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+        if (!asp || !asp->formalp()) {
+            // Positional, and no positional may follow a named one
+            if (named || i >= formals) return false;
+            formalOf[i] = static_cast<int>(i);
+            filled[i] = true;
+            continue;
+        }
+        named = true;
+        if (!formalNamep) return false;  // A conversion or an indexed formal
+        const int idx = symp->paramIndex(formalNamep->name());
+        if (idx < 0 || filled[idx]) return false;
+        formalOf[i] = idx;
+        filled[idx] = true;
+    }
+    for (size_t i = 0; i < formals; ++i) {
+        if (!filled[i] && !symp->paramHasDefault(i)) return false;
+    }
+    return true;
+}
+
 VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // "prefix ( ... )" is a function call, an indexed name, a slice or a type
     // conversion, and only now can we tell which (8.1)
     std::vector<std::string> parts;
     std::vector<VhdlSymbol*> found;
-    if (flatten(nodep->prefixp(), parts) && !parts.empty()) {
+    const bool namedPrefix = flatten(nodep->prefixp(), parts) && !parts.empty();
+    if (namedPrefix) {
         VhdlScope* scopep = m_scopep;
         bool viaScope = parts.size() > 1;
         for (size_t i = 0; i + 1 < parts.size() && viaScope; ++i) {
@@ -1351,7 +2036,18 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
                 if (AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
                     analyzeExpr(asp->actualp(), nullptr);
+                    // The result of a conversion must belong to the subtype
+                    // the type mark names (9.3.6)
+                    checkArrayValue(asp->actualp(), symp->typep(),
+                                    "the conversion to " + symp->typep()->prettyName());
                 }
+            }
+            const std::string what = "the conversion to " + symp->typep()->prettyName();
+            const VhdlValue val = V3VhdlEval::eval(nodep);
+            if (val.known() && !V3VhdlEval::inRange(val, symp->typep())) {
+                err(nodep->fileline(), "Value " + val.prettyName()
+                                           + " is outside the range of " + what + ", which is "
+                                           + rangeText(symp->typep()));
             }
             return symp->typep();
         }
@@ -1360,9 +2056,12 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // Gather what each actual could be, without settling any of them, so the
     // whole set can filter the overloads (12.5)
     std::vector<CandSet> argCands;
+    std::vector<AstVhdlAssoc*> assocs;
     for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
         argCands.emplace_back();
-        if (AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
+        AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
+        assocs.push_back(asp);
+        if (asp) {
             candidateTypes(asp->actualp(), argCands.back());
         } else {
             argCands.back().types.push_back(nullptr);  // A discrete range, in a slice
@@ -1372,6 +2071,18 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     std::vector<VhdlType*> argTypes;
     for (const auto& cands : argCands) {
         argTypes.push_back(cands.types.empty() ? nullptr : cands.types[0]);
+    }
+
+    // A prefix that is not itself a name -- "p.all", or the result of another
+    // call as in CORDIC(...)(1) -- denotes no declaration of its own, so its
+    // type has to be worked out before it can be indexed (8.4)
+    if (!namedPrefix) {
+        VhdlType* const typep = analyzeExpr(nodep->prefixp(), nullptr);
+        if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
+            return isSlice ? analyzeSliceName(nodep, typep) : analyzeIndexedName(nodep, typep);
+        }
+        if (typep && typep->isError()) return typep;
     }
 
     // An object prefix makes it an indexed name or a slice (8.4, 8.5)
@@ -1384,26 +2095,33 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         nodep->vhdlSymp(symp);
         // A slice keeps the array type; an index yields one element
         const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
-        return isSlice ? typep : typep->base()->elementp();
+        return isSlice ? analyzeSliceName(nodep, typep) : analyzeIndexedName(nodep, typep);
     }
 
     // Otherwise a subprogram call, resolved by its arguments and its context
-    std::vector<VhdlSymbol*> exact;
-    std::vector<VhdlSymbol*> loose;
+    std::vector<VhdlSymbol*> cands;
+    std::vector<int> formalOf;
+    int best = -1;
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() != VhdlSymKind::FUNCTION && symp->kind() != VhdlSymKind::PROCEDURE) {
             continue;
         }
-        if (symp->paramTypes().size() != argCands.size()) continue;
+        if (!bindActuals(symp, assocs, formalOf)) continue;
         bool ok = true;
-        bool isExact = true;
+        int score = 0;
         for (size_t i = 0; i < argCands.size() && ok; ++i) {
-            if (!anyMatches(argCands[i], symp->paramTypes()[i])) ok = false;
-            if (!exactMatch(argCands[i], symp->paramTypes()[i])) isExact = false;
+            if (formalOf[i] < 0) continue;
+            VhdlType* const paramp = symp->paramTypes()[formalOf[i]];
+            if (!anyMatches(argCands[i], paramp)) ok = false;
+            if (exactMatch(argCands[i], paramp)) ++score;
         }
-        if (ok) (isExact ? exact : loose).push_back(symp);
+        if (!ok) continue;
+        if (score > best) {
+            best = score;
+            cands.clear();
+        }
+        if (score == best) cands.push_back(symp);
     }
-    std::vector<VhdlSymbol*> cands = exact.empty() ? loose : exact;
     if (cands.empty()) {
         for (const VhdlType* const typep : argTypes) {
             if (typep && typep->isError()) return V3VhdlStd::errorType();
@@ -1423,15 +2141,399 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         = pick(nodep, cands, wantp,
                "subprogram '" + (parts.empty() ? std::string{"<name>"} : parts.back()) + "'");
     // The chosen signature now settles every actual
-    if (nodep->vhdlSymp()) {
-        size_t i = 0;
-        for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp(), ++i) {
-            AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
-            if (!asp || !asp->actualp() || i >= nodep->vhdlSymp()->paramTypes().size()) continue;
-            analyzeExpr(asp->actualp(), nodep->vhdlSymp()->paramTypes()[i]);
+    if (nodep->vhdlSymp() && bindActuals(nodep->vhdlSymp(), assocs, formalOf)) {
+        for (size_t i = 0; i < assocs.size(); ++i) {
+            if (!assocs[i] || !assocs[i]->actualp() || formalOf[i] < 0) continue;
+            VhdlType* const paramp = nodep->vhdlSymp()->paramTypes()[formalOf[i]];
+            analyzeExpr(assocs[i]->actualp(), paramp);
+            // An actual must belong to the parameter's subtype (4.2.2.1)
+            if (!nodep->vhdlSymp()->predefined()) {
+                const std::string what = "parameter " + std::to_string(formalOf[i] + 1) + " of '"
+                                         + nodep->vhdlSymp()->name() + "'";
+                checkValueInRange(assocs[i]->actualp(), paramp, what);
+                checkArrayValue(assocs[i]->actualp(), paramp, what);
+            }
         }
     }
     return resultp;
+}
+
+// A delay may not be negative (10.5.2.1, 10.2)
+void VhdlSemVisitor::checkDelay(AstNodeVhdlExpr* nodep, const char* what) {
+    if (!nodep) return;
+    const VhdlValue val = V3VhdlEval::eval(nodep);
+    if (!val.isInt() || val.toInt() >= 0) return;
+    err(nodep->fileline(),
+        std::string{"A "} + what + " may not be negative, but this one is "
+            + val.prettyName());
+}
+
+// The elements of a waveform take effect in the order written, so their times
+// must strictly increase and only the first may be immediate (10.5.2.1)
+void VhdlSemVisitor::checkWaveform(AstNode* wavesp) {
+    bool haveLast = false;
+    int64_t last = 0;
+    for (AstNode* wp = wavesp; wp; wp = wp->nextp()) {
+        AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
+        checkDelay(wfp->afterp(), "delay");
+        int64_t here = 0;
+        if (wfp->afterp()) {
+            const VhdlValue val = V3VhdlEval::eval(wfp->afterp());
+            if (!val.isInt()) return;  // Not static: nothing can be said
+            here = val.toInt();
+        }
+        if (haveLast && here <= last) {
+            err(wfp->fileline(), "This waveform element takes effect no later than the one "
+                                 "before it, so it would never be seen");
+            return;
+        }
+        haveLast = true;
+        last = here;
+    }
+}
+
+// What is assigned must belong to the target's subtype: in range for a
+// scalar, and of the right length for a constrained array (10.5.2.2)
+void VhdlSemVisitor::checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) {
+    checkValueInRange(nodep, targetp, "the assignment target");
+    checkArrayValue(nodep, targetp, "the assignment target");
+}
+
+void VhdlSemVisitor::analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) {
+    // A choice is a value, a discrete range or "others" (9.3.3.1)
+    if (!chp || chp->isOthers()) return;
+    if (AstVhdlRange* const rp = chp->rangep()) {
+        analyzeRange(rp, wantp);
+        // A range of choices must lie within the subtype it chooses from
+        if (rp->leftp()) checkValueInRange(rp->leftp(), wantp, "this choice");
+        if (rp->rightp()) checkValueInRange(rp->rightp(), wantp, "this choice");
+        return;
+    }
+    AstNodeVhdlExpr* const valuep = chp->valuep();
+    if (!valuep) return;
+    analyzeExpr(valuep, wantp);
+    checkValueInRange(valuep, wantp, "this choice");
+}
+
+// One index per dimension, each within its own index range (8.4)
+VhdlType* VhdlSemVisitor::analyzeIndexedName(AstVhdlCall* nodep, VhdlType* arrayp) {
+    const std::vector<VhdlType*>& indexes = arrayp->indexTypes();
+    size_t dim = 0;
+    for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp(), ++dim) {
+        AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
+        if (!asp || !asp->actualp()) continue;
+        VhdlType* const wantp = dim < indexes.size() ? indexes[dim] : nullptr;
+        analyzeExpr(asp->actualp(), wantp);
+        checkValueInRange(asp->actualp(), wantp, "the index of " + arrayp->prettyName());
+    }
+    if (!indexes.empty() && dim != indexes.size()) {
+        err(nodep->fileline(), "Expected " + std::to_string(indexes.size()) + " index(es) for "
+                                   + arrayp->prettyName() + ", but " + std::to_string(dim)
+                                   + " were given");
+    }
+    return arrayp->base()->elementp();
+}
+
+// A slice is of the array's type, constrained by the slice's own range, which
+// must run the same way as the array's and lie within it (8.5)
+VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp) {
+    VhdlType* const indexp = arrayp->indexTypes().empty() ? nullptr : arrayp->indexTypes()[0];
+    const RangeInfo info = analyzeRange(nodep->argsp(), indexp);
+    VhdlType* const outp = cloneSubtype(arrayp, nodep->fileline());
+    outp->clearIndexTypes();
+    VhdlType* sliceIndexp = info.typep ? info.typep : indexp;
+    if (info.left.known() && info.right.known()) {
+        sliceIndexp = makeRangeSubtype(info, nodep->fileline());
+        if (indexp && indexp->bounded() && !sliceIndexp->isNull()) {
+            if (info.ascending != indexp->ascending()) {
+                err(nodep->fileline(), "Slice runs "
+                                           + std::string{info.ascending ? "'to'" : "'downto'"}
+                                           + " but " + arrayp->prettyName() + " is indexed "
+                                           + (indexp->ascending() ? "'to'" : "'downto'"));
+            } else {
+                checkSubrange(sliceIndexp, indexp, nodep->fileline());
+            }
+        }
+    } else if (sliceIndexp) {
+        sliceIndexp = cloneSubtype(sliceIndexp, nodep->fileline());
+        sliceIndexp->unbound();
+    }
+    outp->addIndexType(sliceIndexp ? sliceIndexp : V3VhdlStd::integerType());
+    outp->unconstrained(!sliceIndexp || !sliceIndexp->bounded());
+    return outp;
+}
+
+// The number of elements a value has, where that is statically known, or -1
+int64_t VhdlSemVisitor::staticLength(AstNodeVhdlExpr* nodep) {
+    if (!nodep) return -1;
+    if (AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate)) {
+        return aggregateLength(aggp);
+    }
+    const VhdlValue val = V3VhdlEval::eval(nodep);
+    if (val.isStr()) return static_cast<int64_t>(val.toStr().size());
+    VhdlType* const typep = nodep->vhdlTypep();
+    if (typep && typep->isConstrainedArray() && typep->dimensions() == 1) {
+        return typep->dimLength(0);
+    }
+    return -1;
+}
+
+// How many elements one positional association supplies. Usually one, but
+// VHDL-2008 lets a value of the aggregate's own type stand for a whole slice
+// of it, so that (c6, 4) is a four-element integer_vector when c6 has three
+// (9.3.3.3).
+int64_t VhdlSemVisitor::elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) {
+    if (!valuep || !arrayTypep) return 1;
+    VhdlType* const typep = valuep->vhdlTypep();
+    if (!typep || typep->base() != arrayTypep->base()) return 1;
+    return staticLength(valuep);
+}
+
+// How many elements an aggregate has, or -1 where "others" or a non-static
+// choice makes that undecidable. Named choices span from the lowest to the
+// highest, which is not the same as counting them (9.3.3.3).
+int64_t VhdlSemVisitor::aggregateLength(AstVhdlAggregate* nodep) {
+    int64_t positional = 0;
+    bool hasNamed = false;
+    int64_t lowest = INT64_MAX;
+    int64_t highest = INT64_MIN;
+    for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
+        AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
+        if (!eap->choicesp()) {
+            const int64_t span = elementSpan(eap->valuep(), nodep->vhdlTypep());
+            if (span < 0) return -1;
+            positional += span;
+        }
+        for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+            if (chp->isOthers()) return -1;
+            hasNamed = true;
+            int64_t lo = 0;
+            int64_t hi = 0;
+            if (AstVhdlRange* const rp = chp->rangep()) {
+                const RangeInfo info = analyzeRange(rp, nullptr);
+                if (!info.left.isInt() || !info.right.isInt()) return -1;
+                lo = info.ascending ? info.left.toInt() : info.right.toInt();
+                hi = info.ascending ? info.right.toInt() : info.left.toInt();
+                if (lo > hi) continue;
+            } else {
+                if (!chp->valuep()) return -1;
+                const VhdlValue val = V3VhdlEval::eval(chp->valuep());
+                if (!val.isInt()) return -1;
+                lo = hi = val.toInt();
+            }
+            lowest = std::min(lowest, lo);
+            highest = std::max(highest, hi);
+        }
+    }
+    if (!hasNamed) return positional;
+    if (lowest > highest) return 0;  // Every choice was a null range
+    return highest - lowest + 1;
+}
+
+// An object declared with an unconstrained array subtype takes its constraint
+// from its initial value (5.3.2.2, 6.4.2.2). Until that is done the object has
+// no length, and neither has anything computed from its attributes.
+VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                             FileLine* flp) {
+    if (!typep || !valuep) return typep;
+    if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->unconstrained()) return typep;
+    // A value that is itself constrained hands over its index ranges directly
+    VhdlType* const valueTypep = valuep->vhdlTypep();
+    if (valueTypep && valueTypep->isConstrainedArray()
+        && valueTypep->dimensions() == typep->dimensions()) {
+        VhdlType* const outp = cloneSubtype(typep, flp);
+        outp->clearIndexTypes();
+        for (VhdlType* const idxp : valueTypep->indexTypes()) outp->addIndexType(idxp);
+        outp->unconstrained(false);
+        return outp;
+    }
+    // Otherwise the value's length decides, starting at the index subtype's
+    // own left bound (9.3.3.3)
+    if (typep->dimensions() != 1) return typep;
+    const int64_t len = staticLength(valuep);
+    if (len < 0) return typep;
+    VhdlType* const indexp = typep->indexTypes()[0];
+    if (!indexp || !indexp->bounded() || indexp->base()->kind() == VhdlTypeKind::FLOATING) {
+        return typep;
+    }
+    VhdlType* const newIndexp = cloneSubtype(indexp, flp);
+    const int64_t left = indexp->left();
+    newIndexp->setBounds(left, indexp->ascending() ? left + len - 1 : left - len + 1,
+                         indexp->ascending());
+    VhdlType* const outp = cloneSubtype(typep, flp);
+    outp->clearIndexTypes();
+    outp->addIndexType(newIndexp);
+    outp->unconstrained(false);
+    return outp;
+}
+
+// An array value must have exactly as many elements as the constrained
+// subtype it is given to (5.3.2.2)
+void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
+                                     const std::string& what) {
+    if (!nodep || !typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return;
+    if (!typep->isConstrainedArray()) return;
+    if (AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate)) {
+        checkAggregate(aggp, typep, what);
+        return;
+    }
+    // Another array value must match dimension for dimension
+    VhdlType* const valuep = nodep->vhdlTypep();
+    if (valuep && valuep->isConstrainedArray()
+        && valuep->dimensions() == typep->dimensions()) {
+        for (size_t dim = 0; dim < typep->dimensions(); ++dim) {
+            const int64_t want = typep->dimLength(dim);
+            const int64_t have = valuep->dimLength(dim);
+            if (want == have) continue;
+            err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for "
+                                       + what + dimensionText(dim, typep->dimensions())
+                                       + ", but the value has " + std::to_string(have));
+            return;
+        }
+        return;
+    }
+    if (typep->dimensions() != 1) return;
+    const int64_t have = staticLength(nodep);
+    if (have < 0) return;
+    const int64_t want = typep->dimLength(0);
+    if (have == want) return;
+    err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for " + what
+                               + ", but the value has " + std::to_string(have));
+}
+
+// Which dimension a length mismatch is in, mentioned only where there is
+// more than one
+std::string VhdlSemVisitor::dimensionText(size_t dim, size_t dims) {
+    if (dims < 2) return "";
+    return " in dimension " + std::to_string(dim + 1);
+}
+
+// An aggregate given to a constrained array subtype must supply exactly its
+// elements (9.3.3.3). Which rule applies turns on whether the aggregate has
+// an "others" choice:
+//
+//   * with "others", the target's index range is the aggregate's, so every
+//     named choice must be an index of the target;
+//   * without it, the aggregate's own choices fix its index range, so the
+//     choices need only be contiguous, distinct, and as many as the target
+//     has elements -- which is why v(7 downto 4) := (3 downto 0 => '1') is
+//     legal while adding "others => '0'" to it is not.
+void VhdlSemVisitor::checkAggregate(AstVhdlAggregate* nodep, VhdlType* typep,
+                                    const std::string& what) {
+    VhdlType* const indexTypep = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
+    std::vector<std::pair<int64_t, int64_t>> covered;  // Low..high of each choice
+    std::vector<FileLine*> flps;
+    int64_t positional = 0;
+    bool hasOthers = false;
+    bool hasNamed = false;
+    bool allStatic = true;
+    for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
+        AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
+        if (!eap->choicesp()) {
+            const int64_t span = elementSpan(eap->valuep(), typep);
+            if (span < 0) {
+                allStatic = false;
+            } else {
+                positional += span;
+            }
+        }
+        for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+            if (chp->isOthers()) {
+                hasOthers = true;
+                continue;
+            }
+            hasNamed = true;
+            int64_t lo = 0;
+            int64_t hi = 0;
+            FileLine* flp = chp->fileline();
+            if (AstVhdlRange* const rp = chp->rangep()) {
+                const RangeInfo info = analyzeRange(rp, indexTypep);
+                if (!info.left.isInt() || !info.right.isInt()) {
+                    allStatic = false;
+                    continue;
+                }
+                lo = info.ascending ? info.left.toInt() : info.right.toInt();
+                hi = info.ascending ? info.right.toInt() : info.left.toInt();
+                flp = rp->fileline();
+                if (lo > hi) continue;  // A null range names nothing
+            } else if (AstNodeVhdlExpr* const valuep = chp->valuep()) {
+                const VhdlValue val = V3VhdlEval::eval(valuep);
+                if (!val.isInt()) {
+                    allStatic = false;
+                    continue;
+                }
+                lo = hi = val.toInt();
+                flp = valuep->fileline();
+            } else {
+                continue;
+            }
+            covered.emplace_back(lo, hi);
+            flps.push_back(flp);
+        }
+    }
+    if (!allStatic || typep->dimensions() != 1) return;
+    const int64_t want = typep->dimLength(0);
+
+    if (hasOthers) {
+        // "others" fixes the aggregate to the target's range, so every named
+        // choice must be one of the target's indexes
+        for (size_t i = 0; i < covered.size(); ++i) {
+            checkChoiceInRange(flps[i], VhdlValue::mkInt(covered[i].first, indexTypep),
+                               indexTypep);
+            if (covered[i].second != covered[i].first) {
+                checkChoiceInRange(flps[i], VhdlValue::mkInt(covered[i].second, indexTypep),
+                                   indexTypep);
+            }
+            // No index may be given a value twice, "others" or not
+            for (size_t j = 0; j < i; ++j) {
+                if (covered[i].first > covered[j].second) continue;
+                if (covered[j].first > covered[i].second) continue;
+                err(flps[i],
+                    "Index "
+                        + VhdlValue::mkInt(std::max(covered[i].first, covered[j].first),
+                                           indexTypep)
+                              .prettyName()
+                        + " is given a value more than once in this aggregate");
+                return;
+            }
+        }
+        return;
+    }
+    if (!hasNamed) {
+        if (positional == want) return;
+        err(nodep->fileline(), "Aggregate has " + std::to_string(positional)
+                                   + " element(s), but " + what + " needs "
+                                   + std::to_string(want));
+        return;
+    }
+    // Named choices: they must be distinct and contiguous, and together as
+    // many as the target has elements
+    std::vector<size_t> order(covered.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&covered](size_t a, size_t b) { return covered[a] < covered[b]; });
+    int64_t elements = 0;
+    for (size_t i = 0; i < order.size(); ++i) {
+        const auto& here = covered[order[i]];
+        elements += here.second - here.first + 1;
+        if (i == 0) continue;
+        const auto& prev = covered[order[i - 1]];
+        if (here.first <= prev.second) {
+            err(flps[order[i]], "Index " + VhdlValue::mkInt(here.first, indexTypep).prettyName()
+                                    + " is given a value more than once in this aggregate");
+            return;
+        }
+        if (here.first != prev.second + 1) {
+            err(flps[order[i]], "This aggregate gives no value for index "
+                                    + VhdlValue::mkInt(prev.second + 1, indexTypep).prettyName());
+            return;
+        }
+    }
+    if (elements == want) return;
+    err(nodep->fileline(), "Aggregate has " + std::to_string(elements) + " element(s), but "
+                               + what + " needs " + std::to_string(want));
 }
 
 VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
@@ -1488,41 +2590,53 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     // Every waveform element is of the target's type (10.5.2.2)
     for (AstNode* wp = nodep->wavesp(); wp; wp = wp->nextp()) {
         AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
-        if (wfp->valuep()) analyzeExpr(wfp->valuep(), targetp);
+        if (wfp->valuep()) {
+            analyzeExpr(wfp->valuep(), targetp);
+            checkAssignedValue(wfp->valuep(), targetp);
+        }
         if (wfp->afterp()) analyzeExpr(wfp->afterp(), V3VhdlStd::timeType());
     }
+    checkWaveform(nodep->wavesp());
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         if (altp->condp()) analyzeExpr(altp->condp(), V3VhdlStd::booleanType());
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
             AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
-            if (chp->exprp()) analyzeExpr(chp->exprp(), nodep->selectorp()
-                                                           ? nodep->selectorp()->vhdlTypep()
-                                                           : nullptr);
+            analyzeChoice(chp, nodep->selectorp() ? nodep->selectorp()->vhdlTypep() : nullptr);
         }
         for (AstNode* wp = altp->wavesp(); wp; wp = wp->nextp()) {
             AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
-            if (wfp->valuep()) analyzeExpr(wfp->valuep(), targetp);
+            if (wfp->valuep()) {
+                analyzeExpr(wfp->valuep(), targetp);
+                checkAssignedValue(wfp->valuep(), targetp);
+            }
             if (wfp->afterp()) analyzeExpr(wfp->afterp(), V3VhdlStd::timeType());
         }
+        checkWaveform(altp->wavesp());
     }
 }
 
 void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
     VhdlType* const targetp = analyzeExpr(nodep->targetp(), nullptr);
-    if (nodep->valuep()) analyzeExpr(nodep->valuep(), targetp);
+    if (nodep->valuep()) {
+        analyzeExpr(nodep->valuep(), targetp);
+        checkAssignedValue(nodep->valuep(), targetp);
+    }
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         if (altp->condp()) analyzeExpr(altp->condp(), V3VhdlStd::booleanType());
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
-            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
-            if (chp->exprp()) analyzeExpr(chp->exprp(), nullptr);
+            analyzeChoice(VN_AS(cp, VhdlChoice),
+                          nodep->selectorp() ? nodep->selectorp()->vhdlTypep() : nullptr);
         }
         for (AstNode* wp = altp->wavesp(); wp; wp = wp->nextp()) {
             AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
-            if (wfp->valuep()) analyzeExpr(wfp->valuep(), targetp);
+            if (wfp->valuep()) {
+                analyzeExpr(wfp->valuep(), targetp);
+                checkAssignedValue(wfp->valuep(), targetp);
+            }
         }
     }
 }
@@ -1541,12 +2655,97 @@ void VhdlSemVisitor::visit(AstVhdlCase* nodep) {
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
-            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
             // Every choice is of the case expression's type (10.9)
-            if (chp->exprp()) analyzeExpr(chp->exprp(), exprp);
+            analyzeChoice(VN_AS(cp, VhdlChoice), exprp);
         }
         iterateAndNextNull(altp->stmtsp());
     }
+    checkCaseChoices(nodep, exprp);
+}
+
+// The choices of a case statement must name every value of the expression's
+// subtype exactly once (10.9). Verilator needs this before lowering anyway:
+// a case that is neither complete nor has an "others" has no defined
+// behaviour to emit, and a duplicated choice has two.
+void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
+    if (!typep || typep->isError() || nodep->matching()) return;
+    const bool discrete = typep->isDiscrete() && typep->bounded();
+    const bool array = typep->base()->kind() == VhdlTypeKind::ARRAY;
+    if (!discrete && !array) return;
+
+    bool hasOthers = false;
+    bool allStatic = true;
+    std::vector<std::pair<int64_t, int64_t>> covered;  // Discrete choices
+    std::vector<FileLine*> flps;
+    std::map<std::string, FileLine*> seenStrings;  // Array choices
+    for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
+        AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
+        for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
+            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+            if (chp->isOthers()) {
+                hasOthers = true;
+                continue;
+            }
+            if (AstVhdlRange* const rp = chp->rangep()) {
+                const RangeInfo info = analyzeRange(rp, typep);
+                if (!info.left.isInt() || !info.right.isInt()) {
+                    allStatic = false;
+                    continue;
+                }
+                const int64_t lo = info.ascending ? info.left.toInt() : info.right.toInt();
+                const int64_t hi = info.ascending ? info.right.toInt() : info.left.toInt();
+                if (lo > hi) continue;  // A null range names nothing
+                covered.emplace_back(lo, hi);
+                flps.push_back(rp->fileline());
+                continue;
+            }
+            AstNodeVhdlExpr* const valuep = chp->valuep();
+            if (!valuep) continue;
+            const VhdlValue val = V3VhdlEval::eval(valuep);
+            if (val.isStr()) {
+                const auto pair = seenStrings.emplace(val.toStr(), valuep->fileline());
+                if (!pair.second) {
+                    err(valuep->fileline(), "Choice " + val.prettyName()
+                                                + " is given by more than one alternative of "
+                                                  "this case statement");
+                }
+                continue;
+            }
+            if (!val.isInt()) {
+                allStatic = false;
+                continue;
+            }
+            covered.emplace_back(val.toInt(), val.toInt());
+            flps.push_back(valuep->fileline());
+        }
+    }
+    if (!allStatic || !discrete) return;
+
+    std::vector<size_t> order(covered.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&covered](size_t a, size_t b) { return covered[a] < covered[b]; });
+    for (size_t i = 1; i < order.size(); ++i) {
+        if (covered[order[i]].first > covered[order[i - 1]].second) continue;
+        err(flps[order[i]],
+            "Choice " + VhdlValue::mkInt(covered[order[i]].first, typep).prettyName()
+                + " is given by more than one alternative of this case statement");
+        return;
+    }
+    if (hasOthers) return;
+    // Without "others" the alternatives must leave no value of the subtype
+    // unaccounted for
+    int64_t next = typep->low();
+    const int64_t last = typep->high();
+    for (const size_t idx : order) {
+        if (covered[idx].first > next) break;
+        if (covered[idx].second >= next) next = covered[idx].second + 1;
+        if (next > last) break;
+    }
+    if (next > last) return;
+    err(nodep->fileline(), "This case statement has no alternative for value "
+                               + VhdlValue::mkInt(next, typep).prettyName() + " of "
+                               + typep->prettyName());
 }
 
 void VhdlSemVisitor::visit(AstVhdlAssert* nodep) {
@@ -1560,7 +2759,10 @@ void VhdlSemVisitor::visit(AstVhdlWait* nodep) {
         analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
     }
     if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
-    if (nodep->timeoutp()) analyzeExpr(nodep->timeoutp(), V3VhdlStd::timeType());
+    if (nodep->timeoutp()) {
+        analyzeExpr(nodep->timeoutp(), V3VhdlStd::timeType());
+        checkDelay(nodep->timeoutp(), "timeout");
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlReturn* nodep) {

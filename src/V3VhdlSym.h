@@ -43,6 +43,13 @@ class AstNode;
 class FileLine;
 
 //============================================================================
+// A character literal and an identifier are different lexical elements (15.6),
+// so 'c' must not collide with a variable named c. Keying character literals
+// with their quotes keeps the two apart in one table, and has the side
+// benefit that a literal's name is already how 'IMAGE spells it.
+inline std::string vhdlCharLitName(const std::string& text) { return "'" + text + "'"; }
+
+//============================================================================
 // What a name denotes
 
 enum class VhdlSymKind : uint8_t {
@@ -85,12 +92,21 @@ class VhdlSymbol final {
     AstNode* const m_declp;  // The node that declared it
     VhdlType* m_typep = nullptr;  // Its type, where it has one
     VhdlScope* m_innerp = nullptr;  // Packages, entities, protected types
-    // Overloadable subprograms: their signature
+    // Overloadable subprograms: their signature. The names and defaults are
+    // needed as well as the types, because an actual may be given by name and
+    // a formal with a default may be left out altogether (6.5.7.1).
     std::vector<VhdlType*> m_paramTypes;
+    std::vector<std::string> m_paramNames;
+    std::vector<bool> m_paramDefaults;
     VhdlType* m_returnTypep = nullptr;
     int m_position = 0;  // Enumeration literal position, or record element index
     bool m_predefined = false;  // Comes from std.standard rather than source
     bool m_hasBody = false;  // A subprogram whose body has been seen
+    // The value of a constant, generic or physical unit, where it folds (9.4).
+    // Unknown for anything whose value is not fixed until elaboration.
+    VhdlValue m_value;
+    bool m_deferred = false;  // A deferred constant, whose value is in the body
+    VhdlSymbol* m_aliasp = nullptr;  // What an alias denotes (6.6)
 
     VL_UNCOPYABLE(VhdlSymbol);
 
@@ -116,9 +132,40 @@ public:
     void predefined(bool flag) { m_predefined = flag; }
     bool hasBody() const { return m_hasBody; }
     void hasBody(bool flag) { m_hasBody = flag; }
+    bool deferred() const { return m_deferred; }
+    void deferred(bool flag) { m_deferred = flag; }
+
+    VhdlSymbol* aliasp() const { return m_aliasp; }
+    void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }
+    // An alias is transparent: it denotes whatever it was declared for (6.6.1)
+    const VhdlSymbol* resolved() const { return m_aliasp ? m_aliasp : this; }
+    VhdlSymbol* resolved() { return m_aliasp ? m_aliasp : this; }
+
+    const VhdlValue& value() const { return m_value; }
+    void value(const VhdlValue& val) { m_value = val; }
+    bool hasValue() const { return m_value.known(); }
 
     const std::vector<VhdlType*>& paramTypes() const { return m_paramTypes; }
-    void addParamType(VhdlType* typep) { m_paramTypes.push_back(typep); }
+    void addParamType(VhdlType* typep) {
+        m_paramTypes.push_back(typep);
+        m_paramNames.emplace_back();
+        m_paramDefaults.push_back(false);
+    }
+    void addParam(const std::string& name, VhdlType* typep, bool hasDefault) {
+        m_paramTypes.push_back(typep);
+        m_paramNames.push_back(name);
+        m_paramDefaults.push_back(hasDefault);
+    }
+    // Which formal that name is, or -1
+    int paramIndex(const std::string& name) const {
+        for (size_t i = 0; i < m_paramNames.size(); ++i) {
+            if (m_paramNames[i] == name) return static_cast<int>(i);
+        }
+        return -1;
+    }
+    bool paramHasDefault(size_t i) const {
+        return i < m_paramDefaults.size() && m_paramDefaults[i];
+    }
     VhdlType* returnTypep() const { return m_returnTypep; }
     void returnTypep(VhdlType* typep) { m_returnTypep = typep; }
 

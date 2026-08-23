@@ -114,6 +114,7 @@
 #include "V3Unknown.h"
 #include "V3Unroll.h"
 #include "V3VariableOrder.h"
+#include "V3VhdlEval.h"
 #include "V3VhdlLib.h"
 #include "V3VhdlScan.h"
 #include "V3VhdlStd.h"
@@ -755,6 +756,7 @@ static bool verilate(const string& argString) {
         V3VhdlScan::selfTest();
         V3VhdlLib::selfTest();
         V3VhdlStd::selfTest();
+        V3VhdlEval::selfTest();
         UINFO(2, "selfTest done");
     }
 

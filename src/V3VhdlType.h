@@ -78,13 +78,16 @@ class VhdlType final {
     VhdlType* m_base = nullptr;  // The type this constrains; self if a type
     FileLine* m_fileline = nullptr;  // Where it was declared
 
-    // Scalar bounds, once they are known. Physical types count in their
-    // primary unit; floating types use m_lowReal/m_highReal.
-    int64_t m_low = 0;
-    int64_t m_high = 0;
-    double m_lowReal = 0.0;
-    double m_highReal = 0.0;
-    bool m_bounded = false;  // Bounds are known
+    // Scalar range, once it is known. Held the way VHDL states it -- left,
+    // right and direction -- rather than as low and high, because a null
+    // range such as (1 downto 10) has neither a low nor a high bound and
+    // 'LEFT and 'RIGHT must still answer exactly (5.2.1, 16.2.3). Physical
+    // types count in their primary unit; floating types use the real fields.
+    int64_t m_left = 0;
+    int64_t m_right = 0;
+    double m_leftReal = 0.0;
+    double m_rightReal = 0.0;
+    bool m_bounded = false;  // The range is known
     bool m_ascending = true;  // Written "to" rather than "downto"
 
     // ENUM: its literals, in position order
@@ -164,24 +167,73 @@ public:
     }
     bool isError() const { return m_kind == VhdlTypeKind::ERROR; }
 
-    // Scalar bounds
+    // Scalar range (5.2.1)
     bool bounded() const { return m_bounded; }
-    int64_t low() const { return m_low; }
-    int64_t high() const { return m_high; }
-    double lowReal() const { return m_lowReal; }
-    double highReal() const { return m_highReal; }
+    void unbound() { m_bounded = false; }
+    int64_t left() const { return m_left; }
+    int64_t right() const { return m_right; }
+    double leftReal() const { return m_leftReal; }
+    double rightReal() const { return m_rightReal; }
     bool ascending() const { return m_ascending; }
-    void setBounds(int64_t lo, int64_t hi, bool ascending) {
-        m_low = lo;
-        m_high = hi;
+    // A null range has no values, so asking for its bounds is meaningless;
+    // callers check isNull() first
+    bool isNull() const {
+        if (!m_bounded) return false;
+        if (m_kind == VhdlTypeKind::FLOATING) {
+            return m_ascending ? m_leftReal > m_rightReal : m_leftReal < m_rightReal;
+        }
+        return m_ascending ? m_left > m_right : m_left < m_right;
+    }
+    int64_t low() const { return m_ascending ? m_left : m_right; }
+    int64_t high() const { return m_ascending ? m_right : m_left; }
+    double lowReal() const { return m_ascending ? m_leftReal : m_rightReal; }
+    double highReal() const { return m_ascending ? m_rightReal : m_leftReal; }
+    // Number of values in the range, for a discrete or physical type
+    int64_t length() const {
+        if (!m_bounded || isNull()) return 0;
+        return high() - low() + 1;
+    }
+    void setBounds(int64_t left, int64_t right, bool ascending) {
+        m_left = left;
+        m_right = right;
         m_ascending = ascending;
         m_bounded = true;
     }
-    void setRealBounds(double lo, double hi, bool ascending) {
-        m_lowReal = lo;
-        m_highReal = hi;
+    void setRealBounds(double left, double right, bool ascending) {
+        m_leftReal = left;
+        m_rightReal = right;
         m_ascending = ascending;
         m_bounded = true;
+    }
+    // Copy the range of another type, as a subtype with no constraint of its
+    // own inherits its base type's range
+    void copyBounds(const VhdlType* fromp) {
+        if (!fromp || !fromp->bounded()) return;
+        m_left = fromp->m_left;
+        m_right = fromp->m_right;
+        m_leftReal = fromp->m_leftReal;
+        m_rightReal = fromp->m_rightReal;
+        m_ascending = fromp->m_ascending;
+        m_bounded = true;
+    }
+
+    // An array whose every index range is known (5.3.2.1). Only such an array
+    // has a length, and only such an array may be the subtype of an object.
+    // The flag matters on its own: STRING is indexed by POSITIVE, which has
+    // bounds of its own, yet STRING itself constrains nothing.
+    bool isConstrainedArray() const {
+        if (m_kind != VhdlTypeKind::ARRAY) return false;
+        if (m_unconstrained) return false;
+        if (m_indexTypes.empty()) return false;
+        for (const VhdlType* const idxp : m_indexTypes) {
+            if (!idxp || !idxp->bounded()) return false;
+        }
+        return true;
+    }
+    // Length of one dimension, counting from zero
+    int64_t dimLength(size_t dim) const {
+        if (dim >= m_indexTypes.size() || !m_indexTypes[dim]) return 0;
+        return m_indexTypes[dim]->length();
     }
 
     // Enumeration
@@ -191,6 +243,7 @@ public:
     // Array
     const std::vector<VhdlType*>& indexTypes() const { return m_indexTypes; }
     void addIndexType(VhdlType* typep) { m_indexTypes.push_back(typep); }
+    void clearIndexTypes() { m_indexTypes.clear(); }
     VhdlType* elementp() const { return m_elementp; }
     void elementp(VhdlType* typep) { m_elementp = typep; }
     bool unconstrained() const { return m_unconstrained; }
@@ -219,6 +272,75 @@ public:
     bool isResolved() const { return m_resolutionp != nullptr; }
 
     // For diagnostics
+    std::string prettyName() const VL_MT_DISABLED;
+};
+
+//============================================================================
+// The value of a static expression (9.4).
+//
+// Only what the frontend must know before elaboration is represented: enough
+// to fold a range bound, size an array, and check a value against a subtype.
+// Enumeration and physical values are integers -- a position number and a
+// count of primary units -- because that is exactly what the LRM says they
+// are, and it is also how V3VhdlLower will emit them.
+//
+// A value that is not static, or that the evaluator declines to fold, is
+// UNKNOWN. UNKNOWN is not an error: it means "no static check is possible
+// here", which is the right answer for anything depending on a generic.
+
+enum class VhdlValKind : uint8_t {
+    UNKNOWN,  // Not static, or not foldable
+    INT,  // Integer, enumeration position, or physical value
+    REAL,
+    STR,  // String, bit string, or the result of 'IMAGE
+};
+
+class VhdlValue final {
+    // MEMBERS
+    VhdlValKind m_kind = VhdlValKind::UNKNOWN;
+    int64_t m_int = 0;
+    double m_real = 0.0;
+    std::string m_str;
+    VhdlType* m_typep = nullptr;  // The type the value belongs to, when known
+
+public:
+    // CONSTRUCTORS
+    VhdlValue() = default;
+    static VhdlValue mkInt(int64_t v, VhdlType* typep = nullptr) {
+        VhdlValue out;
+        out.m_kind = VhdlValKind::INT;
+        out.m_int = v;
+        out.m_typep = typep;
+        return out;
+    }
+    static VhdlValue mkReal(double v, VhdlType* typep = nullptr) {
+        VhdlValue out;
+        out.m_kind = VhdlValKind::REAL;
+        out.m_real = v;
+        out.m_typep = typep;
+        return out;
+    }
+    static VhdlValue mkStr(const std::string& v, VhdlType* typep = nullptr) {
+        VhdlValue out;
+        out.m_kind = VhdlValKind::STR;
+        out.m_str = v;
+        out.m_typep = typep;
+        return out;
+    }
+
+    // METHODS
+    VhdlValKind kind() const { return m_kind; }
+    bool known() const { return m_kind != VhdlValKind::UNKNOWN; }
+    bool isInt() const { return m_kind == VhdlValKind::INT; }
+    bool isReal() const { return m_kind == VhdlValKind::REAL; }
+    bool isStr() const { return m_kind == VhdlValKind::STR; }
+    int64_t toInt() const { return m_int; }
+    double toReal() const { return m_kind == VhdlValKind::REAL ? m_real : double(m_int); }
+    const std::string& toStr() const { return m_str; }
+    VhdlType* typep() const { return m_typep; }
+    void typep(VhdlType* typep) { m_typep = typep; }
+
+    // How the value reads back in a diagnostic
     std::string prettyName() const VL_MT_DISABLED;
 };
 

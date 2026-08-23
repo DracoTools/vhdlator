@@ -131,21 +131,49 @@ void addObject(VhdlScope* scopep, VhdlSymKind kind, const std::string& name, Vhd
     scopep->insert(symp);
 }
 
+// One formal of a predefined subprogram. The name matters because VHDL lets
+// any call use named association, and IEEE's own bodies do: NUMERIC_BIT calls
+// READ (L => L, VALUE => ivalue, GOOD => GOOD).
+struct Formal final {
+    const char* namep;
+    VhdlType* typep;
+    bool hasDefault = false;
+};
+
+// The LRM names an operator's operands L and R (9.2)
+const char* operandName(size_t i, size_t count) {
+    if (count == 1) return "l";
+    static const char* const NAMES[] = {"l", "r", "p3", "p4"};
+    return i < 4 ? NAMES[i] : "p";
+}
+
 // Declare one predefined operator or function
 void addFunc(VhdlScope* scopep, const std::string& name, VhdlType* returnp,
              const std::vector<VhdlType*>& params) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::FUNCTION, name, nullptr);
-    for (VhdlType* const typep : params) symp->addParamType(typep);
+    for (size_t i = 0; i < params.size(); ++i) {
+        symp->addParam(operandName(i, params.size()), params[i], false);
+    }
     symp->returnTypep(returnp);
     symp->typep(returnp);
     symp->predefined(true);
     scopep->insert(symp);
 }
 
-void addProc(VhdlScope* scopep, const std::string& name,
-             const std::vector<VhdlType*>& params) {
+// The same, for subprograms whose formals have names of their own
+void addFuncN(VhdlScope* scopep, const std::string& name, VhdlType* returnp,
+              const std::vector<Formal>& params) {
+    VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::FUNCTION, name, nullptr);
+    for (const Formal& f : params) symp->addParam(f.namep, f.typep, f.hasDefault);
+    symp->returnTypep(returnp);
+    symp->typep(returnp);
+    symp->predefined(true);
+    scopep->insert(symp);
+}
+
+void addProcN(VhdlScope* scopep, const std::string& name, const std::vector<Formal>& params) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::PROCEDURE, name, nullptr);
-    for (VhdlType* const typep : params) symp->addParamType(typep);
+    for (const Formal& f : params) symp->addParam(f.namep, f.typep, f.hasDefault);
     symp->predefined(true);
     scopep->insert(symp);
 }
@@ -164,10 +192,14 @@ std::vector<std::string> characterLiterals() {
     std::vector<std::string> out;
     out.reserve(256);
     for (int i = 0; i < 32; ++i) out.emplace_back(CTRL0[i]);
-    for (int i = 32; i < 127; ++i) out.emplace_back(1, static_cast<char>(i));
+    for (int i = 32; i < 127; ++i) {
+        out.emplace_back(vhdlCharLitName(std::string(1, static_cast<char>(i))));
+    }
     out.emplace_back("del");
     for (int i = 0; i < 32; ++i) out.emplace_back(CTRL128[i]);
-    for (int i = 160; i < 256; ++i) out.emplace_back(1, static_cast<char>(i));
+    for (int i = 160; i < 256; ++i) {
+        out.emplace_back(vhdlCharLitName(std::string(1, static_cast<char>(i))));
+    }
     return out;
 }
 
@@ -287,8 +319,11 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
             for (const char* const op : {"sll", "srl", "sla", "sra", "rol", "ror"}) {
                 addFunc(scopep, op, typep, {typep, s_integerp ? s_integerp : typep});
             }
-            addFunc(scopep, "and", typep, {typep, elemp});
-            addFunc(scopep, "and", typep, {elemp, typep});
+            // Every logical operator has element/array forms, not just "and"
+            for (const char* const op : {"and", "or", "nand", "nor", "xor", "xnor"}) {
+                addFunc(scopep, op, typep, {typep, elemp});
+                addFunc(scopep, op, typep, {elemp, typep});
+            }
         }
     }
 
@@ -301,10 +336,57 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         addFunc(scopep, "&", typep, {elemp, elemp});
     }
 
+    // The matching relational operators are predefined for every type, and
+    // for BIT they give a BIT so that "?=" chains (9.2.3). STD_LOGIC_1164
+    // leaves its STD_ULOGIC versions commented out and relies on this.
+    {
+        VhdlType* const matchp = (typep == s_bitp) ? typep : boolp;
+        addFunc(scopep, "?=", matchp, {typep, typep});
+        addFunc(scopep, "?/=", matchp, {typep, typep});
+        if (typep->isScalar()) {
+            for (const char* const op : {"?<", "?<=", "?>", "?>="}) {
+                addFunc(scopep, op, matchp, {typep, typep});
+            }
+        }
+    }
+
     // The condition operator, for anything that converts to a condition (9.2.9)
     if (typep == s_bitp || typep == s_booleanp) {
         addFunc(scopep, "??", boolp, {typep});
     }
+
+    // Every type has TO_STRING, and the radix forms exist for arrays of BIT
+    // or of a character enumeration (16.3)
+    if (s_stringp && typep != s_stringp) addFunc(scopep, "to_string", s_stringp, {typep});
+
+    // A file type declaration implicitly declares the operations of 5.5.2.
+    // They are declared here rather than written in VHDL because their
+    // parameter is of the file type itself, which VHDL cannot express.
+    if (typep->kind() == VhdlTypeKind::FILE && s_stringp && s_fileOpenKindp) {
+        VhdlType* const valuep = typep->designatedp();
+        addProcN(scopep, "file_open", {{"f", typep},
+                                       {"external_name", s_stringp},
+                                       {"open_kind", s_fileOpenKindp, true}});
+        addProcN(scopep, "file_open", {{"status", s_fileOpenStatusp},
+                                       {"f", typep},
+                                       {"external_name", s_stringp},
+                                       {"open_kind", s_fileOpenKindp, true}});
+        addProcN(scopep, "file_close", {{"f", typep}});
+        addProcN(scopep, "flush", {{"f", typep}});
+        addFuncN(scopep, "endfile", boolp, {{"f", typep}});
+        if (valuep) {
+            addProcN(scopep, "read", {{"f", typep}, {"value", valuep}});
+            addProcN(scopep, "write", {{"f", typep}, {"value", valuep}});
+            // An unconstrained element type reads with a length out parameter
+            if (valuep->kind() == VhdlTypeKind::ARRAY && s_naturalp) {
+                addProcN(scopep, "read",
+                         {{"f", typep}, {"value", valuep}, {"length", s_naturalp}});
+            }
+        }
+    }
+
+    // An access type declaration implicitly declares DEALLOCATE (5.4.2)
+    if (typep->kind() == VhdlTypeKind::ACCESS) addProcN(scopep, "deallocate", {{"p", typep}});
 }
 
 //######################################################################
@@ -329,7 +411,7 @@ void V3VhdlStd::build() {
     // Order matters: BOOLEAN first, since the implicit operators of every
     // other type return it
     s_booleanp = makeEnum(s_standardp, "boolean", {"false", "true"});
-    s_bitp = makeEnum(s_standardp, "bit", {"0", "1"});
+    s_bitp = makeEnum(s_standardp, "bit", {vhdlCharLitName("0"), vhdlCharLitName("1")});
     s_characterp = makeEnum(s_standardp, "character", characterLiterals());
     s_severityp
         = makeEnum(s_standardp, "severity_level", {"note", "warning", "error", "failure"});
@@ -369,6 +451,7 @@ void V3VhdlStd::build() {
         VhdlSymbol* const symp
             = VhdlSymTab::newSymbol(VhdlSymKind::PHYSICAL_UNIT, unit.namep, nullptr);
         symp->typep(s_timep);
+        symp->value(VhdlValue::mkInt(unit.value, s_timep));  // In femtoseconds
         symp->position(static_cast<int>(unit.value));
         symp->predefined(true);
         s_standardp->insert(symp);
@@ -405,6 +488,11 @@ void V3VhdlStd::build() {
     // may be interpreted as (9.3.2)
     addFunc(s_standardp, "*", s_timep, {s_timep, s_univIntp});
     addFunc(s_standardp, "*", s_timep, {s_univIntp, s_timep});
+    // A universal real may be scaled by a universal integer, which is
+    // converted to universal_real for the operation (9.2.7)
+    addFunc(s_standardp, "*", s_univRealp, {s_univRealp, s_univIntp});
+    addFunc(s_standardp, "*", s_univRealp, {s_univIntp, s_univRealp});
+    addFunc(s_standardp, "/", s_univRealp, {s_univRealp, s_univIntp});
     addFunc(s_standardp, "*", s_realp, {s_realp, s_univIntp});
     addFunc(s_standardp, "*", s_realp, {s_univIntp, s_realp});
 
@@ -441,39 +529,60 @@ void V3VhdlStd::buildTextio() {
         addImplicitOperators(s_textiop, typep);
     }
 
-    addFunc(s_textiop, "justify", s_stringp, {s_stringp, s_sidep, widthp});
+    addFuncN(s_textiop, "justify", s_stringp,
+             {{"value", s_stringp}, {"justified", s_sidep, true}, {"field", widthp, true}});
     addObject(s_textiop, VhdlSymKind::FILE, "input", s_textp);
     addObject(s_textiop, VhdlSymKind::FILE, "output", s_textp);
 
-    addProc(s_textiop, "readline", {s_textp, s_linep});
-    addProc(s_textiop, "writeline", {s_textp, s_linep});
-    addProc(s_textiop, "tee", {s_textp, s_linep});
-    addFunc(s_textiop, "endfile", s_booleanp, {s_textp});
-    addFunc(s_textiop, "endline", s_booleanp, {s_linep});
+    addProcN(s_textiop, "readline", {{"f", s_textp}, {"l", s_linep}});
+    addProcN(s_textiop, "writeline", {{"f", s_textp}, {"l", s_linep}});
+    addProcN(s_textiop, "tee", {{"f", s_textp}, {"l", s_linep}});
+    addFuncN(s_textiop, "endfile", s_booleanp, {{"f", s_textp}});
+    addFuncN(s_textiop, "endline", s_booleanp, {{"l", s_linep}});
 
     // READ, WRITE and their VHDL-2008 radix forms, over the predefined types
     // the LRM lists (16.4). Each has a form with and without a GOOD flag.
     for (VhdlType* const typep :
          {s_bitp, s_bitVecp, s_booleanp, s_characterp, s_integerp, s_realp, s_timep,
           s_stringp}) {
-        addProc(s_textiop, "read", {s_linep, typep});
-        addProc(s_textiop, "read", {s_linep, typep, s_booleanp});
-        addProc(s_textiop, "write", {s_linep, typep});
-        addProc(s_textiop, "write", {s_linep, typep, s_sidep, widthp});
-        addProc(s_textiop, "sread", {s_linep, typep, s_naturalp});
+        addProcN(s_textiop, "read", {{"l", s_linep}, {"value", typep}});
+        addProcN(s_textiop, "read", {{"l", s_linep}, {"value", typep}, {"good", s_booleanp}});
+        // One declaration, not two: JUSTIFIED and FIELD have defaults, so a
+        // two-argument call binds to this same procedure (16.4)
+        addProcN(s_textiop, "write", {{"l", s_linep},
+                                      {"value", typep},
+                                      {"justified", s_sidep, true},
+                                      {"field", widthp, true}});
+        addProcN(s_textiop, "sread", {{"l", s_linep}, {"value", typep}, {"strlen", s_naturalp}});
     }
     for (VhdlType* const typep : {s_bitVecp, s_stringp}) {
-        for (const char* const op : {"hread", "hwrite", "oread", "owrite", "bread", "bwrite"}) {
-            addProc(s_textiop, op, {s_linep, typep});
-            addProc(s_textiop, op, {s_linep, typep, s_booleanp});
+        for (const char* const op : {"hread", "oread", "bread"}) {
+            addProcN(s_textiop, op, {{"l", s_linep}, {"value", typep}});
+            addProcN(s_textiop, op, {{"l", s_linep}, {"value", typep}, {"good", s_booleanp}});
+        }
+        // The write forms take an optional justification and field width
+        for (const char* const op : {"hwrite", "owrite", "bwrite"}) {
+            addProcN(s_textiop, op, {{"l", s_linep},
+                                     {"value", typep},
+                                     {"justified", s_sidep, true},
+                                     {"field", widthp, true}});
         }
     }
-    addProc(s_textiop, "swrite", {s_linep, s_stringp});
-    addProc(s_textiop, "swrite", {s_linep, s_stringp, s_sidep, widthp});
-    addFunc(s_textiop, "to_string", s_stringp, {s_timep});
-    addFunc(s_textiop, "to_string", s_stringp, {s_realp});
-    addFunc(s_textiop, "to_string", s_stringp, {s_realp, s_naturalp});
-    addFunc(s_textiop, "to_string", s_stringp, {s_realp, s_stringp});
+    // The radix image functions of VHDL-2008 (16.4)
+    for (VhdlType* const typep : {s_bitVecp, s_stringp}) {
+        for (const char* const op : {"to_string", "to_bstring", "to_binary_string", "to_ostring",
+                                     "to_octal_string", "to_hstring", "to_hex_string"}) {
+            addFuncN(s_textiop, op, s_stringp, {{"value", typep}});
+        }
+    }
+    addProcN(s_textiop, "swrite", {{"l", s_linep},
+                                   {"value", s_stringp},
+                                   {"justified", s_sidep, true},
+                                   {"field", widthp, true}});
+    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_timep}});
+    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_realp}});
+    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_realp}, {"digits", s_naturalp}});
+    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_realp}, {"format", s_stringp}});
 
     UINFO(4, "Built std.textio with " << s_textiop->direct().size() << " declarations");
 }
