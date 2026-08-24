@@ -102,6 +102,19 @@ class VhdlLowerVisitor final {
     AstNodeFTask* m_ftaskp = nullptr;  // Subprogram being built, if any
     std::map<const VhdlSymbol*, AstNodeFTask*> m_funcs;  // Subprogram -> what it became
     std::set<const VhdlSymbol*> m_emitting;  // Subprograms being emitted, to stop recursion
+    // A signal driven from more than one place is resolved (6.5.2). Each
+    // driver keeps its own value and its own enable, and the signal becomes a
+    // net those drivers are wired to, so the resolution Verilator already
+    // does for nets settles it.
+    struct VhdlDriver {
+        AstVar* valp = nullptr;
+        AstVar* enp = nullptr;
+    };
+    std::map<const VhdlSymbol*, std::vector<VhdlDriver>> m_drivers;
+    std::map<const VhdlSymbol*, int> m_driverCount;
+    // How many of a signal's drivers have been lowered, which is the index of
+    // the one being lowered now
+    std::map<const VhdlSymbol*, int> m_driverUsed;
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::string m_prefix;  // Name prefix for declarations inside a process
@@ -397,6 +410,17 @@ private:
                 varp->valuep(defaultValueFor(symp->typep(), flp));
             }
             addStmt(varp);
+            if (objp->kind() == VhdlObjKind::SIGNAL && isResolvedSignal(symp)) {
+                if (isLogicish(symp->typep())) {
+                    makeResolved(symp, varp, flp);
+                } else {
+                    // Any other resolved type would need its own resolution
+                    // function run over the drivers, which is not here yet
+                    unsup(flp, "signal '" + symp->name() + "' with "
+                                   + std::to_string(m_driverCount[symp])
+                                   + " drivers of a type other than a logic type");
+                }
+            }
             return;
         }
         if (AstVhdlConfigSpec* const cfgp = VN_CAST(nodep, VhdlConfigSpec)) {
@@ -1363,6 +1387,20 @@ private:
 
     // METHODS - concurrent statements (clause 11)
 
+    // Each concurrent statement is one driver of whatever it assigns, so the
+    // index of the driver a signal is being written from is known from where
+    // the lowering is, not from the statement itself
+    void lowerConcurrentDriver(AstNodeVhdlStmt* nodep) {
+        std::set<const VhdlSymbol*> driven;
+        collectDriven(nodep, driven);
+        std::vector<const VhdlSymbol*> resolved;
+        for (const VhdlSymbol* const symp : driven) {
+            if (m_drivers.count(symp)) resolved.push_back(symp);
+        }
+        lowerConcurrent(nodep);
+        for (const VhdlSymbol* const symp : resolved) ++m_driverUsed[symp];
+    }
+
     void lowerConcurrent(AstNodeVhdlStmt* nodep) {
         FileLine* const flp = nodep->fileline();
         if (AstVhdlProcess* const procp = VN_CAST(nodep, VhdlProcess)) {
@@ -1722,6 +1760,168 @@ private:
     }
 
     // A concurrent signal assignment is a process of its own (11.6)
+    // The signal a name ultimately assigns, through slices and selections
+    static const VhdlSymbol* rootSymOf(const AstNode* nodep) {
+        while (nodep) {
+            if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
+                if (vp->vhdlSymp()) return vp->vhdlSymp();
+            }
+            if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+                nodep = callp->prefixp();  // An index or a slice
+            } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+                nodep = selp->prefixp();
+            } else {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+    // Every signal one concurrent statement assigns. A process counts once
+    // however many assignments it holds, because a process is one driver.
+    static void collectDriven(AstNode* nodep, std::set<const VhdlSymbol*>& out,
+                              bool follow = false) {
+        if (!nodep) return;
+        if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
+            if (const VhdlSymbol* const symp = rootSymOf(asgp->targetp())) {
+                // A driver belongs to the longest static prefix of the name
+                // (14.7.2), so assigning one element of an array signal from
+                // here and another from there is not two drivers of the
+                // signal. Only a whole-signal assignment is counted, and a
+                // partial one takes the signal out of resolution altogether.
+                if (VN_IS(asgp->targetp(), VhdlName)) {
+                    out.insert(symp);
+                } else {
+                    s_partialDriven.insert(symp);
+                }
+            }
+        }
+        collectDriven(nodep->op1p(), out, true);
+        collectDriven(nodep->op2p(), out, true);
+        collectDriven(nodep->op3p(), out, true);
+        collectDriven(nodep->op4p(), out, true);
+        // Only within a statement: the statements beside this one are other
+        // drivers, and counting them here would make every one of them count
+        // the ones after it as well
+        if (follow) collectDriven(nodep->nextp(), out, true);
+    }
+
+    void countDrivers(AstNode* stmtsp) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            std::set<const VhdlSymbol*> driven;
+            collectDriven(p, driven);
+            // A block is not a driver of its own: its statements are
+            if (const AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+                countDrivers(blockp->stmtsp());
+                continue;
+            }
+            for (const VhdlSymbol* const symp : driven) ++m_driverCount[symp];
+        }
+    }
+
+    // Whether this signal needs resolving, and can be
+    bool isResolvedSignal(const VhdlSymbol* symp) const {
+        if (s_partialDriven.count(symp)) return false;
+        const auto it = m_driverCount.find(symp);
+        return it != m_driverCount.end() && it->second > 1;
+    }
+    // Signals some driver assigns only a part of. Static because the walk
+    // that fills it is, and cleared with the rest of the per-entity state.
+    static std::set<const VhdlSymbol*> s_partialDriven;
+
+    // The wiring for a signal with several drivers: one value and one enable
+    // per driver, and the signal itself a net each of them drives.
+    void makeResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
+        const int count = m_driverCount[symp];
+        netp->varType(VVarType::TRIWIRE);
+        // What the signal starts at is decided by its drivers, not by the
+        // declaration: a net takes its value from what drives it
+        if (netp->valuep()) {
+            AstNode* const oldp = netp->valuep();
+            oldp->unlinkFrBack();
+            VL_DO_DANGLING(oldp->deleteTree(), oldp);
+        }
+        std::vector<VhdlDriver> drivers;
+        for (int i = 0; i < count; ++i) {
+            VhdlDriver drv;
+            const std::string base
+                = "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name();
+            drv.valp = new AstVar{flp, VVarType::VAR, base + "__val", VFlagChildDType{},
+                                  lowerType(symp->typep(), flp)};
+            // One bit, whatever the signal's width: a driver of a resolved
+            // signal is on or off as a whole in every form real code uses,
+            // and a per-bit enable cannot be the condition of a select
+            drv.enp = new AstVar{flp, VVarType::VAR, base + "__en", VFlagChildDType{},
+                                 new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
+            addStmt(drv.valp);
+            addStmt(drv.enp);
+            // Off until the driver says otherwise, which is what a driver of
+            // a resolved signal contributes before it has run
+            drv.enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
+            addStmt(new AstAlways{new AstAssignW{
+                flp, new AstVarRef{flp, netp, VAccess::WRITE},
+                new AstCond{flp, new AstVarRef{flp, drv.enp, VAccess::READ},
+                            new AstVarRef{flp, drv.valp, VAccess::READ},
+                            new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
+            drivers.push_back(drv);
+        }
+        m_drivers.emplace(symp, drivers);
+    }
+
+    // A driver is off exactly where it assigns Z, so the enable is the value
+    // with each of its leaves replaced by all-ones or, for a Z, all-zeroes.
+    static AstNodeExpr* enableOf(const AstNodeExpr* valuep, FileLine* flp) {
+        if (const AstConst* const constp = VN_CAST(valuep, Const)) {
+            if (constp->num().isAnyZ()) return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
+            return new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
+        }
+        if (const AstCond* const condp = VN_CAST(valuep, Cond)) {
+            return new AstCond{flp, condp->condp()->cloneTreePure(false),
+                               enableOf(condp->thenp(), flp), enableOf(condp->elsep(), flp)};
+        }
+        return new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
+    }
+
+    // An assignment to a signal that has several drivers writes this driver's
+    // value and enable rather than the signal
+    AstNode* driveResolved(AstNodeVhdlExpr* targetp, AstNodeExpr* valuep, AstNode* delayp,
+                           bool sequential, FileLine* flp) {
+        const VhdlSymbol* const symp = rootSymOf(targetp);
+        const auto it = m_drivers.find(symp);
+        const int idx = m_driverUsed[symp];
+        if (it == m_drivers.end() || idx >= static_cast<int>(it->second.size())) {
+            VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            unsup(flp, "assignment to a resolved signal from here");
+            return nullptr;
+        }
+        const VhdlDriver& drv = it->second[idx];
+        // Lowering the target against each of the two says how a slice or an
+        // index of the signal maps onto them, without repeating the work here
+        VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
+        AstVar* const savedp = m_vars[keyp];
+        m_vars[keyp] = drv.valp;
+        AstNodeExpr* const valLhsp = lowerExpr(targetp);
+        m_vars[keyp] = drv.enp;
+        AstNodeExpr* const enLhsp = lowerExpr(targetp);
+        m_vars[keyp] = savedp;
+        if (!valLhsp || !enLhsp) {
+            VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            return nullptr;
+        }
+        AstNodeExpr* const enp = enableOf(valuep, flp);
+        AstNode* outp = nullptr;
+        if (sequential) {
+            outp = new AstAssignDly{flp, valLhsp, valuep, delayp};
+            outp = AstNode::addNext(outp,
+                                    static_cast<AstNode*>(new AstAssignDly{flp, enLhsp, enp}));
+        } else {
+            outp = new AstAssignW{flp, valLhsp, valuep, delayp};
+            outp = AstNode::addNext(outp,
+                                    static_cast<AstNode*>(new AstAssignW{flp, enLhsp, enp}));
+        }
+        return outp;
+    }
+
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
@@ -1738,6 +1938,22 @@ private:
         }
         if (!rhsp) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            return;
+        }
+        if (m_drivers.count(rootSymOf(nodep->targetp()))) {
+            VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            if (AstNode* const outp
+                = driveResolved(nodep->targetp(), rhsp, delayp, false, flp)) {
+                // Each continuous assignment becomes its own always, so
+                // the list has to be taken apart from the front: the head has
+                // no back to unlink from
+                for (AstNode* p = outp; p;) {
+                    AstNode* nextp = p->nextp();
+                    if (nextp) nextp->unlinkFrBackWithNext();
+                    addStmt(new AstAlways{VN_AS(p, AssignW)});
+                    p = nextp;
+                }
+            }
             return;
         }
         addStmt(new AstAlways{new AstAssignW{flp, lhsp, rhsp, delayp}});
@@ -2072,9 +2288,6 @@ private:
             unsup(flp, "multi-element waveform");
             return nullptr;
         }
-        AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
-        AstNodeExpr* const rhsp = lowerExpr(wfp->valuep());
-        if (!lhsp || !rhsp) return nullptr;
         AstNode* delayp = nullptr;
         if (wfp->afterp()) {
             if (!v3Global.opt.timing().isTrue()) {
@@ -2083,6 +2296,14 @@ private:
             }
             delayp = new AstDelay{flp, lowerExpr(wfp->afterp()), false};
         }
+        if (m_drivers.count(rootSymOf(nodep->targetp()))) {
+            AstNodeExpr* const valuep = lowerExpr(wfp->valuep());
+            if (!valuep) return nullptr;
+            return driveResolved(nodep->targetp(), valuep, delayp, sequential, flp);
+        }
+        AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+        AstNodeExpr* const rhsp = lowerExpr(wfp->valuep());
+        if (!lhsp || !rhsp) return nullptr;
         if (!sequential) return new AstAssignW{flp, lhsp, rhsp, delayp};
         return new AstAssignDly{flp, lhsp, rhsp, delayp};
     }
@@ -3009,6 +3230,13 @@ private:
         m_vars.clear();
         m_funcs.clear();
         m_emitting.clear();
+        m_drivers.clear();
+        m_driverCount.clear();
+        m_driverUsed.clear();
+        s_partialDriven.clear();
+        // Which signals have more than one driver has to be known before the
+        // declarations are lowered, since it decides what they become
+        if (archp) countDrivers(archp->stmtsp());
         m_bindings.clear();
         m_instanceBindings.clear();
         m_prefix.clear();
@@ -3026,7 +3254,7 @@ private:
         if (archp) {
             for (AstNode* p = archp->declsp(); p; p = p->nextp()) lowerDecl(p);
             for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
-                lowerConcurrent(VN_AS(p, NodeVhdlStmt));
+                lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
         }
         m_modp->addStmtsp(m_stmtsp);
@@ -3035,6 +3263,8 @@ private:
         m_modp = nullptr;
     }
 };
+
+std::set<const VhdlSymbol*> VhdlLowerVisitor::s_partialDriven;
 
 //######################################################################
 // Design units
