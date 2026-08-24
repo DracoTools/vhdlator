@@ -424,14 +424,42 @@ private:
     AstNodeExpr* defaultValueFor(VhdlType* typep, FileLine* flp) {
         if (!typep || typep->isError()) return nullptr;
         VhdlType* const basep = typep->base();
-        if (basep->kind() == VhdlTypeKind::ENUM && typep->bounded()) {
+        switch (basep->kind()) {
+        case VhdlTypeKind::ENUM: {
+            if (!typep->bounded()) return nullptr;
             const std::vector<VhdlSymbol*>& lits = basep->literals();
             const int64_t left = typep->left();
             if (left >= 0 && left < static_cast<int64_t>(lits.size())) {
                 return lowerValue(VhdlValue::mkInt(left, typep), typep, flp);
             }
+            return nullptr;
         }
-        return nullptr;  // Everything else starts as Verilator initializes it
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+            // INTEGER'LEFT, not zero: a variable of a subtype that excludes
+            // zero would otherwise start outside its own subtype
+            if (!typep->bounded()) return nullptr;
+            return lowerValue(VhdlValue::mkInt(typep->left(), typep), typep, flp);
+        case VhdlTypeKind::FLOATING:
+            if (!typep->bounded()) return nullptr;
+            return lowerValue(VhdlValue::mkReal(typep->leftReal(), typep), typep, flp);
+        case VhdlTypeKind::RECORD: {
+            // A record's default is each element's default (6.4.2.2). The
+            // record is packed, so the elements concatenate into one constant
+            // in the order they were declared.
+            AstNodeExpr* outp = nullptr;
+            for (VhdlSymbol* const elemp : basep->elements()) {
+                AstNodeExpr* const onep = defaultValueFor(elemp->typep(), flp);
+                if (!onep) {
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;  // One element with no default gives none
+                }
+                outp = outp ? new AstConcat{flp, outp, onep} : onep;
+            }
+            return outp;
+        }
+        default: return nullptr;  // Handled by the element type, where at all
+        }
     }
 
 
@@ -1749,12 +1777,23 @@ private:
             AstVhdlAlternative* const altp = alts[i];
             AstNodeExpr* const valuep = waveformValue(altp->wavesp());
             if (!valuep) return nullptr;
-            AstNodeExpr* const testp = choiceTest(altp->choicesp(), selp);
+            AstNodeExpr* testp = choiceTest(altp->choicesp(), selp);
             if (!testp) {
                 outp = valuep;  // "when others"
                 continue;
             }
-            if (!outp) outp = lowerExpr(nodep->targetp());
+            if (!outp) {
+                // The choices of a selected assignment name every value the
+                // selector can take (11.6), so the last of them is what is
+                // left when none of the others matched. Testing it as well
+                // and falling back on the target's own value would say the
+                // target keeps its value when nothing matches -- a latch, and
+                // one that reads itself, which is neither what VHDL means nor
+                // something the scheduler can order.
+                VL_DO_DANGLING(testp->deleteTree(), testp);
+                outp = valuep;
+                continue;
+            }
             outp = new AstCond{altp->fileline(), testp, valuep, outp};
         }
         return outp;
