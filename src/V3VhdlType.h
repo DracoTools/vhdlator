@@ -106,6 +106,10 @@ class VhdlType final {
     // them, which is a separate declaration from the type's own (5.6.3)
     VhdlScope* m_scopep = nullptr;
     AstNode* m_bodyp = nullptr;
+    // A range whose bounds did not fold, kept as written. A bound that names
+    // a generic is fixed for each instance but not known during analysis, so
+    // it is carried to the back end as an expression rather than a number.
+    AstNode* m_boundsp = nullptr;
     // Whether values of this type are resolved, and by what (6.3)
     VhdlSymbol* m_resolutionp = nullptr;
 
@@ -269,6 +273,8 @@ public:
     void scopep(VhdlScope* scopep) { m_scopep = scopep; }
     AstNode* bodyp() const { return m_bodyp; }
     void bodyp(AstNode* nodep) { m_bodyp = nodep; }
+    AstNode* boundsp() const { return m_boundsp; }
+    void boundsp(AstNode* nodep) { m_boundsp = nodep; }
 
     // Resolution (6.3)
     VhdlSymbol* resolutionp() const { return m_resolutionp; }

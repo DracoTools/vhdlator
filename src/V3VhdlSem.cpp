@@ -532,10 +532,14 @@ class VhdlSemVisitor final : public VNVisitor {
             if (!info.unbounded && info.left.known() && info.right.known()) {
                 idxp = makeRangeSubtype(info, flp);
                 checkSubrange(idxp, wantp, flp);
-            } else if (idxp && idxp->bounded() && info.valid && !info.unbounded) {
-                // A range whose bounds did not fold constrains nothing static
-                idxp = cloneSubtype(idxp, flp);
+            } else if (!info.unbounded && info.valid) {
+                // A range whose bounds did not fold constrains nothing
+                // static, but it is still a range: a bound that names a
+                // generic is fixed once the instance is elaborated, so keep
+                // it as written for the back end to fold then (10.3)
+                idxp = cloneSubtype(idxp ? idxp : V3VhdlStd::integerType(), flp);
                 idxp->unbound();
+                if (VN_IS(rp, VhdlRange)) idxp->boundsp(rp);
             }
             indexes.push_back(idxp ? idxp : V3VhdlStd::integerType());
             ++dim;

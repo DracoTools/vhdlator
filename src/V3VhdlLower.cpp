@@ -106,7 +106,7 @@ class VhdlLowerVisitor final {
     // driver keeps its own value and its own enable, and the signal becomes a
     // net those drivers are wired to, so the resolution Verilator already
     // does for nets settles it.
-    struct VhdlDriver {
+    struct VhdlDriver final {
         AstVar* valp = nullptr;
         AstVar* enp = nullptr;
         AstVar* weakp = nullptr;  // Driving, but only until something forces
@@ -122,6 +122,16 @@ class VhdlLowerVisitor final {
     AstClass* m_protClassp = nullptr;  // Protected type being built, if any
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
+    // The loops being lowered, innermost last. A labelled exit or next names
+    // a loop that need not be the innermost (10.11, 10.12), which Verilator's
+    // break and continue cannot express, so those become a jump out of a
+    // block wrapping the loop or its body.
+    struct VhdlLoopFrame final {
+        std::string label;
+        AstJumpBlock* exitp = nullptr;  // Wraps the loop; jumping leaves it
+        AstJumpBlock* bodyp = nullptr;  // Wraps the body; jumping ends the pass
+    };
+    std::vector<VhdlLoopFrame> m_loops;
     std::string m_prefix;  // Name prefix for declarations inside a process
     int m_processNum = 0;  // For naming unlabelled processes
     bool m_errored = false;
@@ -317,13 +327,23 @@ private:
         const std::vector<VhdlType*>& indexes = typep->indexTypes();
         for (size_t i = indexes.size(); i-- > 0;) {
             const VhdlType* const idxp = indexes[i];
-            if (!idxp || !idxp->bounded() || typep->unconstrained()) {
-                // Bounds arrive at elaboration, or never: a dynamic array
-                unsup(flp, "unconstrained array '" + typep->prettyName() + "'");
-                return dtypep;
+            AstRange* rangep = nullptr;
+            if (!idxp || !idxp->bounded()) {
+                // A bound that names a generic is fixed once the instance is
+                // elaborated but is not a number now, so it goes to the back
+                // end as an expression and V3Param folds it per instance --
+                // which is what makes one entity with a WIDTH generic emit
+                // one module per width, as VHDL elaboration says it should
+                rangep = boundsRange(idxp, flp);
+                if (!rangep) {
+                    // Bounds that arrive with the value, or never
+                    unsup(flp, "unconstrained array '" + typep->prettyName() + "'");
+                    return dtypep;
+                }
+            } else {
+                rangep = new AstRange{flp, static_cast<int>(idxp->left()),
+                                      static_cast<int>(idxp->right())};
             }
-            AstRange* const rangep = new AstRange{
-                flp, static_cast<int>(idxp->left()), static_cast<int>(idxp->right())};
             if (packed) {
                 dtypep = new AstPackArrayDType{flp, VFlagChildDType{}, dtypep, rangep};
             } else {
@@ -331,6 +351,73 @@ private:
             }
         }
         return dtypep;
+    }
+
+    // The range an index subtype was written with, where its bounds did not
+    // fold. Null if there is none to emit.
+    AstRange* boundsRange(const VhdlType* idxp, FileLine* flp) {
+        if (!idxp || !idxp->boundsp()) return nullptr;
+        AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!rp || !rp->leftp() || !rp->rightp()) return nullptr;
+        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        if (!leftp || !rightp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        return new AstRange{flp, leftp, rightp};
+    }
+
+    // The index subtype of one dimension, or of a scalar type itself
+    static const VhdlType* indexSubtype(const VhdlType* typep, int dim = 0) {
+        if (!typep) return nullptr;
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (dim < 0 || dim >= static_cast<int>(indexes.size())) return nullptr;
+        return indexes[dim];
+    }
+
+    // The bounds of a range that did not fold, as expressions. False when
+    // there is no such range, which means either it folded or there is none.
+    bool dynamicBounds(const VhdlType* typep, int dim, FileLine* flp, AstNodeExpr*& leftp,
+                       AstNodeExpr*& rightp, bool& ascending) {
+        const VhdlType* const idxp = indexSubtype(typep, dim);
+        if (!idxp || !idxp->boundsp()) return false;
+        AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!rp || !rp->leftp() || !rp->rightp()) return false;
+        leftp = lowerExpr(rp->leftp());
+        rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        if (!leftp || !rightp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return false;
+        }
+        ascending = rp->dir() == VhdlDir::TO;
+        return true;
+    }
+
+    // How many elements such a range holds, as an expression
+    AstNodeExpr* boundsLength(const VhdlType* typep, FileLine* flp) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (indexes.size() != 1) return nullptr;
+        const VhdlType* const idxp = indexes[0];
+        if (!idxp || !idxp->boundsp()) return nullptr;
+        AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!rp || !rp->leftp() || !rp->rightp()) return nullptr;
+        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        if (!leftp || !rightp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        // "left to right" holds right-left+1, "left downto right" left-right+1
+        AstNodeExpr* const diffp = rp->dir() == VhdlDir::TO
+                                       ? static_cast<AstNodeExpr*>(new AstSub{flp, rightp, leftp})
+                                       : static_cast<AstNodeExpr*>(new AstSub{flp, leftp, rightp});
+        return new AstAdd{flp, diffp, new AstConst{flp, AstConst::Signed32{}, 1}};
     }
 
     // Whether an element type can live inside a packed array
@@ -419,12 +506,24 @@ private:
     // that a name the analyzer already resolved can be emitted as a bound
     // reference rather than left for V3LinkDot to look up again
     AstVar* newVar(VhdlSymbol* symp, VVarType varType, FileLine* flp) {
-        const std::string name = m_prefix + symp->name();
+        // VHDL nests declarative regions that the emitted module does not, so
+        // two loops in one process may both declare "i". The first keeps the
+        // name it was written with, since that is what a trace shows.
+        std::string name = m_prefix + symp->name();
+        if (!m_names.insert(name).second) {
+            std::string tryp;
+            do {
+                tryp = name + "__" + std::to_string(++m_nameNum);
+            } while (!m_names.insert(tryp).second);
+            name = tryp;
+        }
         AstVar* const varp
             = new AstVar{flp, varType, name, VFlagChildDType{}, lowerType(symp->typep(), flp)};
         m_vars.emplace(symp, varp);
         return varp;
     }
+    std::set<std::string> m_names;  // Names already used in this module
+    int m_nameNum = 0;
 
     // An interface element of a generic or port clause (6.5)
     void lowerInterface(AstVhdlIfaceDecl* nodep, bool isGeneric, int& pinNum) {
@@ -557,6 +656,9 @@ private:
             if (!typep->bounded()) return nullptr;
             return lowerValue(VhdlValue::mkReal(typep->leftReal(), typep), typep, flp);
         case VhdlTypeKind::ARRAY: {
+            // A length that is not known until elaboration has no default to
+            // write here; the variable simply starts at zero
+            if (!typep->isConstrainedArray()) return nullptr;
             // Every element takes the element type's default (6.4.2.2). An
             // array of logic is packed and starts as Verilator starts it; an
             // array of anything else is unpacked, and a sparse initializer
@@ -664,6 +766,42 @@ private:
             if (argp) return new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
         } else if (attr == "pred" || attr == "leftof") {
             if (argp) return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        }
+        // A bound that names a generic does not fold during analysis, so the
+        // attributes that ask about it are answered with the same expression
+        // the range itself was emitted with (16.2)
+        if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
+            || attr == "length" || attr == "ascending") {
+            const VhdlType* const typep = nodep->prefixp()->vhdlTypep();
+            int dim = 0;
+            if (argp) {
+                if (const AstConst* const constp = VN_CAST(argp, Const)) {
+                    dim = static_cast<int>(constp->toSInt()) - 1;
+                }
+            }
+            AstNodeExpr* leftp = nullptr;
+            AstNodeExpr* rightp = nullptr;
+            bool ascending = true;
+            if (dynamicBounds(typep, dim, flp, leftp, rightp, ascending)) {
+                if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                if (attr == "ascending") {
+                    VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                    VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                    return new AstConst{flp, AstConst::BitTrue{}, ascending};
+                }
+                if (attr == "length") {
+                    AstNodeExpr* const diffp
+                        = ascending ? static_cast<AstNodeExpr*>(new AstSub{flp, rightp, leftp})
+                                    : static_cast<AstNodeExpr*>(new AstSub{flp, leftp, rightp});
+                    return new AstAdd{flp, diffp, new AstConst{flp, AstConst::Signed32{}, 1}};
+                }
+                const bool wantLeft = (attr == "left") || (attr == "high" && !ascending)
+                                      || (attr == "low" && ascending);
+                AstNodeExpr* const keepp = wantLeft ? leftp : rightp;
+                AstNodeExpr* const dropp = wantLeft ? rightp : leftp;
+                VL_DO_DANGLING(dropp->deleteTree(), dropp);
+                return keepp;
+            }
         }
         if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
         unsup(flp, "attribute '" + attr);
@@ -902,9 +1040,9 @@ private:
         return 0;
     }
 
-    static void matchVectorWidth(AstVhdlBinary* nodep, const VhdlType* ltypep,
-                                 const VhdlType* rtypep, AstNodeExpr*& lhsp,
-                                 AstNodeExpr*& rhsp, FileLine* flp) {
+    void matchVectorWidth(AstVhdlBinary* nodep, const VhdlType* ltypep,
+                          const VhdlType* rtypep, AstNodeExpr*& lhsp, AstNodeExpr*& rhsp,
+                          FileLine* flp) {
         switch (nodep->op()) {
         case VhdlBinaryOp::ADD:
         case VhdlBinaryOp::SUB:
@@ -926,7 +1064,26 @@ private:
             rhsp = sizedTo(rhsp, lw, flp);
         } else if (rw && !lw && isIntegerType(ltypep)) {
             lhsp = sizedTo(lhsp, rw, flp);
+        } else if (!lw && !rw) {
+            // A vector whose width comes from a generic has no width here,
+            // but its length is an expression, and V3Param folds it before
+            // widths are worked out
+            if (isIntegerType(rtypep) && isDynamicVector(ltypep)) {
+                rhsp = new AstCast{flp, rhsp, VFlagChildDType{},
+                                   lowerType(const_cast<VhdlType*>(ltypep), flp)};
+            } else if (isIntegerType(ltypep) && isDynamicVector(rtypep)) {
+                lhsp = new AstCast{flp, lhsp, VFlagChildDType{},
+                                   lowerType(const_cast<VhdlType*>(rtypep), flp)};
+            }
         }
+    }
+    // A vector whose length is not a number now, but is once the instance is
+    // elaborated
+    static bool isDynamicVector(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (typep->isConstrainedArray()) return false;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        return indexes.size() == 1 && indexes[0] && indexes[0]->boundsp();
     }
     static bool isIntegerType(const VhdlType* typep) {
         if (!typep) return false;
@@ -1272,6 +1429,8 @@ private:
             left = indexp->left();
             step = indexp->ascending() ? 1 : -1;
             count = indexp->length();
+        } else if (AstNodeExpr* const outp = othersOfDynamicLength(nodep, typep, flp)) {
+            return outp;
         } else if (!ownConstraint(nodep, typep, left, step, count)) {
             unsup(flp, "aggregate of this type");
             return nullptr;
@@ -1352,6 +1511,26 @@ private:
         }
         if (packed) return outp;
         return itemsp ? new AstPattern{flp, itemsp} : nullptr;
+    }
+
+    // "(others => v)" where the length is not a number now but is fixed once
+    // the instance is elaborated -- a port or signal whose width comes from a
+    // generic. One value repeated as many times as the range is long, which
+    // V3Param settles along with the range itself.
+    AstNodeExpr* othersOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp) {
+        AstVhdlElemAssoc* const eap = nodep->elemsp();
+        if (!eap || eap->nextp() || !eap->choicesp()) return nullptr;
+        AstVhdlChoice* const chp = eap->choicesp();
+        if (chp->nextp() || !chp->isOthers()) return nullptr;
+        if (!typep->base()->elementp() || !elementPacks(typep->base()->elementp())) return nullptr;
+        AstNodeExpr* const countp = boundsLength(typep, flp);
+        if (!countp) return nullptr;
+        AstNodeExpr* const valuep = lowerExpr(eap->valuep());
+        if (!valuep) {
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            return nullptr;
+        }
+        return new AstReplicate{flp, valuep, countp};
     }
 
     // The index range an aggregate gives itself when nothing else does. A
@@ -2481,8 +2660,8 @@ private:
             return lowerAssert(assertp);
         }
         if (AstVhdlNext* const nextp = VN_CAST(nodep, VhdlNext)) {
-            AstNode* const jumpp = nextp->isExit() ? static_cast<AstNode*>(new AstBreak{flp})
-                                                   : static_cast<AstNode*>(new AstContinue{flp});
+            AstNode* const jumpp = loopJump(nextp, flp);
+            if (!jumpp) return nullptr;
             if (!nextp->condp()) return jumpp;
             return new AstIf{flp, lowerCondition(nextp->condp()), jumpp, nullptr};
         }
@@ -2615,18 +2794,59 @@ private:
         return casep;
     }
 
+    // Where "exit" or "next" goes. Without a label it is the innermost loop,
+    // which break and continue already mean. With one it may be any enclosing
+    // loop, so the jump leaves a block put around that loop, or around its
+    // body for a "next".
+    AstNode* loopJump(AstVhdlNext* nodep, FileLine* flp) {
+        const std::string& label = nodep->loopLabel();
+        if (label.empty() || (!m_loops.empty() && m_loops.back().label == label)) {
+            return nodep->isExit() ? static_cast<AstNode*>(new AstBreak{flp})
+                                   : static_cast<AstNode*>(new AstContinue{flp});
+        }
+        for (size_t i = m_loops.size(); i-- > 0;) {
+            if (m_loops[i].label != label) continue;
+            AstJumpBlock*& blockp = nodep->isExit() ? m_loops[i].exitp : m_loops[i].bodyp;
+            if (!blockp) blockp = new AstJumpBlock{flp, nullptr};
+            return new AstJumpGo{flp, blockp};
+        }
+        err(flp, "No enclosing loop is labelled '" + label + "'");
+        return nullptr;
+    }
+
+    // Lower a loop's body, and put it inside the block a labelled "next"
+    // jumps out of if there was one
+    AstNode* lowerLoopBody(AstVhdlLoop* nodep) {
+        AstNode* const stmtsp = lowerStmts(nodep->stmtsp());
+        if (AstJumpBlock* const blockp = m_loops.back().bodyp) {
+            blockp->addStmtsp(stmtsp);
+            return blockp;
+        }
+        return stmtsp;
+    }
+
+    // Put the loop inside the block a labelled "exit" jumps out of, if there
+    // was one
+    AstNode* wrapLoopExit(AstNode* loopp) {
+        if (AstJumpBlock* const blockp = m_loops.back().exitp) {
+            blockp->addStmtsp(loopp);
+            return blockp;
+        }
+        return loopp;
+    }
+
     AstNode* lowerLoop(AstVhdlLoop* nodep) {
         FileLine* const flp = nodep->fileline();
+        if (nodep->kind() == VhdlLoopKind::FOR) return lowerForLoop(nodep);
         AstLoop* const loopp = new AstLoop{flp};
-        switch (nodep->kind()) {
-        case VhdlLoopKind::LOOP: break;
-        case VhdlLoopKind::WHILE:
+        m_loops.emplace_back(VhdlLoopFrame{nodep->label(), nullptr, nullptr});
+        if (nodep->kind() == VhdlLoopKind::WHILE) {
             loopp->addStmtsp(new AstLoopTest{flp, loopp, lowerCondition(nodep->condp())});
-            break;
-        case VhdlLoopKind::FOR: return lowerForLoop(nodep);
         }
-        loopp->addStmtsp(lowerStmts(nodep->stmtsp()));
-        return loopp;
+        loopp->addStmtsp(lowerLoopBody(nodep));
+        AstNode* const outp = wrapLoopExit(loopp);
+        m_loops.pop_back();
+        return outp;
     }
 
     // A for loop declares its own parameter, which VHDL makes a constant of
@@ -2651,6 +2871,23 @@ private:
                 initp = lowerExpr(rp->leftp());
                 limitp = lowerExpr(rp->rightp());
                 ascending = rp->dir() == VhdlDir::TO;
+            } else if (AstVhdlAttrName* const attrp = VN_CAST(rp->attrp(), VhdlAttrName)) {
+                // "for i in v'range" over an object whose bounds are not
+                // static, which is how a width-generic design is written
+                const std::string& name = attrp->name();
+                if (name == "range" || name == "reverse_range") {
+                    int dim = 0;
+                    if (attrp->argp()) {
+                        const VhdlValue dimv = V3VhdlEval::eval(attrp->argp());
+                        if (dimv.isInt()) dim = static_cast<int>(dimv.toInt()) - 1;
+                    }
+                    bool asc = true;
+                    if (dynamicBounds(attrp->prefixp()->vhdlTypep(), dim, flp, initp, limitp,
+                                      asc)) {
+                        ascending = (name == "range") ? asc : !asc;
+                        if (name == "reverse_range") std::swap(initp, limitp);
+                    }
+                }
             }
         }
         if (!initp || !limitp) {
@@ -2667,6 +2904,17 @@ private:
         AstVar* const varp = newVar(symp, VVarType::VAR, flp);
         varp->usedLoopIdx(true);
         addStmt(varp);
+        // The discrete range is evaluated once, when the loop is entered
+        // (10.10): assigning to something the bound names inside the body
+        // must not change how many times the loop runs
+        AstNode* preloadp = nullptr;
+        if (!VN_IS(limitp, Const)) {
+            AstVar* const limitVarp
+                = newTempVar("__Vloophi", lowerType(rangep, flp), flp);
+            preloadp = new AstAssign{
+                flp, new AstVarRef{flp, limitVarp, VAccess::WRITE}, limitp};
+            limitp = new AstVarRef{flp, limitVarp, VAccess::READ};
+        }
         AstLoop* const loopp = new AstLoop{flp};
         AstNodeExpr* const condp
             = ascending ? static_cast<AstNodeExpr*>(new AstLteS{
@@ -2674,7 +2922,8 @@ private:
                         : static_cast<AstNodeExpr*>(new AstGteS{
                               flp, new AstVarRef{flp, varp, VAccess::READ}, limitp});
         loopp->addStmtsp(new AstLoopTest{flp, loopp, condp});
-        loopp->addStmtsp(lowerStmts(nodep->stmtsp()));
+        m_loops.emplace_back(VhdlLoopFrame{nodep->label(), nullptr, nullptr});
+        loopp->addStmtsp(lowerLoopBody(nodep));
         loopp->addContsp(new AstAssign{
             flp, new AstVarRef{flp, varp, VAccess::WRITE},
             ascending ? static_cast<AstNodeExpr*>(new AstAdd{
@@ -2683,9 +2932,12 @@ private:
                       : static_cast<AstNodeExpr*>(new AstSub{
                             flp, new AstVarRef{flp, varp, VAccess::READ},
                             new AstConst{flp, AstConst::Signed32{}, 1}})});
-        AstNode* const outp
+        AstNode* const wrappedp = wrapLoopExit(loopp);
+        m_loops.pop_back();
+        AstNode* outp
             = new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, initp};
-        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+        if (preloadp) outp = AstNode::addNext(static_cast<AstNode*>(preloadp), outp);
+        return AstNode::addNext(outp, wrappedp);
     }
 
 
@@ -3490,6 +3742,7 @@ private:
         m_modp->timeunit(VTimescale::TS_1FS);
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
+        m_names.clear();
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();
