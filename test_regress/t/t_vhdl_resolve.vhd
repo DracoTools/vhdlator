@@ -21,7 +21,14 @@ architecture sim of t_vhdl_resolve is
   signal en0   : std_logic := '0';
   signal en1   : std_logic := '0';
   signal fromp : std_logic := 'Z';
+
+  -- A pull-up: weak, so anything forcing beats it
+  signal pulled : std_logic;
 begin
+
+  pulled <= 'H';
+  pulled <= '0' when en0 = '1' else 'Z';
+
 
   -- Two concurrent drivers of one signal
   one <= '1' when en0 = '1' else 'Z';
@@ -56,6 +63,18 @@ begin
 
     fromp <= 'Z';
     wait for 1 ns;
+
+    -- Strength: the pull-up holds the line high until something forces it
+    -- The pull-up alone leaves the line weakly high, which is 'H' and not
+    -- '1'. Asserting '1' would pass here only because the two collapse
+    -- together in a two-state model, and would fail on any other simulator.
+    assert pulled = 'H' report "pull-up alone" severity failure;
+    en0 <= '1';
+    wait for 1 ns;
+    assert pulled = '0' report "a forcing low beats a pull-up" severity failure;
+    en0 <= '0';
+    wait for 1 ns;
+    assert pulled = 'H' report "the pull-up returns" severity failure;
 
     report "*-* All Finished *-*";
     stop;

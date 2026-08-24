@@ -109,6 +109,7 @@ class VhdlLowerVisitor final {
     struct VhdlDriver {
         AstVar* valp = nullptr;
         AstVar* enp = nullptr;
+        AstVar* weakp = nullptr;  // Driving, but only until something forces
     };
     std::map<const VhdlSymbol*, std::vector<VhdlDriver>> m_drivers;
     std::map<const VhdlSymbol*, int> m_driverCount;
@@ -1858,34 +1859,126 @@ private:
             // Off until the driver says otherwise, which is what a driver of
             // a resolved signal contributes before it has run
             drv.enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
-            addStmt(new AstAlways{new AstAssignW{
-                flp, new AstVarRef{flp, netp, VAccess::WRITE},
-                new AstCond{flp, new AstVarRef{flp, drv.enp, VAccess::READ},
-                            new AstVarRef{flp, drv.valp, VAccess::READ},
-                            new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
+            drv.weakp = new AstVar{flp, VVarType::VAR, base + "__weak", VFlagChildDType{},
+                                   new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
+            addStmt(drv.weakp);
+            drv.weakp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
             drivers.push_back(drv);
         }
+        // "Some driver is forcing", which is what decides whether the weak
+        // ones are heard at all
+        AstNodeExpr* forcingp = nullptr;
+        for (const VhdlDriver& drv : drivers) {
+            AstNodeExpr* const onep
+                = new AstAnd{flp, new AstVarRef{flp, drv.enp, VAccess::READ},
+                             new AstNot{flp, new AstVarRef{flp, drv.weakp, VAccess::READ}}};
+            forcingp = forcingp ? new AstOr{flp, forcingp, onep} : onep;
+        }
+        for (const VhdlDriver& drv : drivers) {
+            // A forcing driver is always heard; a weak one only while nothing
+            // forces. That is the strength ordering of the resolution table
+            // (16.8.2): a forcing '0' beats a weak 'H', and two weak drivers
+            // decide it between themselves.
+            AstNodeExpr* const heardp = new AstAnd{
+                flp, new AstVarRef{flp, drv.enp, VAccess::READ},
+                new AstOr{flp, new AstNot{flp, new AstVarRef{flp, drv.weakp, VAccess::READ}},
+                          new AstNot{flp, forcingp->cloneTreePure(false)}}};
+            addStmt(new AstAlways{new AstAssignW{
+                flp, new AstVarRef{flp, netp, VAccess::WRITE},
+                new AstCond{flp, heardp, new AstVarRef{flp, drv.valp, VAccess::READ},
+                            new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
+        }
+        VL_DO_DANGLING(forcingp->deleteTree(), forcingp);
         m_drivers.emplace(symp, drivers);
     }
 
-    // A driver is off exactly where it assigns Z, so the enable is the value
-    // with each of its leaves replaced by all-ones or, for a Z, all-zeroes.
-    static AstNodeExpr* enableOf(const AstNodeExpr* valuep, FileLine* flp) {
-        if (const AstConst* const constp = VN_CAST(valuep, Const)) {
-            if (constp->num().isAnyZ()) return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
-            return new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
+    // What one value contributes to a resolved signal: whether it drives at
+    // all, and whether it drives only weakly.
+    //
+    // This has to read the VHDL expression rather than the lowered one. The
+    // nine values collapse on the way down -- 'H' becomes 1 and 'L' becomes 0
+    // -- so by the time there is an AstNode the strength has gone. Only the
+    // literals carry it, which is exactly where real code puts it.
+    enum class VhdlDrive : uint8_t { OFF, WEAK, FORCING };
+
+    static VhdlDrive driveOfLiteral(AstNodeVhdlExpr* nodep) {
+        if (!nodep) return VhdlDrive::FORCING;
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        const VhdlType* const typep = nodep->vhdlTypep();
+        if (val.isStr()) {
+            // An aggregate or a string of logic values, as in (others => 'Z')
+            bool allZ = !val.toStr().empty();
+            bool allWeak = !val.toStr().empty();
+            for (const char c : val.toStr()) {
+                if (c != 'Z' && c != 'z') allZ = false;
+                if (c != 'L' && c != 'H' && c != 'W') allWeak = false;
+            }
+            if (allZ) return VhdlDrive::OFF;
+            if (allWeak) return VhdlDrive::WEAK;
+            return VhdlDrive::FORCING;
         }
-        if (const AstCond* const condp = VN_CAST(valuep, Cond)) {
-            return new AstCond{flp, condp->condp()->cloneTreePure(false),
-                               enableOf(condp->thenp(), flp), enableOf(condp->elsep(), flp)};
+        if (val.isInt() && typep && enumIsLogic(typep->base())) {
+            const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
+            const int64_t pos = val.toInt();
+            if (pos >= 0 && pos < static_cast<int64_t>(lits.size())) {
+                const std::string& name = lits[pos]->name();  // "'H'" and the like
+                if (name.size() == 3) {
+                    switch (name[1]) {
+                    case 'Z':
+                    case 'z': return VhdlDrive::OFF;
+                    case 'L':
+                    case 'l':
+                    case 'H':
+                    case 'h':
+                    case 'W':
+                    case 'w': return VhdlDrive::WEAK;
+                    default: break;
+                    }
+                }
+            }
         }
-        return new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
+        return VhdlDrive::FORCING;
+    }
+
+    // The same, over the alternatives of a conditional or selected assignment,
+    // so that "value when c else 'Z'" turns the driver on and off with c
+    AstNodeExpr* driveFlagOf(AstVhdlSigAssign* nodep, bool wantWeak, FileLine* flp) {
+        const auto leafp = [&](AstVhdlWaveform* wfp) -> AstNodeExpr* {
+            const VhdlDrive drive
+                = driveOfLiteral(wfp && wfp->valuep() ? wfp->valuep() : nullptr);
+            const bool set = wantWeak ? drive == VhdlDrive::WEAK : drive != VhdlDrive::OFF;
+            return new AstConst{flp, AstConst::WidthedValue{}, 1, set ? 1U : 0U};
+        };
+        if (nodep->kind() == VhdlAssignKind::SIMPLE) return leafp(nodep->wavesp());
+        std::vector<AstVhdlAlternative*> alts;
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            alts.push_back(VN_AS(p, VhdlAlternative));
+        }
+        AstNodeExpr* outp = nullptr;
+        for (size_t i = alts.size(); i-- > 0;) {
+            AstNodeExpr* const valuep = leafp(alts[i]->wavesp());
+            AstNodeExpr* testp = nullptr;
+            if (nodep->kind() == VhdlAssignKind::CONDITIONAL) {
+                if (alts[i]->condp()) testp = lowerCondition(alts[i]->condp());
+            } else {
+                testp = choiceTest(alts[i]->choicesp(), nodep->selectorp());
+            }
+            if (!testp || !outp) {
+                if (testp) VL_DO_DANGLING(testp->deleteTree(), testp);
+                if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                outp = valuep;  // The trailing else, or the last choice
+                continue;
+            }
+            outp = new AstCond{flp, testp, valuep, outp};
+        }
+        return outp ? outp : new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
     }
 
     // An assignment to a signal that has several drivers writes this driver's
     // value and enable rather than the signal
-    AstNode* driveResolved(AstNodeVhdlExpr* targetp, AstNodeExpr* valuep, AstNode* delayp,
-                           bool sequential, FileLine* flp) {
+    AstNode* driveResolved(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* targetp,
+                           AstNodeExpr* valuep, AstNode* delayp, bool sequential,
+                           FileLine* flp) {
         const VhdlSymbol* const symp = rootSymOf(targetp);
         const auto it = m_drivers.find(symp);
         const int idx = m_driverUsed[symp];
@@ -1901,23 +1994,32 @@ private:
         AstVar* const savedp = m_vars[keyp];
         m_vars[keyp] = drv.valp;
         AstNodeExpr* const valLhsp = lowerExpr(targetp);
-        m_vars[keyp] = drv.enp;
-        AstNodeExpr* const enLhsp = lowerExpr(targetp);
         m_vars[keyp] = savedp;
-        if (!valLhsp || !enLhsp) {
+        if (!valLhsp) {
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
             return nullptr;
         }
-        AstNodeExpr* const enp = enableOf(valuep, flp);
+        // The enable and the weak flag are one bit whatever the signal's
+        // width, so they are written directly rather than through the target
+        AstNodeExpr* const enp = driveFlagOf(nodep, false, flp);
+        AstNodeExpr* const weakp = driveFlagOf(nodep, true, flp);
         AstNode* outp = nullptr;
         if (sequential) {
             outp = new AstAssignDly{flp, valLhsp, valuep, delayp};
-            outp = AstNode::addNext(outp,
-                                    static_cast<AstNode*>(new AstAssignDly{flp, enLhsp, enp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssignDly{
+                          flp, new AstVarRef{flp, drv.enp, VAccess::WRITE}, enp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssignDly{
+                          flp, new AstVarRef{flp, drv.weakp, VAccess::WRITE}, weakp}));
         } else {
             outp = new AstAssignW{flp, valLhsp, valuep, delayp};
-            outp = AstNode::addNext(outp,
-                                    static_cast<AstNode*>(new AstAssignW{flp, enLhsp, enp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssignW{
+                          flp, new AstVarRef{flp, drv.enp, VAccess::WRITE}, enp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssignW{
+                          flp, new AstVarRef{flp, drv.weakp, VAccess::WRITE}, weakp}));
         }
         return outp;
     }
@@ -1943,7 +2045,7 @@ private:
         if (m_drivers.count(rootSymOf(nodep->targetp()))) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
             if (AstNode* const outp
-                = driveResolved(nodep->targetp(), rhsp, delayp, false, flp)) {
+                = driveResolved(nodep, nodep->targetp(), rhsp, delayp, false, flp)) {
                 // Each continuous assignment becomes its own always, so
                 // the list has to be taken apart from the front: the head has
                 // no back to unlink from
@@ -2299,7 +2401,7 @@ private:
         if (m_drivers.count(rootSymOf(nodep->targetp()))) {
             AstNodeExpr* const valuep = lowerExpr(wfp->valuep());
             if (!valuep) return nullptr;
-            return driveResolved(nodep->targetp(), valuep, delayp, sequential, flp);
+            return driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp);
         }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
         AstNodeExpr* const rhsp = lowerExpr(wfp->valuep());
