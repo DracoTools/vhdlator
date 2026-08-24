@@ -443,6 +443,31 @@ private:
         case VhdlTypeKind::FLOATING:
             if (!typep->bounded()) return nullptr;
             return lowerValue(VhdlValue::mkReal(typep->leftReal(), typep), typep, flp);
+        case VhdlTypeKind::ARRAY: {
+            // Every element takes the element type's default (6.4.2.2). An
+            // array of logic is packed and starts as Verilator starts it; an
+            // array of anything else is unpacked, and a sparse initializer
+            // with only a default says "all elements" without writing them
+            // out, whatever the array's size.
+            if (!typep->isConstrainedArray()) return nullptr;
+            if (!basep->elementp()) return nullptr;
+            // One dimension only: a sparse initializer for a nested array
+            // would have to be nested too, and say nothing a design is likely
+            // to depend on
+            if (typep->indexTypes().size() != 1) return nullptr;
+            if (basep->elementp()->base()->kind() == VhdlTypeKind::ARRAY) return nullptr;
+            if (enumIsLogic(basep->elementp()->base())) return nullptr;
+            if (isStringType(basep)) return nullptr;  // A string, not an array here
+            AstNodeExpr* const elemp = defaultValueFor(basep->elementp(), flp);
+            if (!elemp) return nullptr;
+            AstNodeDType* const dtypep = lowerType(typep, flp);
+            if (!VN_IS(dtypep, UnpackArrayDType)) {
+                VL_DO_DANGLING(elemp->deleteTree(), elemp);
+                VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+                return nullptr;
+            }
+            return new AstInitArray{flp, dtypep, elemp};
+        }
         case VhdlTypeKind::RECORD: {
             // A record's default is each element's default (6.4.2.2). The
             // record is packed, so the elements concatenate into one constant

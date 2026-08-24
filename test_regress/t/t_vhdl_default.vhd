@@ -26,6 +26,8 @@ architecture sim of t_vhdl_default is
     c : colour;
   end record;
 
+  type ints is array (1 to 3) of integer;
+
 begin
 
   main : process is
@@ -37,6 +39,7 @@ begin
     variable w  : warm;
     variable pt : point;
     variable sz : sized;
+    variable ar : ints;
   begin
     assert i = integer'left report "integer" severity failure;
     assert n = 0 report "natural" severity failure;
@@ -47,6 +50,8 @@ begin
     assert pt.x = integer'left and pt.y = integer'left
       report "record of integers" severity failure;
     assert sz.n = 0 and sz.c = red report "record of mixed types" severity failure;
+    assert ar(1) = integer'left and ar(3) = integer'left
+      report "array of integers" severity failure;
 
     report "*-* All Finished *-*";
     stop;
