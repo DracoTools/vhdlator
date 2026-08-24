@@ -102,8 +102,10 @@ class VhdlType final {
     VhdlType* m_designatedp = nullptr;
     // PHYSICAL: unit names and their values in the primary unit
     std::vector<std::pair<std::string, int64_t>> m_units;
-    // PROTECTED: the scope holding its methods
+    // PROTECTED: the scope holding its methods, and the body that defines
+    // them, which is a separate declaration from the type's own (5.6.3)
     VhdlScope* m_scopep = nullptr;
+    AstNode* m_bodyp = nullptr;
     // Whether values of this type are resolved, and by what (6.3)
     VhdlSymbol* m_resolutionp = nullptr;
 
@@ -265,6 +267,8 @@ public:
     // Protected type body scope
     VhdlScope* scopep() const { return m_scopep; }
     void scopep(VhdlScope* scopep) { m_scopep = scopep; }
+    AstNode* bodyp() const { return m_bodyp; }
+    void bodyp(AstNode* nodep) { m_bodyp = nodep; }
 
     // Resolution (6.3)
     VhdlSymbol* resolutionp() const { return m_resolutionp; }

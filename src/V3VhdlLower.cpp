@@ -116,6 +116,10 @@ class VhdlLowerVisitor final {
     // How many of a signal's drivers have been lowered, which is the index of
     // the one being lowered now
     std::map<const VhdlSymbol*, int> m_driverUsed;
+    // A protected type becomes a class, and a shared variable of it an
+    // instance of that class (5.6). The class is built once, on first use.
+    std::map<const VhdlType*, AstClass*> m_protClasses;
+    AstClass* m_protClassp = nullptr;  // Protected type being built, if any
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::string m_prefix;  // Name prefix for declarations inside a process
@@ -138,6 +142,8 @@ public:
         if (!nodep) return;
         if (m_ftaskp) {
             m_ftaskp->addStmtsp(nodep);
+        } else if (m_protClassp) {
+            m_protClassp->addStmtsp(nodep);
         } else {
             m_stmtsp = AstNode::addNextNull(m_stmtsp, nodep);
         }
@@ -202,10 +208,83 @@ private:
             }
             unsup(flp, "access type '" + basep->prettyName() + "'");
             return newLogicDType(flp, 1);
+        case VhdlTypeKind::PROTECTED:
+            return new AstClassRefDType{flp, protectedClass(basep, flp), nullptr};
         default:
             unsup(flp, "type '" + basep->prettyName() + "'");
             return newLogicDType(flp, 1);
         }
+    }
+
+    // A protected type is an object with methods and state of its own, which
+    // only those methods may reach (5.6). That is a class, so it becomes one:
+    // the body's variables are its members, its subprograms are its methods,
+    // and a shared variable of the type is an instance. The class is built
+    // once per type, on first use.
+    AstClass* protectedClass(VhdlType* basep, FileLine* flp) {
+        const auto it = m_protClasses.find(basep);
+        if (it != m_protClasses.end()) return it->second;
+        AstClass* const classp = new AstClass{
+            flp, "__Vprot_" + basep->name(), m_modp ? m_modp->libname() : ""};
+        m_protClasses.emplace(basep, classp);
+        v3Global.setHasClasses();
+        // A class belongs to a design unit, and a protected type may be
+        // declared in a package that several modules use, so it goes in the
+        // one unit every design has
+        m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        // Every class needs a constructor; nothing else makes one this early
+        AstFunc* const newp = new AstFunc{flp, "new", nullptr, nullptr};
+        newp->isConstructor(true);
+        newp->classMethod(true);
+        newp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        classp->addStmtsp(newp);
+        AstVhdlProtectedType* const bodyp = VN_CAST(basep->bodyp(), VhdlProtectedType);
+        if (!bodyp) {
+            unsup(flp, "protected type '" + basep->prettyName() + "' with no body");
+            return classp;
+        }
+        VL_RESTORER(m_protClassp);
+        VL_RESTORER(m_ftaskp);
+        VL_RESTORER(m_stmtsp);
+        VL_RESTORER_COPY(m_prefix);
+        m_protClassp = classp;
+        m_ftaskp = nullptr;
+        m_stmtsp = nullptr;
+        m_prefix.clear();
+        for (AstNode* p = bodyp->declsp(); p; p = p->nextp()) lowerDecl(p);
+        return classp;
+    }
+
+    // The actuals of a call. An association may name its formal (6.5.7.1),
+    // which V3Task matches to the parameter of that name, so a call written
+    // out of order or leaving out a defaulted parameter comes out right.
+    void addCallArgs(AstNodeFTaskRef* refp, AstVhdlCall* callp) {
+        if (!callp) return;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp()) continue;
+            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+            refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "",
+                                      lowerExpr(asp->actualp())});
+        }
+    }
+
+    // The object a method is called on, which the analyzer left on the prefix
+    // of the selected name (5.6.2). Null if this is not such a call.
+    AstNodeExpr* protectedInstance(AstNodeVhdlExpr* objNamep) {
+        if (!objNamep) return nullptr;
+        VhdlSymbol* const objp = objNamep->vhdlSymp();
+        if (!objp || !objp->isObject() || !objp->typep()) return nullptr;
+        if (objp->typep()->base()->kind() != VhdlTypeKind::PROTECTED) return nullptr;
+        const auto it = m_vars.find(objp);
+        if (it == m_vars.end()) return nullptr;
+        return new AstVarRef{objNamep->fileline(), it->second, VAccess::READ};
+    }
+
+    // What one of a protected type's methods is called in the emitted code
+    std::string methodName(VhdlSymbol* symp) {
+        const auto it = m_funcs.find(symp);
+        return it == m_funcs.end() ? uniqueName(symp) : it->second->name();
     }
 
     // A LINE is an access to STRING, which is how textio passes text about
@@ -403,6 +482,13 @@ private:
             case VhdlObjKind::FILE: varType = VVarType::VAR; break;
             }
             AstVar* const varp = newVar(symp, varType, flp);
+            // A variable declared in a protected type body belongs to each
+            // object of the type, so it is a member of the class (5.6.2)
+            if (m_protClassp && !m_ftaskp) {
+                varp->varType(VVarType::MEMBER);
+                varp->funcLocal(false);
+                varp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            }
             // A VHDL process variable keeps its value between activations, so
             // it is a static variable of the module, not a local one
             if (objp->defaultp()) {
@@ -448,6 +534,10 @@ private:
         if (!typep || typep->isError()) return nullptr;
         VhdlType* const basep = typep->base();
         switch (basep->kind()) {
+        case VhdlTypeKind::PROTECTED:
+            // A shared variable holds an object of the type, made once, at
+            // elaboration (5.6.1)
+            return new AstNew{flp};
         case VhdlTypeKind::ENUM: {
             if (!typep->bounded()) return nullptr;
             const std::vector<VhdlSymbol*>& lits = basep->literals();
@@ -627,6 +717,11 @@ private:
             AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
             return new AstMemberSel{flp, fromp, VFlagChildDType{}, symp->name()};
+        }
+        if (symp && symp->kind() == VhdlSymKind::FUNCTION) {
+            if (AstNodeExpr* const instp = protectedInstance(nodep->prefixp())) {
+                return new AstMethodCall{flp, instp, methodName(symp), nullptr};
+            }
         }
         if (symp) return lowerRef(symp, symp->name(), flp);
         // A selected name of something in another design unit
@@ -1041,14 +1136,21 @@ private:
             if (asp && asp->actualp()) args.push_back(asp->actualp());
         }
         if (AstNodeExpr* const outp = lowerIntrinsic(symp, args, nodep, flp)) return outp;
+        // A function of a protected type runs on the object it is called on
+        if (AstVhdlSelected* const selp = VN_CAST(nodep->prefixp(), VhdlSelected)) {
+            if (AstNodeExpr* const instp = protectedInstance(selp->prefixp())) {
+                AstMethodCall* const callp
+                    = new AstMethodCall{flp, instp, methodName(symp), nullptr};
+                addCallArgs(callp, nodep);
+                return callp;
+            }
+        }
         auto it = m_funcs.find(symp);
         if (it == m_funcs.end() && emitOnDemand(symp)) it = m_funcs.find(symp);
         if (it != m_funcs.end() && VN_IS(it->second, Func)) {
             AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
             refp->taskp(it->second);
-            for (AstNodeVhdlExpr* const argp : args) {
-                refp->addArgsp(new AstArg{flp, "", lowerExpr(argp)});
-            }
+            addCallArgs(refp, nodep);
             return refp;
         }
         unsup(flp, "call to '" + symp->name() + "'");
@@ -2532,19 +2634,39 @@ private:
     AstNode* lowerForLoop(AstVhdlLoop* nodep) {
         FileLine* const flp = nodep->fileline();
         VhdlSymbol* const symp = nodep->vhdlSymp();
-        if (!symp || !symp->typep() || !symp->typep()->bounded()) {
+        if (!symp || !symp->typep()) {
             unsup(flp, "loop over a range that is not locally static");
             return nullptr;
         }
         VhdlType* const rangep = symp->typep();
+        // The bounds of a loop need not be static: "for i in 1 to n" with n a
+        // parameter is ordinary VHDL (10.10). Take them from the range as
+        // written, and fold only what is written as a type mark or a range
+        // attribute.
+        bool ascending = rangep->ascending();
+        AstNodeExpr* initp = nullptr;
+        AstNodeExpr* limitp = nullptr;
+        if (AstVhdlRange* const rp = VN_CAST(nodep->rangep(), VhdlRange)) {
+            if (rp->leftp() && rp->rightp()) {
+                initp = lowerExpr(rp->leftp());
+                limitp = lowerExpr(rp->rightp());
+                ascending = rp->dir() == VhdlDir::TO;
+            }
+        }
+        if (!initp || !limitp) {
+            if (initp) VL_DO_DANGLING(initp->deleteTree(), initp);
+            if (limitp) VL_DO_DANGLING(limitp->deleteTree(), limitp);
+            if (!rangep->bounded()) {
+                unsup(flp, "loop over a range that is not locally static");
+                return nullptr;
+            }
+            ascending = rangep->ascending();
+            initp = lowerValue(VhdlValue::mkInt(rangep->left(), rangep), rangep, flp);
+            limitp = lowerValue(VhdlValue::mkInt(rangep->right(), rangep), rangep, flp);
+        }
         AstVar* const varp = newVar(symp, VVarType::VAR, flp);
         varp->usedLoopIdx(true);
         addStmt(varp);
-        const bool ascending = rangep->ascending();
-        AstNodeExpr* const initp = lowerValue(
-            VhdlValue::mkInt(rangep->left(), rangep), rangep, flp);
-        AstNodeExpr* const limitp = lowerValue(
-            VhdlValue::mkInt(rangep->right(), rangep), rangep, flp);
         AstLoop* const loopp = new AstLoop{flp};
         AstNodeExpr* const condp
             = ascending ? static_cast<AstNodeExpr*>(new AstLteS{
@@ -2599,6 +2721,18 @@ private:
                 if (AstNode* const outp = lowerTextioProc(symp->name(), args, flp)) return outp;
             }
         }
+        // A procedure of a protected type runs on the object it is called on
+        if (symp) {
+            AstVhdlSelected* const selp
+                = VN_CAST(callp ? callp->prefixp() : nodep->callp(), VhdlSelected);
+            if (AstNodeExpr* const instp
+                = selp ? protectedInstance(selp->prefixp()) : nullptr) {
+                AstMethodCall* const mcallp
+                    = new AstMethodCall{flp, instp, methodName(symp), nullptr};
+                addCallArgs(mcallp, callp);
+                return new AstStmtExpr{flp, mcallp};
+            }
+        }
         auto it = symp ? m_funcs.find(symp) : m_funcs.end();
         if (it == m_funcs.end() && symp && emitOnDemand(symp)) it = m_funcs.find(symp);
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
@@ -2608,13 +2742,7 @@ private:
         }
         AstTaskRef* const refp = new AstTaskRef{flp, it->second->name(), nullptr};
         refp->taskp(it->second);
-        if (callp) {
-            for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
-                AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
-                if (!asp || !asp->actualp()) continue;
-                refp->addArgsp(new AstArg{flp, "", lowerExpr(asp->actualp())});
-            }
-        }
+        addCallArgs(refp, callp);
         (void)namep;
         return new AstStmtExpr{flp, refp};
     }
@@ -3157,6 +3285,9 @@ private:
         // A VHDL subprogram's variables are created anew on each call (4.3),
         // which is what an automatic lifetime means
         ftaskp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        // A subprogram declared in a protected type body is one of its
+        // methods, and reaches the object's own variables (5.6.2)
+        if (m_protClassp) ftaskp->classMethod(true);
         m_funcs.emplace(symp, ftaskp);
         VL_RESTORER(m_ftaskp);
         VL_RESTORER_COPY(m_prefix);
@@ -3174,8 +3305,18 @@ private:
             case VhdlMode::BUFFER: varp->direction(VDirection::INOUT); break;
             default: varp->direction(VDirection::INPUT); break;
             }
+            // A parameter of a protected type must be a variable of mode
+            // inout (4.2.2.3), but what is passed is the object itself, not a
+            // copy of its state -- so the handle goes in and nothing comes
+            // back, and the subprogram works on the caller's own object
+            if (psymp->typep() && psymp->typep()->base()->kind() == VhdlTypeKind::PROTECTED) {
+                varp->direction(VDirection::INPUT);
+            }
             varp->declDirection(varp->direction());
             varp->funcLocal(true);
+            // A parameter with a default value may be left out of a call
+            // (4.2.2.1), which is what an initial value on the port means here
+            if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
             m_vars.emplace(psymp, varp);
             ftaskp->addStmtsp(varp);
         }

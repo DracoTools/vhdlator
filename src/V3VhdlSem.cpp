@@ -161,6 +161,36 @@ class VhdlSemVisitor final : public VNVisitor {
         return nullptr;
     }
 
+    // A protected type's methods are named through an object of that type
+    // (5.6.2): "c.increment(4)". Given the prefix that stands before the
+    // method name, return the object it denotes and the region holding the
+    // methods, or null if the prefix is not such an object.
+    VhdlSymbol* protectedObject(const AstNodeVhdlExpr* prefixp, VhdlScope*& methScopep) {
+        std::vector<std::string> parts;
+        if (!flatten(prefixp, parts) || parts.empty()) return nullptr;
+        std::vector<VhdlSymbol*> found;
+        if (parts.size() == 1) {
+            lookup(parts[0], found);
+        } else {
+            VhdlScope* scopep = m_scopep;
+            for (size_t i = 0; i + 1 < parts.size() && scopep; ++i) {
+                scopep = scopep->findNamed(parts[i]);
+            }
+            if (!scopep) return nullptr;
+            scopep->lookupLocal(parts.back(), found);
+        }
+        for (VhdlSymbol* const symp : found) {
+            if (!symp->isObject()) continue;
+            VhdlType* typep = symp->typep();
+            if (typep && typep->kind() == VhdlTypeKind::ACCESS) typep = typep->designatedp();
+            if (!typep || typep->base()->kind() != VhdlTypeKind::PROTECTED) continue;
+            if (!typep->base()->scopep()) continue;
+            methScopep = typep->base()->scopep();
+            return symp;
+        }
+        return nullptr;
+    }
+
     // Like flatten(), but ".all" is kept as a final component, as a use
     // clause allows and a type mark does not
     static bool flattenUse(const AstNodeVhdlExpr* nodep, std::vector<std::string>& out) {
@@ -837,6 +867,37 @@ private:
 // Declarations
 
 void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
+    // A protected type body completes a declaration rather than making a new
+    // type (5.6.3), and its declarations belong to the region that
+    // declaration opened, so that the methods see the type's own variables
+    if (AstVhdlProtectedType* const protp = VN_CAST(nodep->defp(), VhdlProtectedType)) {
+        if (protp->isBody()) {
+            std::vector<VhdlSymbol*> found;
+            m_scopep->lookupLocal(nodep->name(), found);
+            // In a package body the declaration being completed is in the
+            // package declaration, one region out (12.1)
+            if (found.empty() && m_inPackageBody) m_scopep->lookup(nodep->name(), found);
+            VhdlSymbol* declp = nullptr;
+            for (VhdlSymbol* const symp : found) {
+                if (symp->kind() == VhdlSymKind::TYPE && symp->typep()
+                    && symp->typep()->kind() == VhdlTypeKind::PROTECTED) {
+                    declp = symp;
+                    break;
+                }
+            }
+            if (!declp) {
+                err(nodep->fileline(), "Protected type body '" + nodep->name()
+                                           + "' has no protected type declaration in this region");
+                return;
+            }
+            nodep->vhdlSymp(declp);
+            declp->typep()->bodyp(protp);
+            VL_RESTORER(m_scopep);
+            m_scopep = declp->typep()->scopep();
+            iterateAndNextNull(protp->declsp());
+            return;
+        }
+    }
     VhdlType* const typep = buildType(nodep->defp(), nodep->name(), nodep->fileline());
     typep->name(nodep->name());
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, nodep->name(), nodep);
@@ -2269,6 +2330,22 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
         }
     }
 
+    // A method of a protected type taking no arguments, named through an
+    // object of that type (5.6.2)
+    {
+        VhdlScope* methScopep = nullptr;
+        VhdlSymbol* const objp = protectedObject(nodep->prefixp(), methScopep);
+        const AstVhdlName* const sufp = objp ? VN_CAST(nodep->suffixp(), VhdlName) : nullptr;
+        if (sufp) {
+            std::vector<VhdlSymbol*> methods;
+            methScopep->lookupLocal(sufp->name(), methods);
+            if (!methods.empty()) {
+                nodep->prefixp()->vhdlSymp(objp);
+                return pick(nodep, methods, wantp, "method '" + sufp->name() + "'");
+            }
+        }
+    }
+
     // Otherwise a record element (8.3)
     VhdlType* const prefixp = analyzeExpr(nodep->prefixp(), nullptr);
     if (!prefixp || prefixp->isError()) return V3VhdlStd::errorType();
@@ -2540,6 +2617,24 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             scopep->lookupLocal(parts.back(), found);
         } else {
             lookup(parts.back(), found);
+        }
+    }
+
+    // A method of a protected type, called through an object of that type
+    // (5.6.2). The object is recorded on the prefix, where lowering reads it.
+    if (AstVhdlSelected* const selp = VN_CAST(nodep->prefixp(), VhdlSelected)) {
+        VhdlScope* methScopep = nullptr;
+        VhdlSymbol* const objp = protectedObject(selp->prefixp(), methScopep);
+        const AstVhdlName* const sufp = objp ? VN_CAST(selp->suffixp(), VhdlName) : nullptr;
+        if (sufp) {
+            std::vector<VhdlSymbol*> methods;
+            methScopep->lookupLocal(sufp->name(), methods);
+            if (!methods.empty()) {
+                found = methods;
+                parts.clear();
+                parts.push_back(sufp->name());
+                selp->prefixp()->vhdlSymp(objp);
+            }
         }
     }
 

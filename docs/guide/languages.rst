@@ -84,8 +84,9 @@ package it ships and whatever that package depends on. Pass
 
 Supported are entities and architectures, packages and package bodies,
 context declarations, configurations, all the standard type classes
-(enumeration, integer, floating point, physical, array, record, access and
-file), subprograms with all four parameter classes, all the concurrent and
+(enumeration, integer, floating point, physical, array, record, access,
+file and protected), shared variables, subprograms with all four parameter
+classes, resolution functions and multiple drivers, all the concurrent and
 sequential statements, blocks, ``for``/``if``/``case`` generate statements,
 component and direct entity instantiation, aliases, attributes, and the
 predefined libraries ``std.standard``, ``std.textio``, ``std.env``, and IEEE
@@ -453,6 +454,17 @@ is carried dynamically instead. Both are correct; only the second allocates.
 fixed-width operations, so arithmetic whose operand width is only known
 during execution is not available. This is reachable only by doing
 arithmetic on a value whose length came from a run-time computation.
+
+**A resolution function of your own is not run.** A signal whose subtype
+names a resolution function that is not one of the ``std_logic_1164``
+family is reported as unsupported rather than resolved. Signals of
+``std_logic`` and of any subtype resolved by ``resolved`` or
+``resolved_max`` are resolved, and a forcing value correctly beats a weak
+one, so a tri-state bus with pull-ups behaves as the LRM says.
+
+**The image of a real is printed in C form.** ``real'image(4.0)`` gives
+``4`` where the LRM asks for text that reads back as a VHDL literal, such as
+``4.0``. This affects only what is printed, not any value.
 
 
 Encrypted Verilog
