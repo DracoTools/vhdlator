@@ -15,8 +15,6 @@ test.scenarios('linter')
 # the symbol table, so a change in what any declaration means shows as a diff.
 test.top_filename = "t/t_vhdl_sem.vhd"
 
-test.lint(fails=True,
-          verilator_flags2=["--dump-vhdl-syms"],
-          expect_filename=test.golden_filename)
+test.lint(verilator_flags2=["--dump-vhdl-syms"], expect_filename=test.golden_filename)
 
 test.passes()

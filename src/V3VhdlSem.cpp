@@ -1257,6 +1257,11 @@ bool VhdlSemVisitor::parseForeign(const std::string& text, FileLine* flp, std::s
 // Regions with their own declarations
 
 void VhdlSemVisitor::visit(AstVhdlProcess* nodep) {
+    // The sensitivity list names signals of the enclosing region, not of the
+    // process's own, so it is analyzed before that region is opened (11.3)
+    for (AstNode* sp = nodep->sensp(); sp; sp = sp->nextp()) {
+        analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
+    }
     pushScope(nodep->name().empty() ? "process" : nodep->name());
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
@@ -2713,6 +2718,28 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         // A slice keeps the array type; an index yields one element
         const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
         return isSlice ? analyzeSliceName(nodep, typep) : analyzeIndexedName(nodep, typep);
+    }
+
+    // A prefix that is a selected name may denote an object the search above
+    // does not reach -- an element of a record, or a name in another design
+    // unit -- and indexing it is an indexed name or a slice (8.4, 8.5)
+    if (namedPrefix && VN_IS(nodep->prefixp(), VhdlSelected)) {
+        bool callable = false;
+        for (const VhdlSymbol* const symp : found) {
+            if (symp->kind() == VhdlSymKind::FUNCTION
+                || symp->kind() == VhdlSymKind::PROCEDURE) {
+                callable = true;
+            }
+        }
+        if (!callable) {
+            VhdlType* typep = analyzeExpr(nodep->prefixp(), nullptr);
+            if (typep && typep->kind() == VhdlTypeKind::ACCESS) typep = typep->designatedp();
+            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY) {
+                const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
+                return isSlice ? analyzeSliceName(nodep, typep) : analyzeIndexedName(nodep, typep);
+            }
+            if (typep && typep->isError()) return typep;
+        }
     }
 
     // Otherwise a subprogram call, resolved by its arguments and its context

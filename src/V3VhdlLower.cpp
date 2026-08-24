@@ -458,7 +458,9 @@ private:
                                 static_cast<uint32_t>(val.toInt())};
         }
         if (basep && basep->kind() == VhdlTypeKind::PHYSICAL) {
-            return new AstConst{flp, AstConst::SizedEData{},
+            // A physical value is counted in its primary unit, which for
+            // TIME is the femtosecond -- far more than 32 bits holds
+            return new AstConst{flp, AstConst::Unsized64{},
                                 static_cast<uint64_t>(val.toInt())};
         }
         return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(val.toInt())};
@@ -524,6 +526,19 @@ private:
     }
     std::set<std::string> m_names;  // Names already used in this module
     int m_nameNum = 0;
+
+    // What a signal attribute needs kept about a signal (16.2.2). VHDL's
+    // model has a value history; a compiled model does not, so what the
+    // attributes ask about is recorded as it happens, in a block that runs
+    // whenever the signal changes.
+    struct VhdlShadow final {
+        AstVar* prevp = nullptr;  // Its value, one delta behind
+        AstVar* lastp = nullptr;  // Its value before the previous event
+        AstVar* timep = nullptr;  // When the previous event happened
+        AstVar* transp = nullptr;  // Flips on every event
+    };
+    std::map<const VhdlSymbol*, VhdlShadow> m_shadows;
+    AstNode* m_shadowsp = nullptr;  // The blocks that keep them, for the module
 
     // An interface element of a generic or port clause (6.5)
     void lowerInterface(AstVhdlIfaceDecl* nodep, bool isGeneric, int& pinNum) {
@@ -767,6 +782,13 @@ private:
         } else if (attr == "pred" || attr == "leftof") {
             if (argp) return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
         }
+        // The signal attributes ask about what has happened to a signal, not
+        // about its type (16.2.2)
+        if (attr == "event" || attr == "active" || attr == "last_value"
+            || attr == "last_event" || attr == "last_active" || attr == "stable"
+            || attr == "quiet" || attr == "transaction") {
+            if (AstNodeExpr* const outp = lowerSignalAttr(nodep, attr, argp, flp)) return outp;
+        }
         // A bound that names a generic does not fold during analysis, so the
         // attributes that ask about it are answered with the same expression
         // the range itself was emitted with (16.2)
@@ -805,6 +827,106 @@ private:
         }
         if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
         unsup(flp, "attribute '" + attr);
+        return nullptr;
+    }
+
+    // What a signal attribute needs kept about one signal, made on first use.
+    // One block, sensitive to the signal, records what VHDL's value history
+    // would have held: the value one delta back, the value before that, when
+    // the last event was, and a bit that flips on each one. The writes are
+    // non-blocking, so a process reading them in the same delta sees what was
+    // true before the event, which is what the attributes are defined against.
+    const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
+        VhdlSymbol* const symp = prefixp->vhdlSymp();
+        if (!symp || symp->kind() != VhdlSymKind::SIGNAL) {
+            if (!symp || symp->kind() != VhdlSymKind::PORT) return nullptr;
+        }
+        const auto found = m_shadows.find(symp);
+        if (found != m_shadows.end()) return &found->second;
+        const auto varIt = m_vars.find(symp);
+        if (varIt == m_vars.end()) return nullptr;
+        AstVar* const sigp = varIt->second;
+        VhdlShadow sh;
+        const std::string base = "__Vsig" + std::to_string(++m_nameNum) + "__" + symp->name();
+        AstNodeDType* const valDTypep = lowerType(symp->typep(), flp);
+        sh.prevp = newTempVar(base + "__prev", valDTypep, flp);
+        sh.lastp = newTempVar(base + "__last", lowerType(symp->typep(), flp), flp);
+        sh.timep = newTempVar(base + "__time",
+                              new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
+                                                VNumRange{63, 0}, -1},
+                              flp);
+        sh.transp = newTempVar(base + "__trans", newLogicDType(flp, 1), flp);
+        // A signal starts out equal to its own past, so nothing reads as an
+        // event before anything has happened
+        sh.prevp->valuep(defaultValueFor(symp->typep(), flp));
+        sh.lastp->valuep(defaultValueFor(symp->typep(), flp));
+        AstNode* stmtsp = new AstAssignDly{
+            flp, new AstVarRef{flp, sh.lastp, VAccess::WRITE},
+            new AstVarRef{flp, sh.prevp, VAccess::READ}};
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, sh.prevp, VAccess::WRITE},
+                        new AstVarRef{flp, sigp, VAccess::READ}}));
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, sh.timep, VAccess::WRITE},
+                        new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}}}));
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, sh.transp, VAccess::WRITE},
+                        new AstNot{flp, new AstVarRef{flp, sh.transp, VAccess::READ}}}));
+        AstSenTree* const senp = new AstSenTree{
+            flp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE,
+                                new AstVarRef{flp, sigp, VAccess::READ}}};
+        AstAlways* const alwaysp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp};
+        m_shadowsp = AstNode::addNextNull(m_shadowsp, static_cast<AstNode*>(alwaysp));
+        return &m_shadows.emplace(symp, sh).first->second;
+    }
+
+    // "s /= s'past value", which is true for exactly the delta in which the
+    // signal changed
+    AstNodeExpr* eventOf(AstNodeVhdlExpr* prefixp, const VhdlShadow* shp, FileLine* flp) {
+        AstNodeExpr* const nowp = lowerExpr(prefixp);
+        if (!nowp) return nullptr;
+        return new AstNeq{flp, nowp, new AstVarRef{flp, shp->prevp, VAccess::READ}};
+    }
+
+    // The signal attributes of 16.2.2, answered from what shadowFor keeps
+    AstNodeExpr* lowerSignalAttr(AstVhdlAttrName* nodep, const std::string& attr,
+                                 AstNodeExpr* argp, FileLine* flp) {
+        const VhdlShadow* const shp = shadowFor(nodep->prefixp(), flp);
+        if (!shp) return nullptr;
+        if (attr == "transaction") return new AstVarRef{flp, shp->transp, VAccess::READ};
+        if (attr == "last_value") {
+            // During the delta in which it changed, the value before the
+            // change is what prev still holds
+            AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
+            if (!evp) return nullptr;
+            return new AstCond{flp, evp, new AstVarRef{flp, shp->prevp, VAccess::READ},
+                               new AstVarRef{flp, shp->lastp, VAccess::READ}};
+        }
+        if (attr == "event" || attr == "active") {
+            return eventOf(nodep->prefixp(), shp, flp);
+        }
+        if (attr == "last_event" || attr == "last_active") {
+            AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
+            if (!evp) return nullptr;
+            AstNodeExpr* const sincep = new AstSub{
+                flp, new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}},
+                new AstVarRef{flp, shp->timep, VAccess::READ}};
+            return new AstCond{flp, evp, new AstConst{flp, AstConst::Unsized64{}, 0}, sincep};
+        }
+        if (attr == "stable" || attr == "quiet") {
+            AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
+            if (!evp) return nullptr;
+            AstNodeExpr* const steadyp = new AstLogNot{flp, evp};
+            if (!argp) return steadyp;
+            // "stable(t)" also asks that the last event was longer ago than t
+            AstNodeExpr* const sincep = new AstSub{
+                flp, new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}},
+                new AstVarRef{flp, shp->timep, VAccess::READ}};
+            return new AstLogAnd{flp, steadyp, new AstGte{flp, sincep, argp}};
+        }
         return nullptr;
     }
 
@@ -1131,9 +1253,17 @@ private:
             if (!argp) return nullptr;
             return lowerConversion(prefixSymp->typep(), argp->actualp(), flp);
         }
-        // An object prefix makes it an index or a slice (8.4, 8.5)
+        // An object prefix makes it an index or a slice (8.4, 8.5). The
+        // prefix need not be a name of its own: "r.v(3)" indexes a record
+        // element, and "p.all(3)" what an access value points at.
         VhdlSymbol* const objSymp = nodep->vhdlSymp();
-        if (objSymp && objSymp->isObject()) {
+        const VhdlType* const prefixTypep
+            = nodep->prefixp() ? nodep->prefixp()->vhdlTypep() : nullptr;
+        const bool indexing
+            = (objSymp && objSymp->isObject())
+              || (!objSymp && prefixTypep
+                  && prefixTypep->base()->kind() == VhdlTypeKind::ARRAY);
+        if (indexing) {
             AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
             if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
@@ -3425,10 +3555,16 @@ private:
         if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
             return lowerMessage(qp->valuep(), format);
         }
-        // 'IMAGE and TO_STRING both turn a value into text
+        // 'IMAGE and TO_STRING both turn a value into text, but not the same
+        // text: the image of an enumeration literal is written the way the
+        // literal is, so a character literal keeps its apostrophes (16.2.3)
         AstNodeVhdlExpr* valuep = nodep;
+        bool isImage = false;
         if (AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
-            if (attrp->name() == "image" && attrp->argp()) valuep = attrp->argp();
+            if (attrp->name() == "image" && attrp->argp()) {
+                valuep = attrp->argp();
+                isImage = true;
+            }
         } else if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
             const VhdlSymbol* const symp = callp->vhdlSymp();
             if (symp && symp->name() == "to_string") {
@@ -3446,7 +3582,7 @@ private:
             format += "%s";
             return namep;
         }
-        format += formatFor(valuep->vhdlTypep());
+        format += formatFor(valuep->vhdlTypep(), isImage);
         return exprp;
     }
 
@@ -3485,17 +3621,24 @@ private:
     }
 
     // How a value of that type reads
-    static std::string formatFor(const VhdlType* typep) {
+    static std::string formatFor(const VhdlType* typep, bool isImage = false) {
         if (!typep) return "%0d";
         const VhdlType* const basep = typep->base();
         switch (basep->kind()) {
         case VhdlTypeKind::FLOATING:
         case VhdlTypeKind::UNIVERSAL_REAL: return "%g";
-        case VhdlTypeKind::PHYSICAL: return "%0t";
+        case VhdlTypeKind::PHYSICAL:
+            // A physical value is written with its unit, and TIME in terms of
+            // the resolution limit, which here is the femtosecond (16.2.3)
+            return isImage ? "%0t fs" : "%0t";
         case VhdlTypeKind::ARRAY:
             // A vector of logic reads in binary, as VHDL prints it
             return basep->elementp() && enumIsLogic(basep->elementp()->base()) ? "%b" : "%0d";
-        case VhdlTypeKind::ENUM: return enumIsLogic(basep) ? "%b" : "%0d";
+        case VhdlTypeKind::ENUM:
+            if (!enumIsLogic(basep)) return "%0d";
+            // A logic value is a character literal, and its image keeps the
+            // apostrophes the literal is written with
+            return isImage ? "'%b'" : "%b";
         default: return "%0d";
         }
     }
@@ -3774,6 +3917,9 @@ private:
         }
         m_modp->addStmtsp(m_stmtsp);
         m_stmtsp = nullptr;
+        m_modp->addStmtsp(m_shadowsp);
+        m_shadowsp = nullptr;
+        m_shadows.clear();
         m_netlistp->addModulesp(m_modp);
         m_modp = nullptr;
     }

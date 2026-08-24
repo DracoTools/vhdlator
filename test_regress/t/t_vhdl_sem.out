@@ -39,6 +39,3 @@ VHDLARCHITECTURE work.rtl
   signal count : natural
   signal flag : boolean
   shared variable total : integer
-%Error: t/t_vhdl_sem.vhd:76:19: Unsupported: VHDL reference to 'clk' cannot be lowered yet
-        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: Exiting due to
