@@ -2308,11 +2308,32 @@ private:
             return filep ? new AstFFlush{flp, filep} : nullptr;
         }
         if (name == "readline" && args.size() == 2) {
-            // "readline(f, l)" fills the line buffer from the file
+            // "readline(f, l)" fills the line buffer from the file. $fgets
+            // writes into the string it is given and returns how much it
+            // read, so the call is the statement; its result is not the line.
             AstNodeExpr* const filep = lowerExpr(args[0]);
             AstNodeExpr* const linep = lowerExpr(args[1]);
             if (!filep || !linep) return nullptr;
-            return new AstAssign{flp, linep, new AstFGetS{flp, linep->cloneTree(false), filep}};
+            AstNode* outp
+                = new AstStmtExpr{flp, new AstFGetS{flp, linep->cloneTree(false), filep}};
+            // A LINE holds the line without its end of line (16.4), which
+            // $fgets keeps
+            AstNodeExpr* const lastp
+                = new AstGetcN{flp, linep->cloneTree(false),
+                               new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                                          new AstConst{flp, AstConst::Signed32{}, 1}}};
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstIf{
+                    flp,
+                    new AstEq{flp, lastp, new AstConst{flp, AstConst::WidthedValue{}, 8, '\n'}},
+                    new AstAssign{
+                        flp, linep->cloneTree(false),
+                        new AstSubstrN{flp, linep->cloneTree(false),
+                                       new AstConst{flp, AstConst::Signed32{}, 0},
+                                       new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                                                  new AstConst{flp, AstConst::Signed32{}, 2}}}}}));
+            return outp;
         }
         if (name == "writeline" || name == "tee") {
             if (args.size() != 2) return nullptr;
@@ -2325,6 +2346,9 @@ private:
             return AstNode::addNext(
                 outp, static_cast<AstNode*>(
                           new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}}));
+        }
+        if (name == "read" || name == "hread" || name == "oread" || name == "bread") {
+            return lowerTextioRead(name, args, flp);
         }
         if (name == "deallocate" && args.size() == 1) {
             AstNodeExpr* const linep = lowerExpr(args[0]);
@@ -2355,6 +2379,163 @@ private:
         if (radix == "%h") textp = new AstToUpperN{flp, textp};
         return new AstAssign{flp, linep,
                              new AstConcatN{flp, linep->cloneTree(false), textp}};
+    }
+
+    // A variable of the lowerer's own, for holding a value across the
+    // statements one VHDL construct expands into
+    AstVar* newTempVar(const std::string& name, AstNodeDType* dtypep, FileLine* flp) {
+        AstVar* const varp = new AstVar{flp, VVarType::VAR, name + std::to_string(++m_tempNum),
+                                        VFlagChildDType{}, dtypep};
+        addStmt(varp);
+        return varp;
+    }
+    int m_tempNum = 0;
+
+    // "c == ' ' || c == HT", the test that finds the edges of an item
+    static AstNodeExpr* isBlank(AstNodeExpr* charp, FileLine* flp) {
+        // getc gives one character, so the comparisons are eight bits wide
+        return new AstLogOr{
+            flp, new AstEq{flp, charp, new AstConst{flp, AstConst::WidthedValue{}, 8, ' '}},
+            new AstEq{flp, charp->cloneTree(false),
+                      new AstConst{flp, AstConst::WidthedValue{}, 8, 9}}};
+    }
+
+    // READ and its radix forms take the leftmost item off the line and turn
+    // it into a value (16.4). A LINE is a string here, so the item is found
+    // with the string operations Verilator already has, rather than by
+    // walking a list of characters at run time as an event-driven simulator
+    // must. The line is shortened by what was read, which is what makes
+    // successive READs walk along one line.
+    AstNode* lowerTextioRead(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
+                             FileLine* flp) {
+        if (args.size() < 2 || args.size() > 3) return nullptr;
+        AstNodeExpr* const linep = lowerExpr(args[0]);
+        AstNodeExpr* const valuep = lowerExpr(args[1]);
+        if (!linep || !valuep) return nullptr;
+        VhdlType* const typep = args[1]->vhdlTypep();
+
+        // Which base the item is written in. The radix forms say so; plain
+        // READ takes its answer from the type, since a vector is written in
+        // binary and a number in decimal.
+        AstAtoN::FmtType fmt = AstAtoN::ATOI;
+        if (name == "hread") {
+            fmt = AstAtoN::ATOHEX;
+        } else if (name == "oread") {
+            fmt = AstAtoN::ATOOCT;
+        } else if (name == "bread") {
+            fmt = AstAtoN::ATOBIN;
+        } else if (isLogicish(typep) || isBitish(typep)) {
+            fmt = AstAtoN::ATOBIN;
+        } else if (typep && typep->base()->kind() == VhdlTypeKind::FLOATING) {
+            fmt = AstAtoN::ATOREAL;
+        } else if (isStringType(typep)) {
+            fmt = AstAtoN::ATOI;  // Unused: a string takes the item as it is
+        } else if (!isIntegerType(typep) && typep
+                   && typep->base()->kind() != VhdlTypeKind::PHYSICAL) {
+            unsup(flp, "READ of a " + typep->prettyName());
+            return nullptr;
+        }
+
+        AstVar* const idxp = newTempVar("__Vtxtpos", new AstBasicDType{flp, VBasicDTypeKwd::INT},
+                                        flp);
+        AstVar* const tokp = newTempVar("__Vtxtitem",
+                                        new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+
+        // Leading blanks are not part of the item (16.4)
+        AstLoop* const skipp = new AstLoop{flp};
+        skipp->addStmtsp(new AstLoopTest{
+            flp, skipp, isBlank(new AstGetcN{flp, linep->cloneTree(false),
+                                             new AstConst{flp, AstConst::Signed32{}, 0}},
+                                flp)});
+        skipp->addStmtsp(new AstAssign{
+            flp, linep->cloneTree(false),
+            new AstSubstrN{flp, linep->cloneTree(false),
+                           new AstConst{flp, AstConst::Signed32{}, 1},
+                           new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                                      new AstConst{flp, AstConst::Signed32{}, 1}}}});
+        AstNode* outp = skipp;
+
+        // The item runs to the next blank, or to the end of the line
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(
+                      new AstAssign{flp, new AstVarRef{flp, idxp, VAccess::WRITE},
+                                    new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstLoop* const scanp = new AstLoop{flp};
+        scanp->addStmtsp(new AstLoopTest{
+            flp, scanp,
+            new AstLogAnd{
+                flp,
+                new AstLtS{flp, new AstVarRef{flp, idxp, VAccess::READ},
+                           new AstLenN{flp, linep->cloneTree(false)}},
+                new AstLogNot{flp, isBlank(new AstGetcN{flp, linep->cloneTree(false),
+                                                        new AstVarRef{flp, idxp, VAccess::READ}},
+                                           flp)}}});
+        scanp->addStmtsp(new AstAssign{
+            flp, new AstVarRef{flp, idxp, VAccess::WRITE},
+            new AstAdd{flp, new AstVarRef{flp, idxp, VAccess::READ},
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(scanp));
+
+        // Split the line into the item and what is left of it
+        outp = AstNode::addNext(
+            outp,
+            static_cast<AstNode*>(new AstAssign{
+                flp, new AstVarRef{flp, tokp, VAccess::WRITE},
+                new AstSubstrN{flp, linep->cloneTree(false),
+                               new AstConst{flp, AstConst::Signed32{}, 0},
+                               new AstSub{flp, new AstVarRef{flp, idxp, VAccess::READ},
+                                          new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+        outp = AstNode::addNext(
+            outp,
+            static_cast<AstNode*>(new AstAssign{
+                flp, linep->cloneTree(false),
+                new AstSubstrN{flp, linep->cloneTree(false),
+                               new AstVarRef{flp, idxp, VAccess::READ},
+                               new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                                          new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+
+        // The value itself
+        AstNodeExpr* readp = nullptr;
+        if (isStringType(typep)) {
+            readp = new AstVarRef{flp, tokp, VAccess::READ};
+        } else {
+            readp = new AstAtoN{flp, new AstVarRef{flp, tokp, VAccess::READ}, fmt};
+            // The conversions give an integer, so a vector target is taken
+            // from its low bits rather than warned about
+            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                && typep->isConstrainedArray() && !typep->indexTypes().empty()) {
+                const int64_t bits = typep->indexTypes()[0]->length();
+                if (bits > 0 && bits <= 4096) {
+                    readp = sizedTo(readp, static_cast<int>(bits), flp);
+                }
+            }
+        }
+        outp = AstNode::addNext(outp,
+                                static_cast<AstNode*>(new AstAssign{flp, valuep, readp}));
+
+        // The GOOD form says whether there was anything to read, and does not
+        // fail when there was not (16.4)
+        if (args.size() == 3) {
+            AstNodeExpr* const goodp = lowerExpr(args[2]);
+            if (goodp) {
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(new AstAssign{
+                              flp, goodp,
+                              new AstNeq{flp, new AstVarRef{flp, idxp, VAccess::READ},
+                                         new AstConst{flp, AstConst::Signed32{}, 0}}}));
+            }
+        }
+        return outp;
+    }
+
+    // BIT and BIT_VECTOR, which textio writes and reads in binary just as it
+    // does the nine-value logic types
+    static bool isBitish(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep == V3VhdlStd::bitType()) return true;
+        return basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()
+               && basep->elementp()->base() == V3VhdlStd::bitType();
     }
 
     // FILE_OPEN in both its forms (5.5.2). The open kind decides the mode,
@@ -2475,8 +2656,38 @@ private:
             appendLiteral(format, "<?>");
             return nullptr;
         }
+        if (AstNodeExpr* const namep = enumImage(exprp, valuep->vhdlTypep(), flOf(valuep))) {
+            format += "%s";
+            return namep;
+        }
         format += formatFor(valuep->vhdlTypep());
         return exprp;
+    }
+
+    static FileLine* flOf(AstNode* nodep) { return nodep->fileline(); }
+
+    // 'IMAGE of an enumeration value is the literal's own name (16.2), not
+    // its position. The literals are known here, so the choice between them
+    // is made without a table at run time; nothing else in the design needs
+    // the names, so nothing else pays for them.
+    static AstNodeExpr* enumImage(AstNodeExpr* exprp, const VhdlType* typep, FileLine* flp) {
+        if (!typep) return nullptr;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ENUM || enumIsLogic(basep)) return nullptr;
+        const std::vector<VhdlSymbol*>& literals = basep->literals();
+        if (literals.empty() || literals.size() > 256) return nullptr;
+        AstNodeExpr* outp = new AstConst{flp, AstConst::String{}, "?"};
+        // Built from the last literal back, so the first is tested first
+        for (size_t i = literals.size(); i-- > 0;) {
+            outp = new AstCond{
+                flp,
+                new AstEq{flp, exprp->cloneTree(false),
+                          new AstConst{flp, AstConst::Unsized32{},
+                                       static_cast<uint32_t>(literals[i]->position())}},
+                new AstConst{flp, AstConst::String{}, literals[i]->name()}, outp};
+        }
+        VL_DO_DANGLING(exprp->deleteTree(), exprp);
+        return outp;
     }
 
     // Text that goes into a format string must not be read as a conversion
