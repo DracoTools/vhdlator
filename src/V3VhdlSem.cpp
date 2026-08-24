@@ -702,6 +702,10 @@ public:
                                      const std::vector<VhdlType*>& actualTypes,
                                      const std::string& name) VL_MT_DISABLED;
 
+    // Give every resolved signal's resolution function the copy that takes as
+    // many driver values as it has drivers
+    void specializeResolvers() VL_MT_DISABLED;
+
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
     // Declarations
@@ -758,6 +762,15 @@ private:
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
     void analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void analyzeDrivers(AstVhdlArchitecture* archp) VL_MT_DISABLED;
+    static bool isLogicValued(const VhdlType* typep) VL_MT_DISABLED;
+    struct NeedResolve final {
+        VhdlSymbol* symp;
+        VhdlSymbol* resolvep;
+        int count;
+        FileLine* flp;
+    };
+    std::vector<NeedResolve> m_needResolve;  // Signals awaiting a sized resolver
     static VhdlType* formalAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
@@ -1402,6 +1415,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             }
             iterateAndNextNull(archp->declsp());
             iterateAndNextNull(archp->stmtsp());
+            analyzeDrivers(archp);
         } else if (AstVhdlPackage* const pkgp = VN_CAST(unitp, VhdlPackage)) {
             iterateAndNextNull(pkgp->genericsp());
             iterateAndNextNull(pkgp->declsp());
@@ -1458,7 +1472,10 @@ class VhdlUnanalyzeVisitor final : public VNVisitor {
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
 
 public:
-    explicit VhdlUnanalyzeVisitor(AstNode* nodep) { iterateAndNextNull(nodep); }
+    // iterate, not iterateAndNext: the node given is a fresh clone with
+    // nothing behind it, and walking a list from a node that has no back is
+    // what a debug build rightly complains about
+    explicit VhdlUnanalyzeVisitor(AstNode* nodep) { iterate(nodep); }
     ~VhdlUnanalyzeVisitor() override = default;
 };
 
@@ -1616,6 +1633,136 @@ private:
     }
 };
 
+//######################################################################
+// Drivers (6.5.2, 14.7.2)
+
+// How many places drive each signal, and what resolves them where there is
+// more than one. A driver belongs to the longest static prefix of the target
+// name, so assigning one element of an array here and another there is not
+// two drivers of the array.
+namespace {
+const VhdlSymbol* driverRootSym(const AstNode* nodep) {
+    while (nodep) {
+        if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
+            if (vp->vhdlSymp()) return vp->vhdlSymp();
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            nodep = callp->prefixp();
+        } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            nodep = selp->prefixp();
+        } else {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
+                       std::set<const VhdlSymbol*>& partial, bool follow) {
+    if (!nodep) return;
+    if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
+        if (const VhdlSymbol* const symp = driverRootSym(asgp->targetp())) {
+            if (VN_IS(asgp->targetp(), VhdlName)) {
+                whole.insert(symp);
+            } else {
+                partial.insert(symp);
+            }
+        }
+    }
+    collectDrivenSyms(nodep->op1p(), whole, partial, true);
+    collectDrivenSyms(nodep->op2p(), whole, partial, true);
+    collectDrivenSyms(nodep->op3p(), whole, partial, true);
+    collectDrivenSyms(nodep->op4p(), whole, partial, true);
+    if (follow) collectDrivenSyms(nodep->nextp(), whole, partial, true);
+}
+}  // namespace
+
+// An enumeration of the nine logic values, or an array of them
+bool VhdlSemVisitor::isLogicValued(const VhdlType* typep) {
+    if (!typep) return false;
+    const VhdlType* basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
+        basep = basep->elementp()->base();
+    }
+    if (basep->kind() != VhdlTypeKind::ENUM) return false;
+    const std::vector<VhdlSymbol*>& lits = basep->literals();
+    if (lits.size() != 9) return false;
+    static const char* const NINE = "UX01ZWLH-";
+    for (size_t i = 0; i < lits.size(); ++i) {
+        const std::string& name = lits[i]->name();
+        if (name.size() != 3 || name[1] != NINE[i]) return false;
+    }
+    return true;
+}
+
+void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
+    std::map<const VhdlSymbol*, int> counts;
+    std::map<const VhdlSymbol*, FileLine*> where;
+    std::set<const VhdlSymbol*> partial;
+    for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
+        std::set<const VhdlSymbol*> whole;
+        collectDrivenSyms(p, whole, partial, false);
+        for (const VhdlSymbol* const symp : whole) {
+            ++counts[symp];
+            if (!where.count(symp)) where[symp] = p->fileline();
+        }
+    }
+    for (const auto& pair : counts) {
+        VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
+        if (partial.count(symp)) continue;  // Its elements are driven, not it
+        symp->driverCount(pair.second);
+        if (pair.second < 2) continue;
+        VhdlType* const typep = symp->typep();
+        VhdlSymbol* const resolvep = typep ? typep->resolutionp() : nullptr;
+        if (!resolvep) {
+            // The one place the language says this must be an error, and the
+            // only way a design can be told its drivers will not be combined
+            err(where[symp], "Signal '" + symp->name() + "' has "
+                                 + std::to_string(pair.second)
+                                 + " drivers, but its subtype names no resolution function");
+            continue;
+        }
+        symp->resolverp(resolvep);
+        // The nine-value logic types resolve natively, so their resolution
+        // function is never run and must not be copied per driver count
+        if (!isLogicValued(typep)) {
+            m_needResolve.push_back(NeedResolve{symp, resolvep, pair.second, where[symp]});
+        }
+    }
+}
+
+// Give each resolution function the copy that takes as many values as the
+// signal has drivers. Its parameter is an unconstrained array, so it needs
+// the same specializing a call site would have given it -- and so this runs
+// where that specializing runs, once analysis is done.
+void VhdlSemVisitor::specializeResolvers() {
+    for (const NeedResolve& need : m_needResolve) {
+        VhdlSymbol* const resolvep = need.resolvep;
+        if (resolvep->paramTypes().size() != 1) continue;
+        VhdlType* const paramp = resolvep->paramTypes()[0];
+        if (!paramp || paramp->base()->kind() != VhdlTypeKind::ARRAY) continue;
+        if (paramp->isConstrainedArray()) continue;  // Already a fixed size
+        AstVhdlSubprogDecl* const bodyp = resolvep->bodyp();
+        VhdlScope* const regionp = resolvep->innerp() ? resolvep->innerp()->parentp() : nullptr;
+        if (!bodyp || !regionp) continue;  // Predefined, as ieee's own is
+        if (!bodyp->backp()) continue;  // Not in the tree, so nothing to copy beside
+        // The drivers as an array indexed from zero
+        VhdlType* const argp = cloneSubtype(paramp->base(), need.flp);
+        VhdlType* const idxp = VhdlSymTab::newType(VhdlTypeKind::INTEGER, "", need.flp);
+        idxp->base(V3VhdlStd::integerType()->base());
+        idxp->setBounds(0, need.count - 1, true);
+        argp->clearIndexTypes();
+        argp->addIndexType(idxp);
+        argp->unconstrained(false);
+        const std::string name
+            = resolvep->name() + "__V" + std::to_string(need.count) + "drv";
+        std::vector<VhdlType*> actualTypes{argp};
+        if (VhdlSymbol* const newp
+            = specializeSubprogram(bodyp, regionp, actualTypes, name)) {
+            need.symp->resolverp(newp);
+        }
+    }
+}
+
 bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     V3VhdlStd::build();
     VhdlSemVisitor visitor;
@@ -1628,6 +1775,10 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     for (int round = 0; round < 20; ++round) {
         if (!specializer.pass(unitsp)) break;
     }
+    // A resolution function is called once per resolved signal rather than
+    // from anywhere in the source, so its copy is made here rather than by
+    // the pass above
+    visitor.specializeResolvers();
     return !visitor.errored();
 }
 

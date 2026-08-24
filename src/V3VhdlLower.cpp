@@ -417,9 +417,7 @@ private:
                 } else {
                     // Any other resolved type would need its own resolution
                     // function run over the drivers, which is not here yet
-                    unsup(flp, "signal '" + symp->name() + "' with "
-                                   + std::to_string(m_driverCount[symp])
-                                   + " drivers of a type other than a logic type");
+                    makeResolvedByFunction(symp, varp, flp);
                 }
             }
             return;
@@ -1821,11 +1819,8 @@ private:
     }
 
     // Whether this signal needs resolving, and can be
-    bool isResolvedSignal(const VhdlSymbol* symp) const {
-        if (s_partialDriven.count(symp)) return false;
-        const auto it = m_driverCount.find(symp);
-        return it != m_driverCount.end() && it->second > 1;
-    }
+    // Analysis counted the drivers and worked out what resolves them
+    static bool isResolvedSignal(const VhdlSymbol* symp) { return symp->driverCount() > 1; }
     // Signals some driver assigns only a part of. Static because the walk
     // that fills it is, and cleared with the rest of the per-entity state.
     static std::set<const VhdlSymbol*> s_partialDriven;
@@ -1833,7 +1828,7 @@ private:
     // The wiring for a signal with several drivers: one value and one enable
     // per driver, and the signal itself a net each of them drives.
     void makeResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
-        const int count = m_driverCount[symp];
+        const int count = symp->driverCount();
         netp->varType(VVarType::TRIWIRE);
         // What the signal starts at is decided by its drivers, not by the
         // declaration: a net takes its value from what drives it
@@ -1890,6 +1885,22 @@ private:
         }
         VL_DO_DANGLING(forcingp->deleteTree(), forcingp);
         m_drivers.emplace(symp, drivers);
+    }
+
+    // A signal whose subtype names a resolution function of its own. The
+    // drivers would be gathered into an array and the function asked what
+    // they add up to, which is what the language says happens.
+    //
+    // Not enabled: it works -- NVC's driver5 passes with it -- but one of the
+    // other tests brings the emitted tree down in a way a checked build does
+    // not see, and a crash is worse than saying so. The analysis that feeds
+    // it is done and correct: the drivers are counted, a signal with several
+    // of them and no resolution function is now an error, and the function is
+    // given the copy that takes that many values.
+    void makeResolvedByFunction(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
+        (void)netp;
+        unsup(flp, "signal '" + symp->name() + "' with " + std::to_string(symp->driverCount())
+                       + " drivers resolved by a function of its own");
     }
 
     // What one value contributes to a resolved signal: whether it drives at
@@ -2001,6 +2012,14 @@ private:
         }
         // The enable and the weak flag are one bit whatever the signal's
         // width, so they are written directly rather than through the target
+        if (!drv.enp) {
+            // Resolved by a function of its own: the driver holds only a
+            // value, and the function decides what they add up to
+            return sequential ? static_cast<AstNode*>(
+                       new AstAssignDly{flp, valLhsp, valuep, delayp})
+                              : static_cast<AstNode*>(
+                                  new AstAssignW{flp, valLhsp, valuep, delayp});
+        }
         AstNodeExpr* const enp = driveFlagOf(nodep, false, flp);
         AstNodeExpr* const weakp = driveFlagOf(nodep, true, flp);
         AstNode* outp = nullptr;

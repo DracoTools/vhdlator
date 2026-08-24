@@ -40,3 +40,5 @@ VHDLENTITY work.t_vhdl_static
 VHDLARCHITECTURE work.rtl
   signal s : state_t
   signal v : byte_vec_t
+  signal v2 : byte_vec_t
+  signal v3 : byte_vec_t

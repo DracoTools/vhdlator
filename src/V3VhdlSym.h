@@ -112,6 +112,11 @@ class VhdlSymbol final {
     // instead of having a body here. The string says which, and which ABI.
     std::string m_foreignName;
     bool m_foreignDpi = false;  // Bound with the DPI-C ABI, not VHPIDIRECT
+    // A signal driven from more than one place is resolved (6.5.2). Analysis
+    // counts the drivers and, where the subtype names a resolution function,
+    // gives it the copy that takes that many values.
+    int m_driverCount = 0;
+    VhdlSymbol* m_resolverp = nullptr;
     AstVhdlSubprogDecl* m_bodyp = nullptr;  // A subprogram's body, for copying
 
     VL_UNCOPYABLE(VhdlSymbol);
@@ -143,6 +148,11 @@ public:
 
     AstVhdlSubprogDecl* bodyp() const { return m_bodyp; }
     void bodyp(AstVhdlSubprogDecl* nodep) { m_bodyp = nodep; }
+
+    int driverCount() const { return m_driverCount; }
+    void driverCount(int n) { m_driverCount = n; }
+    VhdlSymbol* resolverp() const { return m_resolverp; }
+    void resolverp(VhdlSymbol* symp) { m_resolverp = symp; }
 
     const std::string& foreignName() const { return m_foreignName; }
     void foreignName(const std::string& name) { m_foreignName = name; }

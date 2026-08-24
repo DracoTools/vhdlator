@@ -57,13 +57,17 @@ end entity;
 
 architecture rtl of t_vhdl_static is
   use work.p.all;
+  -- One signal per assignment: a signal of an unresolved type may have only
+  -- one driver (6.5.2), and each of these is a driver
   signal v : byte_vec_t;
+  signal v2 : byte_vec_t;
+  signal v3 : byte_vec_t;
   signal s : state_t;
 begin
   -- Aggregates whose choices must cover the target exactly
   v <= (others => '0');
-  v <= "10101010";
-  v <= (7 downto 4 => '1', 3 downto 0 => '0');
+  v2 <= "10101010";
+  v3 <= (7 downto 4 => '1', 3 downto 0 => '0');
 
   process is
     variable i : small_t;
