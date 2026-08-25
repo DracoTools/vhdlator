@@ -1114,6 +1114,21 @@ private:
             unsup(flp, "reference to '" + name + "'");
             return nullptr;
         }
+        // An alias is another name for what it denotes (6.6), so it lowers to
+        // that. An alias that renumbers an array -- "alias b : bit_vector(3
+        // downto 0) is v(7 downto 4)" -- would need its indices translated,
+        // which is not done here.
+        if (symp->kind() == VhdlSymKind::ALIAS) {
+            AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+            if (declp && declp->targetp()) {
+                if (!aliasKeepsRange(symp, declp)) {
+                    unsup(flp, "alias '" + name + "' with an index range of its own");
+                    return nullptr;
+                }
+                return lowerExpr(declp->targetp());
+            }
+            if (symp->aliasp()) return lowerRef(symp->aliasp(), name, flp);
+        }
         const auto it = m_vars.find(symp);
         if (it != m_vars.end()) {
             return new AstVarRef{flp, it->second, VAccess::READ};
@@ -1196,6 +1211,17 @@ private:
         }
         newp->addArgsp(new AstArg{flp, "", valuep});
         return newp;
+    }
+
+    // Whether an alias indexes the same way what it denotes does
+    static bool aliasKeepsRange(const VhdlSymbol* symp, const AstVhdlAliasDecl* declp) {
+        const VhdlType* const atp = symp->typep();
+        if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY) return true;
+        if (!atp->isConstrainedArray() || atp->dimensions() != 1) return true;
+        const VhdlType* const ttp = declp->targetp()->vhdlTypep();
+        if (!ttp || !ttp->isConstrainedArray() || ttp->dimensions() != 1) return true;
+        return atp->indexTypes()[0]->left() == ttp->indexTypes()[0]->left()
+               && atp->indexTypes()[0]->right() == ttp->indexTypes()[0]->right();
     }
 
     AstNodeExpr* lowerSelected(AstVhdlSelected* nodep) {
@@ -2137,20 +2163,25 @@ private:
         if (AstVhdlAssert* const assertp = VN_CAST(nodep, VhdlAssert)) {
             // A concurrent assertion is a process that runs when its
             // expression changes (11.5)
-            AstNode* const bodyp = lowerAssert(assertp);
-            addStmt(new AstAlways{
-                flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
-                bodyp});
+            addStmt(concurrentProcess(lowerAssert(assertp), assertp->postponed(), flp));
             return;
         }
         if (AstVhdlProcCall* const callp = VN_CAST(nodep, VhdlProcCall)) {
-            AstNode* const bodyp = lowerStmt(callp);
-            addStmt(new AstAlways{
-                flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
-                bodyp});
+            addStmt(concurrentProcess(lowerStmt(callp), callp->postponed(), flp));
             return;
         }
         unsup(flp, std::string{"concurrent statement "} + nodep->typeName());
+    }
+
+    // The process a concurrent statement is. A postponed one runs only once
+    // the signals have settled for that time step, after the last delta
+    // cycle (11.3), which is what Verilator's postponed region is -- so a
+    // postponed assertion sees the values the step ended with, not the ones
+    // it passed through.
+    AstNode* concurrentProcess(AstNode* bodyp, bool postponed, FileLine* flp) {
+        if (postponed) return new AstAlwaysPostponed{flp, bodyp};
+        return new AstAlways{flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
+                             bodyp};
     }
 
     // A block may give itself generics and ports (11.2). It is not a module
@@ -3670,6 +3701,28 @@ private:
     // A wait statement suspends the process until something happens (10.2).
     // Each of its three clauses has a direct equivalent, and the combination
     // "until C" already implies waiting for the signals C reads.
+    // A delta cycle: the process schedules a change of its own and waits for
+    // it. The change is a non-blocking assignment, so it lands with all the
+    // others, and the process resumes after they have -- which is what a
+    // delta cycle is, and what "wait for 0 ns" waits for.
+    AstNode* deltaWait(FileLine* flp) {
+        if (!m_deltaVarp) {
+            m_deltaVarp = new AstVar{flp, VVarType::VAR, "__Vdelta", VFlagChildDType{},
+                                     newLogicDType(flp, 1)};
+            m_deltaVarp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            m_stmtsp = AstNode::addNextNull(m_stmtsp, m_deltaVarp);
+        }
+        AstNode* const outp = new AstAssignDly{
+            flp, new AstVarRef{flp, m_deltaVarp, VAccess::WRITE},
+            new AstNot{flp, new AstVarRef{flp, m_deltaVarp, VAccess::READ}}};
+        AstSenTree* const senp = new AstSenTree{
+            flp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE,
+                                new AstVarRef{flp, m_deltaVarp, VAccess::READ}}};
+        return AstNode::addNext(outp,
+                                static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
+    }
+    AstVar* m_deltaVarp = nullptr;  // The module's delta-cycle signal, if used
+
     AstNode* lowerWait(AstVhdlWait* nodep) {
         FileLine* const flp = nodep->fileline();
         if (!v3Global.opt.timing().isTrue()) {
@@ -3697,7 +3750,25 @@ private:
         }
         if (nodep->timeoutp()) {
             AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
-            return timep ? new AstDelay{flp, timep, false} : nullptr;
+            if (!timep) return nullptr;
+            // "wait for 0 ns" does not stand still: it resumes in the next
+            // delta cycle, after the signal assignments already made have
+            // taken effect (10.2, 14.7.5). Verilog's "#0" is not that -- it
+            // resumes before the non-blocking region, so the process would
+            // read the values it was waiting to see change.
+            if (const AstConst* const constp = VN_CAST(timep, Const)) {
+                if (constp->isZero()) {
+                    VL_DO_DANGLING(timep->deleteTree(), timep);
+                    return deltaWait(flp);
+                }
+                return new AstDelay{flp, timep, false};
+            }
+            // Not known here, so decide at run time
+            AstNodeExpr* const isZerop
+                = new AstEq{flp, timep->cloneTree(false),
+                            new AstConst{flp, AstConst::Unsized64{}, 0}};
+            return new AstIf{flp, isZerop, deltaWait(flp),
+                             new AstDelay{flp, timep, false}};
         }
         if (nodep->sensp()) {
             AstSenTree* const sensp = sensitivityOf(nodep->sensp(), flp);
@@ -4432,6 +4503,7 @@ private:
         m_stmtsp = nullptr;
         m_modp->addStmtsp(m_shadowsp);
         m_shadowsp = nullptr;
+        m_deltaVarp = nullptr;
         m_shadows.clear();
         m_netlistp->addModulesp(m_modp);
         m_modp = nullptr;
