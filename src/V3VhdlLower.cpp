@@ -1075,8 +1075,7 @@ private:
                         flp, new AstVarRef{flp, sh.transp, VAccess::WRITE},
                         new AstNot{flp, new AstVarRef{flp, sh.transp, VAccess::READ}}}));
         AstSenTree* const senp = new AstSenTree{
-            flp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE,
-                                new AstVarRef{flp, sigp, VAccess::READ}}};
+            flp, senItemFor(new AstVarRef{flp, sigp, VAccess::READ}, isOneBitVar(sigp), flp)};
         AstAlways* const alwaysp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp};
         m_shadowsp = AstNode::addNextNull(m_shadowsp, static_cast<AstNode*>(alwaysp));
         return &m_shadows.emplace(symp, sh).first->second;
@@ -1816,6 +1815,10 @@ private:
         AstNodeExpr* const firstp = lowerExpr(args[0]);
         if (!firstp) return nullptr;
 
+        if (name == "endfile" && args.size() == 1) {
+            AstNodeExpr* const filep = lowerExpr(args[0]);
+            return filep ? new AstFEof{flp, filep} : nullptr;
+        }
         if (name == "to_integer") {
             // The operand's bits, read with its own signedness ...
             AstNodeExpr* const valuep
@@ -2362,10 +2365,29 @@ private:
         } else {
             sentreep = sensitivity(nodep);
             bodyp = lowerStmts(nodep->stmtsp());
-            // The same rule for a process that is not clocked: it runs once
-            // at the start, whatever its sensitivity list says
-            if (bodyp && nodep->hasSensList() && !nodep->sensAll() && nodep->sensp()) {
+            // Every VHDL process runs once when the simulation starts, before
+            // any signal has changed (11.3). Saying so in the sensitivity
+            // itself, rather than emitting the body a second time, is what
+            // keeps it to exactly one run: a change item may fire at time
+            // zero of its own accord, when the signal starts at a value the
+            // trigger's record of it does not.
+            if (sentreep && nodep->hasSensList() && !nodep->sensAll() && nodep->sensp()) {
                 allowInitialDriver(nodep->stmtsp(), false);
+                if (v3Global.opt.timing().isTrue()) {
+                    // A process with a sensitivity list is the same as one
+                    // with "wait on <list>" as its last statement (11.3): it
+                    // runs once when the simulation starts and then waits.
+                    // Written out that way it runs exactly once at time zero,
+                    // where an "always" with the same sensitivity may or may
+                    // not fire there depending on what the signals start at.
+                    bodyp = AstNode::addNextNull(
+                        bodyp, static_cast<AstNode*>(
+                                   new AstEventControl{flp, sentreep, nullptr}));
+                    addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, bodyp});
+                    return;
+                }
+                // Without --timing there is nothing to suspend on, so the
+                // body is emitted a second time to start it
                 addStmt(new AstInitial{flp, lowerStmts(nodep->stmtsp())});
             }
         }
@@ -2469,16 +2491,18 @@ private:
         if (nodep->sensAll() || !nodep->sensp()) {
             return new AstSenTree{flp, comboSenItem(flp)};
         }
-        // VHDL runs the process when any listed signal changes, which is what
-        // an any-edge sensitivity item means. Keeping the written list rather
+        // VHDL runs the process when any listed signal *changes* -- not on an
+        // edge of its least significant bit, which is what an edge item means
+        // for a vector. Keeping the written list rather
         // than substituting "all" preserves the semantics of an incomplete
         // one, deliberate or not.
         AstSenItem* itemsp = nullptr;
         for (AstNode* p = nodep->sensp(); p; p = p->nextp()) {
-            AstNodeExpr* const sensp = lowerExpr(VN_AS(p, NodeVhdlExpr));
+            AstNodeVhdlExpr* const namep = VN_AS(p, NodeVhdlExpr);
+            AstNodeExpr* const sensp = lowerExpr(namep);
             if (!sensp) continue;
             itemsp = AstNode::addNext(
-                itemsp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE, sensp});
+                itemsp, senItemFor(sensp, isOneBitType(typeOfExpr(namep)), flp));
         }
         if (!itemsp) return new AstSenTree{flp, comboSenItem(flp)};
         return new AstSenTree{flp, itemsp};
@@ -3089,6 +3113,7 @@ private:
         }
         if (!specp->entityClass().empty()) m_bindings[specp->entityClass()] = entity;
     }
+    std::map<std::string, std::string> m_archOf;  // "lib.entity" -> architecture built
     std::map<std::string, std::string> m_bindings;  // Component -> entity
     std::map<std::string, std::string> m_instanceBindings;  // Label -> entity
 
@@ -3097,7 +3122,21 @@ private:
     void lowerInstance(AstVhdlInstance* nodep) {
         FileLine* const flp = nodep->fileline();
         std::vector<std::string> parts;
-        if (!flattenName(nodep->unitp(), parts) || parts.empty()) {
+        // "entity work.reg4(behav)" names the architecture as well (7.3.2),
+        // which the parser could not tell from a call
+        AstNodeVhdlExpr* unitp = nodep->unitp();
+        std::string archName;
+        if (AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) {
+            if (AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc)) {
+                std::vector<std::string> archParts;
+                if (!asp->nextp() && asp->actualp()
+                    && flattenName(asp->actualp(), archParts) && !archParts.empty()) {
+                    archName = archParts.back();
+                }
+            }
+            unitp = callp->prefixp();
+        }
+        if (!flattenName(unitp, parts) || parts.empty()) {
             unsup(flp, "instantiated unit name");
             return;
         }
@@ -3111,6 +3150,17 @@ private:
         } else {
             const auto compIt = m_bindings.find(modName);
             if (compIt != m_bindings.end()) modName = compIt->second;
+        }
+        // Only one architecture of an entity is built, so naming a different
+        // one for this instance would need a module of its own
+        if (!archName.empty()) {
+            const std::string libname = m_modp ? m_modp->libname() : "work";
+            const auto archIt = m_archOf.find(libname + "." + modName);
+            if (archIt != m_archOf.end() && archIt->second != archName) {
+                unsup(flp, "instance of architecture '" + archName + "' where '"
+                               + archIt->second + "' is the one built");
+                return;
+            }
         }
         AstPin* pinsp = nullptr;
         int pinNum = 0;
@@ -3757,14 +3807,40 @@ private:
         return new AstStmtExpr{flp, refp};
     }
 
+    // How a sensitivity item watches one expression. VHDL means "whenever
+    // this changes". For a single bit that is an edge either way, which is
+    // exact even for a bit taken out of a vector; for anything wider it has
+    // to be a change, since an edge item would only ever look at the least
+    // significant bit.
+    static AstSenItem* senItemFor(AstNodeExpr* exprp, bool oneBit, FileLine* flp) {
+        return new AstSenItem{flp, oneBit ? VEdgeType::ET_BOTHEDGE : VEdgeType::ET_CHANGED,
+                              exprp};
+    }
+
+    // Whether a VHDL type is one bit once lowered: BIT, BOOLEAN, STD_ULOGIC
+    // and anything else declared the same way
+    static bool isOneBitType(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ENUM) return false;
+        return enumIsLogic(basep) || bitsFor(basep->literals().size()) == 1;
+    }
+
+    // Whether a variable is one bit wide, as its emitted type says
+    static bool isOneBitVar(const AstVar* varp) {
+        const AstBasicDType* const dtypep = VN_CAST(varp->childDTypep(), BasicDType);
+        return dtypep && dtypep->width() == 1;
+    }
+
     // The sensitivity a list of signal names gives
     AstSenTree* sensitivityOf(AstNode* sensp, FileLine* flp) {
         AstSenItem* itemsp = nullptr;
         for (AstNode* p = sensp; p; p = p->nextp()) {
-            AstNodeExpr* const exprp = lowerExpr(VN_AS(p, NodeVhdlExpr));
+            AstNodeVhdlExpr* const namep = VN_AS(p, NodeVhdlExpr);
+            AstNodeExpr* const exprp = lowerExpr(namep);
             if (!exprp) continue;
-            itemsp
-                = AstNode::addNext(itemsp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE, exprp});
+            itemsp = AstNode::addNext(
+                itemsp, senItemFor(exprp, isOneBitType(typeOfExpr(namep)), flp));
         }
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
@@ -3777,8 +3853,8 @@ private:
         AstSenItem* itemsp = nullptr;
         for (AstVar* const varp : varps) {
             itemsp = AstNode::addNext(
-                itemsp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE,
-                                       new AstVarRef{flp, varp, VAccess::READ}});
+                itemsp,
+                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
         }
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
@@ -3814,8 +3890,7 @@ private:
             flp, new AstVarRef{flp, m_deltaVarp, VAccess::WRITE},
             new AstNot{flp, new AstVarRef{flp, m_deltaVarp, VAccess::READ}}};
         AstSenTree* const senp = new AstSenTree{
-            flp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE,
-                                new AstVarRef{flp, m_deltaVarp, VAccess::READ}}};
+            flp, senItemFor(new AstVarRef{flp, m_deltaVarp, VAccess::READ}, true, flp)};
         return AstNode::addNext(outp,
                                 static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
     }
@@ -4666,6 +4741,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             const auto archIt = archs.find(key);
             if (archIt != archs.end()) archp = archIt->second;
         }
+        if (archp) m_archOf[key] = archp->name();
         lowerEntity(entities[key], archp);
     }
 }

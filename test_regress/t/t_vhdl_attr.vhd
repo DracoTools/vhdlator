@@ -17,6 +17,11 @@ end entity;
 
 architecture tb of t_vhdl_attr is
   signal s : std_logic := '0';
+  -- A vector and an integer, to show that sensitivity means "changes",
+  -- not "an edge of the least significant bit"
+  signal v : std_logic_vector(3 downto 0) := "0000";
+  signal n : integer := 0;
+  signal vseen, nseen : integer := 0;
   signal seen : integer := 0;
   signal texts : string(1 to 40) := (others => ' ');
 begin
@@ -29,10 +34,18 @@ begin
     end if;
   end process;
 
+  wide : process (v, n)
+  begin
+    vseen <= vseen + 1;
+    nseen <= nseen + 1;
+  end process;
+
   driver : process
   begin
     wait for 10 ns;
     s <= '1';
+    v <= "0010";   -- bit 1, not bit 0
+    n <= 2;        -- bit 1, not bit 0
     wait for 10 ns;
     s <= '0';
     wait;
@@ -52,6 +65,9 @@ begin
     assert s'last_event = 5 ns
       report "last_event " & time'image(s'last_event) severity failure;
     assert seen = 1 report "seen " & integer'image(seen) severity failure;
+    -- One run at the start, and one for the change, which is not on bit 0
+    assert vseen = 2 report "vseen " & integer'image(vseen) severity failure;
+    assert nseen = 2 report "nseen " & integer'image(nseen) severity failure;
 
     wait for 10 ns;
     assert s = '0' report "s later" severity failure;
