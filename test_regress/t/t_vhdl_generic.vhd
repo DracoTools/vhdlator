@@ -19,7 +19,9 @@ entity t_vhdl_generic is
         rb : out std_logic_vector(15 downto 0);
         pa : out std_logic;
         pb : out std_logic;
-        sa : out std_logic_vector(7 downto 0));
+        sa : out std_logic_vector(7 downto 0);
+        o4 : out std_logic_vector(3 downto 0);
+        o6 : out std_logic_vector(5 downto 0));
 end entity;
 
 architecture rtl of t_vhdl_generic is
@@ -51,10 +53,23 @@ architecture rtl of t_vhdl_generic is
     return v and m;
   end function;
 
+  -- A result whose length depends on what the call passes, not on the type
+  -- of what it passes: the copy is made for the value as well
+  function ones (n : natural) return std_logic_vector is
+    variable r : std_logic_vector(1 to n);
+  begin
+    for i in r'range loop
+      r(i) := '1';
+    end loop;
+    return r;
+  end function;
+
 begin
   ra <= reverse(a);
   rb <= reverse(b);
   pa <= parity(a);
   pb <= parity(b);
   sa <= mask(a, a);
+  o4 <= ones(4);
+  o6 <= ones(6);
 end architecture;

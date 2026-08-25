@@ -4105,6 +4105,15 @@ private:
                 return;
             }
         }
+        // The same where only the *result* has no length of its own: the
+        // copies made for the call sites carry the lengths their bodies build
+        if (nodep->isFunction()) {
+            const VhdlType* const retp = returnType(nodep, symp);
+            if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
+                && !retp->isConstrainedArray()) {
+                return;
+            }
+        }
         // An overloaded name needs a distinct one in the emitted code
         const std::string name = uniqueName(symp);
         AstNodeFTask* ftaskp = nullptr;

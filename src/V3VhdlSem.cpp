@@ -75,6 +75,8 @@ class VhdlSemVisitor final : public VNVisitor {
     std::map<std::string, AstNodeVhdlUnit*> m_primaryUnits;  // "lib.unit" -> the unit
     std::string m_libname;  // Library of the unit being analyzed
     VhdlType* m_returnTypep = nullptr;  // Result type of the enclosing function
+    // Values a call site fixed, for the copy of a subprogram being made now
+    std::vector<VhdlValue> m_specValues;
     // A package body continues the package declaration's declarative region
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
@@ -862,6 +864,11 @@ public:
     // analyze it as if it had been written that way (see specialize())
     VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
                                      const std::vector<VhdlType*>& actualTypes,
+                                     const std::vector<VhdlValue>& actualValues,
+                                     const std::string& name) VL_MT_DISABLED;
+    void findReturnedType(AstNode* stmtsp, VhdlType*& foundp) VL_MT_DISABLED;
+    VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
+                                     const std::vector<VhdlType*>& actualTypes,
                                      const std::string& name) VL_MT_DISABLED;
 
     // Give every resolved signal's resolution function the copy that takes as
@@ -1150,7 +1157,12 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
     // named in the enclosing one, so resolve them before pushing
     VhdlScope* const outerp = m_scopep;
     VhdlScope* const innerp = pushScope(nodep->name());
-    for (AstNode* paramp = nodep->paramsp(); paramp; paramp = paramp->nextp()) {
+    // A copy made for one call site may have been given the values that call
+    // site passes, so that lengths depending on them fold (see specialize())
+    std::vector<VhdlValue> specValues;
+    specValues.swap(m_specValues);
+    size_t paramNum = 0;
+    for (AstNode* paramp = nodep->paramsp(); paramp; paramp = paramp->nextp(), ++paramNum) {
         AstVhdlIfaceDecl* const ifp = VN_AS(paramp, VhdlIfaceDecl);
         m_scopep = outerp;
         VhdlType* const typep = resolveSubtype(ifp->subtypep());
@@ -1159,6 +1171,12 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             ifp->kind() == VhdlIfaceKind::SIGNAL ? VhdlSymKind::SIGNAL : VhdlSymKind::PARAMETER,
             ifp->name(), ifp);
         psymp->typep(typep);
+        // Only a constant read into the subprogram may be folded: one the
+        // body may write is not the same value throughout (4.2.2.1)
+        if (paramNum < specValues.size() && specValues[paramNum].known()
+            && ifp->kind() == VhdlIfaceKind::CONSTANT && ifp->mode() == VhdlMode::IN) {
+            psymp->value(specValues[paramNum]);
+        }
         ifp->vhdlSymp(psymp);
         symp->addParam(ifp->name(), typep, ifp->defaultp() != nullptr);
         declare(psymp, ifp->fileline());
@@ -1697,6 +1715,14 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
                                                  VhdlScope* regionp,
                                                  const std::vector<VhdlType*>& actualTypes,
                                                  const std::string& name) {
+    return specializeSubprogram(originalp, regionp, actualTypes, std::vector<VhdlValue>{}, name);
+}
+
+VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
+                                                 VhdlScope* regionp,
+                                                 const std::vector<VhdlType*>& actualTypes,
+                                                 const std::vector<VhdlValue>& actualValues,
+                                                 const std::string& name) {
     AstVhdlSubprogDecl* const copyp = originalp->cloneTree(false);
     copyp->name(name);
     VhdlUnanalyzeVisitor{copyp};
@@ -1721,12 +1747,67 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     VhdlType* const savedReturnp = m_returnTypep;
     m_scopep = regionp;
     m_returnTypep = nullptr;
+    m_specValues = actualValues;
     iterate(copyp);
+    m_specValues.clear();
     m_scopep = savedp;
     m_returnTypep = savedReturnp;
+    // Now that the body has been analyzed with the lengths this call site
+    // supplies, the result has one too -- so the copy is an ordinary
+    // subprogram, and nothing tries to specialize it again
+    VhdlSymbol* const newSymp = copyp->vhdlSymp();
+    if (newSymp && newSymp->returnTypep()
+        && newSymp->returnTypep()->base()->kind() == VhdlTypeKind::ARRAY
+        && !newSymp->returnTypep()->isConstrainedArray()) {
+        VhdlType* foundp = nullptr;
+        findReturnedType(copyp->stmtsp(), foundp);
+        if (!foundp) {
+            // "return v and m" gives a result as long as its operands, so a
+            // parameter of the same type says how long that is
+            for (VhdlType* const typep : newSymp->paramTypes()) {
+                if (typep && typep->base() == newSymp->returnTypep()->base()
+                    && typep->isConstrainedArray()) {
+                    foundp = typep;
+                    break;
+                }
+            }
+        }
+        if (foundp) newSymp->returnTypep(foundp);
+    }
     // The copy belongs beside the original, so lowering finds it
     originalp->addNextHere(copyp);
-    return copyp->vhdlSymp();
+    return newSymp;
+}
+
+// The type of the first return statement that has a length of its own
+void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp) {
+    for (AstNode* p = stmtsp; p && !foundp; p = p->nextp()) {
+        if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+            if (retp->valuep() && retp->valuep()->vhdlTypep()) {
+                // The returned value may constrain itself, as an aggregate
+                // written with its own range does (9.3.3.3)
+                VhdlType* const typep = constrainFromValue(
+                    retp->valuep()->vhdlTypep(), retp->valuep(), retp->fileline());
+                if (typep && typep->isConstrainedArray()) foundp = typep;
+            }
+            continue;
+        }
+        if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
+            for (AstNode* ap = ifp->altsp(); ap && !foundp; ap = ap->nextp()) {
+                findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp);
+            }
+            continue;
+        }
+        if (AstVhdlCase* const casep = VN_CAST(p, VhdlCase)) {
+            for (AstNode* ap = casep->altsp(); ap && !foundp; ap = ap->nextp()) {
+                findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp);
+            }
+            continue;
+        }
+        if (AstVhdlLoop* const loopp = VN_CAST(p, VhdlLoop)) {
+            findReturnedType(loopp->stmtsp(), foundp);
+        }
+    }
 }
 
 //######################################################################
@@ -1753,6 +1834,7 @@ class VhdlSpecVisitor final : public VNVisitor {
     VhdlSemVisitor& m_sem;
     // Subprogram and actual types -> the copy made for them
     std::map<std::string, VhdlSymbol*> m_specializations;
+    std::set<const VhdlSymbol*> m_madeSyms;  // Copies, which are never copied again
     int m_count = 0;
     bool m_madeOne = false;
 
@@ -1799,17 +1881,35 @@ private:
                 return true;
             }
         }
-        return false;
+        return resultIsUnconstrained(symp);
+    }
+
+    // A function whose result has no length of its own gets that length from
+    // what its body builds, which may depend on what the call passes -- so
+    // the copy is made for the values as well as for the types
+    static bool resultIsUnconstrained(const VhdlSymbol* symp) {
+        const VhdlType* const retp = symp->returnTypep();
+        return retp && retp->base()->kind() == VhdlTypeKind::ARRAY
+               && !retp->isConstrainedArray();
     }
 
     void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
         if (!needsSpecializing(symp)) return;
+        // A copy is never itself specialized: it was made for one call site
+        // and has nothing left to fix
+        if (m_madeSyms.count(symp)) return;
+        const bool byValue = resultIsUnconstrained(symp);
         // The actual types, which must all be known for the copy to be made
         std::vector<VhdlType*> actualTypes;
+        std::vector<VhdlValue> actualValues;
         size_t i = 0;
         for (AstNode* p = argsp; p; p = p->nextp(), ++i) {
             AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
             if (!asp || !asp->actualp() || i >= symp->paramTypes().size()) return;
+            if (byValue) {
+                const VhdlValue val = V3VhdlEval::eval(asp->actualp());
+                actualValues.push_back(val.isInt() ? val : VhdlValue{});
+            }
             VhdlType* typep = asp->actualp()->vhdlTypep();
             // Only a length that is known is worth specializing on
             if (symp->paramTypes()[i]
@@ -1824,10 +1924,28 @@ private:
             actualTypes.push_back(typep);
         }
         if (actualTypes.size() != symp->paramTypes().size()) return;
+        // Nothing to specialize on: no parameter has a length to fix, and no
+        // value the call passes is known, so the copy would be the original
+        if (byValue) {
+            bool worthIt = false;
+            for (const VhdlValue& val : actualValues) {
+                if (val.known()) worthIt = true;
+            }
+            for (const VhdlType* const typep : symp->paramTypes()) {
+                if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                    && !typep->isConstrainedArray()) {
+                    worthIt = true;
+                }
+            }
+            if (!worthIt) return;
+        }
 
         std::string key = symp->name();
         for (const VhdlType* const typep : actualTypes) {
             key += "|" + std::to_string(reinterpret_cast<uintptr_t>(typep));
+        }
+        for (const VhdlValue& val : actualValues) {
+            key += val.isInt() ? ("=" + std::to_string(val.toInt())) : "=?";
         }
         const auto it = m_specializations.find(key);
         if (it != m_specializations.end()) {
@@ -1837,10 +1955,15 @@ private:
         AstVhdlSubprogDecl* const bodyp = symp->bodyp();
         VhdlScope* const regionp = symp->innerp() ? symp->innerp()->parentp() : nullptr;
         if (!bodyp || !regionp) return;
+        // A copy per call site is bounded by the source; a copy per *value*
+        // could not be, if a recursive call kept folding to a new one
+        if (m_count > 4096) return;
         const std::string name = symp->name() + "__V" + std::to_string(++m_count);
-        VhdlSymbol* const newp = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, name);
+        VhdlSymbol* const newp
+            = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, actualValues, name);
         m_specializations.emplace(key, newp);
         if (newp) {
+            m_madeSyms.insert(newp);
             nodep->vhdlSymp(newp);
             m_madeOne = true;
         }
@@ -3059,6 +3182,10 @@ int64_t VhdlSemVisitor::staticLength(AstNodeVhdlExpr* nodep) {
     if (!nodep) return -1;
     if (AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate)) {
         return aggregateLength(aggp);
+    }
+    // "t'(...)" states a type, and the value inside is what has the length
+    if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
+        return staticLength(qp->valuep());
     }
     const VhdlValue val = V3VhdlEval::eval(nodep);
     if (val.isStr()) return static_cast<int64_t>(val.toStr().size());

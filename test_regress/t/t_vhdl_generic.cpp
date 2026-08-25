@@ -50,6 +50,12 @@ int main(int argc, char** argv) {
             printf("%%Error: mask is 0x%02x, expected 0x%02x\n", (unsigned)topp->sa, a & 0xffu);
             ++errors;
         }
+        // A result whose length came from the value the call passes
+        if (topp->o4 != 0xfu || topp->o6 != 0x3fu) {
+            printf("%%Error: ones is 0x%x and 0x%x, expected 0xf and 0x3f\n", (unsigned)topp->o4,
+                   (unsigned)topp->o6);
+            ++errors;
+        }
     }
 
     topp->final();

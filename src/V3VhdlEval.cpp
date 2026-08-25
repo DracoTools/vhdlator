@@ -200,6 +200,10 @@ private:
             // A deferred constant has no value until its body is analyzed, and
             // a generic none until elaboration
             return symp->deferred() ? VhdlValue{} : symp->value();
+        case VhdlSymKind::PARAMETER:
+            // A parameter has a value only in a copy of a subprogram made for
+            // one call site, which is where the call's own values were fixed
+            return symp->value();
         default: return VhdlValue{};
         }
     }
