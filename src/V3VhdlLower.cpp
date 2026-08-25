@@ -1520,7 +1520,7 @@ private:
         const VhdlType* const prefixTypep
             = nodep->prefixp() ? nodep->prefixp()->vhdlTypep() : nullptr;
         const bool indexing
-            = (objSymp && objSymp->isObject())
+            = (objSymp && (objSymp->isObject() || objSymp->kind() == VhdlSymKind::ALIAS))
               || (!objSymp && prefixTypep
                   && (prefixTypep->base()->kind() == VhdlTypeKind::ARRAY
                       || prefixTypep->base()->kind() == VhdlTypeKind::ACCESS));

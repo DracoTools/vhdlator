@@ -1274,6 +1274,24 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
             if (!symp->typep() && found[0]->typep()) symp->typep(found[0]->typep());
         }
     }
+    // An alias of an object denotes a name that may be a slice or an element,
+    // not only a simple name (6.6.2), so the whole of it is analyzed. An
+    // alias of a type or a subprogram denotes no value, and analyzing it as
+    // an expression would be wrong.
+    bool objectAlias = !nodep->signaturep();
+    if (symp->aliasp()) {
+        objectAlias = objectAlias && symp->aliasp()->isObject();
+    } else {
+        // No single declaration: either an overloaded name, which is a
+        // subprogram or literal alias, or a name too complex to flatten,
+        // which is exactly the slice or element case
+        std::vector<std::string> named;
+        objectAlias = objectAlias && !flatten(nodep->targetp(), named);
+    }
+    if (objectAlias) {
+        VhdlType* const typep = analyzeExpr(nodep->targetp(), symp->typep());
+        if (!symp->typep() && typep && !typep->isError()) symp->typep(typep);
+    }
     nodep->vhdlSymp(symp);
     declare(symp, nodep->fileline());
     // Aliasing a type implicitly aliases everything the type declaration
@@ -2328,8 +2346,25 @@ bool VhdlSemVisitor::exactMatch(const CandSet& cands, const VhdlType* wantp) {
     return false;
 }
 
+// What a symbol finally denotes, following any chain of aliases (6.6)
+static VhdlSymbol* aliasRoot(VhdlSymbol* symp) {
+    for (int depth = 0; symp && symp->aliasp() && depth < 32; ++depth) symp = symp->aliasp();
+    return symp;
+}
+
 VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>& cands,
                                VhdlType* wantp, const std::string& what) {
+    // An alias and what it aliases are one declaration, not two: aliasing a
+    // type brings its literals into view again (6.6.3), and a name matching
+    // both readings is not ambiguous.
+    if (cands.size() > 1) {
+        std::vector<VhdlSymbol*> distinct;
+        std::set<const VhdlSymbol*> seen;
+        for (VhdlSymbol* const symp : cands) {
+            if (seen.insert(aliasRoot(symp)).second) distinct.push_back(symp);
+        }
+        if (distinct.size() < cands.size()) cands.swap(distinct);
+    }
     if (cands.empty()) {
         err(nodep->fileline(), "No visible " + what + " matches this use");
         return V3VhdlStd::errorType();
