@@ -149,6 +149,18 @@ const char* operandName(size_t i, size_t count) {
 }
 
 // Declare one predefined operator or function
+// A character type is an enumeration whose literals are all character
+// literals, which is what makes an array of it printable (5.2.2.1)
+bool isCharacterType(const VhdlType* typep) {
+    if (!typep) return false;
+    const VhdlType* const basep = typep->base();
+    if (basep->kind() != VhdlTypeKind::ENUM || basep->literals().empty()) return false;
+    for (const VhdlSymbol* const litp : basep->literals()) {
+        if (litp->name().empty() || litp->name()[0] != '\'') return false;
+    }
+    return true;
+}
+
 void addFunc(VhdlScope* scopep, const std::string& name, VhdlType* returnp,
              const std::vector<VhdlType*>& params) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::FUNCTION, name, nullptr);
@@ -384,9 +396,16 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         addFunc(scopep, "??", boolp, {typep});
     }
 
-    // Every type has TO_STRING, and the radix forms exist for arrays of BIT
-    // or of a character enumeration (16.3)
-    if (s_stringp && typep != s_stringp) addFunc(scopep, "to_string", s_stringp, {typep});
+    // TO_STRING is implicitly declared for a scalar type, and for a
+    // one-dimensional array whose element type is a character type with only
+    // character literals (5.2.6, 5.3.2.4). Not for INTEGER_VECTOR, say: a
+    // design that writes its own TO_STRING for one would otherwise find both.
+    if (s_stringp && typep != s_stringp
+        && (typep->isScalar()
+            || (typep->kind() == VhdlTypeKind::ARRAY && typep->dimensions() == 1
+                && isCharacterType(typep->elementp())))) {
+        addFunc(scopep, "to_string", s_stringp, {typep});
+    }
 
     // A file type declaration implicitly declares the operations of 5.5.2.
     // They are declared here rather than written in VHDL because their
@@ -513,6 +532,19 @@ void V3VhdlStd::build() {
         addImplicitOperators(s_standardp, typep);
     }
 
+    // The radix forms that come with BIT_VECTOR, and no other type (5.3.2.4)
+    for (const char* const op : {"to_bstring", "to_binary_string", "to_ostring",
+                                 "to_octal_string", "to_hstring", "to_hex_string"}) {
+        addFuncN(s_standardp, op, s_stringp, {{"value", s_bitVecp}});
+    }
+
+    // The overloaded TO_STRING forms of 16.3, which take a second argument
+    // saying how to write the value. The one-argument forms come with each
+    // type, from addImplicitOperators.
+    addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_realp}, {"digits", s_naturalp}});
+    addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_realp}, {"format", s_stringp}});
+    addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_timep}, {"unit", s_timep}});
+
     // A literal's universal type must interoperate with the named types it
     // may be interpreted as (9.3.2)
     addFunc(s_standardp, "*", s_timep, {s_timep, s_univIntp});
@@ -592,13 +624,30 @@ void V3VhdlStd::buildTextio() {
         addProcN(s_textiop, "read", {{"l", s_linep}, {"value", typep}});
         addProcN(s_textiop, "read", {{"l", s_linep}, {"value", typep}, {"good", s_booleanp}});
         // One declaration, not two: JUSTIFIED and FIELD have defaults, so a
-        // two-argument call binds to this same procedure (16.4)
-        addProcN(s_textiop, "write", {{"l", s_linep},
-                                      {"value", typep},
-                                      {"justified", s_sidep, true},
-                                      {"field", widthp, true}});
+        // two-argument call binds to this same procedure (16.4). REAL and
+        // TIME are left out: theirs take one more parameter, and are
+        // declared below rather than twice.
+        if (typep != s_realp && typep != s_timep) {
+            addProcN(s_textiop, "write", {{"l", s_linep},
+                                          {"value", typep},
+                                          {"justified", s_sidep, true},
+                                          {"field", widthp, true}});
+        }
         addProcN(s_textiop, "sread", {{"l", s_linep}, {"value", typep}, {"strlen", s_naturalp}});
     }
+    // REAL and TIME take one more, saying how the value is to be written
+    // (16.4). It has a default, so a call that leaves it out binds here too.
+    addProcN(s_textiop, "write", {{"l", s_linep},
+                                  {"value", s_realp},
+                                  {"justified", s_sidep, true},
+                                  {"field", widthp, true},
+                                  {"digits", s_naturalp, true}});
+    addProcN(s_textiop, "write", {{"l", s_linep}, {"value", s_realp}, {"format", s_stringp}});
+    addProcN(s_textiop, "write", {{"l", s_linep},
+                                  {"value", s_timep},
+                                  {"justified", s_sidep, true},
+                                  {"field", widthp, true},
+                                  {"unit", s_timep, true}});
     for (VhdlType* const typep : {s_bitVecp, s_stringp}) {
         for (const char* const op : {"hread", "oread", "bread"}) {
             addProcN(s_textiop, op, {{"l", s_linep}, {"value", typep}});
@@ -612,21 +661,10 @@ void V3VhdlStd::buildTextio() {
                                      {"field", widthp, true}});
         }
     }
-    // The radix image functions of VHDL-2008 (16.4)
-    for (VhdlType* const typep : {s_bitVecp, s_stringp}) {
-        for (const char* const op : {"to_string", "to_bstring", "to_binary_string", "to_ostring",
-                                     "to_octal_string", "to_hstring", "to_hex_string"}) {
-            addFuncN(s_textiop, op, s_stringp, {{"value", typep}});
-        }
-    }
     addProcN(s_textiop, "swrite", {{"l", s_linep},
                                    {"value", s_stringp},
                                    {"justified", s_sidep, true},
                                    {"field", widthp, true}});
-    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_timep}});
-    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_realp}});
-    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_realp}, {"digits", s_naturalp}});
-    addFuncN(s_textiop, "to_string", s_stringp, {{"value", s_realp}, {"format", s_stringp}});
 
     UINFO(4, "Built std.textio with " << s_textiop->direct().size() << " declarations");
 }

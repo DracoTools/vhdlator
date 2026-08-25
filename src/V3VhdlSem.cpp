@@ -301,12 +301,16 @@ class VhdlSemVisitor final : public VNVisitor {
             return info;
         }
         // "left to right": both bounds are of one type, which the context may
-        // already fix. Analyze the bound that can stand alone first, so a
-        // universal literal on the other side takes its type from it.
-        VhdlType* leftp = analyzeExpr(rp->leftp(), wantp);
+        // already fix. Where it does not, the two bounds decide it between
+        // them -- "NOTE to t_alert_level'right" is a range of t_alert_level
+        // even though NOTE alone names a literal of two types (5.2.1).
+        VhdlType* hintp = wantp;
+        if (!hintp || hintp->isError()) hintp = commonBoundType(rp->leftp(), rp->rightp());
+        VhdlType* leftp = analyzeExpr(rp->leftp(), hintp);
         VhdlType* rightp
-            = analyzeExpr(rp->rightp(), wantp ? wantp : (leftp && !leftp->isUniversal() ? leftp
+            = analyzeExpr(rp->rightp(), hintp ? hintp : (leftp && !leftp->isUniversal() ? leftp
                                                                                        : nullptr));
+        if (!wantp || wantp->isError()) wantp = hintp;
         VhdlType* typep = wantp;
         if (!typep || typep->isError()) typep = (rightp && !rightp->isUniversal()) ? rightp : leftp;
         // A range of universal integers indexes with INTEGER (5.3.2.1)
@@ -322,6 +326,29 @@ class VhdlSemVisitor final : public VNVisitor {
         if (info.left.known() && !info.left.typep()) info.left.typep(typep);
         if (info.right.known() && !info.right.typep()) info.right.typep(typep);
         return info;
+    }
+
+    // The one type both bounds of a range can have, where they decide it
+    // between themselves. Null when they do not settle it, which leaves the
+    // ordinary left-then-right rule to try.
+    VhdlType* commonBoundType(AstNodeVhdlExpr* leftp, AstNodeVhdlExpr* rightp) {
+        if (!leftp || !rightp) return nullptr;
+        CandSet lc;
+        CandSet rc;
+        candidateTypes(leftp, lc);
+        candidateTypes(rightp, rc);
+        if (lc.types.empty() || rc.types.empty()) return nullptr;
+        VhdlType* foundp = nullptr;
+        for (VhdlType* const ltp : lc.types) {
+            if (!ltp || ltp->isUniversal()) continue;
+            for (VhdlType* const rtp : rc.types) {
+                if (!rtp) continue;
+                if (rtp->base() != ltp->base() && !rtp->isUniversal()) continue;
+                if (foundp && foundp->base() != ltp->base()) return nullptr;  // Still ambiguous
+                foundp = ltp;
+            }
+        }
+        return foundp;
     }
 
     // Fill a RangeInfo from a type that already carries its own range
@@ -1012,6 +1039,9 @@ private:
     };
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
     static void dropUninstantiated(std::vector<VhdlSymbol*>& found) VL_MT_DISABLED;
+    VhdlType* attrTypeQuiet(AstVhdlAttrName* nodep) VL_MT_DISABLED;
+    // Set while the call that is a statement of its own is resolved
+    bool m_procCall = false;
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
@@ -2005,9 +2035,14 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         err(nodep->fileline(), "A package instantiation needs the name of a package");
         return;
     }
-    // "work.p" or just "p"
+    // "work.p" or just "p". WORK names the library being compiled into, so
+    // it is the same unit either way (13.2)
     std::string key = m_libname + "." + lower(parts.back());
-    if (parts.size() >= 2) key = lower(parts[parts.size() - 2]) + "." + lower(parts.back());
+    if (parts.size() >= 2) {
+        std::string lib = lower(parts[parts.size() - 2]);
+        if (lib == "work") lib = m_libname;
+        key = lib + "." + lower(parts.back());
+    }
     const auto unitIt = m_primaryUnits.find(key);
     AstVhdlPackage* const pkgp
         = unitIt == m_primaryUnits.end() ? nullptr : VN_CAST(unitIt->second, VhdlPackage);
@@ -2702,6 +2737,35 @@ bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
     return false;
 }
 
+// The type of an attribute of a type mark, worked out without reporting
+// anything: used where a name is being weighed rather than analyzed (16.2)
+VhdlType* VhdlSemVisitor::attrTypeQuiet(AstVhdlAttrName* nodep) {
+    if (!nodep->prefixp()) return nullptr;
+    const std::string& attr = nodep->name();
+    // These answer with a type of their own whatever they are asked about,
+    // so the prefix need not be worked out at all
+    if (attr == "length" || attr == "pos") return V3VhdlStd::integerType();
+    if (attr == "ascending" || attr == "event" || attr == "active" || attr == "stable"
+        || attr == "quiet" || attr == "driving") {
+        return V3VhdlStd::booleanType();
+    }
+    if (attr == "image" || attr == "instance_name" || attr == "path_name"
+        || attr == "simple_name") {
+        return V3VhdlStd::stringType();
+    }
+    if (attr == "last_event" || attr == "last_active") return V3VhdlStd::timeType();
+    // The rest answer about the prefix, so it has to name a type here
+    VhdlSymbol* const symp = lookupTypeQuiet(nodep->prefixp());
+    VhdlType* const prefixp = symp ? symp->typep() : nullptr;
+    if (!prefixp) return nullptr;
+    if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
+        || attr == "base" || attr == "leftof" || attr == "rightof" || attr == "pred"
+        || attr == "succ" || attr == "val" || attr == "value") {
+        return prefixp;
+    }
+    return nullptr;
+}
+
 // An uninstantiated generic subprogram is not callable: only an instance of
 // it is (4.4). It stays visible so that "is new" can find it.
 void VhdlSemVisitor::dropUninstantiated(std::vector<VhdlSymbol*>& found) {
@@ -2720,6 +2784,17 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
     if (nodep->vhdlTypep()) {
         out.types.push_back(nodep->vhdlTypep());
         return;
+    }
+    if (AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
+        // Many attributes have one type whatever the context, and that is
+        // often what settles an expression whose other half is overloaded --
+        // "NOTE to t_alert_level'right", or "width <= s'length". Where the
+        // attribute's type depends on a prefix that is not a type mark, the
+        // ordinary path decides it instead.
+        if (VhdlType* const typep = attrTypeQuiet(attrp)) {
+            out.types.push_back(typep);
+            return;
+        }
     }
     if (const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral)) {
         switch (litp->kind()) {
@@ -2961,6 +3036,31 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
     if (cands.empty()) {
         err(nodep->fileline(), "No visible " + what + " matches this use");
         return V3VhdlStd::errorType();
+    }
+    if (cands.size() > 1) {
+        // A declaration written in the design hides the predefined operation
+        // of the same profile that the language declares implicitly (12.3),
+        // even where both are reached through use clauses: every tool takes
+        // "function to_string (v : string) return string" in a package to be
+        // the one meant, not STANDARD's.
+        std::vector<VhdlSymbol*> explicits;
+        for (VhdlSymbol* const symp : cands) {
+            if (!symp->resolved()->predefined()) explicits.push_back(symp);
+        }
+        if (!explicits.empty() && explicits.size() < cands.size()) {
+            // Only where they are homographs: a predefined one with a
+            // different profile is a real alternative, not a hidden one
+            bool sameProfile = true;
+            for (VhdlSymbol* const symp : cands) {
+                if (!symp->resolved()->predefined()) continue;
+                bool matched = false;
+                for (VhdlSymbol* const exp : explicits) {
+                    if (exp->homographOf(symp)) matched = true;
+                }
+                if (!matched) sameProfile = false;
+            }
+            if (sameProfile) cands.swap(explicits);
+        }
     }
     if (cands.size() > 1 && wantp) {
         // The context settles it (12.5)
@@ -3568,6 +3668,21 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     }
 
     dropUninstantiated(found);
+    // Whether this call is a statement of its own decides between a
+    // procedure and a function of the same profile; the arguments below are
+    // expressions, so it applies to this call alone
+    const bool wantProc = m_procCall;
+    m_procCall = false;
+    if (!found.empty()) {
+        std::vector<VhdlSymbol*> kept;
+        for (VhdlSymbol* const symp : found) {
+            const VhdlSymKind kind = symp->resolved()->kind();
+            if (kind == VhdlSymKind::PROCEDURE && !wantProc) continue;
+            if (kind == VhdlSymKind::FUNCTION && wantProc) continue;
+            kept.push_back(symp);
+        }
+        if (!kept.empty()) found = kept;
+    }
 
     // A type mark in this position makes it a type conversion (9.3.6) or a
     // constrained subtype indication that the parser could not tell apart
@@ -4727,7 +4842,13 @@ VhdlType* VhdlSemVisitor::formalAt(VhdlScope* scopep, int position) {
     return nullptr;
 }
 
-void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) { analyzeExpr(nodep->callp(), nullptr); }
+void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) {
+    // A procedure call statement can only mean a procedure, and an
+    // expression can only mean a function, so the two never compete (4.3)
+    VL_RESTORER(m_procCall);
+    m_procCall = true;
+    analyzeExpr(nodep->callp(), nullptr);
+}
 
 void VhdlSemVisitor::visit(AstVhdlNext* nodep) {
     if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
