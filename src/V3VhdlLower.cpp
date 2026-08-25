@@ -1079,6 +1079,16 @@ private:
             }
         }
         if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+        // "t'image(v)" is the text of the value, which is what a report is
+        // built from -- but it is an ordinary expression too, and a function
+        // may return it (16.2.3)
+        if (attr == "image" && nodep->argp()) {
+            AstNodeExpr* const valuep = lowerExpr(nodep->argp());
+            if (!valuep) return nullptr;
+            const VhdlType* const vtypep = nodep->argp()->vhdlTypep();
+            if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp)) return namep;
+            return new AstSFormatF{flp, formatFor(vtypep, true), false, valuep};
+        }
         // A user-defined attribute stands for the static expression an
         // attribute specification gave the prefix (7.2)
         if (AstNodeExpr* const userp = lowerUserAttr(nodep, attr)) return userp;
@@ -5059,16 +5069,18 @@ private:
         // deciding a length it does not have.
         for (const VhdlType* const typep : symp->paramTypes()) {
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
-                && !typep->isConstrainedArray()) {
+                && !typep->isConstrainedArray() && !isStringType(typep)) {
                 return nullptr;
             }
         }
         // The same where only the *result* has no length of its own: the
-        // copies made for the call sites carry the lengths their bodies build
+        // copies made for the call sites carry the lengths their bodies
+        // build. STRING is the exception: it is text, carried dynamically,
+        // so a function returning one needs no length decided here.
         if (nodep->isFunction()) {
             const VhdlType* const retp = returnType(nodep, symp);
             if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
-                && !retp->isConstrainedArray()) {
+                && !retp->isConstrainedArray() && !isStringType(retp)) {
                 return nullptr;
             }
         }
