@@ -2588,9 +2588,12 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
         if (partial.count(symp)) continue;  // Its elements are driven, not it
         symp->driverCount(pair.second);
-        if (pair.second < 2) continue;
         VhdlType* const typep = symp->typep();
         VhdlSymbol* const resolvep = typep ? typep->resolutionp() : nullptr;
+        // A resolution function is run however many drivers there are, since
+        // with one it may still change the value it is given (6.5.2). Only
+        // the *absence* of one is an error, and only for several drivers.
+        if (pair.second < 2 && !resolvep) continue;
         if (!resolvep) {
             // The one place the language says this must be an error, and the
             // only way a design can be told its drivers will not be combined
@@ -2613,12 +2616,19 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
 // the same specializing a call site would have given it -- and so this runs
 // where that specializing runs, once analysis is done.
 void VhdlSemVisitor::specializeResolvers() {
+    // One copy per function and driver count, however many signals want it
+    std::map<std::pair<const VhdlSymbol*, int>, VhdlSymbol*> made;
     for (const NeedResolve& need : m_needResolve) {
         VhdlSymbol* const resolvep = need.resolvep;
         if (resolvep->paramTypes().size() != 1) continue;
         VhdlType* const paramp = resolvep->paramTypes()[0];
         if (!paramp || paramp->base()->kind() != VhdlTypeKind::ARRAY) continue;
         if (paramp->isConstrainedArray()) continue;  // Already a fixed size
+        const auto madeIt = made.find(std::make_pair(resolvep, need.count));
+        if (madeIt != made.end()) {
+            need.symp->resolverp(madeIt->second);
+            continue;
+        }
         AstVhdlSubprogDecl* const bodyp = resolvep->bodyp();
         VhdlScope* const regionp = resolvep->innerp() ? resolvep->innerp()->parentp() : nullptr;
         if (!bodyp || !regionp) continue;  // Predefined, as ieee's own is
@@ -2637,6 +2647,7 @@ void VhdlSemVisitor::specializeResolvers() {
         if (VhdlSymbol* const newp
             = specializeSubprogram(bodyp, regionp, actualTypes, name)) {
             need.symp->resolverp(newp);
+            made.emplace(std::make_pair(resolvep, need.count), newp);
         }
     }
 }

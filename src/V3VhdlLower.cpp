@@ -778,12 +778,15 @@ private:
                 varp->valuep(defaultValueFor(symp->typep(), flp));
             }
             addStmt(varp);
-            if (objp->kind() == VhdlObjKind::SIGNAL && isResolvedSignal(symp)) {
+            if (objp->kind() == VhdlObjKind::SIGNAL) {
                 if (isLogicish(symp->typep())) {
-                    makeResolved(symp, varp, flp);
-                } else {
-                    // Any other resolved type would need its own resolution
-                    // function run over the drivers, which is not here yet
+                    // One driver of a logic signal resolves to itself, so the
+                    // wiring is only worth building for several
+                    if (isResolvedSignal(symp)) makeResolved(symp, varp, flp);
+                } else if (symp->resolverp()) {
+                    // A function of its own is run over the drivers however
+                    // many there are: with one it may still change the value
+                    // it is given (6.5.2)
                     makeResolvedByFunction(symp, varp, flp);
                 }
             }
@@ -3079,16 +3082,95 @@ private:
     // drivers would be gathered into an array and the function asked what
     // they add up to, which is what the language says happens.
     //
-    // Not enabled: it works -- NVC's driver5 passes with it -- but one of the
-    // other tests brings the emitted tree down in a way a checked build does
-    // not see, and a crash is worse than saying so. The analysis that feeds
-    // it is done and correct: the drivers are counted, a signal with several
-    // of them and no resolution function is now an error, and the function is
-    // given the copy that takes that many values.
+    // Each driver holds a value of its own; they are gathered into the array
+    // the function takes and it says what they add up to. Analysis has
+    // already given the function the copy that takes exactly this many
+    // values, so the array has a length and is built here rather than sized
+    // at run time.
     void makeResolvedByFunction(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
-        (void)netp;
-        unsup(flp, "signal '" + symp->name() + "' with " + std::to_string(symp->driverCount())
-                       + " drivers resolved by a function of its own");
+        const std::string what = "signal '" + symp->name() + "' with "
+                                 + std::to_string(symp->driverCount())
+                                 + " drivers resolved by a function of its own";
+        VhdlSymbol* const resolvep = symp->resolverp();
+        if (!resolvep) {
+            unsup(flp, what);
+            return;
+        }
+        const int count = symp->driverCount();
+        VhdlType* const paramTypep
+            = resolvep->paramTypes().empty() ? nullptr : resolvep->paramTypes()[0];
+        if (!paramTypep || !paramTypep->isConstrainedArray() || paramTypep->dimensions() != 1
+            || paramTypep->dimLength(0) != count) {
+            unsup(flp, what);
+            return;
+        }
+        AstNodeFTask* ftaskp = nullptr;
+        {
+            const auto it = m_funcs.find(resolvep);
+            ftaskp = it != m_funcs.end() ? it->second : emitOnDemand(resolvep);
+        }
+        if (!ftaskp || !VN_IS(ftaskp, Func)) {
+            unsup(flp, what);
+            return;
+        }
+        // What the signal starts at is decided by its drivers, as it is for a
+        // signal resolved by the logic tables: the declaration's own initial
+        // value belongs to each driver instead (14.7.2)
+        // The signal keeps the initial value its declaration gives it: until
+        // the drivers have been resolved for the first time there is nothing
+        // else for it to hold, and a process may read it before then
+        AstNodeExpr* initp = VN_CAST(netp->valuep(), NodeExpr);
+        // Written by the block that resolves it and by nothing else, so the
+        // initial value is not a second driver
+        netp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        // One variable per driver, each starting where the declaration says
+        // the signal does: a driver contributes a value from the beginning,
+        // even before the process that owns it has run (14.7.2)
+        std::vector<VhdlDriver> drivers;
+        for (int i = 0; i < count; ++i) {
+            VhdlDriver drv;
+            drv.valp = new AstVar{
+                flp, VVarType::VAR,
+                "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name() + "__val",
+                VFlagChildDType{}, lowerType(symp->typep(), flp)};
+            addStmt(drv.valp);
+            drv.valp->valuep(initp ? initp->cloneTree(false)
+                                   : defaultValueFor(symp->typep(), flp));
+            drivers.push_back(drv);
+        }
+        // The array the function is given, of exactly the type its parameter
+        // was specialized to, so the two agree without any conversion
+        AstVar* const arrp = new AstVar{flp, VVarType::VAR,
+                                        "__Vres__" + m_prefix + symp->name(), VFlagChildDType{},
+                                        lowerType(paramTypep, flp)};
+        addStmt(arrp);
+        // Filled one element at a time, in the order the parameter's own
+        // index range runs, so that a function which looks at s'left sees the
+        // driver it expects. Element by element rather than as one
+        // concatenation: the widths are not known until V3Width, and a
+        // concatenation has to know them as it is built.
+        const VhdlType* const idxp = paramTypep->indexTypes()[0];
+        AstNode* bodyp = nullptr;
+        for (int i = 0; i < count; ++i) {
+            const int64_t index = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
+            bodyp = AstNode::addNextNull(
+                bodyp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp,
+                    new AstSelBit{flp, new AstVarRef{flp, arrp, VAccess::WRITE},
+                                  new AstConst{flp, AstConst::Signed32{},
+                                               static_cast<int32_t>(index)}},
+                    new AstVarRef{flp, drivers[i].valp, VAccess::READ}}));
+        }
+        AstFuncRef* const callp = new AstFuncRef{flp, ftaskp->name(), nullptr};
+        callp->taskp(ftaskp);
+        callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, arrp, VAccess::READ}});
+        bodyp = AstNode::addNextNull(
+            bodyp, static_cast<AstNode*>(
+                       new AstAssign{flp, new AstVarRef{flp, netp, VAccess::WRITE}, callp}));
+        // Whenever any driver changes, which is what the process reads
+        addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
+        m_drivers.emplace(symp, drivers);
     }
 
     // What one value contributes to a resolved signal: whether it drives at

@@ -42,6 +42,10 @@ verilator_coverage_bin*
 **/__pycache__/*
 **/_build/*
 **/obj_dir/*
+# cocotb's build directory and result file, from examples/make_vhdl_cocotb
+**/sim_build/*
+**/results.xml
+**/__pycache__/*
 /.vscode/
 /.idea/
 /cmake-build-*/

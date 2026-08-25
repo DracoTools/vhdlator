@@ -485,13 +485,6 @@ fixed-width operations, so arithmetic whose operand width is only known
 during execution is not available. This is reachable only by doing
 arithmetic on a value whose length came from a run-time computation.
 
-**A resolution function of your own is not run.** A signal whose subtype
-names a resolution function that is not one of the ``std_logic_1164``
-family is reported as unsupported rather than resolved. Signals of
-``std_logic`` and of any subtype resolved by ``resolved`` or
-``resolved_max`` are resolved, and a forcing value correctly beats a weak
-one, so a tri-state bus with pull-ups behaves as the LRM says.
-
 **A guarded signal is not disconnected.** A guarded assignment drives while
 its block's ``GUARD`` is true and holds its last value while it is false,
 which is what a signal with one driver does. For a signal declared with the
