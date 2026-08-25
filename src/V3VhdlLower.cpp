@@ -281,14 +281,30 @@ private:
     // The actuals of a call. An association may name its formal (6.5.7.1),
     // which V3Task matches to the parameter of that name, so a call written
     // out of order or leaving out a defaulted parameter comes out right.
-    void addCallArgs(AstNodeFTaskRef* refp, AstVhdlCall* callp) {
-        if (!callp) return;
-        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
-            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
-            if (!asp || !asp->actualp()) continue;
-            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
-            refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "",
-                                      lowerExpr(asp->actualp())});
+    void addCallArgs(AstNodeFTaskRef* refp, AstVhdlCall* callp,
+                     const VhdlSymbol* symp = nullptr) {
+        if (callp) {
+            for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+                AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->actualp()) continue;
+                const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "",
+                                          lowerExpr(asp->actualp())});
+            }
+        }
+        addCaptureArgs(refp, symp, refp->fileline());
+    }
+
+    // A nested subprogram is passed what it reaches out of its own region for
+    void addCaptureArgs(AstNodeFTaskRef* refp, const VhdlSymbol* symp, FileLine* flp) {
+        if (!symp) return;
+        const auto it = m_captureOf.find(symp->resolved());
+        if (it == m_captureOf.end()) return;
+        for (VhdlSymbol* const capp : it->second) {
+            const auto varIt = m_vars.find(capp);
+            if (varIt == m_vars.end() || !varIt->second) continue;
+            refp->addArgsp(
+                new AstArg{flp, "", new AstVarRef{flp, varIt->second, VAccess::READWRITE}});
         }
     }
 
@@ -763,6 +779,17 @@ private:
             case VhdlObjKind::FILE: varType = VVarType::VAR; break;
             }
             AstVar* const varp = newVar(symp, varType, flp);
+            // A variable of a subprogram is created anew on each call (4.3),
+            // so it belongs to the emitted function rather than the module.
+            // A variable of a *process* is the opposite: it is elaborated
+            // once and keeps its value from one activation to the next
+            // (14.7.3), so it must not be turned into a local of the
+            // function the process becomes.
+            if (m_ftaskp) {
+                varp->funcLocal(true);
+            } else if (objp->kind() == VhdlObjKind::VARIABLE) {
+                varp->lifetime(VLifetime::STATIC_EXPLICIT);
+            }
             // A variable declared in a protected type body belongs to each
             // object of the type, so it is a member of the class (5.6.2)
             if (m_protClassp && !m_ftaskp) {
@@ -1268,6 +1295,7 @@ private:
             if (funcIt != m_funcs.end() && VN_IS(funcIt->second, Func)) {
                 AstFuncRef* const refp = new AstFuncRef{flp, funcIt->second->name(), nullptr};
                 refp->taskp(funcIt->second);
+                addCaptureArgs(refp, symp, flp);
                 return refp;
             }
         }
@@ -2097,7 +2125,7 @@ private:
         if (it != m_funcs.end() && VN_IS(it->second, Func)) {
             AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
             refp->taskp(it->second);
-            addCallArgs(refp, nodep);
+            addCallArgs(refp, nodep, symp);
             return refp;
         }
         // A predefined operator named rather than written: "\"+\"(a, b)", or
@@ -4290,7 +4318,7 @@ private:
         }
         AstTaskRef* const refp = new AstTaskRef{flp, it->second->name(), nullptr};
         refp->taskp(it->second);
-        addCallArgs(refp, callp);
+        addCallArgs(refp, callp, symp);
         (void)namep;
         return new AstStmtExpr{flp, refp};
     }
@@ -5142,12 +5170,95 @@ private:
             m_vars[psymp] = varp;
             ftaskp->addStmtsp(varp);
         }
-        for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
+        // What this subprogram reaches out of its own region for comes in as
+        // extra parameters, ahead of nothing and behind its own
+        const auto captureIt = m_captureOf.find(symp->resolved());
+        std::vector<std::pair<const VhdlSymbol*, AstVar*>> captureVars;
+        if (captureIt != m_captureOf.end()) {
+            for (VhdlSymbol* const capp : captureIt->second) {
+                AstVar* const varp
+                    = new AstVar{flp, VVarType::PORT, "__Vcap__" + capp->name(),
+                                 VFlagChildDType{}, lowerType(capp->typep(), flp)};
+                // Passed by reference whether or not this subprogram writes
+                // it: it may hand it on to another that does, and the object
+                // it stands for is the enclosing subprogram's own
+                varp->direction(VDirection::INOUT);
+                varp->declDirection(varp->direction());
+                varp->funcLocal(true);
+                ftaskp->addStmtsp(varp);
+                captureVars.emplace_back(capp, varp);
+            }
+        }
+        // Inside the body the captured name means the parameter
+        std::vector<std::pair<VhdlSymbol*, AstVar*>> savedCaps;
+        for (const auto& pair : captureVars) {
+            VhdlSymbol* const capp = const_cast<VhdlSymbol*>(pair.first);
+            savedCaps.emplace_back(capp, m_vars.count(capp) ? m_vars[capp] : nullptr);
+            m_vars[capp] = pair.second;
+        }
+        // A subprogram declared inside this one sees this one's variables
+        // (12.1), which a separate C++ function cannot. Each such reference
+        // becomes a parameter of the inner subprogram, passed at every call.
+        VL_RESTORER_COPY(m_captureOf);
+        for (AstNode* p = nodep->declsp(); p; p = p->nextp()) {
+            // Planned as each is reached, not all at once: what a nested
+            // subprogram can name is what was declared before it, and those
+            // variables do not exist until they have been lowered
+            if (AstVhdlSubprogDecl* const subp = VN_CAST(p, VhdlSubprogDecl)) {
+                planCaptures(subp);
+            }
+            lowerDecl(p);
+        }
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
+        for (const auto& pair : savedCaps) {
+            if (pair.second) {
+                m_vars[pair.first] = pair.second;
+            } else {
+                m_vars.erase(pair.first);
+            }
+        }
         m_ftaskp = nullptr;  // The task itself belongs to the module
         addStmt(ftaskp);
         return ftaskp;
     }
+
+    // What a nested subprogram reaches out of its own region for, in the
+    // order its extra parameters take
+    std::map<const VhdlSymbol*, std::vector<VhdlSymbol*>> m_captureOf;
+
+    // Work out which of the enclosing subprogram's objects a nested one uses.
+    // Only objects: a nested subprogram, type or constant needs nothing
+    // passed, and neither does anything the module itself owns.
+    void planCaptures(AstVhdlSubprogDecl* nodep) {
+        VhdlSymbol* const symp = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+        if (!symp || m_captureOf.count(symp)) return;
+        std::vector<VhdlSymbol*> captures;
+        std::set<const VhdlSymbol*> seen;
+        // What this subprogram declares itself is not captured
+        std::set<const VhdlSymbol*> ownp;
+        collectOwnSymbols(nodep, ownp);
+        nodep->foreach([&](AstNodeVhdlExpr* exprp) {
+            VhdlSymbol* const usedp = exprp->vhdlSymp();
+            if (!usedp) return;
+            VhdlSymbol* const rootp = usedp->resolved();
+            if (ownp.count(rootp)) return;
+            const auto it = m_vars.find(rootp);
+            if (it == m_vars.end() || !it->second || !it->second->isFuncLocal()) return;
+            if (!seen.insert(rootp).second) return;
+            captures.push_back(rootp);
+        });
+        m_captureOf.emplace(symp, captures);
+    }
+
+    // Everything a subprogram declares: its parameters, its own declarations,
+    // and whatever those declare in turn
+    static void collectOwnSymbols(AstVhdlSubprogDecl* nodep, std::set<const VhdlSymbol*>& out) {
+        nodep->foreach([&](AstNodeVhdlDecl* declp) {
+            if (declp->vhdlSymp()) out.insert(declp->vhdlSymp());
+        });
+    }
+
+
 
     // The variable a function's result comes back in. V3LinkDot makes one for
     // Verilog, from the return type the parser left on the node; here the type
