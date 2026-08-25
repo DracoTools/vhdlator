@@ -88,6 +88,11 @@ int bitsFor(size_t n) {
 //######################################################################
 // The lowering pass
 
+struct AstVhdlExprPair final {
+    std::string name;
+    AstNodeVhdlExpr* exprp;
+};
+
 class VhdlLowerVisitor final {
     // TYPES
     // What a VHDL declaration became
@@ -3793,6 +3798,11 @@ private:
                 return new AstStmtExpr{flp, mcallp};
             }
         }
+        // A procedure with a signal parameter drives the caller's own signal,
+        // so it gets a copy bound to the signals this call passes (4.2.2.3)
+        if (symp && callp && hasSignalParam(symp)) {
+            if (AstNode* const outp = lowerSignalProcCall(symp, callp, flp)) return outp;
+        }
         auto it = symp ? m_funcs.find(symp) : m_funcs.end();
         if (it == m_funcs.end() && symp && emitOnDemand(symp)) it = m_funcs.find(symp);
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
@@ -3830,6 +3840,107 @@ private:
     static bool isOneBitVar(const AstVar* varp) {
         const AstBasicDType* const dtypep = VN_CAST(varp->childDTypep(), BasicDType);
         return dtypep && dtypep->width() == 1;
+    }
+
+    // The declaration of a subprogram, from its body where it has one
+    static AstVhdlSubprogDecl* declOf(VhdlSymbol* symp) {
+        if (!symp) return nullptr;
+        if (AstVhdlSubprogDecl* const bodyp = symp->bodyp()) return bodyp;
+        return VN_CAST(symp->declp(), VhdlSubprogDecl);
+    }
+
+    // Whether any parameter is of the signal class (4.2.2.3)
+    static bool hasSignalParam(VhdlSymbol* symp) {
+        AstVhdlSubprogDecl* const declp = declOf(symp);
+        if (!declp) return false;
+        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+            if (VN_AS(p, VhdlIfaceDecl)->kind() == VhdlIfaceKind::SIGNAL) return true;
+        }
+        return false;
+    }
+
+    // Call a procedure whose signal parameters are bound to the actuals
+    AstNode* lowerSignalProcCall(VhdlSymbol* symp, AstVhdlCall* callp, FileLine* flp) {
+        AstVhdlSubprogDecl* const declp = declOf(symp);
+        if (!declp || !declp->hasBody()) return nullptr;
+        // The actuals, in formal order
+        std::vector<AstVhdlAssoc*> assocs;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            assocs.push_back(VN_AS(p, VhdlAssoc));
+        }
+        std::vector<AstVhdlIfaceDecl*> formals;
+        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+            formals.push_back(VN_AS(p, VhdlIfaceDecl));
+        }
+        std::map<const VhdlSymbol*, AstVar*> bind;
+        std::vector<AstVhdlExprPair> passed;  // Formal index and actual, for the rest
+        std::string key = symp->name();
+        for (size_t i = 0; i < formals.size(); ++i) {
+            AstNodeVhdlExpr* actualp = nullptr;
+            for (size_t a = 0; a < assocs.size(); ++a) {
+                const AstVhdlName* const namep
+                    = assocs[a]->formalp() ? VN_CAST(assocs[a]->formalp(), VhdlName) : nullptr;
+                if (namep) {
+                    if (namep->name() == formals[i]->name()) actualp = assocs[a]->actualp();
+                } else if (a == i) {
+                    actualp = assocs[a]->actualp();
+                }
+            }
+            if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) {
+                if (actualp) passed.push_back(AstVhdlExprPair{formals[i]->name(), actualp});
+                continue;
+            }
+            // A signal actual must be a signal of the design, named plainly
+            VhdlSymbol* const actualSymp = actualp ? actualp->vhdlSymp() : nullptr;
+            if (!actualSymp) return nullptr;
+            const auto varIt = m_vars.find(actualSymp);
+            if (varIt == m_vars.end()) return nullptr;
+            if (m_drivers.count(actualSymp)) return nullptr;  // Resolved: needs its drivers
+            bind.emplace(formals[i]->vhdlSymp(), varIt->second);
+            key += "|" + std::to_string(reinterpret_cast<uintptr_t>(varIt->second));
+        }
+        if (bind.empty()) return nullptr;
+        auto copyIt = m_signalCopies.find(key);
+        if (copyIt == m_signalCopies.end()) {
+            // The formals belong to the one declaration, so building a copy
+            // moves their mapping; put back whatever the original left
+            std::map<const VhdlSymbol*, AstVar*> saved;
+            for (AstVhdlIfaceDecl* const ifp : formals) {
+                const auto it = m_vars.find(ifp->vhdlSymp());
+                if (it != m_vars.end()) saved.emplace(ifp->vhdlSymp(), it->second);
+            }
+            AstNodeFTask* taskp = nullptr;
+            {
+                VL_RESTORER_COPY(m_bindSignals);
+                VL_RESTORER(m_ftaskp);
+                VL_RESTORER_COPY(m_prefix);
+                m_bindSignals = bind;
+                m_ftaskp = nullptr;
+                m_prefix.clear();
+                taskp = lowerSubprogramInto(declp, uniqueName(symp) + "__Vsig");
+            }
+            for (AstVhdlIfaceDecl* const ifp : formals) {
+                const auto it = saved.find(ifp->vhdlSymp());
+                if (it == saved.end()) {
+                    m_vars.erase(ifp->vhdlSymp());
+                } else {
+                    m_vars[ifp->vhdlSymp()] = it->second;
+                }
+            }
+            if (!taskp) return nullptr;
+            copyIt = m_signalCopies.emplace(key, taskp).first;
+        }
+        AstTaskRef* const refp = new AstTaskRef{flp, copyIt->second->name(), nullptr};
+        refp->taskp(copyIt->second);
+        for (const AstVhdlExprPair& pair : passed) {
+            AstNodeExpr* const onep = lowerExpr(pair.exprp);
+            if (!onep) {
+                VL_DO_DANGLING(refp->deleteTree(), refp);
+                return nullptr;
+            }
+            refp->addArgsp(new AstArg{flp, pair.name, onep});
+        }
+        return new AstStmtExpr{flp, refp};
     }
 
     // The sensitivity a list of signal names gives
@@ -4395,16 +4506,29 @@ private:
     // function may not assign a signal (4.2.1) is what makes this safe:
     // everything a function touches is local, so it emits as an ordinary C++
     // function that the compiler can inline.
-    void lowerSubprogram(AstVhdlSubprogDecl* nodep) {
+    // A signal-class parameter names the caller's own signal, not a copy of
+    // it (4.2.2.3): an assignment inside the subprogram drives that signal.
+    // There is no reference parameter to carry that, so the subprogram is
+    // copied for the signals one call site passes, with the formals bound
+    // straight to them -- the same answer monomorphization gives everywhere
+    // else in this frontend.
+    std::map<const VhdlSymbol*, AstVar*> m_bindSignals;
+    std::map<std::string, AstNodeFTask*> m_signalCopies;
+
+    void lowerSubprogram(AstVhdlSubprogDecl* nodep) { lowerSubprogramInto(nodep, ""); }
+
+    AstNodeFTask* lowerSubprogramInto(AstVhdlSubprogDecl* nodep, const std::string& copyName) {
         FileLine* const flp = nodep->fileline();
         VhdlSymbol* const symp = nodep->vhdlSymp();
-        if (!symp) return;
-        if (m_funcs.count(symp)) return;  // Its declaration already made one
+        if (!symp) return nullptr;
+        if (copyName.empty() && m_funcs.count(symp)) {
+            return nullptr;  // Its declaration already made one
+        }
         if (symp->isForeign()) {
             lowerForeignSubprogram(nodep, symp);
-            return;
+            return nullptr;
         }
-        if (!nodep->hasBody()) return;  // A declaration alone emits nothing
+        if (!nodep->hasBody()) return nullptr;  // A declaration alone emits nothing
         // A subprogram with an unconstrained parameter is a template: each
         // call site got a copy with the lengths it supplies, and only those
         // copies are emitted. Emitting the template as well would mean
@@ -4412,7 +4536,7 @@ private:
         for (const VhdlType* const typep : symp->paramTypes()) {
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
                 && !typep->isConstrainedArray()) {
-                return;
+                return nullptr;
             }
         }
         // The same where only the *result* has no length of its own: the
@@ -4421,11 +4545,11 @@ private:
             const VhdlType* const retp = returnType(nodep, symp);
             if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
                 && !retp->isConstrainedArray()) {
-                return;
+                return nullptr;
             }
         }
         // An overloaded name needs a distinct one in the emitted code
-        const std::string name = uniqueName(symp);
+        const std::string name = copyName.empty() ? uniqueName(symp) : copyName;
         AstNodeFTask* ftaskp = nullptr;
         if (nodep->isFunction()) {
             AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
@@ -4440,7 +4564,7 @@ private:
         // A subprogram declared in a protected type body is one of its
         // methods, and reaches the object's own variables (5.6.2)
         if (m_protClassp) ftaskp->classMethod(true);
-        m_funcs.emplace(symp, ftaskp);
+        if (copyName.empty()) m_funcs.emplace(symp, ftaskp);
         VL_RESTORER(m_ftaskp);
         VL_RESTORER_COPY(m_prefix);
         m_ftaskp = ftaskp;
@@ -4449,6 +4573,13 @@ private:
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             VhdlSymbol* const psymp = ifp->vhdlSymp();
             if (!psymp) continue;
+            // A signal parameter bound to the caller's own signal needs no
+            // port of its own: the body refers to that signal directly
+            const auto boundIt = m_bindSignals.find(psymp);
+            if (boundIt != m_bindSignals.end()) {
+                m_vars[psymp] = boundIt->second;
+                continue;
+            }
             AstVar* const varp = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
                                             lowerType(psymp->typep(), flp)};
             switch (ifp->mode()) {
@@ -4469,13 +4600,17 @@ private:
             // A parameter with a default value may be left out of a call
             // (4.2.2.1), which is what an initial value on the port means here
             if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
-            m_vars.emplace(psymp, varp);
+            // A copy of a subprogram shares its formals' symbols with the
+            // original, so the mapping is overwritten rather than added to;
+            // the caller puts back what was there
+            m_vars[psymp] = varp;
             ftaskp->addStmtsp(varp);
         }
         for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
         m_ftaskp = nullptr;  // The task itself belongs to the module
         addStmt(ftaskp);
+        return ftaskp;
     }
 
     // The variable a function's result comes back in. V3LinkDot makes one for
