@@ -807,7 +807,14 @@ private:
         }
         if (VN_IS(nodep, VhdlAliasDecl)) return;  // Names, not storage
         if (AstVhdlSubprogDecl* const subp = VN_CAST(nodep, VhdlSubprogDecl)) {
-            lowerSubprogram(subp);
+            // An uninstantiated generic subprogram is a template, never
+            // called as it stands (4.4)
+            if (subp->genericCount() == 0 || subp->isInstance()) lowerSubprogram(subp);
+            return;
+        }
+        if (AstVhdlSubprogInst* const instp = VN_CAST(nodep, VhdlSubprogInst)) {
+            // The instance is the copy analysis made, with its generics bound
+            if (instp->copyp()) lowerSubprogram(instp->copyp());
             return;
         }
         unsup(flp, std::string{"declaration "} + nodep->typeName());
@@ -1385,6 +1392,104 @@ private:
         return shiftIndex(idxp, fromLeft, toLeft, step, flp);
     }
 
+    // "maximum(v)" or "minimum(v)" over a whole array (5.3.2.4)
+    AstNodeExpr* lowerArrayExtreme(AstNodeExpr* arrp, const VhdlType* typep, bool wantMax,
+                                   FileLine* flp) {
+        const VhdlType* const idxp = indexSubtype(typep, 0);
+        if (!typep || typep->dimensions() != 1 || !idxp || !idxp->bounded()) {
+            VL_DO_DANGLING(arrp->deleteTree(), arrp);
+            unsup(flp, std::string{wantMax ? "maximum" : "minimum"}
+                           + " over an array whose length is not fixed here");
+            return nullptr;
+        }
+        const int64_t left = idxp->left();
+        const int64_t right = idxp->right();
+        const int64_t step = idxp->ascending() ? 1 : -1;
+        const int64_t count = (idxp->ascending() ? right - left : left - right) + 1;
+        if (count <= 0) {
+            // A null array has no elements, so the answer is the element
+            // type's own limit -- which needs a value this does not have
+            VL_DO_DANGLING(arrp->deleteTree(), arrp);
+            unsup(flp, std::string{wantMax ? "maximum" : "minimum"} + " over a null array");
+            return nullptr;
+        }
+        const bool signd = typep->elementp() && isSignedType(typep->elementp());
+        AstNodeExpr* bestp = nullptr;
+        for (int64_t i = 0; i < count; ++i) {
+            AstNodeExpr* const elemp = new AstSelBit{
+                flp, arrp->cloneTree(false),
+                new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left + i * step)}};
+            if (!bestp) {
+                bestp = elemp;
+                continue;
+            }
+            AstNodeExpr* const testp
+                = signd ? static_cast<AstNodeExpr*>(new AstGtS{flp, elemp->cloneTree(false),
+                                                               bestp->cloneTree(false)})
+                        : static_cast<AstNodeExpr*>(new AstGt{flp, elemp->cloneTree(false),
+                                                              bestp->cloneTree(false)});
+            bestp = wantMax ? new AstCond{flp, testp, elemp, bestp}
+                            : new AstCond{flp, testp, bestp, elemp};
+        }
+        VL_DO_DANGLING(arrp->deleteTree(), arrp);
+        return bestp;
+    }
+
+    // "\"+\"(a, b)" means the same as "a + b" (4.5.3). An operator has no body
+    // to emit, so the call is rebuilt as the operation it names.
+    AstNodeExpr* lowerOperatorCall(const VhdlSymbol* symp, AstVhdlCall* nodep, FileLine* flp) {
+        static const std::map<std::string, VhdlBinaryOp> BINARY{
+            {"and", VhdlBinaryOp::AND},      {"or", VhdlBinaryOp::OR},
+            {"nand", VhdlBinaryOp::NAND},    {"nor", VhdlBinaryOp::NOR},
+            {"xor", VhdlBinaryOp::XOR},      {"xnor", VhdlBinaryOp::XNOR},
+            {"=", VhdlBinaryOp::EQ},         {"/=", VhdlBinaryOp::NE},
+            {"<", VhdlBinaryOp::LT},         {"<=", VhdlBinaryOp::LE},
+            {">", VhdlBinaryOp::GT},         {">=", VhdlBinaryOp::GE},
+            {"?=", VhdlBinaryOp::MATCH_EQ},  {"?/=", VhdlBinaryOp::MATCH_NE},
+            {"?<", VhdlBinaryOp::MATCH_LT},  {"?<=", VhdlBinaryOp::MATCH_LE},
+            {"?>", VhdlBinaryOp::MATCH_GT},  {"?>=", VhdlBinaryOp::MATCH_GE},
+            {"sll", VhdlBinaryOp::SLL},      {"srl", VhdlBinaryOp::SRL},
+            {"sla", VhdlBinaryOp::SLA},      {"sra", VhdlBinaryOp::SRA},
+            {"rol", VhdlBinaryOp::ROL},      {"ror", VhdlBinaryOp::ROR},
+            {"+", VhdlBinaryOp::ADD},        {"-", VhdlBinaryOp::SUB},
+            {"&", VhdlBinaryOp::CONCAT},     {"*", VhdlBinaryOp::MUL},
+            {"/", VhdlBinaryOp::DIV},        {"mod", VhdlBinaryOp::MOD},
+            {"rem", VhdlBinaryOp::REM},      {"**", VhdlBinaryOp::POW}};
+        static const std::map<std::string, VhdlUnaryOp> UNARY{
+            {"+", VhdlUnaryOp::IDENTITY}, {"-", VhdlUnaryOp::NEGATE},
+            {"abs", VhdlUnaryOp::ABS},    {"not", VhdlUnaryOp::NOT}};
+        // The name may be an alias -- a generic bound to an operator is one
+        const VhdlSymbol* const realp = symp->resolved();
+        if (!realp->predefined()) return nullptr;
+        std::vector<AstNodeVhdlExpr*> args;
+        for (AstNode* p = nodep->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp()) return nullptr;
+            args.push_back(asp->actualp());
+        }
+        if (args.size() == 2) {
+            const auto it = BINARY.find(realp->name());
+            if (it == BINARY.end()) return nullptr;
+            AstVhdlBinary* const tmpp = new AstVhdlBinary{
+                flp, it->second, args[0]->cloneTree(false), args[1]->cloneTree(false)};
+            tmpp->vhdlTypep(nodep->vhdlTypep());
+            AstNodeExpr* const outp = lowerBinary(tmpp);
+            VL_DO_DANGLING(tmpp->deleteTree(), tmpp);
+            return outp;
+        }
+        if (args.size() == 1) {
+            const auto it = UNARY.find(realp->name());
+            if (it == UNARY.end()) return nullptr;
+            AstVhdlUnary* const tmpp
+                = new AstVhdlUnary{flp, it->second, args[0]->cloneTree(false)};
+            tmpp->vhdlTypep(nodep->vhdlTypep());
+            AstNodeExpr* const outp = lowerUnary(tmpp);
+            VL_DO_DANGLING(tmpp->deleteTree(), tmpp);
+            return outp;
+        }
+        return nullptr;
+    }
+
     AstNodeExpr* lowerSelected(AstVhdlSelected* nodep) {
         FileLine* const flp = nodep->fileline();
         // "p.all" reads what an access value points at (8.3)
@@ -1500,6 +1605,40 @@ private:
         const bool signd = isSignedType(ltypep) || isSignedType(rtypep);
         const bool real = (ltypep && ltypep->base()->kind() == VhdlTypeKind::FLOATING)
                           || (rtypep && rtypep->base()->kind() == VhdlTypeKind::FLOATING);
+        // A physical value scaled by a real is defined to be computed in real
+        // arithmetic and converted back (9.2.7), so the conversion is written
+        // out rather than left to be inferred and reported
+        const auto isRealish = [](const VhdlType* typep) {
+            return typep
+                   && (typep->base()->kind() == VhdlTypeKind::FLOATING
+                       || typep->base()->kind() == VhdlTypeKind::UNIVERSAL_REAL);
+        };
+        const auto isPhysical = [](const VhdlType* typep) {
+            return typep && typep->base()->kind() == VhdlTypeKind::PHYSICAL;
+        };
+        if ((isPhysical(ltypep) && isRealish(rtypep))
+            || (isRealish(ltypep) && isPhysical(rtypep))) {
+            if (nodep->op() != VhdlBinaryOp::MUL && nodep->op() != VhdlBinaryOp::DIV) {
+                // Nothing else pairs a physical value with a real (9.2.7)
+            } else {
+            const bool leftIsPhysical = isPhysical(ltypep);
+            FileLine* const cflp = new FileLine{flp};
+            cflp->warnOff(V3ErrorCode::REALCVT, true);
+            cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+            AstNodeExpr* const lrealp
+                = leftIsPhysical ? new AstIToRD{cflp, lhsp} : lhsp;
+            AstNodeExpr* const rrealp
+                = leftIsPhysical ? rhsp : new AstIToRD{cflp, rhsp};
+            AstNodeExpr* const valuep
+                = nodep->op() == VhdlBinaryOp::MUL
+                      ? static_cast<AstNodeExpr*>(new AstMulD{cflp, lrealp, rrealp})
+                      : static_cast<AstNodeExpr*>(new AstDivD{cflp, lrealp, rrealp});
+            AstRToIRoundS* const outp = new AstRToIRoundS{cflp, valuep};
+            // A physical value is counted in 64 bits, not in an int
+            outp->dtypeSetLogicSized(64, VSigning::SIGNED);
+            return outp;
+            }
+        }
         switch (nodep->op()) {
         case VhdlBinaryOp::AND: return new AstAnd{flp, lhsp, rhsp};
         case VhdlBinaryOp::OR: return new AstOr{flp, lhsp, rhsp};
@@ -1867,7 +2006,10 @@ private:
     }
 
     AstNodeExpr* lowerFuncCall(AstVhdlCall* nodep, FileLine* flp) {
-        VhdlSymbol* const symp = nodep->vhdlSymp();
+        // An alias, or a generic subprogram bound to one, denotes what it was
+        // declared for, and that is what is emitted (6.6.1)
+        VhdlSymbol* const symp
+            = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
         if (!symp) {
             unsup(flp, "call");
             return nullptr;
@@ -1895,6 +2037,9 @@ private:
             addCallArgs(refp, nodep);
             return refp;
         }
+        // A predefined operator named rather than written: "\"+\"(a, b)", or
+        // reached through a generic subprogram bound to one (4.5.3, 6.5.5)
+        if (AstNodeExpr* const outp = lowerOperatorCall(symp, nodep, flp)) return outp;
         unsup(flp, "call to '" + symp->name() + "'");
         return nullptr;
     }
@@ -1989,6 +2134,12 @@ private:
         if (name == "nor_reduce") return new AstNot{flp, new AstRedOr{flp, firstp}};
         if (name == "xnor_reduce") return new AstNot{flp, new AstRedXor{flp, firstp}};
         if (name == "maximum" || name == "minimum") {
+            // Over one array, the answer is the largest or smallest element
+            // it holds (5.3.2.4). Its length is fixed here, so the comparison
+            // is written out rather than looped.
+            if (args.size() == 1) {
+                return lowerArrayExtreme(firstp, args[0]->vhdlTypep(), name == "maximum", flp);
+            }
             if (args.size() < 2) return nullptr;
             AstNodeExpr* const secondp = lowerExpr(args[1]);
             if (!secondp) return nullptr;
@@ -4017,11 +4168,19 @@ private:
         return VN_CAST(symp->declp(), VhdlSubprogDecl);
     }
 
+    // The first real parameter, past the generics a generic subprogram keeps
+    // ahead of them (4.2.1)
+    static AstNode* firstParamOf(const AstVhdlSubprogDecl* declp) {
+        AstNode* p = declp->paramsp();
+        for (int i = 0; i < declp->genericCount() && p; ++i) p = p->nextp();
+        return p;
+    }
+
     // Whether any parameter is of the signal class (4.2.2.3)
     static bool hasSignalParam(VhdlSymbol* symp) {
         AstVhdlSubprogDecl* const declp = declOf(symp);
         if (!declp) return false;
-        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
             if (VN_AS(p, VhdlIfaceDecl)->kind() == VhdlIfaceKind::SIGNAL) return true;
         }
         return false;
@@ -4037,7 +4196,7 @@ private:
             assocs.push_back(VN_AS(p, VhdlAssoc));
         }
         std::vector<AstVhdlIfaceDecl*> formals;
-        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
             formals.push_back(VN_AS(p, VhdlIfaceDecl));
         }
         std::map<const VhdlSymbol*, AstVar*> bind;
@@ -4270,8 +4429,12 @@ private:
             AstNodeExpr* const isZerop
                 = new AstEq{flp, timep->cloneTree(false),
                             new AstConst{flp, AstConst::Unsized64{}, 0}};
+            // The zero case is taken by the other branch, so this delay is
+            // never zero however little the back end can see of it
+            FileLine* const dflp = new FileLine{flp};
+            dflp->warnOff(V3ErrorCode::ZERODLY, true);
             return new AstIf{flp, isZerop, deltaWait(flp),
-                             new AstDelay{flp, timep, false}};
+                             new AstDelay{dflp, timep, false}};
         }
     }
 
@@ -4781,7 +4944,7 @@ private:
         VL_RESTORER_COPY(m_prefix);
         m_ftaskp = ftaskp;
         m_prefix.clear();
-        for (AstNode* p = nodep->paramsp(); p; p = p->nextp()) {
+        for (AstNode* p = firstParamOf(nodep); p; p = p->nextp()) {
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             VhdlSymbol* const psymp = ifp->vhdlSymp();
             if (!psymp) continue;
@@ -4881,7 +5044,7 @@ private:
         ftaskp->dpiImport(true);
         ftaskp->cname(symp->foreignName());
         ftaskp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
-        for (AstNode* p = nodep->paramsp(); p; p = p->nextp()) {
+        for (AstNode* p = firstParamOf(nodep); p; p = p->nextp()) {
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             VhdlSymbol* const psymp = ifp->vhdlSymp();
             if (!psymp) continue;

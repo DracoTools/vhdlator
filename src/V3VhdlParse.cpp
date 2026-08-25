@@ -975,8 +975,13 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
     // VHDL-2008 generic subprogram
     if (check(VhdlTokType::KWD_GENERIC)) {
         expect(VhdlTokType::LPAREN, "'(' after 'generic'");
-        // Generics of a subprogram are kept with its parameters for now
+        // A subprogram's generics are interface declarations like its
+        // parameters, so they are kept in the same list with a count of how
+        // many of them come first
         nodep->addParamsp(parseInterfaceList(VhdlIfaceKind::CONSTANT));
+        int generics = 0;
+        for (AstNode* p = nodep->paramsp(); p; p = p->nextp()) ++generics;
+        nodep->genericCount(generics);
         expect(VhdlTokType::RPAREN, "')' after the generic clause");
         if (check(VhdlTokType::KWD_GENERIC)) {
             expect(VhdlTokType::KWD_MAP, "'map' after 'generic'");
@@ -1022,6 +1027,7 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
     if (peekType() == VhdlTokType::KWD_IS && peekType(1) == VhdlTokType::BOX) {
         consume();
         consume();
+        nodep->defaultsToVisible(true);
         return nodep;
     }
     // In an interface list the specification ends at ';' or ')', both of which

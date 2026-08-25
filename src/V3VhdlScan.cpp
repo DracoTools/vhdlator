@@ -773,19 +773,33 @@ VhdlToken V3VhdlScan::scanAbstractLiteral(FileLine* flp) {
     if (isReal) {
         tok.type = VhdlTokType::REAL_LIT;
         double value = 0.0;
-        for (const char c : mantissa) {
-            value = value * base + extendedDigitValue(static_cast<unsigned char>(c));
-        }
-        double scale = 1.0;
-        for (const char c : fraction) {
-            scale /= base;
-            value += extendedDigitValue(static_cast<unsigned char>(c)) * scale;
-        }
-        // pow rather than a loop: an exponent may be astronomically large,
-        // as in 0e100000000000
-        if (exponent != 0) {
-            value *= std::pow(static_cast<double>(base),
-                              static_cast<double>(expNegative ? -exponent : exponent));
+        if (base == 10) {
+            // Converted as one number rather than digit by digit: adding
+            // 7*0.1 and then 5*0.01 gives 0.7500000000000001, not 0.75,
+            // because neither tenth is a binary fraction
+            std::string text = mantissa.empty() ? "0" : mantissa;
+            text += "." + (fraction.empty() ? std::string{"0"} : fraction);
+            if (exponent != 0) {
+                text += std::string{"e"} + (expNegative ? "-" : "") + std::to_string(exponent);
+            }
+            value = std::strtod(text.c_str(), nullptr);
+        } else {
+            for (const char c : mantissa) {
+                value = value * base + extendedDigitValue(static_cast<unsigned char>(c));
+            }
+            // From the right, so each step is one exact division in a base
+            // that is a power of two
+            double frac = 0.0;
+            for (auto it = fraction.rbegin(); it != fraction.rend(); ++it) {
+                frac = (frac + extendedDigitValue(static_cast<unsigned char>(*it))) / base;
+            }
+            value += frac;
+            // pow rather than a loop: an exponent may be astronomically
+            // large, as in 0e100000000000
+            if (exponent != 0) {
+                value *= std::pow(static_cast<double>(base),
+                                  static_cast<double>(expNegative ? -exponent : exponent));
+            }
         }
         tok.realVal = value;
     } else {

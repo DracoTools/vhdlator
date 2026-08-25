@@ -886,10 +886,14 @@ private:
     void visit(AstVhdlComponentDecl* nodep) override;
     void visit(AstVhdlAliasDecl* nodep) override;
     void visit(AstVhdlPackageInst* nodep) override;
+    void visit(AstVhdlSubprogInst* nodep) override;
+
     void instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* intop) VL_MT_DISABLED;
     void bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlExpr* actualp,
                             VhdlScope* outerp) VL_MT_DISABLED;
     std::map<std::string, AstVhdlPackageBody*> m_packageBodies;  // "lib.name" -> its body
+    // Every generic subprogram body in the design, by name, for instantiation
+    std::multimap<std::string, AstVhdlSubprogDecl*> m_genericBodies;
     void visit(AstVhdlAttrDecl* nodep) override;
     void visit(AstVhdlAttrSpec* nodep) override;
     void recordUserAttr(AstVhdlAttrSpec* nodep) VL_MT_DISABLED;
@@ -1007,6 +1011,7 @@ private:
         std::string chars;
     };
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
+    static void dropUninstantiated(std::vector<VhdlSymbol*>& found) VL_MT_DISABLED;
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
@@ -1197,10 +1202,39 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
     // site passes, so that lengths depending on them fold (see specialize())
     std::vector<VhdlValue> specValues;
     specValues.swap(m_specValues);
-    size_t paramNum = 0;
-    for (AstNode* paramp = nodep->paramsp(); paramp; paramp = paramp->nextp(), ++paramNum) {
+    // The generics of a generic subprogram come first and are not part of
+    // its profile (4.2.1). An instantiation supplies their actuals; the
+    // uninstantiated declaration itself declares them as they are written, so
+    // that its body analyzes.
+    size_t genericNum = 0;
+    for (AstNode* paramp = nodep->paramsp();
+         paramp && genericNum < static_cast<size_t>(nodep->genericCount());
+         paramp = paramp->nextp(), ++genericNum) {
         AstVhdlIfaceDecl* const ifp = VN_AS(paramp, VhdlIfaceDecl);
-        m_scopep = outerp;
+        // An instantiation writes each actual into the formal it binds, so
+        // the copy carries its own bindings wherever it is analyzed again
+        if (nodep->isInstance() && ifp->defaultp()) {
+            bindPackageGeneric(ifp, ifp->defaultp(), outerp);
+        } else if (nodep->isInstance()) {
+            // "is <>" left as it stands: the copy uses whatever is visible
+            // where it was instantiated, so nothing is declared to hide it
+        } else {
+            // As written: a generic type, subprogram or package declares
+            // itself here so that the body which uses it analyzes (6.5.5)
+            iterate(ifp);
+        }
+    }
+    size_t paramNum = 0;
+    AstNode* firstParamp = nodep->paramsp();
+    for (int i = 0; i < nodep->genericCount() && firstParamp; ++i) {
+        firstParamp = firstParamp->nextp();
+    }
+    // A parameter's type is named in the enclosing region -- except that a
+    // generic subprogram's generics are visible to its parameters too (6.5.5)
+    VhdlScope* const typeScopep = nodep->genericCount() > 0 ? innerp : outerp;
+    for (AstNode* paramp = firstParamp; paramp; paramp = paramp->nextp(), ++paramNum) {
+        AstVhdlIfaceDecl* const ifp = VN_AS(paramp, VhdlIfaceDecl);
+        m_scopep = typeScopep;
         VhdlType* const typep = resolveSubtype(ifp->subtypep());
         m_scopep = innerp;
         VhdlSymbol* const psymp = VhdlSymTab::newSymbol(
@@ -1222,7 +1256,7 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         if (ifp->defaultp()) analyzeExpr(ifp->defaultp(), typep);
     }
     if (nodep->isFunction()) {
-        m_scopep = outerp;
+        m_scopep = typeScopep;
         VhdlType* const retp = resolveTypeMark(nodep->returnTypep());
         m_scopep = innerp;
         symp->returnTypep(retp);
@@ -1256,6 +1290,26 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             }
         }
     }
+    // A call to the uninstantiated name inside a copy means the copy itself:
+    // that is how a generic subprogram recurses (4.4)
+    if (nodep->isInstance() && !nodep->templateName().empty()
+        && nodep->templateName() != nodep->name()) {
+        VhdlSymbol* const selfp
+            = VhdlSymTab::newSymbol(symp->kind(), nodep->templateName(), nodep);
+        selfp->aliasp(symp);
+        selfp->typep(symp->typep());
+        // The profile too, since overload resolution reads it from the name
+        // it was given rather than from what the name denotes
+        for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
+            selfp->addParam(symp->paramName(i), symp->paramTypes()[i],
+                            symp->paramHasDefault(i));
+        }
+        selfp->returnTypep(symp->returnTypep());
+        selfp->hasBody(true);
+        m_scopep = innerp;
+        declare(selfp, nodep->fileline());
+        m_scopep = outerp;
+    }
     if (reusep) {
         reusep->hasBody(true);
         reusep->innerp(innerp);
@@ -1271,8 +1325,14 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         m_scopep = innerp;
         VhdlType* const oldReturnp = m_returnTypep;
         m_returnTypep = symp->returnTypep();
-        iterateAndNextNull(nodep->declsp());
-        iterateAndNextNull(nodep->stmtsp());
+        // The body of an uninstantiated generic subprogram is written
+        // against types and operations that only an instantiation supplies,
+        // so it is checked in each copy rather than here (4.4)
+        const bool isTemplate = nodep->genericCount() > 0 && !nodep->isInstance();
+        if (!isTemplate) {
+            iterateAndNextNull(nodep->declsp());
+            iterateAndNextNull(nodep->stmtsp());
+        }
         m_returnTypep = oldReturnp;
     }
     m_scopep = outerp;
@@ -1807,6 +1867,14 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             const std::string lib = bodyp->libname().empty() ? "work" : lower(bodyp->libname());
             m_packageBodies[lib + "." + lower(bodyp->name())] = bodyp;
         }
+        // A generic subprogram may be instantiated from a unit that sees only
+        // its declaration, while the body it has to copy is in a package body
+        // analyzed later (4.4)
+        unitp->foreach([this](AstVhdlSubprogDecl* declp) {
+            if (declp->genericCount() > 0 && declp->hasBody()) {
+                m_genericBodies.emplace(declp->name(), declp);
+            }
+        });
     }
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         setupUnitContext(unitp);
@@ -2018,6 +2086,85 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     m_scopep = savedp;
 }
 
+// "function add1 is new adder generic map (1);" (4.4). The instance is a copy
+// of the uninstantiated subprogram with its generics bound, analyzed here.
+void VhdlSemVisitor::visit(AstVhdlSubprogInst* nodep) {
+    std::vector<std::string> parts;
+    if (!flatten(nodep->uninstantiatedp(), parts) || parts.empty()) {
+        err(nodep->fileline(), "A subprogram instantiation needs the name of a subprogram");
+        return;
+    }
+    std::vector<VhdlSymbol*> found;
+    lookup(parts.back(), found);
+    AstVhdlSubprogDecl* templp = nullptr;
+    for (VhdlSymbol* const symp : found) {
+        // The body may be in a package body the instantiation cannot see,
+        // which is where analysis keeps it for copying
+        AstVhdlSubprogDecl* declp = symp->resolved()->bodyp();
+        if (!declp) declp = VN_CAST(symp->resolved()->declp(), VhdlSubprogDecl);
+        if (declp && declp->genericCount() > 0 && declp->hasBody()) {
+            templp = declp;
+            break;
+        }
+    }
+    if (!templp) {
+        const auto range = m_genericBodies.equal_range(parts.back());
+        if (range.first != range.second) {
+            templp = range.first->second;
+            if (std::next(range.first) != range.second) {
+                err(nodep->fileline(), "More than one generic subprogram '" + parts.back()
+                                           + "' could be instantiated here");
+            }
+        }
+    }
+    if (!templp) {
+        err(nodep->fileline(),
+            "Cannot find a generic subprogram '" + parts.back() + "' with a body to instantiate");
+        return;
+    }
+    AstVhdlSubprogDecl* const copyp = templp->cloneTree(false);
+    VhdlUnanalyzeVisitor{copyp};
+    copyp->templateName(copyp->name());
+    copyp->name(nodep->name());
+    copyp->isInstance(true);
+    // The actual for each generic, by name where the map names its formal
+    std::vector<AstVhdlAssoc*> assocs;
+    for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+        assocs.push_back(VN_AS(p, VhdlAssoc));
+    }
+    size_t position = 0;
+    for (AstNode* p = copyp->paramsp();
+         p && position < static_cast<size_t>(copyp->genericCount());
+         p = p->nextp(), ++position) {
+        AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
+        AstNodeVhdlExpr* actualp = nullptr;
+        for (size_t i = 0; i < assocs.size(); ++i) {
+            const AstVhdlName* const namep
+                = assocs[i]->formalp() ? VN_CAST(assocs[i]->formalp(), VhdlName) : nullptr;
+            if (namep) {
+                if (namep->name() == formalp->name()) actualp = assocs[i]->actualp();
+            } else if (i == position) {
+                actualp = assocs[i]->actualp();
+            }
+        }
+        if (!actualp && formalp->profilep() && formalp->profilep()->defaultsToVisible()) {
+            // Left to whatever is visible: the formal binds to nothing, and
+            // its own default is dropped so no later copy binds it either
+            if (formalp->defaultp()) formalp->defaultp()->unlinkFrBack()->deleteTree();
+            continue;
+        }
+        if (actualp) {
+            if (formalp->defaultp()) formalp->defaultp()->unlinkFrBack()->deleteTree();
+            formalp->defaultp(actualp->cloneTree(false));
+        } else if (!formalp->defaultp()) {
+            err(nodep->fileline(),
+                "Generic '" + formalp->name() + "' of the instantiated subprogram has no value");
+        }
+    }
+    nodep->copyp(copyp);
+    iterate(copyp);
+}
+
 // One generic of an instantiated package: a value, a type, or a subprogram
 void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlExpr* actualp,
                                         VhdlScope* outerp) {
@@ -2041,7 +2188,14 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
         m_scopep = outerp;
         std::vector<std::string> parts;
         std::vector<VhdlSymbol*> found;
-        if (flatten(actualp, parts) && !parts.empty()) {
+        // An operator is named by its symbol -- "op => \"+\"" -- which reads
+        // as a string literal until it is known to be a designator (4.5.3)
+        if (const AstVhdlLiteral* const litp = VN_CAST(actualp, VhdlLiteral)) {
+            if (litp->kind() == VhdlLitKind::STRING) parts.push_back(lower(litp->text()));
+        }
+        if (!parts.empty()) {
+            lookup(parts.back(), found);
+        } else if (flatten(actualp, parts) && !parts.empty()) {
             // The actual may be a selected name: "work.helpers.same"
             VhdlScope* scopep = outerp;
             bool viaScope = parts.size() > 1;
@@ -2118,14 +2272,14 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     // as already worked out, which is exactly what a written-out constraint
     // would have produced.
     size_t i = 0;
-    for (AstNode* p = copyp->paramsp(); p; p = p->nextp(), ++i) {
+    // A generic subprogram's generics come ahead of its parameters and are
+    // not what the call supplies (4.2.1)
+    AstNode* firstp = copyp->paramsp();
+    for (int g = 0; g < copyp->genericCount() && firstp; ++g) firstp = firstp->nextp();
+    for (AstNode* p = firstp; p; p = p->nextp(), ++i) {
         AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
         if (i >= actualTypes.size() || !actualTypes[i]) continue;
         if (!ifp->subtypep()) continue;
-        VhdlType* const paramp = originalp->paramsp()
-                                     ? nullptr
-                                     : nullptr;  // Unused; kept for clarity
-        (void)paramp;
         ifp->subtypep()->vhdlTypep(actualTypes[i]);
     }
     // Analyze the copy in the region the original was declared in, so it sees
@@ -2537,6 +2691,19 @@ bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
     return false;
 }
 
+// An uninstantiated generic subprogram is not callable: only an instance of
+// it is (4.4). It stays visible so that "is new" can find it.
+void VhdlSemVisitor::dropUninstantiated(std::vector<VhdlSymbol*>& found) {
+    found.erase(std::remove_if(found.begin(), found.end(),
+                               [](const VhdlSymbol* symp) {
+                                   const AstVhdlSubprogDecl* const declp
+                                       = VN_CAST(symp->resolved()->declp(), VhdlSubprogDecl);
+                                   return declp && declp->genericCount() > 0
+                                          && !declp->isInstance();
+                               }),
+                found.end());
+}
+
 void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
     if (!nodep) return;
     if (nodep->vhdlTypep()) {
@@ -2631,6 +2798,7 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
         std::vector<std::string> parts;
         std::vector<VhdlSymbol*> found;
         if (flatten(callp->prefixp(), parts) && !parts.empty()) lookup(parts.back(), found);
+        dropUninstantiated(found);
         bool onlySubprograms = !found.empty();
         for (const VhdlSymbol* const symp : found) {
             if (symp->kind() != VhdlSymKind::FUNCTION) onlySubprograms = false;
@@ -3387,6 +3555,8 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             }
         }
     }
+
+    dropUninstantiated(found);
 
     // A type mark in this position makes it a type conversion (9.3.6) or a
     // constrained subtype indication that the parser could not tell apart

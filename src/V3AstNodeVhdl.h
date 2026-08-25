@@ -744,6 +744,14 @@ class AstVhdlSubprogDecl final : public AstNodeVhdlDecl {
     bool m_isPure = true;  // Functions are pure unless declared impure
     bool m_hasBody = false;
     bool m_isOperator = false;  // Designator was a string, e.g. "and"
+    // A generic subprogram keeps its generics ahead of its parameters, since
+    // both are interface declarations of the same shape (4.2.1, 6.5.5)
+    int m_genericCount = 0;
+    // "function \"+\" (l, r : t) return t is <>": a generic subprogram that
+    // defaults to whatever is visible where it is instantiated (6.5.5)
+    bool m_defaultsToVisible = false;
+    bool m_isInstance = false;  // A copy made by "is new", which is callable
+    std::string m_templateName;  // What the copy was made from, for recursion
 
 public:
     AstVhdlSubprogDecl(FileLine* fl, const std::string& name, bool isFunction)
@@ -757,6 +765,14 @@ public:
     void vhdlPure(bool flag) { m_isPure = flag; }
     bool hasBody() const { return m_hasBody; }
     void hasBody(bool flag) { m_hasBody = flag; }
+    int genericCount() const { return m_genericCount; }
+    void genericCount(int n) { m_genericCount = n; }
+    bool defaultsToVisible() const { return m_defaultsToVisible; }
+    void defaultsToVisible(bool flag) { m_defaultsToVisible = flag; }
+    bool isInstance() const { return m_isInstance; }
+    void isInstance(bool flag) { m_isInstance = flag; }
+    const std::string& templateName() const { return m_templateName; }
+    void templateName(const std::string& name) { m_templateName = name; }
     bool isOperator() const { return m_isOperator; }
     void isOperator(bool flag) { m_isOperator = flag; }
     void dump(std::ostream& str) const override;
@@ -767,6 +783,7 @@ class AstVhdlSubprogInst final : public AstNodeVhdlDecl {
     // @astgen op1 := uninstantiatedp : AstNodeVhdlExpr
     // @astgen op2 := genericMapp : List[AstVhdlAssoc]
     // @astgen op3 := signaturep : Optional[AstVhdlSignature]
+    // @astgen op4 := copyp : Optional[AstVhdlSubprogDecl]  // The instance itself
     const bool m_isFunction;
 
 public:

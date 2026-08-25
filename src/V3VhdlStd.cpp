@@ -284,6 +284,13 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         addFunc(scopep, ">=", boolp, {typep, typep});
         addFunc(scopep, "minimum", typep, {typep, typep});
         addFunc(scopep, "maximum", typep, {typep, typep});
+        // A one-dimensional array of a scalar also answers for the whole of
+        // itself, giving one element back (5.3.2.4)
+        if (typep->kind() == VhdlTypeKind::ARRAY && typep->elementp()
+            && typep->elementp()->isScalar()) {
+            addFunc(scopep, "minimum", typep->elementp(), {typep});
+            addFunc(scopep, "maximum", typep->elementp(), {typep});
+        }
     }
 
     if (typep->isNumeric()) {

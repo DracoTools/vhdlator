@@ -35,6 +35,12 @@ package p is
   constant image_c : string := "n=" & integer'image(42);
   constant value_c : integer := integer'value("17");
   constant real_c : real := 5.0 / 2;
+  -- A decimal real literal is one number, not a sum of scaled digits: adding
+  -- 7*0.1 and then 5*0.01 gives 0.7500000000000001 rather than 0.75 (15.5.2)
+  constant three_quarters : real := 0.75;
+  constant thousandth : real := 1.0e-3;
+  constant hex_real : real := 16#F.8#;
+  constant bin_real : real := 2#1.1#;
   constant bool_c : boolean := 3 < 2;
   constant delay_c : time := 2 * 500 ns;
   constant char_c : character := 'x';

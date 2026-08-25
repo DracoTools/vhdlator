@@ -3,6 +3,7 @@ VHDLPACKAGE work.p
   enumeration literal 'b' : opcode_t
   enumeration literal 'c' : opcode_t
   constant asc_c : boolean = false
+  constant bin_real : real = 1.50000
   constant bool_c : boolean = false
   enumeration literal busy : state_t
   type byte_t : byte_t range 0 to 255
@@ -13,6 +14,7 @@ VHDLPACKAGE work.p
   enumeration literal done : state_t
   type freq_t : freq_t range 0 hz to 1000000 hz
   physical unit ghz : freq_t = 1000000000 hz
+  constant hex_real : real = 15.5000
   constant high_c : integer = 255
   physical unit hz : freq_t = 1 hz
   enumeration literal idle : state_t
@@ -33,6 +35,8 @@ VHDLPACKAGE work.p
   type small_t : small_t range 1 to 8
   type state_t : state_t range idle to done
   constant succ_c : state_t = busy
+  constant thousandth : real = 0.00100000
+  constant three_quarters : real = 0.750000
   constant value_c : integer = 17
   constant width_c : integer = 8
   type word_t : word_t (<>)
