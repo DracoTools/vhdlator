@@ -247,6 +247,10 @@ void V3Vhdl::parseFile(FileLine* fl, const string& filename, const string& libna
     if (foundname.empty()) return;  // filePath() already reported it, if asked to
 
     s_filenames.push_back(foundname);
+    // What the model was built from, so that "--skip-identical" notices when
+    // a source changes and "-MMD" writes it as a dependency. The Verilog
+    // preprocessor does this for Verilog; VHDL does not go through it.
+    V3File::addSrcDepend(foundname);
 
     // Slurp the file. VHDL sources are small, and a flat buffer keeps the
     // scanner's lookahead trivial.

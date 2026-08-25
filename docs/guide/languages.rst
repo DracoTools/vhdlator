@@ -456,6 +456,15 @@ length and runs at the speed of hand-written Verilog. Where the length is
 not known until the value is computed, as for ``integer'image``, the value
 is carried dynamically instead. Both are correct; only the second allocates.
 
+**An external name reaches instances, not blocks.** ``<< signal
+uut.inner : integer >>`` reads and writes the object it names, by a
+pathname relative to where it is written or absolute from the root. A
+pathname that starts at ``^``, one that names a *block* label -- a block is
+elaborated where it stands, so it is not a level of hierarchy here -- and
+the ``@`` form that names an object in a package are not supported. After a
+``release`` the signal keeps the value it was forced to until something
+drives it again.
+
 **A path name stops at the design unit.** ``'INSTANCE_NAME`` and
 ``'PATH_NAME`` give every region from the design unit down --
 ``:work:pkg:f[ return integer]:`` for a package subprogram,

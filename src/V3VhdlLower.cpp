@@ -967,6 +967,9 @@ private:
             // A null access value is a null handle (9.3.2)
             if (p->kind() == VhdlLitKind::NULLLIT) return new AstConst{flp, AstConst::Null{}};
         }
+        if (AstVhdlExternalName* const p = VN_CAST(nodep, VhdlExternalName)) {
+            return lowerExternalName(p, false);
+        }
         unsup(flp, std::string{"expression "} + nodep->typeName());
         return nullptr;
     }
@@ -1488,6 +1491,53 @@ private:
             return outp;
         }
         return nullptr;
+    }
+
+    // The left side of an assignment, which may be an external name (8.7)
+    AstNodeExpr* lowerTarget(AstNodeVhdlExpr* nodep) {
+        if (AstVhdlExternalName* const extp = VN_CAST(nodep, VhdlExternalName)) {
+            return lowerExternalName(extp, true);
+        }
+        return lowerExpr(nodep);
+    }
+
+    // "<< signal .top.uut.x : natural >>" names an object somewhere else in
+    // the design (8.7). Verilator resolves a dotted name against the
+    // hierarchy already, so the path becomes one.
+    AstNodeExpr* lowerExternalName(AstVhdlExternalName* nodep, bool write) {
+        FileLine* const flp = nodep->fileline();
+        if (nodep->package()) {
+            unsup(flp, "external name of an object in a package");
+            return nullptr;
+        }
+        if (nodep->upLevels() > 0) {
+            unsup(flp, "external name with a relative pathname starting at '^'");
+            return nullptr;
+        }
+        std::vector<std::string> parts;
+        for (AstNode* p = nodep->pathp(); p; p = p->nextp()) {
+            std::vector<std::string> one;
+            if (!flattenName(VN_AS(p, NodeVhdlExpr), one) || one.empty()) {
+                unsup(flp, "external name whose pathname is not a list of names");
+                return nullptr;
+            }
+            for (const std::string& part : one) parts.push_back(part);
+        }
+        if (parts.empty()) {
+            unsup(flp, "external name with no pathname");
+            return nullptr;
+        }
+        const std::string name = parts.back();
+        std::string dotted;
+        // An absolute pathname starts at the root of the design, which is the
+        // top module; a relative one starts where it is written
+        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+            if (!dotted.empty()) dotted += ".";
+            dotted += parts[i];
+        }
+        AstVarXRef* const refp = new AstVarXRef{
+            flp, name, dotted, write ? VAccess::WRITE : VAccess::READ};
+        return refp;
     }
 
     AstNodeExpr* lowerSelected(AstVhdlSelected* nodep) {
@@ -3630,6 +3680,23 @@ private:
     // is exactly what Verilator's non-blocking assignment region means
     AstNode* lowerSeqAssign(AstVhdlSigAssign* nodep, bool sequential) {
         FileLine* const flp = nodep->fileline();
+        // "s <= force v" drives the signal regardless of what else does,
+        // until "s <= release" hands it back (10.5.2.1, VHDL-2008)
+        if (nodep->release()) {
+            AstNodeExpr* const lhsp = lowerTarget(nodep->targetp());
+            if (!lhsp) return nullptr;
+            v3Global.setHasForceableSignals();
+            return new AstRelease{flp, lhsp};
+        }
+        if (nodep->force()) {
+            AstVhdlWaveform* const forcep = nodep->wavesp();
+            if (!forcep || !forcep->valuep()) return nullptr;
+            AstNodeExpr* const lhsp = lowerTarget(nodep->targetp());
+            AstNodeExpr* const rhsp = lowerExpr(forcep->valuep());
+            if (!lhsp || !rhsp) return nullptr;
+            v3Global.setHasForceableSignals();
+            return new AstAssignForce{flp, lhsp, rhsp};
+        }
         if (nodep->kind() != VhdlAssignKind::SIMPLE) {
             unsup(flp, "conditional signal assignment in a process");
             return nullptr;
