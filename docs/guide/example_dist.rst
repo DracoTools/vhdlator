@@ -14,6 +14,21 @@ installed (in an OS-specific place, often in e.g.
 examples/make_hello_binary
    Example GNU-make simple Verilog->binary conversion
 
+examples/make_hello_vhdl
+   Example GNU-make simple VHDL->binary conversion
+
+examples/make_vhdl_foreign
+   Example VHDL calling C with the FOREIGN attribute, and C calling VHDL
+
+examples/make_vhdl_vpi
+   Example reading and writing VHDL objects over VPI
+
+examples/make_mixed_lang
+   Example with VHDL and Verilog instantiating each other in one model
+
+examples/make_vhdl_cocotb
+   Example running a cocotb testbench against a VHDL design
+
 examples/make_hello_c
    Example GNU-make simple Verilog->C++ conversion
 

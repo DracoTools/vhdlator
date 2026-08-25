@@ -112,6 +112,11 @@ SUBDIRS = docs src test_regress \
   examples/cmake_tracing_sc \
   examples/cmake_protect_lib \
   examples/make_hello_binary \
+  examples/make_hello_vhdl \
+  examples/make_vhdl_foreign \
+  examples/make_vhdl_vpi \
+  examples/make_mixed_lang \
+  examples/make_vhdl_cocotb \
   examples/make_hello_c \
   examples/make_hello_sc \
   examples/make_tracing_c \
@@ -321,6 +326,11 @@ installdata:
 	  $(INSTALL_DATA) $$p $(DESTDIR)$(pkgdatadir)/$$p; \
 	done
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_hello_binary
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_hello_vhdl
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_foreign
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_vpi
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_mixed_lang
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_cocotb
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_hello_c
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_hello_sc
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_tracing_c
@@ -360,6 +370,11 @@ uninstall:
 	-rmdir $(DESTDIR)$(pkgdatadir)/include/vltstd
 	-rmdir $(DESTDIR)$(pkgdatadir)/include
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_binary
+	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_vhdl
+	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_foreign
+	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_vpi
+	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_mixed_lang
+	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_cocotb
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_c
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_sc
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_tracing_c

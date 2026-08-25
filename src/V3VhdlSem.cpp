@@ -3564,9 +3564,16 @@ VhdlType* VhdlSemVisitor::convertedType(VhdlType* top, AstVhdlAssoc* argp) {
     }
     if (!argp || !argp->actualp()) return top;
     VhdlType* const fromp = argp->actualp()->vhdlTypep();
-    if (!fromp || !fromp->isConstrainedArray()
-        || fromp->dimensions() != top->base()->indexTypes().size()) {
+    if (!fromp || fromp->base()->kind() != VhdlTypeKind::ARRAY
+        || fromp->indexTypes().size() != top->base()->indexTypes().size()) {
         return top;
+    }
+    if (!fromp->isConstrainedArray()) {
+        // A length that is not a number here but is fixed once the instance
+        // is elaborated transfers just as a static one does
+        for (const VhdlType* const idxp : fromp->indexTypes()) {
+            if (!idxp || !idxp->boundsp()) return top;
+        }
     }
     VhdlType* const outp = cloneSubtype(top, argp->fileline());
     outp->clearIndexTypes();

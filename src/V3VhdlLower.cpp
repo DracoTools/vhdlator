@@ -1026,8 +1026,15 @@ private:
     // true before the event, which is what the attributes are defined against.
     const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
         VhdlSymbol* const symp = prefixp->vhdlSymp();
+        // Only a signal of the design has a history to keep. A signal-class
+        // *parameter* names whatever signal the call passed, which is not
+        // known here.
         if (!symp || symp->kind() != VhdlSymKind::SIGNAL) {
             if (!symp || symp->kind() != VhdlSymKind::PORT) return nullptr;
+        }
+        if (m_ftaskp && symp->kind() == VhdlSymKind::SIGNAL && m_vars.count(symp)
+            && m_vars.at(symp)->isFuncLocal()) {
+            return nullptr;
         }
         const auto found = m_shadows.find(symp);
         if (found != m_shadows.end()) return &found->second;
@@ -1036,6 +1043,10 @@ private:
         AstVar* const sigp = varIt->second;
         VhdlShadow sh;
         const std::string base = "__Vsig" + std::to_string(++m_nameNum) + "__" + symp->name();
+        // These belong to the module: a block assigns them, and a
+        // non-blocking assignment may not target an automatic variable
+        VL_RESTORER(m_ftaskp);
+        m_ftaskp = nullptr;
         AstNodeDType* const valDTypep = lowerType(symp->typep(), flp);
         sh.prevp = newTempVar(base + "__prev", valDTypep, flp);
         sh.lastp = newTempVar(base + "__last", lowerType(symp->typep(), flp), flp);
@@ -1783,6 +1794,25 @@ private:
             return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
         }
         if (args.empty()) return nullptr;
+        // An edge test is the shape a clocked process is recognised by, but
+        // it may be written anywhere; compiling std_logic_1164's own body for
+        // it would ask about the history of a signal-class parameter, which
+        // names a different signal at every call (16.8.2)
+        if ((name == "rising_edge" || name == "falling_edge") && args.size() == 1) {
+            if (const VhdlShadow* const shp = shadowFor(args[0], flp)) {
+                AstNodeExpr* const evp = eventOf(args[0], shp, flp);
+                AstNodeExpr* const levelp = lowerExpr(args[0]);
+                if (evp && levelp) {
+                    return new AstLogAnd{
+                        flp, evp,
+                        name == "rising_edge"
+                            ? levelp
+                            : static_cast<AstNodeExpr*>(new AstLogNot{flp, levelp})};
+                }
+                if (evp) VL_DO_DANGLING(evp->deleteTree(), evp);
+                if (levelp) VL_DO_DANGLING(levelp->deleteTree(), levelp);
+            }
+        }
         AstNodeExpr* const firstp = lowerExpr(args[0]);
         if (!firstp) return nullptr;
 
