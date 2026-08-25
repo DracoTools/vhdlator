@@ -161,6 +161,31 @@ class VhdlSemVisitor final : public VNVisitor {
         return nullptr;
     }
 
+    // The type a name denotes, or null, without saying anything if it does
+    // not denote one
+    VhdlSymbol* lookupTypeQuiet(const AstNodeVhdlExpr* namep) {
+        std::vector<std::string> parts;
+        if (!flatten(namep, parts) || parts.empty()) return nullptr;
+        VhdlScope* scopep = m_scopep;
+        for (size_t i = 0; i + 1 < parts.size() && scopep; ++i) {
+            scopep = scopep->findNamed(parts[i]);
+        }
+        if (!scopep) return nullptr;
+        std::vector<VhdlSymbol*> found;
+        if (parts.size() == 1) {
+            lookup(parts[0], found);
+        } else {
+            scopep->lookupLocal(parts.back(), found);
+        }
+        for (VhdlSymbol* const symp : found) {
+            if (symp->kind() == VhdlSymKind::TYPE && symp->typep()) return symp;
+            if (symp->aliasp() && symp->aliasp()->kind() == VhdlSymKind::TYPE) {
+                return symp->aliasp();
+            }
+        }
+        return nullptr;
+    }
+
     // A protected type's methods are named through an object of that type
     // (5.6.2): "c.increment(4)". Given the prefix that stands before the
     // method name, return the object it denotes and the region holding the
@@ -440,6 +465,28 @@ class VhdlSemVisitor final : public VNVisitor {
     // Resolve a type mark to the type it names
     VhdlType* resolveTypeMark(AstNodeVhdlExpr* markp) {
         if (!markp) return V3VhdlStd::errorType();
+        // An attribute may stand where a type mark does: 'SUBTYPE is the
+        // subtype of an object, constraint and all, and 'ELEMENT the element
+        // subtype of an array (16.2.5)
+        if (AstVhdlAttrName* const attrp = VN_CAST(markp, VhdlAttrName)) {
+            const std::string& attr = attrp->name();
+            if (attr == "subtype" || attr == "base" || attr == "element") {
+                VhdlType* typep = analyzeExpr(attrp->prefixp(), nullptr);
+                if (!typep || typep->isError()) return V3VhdlStd::errorType();
+                if (attr == "base") typep = typep->base();
+                if (attr == "element") {
+                    if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->elementp()) {
+                        err(markp->fileline(),
+                            "Attribute 'element needs an array, but the prefix is "
+                                + typep->prettyName());
+                        return V3VhdlStd::errorType();
+                    }
+                    typep = typep->elementp();
+                }
+                markp->vhdlTypep(typep);
+                return typep;
+            }
+        }
         VhdlSymbol* const symp = lookupOne(markp, VhdlSymKind::TYPE, "type");
         if (!symp || !symp->typep()) return V3VhdlStd::errorType();
         markp->vhdlSymp(symp);
@@ -453,16 +500,22 @@ class VhdlSemVisitor final : public VNVisitor {
         if (nodep->vhdlTypep()) return nodep->vhdlTypep();
         // The parser could not tell "std_logic_vector(7 downto 0)" from a
         // call, so a constrained type mark arrives as one (8.1)
-        AstVhdlCall* const callp = VN_CAST(nodep->typeMarkp(), VhdlCall);
-        VhdlType* const basep
-            = callp ? resolveTypeMark(callp->prefixp()) : resolveTypeMark(nodep->typeMarkp());
+        // "t(3 downto 0)(7 downto 0)" constrains the array and then its
+        // element, and arrives as a call of a call (5.3.2.1)
+        std::vector<AstNode*> argLists;
+        AstNodeVhdlExpr* markp = nodep->typeMarkp();
+        while (AstVhdlCall* const cp = VN_CAST(markp, VhdlCall)) {
+            argLists.push_back(cp->argsp());
+            markp = cp->prefixp();
+        }
+        std::reverse(argLists.begin(), argLists.end());  // Outermost first
+        VhdlType* const basep = resolveTypeMark(markp);
         if (!basep || basep->isError()) {
             nodep->vhdlTypep(V3VhdlStd::errorType());
             return nodep->vhdlTypep();
         }
         AstNodeVhdl* const constraintp = nodep->constraintp();
-        AstNode* const callArgsp = callp ? callp->argsp() : nullptr;
-        if (!constraintp && !callArgsp && !nodep->resolutionp()) {
+        if (!constraintp && argLists.empty() && !nodep->resolutionp()) {
             nodep->vhdlTypep(basep);
             return basep;
         }
@@ -471,8 +524,21 @@ class VhdlSemVisitor final : public VNVisitor {
         // Set before applying the constraint, so that a subtype indication
         // mentioning itself stops rather than recursing
         nodep->vhdlTypep(typep);
-        if (constraintp || callArgsp) {
-            applyConstraint(typep, basep, constraintp, callArgsp, nodep->fileline());
+        VhdlType* curp = typep;
+        VhdlType* curBasep = basep;
+        for (size_t i = 0; i < argLists.size(); ++i) {
+            if (i > 0) {
+                VhdlType* const elemp = curp->elementp();
+                if (!elemp) break;
+                VhdlType* const newElemp = cloneSubtype(elemp, nodep->fileline());
+                curp->elementp(newElemp);
+                curBasep = elemp;
+                curp = newElemp;
+            }
+            applyConstraint(curp, curBasep, nullptr, argLists[i], nodep->fileline());
+        }
+        if (constraintp) {
+            applyConstraint(typep, basep, constraintp, nullptr, nodep->fileline());
         }
         if (nodep->resolutionp()) {
             VhdlSymbol* const resp
@@ -526,7 +592,25 @@ class VhdlSemVisitor final : public VNVisitor {
                 continue;
             }
             VhdlType* const wantp = dim < baseIndexes.size() ? baseIndexes[dim] : nullptr;
-            const RangeInfo info = analyzeRange(rp, wantp);
+            // The parser could not tell an index constraint from a call, so a
+            // range may arrive wrapped in an association
+            AstNode* itemp = rp;
+            if (AstVhdlAssoc* const asp = VN_CAST(rp, VhdlAssoc)) {
+                if (!asp->formalp() && asp->actualp()) itemp = asp->actualp();
+            }
+            RangeInfo info = analyzeRange(itemp, wantp);
+            if (!info.valid) {
+                // A type mark stands for its own range: "t1(r1)" constrains
+                // the array to the whole of R1 (5.3.2.1)
+                if (AstNodeVhdlExpr* const exprp = VN_CAST(itemp, NodeVhdlExpr)) {
+                    if (VhdlSymbol* const tsymp = lookupTypeQuiet(exprp)) {
+                        exprp->vhdlSymp(tsymp);
+                        info.valid = true;
+                        info.typep = tsymp->typep();
+                        takeBoundsFrom(info, info.typep);
+                    }
+                }
+            }
             if (!info.valid) continue;
             VhdlType* idxp = info.typep ? info.typep : wantp;
             if (!info.unbounded && info.left.known() && info.right.known()) {
@@ -2714,6 +2798,9 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         if (typep && typep->kind() == VhdlTypeKind::ACCESS) typep = typep->designatedp();
         if (!typep || typep->kind() != VhdlTypeKind::ARRAY) continue;
         nodep->prefixp()->vhdlSymp(symp);
+        // The prefix denotes the object, so it has the object's type; the
+        // lowering reads it there to know the array's index range
+        if (!nodep->prefixp()->vhdlTypep()) nodep->prefixp()->vhdlTypep(symp->typep());
         nodep->vhdlSymp(symp);
         // A slice keeps the array type; an index yields one element
         const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));

@@ -320,7 +320,9 @@ private:
     // std_logic_vector is one machine word rather than a vector of them
     AstNodeDType* lowerArrayType(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
-        VhdlType* const elemp = basep->elementp();
+        // A subtype may constrain the element as well as the index --
+        // "t(1 to 3)(1 to 2)" -- so its own element is the one to emit
+        VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
         AstNodeDType* dtypep = elemp ? lowerType(elemp, flp) : newLogicDType(flp, 1);
         const bool packed = elemp && elementPacks(elemp);
         // Innermost dimension last, so the ranges nest the way VHDL reads
@@ -748,7 +750,13 @@ private:
         // constant. That covers literals, constants, generics with values and
         // every attribute of a static subtype, in one place.
         const VhdlValue val = V3VhdlEval::eval(nodep);
-        if (val.known()) return lowerValue(val, nodep->vhdlTypep(), flp);
+        if (val.known()) {
+            // A name of an array constant keeps its storage, so that its
+            // index range travels with it and an index reads the right end
+            const bool keepRange = (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected))
+                                   && foldsToBareNumber(nodep->vhdlTypep());
+            if (!keepRange) return lowerValue(val, nodep->vhdlTypep(), flp);
+        }
 
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) {
             return lowerRef(p->vhdlSymp(), p->name(), flp);
@@ -946,7 +954,17 @@ private:
         if (it != m_vars.end()) {
             return new AstVarRef{flp, it->second, VAccess::READ};
         }
-        if (symp->hasValue()) return lowerValue(symp->value(), symp->typep(), flp);
+        if (symp->hasValue()) {
+            // A folded array constant is a plain number, and a number has no
+            // index range, so indexing or slicing it would count from the
+            // wrong end -- VHDL's ranges are the array's, not Verilog's. Such
+            // a constant keeps its storage, so that its range travels with it.
+            if (symp->typep() && symp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                && !isStringType(symp->typep())) {
+                return new AstVarRef{flp, constVarFor(symp, flp), VAccess::READ};
+            }
+            return lowerValue(symp->value(), symp->typep(), flp);
+        }
         // A function of no arguments is called by naming it, with no
         // parentheses, so a name may be a call (4.2.2.1)
         if (symp->kind() == VhdlSymKind::FUNCTION && symp->paramTypes().empty()) {
@@ -968,6 +986,31 @@ private:
         }
         unsup(flp, std::string{symp->kindName()} + " '" + symp->name() + "'");
         return nullptr;
+    }
+
+    // Whether folding a value of this type to a plain number would lose
+    // something. A number has no index range, and Verilog counts its bits
+    // from the right; an array VHDL wrote as "0 to 3" counts from the left,
+    // so indexing the folded number would read the wrong end of it.
+    static bool foldsToBareNumber(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (isStringType(typep)) return false;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (indexes.size() != 1 || !indexes[0]) return false;
+        return indexes[0]->ascending() && indexes[0]->length() > 1;
+    }
+
+    // The variable a folded array constant is kept in, made on first use and
+    // belonging to the module rather than to whatever is being built now
+    AstVar* constVarFor(VhdlSymbol* symp, FileLine* flp) {
+        AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+        varp->valuep(lowerValue(symp->value(), symp->typep(), flp));
+        if (m_protClassp) {
+            m_protClassp->addStmtsp(varp);
+        } else {
+            m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+        }
+        return varp;
     }
 
     AstNodeExpr* lowerSelected(AstVhdlSelected* nodep) {
@@ -1547,6 +1590,24 @@ private:
             unsup(flp, "aggregate of this type");
             return nullptr;
         }
+        // An aggregate written entirely positionally, of an element type that
+        // packs, is a concatenation: each value contributes its own width, so
+        // an element that is itself an array of the aggregate's type spans as
+        // many indices as it is long, which VHDL-2008 allows (9.3.3.3)
+        if (typep->base()->elementp() && elementPacks(typep->base()->elementp())
+            && typep->dimensions() == 1 && allPositional(nodep)) {
+            AstNodeExpr* outp = nullptr;
+            for (AstVhdlElemAssoc* p = nodep->elemsp(); p;
+                 p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+                AstNodeExpr* const elemp = lowerExpr(p->valuep());
+                if (!elemp) {
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;
+                }
+                outp = outp ? new AstConcat{flp, outp, elemp} : elemp;
+            }
+            if (outp) return outp;
+        }
         // Where the context gives no constraint -- an aggregate standing as
         // an operand, or returned from a function whose result is
         // unconstrained -- the aggregate's own elements fix its index range
@@ -1641,6 +1702,16 @@ private:
         }
         if (packed) return outp;
         return itemsp ? new AstPattern{flp, itemsp} : nullptr;
+    }
+
+    // Whether every association is positional, so the values follow the
+    // aggregate's index range in order
+    static bool allPositional(AstVhdlAggregate* nodep) {
+        if (!nodep->elemsp()) return false;
+        for (AstVhdlElemAssoc* p = nodep->elemsp(); p; p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+            if (p->choicesp()) return false;
+        }
+        return true;
     }
 
     // "(others => v)" where the length is not a number now but is fixed once
@@ -1849,14 +1920,14 @@ private:
             // expression changes (11.5)
             AstNode* const bodyp = lowerAssert(assertp);
             addStmt(new AstAlways{
-                flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Combo{}}},
+                flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
                 bodyp});
             return;
         }
         if (AstVhdlProcCall* const callp = VN_CAST(nodep, VhdlProcCall)) {
             AstNode* const bodyp = lowerStmt(callp);
             addStmt(new AstAlways{
-                flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Combo{}}},
+                flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
                 bodyp});
             return;
         }
@@ -2030,6 +2101,13 @@ private:
         return outp;
     }
 
+    // Sensitive to everything the block reads, which is what a process with
+    // no list -- or with "all" -- means (11.3). The STAR form is the one the
+    // rest of Verilator expects to see written out rather than inferred.
+    static AstSenItem* comboSenItem(FileLine* flp) {
+        return new AstSenItem{flp, VEdgeType::ET_COMBO_STAR, nullptr};
+    }
+
     // The sensitivity of a process that is not clocked
     AstSenTree* sensitivity(AstVhdlProcess* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -2045,7 +2123,7 @@ private:
             return nullptr;  // No sensitivity: the waits inside do the work
         }
         if (nodep->sensAll() || !nodep->sensp()) {
-            return new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Combo{}}};
+            return new AstSenTree{flp, comboSenItem(flp)};
         }
         // VHDL runs the process when any listed signal changes, which is what
         // an any-edge sensitivity item means. Keeping the written list rather
@@ -2058,7 +2136,7 @@ private:
             itemsp = AstNode::addNext(
                 itemsp, new AstSenItem{flp, VEdgeType::ET_BOTHEDGE, sensp});
         }
-        if (!itemsp) return new AstSenTree{flp, new AstSenItem{flp, AstSenItem::Combo{}}};
+        if (!itemsp) return new AstSenTree{flp, comboSenItem(flp)};
         return new AstSenTree{flp, itemsp};
     }
 
