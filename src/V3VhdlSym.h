@@ -181,6 +181,10 @@ public:
         m_paramNames.push_back(name);
         m_paramDefaults.push_back(hasDefault);
     }
+    const std::string& paramName(size_t i) const {
+        static const std::string empty;
+        return i < m_paramNames.size() ? m_paramNames[i] : empty;
+    }
     // Which formal that name is, or -1
     int paramIndex(const std::string& name) const {
         for (size_t i = 0; i < m_paramNames.size(); ++i) {
@@ -271,6 +275,11 @@ public:
     // Register a region reachable by selection, e.g. a library or package
     void addNamed(const std::string& name, VhdlScope* scopep) VL_MT_DISABLED;
     VhdlScope* findNamed(const std::string& name) const VL_MT_DISABLED;
+
+    // What this region's own use clauses and library clauses brought in, so
+    // that a copy of a design unit can be given the same context it had
+    const std::vector<VhdlScope*>& uses() const { return m_usedp; }
+    const std::map<std::string, VhdlScope*>& named() const { return m_named; }
 };
 
 //============================================================================

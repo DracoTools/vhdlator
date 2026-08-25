@@ -686,6 +686,7 @@ class AstVhdlIfaceDecl final : public AstNodeVhdlDecl {
     // @astgen op1 := subtypep : Optional[AstVhdlSubtypeInd]
     // @astgen op2 := defaultp : Optional[AstNodeVhdlExpr]
     // @astgen op3 := genericsp : List[AstVhdlIfaceDecl]  // Generic package/subprogram
+    // @astgen op4 := profilep : Optional[AstVhdlSubprogDecl]  // Generic subprogram
     const VhdlIfaceKind m_kind;
     VhdlMode m_mode = VhdlMode::IN;
     bool m_modeExplicit = false;  // Mode was written out
@@ -1350,6 +1351,7 @@ class AstVhdlPackageInst final : public AstNodeVhdlUnit {
     // package_instantiation_declaration (4.9), VHDL-2008
     // @astgen op2 := uninstantiatedp : AstNodeVhdlExpr
     // @astgen op3 := genericMapp : List[AstVhdlAssoc]
+    // @astgen op4 := declsp : List[AstNodeVhdl]  // The copy analysis made
 public:
     AstVhdlPackageInst(FileLine* fl, const std::string& name, AstNodeVhdlExpr* uninstantiatedp)
         : ASTGEN_SUPER_VhdlPackageInst(fl, name) {

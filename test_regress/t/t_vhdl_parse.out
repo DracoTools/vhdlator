@@ -380,11 +380,15 @@
 %Error: t/t_vhdl_parse.vhd:49:20: Cannot find type 'std_logic'
 %Error: t/t_vhdl_parse.vhd:53:18: Cannot find type 'unsigned'
 %Error: t/t_vhdl_parse.vhd:53:59: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+... candidate: '0'() return bit
+... candidate: '0'() return character
 %Error: t/t_vhdl_parse.vhd:54:36: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:55:18: Cannot find type 'std_logic_vector'
 %Error: t/t_vhdl_parse.vhd:58:18: Cannot find type 'std_logic'
 %Error: t/t_vhdl_parse.vhd:58:37: Cannot find type 'std_logic'
 %Error: t/t_vhdl_parse.vhd:66:27: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+... candidate: '0'() return bit
+... candidate: '0'() return character
 %Error: t/t_vhdl_parse.vhd:67:16: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:70:14: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:71:50: Cannot find declaration of 'running'
@@ -394,10 +398,16 @@
 %Error: t/t_vhdl_parse.vhd:79:20: Cannot find declaration of 'idle'
 %Error: t/t_vhdl_parse.vhd:86:28: Cannot find declaration of 'running'
 %Error: t/t_vhdl_parse.vhd:86:11: Ambiguous character literal '1': 2 visible declarations match, and the context does not decide between them
+... candidate: '1'() return bit
+... candidate: '1'() return character
 %Error: t/t_vhdl_parse.vhd:86:41: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+... candidate: '0'() return bit
+... candidate: '0'() return character
 %Error: t/t_vhdl_parse.vhd:88:6: No visible subprogram 'q' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:88:14: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:89:14: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: t/t_vhdl_parse.vhd:90:13: Ambiguous character literal '0': 2 visible declarations match, and the context does not decide between them
+... candidate: '0'() return bit
+... candidate: '0'() return character
 %Error: t/t_vhdl_parse.vhd:93:63: No visible subprogram 'd' takes 1 argument(s) of these types
 %Error: Exiting due to

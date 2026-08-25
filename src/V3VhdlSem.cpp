@@ -885,6 +885,11 @@ private:
     void visit(AstVhdlSubprogDecl* nodep) override;
     void visit(AstVhdlComponentDecl* nodep) override;
     void visit(AstVhdlAliasDecl* nodep) override;
+    void visit(AstVhdlPackageInst* nodep) override;
+    void instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* intop) VL_MT_DISABLED;
+    void bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlExpr* actualp,
+                            VhdlScope* outerp) VL_MT_DISABLED;
+    std::map<std::string, AstVhdlPackageBody*> m_packageBodies;  // "lib.name" -> its body
     void visit(AstVhdlAttrDecl* nodep) override;
     void visit(AstVhdlAttrSpec* nodep) override;
     bool parseForeign(const std::string& text, FileLine* flp, std::string& cnamer,
@@ -1032,6 +1037,9 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
             nodep->vhdlSymp(declp);
             declp->typep()->bodyp(protp);
             VL_RESTORER(m_scopep);
+            // What is visible where the body is written is visible inside it:
+            // the body may be in a package body, and name what that declares
+            declp->typep()->scopep()->addUse(m_scopep);
             m_scopep = declp->typep()->scopep();
             iterateAndNextNull(protp->declsp());
             return;
@@ -1121,6 +1129,13 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
+    // A generic subprogram is declared by its own profile, so that calls to
+    // it inside the package resolve before any instantiation (6.5.4)
+    if (nodep->kind() == VhdlIfaceKind::SUBPROGRAM && nodep->profilep()) {
+        iterate(nodep->profilep());
+        nodep->vhdlSymp(nodep->profilep()->vhdlSymp());
+        return;
+    }
     VhdlSymKind kind = VhdlSymKind::CONSTANT;
     switch (nodep->kind()) {
     case VhdlIfaceKind::CONSTANT: kind = VhdlSymKind::GENERIC; break;
@@ -1180,6 +1195,10 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         ifp->vhdlSymp(psymp);
         symp->addParam(ifp->name(), typep, ifp->defaultp() != nullptr);
         declare(psymp, ifp->fileline());
+        // A parameter's default value is an expression like any other, and
+        // names what the subprogram's own region sees -- a constant of the
+        // package it is declared in, or an earlier parameter (4.2.2.1)
+        if (ifp->defaultp()) analyzeExpr(ifp->defaultp(), typep);
     }
     if (nodep->isFunction()) {
         m_scopep = outerp;
@@ -1200,8 +1219,15 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         std::vector<VhdlSymbol*> local;
         outerp->lookupLocal(nodep->name(), local);
         // In a package body the declaration being completed is in the package
-        // declaration, one region out (12.1)
-        if (local.empty() && m_inPackageBody) outerp->lookup(nodep->name(), local);
+        // declaration, one region out (12.1). It has to be looked for even
+        // when the body's own region already has declarations of that name --
+        // which it does as soon as the name is overloaded, and every IEEE
+        // package overloads heavily.
+        if (m_inPackageBody) {
+            std::vector<VhdlSymbol*> outer;
+            outerp->lookup(nodep->name(), outer);
+            for (VhdlSymbol* const otherp : outer) local.push_back(otherp);
+        }
         for (VhdlSymbol* const otherp : local) {
             if (!otherp->hasBody() && symp->homographOf(otherp)) {
                 reusep = otherp;
@@ -1575,6 +1601,22 @@ void VhdlSemVisitor::applyContextItem(AstVhdlContextItem* ctxp) {
         }
         // A use clause: "use lib.unit.all" or "use lib.unit.item"
         if (!flattenUse(exprp, parts) || parts.size() < 2) continue;
+        // "use inst.all", where inst is a package instantiated in this
+        // region rather than a design unit of a library (4.9, 12.4)
+        if (parts.size() == 2) {
+            if (VhdlScope* const localp = m_scopep->findNamed(parts[0])) {
+                if (parts[1] == "all") {
+                    m_scopep->addUse(localp);
+                    continue;
+                }
+                std::vector<VhdlSymbol*> found;
+                localp->lookupLocal(parts[1], found);
+                if (!found.empty()) {
+                    m_scopep->addUse(localp);
+                    continue;
+                }
+            }
+        }
         std::string lib = parts[0];
         if (lib == "work") lib = m_libname;
         VhdlScope* targetp = nullptr;
@@ -1642,6 +1684,14 @@ void VhdlSemVisitor::dumpScope(const VhdlScope* scopep, const std::string& inden
 
 void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     const bool dump = v3Global.opt.dumpLevel("vhdl-syms") != 0;
+    // A package instantiation needs the body as well as the declaration, and
+    // may be written before either is analyzed, so find them all first
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        if (AstVhdlPackageBody* const bodyp = VN_CAST(unitp, VhdlPackageBody)) {
+            const std::string lib = bodyp->libname().empty() ? "work" : lower(bodyp->libname());
+            m_packageBodies[lib + "." + lower(bodyp->name())] = bodyp;
+        }
+    }
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         setupUnitContext(unitp);
         const std::string lib = m_libname;
@@ -1672,9 +1722,17 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
             m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
             libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
+        } else if (AstVhdlPackageInst* const instp = VN_CAST(unitp, VhdlPackageInst)) {
+            // The same as a package instantiated inside a declarative part,
+            // except that this one is a design unit of its own (4.9)
+            instantiatePackage(instp, unitScopep);
+            m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
+            m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
+            libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
         } else if (AstVhdlPackageBody* const bodyp = VN_CAST(unitp, VhdlPackageBody)) {
             const auto it = m_unitScopes.find(lib + "." + lower(unitp->name()));
             if (it != m_unitScopes.end()) m_scopep->addUse(it->second);
+            m_unitScopes[lib + "." + lower(unitp->name()) + "%body"] = unitScopep;
             VL_RESTORER(m_inPackageBody);
             m_inPackageBody = true;
             iterateAndNextNull(bodyp->declsp());
@@ -1728,6 +1786,192 @@ public:
     explicit VhdlUnanalyzeVisitor(AstNode* nodep) { iterate(nodep); }
     ~VhdlUnanalyzeVisitor() override = default;
 };
+
+// "package q is new work.p generic map (...)" makes a copy of p with the
+// generics fixed (4.9). A generic package is a template, exactly as an
+// unconstrained subprogram is: the copy is analyzed from scratch, so
+// everything inside it -- a type whose bounds name a generic, a subprogram
+// whose body does -- comes out as ordinary VHDL with every bound known.
+void VhdlSemVisitor::visit(AstVhdlPackageInst* nodep) {
+    VhdlScope* const outerp = m_scopep;
+    VhdlScope* const innerp = pushScope(nodep->name());
+    m_scopep = outerp;
+    instantiatePackage(nodep, innerp);
+    m_scopep = outerp;
+    // The instance is a name of its own, so "q.thing" and "use q.all" work
+    outerp->addNamed(lower(nodep->name()), innerp);
+    VhdlSymbol* const symp
+        = VhdlSymTab::newSymbol(VhdlSymKind::PACKAGE, nodep->name(), nodep);
+    symp->innerp(innerp);
+    declare(symp, nodep->fileline());
+}
+
+void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* intop) {
+    std::vector<std::string> parts;
+    if (!flatten(nodep->uninstantiatedp(), parts) || parts.empty()) {
+        err(nodep->fileline(), "A package instantiation needs the name of a package");
+        return;
+    }
+    // "work.p" or just "p"
+    std::string key = m_libname + "." + lower(parts.back());
+    if (parts.size() >= 2) key = lower(parts[parts.size() - 2]) + "." + lower(parts.back());
+    const auto unitIt = m_primaryUnits.find(key);
+    AstVhdlPackage* const pkgp
+        = unitIt == m_primaryUnits.end() ? nullptr : VN_CAST(unitIt->second, VhdlPackage);
+    if (!pkgp) {
+        err(nodep->fileline(), "Cannot find package '" + parts.back() + "' to instantiate");
+        return;
+    }
+    // The actuals are read where the instantiation is written, before the
+    // copy's own region is opened
+    std::vector<AstVhdlAssoc*> assocs;
+    for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+        assocs.push_back(VN_AS(p, VhdlAssoc));
+    }
+
+    VhdlScope* const savedp = m_scopep;
+    m_scopep = intop;
+    // The copy is analyzed where the *package* was written, not where it is
+    // instantiated: its declarations name what its own context clause made
+    // visible, which the instantiation site need not have at all
+    const auto scopeIt = m_unitScopes.find(key);
+    if (scopeIt != m_unitScopes.end() && scopeIt->second->parentp()) {
+        const VhdlScope* const ctxp = scopeIt->second->parentp();
+        for (VhdlScope* const usedp : ctxp->uses()) intop->addUse(usedp);
+        for (const auto& pair : ctxp->named()) intop->addNamed(pair.first, pair.second);
+    }
+    intop->addUse(savedp);
+    size_t position = 0;
+    for (AstNode* p = pkgp->genericsp(); p; p = p->nextp(), ++position) {
+        AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
+        AstNodeVhdlExpr* actualp = nullptr;
+        // By name where the map names its formal, by position otherwise
+        for (size_t i = 0; i < assocs.size(); ++i) {
+            const AstVhdlName* const namep
+                = assocs[i]->formalp() ? VN_CAST(assocs[i]->formalp(), VhdlName) : nullptr;
+            if (namep) {
+                if (namep->name() == formalp->name()) actualp = assocs[i]->actualp();
+            } else if (i == position) {
+                actualp = assocs[i]->actualp();
+            }
+        }
+        if (!actualp) {
+            if (formalp->defaultp()) {
+                actualp = formalp->defaultp();
+            } else {
+                err(nodep->fileline(), "Generic '" + formalp->name()
+                                           + "' of the instantiated package has no value");
+                continue;
+            }
+        }
+        bindPackageGeneric(formalp, actualp, savedp);
+    }
+    // The declarations, and the body's too, so that a subprogram declared in
+    // the package has the body the copy needs
+    for (AstNode* p = pkgp->declsp(); p; p = p->nextp()) {
+        AstNodeVhdl* const copyp = VN_AS(p->cloneTree(false), NodeVhdl);
+        VhdlUnanalyzeVisitor{copyp};
+        nodep->addDeclsp(copyp);
+    }
+    const auto bodyIt = m_packageBodies.find(key);
+    if (bodyIt != m_packageBodies.end()) {
+        // The body has a context clause of its own -- IEEE's fixed_generic_pkg
+        // body uses MATH_REAL where its declaration does not
+        const auto bodyScopeIt = m_unitScopes.find(key + "%body");
+        if (bodyScopeIt != m_unitScopes.end() && bodyScopeIt->second->parentp()) {
+            const VhdlScope* const ctxp = bodyScopeIt->second->parentp();
+            for (VhdlScope* const usedp : ctxp->uses()) intop->addUse(usedp);
+            for (const auto& pair : ctxp->named()) intop->addNamed(pair.first, pair.second);
+        }
+        for (AstNode* p = bodyIt->second->declsp(); p; p = p->nextp()) {
+            AstNodeVhdl* const copyp = VN_AS(p->cloneTree(false), NodeVhdl);
+            VhdlUnanalyzeVisitor{copyp};
+            nodep->addDeclsp(copyp);
+        }
+    }
+    iterateAndNextNull(nodep->declsp());
+    m_scopep = savedp;
+}
+
+// One generic of an instantiated package: a value, a type, or a subprogram
+void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlExpr* actualp,
+                                        VhdlScope* outerp) {
+    FileLine* const flp = formalp->fileline();
+    VhdlScope* const innerp = m_scopep;
+    if (formalp->kind() == VhdlIfaceKind::TYPE) {
+        m_scopep = outerp;
+        VhdlType* const typep = resolveTypeMark(actualp);
+        m_scopep = innerp;
+        VhdlSymbol* const symp
+            = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, formalp->name(), formalp);
+        symp->typep(typep);
+        declare(symp, flp);
+        // The actual type's own operators are already visible wherever the
+        // type is; declaring them again here would make every use of them
+        // ambiguous inside the copy
+        return;
+    }
+    if (formalp->kind() == VhdlIfaceKind::SUBPROGRAM
+        || formalp->kind() == VhdlIfaceKind::PACKAGE) {
+        m_scopep = outerp;
+        std::vector<std::string> parts;
+        std::vector<VhdlSymbol*> found;
+        if (flatten(actualp, parts) && !parts.empty()) {
+            // The actual may be a selected name: "work.helpers.same"
+            VhdlScope* scopep = outerp;
+            bool viaScope = parts.size() > 1;
+            for (size_t i = 0; i + 1 < parts.size() && viaScope; ++i) {
+                VhdlScope* const nextp = scopep ? scopep->findNamed(parts[i]) : nullptr;
+                if (!nextp) {
+                    viaScope = false;
+                } else {
+                    scopep = nextp;
+                }
+            }
+            if (viaScope && scopep) {
+                scopep->lookupLocal(parts.back(), found);
+            } else {
+                lookup(parts.back(), found);
+            }
+        }
+        m_scopep = innerp;
+        for (VhdlSymbol* const targetp : found) {
+            VhdlSymbol* const symp
+                = VhdlSymTab::newSymbol(targetp->kind(), formalp->name(), formalp);
+            symp->aliasp(targetp);
+            symp->typep(targetp->typep());
+            symp->returnTypep(targetp->returnTypep());
+            for (size_t i = 0; i < targetp->paramTypes().size(); ++i) {
+                symp->addParam(targetp->paramName(i), targetp->paramTypes()[i],
+                               targetp->paramHasDefault(i));
+            }
+            symp->bodyp(targetp->bodyp());
+            symp->innerp(targetp->innerp());
+            symp->predefined(targetp->predefined());
+            declare(symp, flp);
+        }
+        if (found.empty()) {
+            err(flp, "Cannot find what generic '" + formalp->name() + "' is mapped to");
+        }
+        return;
+    }
+    // A value: its subtype is named in the package, its value given here
+    VhdlType* const typep = formalp->subtypep() ? resolveSubtype(formalp->subtypep()) : nullptr;
+    m_scopep = outerp;
+    analyzeExpr(actualp, typep);
+    const VhdlValue val = V3VhdlEval::eval(actualp);
+    m_scopep = innerp;
+    VhdlSymbol* const symp
+        = VhdlSymTab::newSymbol(VhdlSymKind::CONSTANT, formalp->name(), formalp);
+    symp->typep(typep);
+    if (val.known()) {
+        symp->value(val);
+    } else {
+        err(flp, "The value of generic '" + formalp->name()
+                     + "' of an instantiated package must be static");
+    }
+    declare(symp, flp);
+}
 
 VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
                                                  VhdlScope* regionp,
@@ -2254,6 +2498,51 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
         std::sort(out.types.begin(), out.types.end());
         out.types.erase(std::unique(out.types.begin(), out.types.end()), out.types.end());
         if (!out.types.empty()) return;
+    } else if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+        // A call has as many possible types as it has applicable overloads,
+        // and two functions may differ only in their result (12.5). Settling
+        // it here would report an ambiguity the surrounding expression is
+        // about to resolve -- "v := not f(3, 0)" picks f by way of "not".
+        std::vector<std::string> parts;
+        std::vector<VhdlSymbol*> found;
+        if (flatten(callp->prefixp(), parts) && !parts.empty()) lookup(parts.back(), found);
+        bool onlySubprograms = !found.empty();
+        for (const VhdlSymbol* const symp : found) {
+            if (symp->kind() != VhdlSymKind::FUNCTION) onlySubprograms = false;
+        }
+        if (onlySubprograms) {
+            std::vector<CandSet> argCands;
+            std::vector<AstVhdlAssoc*> assocs;
+            bool usable = true;
+            for (AstNode* p = callp->argsp(); p && usable; p = p->nextp()) {
+                AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->actualp()) {
+                    usable = false;
+                    break;
+                }
+                assocs.push_back(asp);
+                argCands.emplace_back();
+                candidateTypes(asp->actualp(), argCands.back());
+            }
+            if (usable) {
+                std::vector<int> formalOf;
+                for (VhdlSymbol* const symp : found) {
+                    if (!bindActuals(symp, assocs, formalOf)) continue;
+                    bool fits = true;
+                    for (size_t i = 0; i < argCands.size() && fits; ++i) {
+                        if (formalOf[i] < 0) continue;
+                        if (!anyMatches(argCands[i], symp->paramTypes()[formalOf[i]])) {
+                            fits = false;
+                        }
+                    }
+                    if (fits && symp->returnTypep()) out.types.push_back(symp->returnTypep());
+                }
+                std::sort(out.types.begin(), out.types.end());
+                out.types.erase(std::unique(out.types.begin(), out.types.end()),
+                                out.types.end());
+                if (!out.types.empty()) return;
+            }
+        }
     }
     out.types.push_back(analyzeExpr(nodep, nullptr));
 }
@@ -2394,9 +2683,22 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         if (preferred.size() == 1) {
             cands.swap(preferred);
         } else {
+            std::string detail;
+            for (const VhdlSymbol* const symp : cands) {
+                detail += "\n... candidate: " + symp->name() + "(";
+                for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
+                    if (i) detail += ", ";
+                    detail += symp->paramTypes()[i] ? symp->paramTypes()[i]->prettyName()
+                                                    : "?";
+                }
+                detail += ")";
+                if (symp->returnTypep()) detail += " return " + symp->returnTypep()->prettyName();
+                if (symp->declp()) detail += " at " + symp->declp()->fileline()->ascii();
+            }
             err(nodep->fileline(),
                 "Ambiguous " + what + ": " + std::to_string(cands.size())
-                    + " visible declarations match, and the context does not decide between them");
+                    + " visible declarations match, and the context does not decide between them"
+                    + detail);
             nodep->vhdlSymp(cands[0]);
             return cands[0]->returnTypep() ? cands[0]->returnTypep() : cands[0]->typep();
         }
@@ -2696,6 +2998,18 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
                 break;
             }
         }
+    }
+    // The name attributes ask about the *name*, not about a value, so their
+    // prefix may be a design unit, a package or a statement label -- none of
+    // which analyzes as an expression (16.2.7)
+    const std::string& attrName = nodep->name();
+    if (!prefixTypep
+        && (attrName == "instance_name" || attrName == "path_name"
+            || attrName == "simple_name")) {
+        std::vector<VhdlSymbol*> found;
+        if (!parts.empty()) lookup(parts.back(), found);
+        if (!found.empty()) nodep->prefixp()->vhdlSymp(found[0]);
+        return V3VhdlStd::stringType();
     }
     if (!prefixTypep) prefixTypep = analyzeExpr(nodep->prefixp(), nullptr);
     // Record what the prefix denotes, so that folding an attribute later does

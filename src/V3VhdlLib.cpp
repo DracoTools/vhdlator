@@ -151,6 +151,19 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             if (flattenName(cfgp->entityNamep(), parts) && !parts.empty()) {
                 unit.dependsOn.push_back(primaryKey(work, parts.back()));
             }
+        } else if (const AstVhdlPackageInst* const instp = VN_CAST(unitp, VhdlPackageInst)) {
+            // A package instantiation needs the package it copies, which its
+            // context clause need not mention (4.9)
+            unit.key = primaryKey(work, unitp->name());
+            std::vector<std::string> parts;
+            if (flattenName(instp->uninstantiatedp(), parts) && !parts.empty()) {
+                const std::string lib
+                    = parts.size() >= 2 ? lower(parts[parts.size() - 2]) : work;
+                unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, parts.back()));
+                // And its body, where it has one, since the copy takes that too
+                unit.dependsOn.push_back(
+                    primaryKey(lib == "work" ? work : lib, parts.back()) + "%body");
+            }
         } else {
             unit.key = primaryKey(work, unitp->name());
         }

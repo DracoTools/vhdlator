@@ -523,6 +523,14 @@ private:
             if (!symp) return VhdlValue{};
             return VhdlValue::mkStr(symp->name(), V3VhdlStd::stringType());
         }
+        if (attr == "instance_name" || attr == "path_name") {
+            // The path to what the prefix names, written the way VHDL writes
+            // one (16.2.7). Only the name itself is known here, which is what
+            // these are used for -- naming the source of a report.
+            VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
+            if (!symp) return VhdlValue{};
+            return VhdlValue::mkStr(":" + symp->name() + ":", V3VhdlStd::stringType());
+        }
         return VhdlValue{};
     }
 

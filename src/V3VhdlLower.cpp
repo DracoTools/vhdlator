@@ -772,6 +772,11 @@ private:
             recordBinding(cfgp->specp(), cfgp->bindingp());
             return;
         }
+        if (VN_IS(nodep, VhdlPackageInst)) {
+            // The copy analysis made contributes types, constants and
+            // subprograms, which are emitted where they are used
+            return;
+        }
         if (VN_IS(nodep, VhdlTypeDecl) || VN_IS(nodep, VhdlSubtypeDecl)
             || VN_IS(nodep, VhdlAttrDecl) || VN_IS(nodep, VhdlAttrSpec)
             || VN_IS(nodep, VhdlComponentDecl) || VN_IS(nodep, VhdlContextItem)
@@ -953,6 +958,17 @@ private:
             if (argp) return new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
         } else if (attr == "pred" || attr == "leftof") {
             if (argp) return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        }
+        // The name attributes are about the name, which is always known here
+        // even when the analyzer could not fold them -- the prefix may be a
+        // design unit, which denotes no value (16.2.7)
+        if (attr == "simple_name" || attr == "instance_name" || attr == "path_name") {
+            if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+            std::vector<std::string> parts;
+            flattenName(nodep->prefixp(), parts);
+            const std::string name = parts.empty() ? std::string{"?"} : parts.back();
+            return new AstConst{flp, AstConst::String{},
+                                attr == "simple_name" ? name : ":" + name + ":"};
         }
         // The signal attributes ask about what has happened to a signal, not
         // about its type (16.2.2)
@@ -1158,6 +1174,25 @@ private:
                 return refp;
             }
         }
+        // An object declared in a package is not emitted with the package --
+        // there is no package in the generated code -- so it is emitted into
+        // the module that reads it, on first use
+        if (symp->isObject() && !symp->predefined()) {
+            if (AstVhdlObjectDecl* const objp = VN_CAST(symp->declp(), VhdlObjectDecl)) {
+                AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+                if (objp->defaultp()) {
+                    varp->valuep(lowerExpr(objp->defaultp()));
+                } else {
+                    varp->valuep(defaultValueFor(symp->typep(), flp));
+                }
+                if (m_protClassp) {
+                    m_protClassp->addStmtsp(varp);
+                } else {
+                    m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+                }
+                return new AstVarRef{flp, varp, VAccess::READ};
+            }
+        }
         // OUTPUT and INPUT of std.textio are the standard streams (16.4)
         if (symp->kind() == VhdlSymKind::FILE && symp->predefined()) {
             if (symp->name() == "output") return new AstConst{flp, AstConst::Signed32{}, 1};
@@ -1251,6 +1286,27 @@ private:
         return nullptr;
     }
 
+    // An operator a design declares itself is an ordinary function whose name
+    // happens to be an operator symbol (4.5.2), so it is called like one
+    AstNodeExpr* lowerUserOperator(VhdlSymbol* symp,
+                                   const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
+        if (!symp) return nullptr;
+        auto it = m_funcs.find(symp);
+        if (it == m_funcs.end() && emitOnDemand(symp)) it = m_funcs.find(symp);
+        if (it == m_funcs.end() || !VN_IS(it->second, Func)) return nullptr;
+        AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
+        refp->taskp(it->second);
+        for (AstNodeVhdlExpr* const argp : args) {
+            AstNodeExpr* const onep = lowerExpr(argp);
+            if (!onep) {
+                VL_DO_DANGLING(refp->deleteTree(), refp);
+                return nullptr;
+            }
+            refp->addArgsp(new AstArg{flp, "", onep});
+        }
+        return refp;
+    }
+
     AstNodeExpr* lowerUnary(AstVhdlUnary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -1258,6 +1314,10 @@ private:
         // std_logic_1164 declares "not" for STD_ULOGIC itself, so an operator
         // over a logic type is one of the intrinsics even when it is explicit
         if (symp && !symp->predefined() && !isIeeeOperator(symp, otypep, nullptr)) {
+            if (AstNodeExpr* const outp
+                = lowerUserOperator(const_cast<VhdlSymbol*>(symp), {nodep->lhsp()}, flp)) {
+                return outp;
+            }
             unsup(flp, "user-defined unary operator \"" + symp->name() + "\"");
             return nullptr;
         }
@@ -1300,6 +1360,10 @@ private:
         VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
         VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
         if (symp && !symp->predefined() && !isIeeeOperator(symp, ltypep, rtypep)) {
+            if (AstNodeExpr* const outp = lowerUserOperator(
+                    const_cast<VhdlSymbol*>(symp), {nodep->lhsp(), nodep->rhsp()}, flp)) {
+                return outp;
+            }
             unsup(flp, "user-defined operator \"" + symp->name() + "\"");
             return nullptr;
         }
@@ -4539,7 +4603,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             continue;
         }
         if (VN_IS(unitp, VhdlPackage) || VN_IS(unitp, VhdlPackageBody)
-            || VN_IS(unitp, VhdlContextDecl)) {
+            || VN_IS(unitp, VhdlPackageInst) || VN_IS(unitp, VhdlContextDecl)) {
             // A package contributes types, constants and subprograms, which
             // are used where they are referenced rather than emitted here
             continue;

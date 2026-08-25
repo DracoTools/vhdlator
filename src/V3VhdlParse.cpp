@@ -34,6 +34,16 @@
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
+// An operator symbol names one of the reserved words, and a reserved word is
+// not case sensitive (15.4.1, 15.10): IEEE's MATH_REAL declares "MOD" while
+// the language writes "mod", and they are the same operator.
+static std::string lowerOperator(const std::string& text) {
+    std::string out = text;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+
 //######################################################################
 // Construction and token access
 
@@ -554,11 +564,16 @@ AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceElement(VhdlIfaceKind dflt) {
     if (peekType() == VhdlTokType::KWD_FUNCTION || peekType() == VhdlTokType::KWD_PROCEDURE
         || peekType() == VhdlTokType::KWD_PURE || peekType() == VhdlTokType::KWD_IMPURE) {
         AstNodeVhdl* const subp = parseSubprogram(true);
-        // Represent it as an interface declaration carrying the subprogram name
+        // An interface declaration carrying the subprogram's own declaration,
+        // since the body that uses it needs the profile to resolve calls
         const std::string name = subp ? subp->name() : "";
         AstVhdlIfaceDecl* const nodep
             = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::SUBPROGRAM};
-        if (subp) VL_DO_DANGLING(subp->deleteTree(), subp);
+        if (AstVhdlSubprogDecl* const declp = VN_CAST(subp, VhdlSubprogDecl)) {
+            nodep->profilep(declp);
+        } else if (subp) {
+            VL_DO_DANGLING(subp->deleteTree(), subp);
+        }
         return nodep;
     }
     if (check(VhdlTokType::KWD_PACKAGE)) {
@@ -947,7 +962,7 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
     std::string name;
     bool isOperator = false;
     if (peekType() == VhdlTokType::STRING_LIT) {
-        name = consume().text;
+        name = lowerOperator(consume().text);
         isOperator = true;
     } else {
         name = identifier("a subprogram name");
@@ -1067,7 +1082,9 @@ AstNodeVhdl* V3VhdlParse::parseAliasDecl() {
     FileLine* const flp = here();
     consume();  // "alias"
     std::string name;
-    if (peekType() == VhdlTokType::STRING_LIT || peekType() == VhdlTokType::CHARACTER_LIT) {
+    if (peekType() == VhdlTokType::STRING_LIT) {
+        name = lowerOperator(consume().text);
+    } else if (peekType() == VhdlTokType::CHARACTER_LIT) {
         name = consume().text;
     } else {
         name = identifier("an alias designator");
