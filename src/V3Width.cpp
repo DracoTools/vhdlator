@@ -7583,7 +7583,12 @@ class WidthVisitor final : public VNVisitor {
                     AstNodeExpr* const newp = new AstResizeLValue{pinp->fileline(), pinp};
                     relinkHandle.relink(newp);
                 }
-                if (portp->isWritable()) V3LinkLValue::linkLValueSet(pinp);
+                if (portp->isWritable()) {
+                    // An 'inout' or 'ref' formal reads the actual as well as writing it
+                    V3LinkLValue::linkLValueSet(pinp, portp->direction().isInoutOrRef()
+                                                          ? VAccess::READWRITE
+                                                          : VAccess::WRITE);
+                }
                 if (portp->direction() != VDirection::REF
                     && !(portp->basicp()
                          && portp->basicp()->untyped())  // for properties, handled in V3AssertPre
