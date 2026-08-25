@@ -913,6 +913,23 @@ private:
     void visit(AstVhdlProcCall* nodep) override;
     void visit(AstVhdlNext* nodep) override;
     void visit(AstVhdlInstance* nodep) override;
+    // A port whose subtype is left unconstrained takes its bounds from the
+    // actual, which differ per instance (5.3.2.2, 6.5.6.3)
+    struct OpenBound final {
+        std::string port;  // The port the bounds belong to
+        int dim;  // Which of its dimensions
+        std::string leftName;  // The generics carrying the bounds
+        std::string rightName;
+        bool isGeneric;  // A generic left unconstrained, rather than a port
+    };
+    std::map<VhdlScope*, std::vector<OpenBound>> m_openBounds;
+    void openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlScope* scopep) VL_MT_DISABLED;
+    void bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
+    bool defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim, int64_t& leftr,
+                       int64_t& rightr) VL_MT_DISABLED;
+    void constrainBlockPorts(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
 
     VhdlType* loopParamType(const RangeInfo& info, FileLine* flp) VL_MT_DISABLED;
     void analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) VL_MT_DISABLED;
@@ -1148,8 +1165,11 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
     case VhdlIfaceKind::PACKAGE: kind = VhdlSymKind::PACKAGE; break;
     }
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(kind, nodep->name(), nodep);
-    // Its place in the clause, so that a positional association finds it
-    symp->position(m_ifacePos++);
+    // Its place in the clause, so that a positional association finds it. A
+    // generic synthesized to carry the bounds of another one has no place: it
+    // is never written, so a positional association must skip over it.
+    const bool synthesized = nodep->name().compare(0, 3, "__v") == 0;
+    symp->position(synthesized ? -1 : m_ifacePos++);
     if (nodep->kind() == VhdlIfaceKind::TYPE) {
         // A generic type stands for whatever the instantiation supplies, so
         // give it a type of its own that matches nothing else yet (6.5.5)
@@ -1261,8 +1281,11 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
 void VhdlSemVisitor::visit(AstVhdlComponentDecl* nodep) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::COMPONENT, nodep->name(), nodep);
     VhdlScope* const innerp = pushScope(nodep->name());
+    openPortGenerics(nodep->genericsp(), nodep, innerp);
+    openPortGenerics(nodep->portsp(), nodep, innerp);
     m_ifacePos = 0;
     iterateAndNextNull(nodep->genericsp());
+    fillOpenGenericDefaults(innerp);
     m_ifacePos = 0;
     iterateAndNextNull(nodep->portsp());
     popScope();
@@ -1553,10 +1576,35 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
         iterateAndNextNull(nodep->headerp()->genericsp());
         m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->portsp());
+        // A block is elaborated where it stands, so a port left unconstrained
+        // simply takes the subtype of the one actual it is ever given
+        constrainBlockPorts(nodep->headerp());
     }
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
     popScope();
+}
+
+// A block port whose subtype is unconstrained takes that of its actual
+void VhdlSemVisitor::constrainBlockPorts(AstVhdlBlockHeader* nodep) {
+    std::vector<AstVhdlAssoc*> assocs;
+    for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+        assocs.push_back(VN_AS(p, VhdlAssoc));
+    }
+    size_t position = 0;
+    for (AstNode* p = nodep->portsp(); p; p = p->nextp(), ++position) {
+        AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+        VhdlSymbol* const symp = ifp->vhdlSymp();
+        if (!symp || !symp->typep() || !symp->typep()->unconstrained()) continue;
+        for (size_t i = 0; i < assocs.size(); ++i) {
+            const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
+            if (namep ? namep->name() != symp->name() : i != position) continue;
+            if (!assocs[i]->actualp() || VN_IS(assocs[i]->actualp(), VhdlOpen)) break;
+            VhdlType* const actualp = assocs[i]->actualp()->vhdlTypep();
+            if (actualp && !actualp->unconstrained()) symp->typep(actualp);
+            break;
+        }
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
@@ -1765,9 +1813,14 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         const std::string lib = m_libname;
         VhdlScope* const unitScopep = pushScope(unitp->name());
 
+        unitScopep->prefixes(lib + ":" + lower(unitp->name()),
+                             lib + ":" + lower(unitp->name()));
         if (AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity)) {
+            openPortGenerics(entp->genericsp(), entp, unitScopep);
+            openPortGenerics(entp->portsp(), entp, unitScopep);
             m_ifacePos = 0;
             iterateAndNextNull(entp->genericsp());
+            fillOpenGenericDefaults(unitScopep);
             m_ifacePos = 0;
             iterateAndNextNull(entp->portsp());
             iterateAndNextNull(entp->declsp());
@@ -1780,6 +1833,10 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             if (flatten(archp->entityNamep(), parts) && !parts.empty()) {
                 const auto it = m_unitScopes.find(lib + "." + parts.back());
                 if (it != m_unitScopes.end()) m_scopep->addUse(it->second);
+                // An instance path names the entity, and the instance form
+                // names the architecture with it (16.2.7)
+                unitScopep->prefixes(parts.back() + "(" + lower(archp->name()) + ")",
+                                     parts.back());
             }
             iterateAndNextNull(archp->declsp());
             iterateAndNextNull(archp->stmtsp());
@@ -4225,8 +4282,223 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
             }
         }
     }
+    bindOpenBounds(nodep, unitScopep);
     analyzeAssociations(nodep->genericMapp(), unitScopep);
+    // A generic left unconstrained is bound from the actual's own subtype,
+    // which is only known once the generic map has been analyzed -- and the
+    // actual is often a literal, whose bounds come from how long it is
+    bindOpenGenericBounds(nodep, unitScopep);
     analyzeAssociations(nodep->portMapp(), unitScopep);
+}
+
+// The bounds a default value gives an unconstrained object: its own, where it
+// has them, and otherwise its length starting at the index subtype's own left
+// bound (9.3.3.3)
+bool VhdlSemVisitor::defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim,
+                                   int64_t& leftr, int64_t& rightr) {
+    VhdlType* const valueTypep = valuep->vhdlTypep();
+    if (valueTypep && valueTypep->isConstrainedArray()
+        && dim < static_cast<int>(valueTypep->indexTypes().size())) {
+        const VhdlType* const idxp = valueTypep->indexTypes()[dim];
+        if (idxp && idxp->bounded()) {
+            leftr = idxp->left();
+            rightr = idxp->right();
+            return true;
+        }
+    }
+    if (dim != 0) return false;
+    VhdlType* const typep = symp->typep();
+    if (!typep) return false;
+    const std::vector<VhdlType*>& baseIndexes = typep->base()->indexTypes();
+    if (baseIndexes.empty() || !baseIndexes[0] || !baseIndexes[0]->bounded()) return false;
+    const int64_t len = staticLength(valuep);
+    if (len < 0) return false;
+    leftr = baseIndexes[0]->left();
+    rightr = baseIndexes[0]->ascending() ? leftr + len - 1 : leftr - len + 1;
+    return true;
+}
+
+// A generic left unconstrained but given a default takes its bounds from that
+// default wherever an instance leaves it open -- including at the top, where
+// there is no instance at all
+void VhdlSemVisitor::fillOpenGenericDefaults(VhdlScope* scopep) {
+    const auto it = m_openBounds.find(scopep);
+    if (it == m_openBounds.end()) return;
+    for (const OpenBound& bound : it->second) {
+        if (!bound.isGeneric) continue;
+        std::vector<VhdlSymbol*> found;
+        scopep->lookupLocal(bound.port, found);
+        if (found.empty()) continue;
+        AstVhdlIfaceDecl* const declp = VN_CAST(found[0]->declp(), VhdlIfaceDecl);
+        if (!declp || !declp->defaultp()) continue;
+        int64_t left = 0;
+        int64_t right = 0;
+        if (!defaultBounds(found[0], declp->defaultp(), bound.dim, left, right)) continue;
+        for (int side = 0; side < 2; ++side) {
+            std::vector<VhdlSymbol*> gfound;
+            scopep->lookupLocal(side == 0 ? bound.leftName : bound.rightName, gfound);
+            if (gfound.empty()) continue;
+            AstVhdlIfaceDecl* const genp = VN_CAST(gfound[0]->declp(), VhdlIfaceDecl);
+            if (!genp || genp->defaultp()) continue;
+            const int64_t value = side == 0 ? left : right;
+            AstVhdlLiteral* const litp = new AstVhdlLiteral{
+                genp->fileline(), VhdlLitKind::INTEGER, std::to_string(value)};
+            litp->intVal(value);
+            genp->defaultp(litp);
+            analyzeExpr(litp, V3VhdlStd::integerType());
+            // Deliberately not given to the symbol as a value: it is what an
+            // instance that says nothing gets, and folding it here would fix
+            // every instance to the default's bounds
+        }
+    }
+}
+
+void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) {
+    if (!unitScopep) return;
+    const auto it = m_openBounds.find(unitScopep);
+    if (it == m_openBounds.end()) return;
+    for (const OpenBound& bound : it->second) {
+        if (!bound.isGeneric) continue;
+        std::vector<VhdlSymbol*> found;
+        unitScopep->lookupLocal(bound.port, found);
+        if (found.empty()) continue;
+        const int wantPos = found[0]->position();
+        AstNodeVhdlExpr* actualp = nullptr;
+        int position = 0;
+        for (AstNode* p = nodep->genericMapp(); p; p = p->nextp(), ++position) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (!asp->actualp()) continue;
+            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+            if (namep ? namep->name() == bound.port : position == wantPos) {
+                actualp = asp->actualp();
+                break;
+            }
+        }
+        // Left open, so the default the entity gives it decides the bounds
+        if (!actualp) {
+            AstVhdlIfaceDecl* const declp = VN_CAST(found[0]->declp(), VhdlIfaceDecl);
+            if (declp) actualp = declp->defaultp();
+        }
+        if (!actualp) continue;
+        int64_t left = 0;
+        int64_t right = 0;
+        if (!defaultBounds(found[0], actualp, bound.dim, left, right)) continue;
+        FileLine* const flp = nodep->fileline();
+        for (int side = 0; side < 2; ++side) {
+            const int64_t value = side == 0 ? left : right;
+            AstVhdlLiteral* const litp
+                = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, std::to_string(value)};
+            litp->intVal(value);
+            AstVhdlAssoc* const asp = new AstVhdlAssoc{
+                flp, new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName}, litp};
+            nodep->addGenericMapp(asp);
+            std::vector<VhdlSymbol*> gfound;
+            unitScopep->lookupLocal(asp->formalp()->name(), gfound);
+            if (!gfound.empty()) asp->formalp()->vhdlSymp(gfound[0]);
+            analyzeExpr(litp, V3VhdlStd::integerType());
+        }
+    }
+}
+
+// A port left unconstrained takes the subtype of the actual it is connected
+// to (6.5.6.3). Those bounds are not the same at every instance, so each open
+// dimension becomes a generic of the entity and the port is constrained by
+// it. V3Param then builds one module per set of bounds -- exactly what it
+// does for a width generic written by hand, and what VHDL elaboration says
+// should happen.
+void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlScope* scopep) {
+    AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity);
+    AstVhdlComponentDecl* const compp = VN_CAST(unitp, VhdlComponentDecl);
+    if (!entp && !compp) return;
+    for (AstNode* p = portsp; p; p = p->nextp()) {
+        AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+        if (!ifp
+            || (ifp->kind() != VhdlIfaceKind::SIGNAL
+                && ifp->kind() != VhdlIfaceKind::CONSTANT)) {
+            continue;
+        }
+        AstVhdlSubtypeInd* const subp = ifp->subtypep();
+        if (!subp || subp->constraintp() || !subp->typeMarkp()) continue;
+        VhdlSymbol* const tsymp = lookupTypeQuiet(subp->typeMarkp());
+        VhdlType* const typep = tsymp ? tsymp->typep() : nullptr;
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) continue;
+        if (!typep->unconstrained()) continue;
+        const size_t dims = typep->base()->indexTypes().size();
+        if (!dims) continue;
+        FileLine* const flp = ifp->fileline();
+        AstVhdlIndexConstraint* const consp = new AstVhdlIndexConstraint{flp};
+        for (size_t d = 0; d < dims; ++d) {
+            const std::string suffix = "__" + ifp->name() + "__" + std::to_string(d);
+            const std::string leftName = "__vl" + suffix;
+            const std::string rightName = "__vr" + suffix;
+            for (const std::string& name : {leftName, rightName}) {
+                AstVhdlIfaceDecl* const genp
+                    = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::CONSTANT};
+                genp->subtypep(new AstVhdlSubtypeInd{flp, new AstVhdlName{flp, "integer"}});
+                if (ifp->kind() == VhdlIfaceKind::CONSTANT) {
+                    // A generic constrained by these must see them declared
+                    // first, so they go in ahead of it
+                    ifp->addHereThisAsNext(genp);
+                } else if (entp) {
+                    entp->addGenericsp(genp);
+                } else {
+                    compp->addGenericsp(genp);
+                }
+            }
+            AstVhdlRange* const rangep
+                = new AstVhdlRange{flp, new AstVhdlName{flp, leftName}, VhdlDir::TO,
+                                   new AstVhdlName{flp, rightName}};
+            // Which way round the actual's range runs is not known here
+            rangep->dirUnknown(true);
+            consp->addRangesp(rangep);
+            m_openBounds[scopep].push_back(OpenBound{ifp->name(), static_cast<int>(d),
+                                                     leftName, rightName,
+                                                     ifp->kind() == VhdlIfaceKind::CONSTANT});
+        }
+        subp->constraintp(consp);
+    }
+}
+
+// The bounds an instance gives each of its open ports, written as the
+// associations the synthesized generics need
+void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) {
+    if (!unitScopep) return;
+    const auto it = m_openBounds.find(unitScopep);
+    if (it == m_openBounds.end()) return;
+    for (const OpenBound& bound : it->second) {
+        if (bound.isGeneric) continue;
+        // Where the port is in the clause, so a positional map finds it
+        std::vector<VhdlSymbol*> found;
+        unitScopep->lookupLocal(bound.port, found);
+        if (found.empty()) continue;
+        const int wantPos = found[0]->position();
+        AstNodeVhdlExpr* actualp = nullptr;
+        int position = 0;
+        for (AstNode* p = nodep->portMapp(); p; p = p->nextp(), ++position) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+            if (namep ? namep->name() == bound.port : position == wantPos) {
+                actualp = asp->actualp();
+                break;
+            }
+        }
+        if (!actualp) continue;
+        FileLine* const flp = nodep->fileline();
+        for (int side = 0; side < 2; ++side) {
+            AstVhdlAttrName* const attrp = new AstVhdlAttrName{
+                flp, actualp->cloneTree(false), side == 0 ? "left" : "right"};
+            if (bound.dim > 0) {
+                AstVhdlLiteral* const dimp = new AstVhdlLiteral{
+                    flp, VhdlLitKind::INTEGER, std::to_string(bound.dim + 1)};
+                dimp->intVal(bound.dim + 1);
+                attrp->argp(dimp);
+            }
+            nodep->addGenericMapp(new AstVhdlAssoc{
+                flp, new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
+                attrp});
+        }
+    }
 }
 
 // Each actual takes the type of the formal it is associated with, by position

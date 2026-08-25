@@ -472,7 +472,7 @@ private:
     // The bounds of a range that did not fold, as expressions. False when
     // there is no such range, which means either it folded or there is none.
     bool dynamicBounds(const VhdlType* typep, int dim, FileLine* flp, AstNodeExpr*& leftp,
-                       AstNodeExpr*& rightp, bool& ascending) {
+                       AstNodeExpr*& rightp, bool& ascending, bool* dirKnownp = nullptr) {
         const VhdlType* const idxp = indexSubtype(typep, dim);
         if (!idxp || !idxp->boundsp()) return false;
         AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
@@ -485,7 +485,14 @@ private:
             return false;
         }
         ascending = rp->dir() == VhdlDir::TO;
+        if (dirKnownp) *dirKnownp = !rp->dirUnknown();
         return true;
+    }
+
+    // "left <= right", which is what makes a range ascending once the bounds
+    // are folded. Used where the direction is only known then.
+    static AstNodeExpr* ascendingOf(AstNodeExpr* leftp, AstNodeExpr* rightp, FileLine* flp) {
+        return new AstLteS{flp, leftp->cloneTree(false), rightp->cloneTree(false)};
     }
 
     // How many elements such a range holds, as an expression
@@ -505,9 +512,18 @@ private:
             return nullptr;
         }
         // "left to right" holds right-left+1, "left downto right" left-right+1
-        AstNodeExpr* const diffp = rp->dir() == VhdlDir::TO
-                                       ? static_cast<AstNodeExpr*>(new AstSub{flp, rightp, leftp})
-                                       : static_cast<AstNodeExpr*>(new AstSub{flp, leftp, rightp});
+        AstNodeExpr* diffp = nullptr;
+        if (rp->dirUnknown()) {
+            // Which way round it runs only folds with the instance
+            diffp = new AstCond{
+                flp, ascendingOf(leftp, rightp, flp),
+                new AstSub{flp, rightp->cloneTree(false), leftp->cloneTree(false)},
+                new AstSub{flp, leftp, rightp}};
+        } else {
+            diffp = rp->dir() == VhdlDir::TO
+                        ? static_cast<AstNodeExpr*>(new AstSub{flp, rightp, leftp})
+                        : static_cast<AstNodeExpr*>(new AstSub{flp, leftp, rightp});
+        }
         return new AstAdd{flp, diffp, new AstConst{flp, AstConst::Signed32{}, 1}};
     }
 
@@ -997,8 +1013,39 @@ private:
             AstNodeExpr* leftp = nullptr;
             AstNodeExpr* rightp = nullptr;
             bool ascending = true;
-            if (dynamicBounds(typep, dim, flp, leftp, rightp, ascending)) {
+            bool dirKnown = true;
+            if (dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                if (!dirKnown) {
+                    // The bounds arrive with the instance, and so does which
+                    // way round they run, so every answer is written to fold
+                    // once they do
+                    AstNodeExpr* const ascp = ascendingOf(leftp, rightp, flp);
+                    if (attr == "ascending") {
+                        VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                        return ascp;
+                    }
+                    if (attr == "left" || attr == "right") {
+                        AstNodeExpr* const keepp = attr == "left" ? leftp : rightp;
+                        AstNodeExpr* const dropp = attr == "left" ? rightp : leftp;
+                        VL_DO_DANGLING(dropp->deleteTree(), dropp);
+                        VL_DO_DANGLING(ascp->deleteTree(), ascp);
+                        return keepp;
+                    }
+                    if (attr == "length") {
+                        return new AstAdd{
+                            flp,
+                            new AstCond{flp, ascp, new AstSub{flp, rightp->cloneTree(false),
+                                                              leftp->cloneTree(false)},
+                                        new AstSub{flp, leftp, rightp}},
+                            new AstConst{flp, AstConst::Signed32{}, 1}};
+                    }
+                    // "high" is whichever end is greater, "low" the other
+                    const bool wantRightFirst = attr == "high";
+                    return new AstCond{flp, ascp, wantRightFirst ? rightp : leftp,
+                                       wantRightFirst ? leftp : rightp};
+                }
                 if (attr == "ascending") {
                     VL_DO_DANGLING(leftp->deleteTree(), leftp);
                     VL_DO_DANGLING(rightp->deleteTree(), rightp);
@@ -2350,6 +2397,14 @@ private:
     // it passed through.
     AstNode* concurrentProcess(AstNode* bodyp, bool postponed, FileLine* flp) {
         if (postponed) return new AstAlwaysPostponed{flp, bodyp};
+        // A concurrent statement runs once at the start and again whenever
+        // what it reads changes (11.6). One that reads nothing -- an
+        // assertion about a generic, say -- therefore runs exactly once.
+        bool reads = false;
+        bodyp->foreach([&reads](const AstVarRef* refp) {
+            if (refp->access().isReadOrRW()) reads = true;
+        });
+        if (!reads) return new AstInitial{flp, bodyp};
         return new AstAlways{flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
                              bodyp};
     }
@@ -2382,7 +2437,9 @@ private:
                     break;
                 }
             }
-            if (!actualp) {
+            // "open", written out or left out, means the port takes its own
+            // default and is wired to nothing (6.5.7.1)
+            if (!actualp || VN_IS(actualp, VhdlOpen)) {
                 if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
                 continue;
             }
@@ -3770,6 +3827,7 @@ private:
         bool ascending = rangep->ascending();
         AstNodeExpr* initp = nullptr;
         AstNodeExpr* limitp = nullptr;
+        AstNodeExpr* ascp = nullptr;  // Set where the direction only folds later
         if (AstVhdlRange* const rp = VN_CAST(nodep->rangep(), VhdlRange)) {
             if (rp->leftp() && rp->rightp()) {
                 initp = lowerExpr(rp->leftp());
@@ -3786,10 +3844,15 @@ private:
                         if (dimv.isInt()) dim = static_cast<int>(dimv.toInt()) - 1;
                     }
                     bool asc = true;
+                    bool dirKnown = true;
                     if (dynamicBounds(attrp->prefixp()->vhdlTypep(), dim, flp, initp, limitp,
-                                      asc)) {
+                                      asc, &dirKnown)) {
+                        if (!dirKnown) ascp = ascendingOf(initp, limitp, flp);
                         ascending = (name == "range") ? asc : !asc;
-                        if (name == "reverse_range") std::swap(initp, limitp);
+                        if (name == "reverse_range") {
+                            std::swap(initp, limitp);
+                            if (ascp) ascp = new AstLogNot{flp, ascp};
+                        }
                     }
                 }
             }
@@ -3820,22 +3883,36 @@ private:
             limitp = new AstVarRef{flp, limitVarp, VAccess::READ};
         }
         AstLoop* const loopp = new AstLoop{flp};
+        // Where the direction arrives with the instance, both ways are
+        // written out and the one that applies folds away with it
         AstNodeExpr* const condp
-            = ascending ? static_cast<AstNodeExpr*>(new AstLteS{
-                              flp, new AstVarRef{flp, varp, VAccess::READ}, limitp})
-                        : static_cast<AstNodeExpr*>(new AstGteS{
-                              flp, new AstVarRef{flp, varp, VAccess::READ}, limitp});
+            = ascp ? static_cast<AstNodeExpr*>(new AstCond{
+                  flp, ascp->cloneTree(false),
+                  new AstLteS{flp, new AstVarRef{flp, varp, VAccess::READ},
+                              limitp->cloneTree(false)},
+                  new AstGteS{flp, new AstVarRef{flp, varp, VAccess::READ}, limitp}})
+                   : ascending ? static_cast<AstNodeExpr*>(new AstLteS{
+                         flp, new AstVarRef{flp, varp, VAccess::READ}, limitp})
+                               : static_cast<AstNodeExpr*>(new AstGteS{
+                                   flp, new AstVarRef{flp, varp, VAccess::READ}, limitp});
         loopp->addStmtsp(new AstLoopTest{flp, loopp, condp});
         m_loops.emplace_back(VhdlLoopFrame{nodep->label(), nullptr, nullptr});
         loopp->addStmtsp(lowerLoopBody(nodep));
-        loopp->addContsp(new AstAssign{
-            flp, new AstVarRef{flp, varp, VAccess::WRITE},
-            ascending ? static_cast<AstNodeExpr*>(new AstAdd{
-                            flp, new AstVarRef{flp, varp, VAccess::READ},
-                            new AstConst{flp, AstConst::Signed32{}, 1}})
-                      : static_cast<AstNodeExpr*>(new AstSub{
-                            flp, new AstVarRef{flp, varp, VAccess::READ},
-                            new AstConst{flp, AstConst::Signed32{}, 1}})});
+        AstNodeExpr* stepp = nullptr;
+        if (ascp) {
+            stepp = new AstAdd{flp, new AstVarRef{flp, varp, VAccess::READ},
+                               new AstCond{flp, ascp,
+                                           new AstConst{flp, AstConst::Signed32{}, 1},
+                                           new AstConst{flp, AstConst::Signed32{}, -1}}};
+        } else if (ascending) {
+            stepp = new AstAdd{flp, new AstVarRef{flp, varp, VAccess::READ},
+                               new AstConst{flp, AstConst::Signed32{}, 1}};
+        } else {
+            stepp = new AstSub{flp, new AstVarRef{flp, varp, VAccess::READ},
+                               new AstConst{flp, AstConst::Signed32{}, 1}};
+        }
+        loopp->addContsp(
+            new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, stepp});
         AstNode* const wrappedp = wrapLoopExit(loopp);
         m_loops.pop_back();
         AstNode* outp

@@ -470,6 +470,7 @@ class AstVhdlRange final : public AstNodeVhdl {
     // @astgen op2 := rightp : Optional[AstNodeVhdlExpr]
     // @astgen op3 := attrp : Optional[AstNodeVhdlExpr]  // e.g. t'range
     const VhdlDir m_dir;
+    bool m_dirUnknown = false;  // Which way the range runs is not known here
 
 public:
     AstVhdlRange(FileLine* fl, AstNodeVhdlExpr* leftp, VhdlDir dir, AstNodeVhdlExpr* rightp)
@@ -485,6 +486,10 @@ public:
     }
     ASTGEN_MEMBERS_AstVhdlRange;
     VhdlDir dir() const { return m_dir; }
+    // A range built to carry bounds that only elaboration knows, where which
+    // way round they run is not known here either
+    bool dirUnknown() const { return m_dirUnknown; }
+    void dirUnknown(bool flag) { m_dirUnknown = flag; }
     void dump(std::ostream& str) const override;
 };
 

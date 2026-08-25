@@ -456,6 +456,21 @@ length and runs at the speed of hand-written Verilog. Where the length is
 not known until the value is computed, as for ``integer'image``, the value
 is carried dynamically instead. Both are correct; only the second allocates.
 
+**A path name stops at the design unit.** ``'INSTANCE_NAME`` and
+``'PATH_NAME`` give every region from the design unit down --
+``:work:pkg:f[ return integer]:`` for a package subprogram,
+``:top(tb):lbl:b`` for a signal in a block -- but not the part of the path
+that comes from outside the unit. A signal in an instantiated entity reads
+``:sub(rtl):s`` where the LRM asks for ``:top(tb):u1@sub(rtl):s``, since one
+compiled entity serves every instance of it.
+
+**A range of length one loses its direction across an unconstrained port.**
+A port or generic written without a constraint takes the subtype of the
+actual, and the two bounds are carried to the instance separately, so which
+way the range runs is read back from them. Where the two bounds are equal
+the range is reported as ascending. Only ``'ascending`` can tell the
+difference; every other attribute, and indexing, are the same either way.
+
 **Arithmetic on a width not known until run time.** Verilator emits
 fixed-width operations, so arithmetic whose operand width is only known
 during execution is not available. This is reachable only by doing

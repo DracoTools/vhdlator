@@ -122,6 +122,7 @@ class VhdlSymbol final {
     // Values given by attribute specifications (7.2), by attribute name. The
     // expression stays owned by the specification.
     std::map<std::string, AstNodeVhdlExpr*> m_userAttrs;
+    VhdlScope* m_declScopep = nullptr;  // Where it was declared, for 'path_name
 
     VL_UNCOPYABLE(VhdlSymbol);
 
@@ -172,6 +173,10 @@ public:
     void userAttr(const std::string& name, AstNodeVhdlExpr* valuep) {
         m_userAttrs.emplace(name, valuep);
     }
+
+    // The region the declaration appeared in, which is the path to it (16.2.7)
+    VhdlScope* declScopep() const { return m_declScopep; }
+    void declScopep(VhdlScope* scopep) { m_declScopep = scopep; }
 
     VhdlSymbol* aliasp() const { return m_aliasp; }
     void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }
@@ -248,6 +253,11 @@ class VhdlScope final {
     // MEMBERS
     VhdlScope* const m_parentp;  // Enclosing region, or null at the root
     const std::string m_name;  // For diagnostics
+    // Where a design unit's own path starts, which is not just its name: a
+    // package is reached through its library and an architecture is written
+    // with the entity it belongs to (16.2.7)
+    std::string m_instPrefix;
+    std::string m_pathPrefix;
     // Declared here. A multimap because a name may denote several overloads.
     std::multimap<std::string, VhdlSymbol*> m_direct;
     // Made potentially visible by a use clause (12.4). Searched only when the
@@ -269,6 +279,12 @@ public:
     VhdlScope* parentp() const { return m_parentp; }
     const std::string& name() const { return m_name; }
     const std::multimap<std::string, VhdlSymbol*>& direct() const { return m_direct; }
+    const std::string& instPrefix() const { return m_instPrefix; }
+    const std::string& pathPrefix() const { return m_pathPrefix; }
+    void prefixes(const std::string& inst, const std::string& path) {
+        m_instPrefix = inst;
+        m_pathPrefix = path;
+    }
 
     // Declare a symbol here. Returns the symbol it hides, if any, so the
     // caller can complain about an illegal redeclaration (12.3).

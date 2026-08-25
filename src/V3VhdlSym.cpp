@@ -189,6 +189,7 @@ VhdlSymbol* VhdlScope::insert(VhdlSymbol* symp) {
         if (it->second->predefined() && !symp->predefined()) {
             m_direct.erase(it);
             m_direct.emplace(symp->name(), symp);
+            symp->declScopep(this);
             return nullptr;
         }
         if (symp->predefined() && !it->second->predefined()) return nullptr;  // Already hidden
@@ -196,6 +197,7 @@ VhdlSymbol* VhdlScope::insert(VhdlSymbol* symp) {
         break;
     }
     m_direct.emplace(symp->name(), symp);
+    symp->declScopep(this);
     return hiddenp;
 }
 

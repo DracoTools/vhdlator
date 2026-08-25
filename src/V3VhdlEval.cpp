@@ -448,6 +448,35 @@ private:
         return typep->indexTypes()[dim];
     }
 
+    // Every region from the design unit down to this one, each followed by a
+    // colon. An unnamed process contributes an empty name, as VHDL writes it.
+    static std::string scopePath(const VhdlScope* scopep, bool inst) {
+        if (!scopep) return "";
+        const std::string& prefix = inst ? scopep->instPrefix() : scopep->pathPrefix();
+        if (!prefix.empty()) return prefix + ":";
+        std::string name = scopep->name();
+        if (name == "process" || name == "block" || name == "generate"
+            || name == "generate body" || name == "loop") {
+            name.clear();
+        }
+        const std::string up = scopePath(scopep->parentp(), inst);
+        if (up.empty() && name.empty()) return "";
+        return up + name + ":";
+    }
+
+    // "[bit, bit return integer]", the parameter and result type profile
+    static std::string signatureOf(const VhdlSymbol* symp) {
+        std::string out = "[";
+        bool first = true;
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (!first) out += ",";
+            first = false;
+            out += typep ? typep->prettyName() : "";
+        }
+        if (symp->returnTypep()) out += " return " + symp->returnTypep()->prettyName();
+        return out + "]";
+    }
+
     VhdlValue evalAttr(AstVhdlAttrName* nodep) {
         const std::string& attr = nodep->name();
 
@@ -463,6 +492,31 @@ private:
                     = prefixSymp ? prefixSymp->userAttr(attr) : nullptr;
                 return valuep ? eval(valuep) : VhdlValue{};
             }
+        }
+
+        if (attr == "instance_name" || attr == "path_name") {
+            // The path to what the prefix names, written the way VHDL writes
+            // one (16.2.7): every region from the design unit down, with the
+            // library ahead of a package and the architecture written beside
+            // its entity. A subprogram or a package ends with a colon; an
+            // object does not.
+            VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
+            if (!symp) return VhdlValue{};
+            const bool inst = attr == "instance_name";
+            std::string out = ":" + scopePath(symp->declScopep(), inst) + symp->name();
+            switch (symp->kind()) {
+            case VhdlSymKind::FUNCTION:
+            case VhdlSymKind::PROCEDURE:
+                // A subprogram is named with its profile, since the name
+                // alone need not pick out one declaration (16.2.7)
+                out += signatureOf(symp) + ":";
+                break;
+            case VhdlSymKind::PACKAGE:
+            case VhdlSymKind::ENTITY:
+            case VhdlSymKind::TYPE: out += ":"; break;
+            default: break;
+            }
+            return VhdlValue::mkStr(out, V3VhdlStd::stringType());
         }
 
         VhdlType* typep = prefixType(nodep);
@@ -532,14 +586,6 @@ private:
             VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
             if (!symp) return VhdlValue{};
             return VhdlValue::mkStr(symp->name(), V3VhdlStd::stringType());
-        }
-        if (attr == "instance_name" || attr == "path_name") {
-            // The path to what the prefix names, written the way VHDL writes
-            // one (16.2.7). Only the name itself is known here, which is what
-            // these are used for -- naming the source of a report.
-            VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
-            if (!symp) return VhdlValue{};
-            return VhdlValue::mkStr(":" + symp->name() + ":", V3VhdlStd::stringType());
         }
         return VhdlValue{};
     }
