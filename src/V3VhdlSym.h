@@ -40,6 +40,7 @@
 #include <vector>
 
 class AstNode;
+class AstNodeVhdlExpr;
 class AstVhdlSubprogDecl;
 class FileLine;
 
@@ -118,6 +119,9 @@ class VhdlSymbol final {
     int m_driverCount = 0;
     VhdlSymbol* m_resolverp = nullptr;
     AstVhdlSubprogDecl* m_bodyp = nullptr;  // A subprogram's body, for copying
+    // Values given by attribute specifications (7.2), by attribute name. The
+    // expression stays owned by the specification.
+    std::map<std::string, AstNodeVhdlExpr*> m_userAttrs;
 
     VL_UNCOPYABLE(VhdlSymbol);
 
@@ -159,6 +163,15 @@ public:
     bool isForeign() const { return !m_foreignName.empty(); }
     bool foreignDpi() const { return m_foreignDpi; }
     void foreignDpi(bool flag) { m_foreignDpi = flag; }
+
+    // A user-defined attribute's value for this entity, or nullptr
+    AstNodeVhdlExpr* userAttr(const std::string& name) const {
+        const auto it = m_userAttrs.find(name);
+        return it == m_userAttrs.end() ? nullptr : it->second;
+    }
+    void userAttr(const std::string& name, AstNodeVhdlExpr* valuep) {
+        m_userAttrs.emplace(name, valuep);
+    }
 
     VhdlSymbol* aliasp() const { return m_aliasp; }
     void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }

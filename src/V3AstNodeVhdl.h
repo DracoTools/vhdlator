@@ -1042,10 +1042,13 @@ class AstVhdlBlock final : public AstNodeVhdlStmt {
     // @astgen op2 := headerp : Optional[AstVhdlBlockHeader]
     // @astgen op3 := declsp : List[AstNodeVhdl]
     // @astgen op4 := stmtsp : List[AstNodeVhdlStmt]
+    VhdlSymbol* m_guardSymp = nullptr;  // The GUARD a guard expression declares
 public:
     explicit AstVhdlBlock(FileLine* fl)
         : ASTGEN_SUPER_VhdlBlock(fl) {}
     ASTGEN_MEMBERS_AstVhdlBlock;
+    VhdlSymbol* guardSymp() const { return m_guardSymp; }
+    void guardSymp(VhdlSymbol* symp) { m_guardSymp = symp; }
 };
 
 class AstVhdlCase final : public AstNodeVhdlStmt {

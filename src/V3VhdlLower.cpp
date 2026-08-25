@@ -1019,8 +1019,26 @@ private:
             }
         }
         if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+        // A user-defined attribute stands for the static expression an
+        // attribute specification gave the prefix (7.2)
+        if (AstNodeExpr* const userp = lowerUserAttr(nodep, attr)) return userp;
         unsup(flp, "attribute '" + attr);
         return nullptr;
+    }
+
+    // The value an attribute specification gave the named prefix, lowered in
+    // place of the attribute name
+    AstNodeExpr* lowerUserAttr(AstVhdlAttrName* nodep, const std::string& attr) {
+        VhdlSymbol* symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
+        if (!symp) {
+            // The prefix of an attribute name need not analyze as an
+            // expression, so it may have been left unresolved
+            AstVhdlName* const namep = VN_CAST(nodep->prefixp(), VhdlName);
+            if (namep) symp = namep->vhdlSymp();
+        }
+        if (!symp) return nullptr;
+        AstNodeVhdlExpr* const valuep = symp->resolved()->userAttr(attr);
+        return valuep ? lowerExpr(valuep) : nullptr;
     }
 
     // What a signal attribute needs kept about one signal, made on first use.
@@ -1151,13 +1169,7 @@ private:
         // which is not done here.
         if (symp->kind() == VhdlSymKind::ALIAS) {
             AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
-            if (declp && declp->targetp()) {
-                if (!aliasKeepsRange(symp, declp)) {
-                    unsup(flp, "alias '" + name + "' with an index range of its own");
-                    return nullptr;
-                }
-                return lowerExpr(declp->targetp());
-            }
+            if (declp && declp->targetp()) return lowerExpr(declp->targetp());
             if (symp->aliasp()) return lowerRef(symp->aliasp(), name, flp);
         }
         const auto it = m_vars.find(symp);
@@ -1263,6 +1275,46 @@ private:
         return newp;
     }
 
+    // How an alias numbers its elements against what it denotes (6.6.2).
+    // "alias b : bit_vector(3 downto 0) is v(7 downto 4)" makes b(0) mean
+    // v(4), so an index into the alias is shifted onto the target's own
+    // range. Returns false when there is nothing to translate.
+    static bool aliasMapping(const VhdlSymbol* symp, const AstVhdlAliasDecl* declp,
+                             int64_t& fromLeft, int64_t& toLeft, int& step) {
+        if (aliasKeepsRange(symp, declp)) return false;
+        const VhdlType* const atp = symp->typep();
+        const VhdlType* const ttp = declp->targetp()->vhdlTypep();
+        if (!atp || !ttp || !atp->isConstrainedArray() || !ttp->isConstrainedArray()) {
+            return false;
+        }
+        if (atp->dimensions() != 1 || ttp->dimensions() != 1) return false;
+        const VhdlType* const aidx = atp->indexTypes()[0];
+        const VhdlType* const tidx = ttp->indexTypes()[0];
+        if (!aidx || !tidx || aidx->length() != tidx->length()) return false;
+        fromLeft = aidx->left();
+        toLeft = tidx->left();
+        step = (aidx->ascending() == tidx->ascending()) ? 1 : -1;
+        return true;
+    }
+
+    // "toLeft + step * (idxp - fromLeft)", folded where it can be
+    static AstNodeExpr* shiftIndex(AstNodeExpr* idxp, int64_t fromLeft, int64_t toLeft, int step,
+                                   FileLine* flp) {
+        if (const AstConst* const constp = VN_CAST(idxp, Const)) {
+            const int64_t k = static_cast<int64_t>(constp->toSInt());
+            VL_DO_DANGLING(idxp->deleteTree(), idxp);
+            return new AstConst{flp, AstConst::Signed32{},
+                                static_cast<int32_t>(toLeft + step * (k - fromLeft))};
+        }
+        AstNodeExpr* offsetp
+            = new AstSub{flp, idxp, new AstConst{flp, AstConst::Signed32{},
+                                                 static_cast<int32_t>(fromLeft)}};
+        if (step < 0) offsetp = new AstNegate{flp, offsetp};
+        return new AstAdd{flp, new AstConst{flp, AstConst::Signed32{},
+                                            static_cast<int32_t>(toLeft)},
+                          offsetp};
+    }
+
     // Whether an alias indexes the same way what it denotes does
     static bool aliasKeepsRange(const VhdlSymbol* symp, const AstVhdlAliasDecl* declp) {
         const VhdlType* const atp = symp->typep();
@@ -1272,6 +1324,18 @@ private:
         if (!ttp || !ttp->isConstrainedArray() || ttp->dimensions() != 1) return true;
         return atp->indexTypes()[0]->left() == ttp->indexTypes()[0]->left()
                && atp->indexTypes()[0]->right() == ttp->indexTypes()[0]->right();
+    }
+
+    // An index into an alias, put onto the range of what it denotes
+    static AstNodeExpr* aliasShift(VhdlSymbol* symp, AstNodeExpr* idxp, FileLine* flp) {
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS || !idxp) return idxp;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!declp || !declp->targetp()) return idxp;
+        int64_t fromLeft = 0;
+        int64_t toLeft = 0;
+        int step = 1;
+        if (!aliasMapping(symp, declp, fromLeft, toLeft, step)) return idxp;
+        return shiftIndex(idxp, fromLeft, toLeft, step, flp);
     }
 
     AstNodeExpr* lowerSelected(AstVhdlSelected* nodep) {
@@ -1612,12 +1676,14 @@ private:
                     unsup(flp, "slice by an attribute range");
                     return nullptr;
                 }
-                AstNodeExpr* const leftp = lowerExpr(rp->leftp());
-                AstNodeExpr* const rightp = lowerExpr(rp->rightp());
+                AstNodeExpr* leftp = lowerExpr(rp->leftp());
+                AstNodeExpr* rightp = lowerExpr(rp->rightp());
                 if (!leftp || !rightp) {
                     VL_DO_DANGLING(fromp->deleteTree(), fromp);
                     return nullptr;
                 }
+                leftp = aliasShift(objSymp, leftp, flp);
+                rightp = aliasShift(objSymp, rightp, flp);
                 // A slice whose bounds move together but keep their width --
                 // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
                 // writes both ends, so the width has to be recovered from
@@ -1634,11 +1700,12 @@ private:
             for (AstNode* p = nodep->argsp(); p; p = p->nextp()) {
                 AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                 if (!asp || !asp->actualp()) continue;
-                AstNodeExpr* const indexp = lowerExpr(asp->actualp());
+                AstNodeExpr* indexp = lowerExpr(asp->actualp());
                 if (!indexp) {
                     VL_DO_DANGLING(outp->deleteTree(), outp);
                     return nullptr;
                 }
+                indexp = aliasShift(objSymp, indexp, flp);
                 outp = new AstSelBit{flp, outp, indexp};
             }
             return outp;
@@ -2248,7 +2315,8 @@ private:
             // its declarations and statements belong to the module (11.2).
             // A guard, or a header giving the block its own generics and
             // ports, makes it more than that.
-            if (blockp->guardp()) unsup(flp, "guarded block");
+            VL_RESTORER(m_guardVarp);
+            if (blockp->guardp()) lowerGuard(blockp, flp);
             if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
                 lowerBlockHeader(headerp);
             }
@@ -2977,6 +3045,29 @@ private:
                     p = nextp;
                 }
             }
+            return;
+        }
+        if (nodep->guarded()) {
+            // "s <= guarded w" drives only while GUARD is true; when it goes
+            // false the driver is turned off, which for a signal with one
+            // driver leaves it holding its last value (11.6)
+            if (!m_guardVarp) {
+                unsup(flp, "guarded assignment outside a guarded block");
+                VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                return;
+            }
+            // Holding a value while the guard is false is what the
+            // construct is for, and a VHDL signal assignment is always a
+            // scheduled update, so neither reading as a latch nor using "<="
+            // in combinational logic is a finding here
+            FileLine* const gflp = new FileLine{flp};
+            gflp->warnOff(V3ErrorCode::LATCH, true);
+            gflp->warnOff(V3ErrorCode::COMBDLY, true);
+            AstNode* const stmtsp = new AstIf{
+                gflp, new AstVarRef{gflp, m_guardVarp, VAccess::READ},
+                new AstAssignDly{gflp, lhsp, rhsp, delayp}};
+            addStmt(concurrentProcess(stmtsp, nodep->postponed(), gflp));
             return;
         }
         addStmt(new AstAlways{new AstAssignW{flp, lhsp, rhsp, delayp}});
@@ -4006,6 +4097,25 @@ private:
                                 static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
     }
     AstVar* m_deltaVarp = nullptr;  // The module's delta-cycle signal, if used
+    AstVar* m_guardVarp = nullptr;  // The GUARD of the enclosing guarded block
+
+    // A guard expression declares a signal GUARD holding its value, which the
+    // block's guarded assignments test before they drive (11.2)
+    void lowerGuard(AstVhdlBlock* nodep, FileLine* flp) {
+        VhdlSymbol* const symp = nodep->guardSymp();
+        if (!symp) return;
+        AstNodeExpr* const exprp = lowerCondition(nodep->guardp());
+        if (!exprp) return;
+        AstVar* const varp = new AstVar{flp, VVarType::VAR,
+                                        "__Vguard__" + (nodep->name().empty() ? "block"
+                                                                              : nodep->name()),
+                                        VFlagChildDType{}, newLogicDType(flp, 1)};
+        m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+        m_vars[symp] = varp;
+        m_guardVarp = varp;
+        addStmt(new AstAlways{new AstAssignW{
+            flp, new AstVarRef{flp, varp, VAccess::WRITE}, exprp, nullptr}});
+    }
 
     AstNode* lowerWait(AstVhdlWait* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -4014,8 +4124,20 @@ private:
             return nullptr;
         }
         if (nodep->condp() && nodep->timeoutp()) {
-            unsup(flp, "wait with both a condition and a timeout");
-            return nullptr;
+            // "wait until C for T" resumes on whichever comes first, so both
+            // are run as branches of a join_any and the loser is dropped
+            AstNode* const condp = lowerWaitCond(nodep, flp);
+            AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
+            if (!condp || !timep) {
+                if (condp) VL_DO_DANGLING(condp->deleteTree(), condp);
+                if (timep) VL_DO_DANGLING(timep->deleteTree(), timep);
+                return nullptr;
+            }
+            AstFork* const forkp = new AstFork{flp, VJoinType::JOIN_ANY, ""};
+            forkp->addForksp(new AstBegin{flp, "", condp, false});
+            forkp->addForksp(
+                new AstBegin{flp, "", lowerTimeout(timep, flp), false});
+            return AstNode::addNext(static_cast<AstNode*>(forkp), new AstDisableFork{flp});
         }
         if (nodep->condp()) {
             // "wait until C" always suspends, and resumes when an event makes
@@ -4023,18 +4145,38 @@ private:
             // already true, which for "wait until clk = '1'" written while
             // the clock is high would spin without advancing time. So the
             // process is suspended on an event first, and only then waits.
-            AstNodeExpr* const condp = lowerCondition(nodep->condp());
-            if (!condp) return nullptr;
-            AstSenTree* sensp = sensitivityOf(nodep->sensp(), flp);
-            if (!sensp) sensp = sensitivityOfExpr(condp, flp);
-            if (!sensp) return new AstWait{flp, condp, nullptr};
-            AstNode* const outp = new AstEventControl{flp, sensp, nullptr};
-            return AstNode::addNext(outp, static_cast<AstNode*>(
-                                              new AstWait{flp, condp, nullptr}));
+            return lowerWaitCond(nodep, flp);
         }
         if (nodep->timeoutp()) {
             AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
-            if (!timep) return nullptr;
+            return timep ? lowerTimeout(timep, flp) : nullptr;
+        }
+        if (nodep->sensp()) {
+            AstSenTree* const sensp = sensitivityOf(nodep->sensp(), flp);
+            return sensp ? new AstEventControl{flp, sensp, nullptr} : nullptr;
+        }
+        // A bare "wait" suspends for good: the process never resumes, so
+        // whatever follows it never runs again
+        return new AstWait{flp, new AstConst{flp, AstConst::BitFalse{}}, nullptr};
+    }
+
+    // "wait until C" always suspends, and resumes when an event makes C true
+    // (10.2). Verilog's wait(C) returns at once if C is already true, which
+    // for "wait until clk = '1'" written while the clock is high would spin
+    // without advancing time. So the process is suspended on an event first,
+    // and only then waits.
+    AstNode* lowerWaitCond(AstVhdlWait* nodep, FileLine* flp) {
+        AstNodeExpr* const condp = lowerCondition(nodep->condp());
+        if (!condp) return nullptr;
+        AstSenTree* sensp = sensitivityOf(nodep->sensp(), flp);
+        if (!sensp) sensp = sensitivityOfExpr(condp, flp);
+        if (!sensp) return new AstWait{flp, condp, nullptr};
+        AstNode* const outp = new AstEventControl{flp, sensp, nullptr};
+        return AstNode::addNext(outp, static_cast<AstNode*>(new AstWait{flp, condp, nullptr}));
+    }
+
+    AstNode* lowerTimeout(AstNodeExpr* timep, FileLine* flp) {
+        {
             // "wait for 0 ns" does not stand still: it resumes in the next
             // delta cycle, after the signal assignments already made have
             // taken effect (10.2, 14.7.5). Verilog's "#0" is not that -- it
@@ -4054,13 +4196,6 @@ private:
             return new AstIf{flp, isZerop, deltaWait(flp),
                              new AstDelay{flp, timep, false}};
         }
-        if (nodep->sensp()) {
-            AstSenTree* const sensp = sensitivityOf(nodep->sensp(), flp);
-            return sensp ? new AstEventControl{flp, sensp, nullptr} : nullptr;
-        }
-        // A bare "wait" suspends for good: the process never resumes, so
-        // whatever follows it never runs again
-        return new AstWait{flp, new AstConst{flp, AstConst::BitFalse{}}, nullptr};
     }
 
     // The procedures of std.textio and the implicit file operations (5.5.2,

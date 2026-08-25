@@ -892,6 +892,7 @@ private:
     std::map<std::string, AstVhdlPackageBody*> m_packageBodies;  // "lib.name" -> its body
     void visit(AstVhdlAttrDecl* nodep) override;
     void visit(AstVhdlAttrSpec* nodep) override;
+    void recordUserAttr(AstVhdlAttrSpec* nodep) VL_MT_DISABLED;
     bool parseForeign(const std::string& text, FileLine* flp, std::string& cnamer,
                       bool& dpir);
     void visit(AstVhdlContextItem* nodep) override;
@@ -1344,13 +1345,71 @@ void VhdlSemVisitor::visit(AstVhdlAttrDecl* nodep) {
     declare(symp, nodep->fileline());
 }
 
+// The entity classes of 7.2 that name something analysis has a symbol for.
+// A class the symbol table does not distinguish matches any kind.
+static bool entityClassMatches(const std::string& cls, VhdlSymKind kind) {
+    if (cls == "signal") return kind == VhdlSymKind::SIGNAL || kind == VhdlSymKind::PORT;
+    if (cls == "variable") return kind == VhdlSymKind::VARIABLE;
+    if (cls == "constant") return kind == VhdlSymKind::CONSTANT || kind == VhdlSymKind::GENERIC;
+    if (cls == "type" || cls == "subtype") return kind == VhdlSymKind::TYPE;
+    if (cls == "function") return kind == VhdlSymKind::FUNCTION;
+    if (cls == "procedure") return kind == VhdlSymKind::PROCEDURE;
+    if (cls == "component") return kind == VhdlSymKind::COMPONENT;
+    if (cls == "literal") return kind == VhdlSymKind::ENUM_LITERAL;
+    if (cls == "file") return kind == VhdlSymKind::FILE;
+    return true;
+}
+
+// A user-defined attribute's value belongs to the entity it is given to, and
+// is read back later as "name'attribute" (7.2). It is a static expression, so
+// what is recorded is the expression itself and every use folds it.
+void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
+    VhdlType* attrTypep = nullptr;
+    std::vector<VhdlSymbol*> attrs;
+    lookup(nodep->name(), attrs);
+    for (VhdlSymbol* const symp : attrs) {
+        if (symp->resolved()->kind() == VhdlSymKind::ATTRIBUTE) {
+            attrTypep = symp->resolved()->typep();
+            break;
+        }
+    }
+    if (!attrTypep) {
+        err(nodep->fileline(), "No attribute '" + nodep->name() + "' is declared here");
+        return;
+    }
+    analyzeExpr(nodep->valuep(), attrTypep);
+    AstVhdlEntitySpec* const specp = nodep->specp();
+    if (!specp || specp->all() || specp->others()) return;
+    const std::string cls = specp->entityClass();
+    for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
+        AstNodeVhdlExpr* const namep = VN_AS(p, NodeVhdlExpr);
+        std::vector<std::string> parts;
+        if (!flatten(namep, parts) || parts.empty()) continue;
+        std::vector<VhdlSymbol*> found;
+        lookup(parts.back(), found);
+        for (VhdlSymbol* const symp : found) {
+            VhdlSymbol* const realp = symp->resolved();
+            if (!entityClassMatches(cls, realp->kind())) continue;
+            if (realp->userAttr(nodep->name())) {
+                err(nodep->fileline(), "Attribute '" + nodep->name() + "' is already given a "
+                                       "value for '" + parts.back() + "'");
+                continue;
+            }
+            realp->userAttr(nodep->name(), nodep->valuep());
+        }
+    }
+}
+
 // An attribute specification gives an attribute a value for named entities
 // (7.2). Most attributes are of interest only to the tool that defined them
 // and are carried no further, but FOREIGN is the language's own way of saying
 // that a subprogram is implemented outside VHDL (16.2), so it is acted on.
 void VhdlSemVisitor::visit(AstVhdlAttrSpec* nodep) {
+    if (nodep->name() != "foreign") {
+        recordUserAttr(nodep);
+        return;
+    }
     iterateAndNextNull(nodep->valuep());
-    if (nodep->name() != "foreign") return;
     AstVhdlEntitySpec* const specp = nodep->specp();
     if (!specp) return;
     const std::string cls = specp->entityClass();
@@ -1479,7 +1538,16 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
         analyzeAssociations(nodep->headerp()->genericMapp(), nullptr);
         analyzeAssociations(nodep->headerp()->portMapp(), nullptr);
     }
+    // The guard expression names what is visible where the block appears; the
+    // GUARD signal it declares is visible only inside (11.2)
+    if (nodep->guardp()) analyzeExpr(nodep->guardp(), V3VhdlStd::booleanType());
     pushScope(nodep->name().empty() ? "block" : nodep->name());
+    if (nodep->guardp()) {
+        VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::SIGNAL, "guard", nodep);
+        symp->typep(V3VhdlStd::booleanType());
+        nodep->guardSymp(symp);
+        declare(symp, nodep->fileline());
+    }
     if (nodep->headerp()) {
         m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->genericsp());

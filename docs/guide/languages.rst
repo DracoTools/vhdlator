@@ -468,6 +468,20 @@ family is reported as unsupported rather than resolved. Signals of
 ``resolved_max`` are resolved, and a forcing value correctly beats a weak
 one, so a tri-state bus with pull-ups behaves as the LRM says.
 
+**A guarded signal is not disconnected.** A guarded assignment drives while
+its block's ``GUARD`` is true and holds its last value while it is false,
+which is what a signal with one driver does. For a signal declared with the
+``bus`` or ``register`` kind and driven from more than one place, VHDL turns
+the driver off entirely and lets the resolution function see one fewer
+value; that removal is not modelled, so such a signal keeps contributing its
+last value. ``disconnect`` specifications are accepted and ignored for the
+same reason.
+
+**An attribute specification must name what it applies to.** ``attribute a
+of x : signal is ...`` gives ``x'a`` its value, but the ``all`` and
+``others`` forms, which give every entity of a class in the declarative part
+the same value, are not applied.
+
 **The image of a real is printed in C form.** ``real'image(4.0)`` gives
 ``4`` where the LRM asks for text that reads back as a VHDL literal, such as
 ``4.0``. This affects only what is printed, not any value.

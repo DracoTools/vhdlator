@@ -6,7 +6,8 @@
 --
 -- A block statement with generics and ports of its own. A block is not a
 -- module: it is elaborated where it stands, so each generic is a constant
--- and each port a signal wired to its actual.
+-- and each port a signal wired to its actual. A guard expression declares a
+-- signal GUARD, and a guarded assignment drives only while it is true.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -17,7 +18,17 @@ end entity;
 
 architecture sim of t_vhdl_block is
   signal x, y, z : integer;
+  signal en : std_logic := '0';
+  signal d : std_logic_vector(3 downto 0) := "0001";
+  signal q : std_logic_vector(3 downto 0) := "0000";
+  signal g : boolean := false;
 begin
+
+  latch : block (en = '1') is
+  begin
+    q <= guarded d;
+    g <= GUARD;                     -- the guard is a signal of the block
+  end block;
 
   scaled : block is
     generic (factor : integer);
@@ -46,6 +57,21 @@ begin
     wait for 1 ns;
     assert y = 50 report "block did not follow its input" severity failure;
     assert z = 51 report "plain block did not follow" severity failure;
+    -- The latch holds while its guard is false and follows while it is true
+    assert q = "0000" report "guarded assignment drove while closed" severity failure;
+    assert not g report "GUARD is not readable" severity failure;
+    en <= '1';
+    wait for 1 ns;
+    assert q = "0001" and g report "guarded assignment did not open" severity failure;
+    d <= "1010";
+    wait for 1 ns;
+    assert q = "1010" report "guarded assignment did not follow" severity failure;
+    en <= '0';
+    wait for 1 ns;
+    d <= "0110";
+    wait for 1 ns;
+    assert q = "1010" report "guarded assignment did not hold" severity failure;
+
     report "*-* All Finished *-*";
     stop;
     wait;

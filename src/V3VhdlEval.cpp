@@ -450,13 +450,23 @@ private:
 
     VhdlValue evalAttr(AstVhdlAttrName* nodep) {
         const std::string& attr = nodep->name();
+
+        // A user-defined attribute stands for the static expression that an
+        // attribute specification gave the prefix (7.2). Checked before the
+        // prefix's type, since the prefix may be a label or a design unit.
+        if (VhdlSymbol* const attrp = nodep->vhdlSymp()) {
+            if (attrp->kind() == VhdlSymKind::ATTRIBUTE) {
+                VhdlSymbol* prefixSymp
+                    = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
+                if (prefixSymp) prefixSymp = prefixSymp->resolved();
+                AstNodeVhdlExpr* const valuep
+                    = prefixSymp ? prefixSymp->userAttr(attr) : nullptr;
+                return valuep ? eval(valuep) : VhdlValue{};
+            }
+        }
+
         VhdlType* typep = prefixType(nodep);
         if (!typep || typep->isError()) return VhdlValue{};
-
-        // A user-defined attribute holds whatever its specification gave it
-        if (VhdlSymbol* const symp = nodep->vhdlSymp()) {
-            if (symp->kind() == VhdlSymKind::ATTRIBUTE) return symp->value();
-        }
 
         // Attributes of an array ask about one of its index ranges; those of a
         // scalar type about the type's own range (16.2.3, 16.2.4)
