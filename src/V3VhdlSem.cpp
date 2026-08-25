@@ -379,6 +379,16 @@ class VhdlSemVisitor final : public VNVisitor {
         VhdlType* typep = attrp->prefixp() ? attrp->prefixp()->vhdlTypep() : nullptr;
         if (!typep || typep->isError()) return nullptr;
         if (typep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
+        // "v'range" where v is unconstrained -- a parameter, say -- is the
+        // range of whatever it is given, not the whole of its index subtype.
+        // Reporting the index subtype's own range instead would make a slice
+        // written with it look four billion elements long (16.2.4).
+        if (typep->unconstrained()) {
+            VhdlType* const openp
+                = cloneSubtype(dimensionOf(attrp, typep), attrp->fileline());
+            if (openp) openp->unbound();
+            return openp;
+        }
         return dimensionOf(attrp, typep);
     }
 
@@ -1040,6 +1050,7 @@ private:
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
     static void dropUninstantiated(std::vector<VhdlSymbol*>& found) VL_MT_DISABLED;
     VhdlType* attrTypeQuiet(AstVhdlAttrName* nodep) VL_MT_DISABLED;
+    static bool scopeEncloses(const VhdlScope* outerp, const VhdlScope* innerp) VL_MT_DISABLED;
     // Set while the call that is a statement of its own is resolved
     bool m_procCall = false;
     // True if the candidates could stand where 'wantp' is expected
@@ -1097,6 +1108,21 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
             iterateAndNextNull(protp->declsp());
             return;
         }
+        // A protected type's own name is visible inside its declaration: its
+        // methods take parameters of the type itself (5.6.2), so the name has
+        // to be declared before they are analyzed
+        VhdlType* const typep = VhdlSymTab::newType(VhdlTypeKind::PROTECTED, nodep->name(),
+                                                    nodep->fileline());
+        VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, nodep->name(), nodep);
+        symp->typep(typep);
+        nodep->vhdlSymp(symp);
+        declare(symp, nodep->fileline());
+        V3VhdlStd::addImplicitOperators(m_scopep, typep);
+        VhdlScope* const innerp = pushScope(nodep->name());
+        typep->scopep(innerp);
+        iterateAndNextNull(protp->declsp());
+        popScope();
+        return;
     }
     VhdlType* const typep = buildType(nodep->defp(), nodep->name(), nodep->fileline());
     typep->name(nodep->name());
@@ -2737,6 +2763,16 @@ bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
     return false;
 }
 
+// Whether one region encloses another, so that a declaration in the inner
+// one hides a homograph in the outer (12.3)
+bool VhdlSemVisitor::scopeEncloses(const VhdlScope* outerp, const VhdlScope* innerp) {
+    if (!outerp || !innerp || outerp == innerp) return false;
+    for (const VhdlScope* p = innerp->parentp(); p; p = p->parentp()) {
+        if (p == outerp) return true;
+    }
+    return false;
+}
+
 // The type of an attribute of a type mark, worked out without reporting
 // anything: used where a name is being weighed rather than analyzed (16.2)
 VhdlType* VhdlSemVisitor::attrTypeQuiet(AstVhdlAttrName* nodep) {
@@ -3036,6 +3072,22 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
     if (cands.empty()) {
         err(nodep->fileline(), "No visible " + what + " matches this use");
         return V3VhdlStd::errorType();
+    }
+    if (cands.size() > 1) {
+        // A declaration hides a homograph of it declared further out (12.3).
+        // That is how a protected type's method of the same profile as a
+        // package's function is the one meant inside the type's body.
+        std::vector<VhdlSymbol*> inner;
+        for (VhdlSymbol* const symp : cands) {
+            bool hidden = false;
+            for (VhdlSymbol* const otherp : cands) {
+                if (otherp == symp) continue;
+                if (!symp->homographOf(otherp)) continue;
+                if (scopeEncloses(symp->declScopep(), otherp->declScopep())) hidden = true;
+            }
+            if (!hidden) inner.push_back(symp);
+        }
+        if (!inner.empty() && inner.size() < cands.size()) cands.swap(inner);
     }
     if (cands.size() > 1) {
         // A declaration written in the design hides the predefined operation
