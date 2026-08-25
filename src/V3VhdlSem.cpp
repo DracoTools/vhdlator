@@ -572,6 +572,12 @@ class VhdlSemVisitor final : public VNVisitor {
             firstp = icp->rangesp();
         }
         if (!firstp) return;
+        // A record constraint names an element and constrains that: the
+        // subtype "rec(f(1 to 3))" fixes f and leaves the rest alone (5.3.3)
+        if (basep->base()->kind() == VhdlTypeKind::RECORD) {
+            applyRecordConstraint(typep, basep, firstp, flp);
+            return;
+        }
         if (basep->base()->kind() != VhdlTypeKind::ARRAY) {
             // A parenthesized type mark that is not an array is a conversion
             // or a call the caller mistook for a subtype; leave it alone
@@ -641,6 +647,44 @@ class VhdlSemVisitor final : public VNVisitor {
             if (!idxp->bounded()) unconstrained = true;
         }
         typep->unconstrained(unconstrained);
+    }
+
+    // "rec (f (1 to 3), g (7 downto 0))": each element named is constrained,
+    // and gets a declaration of its own in this subtype (5.3.3)
+    void applyRecordConstraint(VhdlType* typep, VhdlType* basep, AstNode* firstp, FileLine* flp) {
+        for (AstNode* p = firstp; p; p = p->nextp()) {
+            AstNode* itemp = p;
+            if (AstVhdlAssoc* const asp = VN_CAST(itemp, VhdlAssoc)) {
+                if (!asp->formalp() && asp->actualp()) itemp = asp->actualp();
+            }
+            AstVhdlCall* const callp = VN_CAST(itemp, VhdlCall);
+            const AstVhdlName* const namep
+                = callp ? VN_CAST(callp->prefixp(), VhdlName) : nullptr;
+            if (!namep) {
+                err(flp, "A record constraint names an element and how to constrain it");
+                return;
+            }
+            const std::vector<VhdlSymbol*>& elems = basep->base()->elements();
+            size_t pos = elems.size();
+            for (size_t i = 0; i < elems.size(); ++i) {
+                if (elems[i]->name() == namep->name()) pos = i;
+            }
+            if (pos == elems.size()) {
+                err(namep->fileline(), "Record type " + basep->prettyName()
+                                           + " has no element '" + namep->name() + "'");
+                return;
+            }
+            VhdlType* const elemTypep = elems[pos]->typep();
+            if (!elemTypep) return;
+            VhdlType* const newTypep = cloneSubtype(elemTypep, flp);
+            applyConstraint(newTypep, elemTypep, nullptr, callp->argsp(), flp);
+            VhdlSymbol* const newSymp = VhdlSymTab::newSymbol(VhdlSymKind::RECORD_ELEMENT,
+                                                             elems[pos]->name(),
+                                                             elems[pos]->declp());
+            newSymp->typep(newTypep);
+            newSymp->position(elems[pos]->position());
+            typep->replaceElement(pos, newSymp);
+        }
     }
 
     // A subtype's range must lie within the range it narrows (5.2.1)

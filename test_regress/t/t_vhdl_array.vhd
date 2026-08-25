@@ -35,7 +35,19 @@ architecture tb of t_vhdl_array is
 begin
 
   process
+    variable a, b : integer;
+    variable lo, hi : bits(0 to 1);
   begin
+    -- An aggregate may stand on the left of an assignment: each name takes
+    -- the element of the value in its own position (10.6.2)
+    (a, b) := integer_vector'(11, 22);
+    assert a = 11 and b = 22 report "aggregate target" severity failure;
+
+    -- And an element of the target may be a whole slice of the value
+    (lo, hi) := n;
+    assert lo = "10" report "aggregate target slice lo" severity failure;
+    assert hi = "11" report "aggregate target slice hi" severity failure;
+
     assert grid(1)(1) = 1 report "grid(1)(1)" severity failure;
     assert grid(2)(2) = 4 report "grid(2)(2)" severity failure;
     assert grid(3)(1) = 5 report "grid(3)(1)" severity failure;

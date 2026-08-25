@@ -259,6 +259,10 @@ public:
     // Record
     const std::vector<VhdlSymbol*>& elements() const { return m_elements; }
     void addElement(VhdlSymbol* symp) { m_elements.push_back(symp); }
+    // A subtype may constrain one element without touching the others (5.3.3)
+    void replaceElement(size_t pos, VhdlSymbol* symp) {
+        if (pos < m_elements.size()) m_elements[pos] = symp;
+    }
 
     // Access and file
     VhdlType* designatedp() const { return m_designatedp; }
