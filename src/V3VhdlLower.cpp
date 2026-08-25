@@ -432,8 +432,38 @@ private:
         }
     }
 
+    // Whether every element of a record can live inside a packed structure.
+    // One that cannot -- a real, a string, an unpacked array, an access value
+    // -- makes the whole record unpacked.
+    static bool recordPacks(const VhdlType* typep) {
+        for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+            const VhdlType* const etypep = elemp->typep();
+            if (!etypep) return false;
+            switch (etypep->base()->kind()) {
+            case VhdlTypeKind::ENUM:
+            case VhdlTypeKind::INTEGER:
+            case VhdlTypeKind::UNIVERSAL_INTEGER:
+            case VhdlTypeKind::PHYSICAL: break;
+            case VhdlTypeKind::ARRAY:
+                if (isStringType(etypep)) return false;
+                if (!etypep->isConstrainedArray()) return false;
+                if (!etypep->base()->elementp()) return false;
+                if (!elementPacks(etypep->base()->elementp())) return false;
+                break;
+            case VhdlTypeKind::RECORD:
+                if (!recordPacks(etypep)) return false;
+                break;
+            default: return false;
+            }
+        }
+        return true;
+    }
+
     AstNodeDType* lowerRecordType(VhdlType* typep, FileLine* flp) {
-        // Packed, so that a record of vectors is one machine word
+        // Packed where it can be, so that a record of vectors is one machine
+        // word; unpacked where an element will not fit in one
+        const bool packed = recordPacks(typep);
+        if (!packed) return unpackedRecordRef(typep, flp);
         AstStructDType* const structp = new AstStructDType{flp, VSigning::UNSIGNED};
         structp->name(typep->name());
         for (VhdlSymbol* const elemp : typep->elements()) {
@@ -442,6 +472,32 @@ private:
         }
         return structp;
     }
+
+    // A record that does not pack becomes a C++ structure, which has to be
+    // declared once and named -- so it is a typedef of the module, and every
+    // use of the record refers to it by name.
+    AstNodeDType* unpackedRecordRef(VhdlType* typep, FileLine* flp) {
+        const auto found = m_recNames.find(typep);
+        if (found != m_recNames.end()) return new AstRefDType{flp, found->second};
+        const std::string name
+            = "__Vrec" + std::to_string(++m_nameNum) + "__" + typep->name();
+        m_recNames.emplace(typep, name);
+        AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
+        structp->name(name);
+        structp->classOrPackagep(m_modp);
+        for (VhdlSymbol* const elemp : typep->elements()) {
+            structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
+                                                    lowerType(elemp->typep(), flp), nullptr});
+        }
+        AstTypedef* const tdefp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
+        if (m_protClassp) {
+            m_protClassp->addStmtsp(tdefp);
+        } else {
+            m_stmtsp = AstNode::addNextNull(m_stmtsp, tdefp);
+        }
+        return new AstRefDType{flp, name};
+    }
+    std::map<const VhdlType*, std::string> m_recNames;  // Record -> its typedef
 
     // METHODS - constants
 
@@ -701,19 +757,29 @@ private:
             return new AstInitArray{flp, dtypep, elemp};
         }
         case VhdlTypeKind::RECORD: {
-            // A record's default is each element's default (6.4.2.2). The
-            // record is packed, so the elements concatenate into one constant
-            // in the order they were declared.
+            // A record's default is each element's default (6.4.2.2), written
+            // the way the record itself is: one concatenated constant when it
+            // packs, member by member when it does not
+            const bool packed = recordPacks(basep);
             AstNodeExpr* outp = nullptr;
+            AstNode* itemsp = nullptr;
             for (VhdlSymbol* const elemp : basep->elements()) {
                 AstNodeExpr* const onep = defaultValueFor(elemp->typep(), flp);
                 if (!onep) {
                     if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
                     return nullptr;  // One element with no default gives none
                 }
-                outp = outp ? new AstConcat{flp, outp, onep} : onep;
+                if (packed) {
+                    outp = outp ? new AstConcat{flp, outp, onep} : onep;
+                } else {
+                    itemsp = AstNode::addNextNull(
+                        itemsp, new AstPatMember{flp, onep, new AstText{flp, elemp->name()},
+                                                 nullptr});
+                }
             }
-            return outp;
+            if (packed) return outp;
+            return itemsp ? new AstPattern{flp, itemsp} : nullptr;
         }
         default: return nullptr;  // Handled by the element type, where at all
         }
@@ -1836,8 +1902,12 @@ private:
                 }
             }
         }
-        // The first element is the most significant, as the structure packs
+        // A packed record is one value, so its aggregate is a concatenation
+        // with the first element most significant. An unpacked one has to be
+        // written member by member, which only an assignment pattern can do.
+        const bool packed = recordPacks(typep);
         AstNodeExpr* outp = nullptr;
+        AstNode* itemsp = nullptr;
         for (size_t i = 0; i < elems.size(); ++i) {
             AstNodeVhdlExpr* const valuep = byElem[i] ? byElem[i] : othersp;
             if (!valuep) {
@@ -1846,9 +1916,16 @@ private:
             }
             AstNodeExpr* const memberp = lowerExpr(valuep);
             if (!memberp) return nullptr;
-            outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
+            if (packed) {
+                outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
+            } else {
+                itemsp = AstNode::addNextNull(
+                    itemsp, new AstPatMember{flp, memberp,
+                                             new AstText{flp, elems[i]->name()}, nullptr});
+            }
         }
-        return outp;
+        if (packed) return outp;
+        return itemsp ? new AstPattern{flp, itemsp} : nullptr;
     }
 
     // METHODS - names
@@ -3964,6 +4041,7 @@ private:
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_names.clear();
+        m_recNames.clear();
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();
