@@ -219,8 +219,12 @@ private:
             if (basep->designatedp() && isStringType(basep->designatedp()->base())) {
                 return new AstBasicDType{flp, VBasicDTypeKwd::STRING};
             }
-            unsup(flp, "access type '" + basep->prettyName() + "'");
-            return newLogicDType(flp, 1);
+            if (!basep->designatedp()
+                || basep->designatedp()->base()->kind() == VhdlTypeKind::INCOMPLETE) {
+                unsup(flp, "access type '" + basep->prettyName() + "'");
+                return newLogicDType(flp, 1);
+            }
+            return new AstClassRefDType{flp, accessClass(basep, flp), nullptr};
         case VhdlTypeKind::PROTECTED:
             return new AstClassRefDType{flp, protectedClass(basep, flp), nullptr};
         default:
@@ -250,6 +254,7 @@ private:
         newp->isConstructor(true);
         newp->classMethod(true);
         newp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        newp->dtypep(newp->findVoidDType());
         classp->addStmtsp(newp);
         AstVhdlProtectedType* const bodyp = VN_CAST(basep->bodyp(), VhdlProtectedType);
         if (!bodyp) {
@@ -280,6 +285,73 @@ private:
             refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "",
                                       lowerExpr(asp->actualp())});
         }
+    }
+
+    // An access type points at an object made by an allocator and read
+    // through ".all" (5.4). Verilator has no pointer to a bare value, but a
+    // class reference is one: the class holds the designated value as its
+    // only member, "new" makes one, and a null access value is a null handle.
+    AstClass* accessClass(VhdlType* basep, FileLine* flp) {
+        const auto it = m_accClasses.find(basep);
+        if (it != m_accClasses.end()) return it->second;
+        AstClass* const classp = new AstClass{
+            flp, "__Vacc" + std::to_string(++m_nameNum) + "__" + basep->name(),
+            m_modp ? m_modp->libname() : ""};
+        m_accClasses.emplace(basep, classp);
+        v3Global.setHasClasses();
+        m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        VhdlType* const designatedp = basep->designatedp();
+        AstVar* const memberp
+            = new AstVar{flp, VVarType::MEMBER, "all", VFlagChildDType{},
+                         lowerType(designatedp, flp)};
+        memberp->funcLocal(false);
+        memberp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        classp->addStmtsp(memberp);
+        // "new t" gives the designated subtype's default, "new t'(v)" gives v,
+        // which is one constructor with a defaulted parameter (9.3.7)
+        AstFunc* const newp = new AstFunc{flp, "new", nullptr, nullptr};
+        newp->isConstructor(true);
+        newp->classMethod(true);
+        newp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        newp->dtypep(newp->findVoidDType());
+        AstVar* const argp = new AstVar{flp, VVarType::PORT, "__Vv", VFlagChildDType{},
+                                        lowerType(designatedp, flp)};
+        argp->direction(VDirection::INPUT);
+        argp->declDirection(VDirection::INPUT);
+        argp->funcLocal(true);
+        // The parameter has no default: "new t" with no value passes the
+        // designated subtype's default from the call site instead. A default
+        // written here would have to be a folded constant, which a record's
+        // is not.
+        newp->addStmtsp(argp);
+        newp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, memberp, VAccess::WRITE},
+                                      new AstVarRef{flp, argp, VAccess::READ}});
+        classp->addStmtsp(newp);
+        return classp;
+    }
+    std::map<const VhdlType*, AstClass*> m_accClasses;
+
+    // "p.all", and the dereference VHDL leaves implicit when a name of an
+    // access value is used where the designated object is meant (8.3)
+    static AstNodeExpr* dereference(AstNodeExpr* fromp, FileLine* flp) {
+        return new AstMemberSel{flp, fromp, VFlagChildDType{}, "all"};
+    }
+
+    // The type an expression has, from the node or from what it denotes
+    static const VhdlType* typeOfExpr(const AstNodeVhdlExpr* nodep) {
+        if (!nodep) return nullptr;
+        if (nodep->vhdlTypep()) return nodep->vhdlTypep();
+        return nodep->vhdlSymp() ? nodep->vhdlSymp()->typep() : nullptr;
+    }
+
+    // Selecting an element of, or indexing, an access value means the object
+    // it points at, with no ".all" written (8.3)
+    static AstNodeExpr* derefIfAccess(AstNodeExpr* fromp, const AstNodeVhdlExpr* prefixp,
+                                      FileLine* flp) {
+        const VhdlType* const typep = typeOfExpr(prefixp);
+        if (!fromp || !typep || typep->base()->kind() != VhdlTypeKind::ACCESS) return fromp;
+        if (isLineType(typep)) return fromp;  // A LINE is text, not an object
+        return dereference(fromp, flp);
     }
 
     // The object a method is called on, which the analyzer left on the prefix
@@ -496,17 +568,15 @@ private:
         m_recNames.emplace(typep, name);
         AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
         structp->name(name);
-        structp->classOrPackagep(m_modp);
+        // In the one unit every design has, so that a class built for an
+        // access or protected type sees the same declaration a module does
+        AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
+        structp->classOrPackagep(unitp);
         for (VhdlSymbol* const elemp : typep->elements()) {
             structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
                                                     lowerType(elemp->typep(), flp), nullptr});
         }
-        AstTypedef* const tdefp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
-        if (m_protClassp) {
-            m_protClassp->addStmtsp(tdefp);
-        } else {
-            m_stmtsp = AstNode::addNextNull(m_stmtsp, tdefp);
-        }
+        unitp->addStmtsp(new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp});
         return new AstRefDType{flp, name};
     }
     std::map<const VhdlType*, std::string> m_recNames;  // Record -> its typedef
@@ -722,6 +792,11 @@ private:
             // A shared variable holds an object of the type, made once, at
             // elaboration (5.6.1)
             return new AstNew{flp};
+        case VhdlTypeKind::ACCESS:
+            // An access value starts out pointing at nothing (5.4.1); a LINE
+            // is text here, so it starts out empty
+            if (isLineType(basep)) return new AstConst{flp, AstConst::String{}, ""};
+            return new AstConst{flp, AstConst::Null{}};
         case VhdlTypeKind::ENUM: {
             if (!typep->bounded()) return nullptr;
             const std::vector<VhdlSymbol*>& lits = basep->literals();
@@ -848,6 +923,11 @@ private:
             return lowerExpr(p->valuep());
         }
         if (AstVhdlAttrName* const p = VN_CAST(nodep, VhdlAttrName)) return lowerAttr(p);
+        if (AstVhdlAllocator* const p = VN_CAST(nodep, VhdlAllocator)) return lowerAllocator(p);
+        if (AstVhdlLiteral* const p = VN_CAST(nodep, VhdlLiteral)) {
+            // A null access value is a null handle (9.3.2)
+            if (p->kind() == VhdlLitKind::NULLLIT) return new AstConst{flp, AstConst::Null{}};
+        }
         unsup(flp, std::string{"expression "} + nodep->typeName());
         return nullptr;
     }
@@ -1091,12 +1171,39 @@ private:
         return varp;
     }
 
+    // "new t" or "new t'(v)": an object of the designated subtype, which
+    // here is an instance of the class the access type became (9.3.7)
+    AstNodeExpr* lowerAllocator(AstVhdlAllocator* nodep) {
+        FileLine* const flp = nodep->fileline();
+        AstNew* const newp = new AstNew{flp};
+        AstNodeExpr* valuep = nullptr;
+        if (nodep->valuep()) {
+            valuep = lowerExpr(nodep->valuep());
+        } else if (nodep->subtypep()) {
+            // "new t" gives the designated subtype's default (9.3.7)
+            valuep = defaultValueFor(nodep->subtypep()->vhdlTypep(), flp);
+        }
+        if (!valuep) {
+            unsup(flp, "allocator for a subtype with no default value");
+            VL_DO_DANGLING(newp->deleteTree(), newp);
+            return nullptr;
+        }
+        newp->addArgsp(new AstArg{flp, "", valuep});
+        return newp;
+    }
+
     AstNodeExpr* lowerSelected(AstVhdlSelected* nodep) {
         FileLine* const flp = nodep->fileline();
+        // "p.all" reads what an access value points at (8.3)
+        if (nodep->isAll()) {
+            AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
+            return fromp ? dereference(fromp, flp) : nullptr;
+        }
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (symp && symp->kind() == VhdlSymKind::RECORD_ELEMENT) {
-            AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
+            AstNodeExpr* fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
+            fromp = derefIfAccess(fromp, nodep->prefixp(), flp);
             return new AstMemberSel{flp, fromp, VFlagChildDType{}, symp->name()};
         }
         if (symp && symp->kind() == VhdlSymKind::FUNCTION) {
@@ -1383,10 +1490,12 @@ private:
         const bool indexing
             = (objSymp && objSymp->isObject())
               || (!objSymp && prefixTypep
-                  && prefixTypep->base()->kind() == VhdlTypeKind::ARRAY);
+                  && (prefixTypep->base()->kind() == VhdlTypeKind::ARRAY
+                      || prefixTypep->base()->kind() == VhdlTypeKind::ACCESS));
         if (indexing) {
-            AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
+            AstNodeExpr* fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
+            fromp = derefIfAccess(fromp, nodep->prefixp(), flp);
             if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
                 if (!rp->leftp() || !rp->rightp()) {
                     unsup(flp, "slice by an attribute range");
@@ -3593,7 +3702,12 @@ private:
         if (name == "deallocate" && args.size() == 1) {
             AstNodeExpr* const linep = lowerExpr(args[0]);
             if (!linep) return nullptr;
-            return new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}};
+            // A LINE is text here, so emptying it is what deallocating it
+            // means; any other access value becomes null (5.4.2)
+            if (isLineType(args[0]->vhdlTypep())) {
+                return new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}};
+            }
+            return new AstAssign{flp, linep, new AstConst{flp, AstConst::Null{}}};
         }
         // WRITE and its radix forms append to the line buffer
         std::string radix;
@@ -4210,7 +4324,6 @@ private:
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_names.clear();
-        m_recNames.clear();
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();

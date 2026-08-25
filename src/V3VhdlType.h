@@ -73,7 +73,10 @@ enum class VhdlTypeKind : uint8_t {
 
 class VhdlType final {
     // MEMBERS
-    const VhdlTypeKind m_kind;
+    // Not const: an incomplete type becomes the full one when its
+    // declaration arrives, and everything that already names it must see the
+    // completion (5.4.2)
+    VhdlTypeKind m_kind;
     std::string m_name;  // Declared name, or empty for an anonymous type
     VhdlType* m_base = nullptr;  // The type this constrains; self if a type
     FileLine* m_fileline = nullptr;  // Where it was declared
@@ -279,6 +282,31 @@ public:
     void bodyp(AstNode* nodep) { m_bodyp = nodep; }
     AstNode* boundsp() const { return m_boundsp; }
     void boundsp(AstNode* nodep) { m_boundsp = nodep; }
+
+    // Take on everything another type is, keeping this object's identity so
+    // that an access type declared against the incomplete name sees the full
+    // declaration (5.4.2)
+    void becomes(const VhdlType* otherp) {
+        m_kind = otherp->m_kind;
+        m_base = this;
+        m_left = otherp->m_left;
+        m_right = otherp->m_right;
+        m_leftReal = otherp->m_leftReal;
+        m_rightReal = otherp->m_rightReal;
+        m_bounded = otherp->m_bounded;
+        m_ascending = otherp->m_ascending;
+        m_literals = otherp->m_literals;
+        m_indexTypes = otherp->m_indexTypes;
+        m_elementp = otherp->m_elementp;
+        m_unconstrained = otherp->m_unconstrained;
+        m_elements = otherp->m_elements;
+        m_designatedp = otherp->m_designatedp;
+        m_units = otherp->m_units;
+        m_scopep = otherp->m_scopep;
+        m_bodyp = otherp->m_bodyp;
+        m_boundsp = otherp->m_boundsp;
+        m_resolutionp = otherp->m_resolutionp;
+    }
 
     // Resolution (6.3)
     VhdlSymbol* resolutionp() const { return m_resolutionp; }

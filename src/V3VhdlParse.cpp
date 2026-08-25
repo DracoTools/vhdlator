@@ -2392,6 +2392,11 @@ AstNodeVhdlExpr* V3VhdlParse::parseAllocator() {
     AstVhdlAllocator* const nodep = new AstVhdlAllocator{flp};
     AstNodeVhdlExpr* const namep = parseName();
     if (!namep) return nodep;
+    // A name may already have taken the qualification: "new integer'(42)"
+    if (VN_IS(namep, VhdlQualified)) {
+        nodep->valuep(namep);
+        return nodep;
+    }
     if (peekType() == VhdlTokType::TICK) {
         consume();
         AstNodeVhdlExpr* const valuep = parseParenOrAggregate();

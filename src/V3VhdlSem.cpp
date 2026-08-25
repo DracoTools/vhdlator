@@ -1032,6 +1032,20 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
     }
     VhdlType* const typep = buildType(nodep->defp(), nodep->name(), nodep->fileline());
     typep->name(nodep->name());
+    // An incomplete type declaration is completed by the full one, not
+    // redeclared by it, and an access type already declared against the name
+    // must see the completion (5.4.2)
+    std::vector<VhdlSymbol*> prior;
+    m_scopep->lookupLocal(nodep->name(), prior);
+    for (VhdlSymbol* const otherp : prior) {
+        if (otherp->kind() != VhdlSymKind::TYPE || !otherp->typep()) continue;
+        if (otherp->typep()->kind() != VhdlTypeKind::INCOMPLETE) continue;
+        otherp->typep()->becomes(typep);
+        otherp->typep()->name(nodep->name());
+        nodep->vhdlSymp(otherp);
+        V3VhdlStd::addImplicitOperators(m_scopep, otherp->typep());
+        return;
+    }
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, nodep->name(), nodep);
     symp->typep(typep);
     nodep->vhdlSymp(symp);
@@ -1461,7 +1475,9 @@ void VhdlSemVisitor::visit(AstVhdlLoop* nodep) {
         popScope();
         return;
     }
-    iterateChildren(nodep);
+    // A while loop tests a condition of type BOOLEAN before each pass (10.10)
+    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    iterateAndNextNull(nodep->stmtsp());
 }
 
 // The subtype of a loop or generate parameter: the range's type, narrowed to
