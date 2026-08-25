@@ -437,6 +437,12 @@ Verilog-style non-blocking delay, which is transport-like. VHDL's default
 inertial pulse rejection, and an explicit ``reject`` clause, do not remove
 short pulses.
 
+**A waveform does not replace what is already scheduled.** ``s <= a after 10
+ns, b after 20 ns`` schedules both, which is right; but VHDL says a later
+assignment to the same signal deletes any transaction already projected for a
+later time, and that deletion is not modelled. A design that overwrites its
+own pending transactions sees both.
+
 **The delta cycle count is not observable.** Verilator settles combinational
 logic in a converge loop rather than counting deltas. Ordering within a
 simulation time step follows VHDL's rule that a signal assignment takes

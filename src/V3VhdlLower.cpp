@@ -712,7 +712,13 @@ private:
         }
         varp->declDirection(varp->direction());
         varp->ansi(true);
-        if (nodep->defaultp()) varp->valuep(lowerExpr(nodep->defaultp()));
+        // A port's default value is what an input takes when the instance
+        // leaves it open, and what an output's driver starts at (6.5.6.3).
+        // An inout may not carry one in the emitted code.
+        if (nodep->defaultp() && nodep->mode() != VhdlMode::INOUT
+            && nodep->mode() != VhdlMode::LINKAGE) {
+            varp->valuep(lowerExpr(nodep->defaultp()));
+        }
         addStmt(new AstPort{flp, ++pinNum, varp->name()});
         addStmt(varp);
     }
@@ -2747,6 +2753,42 @@ private:
 
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
+        // A waveform of more than one element schedules each at its own time
+        // (11.6, 10.5.2.2); each becomes a delayed assignment of its own
+        if (nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
+            && nodep->wavesp()->nextp()
+            && !m_drivers.count(rootSymOf(nodep->targetp()))) {
+            if (!v3Global.opt.timing().isTrue()) {
+                unsup(flp, "waveform with more than one element without --timing");
+                return;
+            }
+            // One process that schedules them all, in order, which is what
+            // the concurrent form is defined to be (11.6)
+            AstNode* stmtsp = nullptr;
+            AstNodeExpr* readsp = nullptr;
+            for (AstVhdlWaveform* p = nodep->wavesp(); p;
+                 p = VN_AS(p->nextp(), VhdlWaveform)) {
+                AstNodeExpr* const onep = lowerExpr(nodep->targetp());
+                AstNodeExpr* const valuep = lowerExpr(p->valuep());
+                if (!onep || !valuep) return;
+                readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
+                                : valuep->cloneTree(false);
+                AstNode* const delayp
+                    = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                stmtsp = AstNode::addNextNull(
+                    stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
+            }
+            // It runs again whenever what it reads changes; a waveform of
+            // literals reads nothing, so it runs once
+            AstSenTree* const senp = readsp ? sensitivityOfExpr(readsp, flp) : nullptr;
+            if (readsp) VL_DO_DANGLING(readsp->deleteTree(), readsp);
+            if (senp) {
+                addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp});
+            } else {
+                addStmt(new AstInitial{flp, stmtsp});
+            }
+            return;
+        }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
         if (!lhsp) return;
         AstNodeExpr* rhsp = nullptr;
@@ -2965,7 +3007,11 @@ private:
             std::vector<std::string> parts;
             if (flattenName(nodep->formalp(), parts) && !parts.empty()) formal = parts.back();
         }
-        if (nodep->isOpen()) return new AstPin{flp, pinNum, formal, nullptr};
+        // "open" written out means the same as leaving the formal out: the
+        // port takes its own default (6.5.7.1)
+        if (nodep->isOpen() || VN_IS(nodep->actualp(), VhdlOpen)) {
+            return new AstPin{flp, pinNum, formal, nullptr};
+        }
         return new AstPin{flp, pinNum, formal, lowerExpr(nodep->actualp())};
     }
 
@@ -3107,9 +3153,29 @@ private:
         }
         AstVhdlWaveform* const wfp = nodep->wavesp();
         if (!wfp || !wfp->valuep()) return nullptr;
+        // "s <= a after t1, b after t2" schedules each element at its own
+        // time (10.5.2.2). Each becomes a delayed assignment of its own,
+        // which is right as long as the times increase, as the language
+        // requires them to.
         if (wfp->nextp()) {
-            unsup(flp, "multi-element waveform");
-            return nullptr;
+            if (!v3Global.opt.timing().isTrue()) {
+                unsup(flp, "waveform with more than one element without --timing");
+                return nullptr;
+            }
+            AstNode* outp = nullptr;
+            for (AstVhdlWaveform* p = wfp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
+                AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+                AstNodeExpr* const rhsp = lowerExpr(p->valuep());
+                if (!lhsp || !rhsp) return outp;
+                AstNode* const delayp
+                    = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                outp = AstNode::addNextNull(
+                    outp, sequential ? static_cast<AstNode*>(
+                              new AstAssignDly{flp, lhsp, rhsp, delayp})
+                                     : static_cast<AstNode*>(
+                                           new AstAssignW{flp, lhsp, rhsp, delayp}));
+            }
+            return outp;
         }
         AstNode* delayp = nullptr;
         if (wfp->afterp()) {
