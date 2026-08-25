@@ -2848,10 +2848,14 @@ private:
 
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
-        // A waveform of more than one element schedules each at its own time
-        // (11.6, 10.5.2.2); each becomes a delayed assignment of its own
+        // A waveform with a delay, or with more than one element, schedules
+        // each element at its own time (11.6, 10.5.2.2). It becomes a process
+        // that assigns them, rather than a continuous assignment with a
+        // delay: a continuous assignment reaches its target through the
+        // delay, where a VHDL driver holds its old value until the time comes
+        // -- which is what "rst <= '0' after 22 ns" means.
         if (nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
-            && nodep->wavesp()->nextp()
+            && (nodep->wavesp()->nextp() || nodep->wavesp()->afterp())
             && !m_drivers.count(rootSymOf(nodep->targetp()))) {
             if (!v3Global.opt.timing().isTrue()) {
                 unsup(flp, "waveform with more than one element without --timing");
@@ -2873,15 +2877,15 @@ private:
                 stmtsp = AstNode::addNextNull(
                     stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
             }
-            // It runs again whenever what it reads changes; a waveform of
-            // literals reads nothing, so it runs once
+            // A concurrent statement is a process that runs once at time
+            // zero and again whenever what it reads changes (11.6). Verilog's
+            // "always" with an event control does not run at time zero, so
+            // the statements are emitted twice: once to start, once to react.
             AstSenTree* const senp = readsp ? sensitivityOfExpr(readsp, flp) : nullptr;
             if (readsp) VL_DO_DANGLING(readsp->deleteTree(), readsp);
-            if (senp) {
-                addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp});
-            } else {
-                addStmt(new AstInitial{flp, stmtsp});
-            }
+            if (senp) addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp,
+                                            stmtsp->cloneTree(true)});
+            addStmt(new AstInitial{flp, stmtsp});
             return;
         }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
