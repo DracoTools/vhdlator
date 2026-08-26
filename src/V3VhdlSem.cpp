@@ -2785,6 +2785,7 @@ VhdlType* VhdlSemVisitor::attrTypeQuiet(AstVhdlAttrName* nodep) {
         || attr == "quiet" || attr == "driving") {
         return V3VhdlStd::booleanType();
     }
+    if (attr == "transaction") return V3VhdlStd::bitType();
     if (attr == "image" || attr == "instance_name" || attr == "path_name"
         || attr == "simple_name") {
         return V3VhdlStd::stringType();
@@ -3525,8 +3526,10 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
     if (attr == "instance_name" || attr == "path_name" || attr == "simple_name") {
         return V3VhdlStd::stringType();
     }
+    // S'TRANSACTION is a BIT that toggles, whatever the type of S (16.2.4)
+    if (attr == "transaction") return V3VhdlStd::bitType();
     if (attr == "last_value" || attr == "delayed" || attr == "driving_value"
-        || attr == "transaction" || attr == "base") {
+        || attr == "base") {
         return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
     }
     if (attr == "last_event" || attr == "last_active") return V3VhdlStd::timeType();

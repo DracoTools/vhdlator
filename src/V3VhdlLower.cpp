@@ -712,10 +712,33 @@ private:
         AstVar* prevp = nullptr;  // Its value, one delta behind
         AstVar* lastp = nullptr;  // Its value before the previous event
         AstVar* timep = nullptr;  // When the previous event happened
+        AstVar* everp = nullptr;  // Set once an event has happened at all
         AstVar* transp = nullptr;  // Flips on every event
     };
     std::map<const VhdlSymbol*, VhdlShadow> m_shadows;
     AstNode* m_shadowsp = nullptr;  // The blocks that keep them, for the module
+
+    // What 'ACTIVE, 'LAST_ACTIVE, 'TRANSACTION and 'QUIET need. They ask
+    // whether a driver assigned, not whether the value changed, and nothing
+    // in Verilator's model records that -- an assignment of the value a
+    // signal already holds leaves no trace. So a signal any of them names
+    // gets a companion bit that every assignment to it flips, and that bit,
+    // whose every write is an event, is what the attributes are read from.
+    struct VhdlActive final {
+        AstVar* togglep = nullptr;  // Flips on each transaction
+        AstVar* prevp = nullptr;  // The toggle, one delta behind
+        AstVar* timep = nullptr;  // When the previous transaction happened
+        AstVar* everp = nullptr;  // Set once a transaction has happened at all
+    };
+    std::map<const VhdlSymbol*, VhdlActive> m_actives;
+    std::set<const VhdlSymbol*> m_needActive;  // Signals an active attribute names
+    // The signal "S delayed by T", one per signal and delay it is asked for
+    std::map<std::pair<const VhdlSymbol*, int64_t>, AstVar*> m_delayeds;
+    // Whether anything in the design delivers a signal transaction at a time
+    // of its own -- an "after" clause or a 'DELAYED. Only then can a process
+    // whose timeout expires find a signal being updated in the same cycle,
+    // and only then does a timed wait have to stand aside for the update.
+    bool m_anyAfter = false;
 
     // An interface element of a generic or port clause (6.5)
     void lowerInterface(AstVhdlIfaceDecl* nodep, bool isGeneric, int& pinNum) {
@@ -853,6 +876,18 @@ private:
     // VHDL initializes every object to the leftmost value of its subtype
     // (6.4.2.2), which for STD_LOGIC is 'U'. Two-state, that is X, and
     // --x-initial gives the randomization that most nearly stands in for it.
+    // A packed array's default is its element's default repeated. Written as
+    // a concatenation, the way a packed record's default is: the parts are
+    // constants, so their widths are known before V3Width runs.
+    static AstNodeExpr* packedRepeat(AstNodeExpr* elemp, int64_t count, FileLine* flp) {
+        if (count <= 0 || count > 4096) return nullptr;
+        AstNodeExpr* outp = elemp;
+        for (int64_t i = 1; i < count; ++i) {
+            outp = new AstConcat{flp, outp, elemp->cloneTree(false)};
+        }
+        return outp;
+    }
+
     AstNodeExpr* defaultValueFor(VhdlType* typep, FileLine* flp) {
         if (!typep || typep->isError()) return nullptr;
         VhdlType* const basep = typep->base();
@@ -895,17 +930,29 @@ private:
             // out, whatever the array's size.
             if (!typep->isConstrainedArray()) return nullptr;
             if (!basep->elementp()) return nullptr;
-            // One dimension only: a sparse initializer for a nested array
-            // would have to be nested too, and say nothing a design is likely
-            // to depend on
-            if (typep->indexTypes().size() != 1) return nullptr;
-            if (basep->elementp()->base()->kind() == VhdlTypeKind::ARRAY) return nullptr;
             if (enumIsLogic(basep->elementp()->base())) return nullptr;
             if (isStringType(basep)) return nullptr;  // A string, not an array here
             AstNodeExpr* const elemp = defaultValueFor(basep->elementp(), flp);
             if (!elemp) return nullptr;
             AstNodeDType* const dtypep = lowerType(typep, flp);
-            if (!VN_IS(dtypep, UnpackArrayDType)) {
+            if (VN_IS(dtypep, PackArrayDType)) {
+                // Packed, so the whole array is one constant: the element's
+                // default repeated over every index, however many dimensions
+                // it has
+                VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+                int64_t count = 1;
+                for (const VhdlType* const idxp : typep->indexTypes()) {
+                    if (!idxp || !idxp->bounded()) count = 0;
+                    if (count) count *= idxp->length();
+                }
+                AstNodeExpr* const outp = packedRepeat(elemp, count, flp);
+                if (!outp) VL_DO_DANGLING(elemp->deleteTree(), elemp);
+                return outp;
+            }
+            // One dimension only: a sparse initializer for a nested array
+            // would have to be nested too, and say nothing a design is likely
+            // to depend on
+            if (typep->indexTypes().size() != 1 || !VN_IS(dtypep, UnpackArrayDType)) {
                 VL_DO_DANGLING(elemp->deleteTree(), elemp);
                 VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
                 return nullptr;
@@ -1035,7 +1082,7 @@ private:
         // about its type (16.2.2)
         if (attr == "event" || attr == "active" || attr == "last_value"
             || attr == "last_event" || attr == "last_active" || attr == "stable"
-            || attr == "quiet" || attr == "transaction") {
+            || attr == "quiet" || attr == "transaction" || attr == "delayed") {
             if (AstNodeExpr* const outp = lowerSignalAttr(nodep, attr, argp, flp)) return outp;
         }
         // A bound that names a generic does not fold during analysis, so the
@@ -1174,11 +1221,18 @@ private:
                               new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
                                                 VNumRange{63, 0}, -1},
                               flp);
+        sh.everp = newTempVar(base + "__ever", newLogicDType(flp, 1), flp);
         sh.transp = newTempVar(base + "__trans", newLogicDType(flp, 1), flp);
         // A signal starts out equal to its own past, so nothing reads as an
-        // event before anything has happened
-        sh.prevp->valuep(defaultValueFor(symp->typep(), flp));
-        sh.lastp->valuep(defaultValueFor(symp->typep(), flp));
+        // event before anything has happened. That past is the value the
+        // signal itself starts at, which is its own initial value where it
+        // was given one, and the type's default where it was not (6.4.2.3).
+        AstNodeExpr* const startp
+            = sigp->valuep() ? VN_CAST(sigp->valuep()->cloneTree(false), NodeExpr) : nullptr;
+        sh.prevp->valuep(startp ? startp : defaultValueFor(symp->typep(), flp));
+        sh.lastp->valuep(startp ? startp->cloneTree(false)
+                                : defaultValueFor(symp->typep(), flp));
+        sh.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
         AstNode* stmtsp = new AstAssignDly{
             flp, new AstVarRef{flp, sh.lastp, VAccess::WRITE},
             new AstVarRef{flp, sh.prevp, VAccess::READ}};
@@ -1192,6 +1246,10 @@ private:
                         new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}}}));
         stmtsp = AstNode::addNext(
             stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, sh.everp, VAccess::WRITE},
+                        new AstConst{flp, AstConst::BitTrue{}}}));
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssignDly{
                         flp, new AstVarRef{flp, sh.transp, VAccess::WRITE},
                         new AstNot{flp, new AstVarRef{flp, sh.transp, VAccess::READ}}}));
         AstSenTree* const senp = new AstSenTree{
@@ -1199,6 +1257,115 @@ private:
         AstAlways* const alwaysp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp};
         m_shadowsp = AstNode::addNextNull(m_shadowsp, static_cast<AstNode*>(alwaysp));
         return &m_shadows.emplace(symp, sh).first->second;
+    }
+
+    // Which signals need their transactions recorded. Collected before any
+    // statement is lowered, because the assignment that marks a transaction
+    // is lowered long before the attribute that reads it comes into view.
+    void collectActive(AstNode* nodep) {
+        if (!nodep) return;
+        nodep->foreachAndNext([this](AstVhdlAttrName* attrp) {
+            const std::string& attr = attrp->name();
+            if (attr != "active" && attr != "last_active" && attr != "transaction"
+                && attr != "quiet") {
+                return;
+            }
+            if (const VhdlSymbol* const symp = rootSymOf(attrp->prefixp())) {
+                m_needActive.insert(symp->resolved());
+            }
+        });
+    }
+
+    // The companion bit and its history, for each signal an active attribute
+    // named. Made once the declarations are lowered, so that the signal's own
+    // variable exists, and before any statement is, so that every assignment
+    // can mark itself.
+    void makeActives(FileLine* flp) {
+        for (const VhdlSymbol* const symp : m_needActive) {
+            if (m_actives.count(symp)) continue;
+            const auto varIt = m_vars.find(symp);
+            if (varIt == m_vars.end()) continue;
+            VL_RESTORER(m_ftaskp);
+            m_ftaskp = nullptr;
+            VhdlActive ac;
+            const std::string base = "__Vact" + std::to_string(++m_nameNum) + "__" + symp->name();
+            // Every driver of the signal marks the same bit, and a concurrent
+            // assignment marks it from two blocks -- once to start and once
+            // to react -- so it is written from more than one place by
+            // construction, which is not a finding about the design
+            FileLine* const mflp = new FileLine{flp};
+            mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            ac.togglep = newTempVar(base + "__trans", newLogicDType(mflp, 1), mflp);
+            ac.prevp = newTempVar(base + "__prev", newLogicDType(flp, 1), flp);
+            ac.timep = newTempVar(base + "__time",
+                                  new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
+                                                    VNumRange{63, 0}, -1},
+                                  flp);
+            ac.everp = newTempVar(base + "__ever", newLogicDType(flp, 1), flp);
+            ac.togglep->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            ac.prevp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            ac.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            AstNode* stmtsp = new AstAssignDly{flp,
+                                               new AstVarRef{flp, ac.prevp, VAccess::WRITE},
+                                               new AstVarRef{flp, ac.togglep, VAccess::READ}};
+            stmtsp = AstNode::addNext(
+                stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                            flp, new AstVarRef{flp, ac.timep, VAccess::WRITE}, nowOf(flp)}));
+            stmtsp = AstNode::addNext(
+                stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                            flp, new AstVarRef{flp, ac.everp, VAccess::WRITE},
+                            new AstConst{flp, AstConst::BitTrue{}}}));
+            AstSenTree* const senp = new AstSenTree{
+                flp, senItemFor(new AstVarRef{flp, ac.togglep, VAccess::READ}, true, flp)};
+            m_shadowsp = AstNode::addNextNull(
+                m_shadowsp,
+                static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp}));
+            m_actives.emplace(symp, ac);
+        }
+    }
+
+    const VhdlActive* activeFor(AstNodeVhdlExpr* prefixp) {
+        const VhdlSymbol* const symp = rootSymOf(prefixp);
+        if (!symp) return nullptr;
+        const auto found = m_actives.find(symp->resolved());
+        return found == m_actives.end() ? nullptr : &found->second;
+    }
+
+    // The extra assignment that says a driver of this signal has assigned,
+    // whatever it assigned. It carries the same delay as the assignment it
+    // accompanies, since a transaction happens when the value is delivered.
+    AstNode* transactionMark(const AstNode* targetp, AstNode* delayp, bool sequential,
+                             const AstNode* readsp, FileLine* flp) {
+        if (m_actives.empty()) return nullptr;
+        const VhdlSymbol* const symp = rootSymOf(targetp);
+        if (!symp) return nullptr;
+        const auto found = m_actives.find(symp->resolved());
+        if (found == m_actives.end()) return nullptr;
+        AstVar* const tp = found->second.togglep;
+        // Every driver of the signal marks the same bit, and a concurrent
+        // assignment marks it from two blocks -- once to start and once to
+        // react -- so it is written from more than one place by construction
+        FileLine* const mflp = new FileLine{flp};
+        mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        mflp->warnOff(V3ErrorCode::COMBDLY, true);
+        AstNode* const dp = delayp ? delayp->cloneTree(false) : nullptr;
+        AstNode* const flipp
+            = new AstAssignDly{mflp, new AstVarRef{mflp, tp, VAccess::WRITE},
+                               new AstNot{mflp, new AstVarRef{mflp, tp, VAccess::READ}}, dp};
+        if (sequential) return flipp;
+        // A concurrent assignment is a process sensitive to what it reads
+        // (11.6), so the times it makes a transaction are the times that
+        // process runs: once at time zero, and again on every event on a
+        // signal it reads
+        AstNode* const outp = new AstInitial{mflp, flipp->cloneTree(false)};
+        AstSenTree* const senp = readsp ? sensitivityOfExpr(VN_CAST(readsp, NodeExpr), mflp)
+                                        : nullptr;
+        if (!senp) {
+            VL_DO_DANGLING(flipp->deleteTree(), flipp);
+            return outp;  // Nothing to wake it: it runs at time zero only
+        }
+        return AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAlways{mflp, VAlwaysKwd::ALWAYS, senp, flipp}));
     }
 
     // "s /= s'past value", which is true for exactly the delta in which the
@@ -1209,12 +1376,140 @@ private:
         return new AstNeq{flp, nowp, new AstVarRef{flp, shp->prevp, VAccess::READ}};
     }
 
-    // The signal attributes of 16.2.2, answered from what shadowFor keeps
+    // "now"
+    AstNodeExpr* nowOf(FileLine* flp) {
+        return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
+    }
+
+    // How long ago something last happened, as the attributes of 16.2 define
+    // it: nothing at all if it is happening in this cycle, and TIME'HIGH if
+    // it has never happened
+    AstNodeExpr* sinceOf(AstNodeExpr* happeningp, AstVar* timep, AstVar* everp, FileLine* flp) {
+        AstNodeExpr* const sincep = new AstSub{flp, nowOf(flp),
+                                               new AstVarRef{flp, timep, VAccess::READ}};
+        AstNodeExpr* const everSincep
+            = new AstCond{flp, new AstVarRef{flp, everp, VAccess::READ}, sincep,
+                          new AstConst{flp, AstConst::Unsized64{},
+                                       static_cast<uint64_t>(INT64_MAX)}};
+        return new AstCond{flp, happeningp, new AstConst{flp, AstConst::Unsized64{}, 0},
+                           everSincep};
+    }
+
+    // "no such thing has happened for T", the shape 'STABLE(T) and 'QUIET(T)
+    // share. Before the first one has happened at all the answer is yes,
+    // however long T is.
+    AstNodeExpr* steadyForOf(AstNodeExpr* happeningp, AstVar* timep, AstVar* everp,
+                             AstNodeExpr* argp, FileLine* flp) {
+        AstNodeExpr* const steadyp = new AstLogNot{flp, happeningp};
+        if (!argp) return steadyp;
+        AstNodeExpr* const sincep = new AstSub{flp, nowOf(flp),
+                                               new AstVarRef{flp, timep, VAccess::READ}};
+        AstNodeExpr* const longEnoughp
+            = new AstLogOr{flp, new AstLogNot{flp, new AstVarRef{flp, everp, VAccess::READ}},
+                           new AstGte{flp, sincep, argp}};
+        return new AstLogAnd{flp, steadyp, longEnoughp};
+    }
+
+    // "the toggle /= its past value", true for exactly the cycle in which a
+    // driver of the signal assigned
+    AstNodeExpr* activeOf(const VhdlActive* acp, FileLine* flp) {
+        return new AstNeq{flp, new AstVarRef{flp, acp->togglep, VAccess::READ},
+                          new AstVarRef{flp, acp->prevp, VAccess::READ}};
+    }
+
+    // "S'DELAYED(T)", a signal that is S delayed by T (16.2.4). Delayed by
+    // nothing at all is the value one delta back, which is what the event
+    // shadow already keeps; delayed by a time is a signal of its own, driven
+    // from S through that delay. One per signal and delay, since a design
+    // may ask for several.
+    AstNodeExpr* delayedOf(AstNodeVhdlExpr* prefixp, const VhdlShadow* shp, AstNodeExpr* argp,
+                           FileLine* flp) {
+        if (!argp) return new AstVarRef{flp, shp->prevp, VAccess::READ};
+        AstConst* const constp = VN_CAST(argp, Const);
+        if (!constp) {
+            unsup(flp, "'delayed by a time that is not static");
+            return nullptr;
+        }
+        const int64_t ticks = static_cast<int64_t>(constp->toUQuad());
+        if (ticks == 0) {
+            VL_DO_DANGLING(argp->deleteTree(), argp);
+            return new AstVarRef{flp, shp->prevp, VAccess::READ};
+        }
+        if (!v3Global.opt.timing().isTrue()) {
+            unsup(flp, "'delayed by a time without --timing");
+            return nullptr;
+        }
+        VhdlSymbol* const symp = prefixp->vhdlSymp();
+        const auto varIt = symp ? m_vars.find(symp->resolved()) : m_vars.end();
+        if (varIt == m_vars.end()) return nullptr;
+        AstVar* const sigp = varIt->second;
+        const auto key = std::make_pair(static_cast<const VhdlSymbol*>(symp->resolved()), ticks);
+        const auto found = m_delayeds.find(key);
+        if (found != m_delayeds.end()) {
+            VL_DO_DANGLING(argp->deleteTree(), argp);
+            return new AstVarRef{flp, found->second, VAccess::READ};
+        }
+        VL_RESTORER(m_ftaskp);
+        m_ftaskp = nullptr;
+        AstVar* const dlyp = newTempVar("__Vdly" + std::to_string(++m_nameNum) + "__"
+                                            + symp->name(),
+                                        lowerType(symp->typep(), flp), flp);
+        // It starts out equal to S, so that nothing reads a delayed value
+        // that S never had (16.2.4)
+        if (sigp->valuep()) {
+            dlyp->valuep(VN_AS(sigp->valuep()->cloneTree(false), NodeExpr));
+        } else if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp)) {
+            dlyp->valuep(defp);
+        }
+        AstNode* const bodyp = new AstAssignDly{flp, new AstVarRef{flp, dlyp, VAccess::WRITE},
+                                                new AstVarRef{flp, sigp, VAccess::READ},
+                                                new AstDelay{flp, argp, false}};
+        AstSenTree* const senp = new AstSenTree{
+            flp, senItemFor(new AstVarRef{flp, sigp, VAccess::READ}, isOneBitVar(sigp), flp)};
+        m_shadowsp = AstNode::addNextNull(
+            m_shadowsp,
+            static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp}));
+        m_delayeds.emplace(key, dlyp);
+        return new AstVarRef{flp, dlyp, VAccess::READ};
+    }
+
+    // The signal attributes of 16.2.4, answered from what shadowFor and
+    // makeActive keep
     AstNodeExpr* lowerSignalAttr(AstVhdlAttrName* nodep, const std::string& attr,
                                  AstNodeExpr* argp, FileLine* flp) {
+        if (attr == "transaction" || attr == "active" || attr == "last_active"
+            || attr == "quiet") {
+            const VhdlActive* const acp = activeFor(nodep->prefixp());
+            if (!acp) {
+                // Nothing marks this signal's transactions -- it is a signal
+                // no assignment here writes, such as a port driven from
+                // outside. Its events are all this side can see, and every
+                // event is a transaction, so answer from those.
+                const VhdlShadow* const evp = shadowFor(nodep->prefixp(), flp);
+                if (!evp) return nullptr;
+                if (attr == "transaction") {
+                    return new AstVarRef{flp, evp->transp, VAccess::READ};
+                }
+                AstNodeExpr* const happeningp = eventOf(nodep->prefixp(), evp, flp);
+                if (!happeningp) return nullptr;
+                if (attr == "active") return happeningp;
+                if (attr == "last_active") {
+                    return sinceOf(happeningp, evp->timep, evp->everp, flp);
+                }
+                return steadyForOf(happeningp, evp->timep, evp->everp, argp, flp);
+            }
+            if (attr == "transaction") {
+                return new AstVarRef{flp, acp->togglep, VAccess::READ};
+            }
+            if (attr == "active") return activeOf(acp, flp);
+            if (attr == "last_active") {
+                return sinceOf(activeOf(acp, flp), acp->timep, acp->everp, flp);
+            }
+            return steadyForOf(activeOf(acp, flp), acp->timep, acp->everp, argp, flp);
+        }
         const VhdlShadow* const shp = shadowFor(nodep->prefixp(), flp);
         if (!shp) return nullptr;
-        if (attr == "transaction") return new AstVarRef{flp, shp->transp, VAccess::READ};
+        if (attr == "delayed") return delayedOf(nodep->prefixp(), shp, argp, flp);
         if (attr == "last_value") {
             // During the delta in which it changed, the value before the
             // change is what prev still holds
@@ -1223,27 +1518,16 @@ private:
             return new AstCond{flp, evp, new AstVarRef{flp, shp->prevp, VAccess::READ},
                                new AstVarRef{flp, shp->lastp, VAccess::READ}};
         }
-        if (attr == "event" || attr == "active") {
-            return eventOf(nodep->prefixp(), shp, flp);
-        }
-        if (attr == "last_event" || attr == "last_active") {
+        if (attr == "event") return eventOf(nodep->prefixp(), shp, flp);
+        if (attr == "last_event") {
             AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
             if (!evp) return nullptr;
-            AstNodeExpr* const sincep = new AstSub{
-                flp, new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}},
-                new AstVarRef{flp, shp->timep, VAccess::READ}};
-            return new AstCond{flp, evp, new AstConst{flp, AstConst::Unsized64{}, 0}, sincep};
+            return sinceOf(evp, shp->timep, shp->everp, flp);
         }
-        if (attr == "stable" || attr == "quiet") {
+        if (attr == "stable") {
             AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
             if (!evp) return nullptr;
-            AstNodeExpr* const steadyp = new AstLogNot{flp, evp};
-            if (!argp) return steadyp;
-            // "stable(t)" also asks that the last event was longer ago than t
-            AstNodeExpr* const sincep = new AstSub{
-                flp, new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}},
-                new AstVarRef{flp, shp->timep, VAccess::READ}};
-            return new AstLogAnd{flp, steadyp, new AstGte{flp, sincep, argp}};
+            return steadyForOf(evp, shp->timep, shp->everp, argp, flp);
         }
         return nullptr;
     }
@@ -1862,6 +2146,30 @@ private:
         }
         const int lw = exprVectorWidth(nodep->lhsp());
         const int rw = exprVectorWidth(nodep->rhsp());
+        if (lw && rw && lw != rw) {
+            // "+" and friends of numeric_std take operands of any two lengths
+            // and give a result as long as the longer, each operand resized
+            // to it first (16.5). Only arithmetic does: array equality is
+            // defined for every array type and is false between lengths that
+            // differ, so it must not be made to agree here.
+            switch (nodep->op()) {
+            case VhdlBinaryOp::ADD:
+            case VhdlBinaryOp::SUB:
+            case VhdlBinaryOp::MUL:
+            case VhdlBinaryOp::DIV:
+            case VhdlBinaryOp::MOD:
+            case VhdlBinaryOp::REM: {
+                const bool signd = isSignedType(ltypep) || isSignedType(rtypep);
+                if (lw < rw) {
+                    lhsp = sizedTo(signd ? new AstSigned{flp, lhsp} : lhsp, rw, flp);
+                } else {
+                    rhsp = sizedTo(signd ? new AstSigned{flp, rhsp} : rhsp, lw, flp);
+                }
+                return;
+            }
+            default: break;
+            }
+        }
         if (lw && !rw && isIntegerType(rtypep)) {
             rhsp = sizedTo(rhsp, lw, flp);
         } else if (rw && !lw && isIntegerType(ltypep)) {
@@ -3381,6 +3689,8 @@ private:
                     = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
                 stmtsp = AstNode::addNextNull(
                     stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
+                stmtsp = AstNode::addNextNull(
+                    stmtsp, transactionMark(nodep->targetp(), delayp, true, nullptr, flp));
             }
             // A concurrent statement is a process that runs once at time
             // zero and again whenever what it reads changes (11.6). Verilog's
@@ -3422,6 +3732,7 @@ private:
                     addStmt(new AstAlways{VN_AS(p, AssignW)});
                     p = nextp;
                 }
+                addStmt(transactionMark(nodep->targetp(), delayp, false, rhsp, flp));
             }
             return;
         }
@@ -3442,13 +3753,17 @@ private:
             FileLine* const gflp = new FileLine{flp};
             gflp->warnOff(V3ErrorCode::LATCH, true);
             gflp->warnOff(V3ErrorCode::COMBDLY, true);
-            AstNode* const stmtsp = new AstIf{
-                gflp, new AstVarRef{gflp, m_guardVarp, VAccess::READ},
-                new AstAssignDly{gflp, lhsp, rhsp, delayp}};
+            AstNode* const assignp = new AstAssignDly{gflp, lhsp, rhsp, delayp};
+            AstNode* const drivep = AstNode::addNextNull(
+                assignp, transactionMark(nodep->targetp(), delayp, true, nullptr, gflp));
+            AstNode* const stmtsp
+                = new AstIf{gflp, new AstVarRef{gflp, m_guardVarp, VAccess::READ}, drivep};
             addStmt(concurrentProcess(stmtsp, nodep->postponed(), gflp));
             return;
         }
+        AstNode* const markp = transactionMark(nodep->targetp(), delayp, false, rhsp, flp);
         addStmt(new AstAlways{new AstAssignW{flp, lhsp, rhsp, delayp}});
+        if (markp) addStmt(markp);
     }
 
     AstNodeExpr* waveformValue(AstVhdlWaveform* wfp) {
@@ -3839,11 +4154,14 @@ private:
                 if (!lhsp || !rhsp) return outp;
                 AstNode* const delayp
                     = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                AstNode* const markp
+                    = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
                 outp = AstNode::addNextNull(
                     outp, sequential ? static_cast<AstNode*>(
                               new AstAssignDly{flp, lhsp, rhsp, delayp})
                                      : static_cast<AstNode*>(
                                            new AstAssignW{flp, lhsp, rhsp, delayp}));
+                outp = AstNode::addNextNull(outp, markp);
             }
             return outp;
         }
@@ -3862,13 +4180,19 @@ private:
         if (m_drivers.count(rootSymOf(nodep->targetp()))) {
             AstNodeExpr* const valuep = lowerExpr(wfp->valuep());
             if (!valuep) return nullptr;
-            return driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp);
+            AstNode* const markp
+                = transactionMark(nodep->targetp(), delayp, sequential, valuep, flp);
+            return AstNode::addNextNull(
+                driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp), markp);
         }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
         AstNodeExpr* const rhsp = lowerExpr(wfp->valuep());
         if (!lhsp || !rhsp) return nullptr;
-        if (!sequential) return new AstAssignW{flp, lhsp, rhsp, delayp};
-        return new AstAssignDly{flp, lhsp, rhsp, delayp};
+        AstNode* const markp = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
+        AstNode* const outp
+            = sequential ? static_cast<AstNode*>(new AstAssignDly{flp, lhsp, rhsp, delayp})
+                         : static_cast<AstNode*>(new AstAssignW{flp, lhsp, rhsp, delayp});
+        return AstNode::addNextNull(outp, markp);
     }
 
     // "(a, b, c) := v" assigns each element of the value to the name in the
@@ -4387,6 +4711,7 @@ private:
             formals.push_back(VN_AS(p, VhdlIfaceDecl));
         }
         std::map<const VhdlSymbol*, AstVar*> bind;
+        std::map<const VhdlSymbol*, VhdlActive> activeBind;
         std::vector<AstVhdlExprPair> passed;  // Formal index and actual, for the rest
         std::string key = symp->name();
         for (size_t i = 0; i < formals.size(); ++i) {
@@ -4411,6 +4736,10 @@ private:
             if (varIt == m_vars.end()) return nullptr;
             if (m_drivers.count(actualSymp)) return nullptr;  // Resolved: needs its drivers
             bind.emplace(formals[i]->vhdlSymp(), varIt->second);
+            // An assignment inside the copy is a transaction on the actual,
+            // so the formal answers from the actual's transaction bit
+            const auto acIt = m_actives.find(actualSymp->resolved());
+            if (acIt != m_actives.end()) activeBind.emplace(formals[i]->vhdlSymp(), acIt->second);
             key += "|" + std::to_string(reinterpret_cast<uintptr_t>(varIt->second));
         }
         if (bind.empty()) return nullptr;
@@ -4431,7 +4760,9 @@ private:
                 m_bindSignals = bind;
                 m_ftaskp = nullptr;
                 m_prefix.clear();
+                for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
                 taskp = lowerSubprogramInto(declp, uniqueName(symp) + "__Vsig");
+                for (const auto& pair : activeBind) m_actives.erase(pair.first);
             }
             for (AstVhdlIfaceDecl* const ifp : formals) {
                 const auto it = saved.find(ifp->vhdlSymp());
@@ -4599,30 +4930,40 @@ private:
     }
 
     AstNode* lowerTimeout(AstNodeExpr* timep, FileLine* flp) {
-        {
-            // "wait for 0 ns" does not stand still: it resumes in the next
-            // delta cycle, after the signal assignments already made have
-            // taken effect (10.2, 14.7.5). Verilog's "#0" is not that -- it
-            // resumes before the non-blocking region, so the process would
-            // read the values it was waiting to see change.
-            if (const AstConst* const constp = VN_CAST(timep, Const)) {
-                if (constp->isZero()) {
-                    VL_DO_DANGLING(timep->deleteTree(), timep);
-                    return deltaWait(flp);
-                }
-                return new AstDelay{flp, timep, false};
+        // "wait for 0 ns" does not stand still: it resumes in the next delta
+        // cycle, after the signal assignments already made have taken effect
+        // (10.2, 14.7.5). Verilog's "#0" is not that -- it resumes before the
+        // non-blocking region, so the process would read the values it was
+        // waiting to see change.
+        //
+        // A timeout that does advance time has the same problem one step
+        // further out. A VHDL simulation cycle updates every signal whose
+        // transaction is due, and only then resumes the processes whose
+        // timeouts have expired (14.7.5.1), so a process that waits a
+        // nanosecond sees what an "after 1 ns" assignment delivered at that
+        // instant. Verilog resumes "#1ns" in the active region, before the
+        // non-blocking region that delivers it, so the process would read the
+        // value the signal had a moment ago. Waiting one delta more puts the
+        // process back where the language says it runs.
+        if (const AstConst* const constp = VN_CAST(timep, Const)) {
+            if (constp->isZero()) {
+                VL_DO_DANGLING(timep->deleteTree(), timep);
+                return deltaWait(flp);
             }
-            // Not known here, so decide at run time
-            AstNodeExpr* const isZerop
-                = new AstEq{flp, timep->cloneTree(false),
-                            new AstConst{flp, AstConst::Unsized64{}, 0}};
-            // The zero case is taken by the other branch, so this delay is
-            // never zero however little the back end can see of it
-            FileLine* const dflp = new FileLine{flp};
-            dflp->warnOff(V3ErrorCode::ZERODLY, true);
-            return new AstIf{flp, isZerop, deltaWait(flp),
-                             new AstDelay{dflp, timep, false}};
+            if (!m_anyAfter) return new AstDelay{flp, timep, false};
+            return AstNode::addNext(static_cast<AstNode*>(new AstDelay{flp, timep, false}),
+                                    deltaWait(flp));
         }
+        // Not known here, so decide at run time
+        AstNodeExpr* const isZerop = new AstEq{
+            flp, timep->cloneTree(false), new AstConst{flp, AstConst::Unsized64{}, 0}};
+        // The zero case is taken by the other branch, so this delay is never
+        // zero however little the back end can see of it
+        FileLine* const dflp = new FileLine{flp};
+        dflp->warnOff(V3ErrorCode::ZERODLY, true);
+        AstNode* elsep = new AstDelay{dflp, timep, false};
+        if (m_anyAfter) elsep = AstNode::addNext(elsep, deltaWait(flp));
+        return new AstIf{flp, isZerop, deltaWait(flp), elsep};
     }
 
     // The procedures of std.textio and the implicit file operations (5.5.2,
@@ -5434,6 +5775,14 @@ private:
         // Which signals have more than one driver has to be known before the
         // declarations are lowered, since it decides what they become
         if (archp) countDrivers(archp->stmtsp());
+        m_actives.clear();
+        m_needActive.clear();
+        m_delayeds.clear();
+        collectActive(entp->declsp());
+        if (archp) {
+            collectActive(archp->declsp());
+            collectActive(archp->stmtsp());
+        }
         m_bindings.clear();
         m_instanceBindings.clear();
         m_prefix.clear();
@@ -5450,6 +5799,9 @@ private:
         for (AstNode* p = entp->declsp(); p; p = p->nextp()) lowerDecl(p);
         if (archp) {
             for (AstNode* p = archp->declsp(); p; p = p->nextp()) lowerDecl(p);
+            // Every signal now has its variable, so the transaction bits that
+            // the statements will mark can be made
+            makeActives(flp);
             for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
                 lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
@@ -5471,6 +5823,30 @@ std::set<const VhdlSymbol*> VhdlLowerVisitor::s_partialDriven;
 // Design units
 
 void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    // Whether any signal transaction in the design is delivered at a time of
+    // its own. This decides whether a process whose timeout expires has to
+    // stand aside for a signal update in the same cycle, and it is a property
+    // of the whole design, so it is answered before any of it is lowered.
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        if (m_anyAfter) break;
+        unitp->foreach([this](AstNode* nodep) {
+            if (const AstVhdlWaveform* const wfp = VN_CAST(nodep, VhdlWaveform)) {
+                if (wfp->afterp()) m_anyAfter = true;
+            } else if (const AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
+                if (attrp->name() == "delayed" && attrp->argp()) m_anyAfter = true;
+            }
+        });
+    }
+    // A Verilog source in the same design may schedule an update of its own,
+    // and nothing here can see when
+    if (!m_anyAfter) {
+        for (const VFileLibName& fl : v3Global.opt.vFiles()) {
+            if (!v3Global.opt.fileLanguage(fl.filename()).vhdl()) {
+                m_anyAfter = true;
+                break;
+            }
+        }
+    }
     // An entity and an architecture become one module, so pair them up
     // first. VHDL's default binding takes the architecture analyzed last
     // (7.3.3), which is what keeping the newest one gives.

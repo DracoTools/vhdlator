@@ -499,6 +499,22 @@ of x : signal is ...`` gives ``x'a`` its value, but the ``all`` and
 ``others`` forms, which give every entity of a class in the declarative part
 the same value, are not applied.
 
+**A transaction is recorded per signal, not per element.** ``S'ACTIVE``,
+``S'TRANSACTION``, ``S'QUIET`` and ``S'LAST_ACTIVE`` ask whether a driver
+assigned, not whether the value changed, which a compiled model has no other
+way to know; so a signal any of them names is given a companion bit that
+every assignment to it flips. Assigning one element of a composite signal
+flips the whole signal's bit, so ``S(i)'TRANSACTION`` reports a transaction
+on ``S``. Where the signal is driven from outside the entity that asks --
+an input port, say -- there is no assignment to mark, and the four are
+answered from the signal's events instead, which is the same answer whenever
+every transaction changes the value.
+
+**``'DELAYED`` needs a static delay.** ``S'DELAYED(T)`` becomes a signal of
+its own driven from ``S`` through ``T``, which requires ``T`` to be known
+when the model is built. The LRM requires ``T`` to be a static expression,
+so this rejects only what was already illegal.
+
 **The image of a real is printed in C form.** ``real'image(4.0)`` gives
 ``4`` where the LRM asks for text that reads back as a VHDL literal, such as
 ``4.0``. This affects only what is printed, not any value.

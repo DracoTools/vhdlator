@@ -75,6 +75,65 @@ bool mulOvf(int64_t a, int64_t b, int64_t& out) {
     out = a * b;
     return true;
 }
+// The position number of a physical literal is the largest integer that is
+// not greater than the product of its abstract literal and the unit
+// (5.2.4.1). Working from the literal's decimal digits rather than from the
+// double it parsed to keeps "8.2 ms" and "8200 us" the same value. False if
+// the text is not a plain decimal literal, or the product does not fit.
+bool scaleDecimal(const std::string& text, int64_t unit, int64_t& out) {
+    if (unit <= 0) return false;
+    unsigned __int128 mant = 0;
+    int fracDigits = 0;
+    int exp10 = 0;
+    bool anyDigit = false;
+    bool inFrac = false;
+    size_t i = 0;
+    for (; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '_') continue;
+        if (c == '.') {
+            if (inFrac) return false;
+            inFrac = true;
+            continue;
+        }
+        if (c == 'e' || c == 'E') break;
+        if (c < '0' || c > '9') return false;  // A based literal, or worse
+        mant = mant * 10 + static_cast<unsigned>(c - '0');
+        if (mant > (static_cast<unsigned __int128>(1) << 60)) return false;
+        if (inFrac) ++fracDigits;
+        anyDigit = true;
+    }
+    if (!anyDigit) return false;
+    if (i < text.size()) {  // An exponent, which for a real literal may be signed
+        ++i;
+        bool neg = false;
+        if (i < text.size() && (text[i] == '+' || text[i] == '-')) neg = text[i++] == '-';
+        bool anyExp = false;
+        for (; i < text.size(); ++i) {
+            if (text[i] == '_') continue;
+            if (text[i] < '0' || text[i] > '9') return false;
+            exp10 = exp10 * 10 + (text[i] - '0');
+            if (exp10 > 4096) return false;
+            anyExp = true;
+        }
+        if (!anyExp) return false;
+        if (neg) exp10 = -exp10;
+    }
+    exp10 -= fracDigits;
+    unsigned __int128 acc = mant * static_cast<unsigned __int128>(unit);
+    if (exp10 >= 0) {
+        for (int k = 0; k < exp10; ++k) {
+            acc *= 10;
+            if (acc > static_cast<unsigned __int128>(INT64_MAX)) return false;
+        }
+    } else {
+        for (int k = 0; k < -exp10; ++k) acc /= 10;  // Floor, the values being positive
+    }
+    if (acc > static_cast<unsigned __int128>(INT64_MAX)) return false;
+    out = static_cast<int64_t>(acc);
+    return true;
+}
+
 bool powOvf(int64_t base, int64_t exp, int64_t& out) {
     if (exp < 0) return false;
     int64_t acc = 1;
@@ -225,10 +284,16 @@ private:
             if (!unit.known()) return VhdlValue{};
             int64_t out = 0;
             if (nodep->realVal() != 0.0 || nodep->intVal() == 0) {
-                // A real abstract literal scales and then truncates (9.3.2)
-                const double scaled = nodep->realVal() * static_cast<double>(unit.toInt());
-                if (!(scaled >= -9.2e18 && scaled <= 9.2e18)) return VhdlValue{};
-                out = static_cast<int64_t>(scaled);
+                // A real abstract literal scales and then takes the largest
+                // integer not greater than the product (5.2.4.1). Worked out
+                // on the literal's own digits, because "8.2 ms" and "8200 us"
+                // are the same value while 8.2 times ten to the twelfth, as
+                // doubles, is not the integer 8200000000000
+                if (!scaleDecimal(nodep->text(), unit.toInt(), out)) {
+                    const double scaled = nodep->realVal() * static_cast<double>(unit.toInt());
+                    if (!(scaled >= -9.2e18 && scaled <= 9.2e18)) return VhdlValue{};
+                    out = static_cast<int64_t>(scaled);
+                }
                 if (nodep->realVal() == 0.0) out = 0;
             }
             if (nodep->intVal() != 0) {
