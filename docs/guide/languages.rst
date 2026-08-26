@@ -454,7 +454,11 @@ unconstrained array is fixed at the call site -- which is every call into
 ``ieee.numeric_std`` in real code -- the subprogram is specialized to that
 length and runs at the speed of hand-written Verilog. Where the length is
 not known until the value is computed, as for ``integer'image``, the value
-is carried dynamically instead. Both are correct; only the second allocates.
+is carried dynamically instead. An access value pointing at an unconstrained
+array -- ``type p is access t`` where ``t`` is ``array (natural range <>) of
+...`` -- is the same case: the object carries the bounds the allocation gave
+it, and indexing, slicing and the array attributes read them from it. Both
+are correct; only the second allocates.
 
 **An external name reaches instances, not blocks.** ``<< signal
 uut.inner : integer >>`` reads and writes the object it names, by a
@@ -510,22 +514,17 @@ an input port, say -- there is no assignment to mark, and the four are
 answered from the signal's events instead, which is the same answer whenever
 every transaction changes the value.
 
-**A ``NUL`` in a string aggregate is dropped.** A ``STRING`` is Verilator's
-string, which is characters rather than bits, and an aggregate of characters
-reaches it through a packed value whose conversion drops ``NUL`` bytes. So
-``(1 to 4 => NUL)`` is the empty string where the language says four
-characters. A ``STRING`` object *declared* with a constraint does start as
-that many ``NUL`` characters, and every other character survives an
-aggregate; it is only ``NUL`` written into one that is lost.
-
 **``'DELAYED`` needs a static delay.** ``S'DELAYED(T)`` becomes a signal of
 its own driven from ``S`` through ``T``, which requires ``T`` to be known
 when the model is built. The LRM requires ``T`` to be a static expression,
 so this rejects only what was already illegal.
 
-**The image of a real is printed in C form.** ``real'image(4.0)`` gives
-``4`` where the LRM asks for text that reads back as a VHDL literal, such as
-``4.0``. This affects only what is printed, not any value.
+**The image of a real is a VHDL literal, but not always the same one.**
+``real'image`` gives text that reads back as a VHDL literal -- ``4.0``,
+``0.5``, ``-3.25`` -- but which literal is implementation defined, and the
+reference simulators do not agree either: GHDL 7.0.0-dev writes ``5.0e-1``
+where NVC 1.22.1 writes ``0.5``. The number of digits a value is written to
+may differ from both.
 
 
 Encrypted Verilog
