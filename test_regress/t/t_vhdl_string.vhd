@@ -40,6 +40,8 @@ begin
     variable s : string(1 to 5);
     variable t : string(3 to 7);
     constant nuls : string := nul & nul & nul;
+    constant filled : string := (1 to 3 => nul);
+    constant mixed : string(1 to 4) := ('a', 'b', nul, 'c');
     variable words : name_array := ("one ", "two ", "tre ");
   begin
     assert img(y) = "0101" report "img" severity failure;
@@ -66,6 +68,11 @@ begin
     assert nuls'length = 3 report "nul length " & integer'image(nuls'length) severity failure;
     assert nuls(1) = nul report "nul first" severity failure;
     assert "" & nul & 'a' /= "a" report "a nul is a character of its own" severity failure;
+
+    -- An aggregate of characters is text too, control characters included
+    assert filled = nuls report "an aggregate of nuls" severity failure;
+    assert filled'length = 3 report "aggregate length" severity failure;
+    assert mixed = "ab" & nul & "c" report "an aggregate with a nul in it" severity failure;
 
     -- An array of strings is an array of objects, not a vector of bits
     assert words(0) = "one " report "words 0" severity failure;

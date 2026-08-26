@@ -3393,6 +3393,15 @@ private:
     // An aggregate builds a value out of its elements (9.3.3). Every choice
     // has already been checked to be static, so the whole value is a
     // concatenation over the target's index range.
+    // One element of a STRING aggregate, as text. A STRING is characters
+    // here rather than bits, so an aggregate of one is built with the string
+    // operations: a packed value would lose any NUL in it on the way (16.3).
+    AstNodeExpr* stringElem(AstNodeVhdlExpr* valuep, AstNodeExpr* loweredp, FileLine* flp) {
+        const VhdlType* const typep = valuep ? valuep->vhdlTypep() : nullptr;
+        if (typep && isStringType(typep)) return loweredp;
+        return new AstSFormatF{flp, "%c", false, loweredp};
+    }
+
     AstNodeExpr* lowerAggregate(AstVhdlAggregate* nodep) {
         FileLine* const flp = nodep->fileline();
         VhdlType* const typep = nodep->vhdlTypep();
@@ -3407,17 +3416,23 @@ private:
         // packs, is a concatenation: each value contributes its own width, so
         // an element that is itself an array of the aggregate's type spans as
         // many indices as it is long, which VHDL-2008 allows (9.3.3.3)
+        const bool asString = isStringType(typep);
         if (typep->base()->elementp() && elementPacks(typep->base()->elementp())
             && typep->dimensions() == 1 && allPositional(nodep)) {
             AstNodeExpr* outp = nullptr;
             for (AstVhdlElemAssoc* p = nodep->elemsp(); p;
                  p = VN_AS(p->nextp(), VhdlElemAssoc)) {
-                AstNodeExpr* const elemp = lowerExpr(p->valuep());
+                AstNodeExpr* elemp = lowerExpr(p->valuep());
                 if (!elemp) {
                     if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
                     return nullptr;
                 }
-                outp = outp ? new AstConcat{flp, outp, elemp} : elemp;
+                if (asString) elemp = stringElem(p->valuep(), elemp, flp);
+                outp = outp ? (asString ? static_cast<AstNodeExpr*>(
+                                   new AstConcatN{flp, outp, elemp})
+                                        : static_cast<AstNodeExpr*>(
+                                            new AstConcat{flp, outp, elemp}))
+                            : elemp;
             }
             if (outp) return outp;
         }
@@ -3527,20 +3542,23 @@ private:
                 unsup(flp, "aggregate with an element left unset");
                 return nullptr;
             }
-            if (spanAt[static_cast<size_t>(i)] > 1 && !packed) {
+            if (spanAt[static_cast<size_t>(i)] > 1 && !packed && !asString) {
                 unsup(flp, "aggregate with a run of elements given at once");
                 return nullptr;
             }
-            AstNodeExpr* const elemp = lowerExpr(valuep);
+            AstNodeExpr* elemp = lowerExpr(valuep);
             if (!elemp) return nullptr;
-            if (packed) {
+            if (asString) {
+                elemp = stringElem(valuep, elemp, flp);
+                outp = outp ? new AstConcatN{flp, outp, elemp} : elemp;
+            } else if (packed) {
                 outp = outp ? new AstConcat{flp, outp, elemp} : elemp;
             } else {
                 itemsp = AstNode::addNextNull(
                     itemsp, new AstPatMember{flp, elemp, nullptr, nullptr});
             }
         }
-        if (packed) return outp;
+        if (packed || asString) return outp;
         return itemsp ? new AstPattern{flp, itemsp} : nullptr;
     }
 
@@ -3569,6 +3587,17 @@ private:
         if (!chp->isOthers() && !chp->rangep()) return nullptr;
         const bool packed
             = typep->base()->elementp() && elementPacks(typep->base()->elementp());
+        if (isStringType(typep)) {
+            if (AstNodeExpr* const countp = boundsLength(typep, flp)) {
+                AstNodeExpr* const valuep = lowerExpr(eap->valuep());
+                if (!valuep) {
+                    VL_DO_DANGLING(countp->deleteTree(), countp);
+                    return nullptr;
+                }
+                return new AstReplicateN{flp, stringElem(eap->valuep(), valuep, flp), countp};
+            }
+            return nullptr;
+        }
         if (packed) {
             if (AstNodeExpr* const countp = boundsLength(typep, flp)) {
                 AstNodeExpr* const valuep = lowerExpr(eap->valuep());
