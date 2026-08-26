@@ -10,6 +10,9 @@
 -- (16.4). And a loop over the range of a string whose length is not fixed by
 -- its subtype runs from 1 to however long the value is.
 
+library ieee;
+use ieee.std_logic_1164.all;
+
 use std.env.all;
 use std.textio.all;
 
@@ -40,6 +43,9 @@ begin
     variable b : bit := '1';
     variable c : colour := green;
     variable t : time := 3 ns;
+    variable v8 : std_logic_vector(7 downto 0) := "10100101";
+    variable v5 : std_logic_vector(4 downto 0) := "10101";
+    variable v4 : std_logic_vector(3 downto 0) := "1100";
     variable unit : time := ns;
     variable l : line;
   begin
@@ -60,6 +66,15 @@ begin
     l := new string'("MiXeD");
     assert lower(l.all) = "mixed" report "loop over a dynamic range" severity failure;
     deallocate(l);
+
+    -- The radix forms write the value in that base, padded to whole digits
+    -- (16.3). Written as a conversion rather than compiled from the IEEE
+    -- body, which pads through an array that is null when the length
+    -- divides evenly.
+    assert to_hstring(v8) = "A5" report "to_hstring: " & to_hstring(v8) severity failure;
+    assert to_hstring(v5) = "15" report "to_hstring of five bits" severity failure;
+    assert to_ostring(v8) = "245" report "to_ostring: " & to_ostring(v8) severity failure;
+    assert to_bstring(v4) = "1100" report "to_bstring" severity failure;
 
     report "*-* All Finished *-*";
     stop;

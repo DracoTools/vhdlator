@@ -3466,6 +3466,26 @@ private:
             return name == "maximum" ? new AstCond{flp, testp, firstp, secondp}
                                      : new AstCond{flp, testp, secondp, firstp};
         }
+        // "to_hstring(v)" and its relatives write the value in that base
+        // (16.3). Compiled from the IEEE body they would be a loop over a
+        // padded copy, whose padding is a null array when the length is a
+        // multiple of the base -- and a null array has no representation in
+        // a statically sized model. Written as a conversion they are neither
+        // a loop nor a null array.
+        if ((name == "to_hstring" || name == "to_ostring" || name == "to_bstring"
+             || name == "to_binarystring" || name == "to_hex_string"
+             || name == "to_octal_string" || name == "to_binary_string")
+            && args.size() == 1
+            && (isLogicish(args[0]->vhdlTypep()) || isBitish(args[0]->vhdlTypep()))) {
+            const std::string fmt
+                = (name == "to_hstring" || name == "to_hex_string")
+                      ? "%h"
+                      : ((name == "to_ostring" || name == "to_octal_string") ? "%o" : "%b");
+            AstNodeExpr* outp = new AstSFormatF{flp, fmt, false, firstp};
+            // VHDL writes hexadecimal in upper case
+            if (fmt == "%h") outp = new AstToUpperN{flp, outp};
+            return outp;
+        }
         // The conversions between the logic families keep the same bits.
         // Recognised by what they operate on rather than by name alone: a
         // design may declare a function of the same name over a type of its

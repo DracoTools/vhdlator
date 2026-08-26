@@ -268,7 +268,9 @@ bool V3VhdlStd::isIntrinsicName(const std::string& name) {
         "hwrite",         "owrite",        "bwrite",          "swrite",
         "hread",          "oread",         "bread",           "tee",
         "file_open",      "file_close",    "flush",           "endfile",
-        "deallocate",     "stop",          "finish"};
+        "deallocate",     "stop",          "finish",
+        "to_hstring",     "to_ostring",    "to_bstring",      "to_binarystring",
+        "to_hex_string",  "to_octal_string", "to_binary_string"};
     for (const std::string& candidate : NAMES) {
         if (candidate == name) return true;
     }
