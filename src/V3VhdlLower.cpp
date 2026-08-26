@@ -407,6 +407,24 @@ private:
         return typep && strp && typep->base() == strp->base();
     }
 
+    // The index a STRING's own range starts at. Verilator's string is indexed
+    // from zero; VHDL indexes STRING from its range, which is 1 for the
+    // predefined subtype and for every string literal (16.3).
+    static int64_t stringLow(const VhdlType* typep) {
+        if (!typep) return 1;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (!indexes.empty() && indexes[0] && indexes[0]->bounded()) return indexes[0]->left();
+        return 1;
+    }
+    // An index into a STRING, brought back to where Verilator counts from
+    static AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
+        if (!typep || !isStringType(typep)) return indexp;
+        const int64_t low = stringLow(typep);
+        if (low == 0) return indexp;
+        return new AstSub{flp, indexp,
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(low)}};
+    }
+
     static AstNodeDType* newLogicDType(FileLine* flp, int bits) {
         if (bits <= 1) return new AstBasicDType{flp, VBasicDTypeKwd::LOGIC};
         return new AstBasicDType{flp, VFlagLogicPacked{}, bits};
@@ -888,7 +906,12 @@ private:
         return outp;
     }
 
-    AstNodeExpr* defaultValueFor(VhdlType* typep, FileLine* flp) {
+    // The default initial value of an object of this type (6.4.2.3). Null
+    // where there is nothing worth writing -- an array of logic starts where
+    // Verilator starts it anyway -- unless "mustHave", which is how a
+    // composite asks, since one element with no value would leave the whole
+    // record or array without one.
+    AstNodeExpr* defaultValueFor(VhdlType* typep, FileLine* flp, bool mustHave = false) {
         if (!typep || typep->isError()) return nullptr;
         VhdlType* const basep = typep->base();
         switch (basep->kind()) {
@@ -930,9 +953,24 @@ private:
             // out, whatever the array's size.
             if (!typep->isConstrainedArray()) return nullptr;
             if (!basep->elementp()) return nullptr;
-            if (enumIsLogic(basep->elementp()->base())) return nullptr;
-            if (isStringType(basep)) return nullptr;  // A string, not an array here
-            AstNodeExpr* const elemp = defaultValueFor(basep->elementp(), flp);
+            if (!mustHave && enumIsLogic(basep->elementp()->base())) return nullptr;
+            if (isStringType(basep)) {
+                // A STRING is Verilator's string, whose length is the number
+                // of characters it holds. One declared with a constraint must
+                // start out that long, or assigning to an element of it
+                // writes nothing at all. Every character starts at
+                // CHARACTER'LEFT, which is NUL (6.4.2.3).
+                if (!typep->isConstrainedArray()) return nullptr;
+                const std::vector<VhdlType*>& sindexes = typep->indexTypes();
+                if (sindexes.size() != 1 || !sindexes[0] || !sindexes[0]->bounded()) {
+                    return nullptr;
+                }
+                const int64_t len = sindexes[0]->length();
+                if (len <= 0 || len > (1 << 20)) return nullptr;
+                return new AstConst{flp, AstConst::String{},
+                                    std::string(static_cast<size_t>(len), '\0')};
+            }
+            AstNodeExpr* const elemp = defaultValueFor(basep->elementp(), flp, true);
             if (!elemp) return nullptr;
             AstNodeDType* const dtypep = lowerType(typep, flp);
             if (VN_IS(dtypep, PackArrayDType)) {
@@ -949,15 +987,27 @@ private:
                 if (!outp) VL_DO_DANGLING(elemp->deleteTree(), elemp);
                 return outp;
             }
-            // One dimension only: a sparse initializer for a nested array
-            // would have to be nested too, and say nothing a design is likely
-            // to depend on
-            if (typep->indexTypes().size() != 1 || !VN_IS(dtypep, UnpackArrayDType)) {
+            // Unpacked, so a sparse initializer with only a default says
+            // "every element" without writing them out. A dimension of its
+            // own needs one such initializer per level, each carrying the
+            // type of that level.
+            std::vector<AstNodeDType*> levels;
+            for (AstNodeDType* d = dtypep; VN_IS(d, UnpackArrayDType);
+                 d = VN_AS(d, UnpackArrayDType)->childDTypep()) {
+                levels.push_back(d);
+            }
+            if (levels.size() != typep->indexTypes().size()) {
                 VL_DO_DANGLING(elemp->deleteTree(), elemp);
                 VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
                 return nullptr;
             }
-            return new AstInitArray{flp, dtypep, elemp};
+            AstNodeExpr* outp = elemp;
+            for (size_t i = levels.size(); i-- > 0;) {
+                AstNodeDType* const lvlp
+                    = (i == 0) ? dtypep : levels[i]->cloneTree(false);
+                outp = new AstInitArray{flp, lvlp, outp};
+            }
+            return outp;
         }
         case VhdlTypeKind::RECORD: {
             // A record's default is each element's default (6.4.2.2), written
@@ -967,7 +1017,7 @@ private:
             AstNodeExpr* outp = nullptr;
             AstNode* itemsp = nullptr;
             for (VhdlSymbol* const elemp : typep->elements()) {
-                AstNodeExpr* const onep = defaultValueFor(elemp->typep(), flp);
+                AstNodeExpr* const onep = defaultValueFor(elemp->typep(), flp, true);
                 if (!onep) {
                     if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
                     if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
@@ -1060,8 +1110,16 @@ private:
         AstNodeExpr* const argp = nodep->argp() ? lowerExpr(nodep->argp()) : nullptr;
         // An enumeration value is its own position, and a position its own
         // value, so 'POS and 'VAL are identities in the emitted code (16.2.3)
-        if (attr == "pos" || attr == "val") {
+        if (attr == "pos") {
             if (argp) return argp;
+        } else if (attr == "val") {
+            // "T'VAL(n)" is a value of T, so it is as wide as T even though
+            // the position it is given is an integer
+            if (argp) {
+                VhdlType* const totypep = nodep->vhdlTypep();
+                if (!totypep) return argp;
+                return new AstCast{flp, argp, VFlagChildDType{}, lowerType(totypep, flp)};
+            }
         } else if (attr == "succ" || attr == "rightof") {
             if (argp) return new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
         } else if (attr == "pred" || attr == "leftof") {
@@ -1553,6 +1611,8 @@ private:
             if (declp && declp->targetp()) return lowerExpr(declp->targetp());
             if (symp->aliasp()) return lowerRef(symp->aliasp(), name, flp);
         }
+        const auto bit = m_bindExprs.find(symp);
+        if (bit != m_bindExprs.end()) return lowerExpr(bit->second);
         const auto it = m_vars.find(symp);
         if (it != m_vars.end()) {
             return new AstVarRef{flp, it->second, VAccess::READ};
@@ -2269,6 +2329,13 @@ private:
                 }
                 leftp = aliasShift(objSymp, leftp, flp);
                 rightp = aliasShift(objSymp, rightp, flp);
+                if (prefixTypep && isStringType(prefixTypep)) {
+                    // A slice of a STRING is a substring: Verilator's string
+                    // is characters, not bits, so a part select of it means
+                    // nothing
+                    return new AstSubstrN{flp, fromp, stringIndex(prefixTypep, leftp, flp),
+                                          stringIndex(prefixTypep, rightp, flp)};
+                }
                 // A slice whose bounds move together but keep their width --
                 // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
                 // writes both ends, so the width has to be recovered from
@@ -2291,6 +2358,7 @@ private:
                     return nullptr;
                 }
                 indexp = aliasShift(objSymp, indexp, flp);
+                indexp = stringIndex(prefixTypep, indexp, flp);
                 outp = new AstSelBit{flp, outp, indexp};
             }
             return outp;
@@ -3297,6 +3365,59 @@ private:
 
     // A concurrent signal assignment is a process of its own (11.6)
     // The signal a name ultimately assigns, through slices and selections
+    // The part of an object a name selects, as a key, where every step of the
+    // selection is decided now: "r.y", "v(3)", "v(7 downto 4)". False if the
+    // name is not that -- an index that is only known while running names a
+    // different element at every call, and one copy of the subprogram cannot
+    // stand for all of them.
+    // The object a selected name is ultimately a part of. Unlike rootSymOf,
+    // this walks past the element or index symbol the selection itself
+    // denotes and answers with the object that holds it.
+    static const VhdlSymbol* baseSymOf(const AstNode* nodep) {
+        while (nodep) {
+            if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+                nodep = callp->prefixp();
+            } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+                nodep = selp->prefixp();
+            } else if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
+                return vp->vhdlSymp() ? vp->vhdlSymp()->resolved() : nullptr;
+            } else {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+    static bool staticSelectKey(const AstNodeVhdlExpr* nodep, std::string& out) {
+        if (!nodep) return false;
+        if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            if (!staticSelectKey(selp->prefixp(), out)) return false;
+            out += "." + selp->name();
+            return true;
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            if (!staticSelectKey(callp->prefixp(), out)) return false;
+            if (const AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
+                const VhdlValue lv = V3VhdlEval::eval(rp->leftp());
+                const VhdlValue rv = V3VhdlEval::eval(rp->rightp());
+                if (!lv.isInt() || !rv.isInt()) return false;
+                out += "(" + std::to_string(lv.toInt()) + ":" + std::to_string(rv.toInt()) + ")";
+                return true;
+            }
+            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            if (!asp || asp->nextp() || !asp->actualp()) return false;
+            const VhdlValue iv = V3VhdlEval::eval(asp->actualp());
+            if (!iv.isInt()) return false;
+            out += "(" + std::to_string(iv.toInt()) + ")";
+            return true;
+        }
+        if (nodep->vhdlSymp()) {
+            out += "@" + std::to_string(reinterpret_cast<uintptr_t>(nodep->vhdlSymp()->resolved()));
+            return true;
+        }
+        return false;
+    }
+
     static const VhdlSymbol* rootSymOf(const AstNode* nodep) {
         while (nodep) {
             if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
@@ -4711,6 +4832,7 @@ private:
             formals.push_back(VN_AS(p, VhdlIfaceDecl));
         }
         std::map<const VhdlSymbol*, AstVar*> bind;
+        std::map<const VhdlSymbol*, AstNodeVhdlExpr*> exprBind;
         std::map<const VhdlSymbol*, VhdlActive> activeBind;
         std::vector<AstVhdlExprPair> passed;  // Formal index and actual, for the rest
         std::string key = symp->name();
@@ -4729,11 +4851,24 @@ private:
                 if (actualp) passed.push_back(AstVhdlExprPair{formals[i]->name(), actualp});
                 continue;
             }
-            // A signal actual must be a signal of the design, named plainly
+            // A signal actual is a signal of the design, either named plainly
+            // or with a part of it selected in a way that is decided now
             VhdlSymbol* const actualSymp = actualp ? actualp->vhdlSymp() : nullptr;
-            if (!actualSymp) return nullptr;
-            const auto varIt = m_vars.find(actualSymp);
-            if (varIt == m_vars.end()) return nullptr;
+            const auto varIt
+                = actualSymp ? m_vars.find(actualSymp) : m_vars.end();
+            if (!actualSymp || varIt == m_vars.end() || VN_IS(actualp, VhdlSelected)
+                || VN_IS(actualp, VhdlCall)) {
+                // "drive(r.y, 3)" or "set(v(3))": the formal has no variable
+                // of its own, so the actual's name is lowered again wherever
+                // the body refers to it
+                std::string path;
+                const VhdlSymbol* const rootp = actualp ? baseSymOf(actualp) : nullptr;
+                if (!rootp || !m_vars.count(rootp) || m_drivers.count(rootp)) return nullptr;
+                if (!staticSelectKey(actualp, path)) return nullptr;
+                exprBind.emplace(formals[i]->vhdlSymp(), actualp);
+                key += "|" + path;
+                continue;
+            }
             if (m_drivers.count(actualSymp)) return nullptr;  // Resolved: needs its drivers
             bind.emplace(formals[i]->vhdlSymp(), varIt->second);
             // An assignment inside the copy is a transaction on the actual,
@@ -4742,7 +4877,7 @@ private:
             if (acIt != m_actives.end()) activeBind.emplace(formals[i]->vhdlSymp(), acIt->second);
             key += "|" + std::to_string(reinterpret_cast<uintptr_t>(varIt->second));
         }
-        if (bind.empty()) return nullptr;
+        if (bind.empty() && exprBind.empty()) return nullptr;
         auto copyIt = m_signalCopies.find(key);
         if (copyIt == m_signalCopies.end()) {
             // The formals belong to the one declaration, so building a copy
@@ -4757,7 +4892,9 @@ private:
                 VL_RESTORER_COPY(m_bindSignals);
                 VL_RESTORER(m_ftaskp);
                 VL_RESTORER_COPY(m_prefix);
+                VL_RESTORER_COPY(m_bindExprs);
                 m_bindSignals = bind;
+                m_bindExprs = exprBind;
                 m_ftaskp = nullptr;
                 m_prefix.clear();
                 for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
@@ -5416,6 +5553,10 @@ private:
     // straight to them -- the same answer monomorphization gives everywhere
     // else in this frontend.
     std::map<const VhdlSymbol*, AstVar*> m_bindSignals;
+    // A signal-class formal bound to part of a signal rather than to a whole
+    // one -- "drive(r.y, 3)" -- which has no variable of its own to stand
+    // for it, so the actual's own name is lowered again at each reference
+    std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_bindExprs;
     std::map<std::string, AstNodeFTask*> m_signalCopies;
 
     void lowerSubprogram(AstVhdlSubprogDecl* nodep) { lowerSubprogramInto(nodep, ""); }
@@ -5485,6 +5626,9 @@ private:
                 m_vars[psymp] = boundIt->second;
                 continue;
             }
+            // Bound to part of a signal rather than to a whole one, which
+            // likewise needs no port: the body names that part directly
+            if (m_bindExprs.count(psymp)) continue;
             AstVar* const varp = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
                                             lowerType(psymp->typep(), flp)};
             switch (ifp->mode()) {

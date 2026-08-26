@@ -27,6 +27,16 @@ architecture sim of t_vhdl_default is
   end record;
 
   type ints is array (1 to 3) of integer;
+  -- A dimension of its own, and an element that packs, each need the
+  -- element's default written out rather than left at zero
+  type matrix is array (1 to 2, 1 to 3) of integer;
+  type packedrec is record
+    b : bit_vector(1 to 3);
+    n : integer;
+  end record;
+  type recs is array (1 to 2) of packedrec;
+  signal sm : matrix;
+  signal sr : recs;
 
 begin
 
@@ -52,6 +62,11 @@ begin
     assert sz.n = 0 and sz.c = red report "record of mixed types" severity failure;
     assert ar(1) = integer'left and ar(3) = integer'left
       report "array of integers" severity failure;
+    assert sm(1, 1) = integer'left and sm(2, 3) = integer'left
+      report "array of two dimensions" severity failure;
+    assert sr(1).n = integer'left and sr(2).n = integer'left
+      report "array of records that pack" severity failure;
+    assert sr(1).b = "000" report "packed element of a record" severity failure;
 
     report "*-* All Finished *-*";
     stop;

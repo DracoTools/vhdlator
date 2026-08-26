@@ -45,6 +45,7 @@ begin
     wait for 1 ns;
     assert y = 3 report "y3" severity failure;
     assert y'delayed(1 ns) = 2 report "dy2" severity failure;
+    assert y'delayed(2 ns) = 1 report "dy3" severity failure;
 
     -- A physical literal is the largest integer not greater than the product
     -- of its abstract literal and its unit (5.2.4.1), worked out exactly

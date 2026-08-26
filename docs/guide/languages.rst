@@ -510,6 +510,14 @@ an input port, say -- there is no assignment to mark, and the four are
 answered from the signal's events instead, which is the same answer whenever
 every transaction changes the value.
 
+**A ``NUL`` in a string aggregate is dropped.** A ``STRING`` is Verilator's
+string, which is characters rather than bits, and an aggregate of characters
+reaches it through a packed value whose conversion drops ``NUL`` bytes. So
+``(1 to 4 => NUL)`` is the empty string where the language says four
+characters. A ``STRING`` object *declared* with a constraint does start as
+that many ``NUL`` characters, and every other character survives an
+aggregate; it is only ``NUL`` written into one that is lost.
+
 **``'DELAYED`` needs a static delay.** ``S'DELAYED(T)`` becomes a signal of
 its own driven from ``S`` through ``T``, which requires ``T`` to be known
 when the model is built. The LRM requires ``T`` to be a static expression,
