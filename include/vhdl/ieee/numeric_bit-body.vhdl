@@ -54,8 +54,6 @@
 -- $Date: 2008-04-10 17:16:09 +0930 (Thu, 10 Apr 2008) $
 -- --------------------------------------------------------------------
 
-library nvc;
-
 package body NUMERIC_BIT is
 
   -- null range array constants
@@ -65,7 +63,7 @@ package body NUMERIC_BIT is
 
   -- implementation controls
 
-  alias NO_WARNING is nvc.sim_pkg.ieee_no_warning;
+  constant NO_WARNING : BOOLEAN := false;  -- default to emit warnings
 
   -- =========================Local Subprograms =================================
 
