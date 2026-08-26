@@ -1594,6 +1594,9 @@ class AstFork final : public AstNodeBlock {
     // @astgen op3 := forksp : List[AstBegin]
     const VJoinType m_joinType;  // Join keyword type
     bool m_immediateStart = false;  // Fork starts before its parent blocks or exits
+    // Made to carry an assignment's own delay, not written in the design. A
+    // scheduled update is not a process, so "disable fork" must not end it.
+    bool m_forDelayedAssign = false;
 
 public:
     AstFork(FileLine* fl, VJoinType joinType, const string& name = "")
@@ -1610,6 +1613,8 @@ public:
     VJoinType joinType() const { return m_joinType; }
     bool immediateStart() const { return m_immediateStart; }
     void immediateStart(bool flag) { m_immediateStart = flag; }
+    bool forDelayedAssign() const { return m_forDelayedAssign; }
+    void forDelayedAssign(bool flag) { m_forDelayedAssign = flag; }
 };
 
 // === AstNodeCoverOrAssert ===

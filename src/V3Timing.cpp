@@ -1213,7 +1213,14 @@ class TimingControlVisitor final : public VNVisitor {
             // Put it in a fork so it doesn't block
             // Could already be the only thing directly under a fork, reuse that if possible
             AstFork* forkp = !nodep->nextp() ? VN_CAST(nodep->firstAbovep(), Fork) : nullptr;
-            if (!forkp) forkp = new AstFork{flp, VJoinType::JOIN_NONE};
+            if (!forkp) {
+                forkp = new AstFork{flp, VJoinType::JOIN_NONE};
+                // Made here to carry the assignment's own delay. It is not a
+                // process the design forked, so "disable fork" must leave it
+                // alone: an update already scheduled still happens (IEEE
+                // 1800-2023 9.6.3).
+                forkp->forDelayedAssign(true);
+            }
             if (!m_underProcedure) {
                 // If it's in a function, it won't be handled by V3Delayed
                 // Put it behind an additional named event that gets triggered in the NBA region
@@ -1447,11 +1454,19 @@ class TimingControlVisitor final : public VNVisitor {
     void visit(AstBegin* nodep) override {
         VL_RESTORER(m_procp);
         VL_RESTORER(m_hasProcess);
+        VL_RESTORER(m_inDelayedAssignFork);
+        // A branch of a fork the design wrote is a process of its own, so it
+        // is given one whenever the process it was forked from has one --
+        // that is what lets "disable fork" end it. The fork made to carry an
+        // assignment's delay is not such a branch.
+        if (m_inDelayedAssignFork) m_hasProcess = false;
+        m_inDelayedAssignFork = false;
         m_hasProcess |= hasFlags(nodep, T_HAS_PROC);
         m_procp = nodep;
         if (m_hasProcess) nodep->setNeedProcess();
         iterateChildren(nodep);
     }
+    bool m_inDelayedAssignFork = false;  // Directly under such a fork
     void visit(AstFork* nodep) override {
         if (nodep->user1SetOnce()) return;
         UINFO(9, "control-visit " << nodep);
@@ -1464,6 +1479,8 @@ class TimingControlVisitor final : public VNVisitor {
         //       inserted something there, but as of today we don't need to.
 
         // Process and name each fork
+        VL_RESTORER(m_inDelayedAssignFork);
+        m_inDelayedAssignFork = nodep->forDelayedAssign();
         size_t idx = 0;  // Index for naming begins
         for (AstBegin *itemp = nodep->forksp(), *nextp; itemp; itemp = nextp) {
             nextp = VN_AS(itemp->nextp(), Begin);
