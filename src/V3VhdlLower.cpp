@@ -3466,11 +3466,15 @@ private:
             return name == "maximum" ? new AstCond{flp, testp, firstp, secondp}
                                      : new AstCond{flp, testp, secondp, firstp};
         }
-        // The conversions between the logic families keep the same bits
-        if (name == "to_stdlogicvector" || name == "to_stdulogicvector"
-            || name == "to_bitvector" || name == "to_bit" || name == "to_stdulogic"
-            || name == "to_stdlogic" || name == "to_x01" || name == "to_01"
-            || name == "to_ux01") {
+        // The conversions between the logic families keep the same bits.
+        // Recognised by what they operate on rather than by name alone: a
+        // design may declare a function of the same name over a type of its
+        // own, and that one has to be called.
+        if ((name == "to_stdlogicvector" || name == "to_stdulogicvector"
+             || name == "to_bitvector" || name == "to_bit" || name == "to_stdulogic"
+             || name == "to_stdlogic" || name == "to_x01" || name == "to_01"
+             || name == "to_ux01")
+            && (isLogicish(args[0]->vhdlTypep()) || isBitish(args[0]->vhdlTypep()))) {
             return firstp;
         }
         VL_DO_DANGLING(firstp->deleteTree(), firstp);
