@@ -1255,7 +1255,16 @@ private:
         if (AstVhdlSubprogDecl* const subp = VN_CAST(nodep, VhdlSubprogDecl)) {
             // An uninstantiated generic subprogram is a template, never
             // called as it stands (4.4)
-            if (subp->genericCount() == 0 || subp->isInstance()) lowerSubprogram(subp);
+            if (subp->genericCount() != 0 && !subp->isInstance()) return;
+            // One with a signal parameter is a template too, of a different
+            // kind: what its formal names, and so what that formal's history
+            // attributes answer from, is only known at a call site, so a copy
+            // is made there instead (4.2.2.3)
+            if (subp->vhdlSymp() && hasSignalParam(subp->vhdlSymp())
+                && subp->hasBody()) {
+                return;
+            }
+            lowerSubprogram(subp);
             return;
         }
         if (AstVhdlSubprogInst* const instp = VN_CAST(nodep, VhdlSubprogInst)) {
@@ -1754,11 +1763,17 @@ private:
     // the last event was, and a bit that flips on each one. The writes are
     // non-blocking, so a process reading them in the same delta sees what was
     // true before the event, which is what the attributes are defined against.
+    // A signal-class formal names whatever signal the call passed. Inside a
+    // copy of the body made for one call site, that signal is known, and its
+    // history is the one the formal's attributes ask about (4.2.2.3).
+    VhdlSymbol* boundSignal(VhdlSymbol* symp) const {
+        const auto it = m_bindSymbols.find(symp);
+        return it == m_bindSymbols.end() ? symp : it->second;
+    }
+
     const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
-        VhdlSymbol* const symp = prefixp->vhdlSymp();
-        // Only a signal of the design has a history to keep. A signal-class
-        // *parameter* names whatever signal the call passed, which is not
-        // known here.
+        VhdlSymbol* const symp = boundSignal(prefixp->vhdlSymp());
+        // Only a signal of the design has a history to keep
         if (!symp || symp->kind() != VhdlSymKind::SIGNAL) {
             if (!symp || symp->kind() != VhdlSymKind::PORT) return nullptr;
         }
@@ -1888,8 +1903,11 @@ private:
     }
 
     const VhdlActive* activeFor(AstNodeVhdlExpr* prefixp) {
-        const VhdlSymbol* const symp = rootSymOf(prefixp);
+        const VhdlSymbol* symp = rootSymOf(prefixp);
         if (!symp) return nullptr;
+        // A signal-class formal answers from the signal the call passed
+        const auto bindIt = m_bindSymbols.find(symp);
+        if (bindIt != m_bindSymbols.end()) symp = bindIt->second;
         const auto found = m_actives.find(symp->resolved());
         return found == m_actives.end() ? nullptr : &found->second;
     }
@@ -3359,6 +3377,12 @@ private:
                 addCallArgs(callp, nodep);
                 return callp;
             }
+        }
+        // A function with a signal parameter needs a copy of its body per
+        // call site, so that the formal's 'EVENT and the rest can be answered
+        // from the signal the call passed
+        if (hasSignalParam(symp)) {
+            if (AstNodeExpr* const outp = lowerSignalFuncCall(symp, nodep, flp)) return outp;
         }
         auto it = m_funcs.find(symp);
         if (it == m_funcs.end() && emitOnDemand(symp)) it = m_funcs.find(symp);
@@ -6541,8 +6565,13 @@ private:
         return false;
     }
 
-    // Call a procedure whose signal parameters are bound to the actuals
-    AstNode* lowerSignalProcCall(VhdlSymbol* symp, AstVhdlCall* callp, FileLine* flp) {
+    // A copy of a subprogram's body made for one call site, with each
+    // signal-class formal bound to the signal the call passed (4.2.2.3): an
+    // assignment inside it drives that signal, and the formal's history
+    // attributes answer from that signal's record. The actuals that are not
+    // signals are left in `passed` for the caller to hand over as usual.
+    AstNodeFTask* signalCopyFor(VhdlSymbol* symp, AstVhdlCall* callp,
+                                std::vector<AstVhdlExprPair>& passed) {
         AstVhdlSubprogDecl* const declp = declOf(symp);
         if (!declp || !declp->hasBody()) return nullptr;
         // The actuals, in formal order
@@ -6557,7 +6586,7 @@ private:
         std::map<const VhdlSymbol*, AstVar*> bind;
         std::map<const VhdlSymbol*, AstNodeVhdlExpr*> exprBind;
         std::map<const VhdlSymbol*, VhdlActive> activeBind;
-        std::vector<AstVhdlExprPair> passed;  // Formal index and actual, for the rest
+        std::map<const VhdlSymbol*, VhdlSymbol*> symBind;
         std::string key = symp->name();
         for (size_t i = 0; i < formals.size(); ++i) {
             AstNodeVhdlExpr* actualp = nullptr;
@@ -6594,6 +6623,10 @@ private:
             }
             if (m_drivers.count(actualSymp)) return nullptr;  // Resolved: needs its drivers
             bind.emplace(formals[i]->vhdlSymp(), varIt->second);
+            // Which signal the formal names, so that inside the copy its
+            // history attributes -- 'EVENT, 'LAST_VALUE and the rest -- are
+            // answered from the actual's record rather than from nothing
+            symBind.emplace(formals[i]->vhdlSymp(), actualSymp->resolved());
             // An assignment inside the copy is a transaction on the actual,
             // so the formal answers from the actual's transaction bit
             const auto acIt = m_actives.find(actualSymp->resolved());
@@ -6616,8 +6649,10 @@ private:
                 VL_RESTORER(m_ftaskp);
                 VL_RESTORER_COPY(m_prefix);
                 VL_RESTORER_COPY(m_bindExprs);
+                VL_RESTORER_COPY(m_bindSymbols);
                 m_bindSignals = bind;
                 m_bindExprs = exprBind;
+                m_bindSymbols = symBind;
                 m_ftaskp = nullptr;
                 m_prefix.clear();
                 for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
@@ -6635,17 +6670,47 @@ private:
             if (!taskp) return nullptr;
             copyIt = m_signalCopies.emplace(key, taskp).first;
         }
-        AstTaskRef* const refp = new AstTaskRef{flp, copyIt->second->name(), nullptr};
-        refp->taskp(copyIt->second);
+        return copyIt->second;
+    }
+
+    // The arguments a call to such a copy still has to hand over
+    bool addPassedArgs(AstNodeFTaskRef* refp, const std::vector<AstVhdlExprPair>& passed,
+                       FileLine* flp) {
         for (const AstVhdlExprPair& pair : passed) {
             AstNodeExpr* const onep = lowerExpr(pair.exprp);
-            if (!onep) {
-                VL_DO_DANGLING(refp->deleteTree(), refp);
-                return nullptr;
-            }
+            if (!onep) return false;
             refp->addArgsp(new AstArg{flp, pair.name, onep});
         }
+        return true;
+    }
+
+    // Call a procedure whose signal parameters are bound to the actuals
+    AstNode* lowerSignalProcCall(VhdlSymbol* symp, AstVhdlCall* callp, FileLine* flp) {
+        std::vector<AstVhdlExprPair> passed;
+        AstNodeFTask* const taskp = signalCopyFor(symp, callp, passed);
+        if (!taskp) return nullptr;
+        AstTaskRef* const refp = new AstTaskRef{flp, taskp->name(), nullptr};
+        refp->taskp(taskp);
+        if (!addPassedArgs(refp, passed, flp)) {
+            VL_DO_DANGLING(refp->deleteTree(), refp);
+            return nullptr;
+        }
         return new AstStmtExpr{flp, refp};
+    }
+
+    // The same for a function: "rising_edge(s)" written out rather than
+    // recognised, or any function of the design that takes a signal
+    AstNodeExpr* lowerSignalFuncCall(VhdlSymbol* symp, AstVhdlCall* callp, FileLine* flp) {
+        std::vector<AstVhdlExprPair> passed;
+        AstNodeFTask* const taskp = signalCopyFor(symp, callp, passed);
+        if (!taskp || !VN_IS(taskp, Func)) return nullptr;
+        AstFuncRef* const refp = new AstFuncRef{flp, taskp->name(), nullptr};
+        refp->taskp(taskp);
+        if (!addPassedArgs(refp, passed, flp)) {
+            VL_DO_DANGLING(refp->deleteTree(), refp);
+            return nullptr;
+        }
+        return refp;
     }
 
     // The sensitivity a list of signal names gives
@@ -7392,6 +7457,8 @@ private:
     // straight to them -- the same answer monomorphization gives everywhere
     // else in this frontend.
     std::map<const VhdlSymbol*, AstVar*> m_bindSignals;
+    // Which signal each signal-class formal names in this copy of the body
+    std::map<const VhdlSymbol*, VhdlSymbol*> m_bindSymbols;
     // A signal-class formal bound to part of a signal rather than to a whole
     // one -- "drive(r.y, 3)" -- which has no variable of its own to stand
     // for it, so the actual's own name is lowered again at each reference

@@ -4239,6 +4239,23 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             if (!assocs[i] || !assocs[i]->actualp() || formalOf[i] < 0) continue;
             VhdlType* const paramp = nodep->vhdlSymp()->paramTypes()[formalOf[i]];
             analyzeExpr(assocs[i]->actualp(), paramp);
+            // A parameter written against an unconstrained array takes its
+            // index range from the actual (5.3.2.2). Where the actual is a
+            // value rather than an object -- a string literal, an aggregate,
+            // a qualified expression -- nothing else has worked its bounds
+            // out, and without them the call cannot be specialized on its
+            // length and so cannot be emitted at all.
+            if (paramp && paramp->base()->kind() == VhdlTypeKind::ARRAY
+                && paramp->unconstrained()) {
+                VhdlType* const actualp = assocs[i]->actualp()->vhdlTypep();
+                if (!actualp || !actualp->isConstrainedArray()) {
+                    VhdlType* const boundp = constrainFromValue(paramp, assocs[i]->actualp(),
+                                                               assocs[i]->fileline());
+                    if (boundp && boundp->isConstrainedArray()) {
+                        assocs[i]->actualp()->vhdlTypep(boundp);
+                    }
+                }
+            }
             // An actual must belong to the parameter's subtype (4.2.2.1)
             if (!nodep->vhdlSymp()->predefined()) {
                 const std::string what = "parameter " + std::to_string(formalOf[i] + 1) + " of '"
