@@ -991,6 +991,9 @@ private:
     VhdlType* convertedType(VhdlType* top, AstVhdlAssoc* argp) VL_MT_DISABLED;
     VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) VL_MT_DISABLED;
+    VhdlType* constrainRecordFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                      FileLine* flp) VL_MT_DISABLED;
+    static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
@@ -1402,6 +1405,15 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         if (!isTemplate) {
             iterateAndNextNull(nodep->declsp());
             iterateAndNextNull(nodep->stmtsp());
+            // A function whose result type leaves something open -- a record
+            // with an element of an unconstrained array type -- gets it from
+            // what the body returns (5.3.3)
+            if (symp->returnTypep() && !fullyConstrainedRecord(symp->returnTypep())
+                && symp->returnTypep()->base()->kind() == VhdlTypeKind::RECORD) {
+                VhdlType* foundp = nullptr;
+                findReturnedType(nodep->stmtsp(), foundp);
+                if (foundp) symp->returnTypep(foundp);
+            }
         }
         m_returnTypep = oldReturnp;
     }
@@ -2404,7 +2416,9 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp) {
                 // written with its own range does (9.3.3.3)
                 VhdlType* const typep = constrainFromValue(
                     retp->valuep()->vhdlTypep(), retp->valuep(), retp->fileline());
-                if (typep && typep->isConstrainedArray()) foundp = typep;
+                if (typep && (typep->isConstrainedArray() || fullyConstrainedRecord(typep))) {
+                    foundp = typep;
+                }
             }
             continue;
         }
@@ -3443,10 +3457,15 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
     }
     const AstVhdlName* const suffixp = VN_CAST(nodep->suffixp(), VhdlName);
     if (!suffixp) return V3VhdlStd::errorType();
-    for (VhdlSymbol* const elemp : recp->base()->elements()) {
-        if (elemp->name() == suffixp->name()) {
-            nodep->vhdlSymp(elemp);
-            return elemp->typep();
+    // The subtype's own elements first: a record element of an unconstrained
+    // array type is constrained per object, and the base type's element still
+    // says nothing about how long it is (5.3.3)
+    for (const std::vector<VhdlSymbol*>* listp : {&recp->elements(), &recp->base()->elements()}) {
+        for (VhdlSymbol* const elemp : *listp) {
+            if (elemp->name() == suffixp->name()) {
+                nodep->vhdlSymp(elemp);
+                return elemp->typep();
+            }
         }
     }
     err(nodep->fileline(), "Record type " + recp->prettyName() + " has no element '"
@@ -4180,9 +4199,99 @@ int64_t VhdlSemVisitor::aggregateLength(AstVhdlAggregate* nodep) {
 // An object declared with an unconstrained array subtype takes its constraint
 // from its initial value (5.3.2.2, 6.4.2.2). Until that is done the object has
 // no length, and neither has anything computed from its attributes.
+// Whether a record type has no element left open. A record with an element
+// of an unconstrained array type is not a type an object can have until the
+// value it is given says how long that element is (5.3.3).
+bool VhdlSemVisitor::fullyConstrainedRecord(const VhdlType* typep) {
+    if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+    for (const VhdlSymbol* const ep : typep->elements()) {
+        const VhdlType* const etp = ep->typep();
+        if (!etp) continue;
+        if (etp->base()->kind() == VhdlTypeKind::ARRAY && etp->unconstrained()) return false;
+        if (etp->base()->kind() == VhdlTypeKind::RECORD && !fullyConstrainedRecord(etp)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A record whose elements are constrained by the value an object of it is
+// given. VHDL-2008 lets a record element be an unconstrained array, and then
+// the object's own value is what says how long it is (5.3.3).
+VhdlType* VhdlSemVisitor::constrainRecordFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                                   FileLine* flp) {
+    const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
+    bool anyOpen = false;
+    for (VhdlSymbol* const ep : elems) {
+        if (ep->typep() && ep->typep()->base()->kind() == VhdlTypeKind::ARRAY
+            && ep->typep()->unconstrained()) {
+            anyOpen = true;
+        }
+    }
+    if (!anyOpen) return typep;
+    // Another value of the same record type hands over its element subtypes
+    AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate);
+    if (!aggp) {
+        VhdlType* const valueTypep = valuep->vhdlTypep();
+        if (valueTypep && valueTypep->base() == typep->base()
+            && valueTypep->elements().size() == elems.size()) {
+            bool settled = true;
+            for (VhdlSymbol* const ep : valueTypep->elements()) {
+                if (ep->typep() && ep->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                    && ep->typep()->unconstrained()) {
+                    settled = false;
+                }
+            }
+            if (settled) return valueTypep;
+        }
+        return typep;
+    }
+    // Which value each element is given, positionally or by name
+    std::vector<AstNodeVhdlExpr*> byPos(elems.size(), nullptr);
+    size_t positional = 0;
+    for (AstVhdlElemAssoc* p = aggp->elemsp(); p; p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+        if (!p->choicesp()) {
+            if (positional < elems.size()) byPos[positional] = p->valuep();
+            ++positional;
+            continue;
+        }
+        for (AstNode* cp = p->choicesp(); cp; cp = cp->nextp()) {
+            AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+            const AstVhdlName* const namep
+                = chp->valuep() ? VN_CAST(chp->valuep(), VhdlName) : nullptr;
+            if (!namep) continue;
+            for (size_t i = 0; i < elems.size(); ++i) {
+                if (elems[i]->name() == namep->name()) byPos[i] = p->valuep();
+            }
+        }
+    }
+    VhdlType* outp = nullptr;
+    for (size_t i = 0; i < elems.size(); ++i) {
+        VhdlType* const elemTypep = elems[i]->typep();
+        if (!elemTypep || !byPos[i]) continue;
+        if (elemTypep->base()->kind() != VhdlTypeKind::ARRAY || !elemTypep->unconstrained()) {
+            continue;
+        }
+        VhdlType* const newTypep = constrainFromValue(elemTypep, byPos[i], flp);
+        if (newTypep == elemTypep) continue;
+        if (!outp) outp = cloneSubtype(typep, flp);
+        VhdlSymbol* const newSymp = VhdlSymTab::newSymbol(
+            VhdlSymKind::RECORD_ELEMENT, elems[i]->name(), elems[i]->declp());
+        newSymp->typep(newTypep);
+        newSymp->position(elems[i]->position());
+        outp->replaceElement(i, newSymp);
+    }
+    return outp ? outp : typep;
+}
+
 VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                              FileLine* flp) {
     if (!typep || !valuep) return typep;
+    // A record may have an element of an unconstrained array type, and that
+    // element takes its bounds from the value the object is given (5.3.3)
+    if (typep->base()->kind() == VhdlTypeKind::RECORD) {
+        return constrainRecordFromValue(typep, valuep, flp);
+    }
     if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->unconstrained()) return typep;
     // A value that is itself constrained hands over its index ranges directly
     VhdlType* const valueTypep = valuep->vhdlTypep();

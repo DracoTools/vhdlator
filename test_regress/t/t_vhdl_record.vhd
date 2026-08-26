@@ -32,6 +32,19 @@ architecture tb of t_vhdl_record is
   signal s : sample := (n => 1, r => 2.5, v => (4, 5, 6));
   constant c : sample := (7, 8.5, (1, 2, 3));
 
+  -- VHDL-2008 lets an element be an unconstrained array; the value an object
+  -- is given is then what says how long it is (5.3.3)
+  type holder is record
+    x : integer_vector;
+  end record;
+
+  function make return holder is
+  begin
+    return (x => (5, 6));
+  end function;
+
+  constant h : holder := (x => (7, 8, 9));
+
 begin
 
   process
@@ -54,6 +67,11 @@ begin
     assert t.n = 9 report "t.n" severity failure;
     assert t.v(1) = 4 report "t.v" severity failure;
     assert s.n = 1 report "s.n after copy" severity failure;
+
+    assert h.x'length = 3 report "h.x'length" severity failure;
+    assert h.x(1) = 8 report "h.x" severity failure;
+    assert make.x'length = 2 report "make.x'length" severity failure;
+    assert make.x(1) = 6 report "make.x" severity failure;
 
     report "*-* All Finished *-*";
     stop;
