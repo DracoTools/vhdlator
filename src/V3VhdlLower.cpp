@@ -1368,7 +1368,9 @@ private:
             AstNodeExpr* const elemp = defaultValueFor(basep->elementp(), flp, true);
             if (!elemp) return nullptr;
             AstNodeDType* const dtypep = lowerType(typep, flp);
-            if (VN_IS(dtypep, PackArrayDType)) {
+            // A vector of single bits comes out as a type with a range
+            // rather than an array of them, and is packed just the same
+            if (VN_IS(dtypep, PackArrayDType) || VN_IS(dtypep, BasicDType)) {
                 // Packed, so the whole array is one constant: the element's
                 // default repeated over every index, however many dimensions
                 // it has
