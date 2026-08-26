@@ -4026,6 +4026,17 @@ private:
     // single most consequential choice in this file: a clocked process must
     // become edge-triggered, or every register would be re-evaluated whenever
     // any of its inputs changed and the speed the project exists for is lost.
+    // Whether anything in these statements suspends the process
+    static bool hasWait(AstNode* nodep) {
+        bool found = false;
+        for (AstNode* p = nodep; p && !found; p = p->nextp()) {
+            p->foreach([&found](AstNode* subp) {
+                if (VN_IS(subp, VhdlWait)) found = true;
+            });
+        }
+        return found;
+    }
+
     void lowerProcess(AstVhdlProcess* nodep) {
         FileLine* const flp = nodep->fileline();
         VL_RESTORER_COPY(m_prefix);
@@ -4086,6 +4097,16 @@ private:
         }
         if (!sentreep && nodep->hasSensList()) return;  // Already reported
         if (!sentreep && !bodyp) return;
+        if (!sentreep && !hasWait(nodep->stmtsp())) {
+            // A process with no sensitivity list and no wait in it never
+            // suspends, so it has nothing to be sensitive to. Written as a
+            // process that runs when the simulation starts it does what such
+            // a process can usefully do -- run once, and stop the run -- and
+            // is not taken for combinational logic, which reading and writing
+            // its own variables would otherwise make it.
+            addStmt(new AstInitial{flp, bodyp});
+            return;
+        }
         addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, sentreep, bodyp});
     }
 

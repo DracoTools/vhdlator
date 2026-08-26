@@ -5,7 +5,9 @@
 -- SPDX-License-Identifier: CC0-1.0
 --
 -- std.textio: building a line and writing it out. The expected output is
--- byte for byte what GHDL prints for the same source.
+-- byte for byte what GHDL prints for the same source. The process has no
+-- wait at all, which is what a process that only writes and then stops the
+-- run looks like.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -42,7 +44,9 @@ begin
     writeline(output, l);
 
     report "*-* All Finished *-*";
+    -- No wait at the end: a process with no sensitivity list and nothing to
+    -- suspend on runs once and stops the simulation, which is the only thing
+    -- such a process can usefully do (11.3)
     stop;
-    wait;
   end process;
 end architecture;
