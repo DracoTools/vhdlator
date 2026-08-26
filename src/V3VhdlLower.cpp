@@ -4725,6 +4725,51 @@ private:
         return outp;
     }
 
+    // Whether any waveform of a conditional assignment schedules a
+    // transaction at a time of its own, or more than one
+    static bool anyWaveformDelay(AstVhdlSigAssign* nodep) {
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            AstVhdlWaveform* const wavesp = VN_AS(p, VhdlAlternative)->wavesp();
+            if (wavesp && (wavesp->nextp() || wavesp->afterp())) return true;
+        }
+        return false;
+    }
+
+    // The statements one waveform becomes: each element assigned at its own
+    // time, in the order written (10.5.2.2). Adds what it reads to readsp,
+    // which is what the process is sensitive to.
+    AstNode* waveformStmts(AstNodeVhdlExpr* targetp, AstVhdlWaveform* wavesp,
+                           AstNodeExpr*& readsp, FileLine* flp) {
+        AstNode* stmtsp = nullptr;
+        for (AstVhdlWaveform* p = wavesp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
+            AstNodeExpr* const onep = lowerExpr(targetp);
+            AstNodeExpr* const valuep = lowerExpr(p->valuep());
+            if (!onep || !valuep) return nullptr;
+            readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
+                            : valuep->cloneTree(false);
+            AstNode* const delayp
+                = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+            stmtsp = AstNode::addNextNull(
+                stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
+            stmtsp = AstNode::addNextNull(stmtsp,
+                                          transactionMark(targetp, delayp, true, nullptr, flp));
+        }
+        return stmtsp;
+    }
+
+    // A concurrent statement is a process that runs once at time zero and
+    // again whenever what it reads changes (11.6). Verilog's "always" with an
+    // event control does not run at time zero, so the statements are emitted
+    // twice: once to start, once to react.
+    void emitWaveformProcess(AstNode* stmtsp, AstNodeExpr* readsp, FileLine* flp) {
+        AstSenTree* const senp = readsp ? sensitivityOfExpr(readsp, flp) : nullptr;
+        if (readsp) VL_DO_DANGLING(readsp->deleteTree(), readsp);
+        if (senp) {
+            addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp->cloneTree(true)});
+        }
+        addStmt(new AstInitial{flp, stmtsp});
+    }
+
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
         // A waveform with a delay, or with more than one element, schedules
@@ -4742,31 +4787,41 @@ private:
             }
             // One process that schedules them all, in order, which is what
             // the concurrent form is defined to be (11.6)
-            AstNode* stmtsp = nullptr;
             AstNodeExpr* readsp = nullptr;
-            for (AstVhdlWaveform* p = nodep->wavesp(); p;
-                 p = VN_AS(p->nextp(), VhdlWaveform)) {
-                AstNodeExpr* const onep = lowerExpr(nodep->targetp());
-                AstNodeExpr* const valuep = lowerExpr(p->valuep());
-                if (!onep || !valuep) return;
-                readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
-                                : valuep->cloneTree(false);
-                AstNode* const delayp
-                    = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
-                stmtsp = AstNode::addNextNull(
-                    stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
-                stmtsp = AstNode::addNextNull(
-                    stmtsp, transactionMark(nodep->targetp(), delayp, true, nullptr, flp));
+            AstNode* const stmtsp = waveformStmts(nodep->targetp(), nodep->wavesp(), readsp, flp);
+            if (!stmtsp) return;
+            emitWaveformProcess(stmtsp, readsp, flp);
+            return;
+        }
+        // The same, where which waveform is scheduled depends on a condition
+        if (nodep->kind() == VhdlAssignKind::CONDITIONAL
+            && !m_drivers.count(rootSymOf(nodep->targetp())) && anyWaveformDelay(nodep)) {
+            if (!v3Global.opt.timing().isTrue()) {
+                unsup(flp, "waveform with more than one element without --timing");
+                return;
             }
-            // A concurrent statement is a process that runs once at time
-            // zero and again whenever what it reads changes (11.6). Verilog's
-            // "always" with an event control does not run at time zero, so
-            // the statements are emitted twice: once to start, once to react.
-            AstSenTree* const senp = readsp ? sensitivityOfExpr(readsp, flp) : nullptr;
-            if (readsp) VL_DO_DANGLING(readsp->deleteTree(), readsp);
-            if (senp) addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp,
-                                            stmtsp->cloneTree(true)});
-            addStmt(new AstInitial{flp, stmtsp});
+            std::vector<AstVhdlAlternative*> alts;
+            for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+                alts.push_back(VN_AS(p, VhdlAlternative));
+            }
+            AstNode* outp = nullptr;
+            AstNodeExpr* readsp = nullptr;
+            for (size_t i = alts.size(); i-- > 0;) {
+                AstNode* const bodyp
+                    = waveformStmts(nodep->targetp(), alts[i]->wavesp(), readsp, flp);
+                if (!bodyp) return;
+                if (!alts[i]->condp()) {
+                    outp = bodyp;  // The trailing "else"
+                    continue;
+                }
+                AstNodeExpr* const condp = lowerCondition(alts[i]->condp());
+                if (!condp) return;
+                readsp = readsp ? new AstConcat{flp, readsp, condp->cloneTree(false)}
+                                : condp->cloneTree(false);
+                outp = new AstIf{alts[i]->fileline(), condp, bodyp, outp};
+            }
+            if (!outp) return;
+            emitWaveformProcess(outp, readsp, flp);
             return;
         }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());

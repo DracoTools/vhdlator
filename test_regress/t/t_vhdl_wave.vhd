@@ -36,6 +36,9 @@ architecture tb of t_vhdl_wave is
   signal rst : std_logic := '1';
   signal clk : std_logic := '0';
   signal ticks : integer := 0;
+  signal gclk : std_logic := '0';
+  signal running : boolean := true;
+  signal gticks : integer := 0;
 begin
 
   -- Concurrent, three elements
@@ -49,6 +52,10 @@ begin
   -- whenever what it reads changes. This one reads itself.
   clk <= not clk after 5 ns;
 
+  -- The same, where which waveform is scheduled depends on a condition: the
+  -- gated clock every testbench stops itself with
+  gclk <= not gclk after 5 ns when running else '0';
+
   -- One port left out, one written "open"
   u1 : entity work.t_vhdl_wave_sub port map (a => d, y => y1);
   u2 : entity work.t_vhdl_wave_sub port map (a => open, b => d, y => y2);
@@ -57,6 +64,13 @@ begin
   begin
     if rising_edge(clk) and rst = '0' then
       ticks <= ticks + 1;
+    end if;
+  end process;
+
+  gcounter : process (gclk)
+  begin
+    if rising_edge(gclk) then
+      gticks <= gticks + 1;
     end if;
   end process;
 
@@ -87,6 +101,17 @@ begin
 
     wait for 68 ns;   -- 100 ns
     assert ticks = 8 report "ticks = " & integer'image(ticks) severity failure;
+
+    -- The gated clock ran alongside, and stops where it is told to
+    assert gticks = 10 report "gticks = " & integer'image(gticks) severity failure;
+    running <= false;
+    wait for 20 ns;   -- 120 ns
+    assert gclk = '0' report "the gated clock did not stop" severity failure;
+    -- How many more edges it gives before it stops depends on whether a new
+    -- waveform takes back the transaction the old one had scheduled, which
+    -- is the inertial-delay rule this model does not carry
+    assert gticks >= 10 and gticks <= 11
+      report "gticks after stopping = " & integer'image(gticks) severity failure;
 
     report "*-* All Finished *-*";
     stop;
