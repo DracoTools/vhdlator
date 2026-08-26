@@ -6075,6 +6075,22 @@ private:
             // process is suspended on an event first, and only then waits.
             return lowerWaitCond(nodep, flp);
         }
+        if (nodep->sensp() && nodep->timeoutp()) {
+            // "wait on S for T" resumes on whichever comes first (10.2), the
+            // same shape as a condition with a timeout
+            AstSenTree* const sensp = sensitivityOf(nodep->sensp(), flp);
+            AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
+            if (!sensp || !timep) {
+                if (sensp) VL_DO_DANGLING(sensp->deleteTree(), sensp);
+                if (timep) VL_DO_DANGLING(timep->deleteTree(), timep);
+                return nullptr;
+            }
+            AstFork* const forkp = new AstFork{flp, VJoinType::JOIN_ANY, ""};
+            forkp->addForksp(new AstBegin{
+                flp, "", new AstEventControl{flp, sensp, nullptr}, false});
+            forkp->addForksp(new AstBegin{flp, "", lowerTimeout(timep, flp), false});
+            return AstNode::addNext(static_cast<AstNode*>(forkp), new AstDisableFork{flp});
+        }
         if (nodep->timeoutp()) {
             AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
             return timep ? lowerTimeout(timep, flp) : nullptr;

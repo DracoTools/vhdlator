@@ -17,6 +17,8 @@ end entity;
 
 architecture tb of t_vhdl_waitfor is
   signal ack : std_logic := '0';
+  signal trig : std_logic := '0';
+  signal vec : std_logic_vector(0 to 3) := "0000";
 begin
 
   process
@@ -49,6 +51,26 @@ begin
     t0 := now;
     wait on ack until ack = '0' for 7 ns;
     assert now - t0 = 7 ns report "wait on/until/for" severity failure;
+
+    -- A sensitivity list with a timeout and no condition: whichever comes
+    -- first ends the wait
+    t0 := now;
+    wait on ack for 9 ns;
+    assert now - t0 = 9 ns report "wait on/for timeout" severity failure;
+
+    -- And where the signal changes first, it is what ends it
+    t0 := now;
+    trig <= '1' after 4 ns;
+    wait on trig for 40 ns;
+    assert now - t0 = 4 ns
+      report "wait on/for woke at " & time'image(now - t0) severity failure;
+
+    -- An element of a signal is watched on its own
+    t0 := now;
+    vec <= "0100" after 3 ns;
+    wait on vec(1) for 40 ns;
+    assert now - t0 = 3 ns
+      report "wait on an element woke at " & time'image(now - t0) severity failure;
 
     report "*-* All Finished *-*";
     stop;
