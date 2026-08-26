@@ -1999,8 +1999,15 @@ class LinkDotFindVisitor final : public VNVisitor {
                     // This is the toplevel module. Check for command line overwrites of parameters
                     // We first search if the parameter is overwritten and then replace it with a
                     // new value.
-                    if (v3Global.opt.hasParameter(nodep->name())) {
-                        const string svalue = v3Global.opt.parameter(nodep->name());
+                    // A VHDL generic is named without regard to case (IEEE
+                    // 1076-2008 15.4), and its name here has been lowered, so
+                    // the spelling on the command line is matched loosely
+                    const bool vhdl = nodep->fileline()->language().vhdl();
+                    if (vhdl ? v3Global.opt.hasParameterCaseless(nodep->name())
+                             : v3Global.opt.hasParameter(nodep->name())) {
+                        const string svalue = vhdl
+                                                  ? v3Global.opt.parameterCaseless(nodep->name())
+                                                  : v3Global.opt.parameter(nodep->name());
                         if (AstConst* const valuep
                             = AstConst::parseParamLiteral(nodep->fileline(), svalue)) {
                             UINFO(9, "       replace parameter " << nodep);

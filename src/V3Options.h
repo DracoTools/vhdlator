@@ -727,6 +727,11 @@ public:
 
     bool hasParameter(const string& name);
     string parameter(const string& name);
+    // A VHDL generic is named without regard to case (IEEE 1076-2008 15.4), so
+    // -GWIDTH and -Gwidth must both reach a generic declared as WIDTH
+    std::map<const string, string>::iterator findParameterCaseless(const string& name);
+    bool hasParameterCaseless(const string& name);
+    string parameterCaseless(const string& name);
     void checkParameters();
 
     bool isFuture(const string& flag) const;

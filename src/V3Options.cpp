@@ -347,6 +347,28 @@ string V3Options::parameter(const string& name) {
     return value;
 }
 
+// A VHDL generic is named without regard to case, so the name written on the
+// command line need not match the spelling the source used
+std::map<const std::string, std::string>::iterator V3Options::findParameterCaseless(
+    const string& name) {
+    const string lower = VString::downcase(name);
+    for (auto it = m_parameters.begin(); it != m_parameters.end(); ++it) {
+        if (VString::downcase(it->first) == lower) return it;
+    }
+    return m_parameters.end();
+}
+
+bool V3Options::hasParameterCaseless(const string& name) {
+    return findParameterCaseless(name) != m_parameters.end();
+}
+
+string V3Options::parameterCaseless(const string& name) {
+    const auto it = findParameterCaseless(name);
+    const string value = it->second;
+    m_parameters.erase(it);
+    return value;
+}
+
 void V3Options::checkParameters() {
     if (!m_parameters.empty()) {
         std::stringstream msg;

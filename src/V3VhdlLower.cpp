@@ -1170,10 +1170,17 @@ private:
                             mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
                         }
                     }
-                    addStmt(new AstAssign{
+                    AstNode* const openp = new AstAssign{
                         flp, new AstVarRef{flp, varp, VAccess::WRITE},
                         new AstFOpen{flp, namep,
-                                     new AstConst{flp, AstConst::String{}, mode}}});
+                                     new AstConst{flp, AstConst::String{}, mode}}};
+                    // A file of a subprogram is opened again on every call.
+                    // Anywhere else -- an architecture, a block, a process --
+                    // the declaration is elaborated once before the design
+                    // runs, so the open belongs in an initial rather than
+                    // loose among the module's statements, which is not a
+                    // place a statement may stand at all.
+                    addStmt(m_ftaskp ? openp : new AstInitial{flp, openp});
                 }
                 return;
             }
@@ -3441,8 +3448,34 @@ private:
         if (!firstp) return nullptr;
 
         if (name == "endfile" && args.size() == 1) {
-            AstNodeExpr* const filep = lowerExpr(args[0]);
-            return filep ? new AstFEof{flp, filep} : nullptr;
+            // ENDFILE is true when nothing more can be read (5.5.2), which is
+            // not what C's feof reports: that only becomes true once a read
+            // has already run off the end, so it would still be false with
+            // the position sitting at the end of the last line. The next
+            // character is taken and put straight back instead.
+            AstVar* const fdp = newTempVar("__Veoffd", newIntDType(flp), flp);
+            AstVar* const chp = newTempVar("__Veofc", newIntDType(flp), flp);
+            AstVar* const backp = newTempVar("__Veofu", newIntDType(flp), flp);
+            AstNode* stmtsp
+                = new AstAssign{flp, new AstVarRef{flp, fdp, VAccess::WRITE}, firstp};
+            stmtsp = AstNode::addNext(
+                stmtsp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, chp, VAccess::WRITE},
+                    new AstFGetC{flp, new AstVarRef{flp, fdp, VAccess::READ}}}));
+            stmtsp = AstNode::addNext(
+                stmtsp,
+                static_cast<AstNode*>(new AstIf{
+                    flp,
+                    new AstGteS{flp, new AstVarRef{flp, chp, VAccess::READ},
+                                new AstConst{flp, AstConst::Signed32{}, 0}},
+                    new AstAssign{flp, new AstVarRef{flp, backp, VAccess::WRITE},
+                                  new AstFUngetC{flp, new AstVarRef{flp, fdp, VAccess::READ},
+                                                 new AstVarRef{flp, chp, VAccess::READ}}},
+                    nullptr}));
+            return new AstExprStmt{flp, stmtsp,
+                                   new AstLtS{flp, new AstVarRef{flp, chp, VAccess::READ},
+                                              new AstConst{flp, AstConst::Signed32{}, 0}}};
         }
         if (name == "to_integer") {
             // The operand's bits, read with its own signedness ...
