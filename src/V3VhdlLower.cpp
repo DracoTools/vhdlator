@@ -928,18 +928,38 @@ private:
     // declared once and named -- so it is a typedef of the module, and every
     // use of the record refers to it by name.
     AstNodeDType* unpackedRecordRef(VhdlType* typep, FileLine* flp) {
-        const auto found = m_recNames.find(typep);
+        // One structure per record *type*, not per subtype of it: two values
+        // are assignment-compatible when they share a base type (5.2), so the
+        // C++ representation has to be the same one.
+        //
+        // Except where the record has an element of an unconstrained array
+        // type. Then the base says nothing about how long that element is,
+        // and each object takes its length from what constrains it (5.3.3) --
+        // so those really are different structures, and are kept apart by
+        // subtype as before.
+        // A STRING element is not one of them: it is carried as a string,
+        // which is the same member however long the value is.
+        bool openElement = false;
+        for (VhdlSymbol* const elemp : typep->base()->elements()) {
+            VhdlType* const etp = elemp->typep();
+            if (etp && etp->base()->kind() == VhdlTypeKind::ARRAY && etp->unconstrained()
+                && !isStringType(etp)) {
+                openElement = true;
+            }
+        }
+        VhdlType* const keyp = openElement ? typep : typep->base();
+        const auto found = m_recNames.find(keyp);
         if (found != m_recNames.end()) return new AstRefDType{flp, found->second};
         const std::string name
-            = "__Vrec" + std::to_string(++m_nameNum) + "__" + typep->name();
-        m_recNames.emplace(typep, name);
+            = "__Vrec" + std::to_string(++m_nameNum) + "__" + keyp->name();
+        m_recNames.emplace(keyp, name);
         AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
         structp->name(name);
         // In the one unit every design has, so that a class built for an
         // access or protected type sees the same declaration a module does
         AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
         structp->classOrPackagep(unitp);
-        for (VhdlSymbol* const elemp : typep->elements()) {
+        for (VhdlSymbol* const elemp : keyp->elements()) {
             structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
                                                     lowerType(elemp->typep(), flp), nullptr});
         }
@@ -2750,16 +2770,20 @@ private:
         if (!lhsp || !rhsp) return nullptr;
         matchVectorWidth(nodep, ltypep, rtypep, lhsp, rhsp, flp);
         const bool signd = isSignedType(ltypep) || isSignedType(rtypep);
-        const bool real = (ltypep && ltypep->base()->kind() == VhdlTypeKind::FLOATING)
-                          || (rtypep && rtypep->base()->kind() == VhdlTypeKind::FLOATING);
-        // A physical value scaled by a real is defined to be computed in real
-        // arithmetic and converted back (9.2.7), so the conversion is written
-        // out rather than left to be inferred and reported
-        const auto isRealish = [](const VhdlType* typep) {
+        // A real literal that no context has converted is still a real. "**"
+        // is the operator that shows it, being the only predefined one whose
+        // two operands have different types: "2.0 ** n" would otherwise be
+        // taken for integer arithmetic over a double.
+        const auto isRealValue = [](const VhdlType* typep) {
             return typep
                    && (typep->base()->kind() == VhdlTypeKind::FLOATING
                        || typep->base()->kind() == VhdlTypeKind::UNIVERSAL_REAL);
         };
+        const bool real = isRealValue(ltypep) || isRealValue(rtypep);
+        // A physical value scaled by a real is defined to be computed in real
+        // arithmetic and converted back (9.2.7), so the conversion is written
+        // out rather than left to be inferred and reported
+        const auto& isRealish = isRealValue;
         const auto isPhysical = [](const VhdlType* typep) {
             return typep && typep->base()->kind() == VhdlTypeKind::PHYSICAL;
         };

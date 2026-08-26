@@ -1502,6 +1502,7 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     // Record what the alias denotes, so that an alias of a type may be used
     // as a type mark and an alias of an object as an object (6.6)
     std::vector<std::string> parts;
+    std::vector<VhdlSymbol*> found;
     if (flatten(nodep->targetp(), parts) && !parts.empty()) {
         VhdlScope* scopep = m_scopep;
         bool viaScope = parts.size() > 1;
@@ -1513,7 +1514,6 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
                 scopep = nextp;
             }
         }
-        std::vector<VhdlSymbol*> found;
         if (viaScope && scopep) {
             scopep->lookupLocal(parts.back(), found);
         } else {
@@ -1573,13 +1573,14 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     bool objectAlias = !nodep->signaturep();
     if (symp->aliasp()) {
         objectAlias = objectAlias && symp->aliasp()->isObject();
-    } else {
-        // No single declaration: either an overloaded name, which is a
-        // subprogram or literal alias, or a name too complex to flatten,
-        // which is exactly the slice or element case
-        std::vector<std::string> named;
-        objectAlias = objectAlias && !flatten(nodep->targetp(), named);
+    } else if (!found.empty()) {
+        // An overloaded name: a subprogram or a literal, which denotes no
+        // value of its own
+        objectAlias = false;
     }
+    // Otherwise the target denotes no single declaration reachable by name --
+    // a record element, a slice, an indexed name -- and that is precisely the
+    // object alias of 6.6.2, so it is analyzed as the expression it is
     if (objectAlias) {
         VhdlType* const typep = analyzeExpr(nodep->targetp(), symp->typep());
         if (!symp->typep() && typep && !typep->isError()) symp->typep(typep);
@@ -3803,8 +3804,13 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
             analyzeExpr(nodep->argp(), V3VhdlStd::integerType());
         }
         if (attr == "element") {
-            return isArray && prefixTypep->base()->elementp() ? prefixTypep->base()->elementp()
-                                                              : V3VhdlStd::errorType();
+            // A subtype may constrain the element as well as the index --
+            // t(0 to 3)(7 downto 0) -- and it is that element the attribute
+            // gives, not the base type's unconstrained one (16.2.3)
+            if (!isArray) return V3VhdlStd::errorType();
+            VhdlType* const elemp = prefixTypep->elementp() ? prefixTypep->elementp()
+                                                            : prefixTypep->base()->elementp();
+            return elemp ? elemp : V3VhdlStd::errorType();
         }
         if (attr == "length") return V3VhdlStd::integerType();
         if (attr == "ascending") return V3VhdlStd::booleanType();
