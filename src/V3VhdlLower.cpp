@@ -1474,10 +1474,26 @@ private:
                 if (!totypep) return argp;
                 return new AstCast{flp, argp, VFlagChildDType{}, lowerType(totypep, flp)};
             }
-        } else if (attr == "succ" || attr == "rightof") {
+        } else if (attr == "succ") {
             if (argp) return new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
-        } else if (attr == "pred" || attr == "leftof") {
+        } else if (attr == "pred") {
             if (argp) return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        } else if (attr == "leftof" || attr == "rightof") {
+            // A step toward one end of the prefix's range, which is a step
+            // down for a range that runs the other way (16.2.3). 'SUCC and
+            // 'PRED are about the type's own order and do not turn round.
+            if (argp) {
+                const VhdlType* ptypep = nodep->prefixp()->vhdlTypep();
+                if (!ptypep && nodep->prefixp()->vhdlSymp()) {
+                    ptypep = nodep->prefixp()->vhdlSymp()->typep();
+                }
+                const bool ascending = !ptypep || ptypep->ascending();
+                if ((attr == "rightof") == ascending) {
+                    return new AstAdd{flp, argp,
+                                      new AstConst{flp, AstConst::Signed32{}, 1}};
+                }
+                return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+            }
         }
         // The name attributes are about the name, which is always known here
         // even when the analyzer could not fold them -- the prefix may be a

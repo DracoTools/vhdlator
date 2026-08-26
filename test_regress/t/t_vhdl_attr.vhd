@@ -28,6 +28,8 @@ architecture tb of t_vhdl_attr is
   signal b : bit := '0';
   signal k : boolean := false;
   signal bseen, kseen : integer := 0;
+  type down is range 10 downto 0;
+
 begin
 
   -- A process with a sensitivity list, which is not a clocked one
@@ -90,6 +92,19 @@ begin
     assert seen = 2 report "seen later" severity failure;
     assert bseen = 1 report "rising_edge of a bit" severity failure;
     assert kseen = 1 report "falling_edge of a boolean" severity failure;
+
+    -- 'SUCC and 'PRED are about the type's own order; 'LEFTOF and 'RIGHTOF
+    -- are about the range's, and turn round with it (16.2.3)
+    assert integer'succ(4) = 5 report "succ" severity failure;
+    assert integer'pred(4) = 3 report "pred" severity failure;
+    assert integer'leftof(4) = 3 report "leftof of an ascending range" severity failure;
+    assert integer'rightof(4) = 5 report "rightof of an ascending range" severity failure;
+    assert down'succ(4) = 5 report "succ of a descending range" severity failure;
+    assert down'pred(4) = 3 report "pred of a descending range" severity failure;
+    assert down'leftof(4) = 5 report "leftof of a descending range" severity failure;
+    assert down'rightof(4) = 3 report "rightof of a descending range" severity failure;
+    assert down'left = 10 and down'right = 0 report "descending bounds" severity failure;
+    assert not down'ascending report "descending" severity failure;
 
     report "*-* All Finished *-*";
     stop;
