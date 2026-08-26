@@ -22,6 +22,27 @@ architecture tb of t_vhdl_alias is
 
   -- An alias may number its elements its own way (6.6.2)
   alias hi    : std_logic_vector(3 downto 0) is v(7 downto 4);
+
+  -- An alias of an overloaded subprogram picks one of its declarations by
+  -- signature (4.5.3, 6.6.2), and a subprogram every one of whose parameters
+  -- has a default may be called by naming it (4.2.2.1)
+  procedure bump(a : integer; b : out integer) is
+  begin
+    b := a + 1;
+  end procedure;
+  procedure bump(a : real; b : out real) is
+  begin
+    b := a + 1.0;
+  end procedure;
+  function twice(a : integer) return integer is
+  begin
+    return a * 2;
+  end function;
+  alias bump_int is bump[integer, integer];
+  alias bump_real is bump[real, real];
+  alias twice_int is twice[integer return integer];
+
+
   alias lo    : std_logic_vector(0 to 3)     is v(3 downto 0);
 
   signal n : integer := 42;
@@ -34,6 +55,13 @@ begin
 
   process
     variable s : st;
+    variable ai : integer;
+    variable ar : real;
+    variable counted : integer := 0;
+    procedure tick(n : integer := 1) is
+    begin
+      counted := counted + n;
+    end procedure;
   begin
     assert whole = "10110001" report "whole" severity failure;
     assert top = "1011" report "top" severity failure;
@@ -43,6 +71,14 @@ begin
     -- hi(0) is v(4) and lo(0) is v(3), whichever way each range runs
     assert hi = "1011" report "hi" severity failure;
     assert hi(3) = '1' and hi(0) = '1' and hi(2) = '0' report "hi element" severity failure;
+    bump_int(1, ai);
+    assert ai = 2 report "alias by signature, integer" severity failure;
+    bump_real(1.0, ar);
+    assert ar = 2.0 report "alias by signature, real" severity failure;
+    assert twice_int(3) = 6 report "alias of a function by signature" severity failure;
+    tick;
+    tick(4);
+    assert counted = 5 report "call with every parameter defaulted" severity failure;
     assert lo(0) = '0' and lo(3) = '1' report "lo element" severity failure;
     assert lo(1 to 2) = "00" report "lo slice" severity failure;
 

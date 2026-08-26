@@ -994,6 +994,7 @@ private:
     VhdlType* constrainRecordFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                       FileLine* flp) VL_MT_DISABLED;
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
+    static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
@@ -1104,9 +1105,14 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
             nodep->vhdlSymp(declp);
             declp->typep()->bodyp(protp);
             VL_RESTORER(m_scopep);
-            // What is visible where the body is written is visible inside it:
-            // the body may be in a package body, and name what that declares
+            // What is visible where the body is written is visible inside
+            // it: the body's region is nested in that one (12.1), so it sees
+            // what that region declares and also what a use clause there has
+            // made visible -- potential visibility does not chain on its own
             declp->typep()->scopep()->addUse(m_scopep);
+            for (VhdlScope* const usedp : m_scopep->uses()) {
+                declp->typep()->scopep()->addUse(usedp);
+            }
             m_scopep = declp->typep()->scopep();
             iterateAndNextNull(protp->declsp());
             return;
@@ -1459,11 +1465,51 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         } else {
             lookup(parts.back(), found);
         }
+        // "alias r is p[real, real]": a signature says which of an overloaded
+        // name's declarations the alias denotes (4.5.3, 6.6.2)
+        if (nodep->signaturep() && found.size() > 1) {
+            std::vector<VhdlType*> wantParams;
+            for (AstNode* p = nodep->signaturep()->paramTypesp(); p; p = p->nextp()) {
+                wantParams.push_back(resolveTypeMark(VN_AS(p, NodeVhdlExpr)));
+            }
+            VhdlType* const wantReturnp
+                = nodep->signaturep()->returnTypep()
+                      ? resolveTypeMark(nodep->signaturep()->returnTypep())
+                      : nullptr;
+            std::vector<VhdlSymbol*> matched;
+            for (VhdlSymbol* const candp : found) {
+                if (candp->paramTypes().size() != wantParams.size()) continue;
+                bool ok = true;
+                for (size_t i = 0; i < wantParams.size() && ok; ++i) {
+                    const VhdlType* const havep = candp->paramTypes()[i];
+                    if (!havep || !wantParams[i] || havep->base() != wantParams[i]->base()) {
+                        ok = false;
+                    }
+                }
+                if (ok && wantReturnp) {
+                    ok = candp->returnTypep()
+                         && candp->returnTypep()->base() == wantReturnp->base();
+                } else if (ok && !wantReturnp) {
+                    ok = !candp->returnTypep();  // A procedure has no result
+                }
+                if (ok) matched.push_back(candp);
+            }
+            if (matched.size() == 1) found.swap(matched);
+        }
         // An overloaded name aliases every one of its declarations at once,
         // so only an unambiguous target is worth recording here
         if (found.size() == 1) {
             symp->aliasp(found[0]);
             if (!symp->typep() && found[0]->typep()) symp->typep(found[0]->typep());
+            // An alias of a subprogram is called like one, so it carries the
+            // same profile: what it takes and what it gives back
+            if (found[0]->isOverloadable()) {
+                for (size_t i = 0; i < found[0]->paramTypes().size(); ++i) {
+                    symp->addParam(found[0]->paramName(i), found[0]->paramTypes()[i],
+                                   found[0]->paramHasDefault(i));
+                }
+                if (found[0]->returnTypep()) symp->returnTypep(found[0]->returnTypep());
+            }
         }
     }
     // An alias of an object denotes a name that may be a slice or an element,
@@ -3221,7 +3267,12 @@ VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
     std::vector<VhdlSymbol*> objects;
     std::vector<VhdlSymbol*> callables;
     for (VhdlSymbol* const symp : found) {
-        if (symp->isOverloadable() && !symp->paramTypes().empty()) continue;  // Needs arguments
+        // A subprogram every one of whose parameters has a default may be
+        // called by naming it, with no parentheses at all (4.2.2.1)
+        if (symp->isOverloadable() && !symp->paramTypes().empty()
+            && !allParamsDefaulted(symp)) {
+            continue;
+        }
         if (symp->isOverloadable()) {
             callables.push_back(symp);
         } else {
@@ -3237,6 +3288,26 @@ VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
         return V3VhdlStd::errorType();
     }
     return pick(nodep, callables, wantp, "declaration of '" + nodep->name() + "'");
+}
+
+// Whether every parameter of a subprogram has a default value, so that it
+// may be called with no arguments at all (4.2.2.1)
+bool VhdlSemVisitor::allParamsDefaulted(const VhdlSymbol* symp) {
+    const AstVhdlSubprogDecl* const declp
+        = symp->declp() ? VN_CAST(symp->declp(), VhdlSubprogDecl) : nullptr;
+    if (!declp) return false;
+    int seen = 0;
+    int skip = declp->genericCount();
+    for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+        const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+        if (skip > 0) {
+            --skip;
+            continue;
+        }
+        if (!ifp->defaultp()) return false;
+        ++seen;
+    }
+    return seen == static_cast<int>(symp->paramTypes().size());
 }
 
 VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp) {
@@ -3856,7 +3927,15 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
 
     // An object prefix makes it an indexed name or a slice (8.4, 8.5)
     for (VhdlSymbol* const symp : found) {
-        if (!symp->isObject() && symp->kind() != VhdlSymKind::ALIAS) continue;
+        // An alias of an object is indexed like the object; an alias of a
+        // subprogram is a call, which the search below settles
+        if (!symp->isObject()) {
+            if (symp->kind() != VhdlSymKind::ALIAS) continue;
+            const VhdlSymKind rootKind = symp->resolved()->kind();
+            if (rootKind == VhdlSymKind::FUNCTION || rootKind == VhdlSymKind::PROCEDURE) {
+                continue;
+            }
+        }
         VhdlType* typep = symp->typep();
         if (typep && typep->kind() == VhdlTypeKind::ACCESS) typep = typep->designatedp();
         if (!typep || typep->kind() != VhdlTypeKind::ARRAY) continue;
@@ -3897,9 +3976,9 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     std::vector<int> formalOf;
     int best = -1;
     for (VhdlSymbol* const symp : found) {
-        if (symp->kind() != VhdlSymKind::FUNCTION && symp->kind() != VhdlSymKind::PROCEDURE) {
-            continue;
-        }
+        // An alias of a subprogram is called like the subprogram it names
+        const VhdlSymKind kind = symp->resolved()->kind();
+        if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
         if (!bindActuals(symp, assocs, formalOf)) continue;
         bool ok = true;
         int score = 0;

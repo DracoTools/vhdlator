@@ -2319,8 +2319,15 @@ private:
         VhdlSymbol* const objSymp = nodep->vhdlSymp();
         const VhdlType* const prefixTypep
             = nodep->prefixp() ? nodep->prefixp()->vhdlTypep() : nullptr;
+        // An alias of an object is indexed like the object; an alias of a
+        // subprogram is a call
+        const bool aliasOfSubprogram
+            = objSymp && objSymp->kind() == VhdlSymKind::ALIAS
+              && (objSymp->resolved()->kind() == VhdlSymKind::FUNCTION
+                  || objSymp->resolved()->kind() == VhdlSymKind::PROCEDURE);
         const bool indexing
-            = (objSymp && (objSymp->isObject() || objSymp->kind() == VhdlSymKind::ALIAS))
+            = (objSymp && !aliasOfSubprogram
+               && (objSymp->isObject() || objSymp->kind() == VhdlSymKind::ALIAS))
               || (!objSymp && prefixTypep
                   && (prefixTypep->base()->kind() == VhdlTypeKind::ARRAY
                       || prefixTypep->base()->kind() == VhdlTypeKind::ACCESS));
@@ -4766,7 +4773,9 @@ private:
         FileLine* const flp = nodep->fileline();
         AstVhdlCall* const callp = VN_CAST(nodep->callp(), VhdlCall);
         AstNodeVhdlExpr* const namep = callp ? callp->prefixp() : nodep->callp();
-        VhdlSymbol* const symp = callp ? callp->vhdlSymp() : nodep->callp()->vhdlSymp();
+        // An alias denotes the procedure it was declared for (6.6.1)
+        VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nodep->callp()->vhdlSymp();
+        VhdlSymbol* const symp = namedp ? namedp->resolved() : nullptr;
         // std.env's control procedures are the simulator, not VHDL (16.5).
         // Both end the run here: STOP means "suspend", which only an
         // interactive simulator can offer.

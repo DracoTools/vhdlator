@@ -492,8 +492,15 @@ private:
         if (!prefixp) return nullptr;
         VhdlSymbol* const symp = prefixp->vhdlSymp();
         if (symp && symp->kind() == VhdlSymKind::TYPE) return symp->typep();
+        // An indexed or selected name denotes a part of the object, not the
+        // whole of it, and carries the symbol of the object it is part of --
+        // so "a(0)'length" is the length of an element, not of a. The
+        // expression's own type is the one the attribute asks about.
+        if (VhdlType* const exprp = prefixp->vhdlTypep()) {
+            if (!exprp->isError()) return exprp;
+        }
         if (symp && symp->typep()) return symp->typep();
-        return prefixp->vhdlTypep();
+        return nullptr;
     }
 
     // The index type an array attribute asks about, honouring the optional
