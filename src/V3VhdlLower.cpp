@@ -3045,8 +3045,6 @@ private:
             VhdlSymbol* const symp = ifp->vhdlSymp();
             if (!symp) continue;
             FileLine* const flp = ifp->fileline();
-            AstVar* const varp = newVar(symp, VVarType::VAR, flp);
-            addStmt(varp);
             AstNodeVhdlExpr* actualp = nullptr;
             for (size_t i = 0; i < assocs.size(); ++i) {
                 const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
@@ -3058,11 +3056,31 @@ private:
             // "open", written out or left out, means the port takes its own
             // default and is wired to nothing (6.5.7.1)
             if (!actualp || VN_IS(actualp, VhdlOpen)) {
+                AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+                addStmt(varp);
                 if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
                 continue;
             }
+            // The actual is looked at before the formal has a variable, so
+            // that a formal of the same name cannot stand in for it
             AstNodeExpr* const valuep = lowerExpr(actualp);
-            if (!valuep) continue;
+            if (!valuep) {
+                addStmt(newVar(symp, VVarType::VAR, flp));
+                continue;
+            }
+            // A port mapped to a signal of the design is another name for
+            // that signal (11.2): a block is elaborated where it stands, so
+            // there is nothing between the two, and a port of mode "inout"
+            // or "buffer" has to write the signal itself rather than a copy
+            if (!isGeneric) {
+                if (AstVarRef* const refp = VN_CAST(valuep, VarRef)) {
+                    m_vars.emplace(symp, refp->varp());
+                    VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                    continue;
+                }
+            }
+            AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+            addStmt(varp);
             if (isGeneric) {
                 varp->valuep(valuep);
                 continue;

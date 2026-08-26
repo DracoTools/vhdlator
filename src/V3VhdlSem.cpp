@@ -1737,13 +1737,21 @@ void VhdlSemVisitor::constrainBlockPorts(AstVhdlBlockHeader* nodep) {
     for (AstNode* p = nodep->portsp(); p; p = p->nextp(), ++position) {
         AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
         VhdlSymbol* const symp = ifp->vhdlSymp();
-        if (!symp || !symp->typep() || !symp->typep()->unconstrained()) continue;
+        if (!symp || !symp->typep()) continue;
+        // A record with an element of an unconstrained array type is open
+        // too, though its own index constraint says nothing (5.3.3)
+        const VhdlType* const declp = symp->typep();
+        const bool isRecord = declp->base()->kind() == VhdlTypeKind::RECORD;
+        if (!declp->unconstrained() && !(isRecord && !fullyConstrainedRecord(declp))) continue;
         for (size_t i = 0; i < assocs.size(); ++i) {
             const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
             if (namep ? namep->name() != symp->name() : i != position) continue;
             if (!assocs[i]->actualp() || VN_IS(assocs[i]->actualp(), VhdlOpen)) break;
             VhdlType* const actualp = assocs[i]->actualp()->vhdlTypep();
-            if (actualp && !actualp->unconstrained()) symp->typep(actualp);
+            if (!actualp) break;
+            if (isRecord ? fullyConstrainedRecord(actualp) : !actualp->unconstrained()) {
+                symp->typep(actualp);
+            }
             break;
         }
     }

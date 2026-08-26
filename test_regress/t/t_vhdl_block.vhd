@@ -17,11 +17,15 @@ entity t_vhdl_block is
 end entity;
 
 architecture sim of t_vhdl_block is
+  type rec_t is record
+    f : integer_vector;
+  end record;
   signal x, y, z : integer;
   signal en : std_logic := '0';
   signal d : std_logic_vector(3 downto 0) := "0001";
   signal q : std_logic_vector(3 downto 0) := "0000";
   signal g : boolean := false;
+  signal r : rec_t(f(1 to 3)) := (f => (others => -1));
 begin
 
   latch : block (en = '1') is
@@ -39,6 +43,15 @@ begin
     o <= i * factor;
   end block;
 
+  -- A port of mode "inout" is another name for the signal it is mapped to,
+  -- and a record port takes the constraint of that signal (11.2, 5.3.3)
+  paired : block is
+    port (p : inout rec_t);
+    port map (p => r);
+  begin
+    p <= (f => (1, 2, 3));
+  end block;
+
   -- A plain block is just a declarative region
   plain : block is
     signal t : integer;
@@ -53,6 +66,7 @@ begin
     wait for 1 ns;
     assert y = 5 report "block port or generic is wrong" severity failure;
     assert z = 6 report "plain block is wrong" severity failure;
+    assert r.f = (1, 2, 3) report "inout block port did not drive" severity failure;
     x <= 10;
     wait for 1 ns;
     assert y = 50 report "block did not follow its input" severity failure;
