@@ -1,0 +1,9 @@
+%Error: t/t_param_func_display_bad.v:14:23: Expecting expression to be constant, but can't determine constant for FUNCREF 'f'
+                                          : ... note: In instance 't'
+        t/t_param_func_display_bad.v:11:44: ... Location of non-constant TIME: Isn't predictable
+        t/t_param_func_display_bad.v:14:23: ... Called from 'f()' with parameters:
+           x = ?32?h1
+   14 |    localparam int P = f(1);
+      |                       ^
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

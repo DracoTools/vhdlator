@@ -1331,6 +1331,10 @@ private:
         // functions and we want them to work if used with parameters
         checkNodeInfo(nodep, /*display:*/ true);
         iterateChildrenConst(nodep);
+        // A format whose arguments were not all constant leaves the
+        // AstSFormatF without a value, and asking for one then trips an
+        // assertion. Every VHDL report passes $time, so it is reached often.
+        if (!optimizable()) return;
         if (m_params) {
             const AstConst* const textp = fetchConst(nodep->fmtp());
             switch (nodep->displayType()) {
