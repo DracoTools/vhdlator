@@ -2730,11 +2730,19 @@ void VhdlSemVisitor::specializeResolvers() {
         VhdlScope* const regionp = resolvep->innerp() ? resolvep->innerp()->parentp() : nullptr;
         if (!bodyp || !regionp) continue;  // Predefined, as ieee's own is
         if (!bodyp->backp()) continue;  // Not in the tree, so nothing to copy beside
-        // The drivers as an array indexed from zero
+        // The drivers as an array starting where the parameter's own index
+        // subtype starts: a function written against "array (positive range
+        // <>)" is entitled to find its first driver at 1, and one written
+        // against NATURAL at 0 (5.2.1)
         VhdlType* const argp = cloneSubtype(paramp->base(), need.flp);
-        VhdlType* const idxp = VhdlSymTab::newType(VhdlTypeKind::INTEGER, "", need.flp);
-        idxp->base(V3VhdlStd::integerType()->base());
-        idxp->setBounds(0, need.count - 1, true);
+        const std::vector<VhdlType*>& baseIdx = paramp->base()->indexTypes();
+        VhdlType* const baseIdxp = baseIdx.empty() ? nullptr : baseIdx[0];
+        const bool asc = !baseIdxp || baseIdxp->ascending();
+        const int64_t left = (baseIdxp && baseIdxp->bounded()) ? baseIdxp->left() : 0;
+        VhdlType* const idxp = VhdlSymTab::newType(
+            baseIdxp ? baseIdxp->kind() : VhdlTypeKind::INTEGER, "", need.flp);
+        idxp->base(baseIdxp ? baseIdxp->base() : V3VhdlStd::integerType()->base());
+        idxp->setBounds(left, asc ? left + need.count - 1 : left - need.count + 1, asc);
         argp->clearIndexTypes();
         argp->addIndexType(idxp);
         argp->unconstrained(false);

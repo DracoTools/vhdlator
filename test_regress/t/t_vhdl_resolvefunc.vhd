@@ -38,6 +38,19 @@ architecture tb of t_vhdl_resolvefunc is
   subtype res_t is strongest level_t;
 
   -- The sum of the drivers, which is not a value any one of them has
+  -- The array a resolution function is given starts where its own index
+  -- subtype starts, so one written against POSITIVE finds its first driver
+  -- at 1 and one written against NATURAL at 0 (5.2.1)
+  type pos_vec is array (positive range <>) of integer;
+  function firstOf (v : pos_vec) return integer is
+  begin
+    assert v'left = 1 report "resolver array left" severity failure;
+    assert v'right = v'length report "resolver array right" severity failure;
+    return v(v'left);
+  end function;
+  subtype first_t is firstOf integer;
+  signal fst : first_t := 0;
+
   type int_vec is array (natural range <>) of integer;
   function total (v : int_vec) return integer is
     variable acc : integer := 0;
@@ -57,6 +70,10 @@ architecture tb of t_vhdl_resolvefunc is
   signal one : sum_t := 0;
 
 begin
+
+  -- Two drivers on fst, so its resolver is given an array of two
+  fst <= 11;
+  fst <= 22;
 
   a : process is
   begin
@@ -91,6 +108,7 @@ begin
     assert n = 0 report "sum before anything drives" severity failure;
 
     wait for 1500 ps;
+    assert fst = 11 report "positive-indexed resolver" severity failure;
     assert s = low report "one driver away from idle" severity failure;
     assert n = 10 report "one contributing driver" severity failure;
 
