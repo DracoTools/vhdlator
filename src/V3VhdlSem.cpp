@@ -1777,6 +1777,15 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
         // A block is elaborated where it stands, so a port left unconstrained
         // simply takes the subtype of the one actual it is ever given
         constrainBlockPorts(nodep->headerp());
+        // A conversion written on the formal converts what the port drives
+        // on its way out to the actual (6.5.7.1). It names the port, which
+        // is declared here, so it is analyzed once that has happened.
+        for (AstNode* p = nodep->headerp()->portMapp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (asp->formalp() && !VN_IS(asp->formalp(), VhdlName)) {
+                analyzeExpr(asp->formalp(), nullptr);
+            }
+        }
     }
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
@@ -1801,6 +1810,26 @@ void VhdlSemVisitor::constrainBlockPorts(AstVhdlBlockHeader* nodep) {
         if (!declp->unconstrained() && !(isRecord && !fullyConstrainedRecord(declp))) continue;
         for (size_t i = 0; i < assocs.size(); ++i) {
             const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
+            // A conversion written on the formal means the actual's subtype
+            // is not the port's: what the port drives goes through the
+            // conversion on its way there (6.5.7.1). A conversion is
+            // element by element, so the port is as long as the actual --
+            // which is all an unconstrained port needs to know.
+            if (assocs[i]->formalp() && !namep) {
+                if (i != position || isRecord) continue;
+                VhdlType* const fromp
+                    = assocs[i]->actualp() ? assocs[i]->actualp()->vhdlTypep() : nullptr;
+                if (!fromp || !fromp->isConstrainedArray() || fromp->indexTypes().size() != 1
+                    || declp->indexTypes().size() != 1) {
+                    continue;
+                }
+                VhdlType* const portTypep = cloneSubtype(symp->typep(), ifp->fileline());
+                portTypep->clearIndexTypes();
+                portTypep->addIndexType(fromp->indexTypes()[0]);
+                portTypep->unconstrained(false);
+                symp->typep(portTypep);
+                break;
+            }
             if (namep ? namep->name() != symp->name() : i != position) continue;
             if (!assocs[i]->actualp() || VN_IS(assocs[i]->actualp(), VhdlOpen)) break;
             VhdlType* const actualp = assocs[i]->actualp()->vhdlTypep();

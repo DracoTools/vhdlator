@@ -3966,6 +3966,32 @@ private:
         lowerBlockInterface(nodep->genericsp(), nodep->genericMapp(), true);
         lowerBlockInterface(nodep->portsp(), nodep->portMapp(), false);
     }
+    // Whether an expression names something that can be assigned to
+    static bool isAssignable(const AstNodeExpr* nodep) {
+        if (VN_IS(nodep, VarRef)) return true;
+        if (const AstMemberSel* const memp = VN_CAST(nodep, MemberSel)) {
+            return isAssignable(memp->fromp());
+        }
+        if (const AstStructSel* const strp = VN_CAST(nodep, StructSel)) {
+            return isAssignable(strp->fromp());
+        }
+        if (const AstSelBit* const bitp = VN_CAST(nodep, SelBit)) {
+            return isAssignable(bitp->fromp());
+        }
+        if (const AstSelExtract* const extp = VN_CAST(nodep, SelExtract)) {
+            return isAssignable(extp->fromp());
+        }
+        return false;
+    }
+
+    // The name a conversion on a formal is applied to, as in "f(p) => a"
+    static std::string formalNamed(AstNode* argsp) {
+        AstVhdlAssoc* const asp = VN_CAST(argsp, VhdlAssoc);
+        if (!asp || asp->nextp()) return "";
+        const AstVhdlName* const namep = VN_CAST(asp->actualp(), VhdlName);
+        return namep ? namep->name() : "";
+    }
+
     void lowerBlockInterface(AstNode* formalsp, AstNode* mapp, bool isGeneric) {
         // The actual for each formal, by position or by name
         std::vector<AstVhdlAssoc*> assocs;
@@ -3977,11 +4003,44 @@ private:
             if (!symp) continue;
             FileLine* const flp = ifp->fileline();
             AstNodeVhdlExpr* actualp = nullptr;
+            AstNodeVhdlExpr* outConvp = nullptr;  // "f(port) => actual" (6.5.7.1)
             for (size_t i = 0; i < assocs.size(); ++i) {
                 const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
-                if (namep ? namep->name() == symp->name() : i == position) {
+                AstVhdlCall* const convp = VN_CAST(assocs[i]->formalp(), VhdlCall);
+                const AstVhdlName* const convNamep
+                    = convp ? VN_CAST(convp->prefixp(), VhdlName) : nullptr;
+                const bool byName = namep && namep->name() == symp->name();
+                const bool byConv = convNamep && convNamep->name() != symp->name()
+                                    && formalNamed(convp->argsp()) == symp->name();
+                if (byName || byConv || (!namep && !convp && i == position)) {
                     actualp = assocs[i]->actualp();
+                    if (byConv) outConvp = assocs[i]->formalp();
                     break;
+                }
+            }
+            // A conversion written on the formal converts what the port
+            // drives on its way out to the actual (6.5.7.1): the port is a
+            // signal of its own, and the actual follows the conversion of it
+            if (outConvp) {
+                AstNodeExpr* const targetp = lowerExpr(actualp);
+                // The actual has to be something that can be assigned. Where
+                // it is itself a conversion -- a conversion written on both
+                // sides -- there is nothing to drive, and the association is
+                // left to be bound the ordinary way.
+                if (targetp && !isAssignable(targetp)) {
+                    VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                    outConvp = nullptr;
+                } else {
+                    AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+                    addStmt(varp);
+                    AstNodeExpr* const convValuep = lowerExpr(outConvp);
+                    if (!targetp || !convValuep) {
+                        if (targetp) VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                        if (convValuep) VL_DO_DANGLING(convValuep->deleteTree(), convValuep);
+                        continue;
+                    }
+                    addStmt(new AstAlways{new AstAssignW{flp, targetp, convValuep}});
+                    continue;
                 }
             }
             // "open", written out or left out, means the port takes its own

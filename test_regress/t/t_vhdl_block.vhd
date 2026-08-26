@@ -26,12 +26,45 @@ architecture sim of t_vhdl_block is
   signal q : std_logic_vector(3 downto 0) := "0000";
   signal g : boolean := false;
   signal r : rec_t(f(1 to 3)) := (f => (others => -1));
+  signal bv : bit_vector(3 downto 0) := "0000";
+  signal nones : integer := 0;
+
+  function to_bit (v : boolean) return bit is
+  begin
+    if v then return '1'; else return '0'; end if;
+  end function;
+
+  function ones (v : bit_vector) return integer is
+    variable n : integer := 0;
+  begin
+    for i in v'range loop
+      if v(i) = '1' then n := n + 1; end if;
+    end loop;
+    return n;
+  end function;
 begin
 
   latch : block (en = '1') is
   begin
     q <= guarded d;
     g <= GUARD;                     -- the guard is a signal of the block
+  end block;
+
+  -- A conversion written on the actual converts what reaches the port, and
+  -- one written on the formal converts what the port drives on its way out
+  -- (6.5.7.1)
+  converted : block is
+    port (bp : in bit; bo : out bit_vector(3 downto 0));
+    port map (bp => to_bit(x > 0), bo => bv);
+  begin
+    bo <= "1111" when bp = '1' else "0000";
+  end block;
+
+  counted : block is
+    port (cp : out bit_vector(3 downto 0));
+    port map (ones(cp) => nones);
+  begin
+    cp <= bv;
   end block;
 
   scaled : block is
@@ -85,6 +118,12 @@ begin
     d <= "0110";
     wait for 1 ns;
     assert q = "1010" report "guarded assignment did not hold" severity failure;
+
+    -- x was set above, so the conversion on the actual made bp '1', and the
+    -- conversion on the formal counted the bits the block drove
+    assert bv = "1111" report "conversion on the actual" severity failure;
+    assert nones = 4 report "conversion on the formal, got " & integer'image(nones)
+      severity failure;
 
     report "*-* All Finished *-*";
     stop;
