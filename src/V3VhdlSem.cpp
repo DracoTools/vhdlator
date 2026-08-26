@@ -3792,7 +3792,11 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
         return wantp ? wantp : V3VhdlStd::errorType();
     }
     if (wantp->kind() == VhdlTypeKind::ARRAY) {
-        VhdlType* elemTypep = wantp->base()->elementp();
+        // A subtype may constrain the element as well as the index --
+        // "t(0 to 3)(7 downto 0)" -- and it is that element the aggregate's
+        // own elements have (5.3.3)
+        VhdlType* elemTypep
+            = wantp->elementp() ? wantp->elementp() : wantp->base()->elementp();
         if (wantp->base()->dimensions() > 1) {
             // In a multidimensional aggregate each element is itself an
             // aggregate covering the remaining dimensions (9.3.3.3), so hand
@@ -4233,7 +4237,9 @@ VhdlType* VhdlSemVisitor::analyzeIndexedName(AstVhdlCall* nodep, VhdlType* array
                                    + arrayp->prettyName() + ", but " + std::to_string(dim)
                                    + " were given");
     }
-    return arrayp->base()->elementp();
+    // A subtype may constrain the element as well as the index --
+    // "t(0 to 3)(7 downto 0)" -- and it is that element an index gives (5.3.3)
+    return arrayp->elementp() ? arrayp->elementp() : arrayp->base()->elementp();
 }
 
 // A slice is of the array's type, constrained by the slice's own range, which

@@ -18,6 +18,7 @@ architecture tb of t_vhdl_array is
   -- The element is unconstrained until the subtype says otherwise
   type int_grid is array (natural range <>) of integer_vector;
   subtype pair_list is int_grid(1 to 3)(1 to 2);
+  type slv_grid is array (natural range <>) of bit_vector;
 
   constant grid : pair_list := ((1, 2), (3, 4), (5, 6));
 
@@ -63,6 +64,7 @@ begin
     variable lo, hi : bits(0 to 1);
     variable bv : bit_vector(1 to 4) := "1101";
     variable nofs : freqs(3 to 1);
+    variable ragged : slv_grid(0 to 2)(7 downto 0) := (others => (others => '0'));
   begin
     -- An aggregate may stand on the left of an assignment: each name takes
     -- the element of the value in its own position (10.6.2)
@@ -96,6 +98,13 @@ begin
     assert maximum(fs) = 10 ns report "maximum over an array" severity failure;
     assert minimum(nofs) = time'high report "minimum over a null array" severity failure;
     assert maximum(nofs) = time'low report "maximum over a null array" severity failure;
+    -- A subtype may constrain the element as well as the index, so an index
+    -- into it gives the constrained element (5.3.3)
+    assert ragged(1)'length = 8 report "element constraint length" severity failure;
+    ragged(1) := "10101010";
+    assert ragged(1) = "10101010" report "element constraint value" severity failure;
+    assert ragged(0) = "00000000" report "element constraint default" severity failure;
+
     report "*-* All Finished *-*";
     stop;
   end process;
