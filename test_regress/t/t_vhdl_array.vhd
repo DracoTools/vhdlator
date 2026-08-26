@@ -28,6 +28,12 @@ architecture tb of t_vhdl_array is
 
   constant n : nibble := "1011";
 
+  -- A choice may be given a value of the aggregate's own type, which then
+  -- covers that whole run of indices rather than one of them (9.3.3.3)
+  constant twelve : bits(0 to 1) := "10";
+  constant run : bits(0 to 3) := (0 to 1 => twelve, 2 => '1', 3 => '0');
+  constant srun : string(1 to 8) := (1 to 5 => "abcde", others => 'z');
+
   -- MINIMUM and MAXIMUM answer for a whole array of any scalar element, and
   -- for a null one they give the element type's limit at the other end
   type freqs is array (natural range <>) of time;
@@ -82,6 +88,9 @@ begin
     assert m(1, 2) = 8 report "m(1,2)" severity failure;
 
     assert flip(bv) = "1011" report "reverse_range" severity failure;
+
+    assert run = "1010" report "run of elements in an aggregate" severity failure;
+    assert srun = "abcdezzz" report "run of characters" severity failure;
 
     assert minimum(fs) = 1 ns report "minimum over an array" severity failure;
     assert maximum(fs) = 10 ns report "maximum over an array" severity failure;

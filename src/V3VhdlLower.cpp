@@ -2695,8 +2695,13 @@ private:
             unsup(flp, "aggregate of this size");
             return nullptr;
         }
-        // Which element association gives each index
+        // Which element association gives each index. A value of the
+        // aggregate's own type covers a whole run of them rather than one,
+        // which VHDL-2008 allows for a choice as well as for a positional
+        // association (9.3.3.3); the run is recorded at its first index and
+        // the rest are marked as spoken for.
         std::vector<AstNodeVhdlExpr*> byIndex(static_cast<size_t>(count), nullptr);
+        std::vector<int64_t> spanAt(static_cast<size_t>(count), 1);
         AstNodeVhdlExpr* othersp = nullptr;
         int64_t positional = 0;
         for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
@@ -2733,6 +2738,23 @@ private:
                     }
                     lo = hi = v.toInt();
                 }
+                const bool wholeRun
+                    = eap->valuep() && eap->valuep()->vhdlTypep()
+                      && eap->valuep()->vhdlTypep()->base() == typep->base();
+                if (wholeRun) {
+                    // "11 downto 0 => t" puts the whole of t across those
+                    // indices, so it is one value spanning them all
+                    const int64_t first = ((step > 0 ? lo : hi) - left) * step;
+                    const int64_t span = hi - lo + 1;
+                    if (first >= 0 && first + span <= count) {
+                        byIndex[static_cast<size_t>(first)] = eap->valuep();
+                        spanAt[static_cast<size_t>(first)] = span;
+                        for (int64_t k = 1; k < span; ++k) {
+                            spanAt[static_cast<size_t>(first + k)] = 0;
+                        }
+                    }
+                    continue;
+                }
                 for (int64_t index = lo; index <= hi; ++index) {
                     const int64_t slot = (index - left) * step;
                     if (slot >= 0 && slot < count) {
@@ -2750,10 +2772,15 @@ private:
         AstNodeExpr* outp = nullptr;
         AstNode* itemsp = nullptr;
         for (int64_t i = 0; i < count; ++i) {
+            if (spanAt[static_cast<size_t>(i)] == 0) continue;  // Covered by a run
             AstNodeVhdlExpr* const valuep
                 = byIndex[static_cast<size_t>(i)] ? byIndex[static_cast<size_t>(i)] : othersp;
             if (!valuep) {
                 unsup(flp, "aggregate with an element left unset");
+                return nullptr;
+            }
+            if (spanAt[static_cast<size_t>(i)] > 1 && !packed) {
+                unsup(flp, "aggregate with a run of elements given at once");
                 return nullptr;
             }
             AstNodeExpr* const elemp = lowerExpr(valuep);
