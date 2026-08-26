@@ -41,6 +41,10 @@ public:
         AstNodeVhdlUnit* nodep = nullptr;
         std::string key;  // Unique: "lib.name", "lib.ent(arch)" or "lib.pkg%body"
         std::vector<std::string> dependsOn;  // Keys of units this must follow
+        // Keys of units this must follow if they exist at all. A package
+        // instantiation takes the body of what it copies, but an
+        // uninstantiated package need not have one.
+        std::vector<std::string> softDependsOn;
     };
 
     // Register a parsed file's design units

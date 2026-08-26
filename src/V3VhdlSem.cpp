@@ -1280,6 +1280,34 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
     // is never written, so a positional association must skip over it.
     const bool synthesized = nodep->name().compare(0, 3, "__v") == 0;
     symp->position(synthesized ? -1 : m_ifacePos++);
+    if (nodep->kind() == VhdlIfaceKind::PACKAGE) {
+        // "package p is new work.poly generic map (<>)" declares a name for
+        // a package that is not instantiated yet (6.5.5). Inside the unit
+        // that declares it, what "p" offers is what the uninstantiated
+        // package declares, with its own generics still unbound -- so the
+        // formal's region is that package's, and every use of it is checked
+        // against the template. What the instantiation actually supplies is
+        // bound later, in bindPackageGeneric, when the unit is copied.
+        std::string key = lower(nodep->newFrom());
+        const size_t dot = key.rfind('.');
+        if (dot == std::string::npos) {
+            key = m_libname + "." + key;
+        } else if (key.compare(0, dot, "work") == 0) {
+            key = m_libname + key.substr(dot);
+        }
+        const auto scopeIt = m_unitScopes.find(key);
+        if (scopeIt != m_unitScopes.end()) {
+            symp->innerp(scopeIt->second);
+            m_scopep->addNamed(lower(nodep->name()), scopeIt->second);
+        } else if (!nodep->newFrom().empty()) {
+            err(nodep->fileline(),
+                "Cannot find package '" + nodep->newFrom() + "' that generic package '"
+                    + nodep->name() + "' is new of");
+        }
+        nodep->vhdlSymp(symp);
+        declare(symp, nodep->fileline());
+        return;
+    }
     if (nodep->kind() == VhdlIfaceKind::TYPE) {
         // A generic type stands for whatever the instantiation supplies, so
         // give it a type of its own that matches nothing else yet (6.5.5)
@@ -2123,7 +2151,16 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
         } else if (AstVhdlPackageBody* const bodyp = VN_CAST(unitp, VhdlPackageBody)) {
             const auto it = m_unitScopes.find(lib + "." + lower(unitp->name()));
-            if (it != m_unitScopes.end()) m_scopep->addUse(it->second);
+            if (it != m_unitScopes.end()) {
+                m_scopep->addUse(it->second);
+                // The body continues the declaration's declarative region
+                // (12.1), so whatever a use clause there made visible, and
+                // whatever regions it named, are visible here too
+                for (VhdlScope* const usedp : it->second->uses()) m_scopep->addUse(usedp);
+                for (const auto& pair : it->second->named()) {
+                    m_scopep->addNamed(pair.first, pair.second);
+                }
+            }
             m_unitScopes[lib + "." + lower(unitp->name()) + "%body"] = unitScopep;
             VL_RESTORER(m_inPackageBody);
             m_inPackageBody = true;
@@ -2281,9 +2318,19 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
                 actualp = assocs[i]->actualp();
             }
         }
+        // "open" written out means the same as leaving the formal out: it
+        // takes its own default (6.5.7.1)
+        if (actualp && VN_IS(actualp, VhdlOpen)) actualp = nullptr;
         if (!actualp) {
             if (formalp->defaultp()) {
                 actualp = formalp->defaultp();
+            } else if (formalp->profilep() && formalp->profilep()->defaultsToVisible()) {
+                // "is <>": bound to whatever subprogram of that designator
+                // and profile is visible where the package is instantiated
+                // (6.5.6.2). Declaring nothing leaves the copy's region
+                // transparent to the instantiation site, which the addUse
+                // above has already made reachable.
+                continue;
             } else {
                 err(nodep->fileline(), "Generic '" + formalp->name()
                                            + "' of the instantiated package has no value");
@@ -2291,6 +2338,13 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
             }
         }
         bindPackageGeneric(formalp, actualp, savedp);
+    }
+    // What a previous analysis expanded here is output, not source: an
+    // instantiation nested in an uninstantiated package is analyzed once as
+    // the template and again in every copy of it, and the copies would
+    // otherwise pile up one on top of another
+    if (AstNode* const stalep = nodep->declsp()) {
+        VL_DO_DANGLING(stalep->unlinkFrBackWithNext()->deleteTree(), stalep);
     }
     // The declarations, and the body's too, so that a subprogram declared in
     // the package has the body the copy needs
@@ -2461,6 +2515,11 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
             symp->innerp(targetp->innerp());
             symp->predefined(targetp->predefined());
             declare(symp, flp);
+            // A formal generic package is a name of its own inside the copy,
+            // so "p.thing" and "use p.all" reach what it was mapped to
+            if (formalp->kind() == VhdlIfaceKind::PACKAGE && targetp->innerp()) {
+                innerp->addNamed(lower(formalp->name()), targetp->innerp());
+            }
         }
         if (found.empty()) {
             err(flp, "Cannot find what generic '" + formalp->name() + "' is mapped to");
@@ -4304,6 +4363,27 @@ int64_t VhdlSemVisitor::staticLength(AstNodeVhdlExpr* nodep) {
     // "t'(...)" states a type, and the value inside is what has the length
     if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
         return staticLength(qp->valuep());
+    }
+    // A concatenation is as long as its two operands together, counting an
+    // operand of the element type as one element (9.2.5). That is what fixes
+    // the length of "constant k : bit_vector := a & b", where neither the
+    // subtype indication nor either operand alone says how long it is.
+    if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
+        if (binp->op() == VhdlBinaryOp::CONCAT) {
+            VhdlType* const arrayp = nodep->vhdlTypep();
+            VhdlType* const elemp
+                = arrayp && arrayp->base() ? arrayp->base()->elementp() : nullptr;
+            const auto sideLength = [&](AstNodeVhdlExpr* sidep) -> int64_t {
+                VhdlType* const sidetp = sidep ? sidep->vhdlTypep() : nullptr;
+                if (elemp && sidetp && sidetp->base() == elemp->base()) return 1;
+                return staticLength(sidep);
+            };
+            const int64_t lhsLen = sideLength(binp->lhsp());
+            if (lhsLen < 0) return -1;
+            const int64_t rhsLen = sideLength(binp->rhsp());
+            if (rhsLen < 0) return -1;
+            return lhsLen + rhsLen;
+        }
     }
     const VhdlValue val = V3VhdlEval::eval(nodep);
     if (val.isStr()) return static_cast<int64_t>(val.toStr().size());

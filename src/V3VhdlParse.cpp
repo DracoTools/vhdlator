@@ -32,6 +32,8 @@
 
 #include "V3Global.h"
 
+#include <functional>
+
 VL_DEFINE_DEBUG_FUNCTIONS;
 
 // An operator symbol names one of the reserved words, and a reserved word is
@@ -581,11 +583,34 @@ AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceElement(VhdlIfaceKind dflt) {
         AstVhdlIfaceDecl* const nodep = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::PACKAGE};
         expect(VhdlTokType::KWD_IS, "'is' in a generic package interface");
         expect(VhdlTokType::KWD_NEW, "'new' in a generic package interface");
-        parseName();
+        // Which package the formal stands for is what makes its declarations
+        // nameable inside the unit that declares it (6.5.5)
+        if (AstNodeVhdlExpr* const fromp = parseName()) {
+            std::string dotted;
+            const std::function<void(const AstNodeVhdlExpr*)> flatten
+                = [&](const AstNodeVhdlExpr* np) {
+                      if (const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected)) {
+                          flatten(selp->prefixp());
+                          flatten(selp->suffixp());
+                          return;
+                      }
+                      if (const AstVhdlName* const namep = VN_CAST(np, VhdlName)) {
+                          if (!dotted.empty()) dotted += ".";
+                          dotted += namep->name();
+                      }
+                  };
+            flatten(fromp);
+            nodep->newFrom(dotted);
+            VL_DO_DANGLING(fromp->deleteTree(), fromp);
+        }
         if (check(VhdlTokType::KWD_GENERIC)) {
             expect(VhdlTokType::KWD_MAP, "'map' after 'generic'");
             expect(VhdlTokType::LPAREN, "'(' after 'generic map'");
-            if (!check(VhdlTokType::BOX)) parseAssociationList();
+            if (check(VhdlTokType::BOX)) {
+                nodep->boxMap(true);
+            } else {
+                parseAssociationList();
+            }
             expect(VhdlTokType::RPAREN, "')' after the generic map");
         }
         return nodep;

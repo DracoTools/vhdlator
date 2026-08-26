@@ -283,6 +283,16 @@ VhdlScope* VhdlScope::findNamed(const std::string& name) const {
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         const auto it = scopep->m_named.find(name);
         if (it != scopep->m_named.end()) return it->second;
+        // A use clause makes what the used package declares potentially
+        // visible too, so a package instantiated inside another package can
+        // be the prefix of an expanded name (4.9, 12.4). The region's own
+        // declarations are looked at first, so a local one still hides it,
+        // and a used region's own uses are not followed: potential
+        // visibility does not pass on.
+        for (const VhdlScope* const usedp : scopep->m_usedp) {
+            const auto uit = usedp->m_named.find(name);
+            if (uit != usedp->m_named.end()) return uit->second;
+        }
     }
     return nullptr;
 }

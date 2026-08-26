@@ -696,6 +696,10 @@ class AstVhdlIfaceDecl final : public AstNodeVhdlDecl {
     VhdlMode m_mode = VhdlMode::IN;
     bool m_modeExplicit = false;  // Mode was written out
     VhdlSignalKind m_signalKind = VhdlSignalKind::NONE;
+    // "package p is new work.poly generic map (<>)": which package the formal
+    // stands for, and whether the map was written as a box (6.5.5)
+    std::string m_newFrom;
+    bool m_boxMap = false;
 
 public:
     AstVhdlIfaceDecl(FileLine* fl, const std::string& name, VhdlIfaceKind kind)
@@ -711,6 +715,10 @@ public:
     bool modeExplicit() const { return m_modeExplicit; }
     VhdlSignalKind signalKind() const { return m_signalKind; }
     void signalKind(VhdlSignalKind kind) { m_signalKind = kind; }
+    std::string newFrom() const { return m_newFrom; }
+    void newFrom(const std::string& name) { m_newFrom = name; }
+    bool boxMap() const { return m_boxMap; }
+    void boxMap(bool flag) { m_boxMap = flag; }
     void dump(std::ostream& str) const override;
 };
 

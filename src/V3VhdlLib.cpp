@@ -160,8 +160,10 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
                 const std::string lib
                     = parts.size() >= 2 ? lower(parts[parts.size() - 2]) : work;
                 unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, parts.back()));
-                // And its body, where it has one, since the copy takes that too
-                unit.dependsOn.push_back(
+                // And its body, where it has one, since the copy takes that
+                // too -- but an uninstantiated package need not have a body,
+                // so this only says which order to take them in
+                unit.softDependsOn.push_back(
                     primaryKey(lib == "work" ? work : lib, parts.back()) + "%body");
             }
         } else {
@@ -171,6 +173,16 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
         for (AstNode* itemp = unitp->contextp(); itemp; itemp = itemp->nextp()) {
             addContextDependency(VN_AS(itemp, VhdlContextItem), work, unit.dependsOn);
         }
+        // "package p is new work.poly generic map (<>)" needs work.poly
+        // analyzed first, and says so nowhere in the context clause (6.5.5)
+        unitp->foreach([&](const AstVhdlIfaceDecl* ifp) {
+            if (ifp->kind() != VhdlIfaceKind::PACKAGE || ifp->newFrom().empty()) return;
+            const std::string& from = ifp->newFrom();
+            const size_t dot = from.rfind('.');
+            const std::string lib = dot == std::string::npos ? work : lower(from.substr(0, dot));
+            const std::string name = dot == std::string::npos ? from : from.substr(dot + 1);
+            unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, name));
+        });
 
         const auto it = s_byKey.find(unit.key);
         if (it != s_byKey.end()) {
@@ -213,10 +225,17 @@ bool V3VhdlLib::computeOrder() {
         while (!frames.empty()) {
             Frame& frame = frames.back();
             const Unit& unit = s_units[frame.index];
-            if (frame.depIdx < unit.dependsOn.size()) {
-                const std::string& dep = unit.dependsOn[frame.depIdx++];
+            const size_t nHard = unit.dependsOn.size();
+            if (frame.depIdx < nHard + unit.softDependsOn.size()) {
+                const bool soft = frame.depIdx >= nHard;
+                const std::string& dep = soft ? unit.softDependsOn[frame.depIdx - nHard]
+                                              : unit.dependsOn[frame.depIdx];
+                ++frame.depIdx;
                 const auto it = s_byKey.find(dep);
                 if (it == s_byKey.end()) {
+                    // A soft dependency is only there to say which order to
+                    // take two units in, so its absence is not a finding
+                    if (soft) continue;
                     // Not in any library we were given
                     const std::string lib = dep.substr(0, dep.find('.'));
                     if (!isPredefinedLib(lib) && s_reportedMissing.insert(dep).second) {
