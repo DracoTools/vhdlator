@@ -32,11 +32,15 @@ architecture tb of t_vhdl_string is
 
   signal y : bit_vector(0 to 3) := "0101";
 
+  type name_array is array (0 to 2) of string(1 to 4);
+
 begin
 
   main : process is
     variable s : string(1 to 5);
     variable t : string(3 to 7);
+    constant nuls : string := nul & nul & nul;
+    variable words : name_array := ("one ", "two ", "tre ");
   begin
     assert img(y) = "0101" report "img" severity failure;
 
@@ -56,6 +60,18 @@ begin
     assert t = "abcde" report "fill from three" severity failure;
     assert t(4) = 'b' report "index from three" severity failure;
     assert t(4 to 6) = "bcd" report "slice from three" severity failure;
+
+    -- A string may hold any character, control characters included, and its
+    -- length counts them (16.3)
+    assert nuls'length = 3 report "nul length " & integer'image(nuls'length) severity failure;
+    assert nuls(1) = nul report "nul first" severity failure;
+    assert "" & nul & 'a' /= "a" report "a nul is a character of its own" severity failure;
+
+    -- An array of strings is an array of objects, not a vector of bits
+    assert words(0) = "one " report "words 0" severity failure;
+    assert words(2) = "tre " report "words 2" severity failure;
+    words(1) := "four";
+    assert words(1) = "four" report "words written" severity failure;
 
     report "*-* All Finished *-*";
     stop;

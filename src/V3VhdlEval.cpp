@@ -192,7 +192,14 @@ bool asCharString(const VhdlValue& val, std::string& out) {
     if (basep->kind() != VhdlTypeKind::ENUM) return false;
     const std::vector<VhdlSymbol*>& lits = basep->literals();
     if (val.toInt() < 0 || val.toInt() >= static_cast<int64_t>(lits.size())) return false;
-    // A character literal is named with its quotes, as in 'c'
+    // A character's position is its code (16.3). The printable ones are
+    // named with their quotes, as in 'c'; the control characters are named
+    // rather than written, so the position is what says which they are.
+    const VhdlType* const charp = V3VhdlStd::characterType();
+    if (charp && basep == charp->base()) {
+        out.assign(1, static_cast<char>(val.toInt()));
+        return true;
+    }
     const std::string& name = lits[val.toInt()]->name();
     if (name.size() != 3 || name.front() != '\'' || name.back() != '\'') return false;
     out.assign(1, name[1]);

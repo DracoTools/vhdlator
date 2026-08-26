@@ -2628,7 +2628,10 @@ private:
             if (!worthIt) return;
         }
 
-        std::string key = symp->name();
+        // Which subprogram, not merely which name: a package and a protected
+        // type may each declare one of the same name and profile, and they
+        // are different subprograms with different bodies (5.6.2)
+        std::string key = std::to_string(reinterpret_cast<uintptr_t>(symp));
         for (const VhdlType* const typep : actualTypes) {
             key += "|" + std::to_string(reinterpret_cast<uintptr_t>(typep));
         }
@@ -4175,7 +4178,11 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
     VhdlType* sliceIndexp = info.typep ? info.typep : indexp;
     if (info.left.known() && info.right.known()) {
         sliceIndexp = makeRangeSubtype(info, nodep->fileline());
-        if (indexp && indexp->bounded() && !sliceIndexp->isNull()) {
+        // Only an array whose own range is known can say which way a slice
+        // of it must run: an unconstrained type carries the index subtype,
+        // and the object decides the direction, not the subtype (8.5)
+        if (indexp && indexp->bounded() && arrayp->isConstrainedArray()
+            && !sliceIndexp->isNull()) {
             if (info.ascending != indexp->ascending()) {
                 err(nodep->fileline(), "Slice runs "
                                            + std::string{info.ascending ? "'to'" : "'downto'"}

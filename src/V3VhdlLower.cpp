@@ -125,6 +125,11 @@ class VhdlLowerVisitor final {
     // instance of that class (5.6). The class is built once, on first use.
     std::map<const VhdlType*, AstClass*> m_protClasses;
     AstClass* m_protClassp = nullptr;  // Protected type being built, if any
+    // The body whose declarations belong to that class, and the type whose
+    // own declarative region declares its methods (5.6.2). What is declared
+    // elsewhere and merely used from inside belongs to the module.
+    AstNode* m_protBodyp = nullptr;
+    const VhdlType* m_protTypep = nullptr;
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     // The loops being lowered, innermost last. A labelled exit or next names
@@ -250,10 +255,15 @@ private:
             flp, "__Vprot_" + basep->name(), m_modp ? m_modp->libname() : ""};
         m_protClasses.emplace(basep, classp);
         v3Global.setHasClasses();
-        // A class belongs to a design unit, and a protected type may be
-        // declared in a package that several modules use, so it goes in the
-        // one unit every design has
-        m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        // The class goes where the object of it does. A protected type's
+        // methods call what is visible where the type was declared -- the
+        // subprograms of the package it is in, which are emitted into the
+        // module that uses them -- so the class has to be able to see them.
+        if (m_modp) {
+            m_modp->addStmtsp(classp);
+        } else {
+            m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        }
         // Every class needs a constructor; nothing else makes one this early
         AstFunc* const newp = new AstFunc{flp, "new", nullptr, nullptr};
         newp->isConstructor(true);
@@ -267,10 +277,14 @@ private:
             return classp;
         }
         VL_RESTORER(m_protClassp);
+        VL_RESTORER(m_protBodyp);
+        VL_RESTORER(m_protTypep);
         VL_RESTORER(m_ftaskp);
         VL_RESTORER(m_stmtsp);
         VL_RESTORER_COPY(m_prefix);
         m_protClassp = classp;
+        m_protBodyp = bodyp;
+        m_protTypep = basep;
         m_ftaskp = nullptr;
         m_stmtsp = nullptr;
         m_prefix.clear();
@@ -312,9 +326,207 @@ private:
     // through ".all" (5.4). Verilator has no pointer to a bare value, but a
     // class reference is one: the class holds the designated value as its
     // only member, "new" makes one, and a null access value is a null handle.
+    // What an access to an unconstrained array became: the elements, and
+    // the bounds the allocation gave them
+    struct DynAccess final {
+        AstClass* classp = nullptr;
+        AstVar* datap = nullptr;  // The elements, stored from zero up
+        AstVar* leftp = nullptr;  // The index the object's own range starts at
+        AstVar* dirp = nullptr;  // 1 for "to", -1 for "downto"
+    };
+    std::map<const VhdlType*, DynAccess> m_dynAccess;
+
+    // The object an allocator makes for an array whose length it decides
+    // (5.4.1). Verilator's dynamic array holds the elements and answers for
+    // its own size; the left bound and the direction are the two things a
+    // VHDL array value keeps that a dynamic array does not, so the object
+    // carries them alongside.
+    AstClass* dynamicAccessClass(VhdlType* basep, FileLine* flp) {
+        AstClass* const classp = new AstClass{
+            flp, "__Vdyn" + std::to_string(++m_nameNum) + "__" + basep->name(),
+            m_modp ? m_modp->libname() : ""};
+        m_accClasses.emplace(basep, classp);
+        v3Global.setHasClasses();
+        m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        VhdlType* const designatedp = basep->designatedp();
+        VhdlType* const elemp = designatedp->base()->elementp();
+        AstVar* const datap
+            = new AstVar{flp, VVarType::MEMBER, "all", VFlagChildDType{},
+                         new AstDynArrayDType{flp, VFlagChildDType{},
+                                              elemp ? lowerType(elemp, flp)
+                                                    : newLogicDType(flp, 1)}};
+        AstVar* const leftp = new AstVar{flp, VVarType::MEMBER, "__Vleft", VFlagChildDType{},
+                                         newIntDType(flp)};
+        AstVar* const dirp = new AstVar{flp, VVarType::MEMBER, "__Vdir", VFlagChildDType{},
+                                        newIntDType(flp)};
+        for (AstVar* const varp : {datap, leftp, dirp}) {
+            varp->funcLocal(false);
+            varp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            classp->addStmtsp(varp);
+        }
+        // "new(count, left, dir)". The elements start at the element type's
+        // own default, which is where a dynamic array starts them anyway.
+        AstFunc* const newp = new AstFunc{flp, "new", nullptr, nullptr};
+        newp->isConstructor(true);
+        newp->classMethod(true);
+        newp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        newp->dtypep(newp->findVoidDType());
+        AstVar* const nArgp
+            = new AstVar{flp, VVarType::PORT, "__Vn", VFlagChildDType{}, newIntDType(flp)};
+        AstVar* const lArgp
+            = new AstVar{flp, VVarType::PORT, "__Vl", VFlagChildDType{}, newIntDType(flp)};
+        AstVar* const dArgp
+            = new AstVar{flp, VVarType::PORT, "__Vd", VFlagChildDType{}, newIntDType(flp)};
+        for (AstVar* const argp : {nArgp, lArgp, dArgp}) {
+            argp->direction(VDirection::INPUT);
+            argp->declDirection(VDirection::INPUT);
+            argp->funcLocal(true);
+            argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            newp->addStmtsp(argp);
+        }
+        newp->addStmtsp(new AstAssign{
+            flp, new AstVarRef{flp, datap, VAccess::WRITE},
+            new AstNewDynamic{flp, new AstVarRef{flp, nArgp, VAccess::READ}, nullptr}});
+        newp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, leftp, VAccess::WRITE},
+                                      new AstVarRef{flp, lArgp, VAccess::READ}});
+        newp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, dirp, VAccess::WRITE},
+                                      new AstVarRef{flp, dArgp, VAccess::READ}});
+        classp->addStmtsp(newp);
+        m_dynAccess.emplace(basep, DynAccess{classp, datap, leftp, dirp});
+        return classp;
+    }
+
+    // The class an access to an unconstrained array became, or null if this
+    // type is not one. Building it on demand means an access type that is
+    // only ever null costs nothing.
+    const DynAccess* dynAccessOf(VhdlType* typep, FileLine* flp) {
+        if (!typep) return nullptr;
+        VhdlType* const basep = typep->base();
+        if (!isDynamicAccess(basep)) return nullptr;
+        accessClass(basep, flp);
+        const auto it = m_dynAccess.find(basep);
+        return it == m_dynAccess.end() ? nullptr : &it->second;
+    }
+
+    // What an index, a slice or an array attribute is really on when what is
+    // written is an access value, or a dereference of one written out in
+    // full. Null if this is not an access to an unconstrained array.
+    AstNodeVhdlExpr* dynAccessObj(AstNodeVhdlExpr* nodep, const DynAccess*& dynp) {
+        dynp = dynAccessOfExpr(nodep);
+        if (dynp) return nodep;
+        AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected);
+        if (selp && selp->isAll()) {
+            dynp = dynAccessOfExpr(selp->prefixp());
+            if (dynp) return selp->prefixp();
+        }
+        return nullptr;
+    }
+
+    // The same, for what an expression denotes
+    const DynAccess* dynAccessOfExpr(AstNodeVhdlExpr* nodep) {
+        if (!nodep) return nullptr;
+        VhdlType* typep = nodep->vhdlTypep();
+        if (!typep && nodep->vhdlSymp()) typep = nodep->vhdlSymp()->typep();
+        return dynAccessOf(typep, nodep->fileline());
+    }
+
+    // A 32-bit signed integer, which is what a bound is
+    static AstNodeDType* newIntDType(FileLine* flp) {
+        return new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED};
+    }
+
+    // An expression that may be evaluated more than once because a bound has
+    // to be read from the same object the elements are. A name is; anything
+    // that could run a function or change something is not.
+    static bool repeatable(const AstNodeExpr* nodep) {
+        if (VN_IS(nodep, VarRef) || VN_IS(nodep, Const)) return true;
+        if (const AstMemberSel* const memp = VN_CAST(nodep, MemberSel)) {
+            return repeatable(memp->fromp());
+        }
+        if (const AstStructSel* const strp = VN_CAST(nodep, StructSel)) {
+            return repeatable(strp->fromp());
+        }
+        return false;
+    }
+
+    // The bounds of the array an access value points at, which the object
+    // carries because its type does not (5.4.1). Each reads the object
+    // again, so the object must be a name.
+    AstNodeExpr* dynLeft(const DynAccess* dynp, AstNodeExpr* objp, FileLine* flp) {
+        return memberOf(objp->cloneTree(false), dynp->leftp->name(), flp);
+    }
+    AstNodeExpr* dynAscending(const DynAccess* dynp, AstNodeExpr* objp, FileLine* flp) {
+        return new AstGt{flp, memberOf(objp->cloneTree(false), dynp->dirp->name(), flp),
+                         new AstConst{flp, AstConst::Signed32{}, 0}};
+    }
+    AstNodeExpr* dynLength(const DynAccess* dynp, AstNodeExpr* objp, FileLine* flp) {
+        return new AstMethodCall{flp, memberOf(objp->cloneTree(false), dynp->datap->name(), flp),
+                                 "size", nullptr};
+    }
+    // "left + dir * (length - 1)", which is the other end of the range
+    AstNodeExpr* dynRight(const DynAccess* dynp, AstNodeExpr* objp, FileLine* flp) {
+        AstNodeExpr* const spanp
+            = new AstSub{flp, dynLength(dynp, objp, flp),
+                         new AstConst{flp, AstConst::Signed32{}, 1}};
+        return new AstAdd{flp, dynLeft(dynp, objp, flp),
+                          new AstMul{flp, memberOf(objp->cloneTree(false), dynp->dirp->name(),
+                                                   flp),
+                                     spanp}};
+    }
+    AstNodeExpr* dynLow(const DynAccess* dynp, AstNodeExpr* objp, FileLine* flp) {
+        return new AstCond{flp, dynAscending(dynp, objp, flp), dynLeft(dynp, objp, flp),
+                           dynRight(dynp, objp, flp)};
+    }
+    AstNodeExpr* dynHigh(const DynAccess* dynp, AstNodeExpr* objp, FileLine* flp) {
+        return new AstCond{flp, dynAscending(dynp, objp, flp), dynRight(dynp, objp, flp),
+                           dynLeft(dynp, objp, flp)};
+    }
+    // The attribute an array's own bounds answer, read from the object
+    AstNodeExpr* dynAttr(const DynAccess* dynp, AstNodeExpr* objp,
+                         const std::string& attr, FileLine* flp) {
+        if (attr == "left") return dynLeft(dynp, objp, flp);
+        if (attr == "right") return dynRight(dynp, objp, flp);
+        if (attr == "low") return dynLow(dynp, objp, flp);
+        if (attr == "high") return dynHigh(dynp, objp, flp);
+        if (attr == "ascending") return dynAscending(dynp, objp, flp);
+        if (attr == "length") return dynLength(dynp, objp, flp);
+        return nullptr;
+    }
+
+    // A member of the object an access value points at, by name, the way a
+    // dereference is written
+    static AstNodeExpr* memberOf(AstNodeExpr* objp, const std::string& name, FileLine* flp) {
+        return new AstMemberSel{flp, objp, VFlagChildDType{}, name};
+    }
+
+    // "(i - left) * dir", the index into the elements as they are stored,
+    // from an index on the object's own range
+    AstNodeExpr* dynIndex(const DynAccess* dynp, AstNodeExpr* objp, AstNodeExpr* idxp,
+                          FileLine* flp) {
+        AstNodeExpr* const offsetp
+            = new AstSub{flp, idxp, memberOf(objp, dynp->leftp->name(), flp)};
+        return new AstMul{flp, offsetp,
+                          memberOf(objp->cloneTree(false), dynp->dirp->name(), flp)};
+    }
+
+    // Whether what an access type points at is an array whose length is
+    // only fixed when it is allocated. The object then carries its own
+    // bounds, the way GHDL and NVC carry them on every array value -- but
+    // only here, where there is no other way to know them.
+    static bool isDynamicAccess(const VhdlType* basep) {
+        if (!basep || basep->kind() != VhdlTypeKind::ACCESS) return false;
+        const VhdlType* const designatedp = basep->designatedp();
+        if (!designatedp) return false;
+        if (isStringType(designatedp)) return false;  // A LINE is text
+        const VhdlType* const dbasep = designatedp->base();
+        if (dbasep->kind() != VhdlTypeKind::ARRAY) return false;
+        return !designatedp->isConstrainedArray() && dbasep->indexTypes().size() == 1;
+    }
+
     AstClass* accessClass(VhdlType* basep, FileLine* flp) {
         const auto it = m_accClasses.find(basep);
         if (it != m_accClasses.end()) return it->second;
+        if (isDynamicAccess(basep)) return dynamicAccessClass(basep, flp);
         AstClass* const classp = new AstClass{
             flp, "__Vacc" + std::to_string(++m_nameNum) + "__" + basep->name(),
             m_modp ? m_modp->libname() : ""};
@@ -375,22 +587,88 @@ private:
         return dereference(fromp, flp);
     }
 
+    // Whether a declaration is one of the protected body being built, rather
+    // than something declared elsewhere that its methods happen to use
+    bool inProtectedBody(const VhdlSymbol* symp) const {
+        if (!m_protBodyp || !symp) return false;
+        // A method is declared in the protected type and again in its body,
+        // and a call may name either
+        if (m_protTypep && symp->declScopep() && symp->declScopep() == m_protTypep->scopep()) {
+            return true;
+        }
+        const AstNode* declp = symp->bodyp() ? static_cast<const AstNode*>(symp->bodyp())
+                                             : symp->declp();
+        for (const AstNode* p = declp; p; p = p->backp()) {
+            if (p == m_protBodyp) return true;
+        }
+        return false;
+    }
+
     // The object a method is called on, which the analyzer left on the prefix
     // of the selected name (5.6.2). Null if this is not such a call.
-    AstNodeExpr* protectedInstance(AstNodeVhdlExpr* objNamep) {
+    AstNodeExpr* protectedInstance(AstNodeVhdlExpr* objNamep,
+                                   const VhdlType** typepp = nullptr) {
         if (!objNamep) return nullptr;
         VhdlSymbol* const objp = objNamep->vhdlSymp();
         if (!objp || !objp->isObject() || !objp->typep()) return nullptr;
         if (objp->typep()->base()->kind() != VhdlTypeKind::PROTECTED) return nullptr;
-        const auto it = m_vars.find(objp);
-        if (it == m_vars.end()) return nullptr;
-        return new AstVarRef{objNamep->fileline(), it->second, VAccess::READ};
+        if (typepp) *typepp = objp->typep()->base();
+        AstVar* const varp = objectVar(objp, objNamep->fileline());
+        return varp ? new AstVarRef{objNamep->fileline(), varp, VAccess::READ} : nullptr;
     }
 
     // What one of a protected type's methods is called in the emitted code
-    std::string methodName(VhdlSymbol* symp) {
-        const auto it = m_funcs.find(symp);
-        return it == m_funcs.end() ? uniqueName(symp) : it->second->name();
+    std::string methodName(VhdlSymbol* symp, const VhdlType* protTypep = nullptr) {
+        const AstNodeFTask* ftaskp = emittedFunc(symp);
+        if (!ftaskp) ftaskp = emitMethodOnDemand(symp, protTypep);
+        return ftaskp ? ftaskp->name() : uniqueName(symp);
+    }
+
+    // A method may be called before the body that defines it has been
+    // reached: one method's body may call a subprogram declared elsewhere
+    // that calls back into the object. Emit it into its own class now,
+    // rather than into whatever is being built at the time (5.6.2).
+    AstNodeFTask* emitMethodOnDemand(VhdlSymbol* symp, const VhdlType* protTypep) {
+        if (!symp) return nullptr;
+        // The type is known where the call names an object of it; a
+        // specialized copy of a method is declared in the type's own region,
+        // which says which type it belongs to when nothing else does
+        if (!protTypep && symp->declScopep()) {
+            for (const auto& pair : m_protClasses) {
+                if (pair.first->scopep() == symp->declScopep()) protTypep = pair.first;
+            }
+        }
+        if (!protTypep) return nullptr;
+        const auto it = m_protClasses.find(protTypep);
+        if (it == m_protClasses.end()) return nullptr;
+        VL_RESTORER(m_protClassp);
+        VL_RESTORER(m_protBodyp);
+        VL_RESTORER(m_protTypep);
+        m_protClassp = it->second;
+        m_protTypep = protTypep;
+        m_protBodyp = protTypep->bodyp();
+        emitOnDemand(symp);
+        return emittedFunc(symp);
+    }
+
+    // What a subprogram became. A method is declared in the protected type
+    // and again in its body (5.6.2), and a call may name either symbol, so
+    // both find the one function that was emitted.
+    AstNodeFTask* emittedFunc(VhdlSymbol* symp) {
+        if (!symp) return nullptr;
+        auto it = m_funcs.find(symp);
+        if (it != m_funcs.end()) return it->second;
+        if (symp->bodyp() && symp->bodyp()->vhdlSymp()) {
+            it = m_funcs.find(symp->bodyp()->vhdlSymp());
+            if (it != m_funcs.end()) return it->second;
+        }
+        if (AstVhdlSubprogDecl* const declp = VN_CAST(symp->declp(), VhdlSubprogDecl)) {
+            if (declp->vhdlSymp() && declp->vhdlSymp() != symp) {
+                it = m_funcs.find(declp->vhdlSymp());
+                if (it != m_funcs.end()) return it->second;
+            }
+        }
+        return nullptr;
     }
 
     // A LINE is an access to STRING, which is how textio passes text about
@@ -563,6 +841,9 @@ private:
 
     // Whether an element type can live inside a packed array
     static bool elementPacks(const VhdlType* typep) {
+        // A STRING is text here rather than a vector of characters, so an
+        // array of them is an array of objects, not of bits (16.3)
+        if (isStringType(typep)) return false;
         const VhdlType* const basep = typep->base();
         switch (basep->kind()) {
         case VhdlTypeKind::ENUM: return true;
@@ -703,6 +984,11 @@ private:
     // that a name the analyzer already resolved can be emitted as a bound
     // reference rather than left for V3LinkDot to look up again
     AstVar* newVar(VhdlSymbol* symp, VVarType varType, FileLine* flp) {
+        return newVarOfType(symp, varType, lowerType(symp->typep(), flp), flp);
+    }
+
+    AstVar* newVarOfType(VhdlSymbol* symp, VVarType varType, AstNodeDType* dtypep,
+                         FileLine* flp) {
         // VHDL nests declarative regions that the emitted module does not, so
         // two loops in one process may both declare "i". The first keeps the
         // name it was written with, since that is what a trace shows.
@@ -714,8 +1000,7 @@ private:
             } while (!m_names.insert(tryp).second);
             name = tryp;
         }
-        AstVar* const varp
-            = new AstVar{flp, varType, name, VFlagChildDType{}, lowerType(symp->typep(), flp)};
+        AstVar* const varp = new AstVar{flp, varType, name, VFlagChildDType{}, dtypep};
         m_vars.emplace(symp, varp);
         return varp;
     }
@@ -952,7 +1237,7 @@ private:
         return strp ? new AstLenN{flp, strp} : nullptr;
     }
 
-    // A packed array's default is its element's default repeated.    // A packed array's default is its element's default repeated. Written as
+    // A packed array's default is its element's default repeated. Written as
     // a concatenation, the way a packed record's default is: the parts are
     // constants, so their widths are known before V3Width runs.
     static AstNodeExpr* packedRepeat(AstNodeExpr* elemp, int64_t count, FileLine* flp) {
@@ -1149,8 +1434,14 @@ private:
         if (AstVhdlAttrName* const p = VN_CAST(nodep, VhdlAttrName)) return lowerAttr(p);
         if (AstVhdlAllocator* const p = VN_CAST(nodep, VhdlAllocator)) return lowerAllocator(p);
         if (AstVhdlLiteral* const p = VN_CAST(nodep, VhdlLiteral)) {
-            // A null access value is a null handle (9.3.2)
-            if (p->kind() == VhdlLitKind::NULLLIT) return new AstConst{flp, AstConst::Null{}};
+            // A null access value is a null handle (9.3.2). A LINE is text
+            // here rather than a handle, so its null is no text at all.
+            if (p->kind() == VhdlLitKind::NULLLIT) {
+                if (isLineType(p->vhdlTypep())) {
+                    return new AstConst{flp, AstConst::String{}, ""};
+                }
+                return new AstConst{flp, AstConst::Null{}};
+            }
         }
         if (AstVhdlExternalName* const p = VN_CAST(nodep, VhdlExternalName)) {
             return lowerExternalName(p, false);
@@ -1221,6 +1512,20 @@ private:
             // LINE points at -- carries it at run time, so the bounds are
             // read from the value rather than from the type. Such a value
             // always runs from 1 (16.3).
+            const DynAccess* dynp = nullptr;
+            if (AstNodeVhdlExpr* const dynObjp = dynAccessObj(nodep->prefixp(), dynp)) {
+                if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                AstNodeExpr* const objp = lowerExpr(dynObjp);
+                if (!objp) return nullptr;
+                if (!repeatable(objp)) {
+                    VL_DO_DANGLING(objp->deleteTree(), objp);
+                    unsup(flp, "'" + attr + " of an access value that is not a name");
+                    return nullptr;
+                }
+                AstNodeExpr* const outp = dynAttr(dynp, objp, attr, flp);
+                VL_DO_DANGLING(objp->deleteTree(), objp);
+                return outp;
+            }
             if (typep && isStringType(typep) && !typep->isConstrainedArray()) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                 AstNodeExpr* const strp = lowerExpr(nodep->prefixp());
@@ -1680,6 +1985,52 @@ private:
         return exprp;
     }
 
+    // What an object became. An object declared in a package is not emitted
+    // with the package -- there is no package in the generated code -- so it
+    // is emitted into the module that reads it, on first use. Null if this
+    // symbol is not an object of the design's own.
+    AstVar* objectVar(VhdlSymbol* symp, FileLine* flp) {
+        if (!symp) return nullptr;
+        const auto it = m_vars.find(symp);
+        if (it != m_vars.end()) return it->second;
+        if (!symp->isObject() || symp->predefined()) return nullptr;
+        AstVhdlObjectDecl* const declp = VN_CAST(symp->declp(), VhdlObjectDecl);
+        if (!declp) return nullptr;
+        // The type is lowered first: a protected type becomes a class whose
+        // own body may name this same object, and that reference must find
+        // the one variable rather than make a second
+        AstNodeDType* const dtypep = lowerType(symp->typep(), flp);
+        const auto madeIt = m_vars.find(symp);
+        if (madeIt != m_vars.end()) {
+            VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+            return madeIt->second;
+        }
+        AstVar* const varp = newVarOfType(symp, VVarType::VAR, dtypep, flp);
+        if (declp->defaultp()) {
+            varp->valuep(lowerExpr(declp->defaultp()));
+        } else {
+            varp->valuep(defaultValueFor(symp->typep(), flp));
+        }
+        if (m_protClassp && inProtectedBody(symp)) {
+            m_protClassp->addStmtsp(varp);
+        } else if (m_protClassp && m_modp) {
+            // Declared outside the protected type, so it belongs to the
+            // module however it was reached
+            m_modp->addStmtsp(varp);
+        } else {
+            m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+        }
+        return varp;
+    }
+
+    // Whether a subprogram may be called with no arguments at all
+    static bool allParamsDefaulted(const VhdlSymbol* symp) {
+        for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
+            if (!symp->paramHasDefault(i)) return false;
+        }
+        return true;
+    }
+
     AstNodeExpr* lowerRef(VhdlSymbol* symp, const std::string& name, FileLine* flp) {
         if (!symp) {
             unsup(flp, "reference to '" + name + "'");
@@ -1711,11 +2062,17 @@ private:
             }
             return lowerValue(symp->value(), symp->typep(), flp);
         }
-        // A function of no arguments is called by naming it, with no
-        // parentheses, so a name may be a call (4.2.2.1)
-        if (symp->kind() == VhdlSymKind::FUNCTION && symp->paramTypes().empty()) {
+        // A function is called by naming it, with no parentheses, when it
+        // needs no argument -- either because it takes none or because every
+        // parameter has a default (4.2.2.1, 6.5.7.1)
+        if (symp->kind() == VhdlSymKind::FUNCTION && allParamsDefaulted(symp)) {
             if (symp->name() == "now") {
                 return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
+            }
+            // The smallest time this simulation tells apart. Time is counted
+            // in femtoseconds here, which is TIME's own primary unit (5.2.4.2)
+            if (symp->name() == "resolution_limit" && symp->predefined()) {
+                return new AstConst{flp, AstConst::Unsized64{}, 1};
             }
             auto funcIt = m_funcs.find(symp);
             if (funcIt == m_funcs.end() && emitOnDemand(symp)) funcIt = m_funcs.find(symp);
@@ -1726,24 +2083,8 @@ private:
                 return refp;
             }
         }
-        // An object declared in a package is not emitted with the package --
-        // there is no package in the generated code -- so it is emitted into
-        // the module that reads it, on first use
-        if (symp->isObject() && !symp->predefined()) {
-            if (AstVhdlObjectDecl* const objp = VN_CAST(symp->declp(), VhdlObjectDecl)) {
-                AstVar* const varp = newVar(symp, VVarType::VAR, flp);
-                if (objp->defaultp()) {
-                    varp->valuep(lowerExpr(objp->defaultp()));
-                } else {
-                    varp->valuep(defaultValueFor(symp->typep(), flp));
-                }
-                if (m_protClassp) {
-                    m_protClassp->addStmtsp(varp);
-                } else {
-                    m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
-                }
-                return new AstVarRef{flp, varp, VAccess::READ};
-            }
+        if (AstVar* const varp = objectVar(symp, flp)) {
+            return new AstVarRef{flp, varp, VAccess::READ};
         }
         // OUTPUT and INPUT of std.textio are the standard streams (16.4)
         if (symp->kind() == VhdlSymKind::FILE && symp->predefined()) {
@@ -1783,6 +2124,7 @@ private:
     // here is an instance of the class the access type became (9.3.7)
     AstNodeExpr* lowerAllocator(AstVhdlAllocator* nodep) {
         FileLine* const flp = nodep->fileline();
+        if (dynAccessOfExpr(nodep)) return lowerDynAllocator(nodep, flp);
         AstNew* const newp = new AstNew{flp};
         AstNodeExpr* valuep = nullptr;
         if (nodep->valuep()) {
@@ -1807,6 +2149,152 @@ private:
         }
         newp->addArgsp(new AstArg{flp, "", valuep});
         return newp;
+    }
+
+    // "new t(l to r)" for an array whose bounds only the allocation fixes:
+    // the object it makes carries them, so they are what it is made with
+    // (5.4.1, 9.3.7)
+    AstNodeExpr* lowerDynAllocator(AstVhdlAllocator* nodep, FileLine* flp) {
+        const DynAccess* const dynp = dynAccessOfExpr(nodep);
+        AstVhdlRange* const rp = allocatorRange(nodep);
+        if (rp && rp->leftp() && rp->rightp()) {
+            AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+            AstNodeExpr* const rightp = lowerExpr(rp->rightp());
+            if (!leftp || !rightp) {
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return nullptr;
+            }
+            const bool ascending = rp->dir() != VhdlDir::DOWNTO;
+            // A null range gives an object with no elements, which
+            // "right - left + 1" says by coming out at nothing or less
+            AstNodeExpr* const spanp
+                = ascending ? new AstSub{flp, rightp, leftp->cloneTree(false)}
+                            : new AstSub{flp, leftp->cloneTree(false), rightp};
+            return dynNew(new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}},
+                          leftp, ascending ? 1 : -1, flp);
+        }
+        // "new s" of a subtype that constrains the array itself
+        const VhdlType* const subTypep
+            = nodep->subtypep() ? nodep->subtypep()->vhdlTypep() : nullptr;
+        if (!nodep->valuep() && dynBoundedArray(subTypep)) {
+            const VhdlType* const idxp = subTypep->indexTypes()[0];
+            return dynNew(new AstConst{flp, AstConst::Signed32{},
+                                       static_cast<int32_t>(idxp->length())},
+                          new AstConst{flp, AstConst::Signed32{},
+                                       static_cast<int32_t>(idxp->left())},
+                          idxp->ascending() ? 1 : -1, flp);
+        }
+        // "new t'(v)", where the value decides the bounds
+        if (nodep->valuep()) return dynAllocFromValue(nodep->valuep(), dynp, flp);
+        unsup(flp, "allocator for an unconstrained array without a range");
+        return nullptr;
+    }
+
+    // The range an allocator gives the array it makes. "new t(l to r)"
+    // parses as a name with a range rather than as a subtype indication with
+    // a constraint, since the two look alike until the name is known (8.1).
+    static AstVhdlRange* allocatorRange(AstVhdlAllocator* nodep) {
+        AstVhdlSubtypeInd* const subp = nodep->subtypep();
+        if (!subp) return nullptr;
+        if (AstVhdlIndexConstraint* const icp
+            = VN_CAST(subp->constraintp(), VhdlIndexConstraint)) {
+            if (AstVhdlRange* const rangep = VN_CAST(icp->rangesp(), VhdlRange)) return rangep;
+        }
+        if (AstVhdlCall* const callp = VN_CAST(subp->typeMarkp(), VhdlCall)) {
+            return VN_CAST(callp->argsp(), VhdlRange);
+        }
+        return nullptr;
+    }
+
+    // Whether a type is an array of one dimension whose bounds are known
+    static bool dynBoundedArray(const VhdlType* typep) {
+        return typep && typep->isConstrainedArray() && typep->dimensions() == 1
+               && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded();
+    }
+
+    // The object an allocator makes, given how many elements it has and
+    // where its range starts. Takes ownership of both expressions.
+    static AstNodeExpr* dynNew(AstNodeExpr* countp, AstNodeExpr* leftp, int dir,
+                               FileLine* flp) {
+        AstNew* const newp = new AstNew{flp};
+        newp->addArgsp(new AstArg{flp, "", countp});
+        newp->addArgsp(new AstArg{flp, "", leftp});
+        newp->addArgsp(new AstArg{flp, "", new AstConst{flp, AstConst::Signed32{}, dir}});
+        return newp;
+    }
+
+    // "new t'(v)" for an array whose bounds only the value gives: the object
+    // is made the size of the value, and the value copied into it. The
+    // statements that do so travel with the expression, since an allocator
+    // may appear anywhere an expression may (9.3.7).
+    AstNodeExpr* dynAllocFromValue(AstNodeVhdlExpr* valuep, const DynAccess* dynp,
+                                   FileLine* flp) {
+        // "t'(v)" is of the type mark, which says nothing about bounds; the
+        // value inside it is what has them (9.3.5)
+        while (AstVhdlQualified* const qualp = VN_CAST(valuep, VhdlQualified)) {
+            if (dynBoundedArray(valuep->vhdlTypep())) break;
+            valuep = qualp->valuep();
+        }
+        VhdlType* const typep = valuep->vhdlTypep();
+        if (!dynBoundedArray(typep)) {
+            unsup(flp, "allocator for a value whose bounds are not known");
+            return nullptr;
+        }
+        const VhdlType* const idxTypep = typep->indexTypes()[0];
+        const int64_t count = idxTypep->length();
+        AstNodeExpr* const srcp = lowerExpr(valuep);
+        if (!srcp) return nullptr;
+        // The value is written into a temporary of its own type first, since
+        // an aggregate or a call result cannot be read one element at a time
+        AstVar* const srcVarp
+            = newTempVar("__Vdynval", lowerType(typep, flp), flp);
+        AstVar* const objVarp = newTempVar(
+            "__Vdynobj", new AstClassRefDType{flp, dynp->classp, nullptr}, flp);
+        AstVar* const idxVarp = newTempVar("__Vdynj", newIntDType(flp), flp);
+        idxVarp->usedLoopIdx(true);
+        AstNode* stmtsp
+            = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
+        stmtsp = AstNode::addNext(
+            stmtsp,
+            static_cast<AstNode*>(new AstAssign{
+                flp, new AstVarRef{flp, objVarp, VAccess::WRITE},
+                dynNew(new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)},
+                       new AstConst{flp, AstConst::Signed32{},
+                                    static_cast<int32_t>(idxTypep->left())},
+                       idxTypep->ascending() ? 1 : -1, flp)}));
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(
+                        new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                      new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstNodeExpr* const srcIdxp
+            = new AstConst{flp, AstConst::Signed32{},
+                           static_cast<int32_t>(idxTypep->left())};
+        AstNodeExpr* const elemIdxp
+            = idxTypep->ascending()
+                  ? static_cast<AstNodeExpr*>(
+                        new AstAdd{flp, srcIdxp, new AstVarRef{flp, idxVarp, VAccess::READ}})
+                  : static_cast<AstNodeExpr*>(
+                        new AstSub{flp, srcIdxp, new AstVarRef{flp, idxVarp, VAccess::READ}});
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLtS{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                       new AstConst{flp, AstConst::Signed32{},
+                                    static_cast<int32_t>(count)}}});
+        loopp->addStmtsp(new AstAssign{
+            flp,
+            new AstSelBit{flp,
+                          memberOf(new AstVarRef{flp, objVarp, VAccess::READ},
+                                   dynp->datap->name(), flp),
+                          new AstVarRef{flp, idxVarp, VAccess::READ}},
+            new AstSelBit{flp, new AstVarRef{flp, srcVarp, VAccess::READ}, elemIdxp}});
+        loopp->addContsp(new AstAssign{
+            flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+            new AstAdd{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        stmtsp = AstNode::addNext(stmtsp, static_cast<AstNode*>(loopp));
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, objVarp, VAccess::READ}};
     }
 
     // How an alias numbers its elements against what it denotes (6.6.2).
@@ -2045,8 +2533,9 @@ private:
             return new AstMemberSel{flp, fromp, VFlagChildDType{}, symp->name()};
         }
         if (symp && symp->kind() == VhdlSymKind::FUNCTION) {
-            if (AstNodeExpr* const instp = protectedInstance(nodep->prefixp())) {
-                return new AstMethodCall{flp, instp, methodName(symp), nullptr};
+            const VhdlType* protTypep = nullptr;
+            if (AstNodeExpr* const instp = protectedInstance(nodep->prefixp(), &protTypep)) {
+                return new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
             }
         }
         if (symp) return lowerRef(symp, symp->name(), flp);
@@ -2425,6 +2914,11 @@ private:
                   && (prefixTypep->base()->kind() == VhdlTypeKind::ARRAY
                       || prefixTypep->base()->kind() == VhdlTypeKind::ACCESS));
         if (indexing) {
+            const DynAccess* dynp = nullptr;
+            if (AstNodeVhdlExpr* const dynObjp = dynAccessObj(nodep->prefixp(), dynp)) {
+                AstNodeExpr* const objp = lowerExpr(dynObjp);
+                return objp ? lowerDynIndex(nodep, dynp, objp, flp) : nullptr;
+            }
             AstNodeExpr* fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
             fromp = derefIfAccess(fromp, nodep->prefixp(), flp);
@@ -2477,6 +2971,38 @@ private:
         }
         // Otherwise a function call
         return lowerFuncCall(nodep, flp);
+    }
+
+    // Indexing what an access value points at, where the object carries its
+    // own bounds: the index is put onto the elements as they are stored.
+    // A slice is a value with bounds of its own, which only an assignment
+    // between two such objects can carry here, so it is left to the
+    // statement that assigns it.
+    AstNodeExpr* lowerDynIndex(AstVhdlCall* nodep, const DynAccess* dynp, AstNodeExpr* objp,
+                               FileLine* flp) {
+        if (VN_IS(nodep->argsp(), VhdlRange)) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            unsup(flp, "slice of an unconstrained array read through an access value");
+            return nullptr;
+        }
+        if (!repeatable(objp)) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            unsup(flp, "index of an access value that is not a name");
+            return nullptr;
+        }
+        AstVhdlAssoc* const asp = VN_CAST(nodep->argsp(), VhdlAssoc);
+        if (asp && asp->nextp()) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            unsup(flp, "index of an unconstrained array of more than one dimension");
+            return nullptr;
+        }
+        AstNodeExpr* const indexp = asp && asp->actualp() ? lowerExpr(asp->actualp()) : nullptr;
+        if (!indexp) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            return nullptr;
+        }
+        return new AstSelBit{flp, memberOf(objp->cloneTree(false), dynp->datap->name(), flp),
+                             dynIndex(dynp, objp, indexp, flp)};
     }
 
     // Peel "expr + k" or "expr - k" down to its base, accumulating the
@@ -2563,10 +3089,24 @@ private:
         m_emitting.insert(symp);
         {
             VL_RESTORER(m_ftaskp);
+            VL_RESTORER(m_protClassp);
             VL_RESTORER_COPY(m_prefix);
+            // A subprogram declared outside a protected type is not one of
+            // its methods, however it was first reached, so it and whatever
+            // it declares belong to the module (5.6.2)
+            const bool outside = m_protClassp && !inProtectedBody(symp);
+            AstNode* const outerStmtsp = m_stmtsp;
+            if (outside) {
+                m_protClassp = nullptr;
+                m_stmtsp = nullptr;
+            }
             m_ftaskp = nullptr;
             m_prefix.clear();
             lowerSubprogram(declp);
+            if (outside) {
+                if (m_stmtsp && m_modp) m_modp->addStmtsp(m_stmtsp);
+                m_stmtsp = outerStmtsp;
+            }
         }
         m_emitting.erase(symp);
         auto it = m_funcs.find(symp);
@@ -2601,9 +3141,10 @@ private:
         if (AstNodeExpr* const outp = lowerIntrinsic(symp, args, nodep, flp)) return outp;
         // A function of a protected type runs on the object it is called on
         if (AstVhdlSelected* const selp = VN_CAST(nodep->prefixp(), VhdlSelected)) {
-            if (AstNodeExpr* const instp = protectedInstance(selp->prefixp())) {
+            const VhdlType* protTypep = nullptr;
+            if (AstNodeExpr* const instp = protectedInstance(selp->prefixp(), &protTypep)) {
                 AstMethodCall* const callp
-                    = new AstMethodCall{flp, instp, methodName(symp), nullptr};
+                    = new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
                 addCallArgs(callp, nodep);
                 return callp;
             }
@@ -4709,10 +5250,185 @@ private:
             if (!nodep->valuep()) return nullptr;
             return lowerAggregateTarget(aggp, nodep->valuep(), false, false, flp);
         }
+        if (nodep->valuep() && isDynTarget(nodep->targetp())) {
+            return lowerDynCopy(nodep->targetp(), nodep->valuep(), flp);
+        }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
         AstNodeExpr* const rhsp = nodep->valuep() ? lowerExpr(nodep->valuep()) : nullptr;
         if (!lhsp || !rhsp) return nullptr;
         return new AstAssign{flp, lhsp, rhsp};
+    }
+
+    // Whether an assignment writes a whole array, or a slice of one, that an
+    // access value points at. Writing one element is an ordinary assignment;
+    // writing many is a copy, since how many there are is only known while
+    // running.
+    bool isDynTarget(AstNodeVhdlExpr* targetp) {
+        const DynAccess* dynp = nullptr;
+        if (AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+            if (!VN_IS(callp->argsp(), VhdlRange)) return false;
+            return dynAccessObj(callp->prefixp(), dynp) != nullptr;
+        }
+        AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected);
+        return selp && selp->isAll() && dynAccessObj(selp, dynp) != nullptr;
+    }
+
+    // "p.all := v" and "p(a to b) := v", where what p points at carries its
+    // own bounds: the elements are copied one at a time, since how many
+    // there are is only known while running. Slices of one same object that
+    // overlap are copied in order rather than through a temporary, which the
+    // LRM would have them go through (10.5.2.2).
+    AstNode* lowerDynCopy(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        const DynAccess* dynp = nullptr;
+        AstVhdlRange* rangep = nullptr;
+        AstNodeVhdlExpr* objNodep = nullptr;
+        if (AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+            rangep = VN_CAST(callp->argsp(), VhdlRange);
+            objNodep = dynAccessObj(callp->prefixp(), dynp);
+        } else {
+            objNodep = dynAccessObj(VN_AS(targetp, VhdlSelected), dynp);
+        }
+        AstNodeExpr* const dstp = objNodep ? lowerExpr(objNodep) : nullptr;
+        if (!dstp) return nullptr;
+        if (!repeatable(dstp)) {
+            VL_DO_DANGLING(dstp->deleteTree(), dstp);
+            unsup(flp, "assignment to an access value that is not a name");
+            return nullptr;
+        }
+        AstNodeExpr* countp = nullptr;
+        AstNodeExpr* basep = nullptr;
+        if (rangep) {
+            if (!rangep->leftp() || !rangep->rightp()) {
+                VL_DO_DANGLING(dstp->deleteTree(), dstp);
+                unsup(flp, "slice by an attribute range");
+                return nullptr;
+            }
+            AstNodeExpr* const leftp = lowerExpr(rangep->leftp());
+            AstNodeExpr* const rightp = lowerExpr(rangep->rightp());
+            if (!leftp || !rightp) {
+                VL_DO_DANGLING(dstp->deleteTree(), dstp);
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return nullptr;
+            }
+            const bool ascending = rangep->dir() != VhdlDir::DOWNTO;
+            AstNodeExpr* const spanp
+                = ascending ? new AstSub{flp, rightp, leftp->cloneTree(false)}
+                            : new AstSub{flp, leftp->cloneTree(false), rightp};
+            countp = new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}};
+            basep = dynIndex(dynp, dstp->cloneTree(false), leftp, flp);
+        } else {
+            countp = dynLength(dynp, dstp, flp);
+            basep = new AstConst{flp, AstConst::Signed32{}, 0};
+        }
+        AstVar* const countVarp = newTempVar("__Vdyncnt", newIntDType(flp), flp);
+        AstVar* const baseVarp = newTempVar("__Vdynbase", newIntDType(flp), flp);
+        AstVar* const idxVarp = newTempVar("__Vdyni", newIntDType(flp), flp);
+        idxVarp->usedLoopIdx(true);
+        AstNodeExpr* const elemp
+            = dynSourceElem(valuep, new AstVarRef{flp, idxVarp, VAccess::READ}, flp);
+        if (!elemp) {
+            VL_DO_DANGLING(dstp->deleteTree(), dstp);
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            VL_DO_DANGLING(basep->deleteTree(), basep);
+            return nullptr;
+        }
+        AstNodeExpr* const dstElemp = new AstSelBit{
+            flp, memberOf(dstp, dynp->datap->name(), flp),
+            new AstAdd{flp, new AstVarRef{flp, baseVarp, VAccess::READ},
+                       new AstVarRef{flp, idxVarp, VAccess::READ}}};
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLtS{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                       new AstVarRef{flp, countVarp, VAccess::READ}}});
+        loopp->addStmtsp(new AstAssign{flp, dstElemp, elemp});
+        loopp->addContsp(new AstAssign{
+            flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+            new AstAdd{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        AstNode* outp
+            = new AstAssign{flp, new AstVarRef{flp, countVarp, VAccess::WRITE}, countp};
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(
+                      new AstAssign{flp, new AstVarRef{flp, baseVarp, VAccess::WRITE}, basep}));
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(
+                      new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                    new AstConst{flp, AstConst::Signed32{}, 0}}));
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+    }
+
+    // One element of the value being copied into an array an access value
+    // points at, at the offset the loop has reached. Takes ownership of the
+    // offset expression.
+    AstNodeExpr* dynSourceElem(AstNodeVhdlExpr* valuep, AstNodeExpr* offsetp, FileLine* flp) {
+        const DynAccess* dynp = nullptr;
+        AstVhdlRange* rangep = nullptr;
+        AstNodeVhdlExpr* objNodep = nullptr;
+        if (AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall)) {
+            if ((rangep = VN_CAST(callp->argsp(), VhdlRange))) {
+                objNodep = dynAccessObj(callp->prefixp(), dynp);
+            }
+        }
+        if (!objNodep && !rangep) objNodep = dynAccessObj(valuep, dynp);
+        if (objNodep) {
+            AstNodeExpr* const srcp = lowerExpr(objNodep);
+            if (!srcp) {
+                VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                return nullptr;
+            }
+            if (!repeatable(srcp)) {
+                VL_DO_DANGLING(srcp->deleteTree(), srcp);
+                VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                unsup(flp, "copy from an access value that is not a name");
+                return nullptr;
+            }
+            AstNodeExpr* startp = nullptr;
+            if (rangep && rangep->leftp()) {
+                AstNodeExpr* const leftp = lowerExpr(rangep->leftp());
+                if (!leftp) {
+                    VL_DO_DANGLING(srcp->deleteTree(), srcp);
+                    VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                    return nullptr;
+                }
+                startp = dynIndex(dynp, srcp->cloneTree(false), leftp, flp);
+            }
+            AstNodeExpr* const idxp
+                = startp ? static_cast<AstNodeExpr*>(new AstAdd{flp, startp, offsetp}) : offsetp;
+            return new AstSelBit{flp, memberOf(srcp, dynp->datap->name(), flp), idxp};
+        }
+        // A value whose own bounds are known, indexed on its own range. A
+        // slice keeps the index values of what it is a slice of (8.5), so it
+        // is the object itself that is indexed, not the slice of it.
+        const VhdlType* const typep = valuep->vhdlTypep();
+        AstNodeVhdlExpr* wholep = valuep;
+        if (AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall)) {
+            if (VN_IS(callp->argsp(), VhdlRange)) wholep = callp->prefixp();
+        }
+        if (typep && typep->isConstrainedArray() && typep->dimensions() == 1
+            && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded()) {
+            AstNodeExpr* const srcp = lowerExpr(wholep);
+            if (!srcp) {
+                VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                return nullptr;
+            }
+            if (repeatable(srcp)) {
+                const VhdlType* const idxTypep = typep->indexTypes()[0];
+                AstNodeExpr* const leftp
+                    = new AstConst{flp, AstConst::Signed32{},
+                                   static_cast<int32_t>(idxTypep->left())};
+                AstNodeExpr* const idxp
+                    = idxTypep->ascending()
+                          ? static_cast<AstNodeExpr*>(new AstAdd{flp, leftp, offsetp})
+                          : static_cast<AstNodeExpr*>(new AstSub{flp, leftp, offsetp});
+                return new AstSelBit{flp, srcp, idxp};
+            }
+            VL_DO_DANGLING(srcp->deleteTree(), srcp);
+        }
+        VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+        unsup(flp, "value copied into an unconstrained array through an access value");
+        return nullptr;
     }
 
     AstNode* lowerIf(AstVhdlIf* nodep) {
@@ -4859,6 +5575,7 @@ private:
         AstNodeExpr* initp = nullptr;
         AstNodeExpr* limitp = nullptr;
         AstNodeExpr* ascp = nullptr;  // Set where the direction only folds later
+        const DynAccess* dynLoopp = nullptr;
         if (AstVhdlRange* const rp = VN_CAST(nodep->rangep(), VhdlRange)) {
             if (rp->leftp() && rp->rightp()) {
                 initp = lowerExpr(rp->leftp());
@@ -4885,6 +5602,25 @@ private:
                         ascending = name == "range";
                         if (!ascending) std::swap(initp, limitp);
                     }
+                } else if ((name == "range" || name == "reverse_range")
+                           && dynAccessObj(attrp->prefixp(), dynLoopp)) {
+                    // The array an access value points at carries its own
+                    // bounds, so the loop reads them from the object
+                    AstNodeExpr* const objp = lowerExpr(
+                        dynAccessObj(attrp->prefixp(), dynLoopp));
+                    if (objp && repeatable(objp)) {
+                        initp = dynLeft(dynLoopp, objp, flp);
+                        limitp = dynRight(dynLoopp, objp, flp);
+                        ascp = dynAscending(dynLoopp, objp, flp);
+                        ascending = true;
+                        if (name == "reverse_range") {
+                            std::swap(initp, limitp);
+                            ascp = new AstLogNot{flp, ascp};
+                        }
+                    } else {
+                        unsup(flp, "loop over the range of an access value that is not a name");
+                    }
+                    if (objp) VL_DO_DANGLING(objp->deleteTree(), objp);
                 } else if (name == "range" || name == "reverse_range") {
                     int dim = 0;
                     if (attrp->argp()) {
@@ -5008,10 +5744,11 @@ private:
         if (symp) {
             AstVhdlSelected* const selp
                 = VN_CAST(callp ? callp->prefixp() : nodep->callp(), VhdlSelected);
+            const VhdlType* protTypep = nullptr;
             if (AstNodeExpr* const instp
-                = selp ? protectedInstance(selp->prefixp()) : nullptr) {
+                = selp ? protectedInstance(selp->prefixp(), &protTypep) : nullptr) {
                 AstMethodCall* const mcallp
-                    = new AstMethodCall{flp, instp, methodName(symp), nullptr};
+                    = new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
                 addCallArgs(mcallp, callp);
                 return new AstStmtExpr{flp, mcallp};
             }
@@ -5499,6 +6236,41 @@ private:
         // Which base the item is written in. The radix forms say so; plain
         // READ takes its answer from the type, since a vector is written in
         // binary and a number in decimal.
+        // READ of a CHARACTER takes exactly one character, whatever it is,
+        // and says so through GOOD when there is one (16.4)
+        if (name == "read" && typep && V3VhdlStd::characterType()
+            && typep->base() == V3VhdlStd::characterType()->base()) {
+            AstNode* thenp = new AstAssign{
+                flp, valuep,
+                new AstGetcN{flp, linep->cloneTree(false),
+                             new AstConst{flp, AstConst::Signed32{}, 0}}};
+            thenp = AstNode::addNext(
+                thenp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, linep->cloneTree(false),
+                    new AstSubstrN{flp, linep->cloneTree(false),
+                                   new AstConst{flp, AstConst::Signed32{}, 1},
+                                   new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                                              new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+            AstNode* elsep = nullptr;
+            if (args.size() == 3) {
+                AstNodeExpr* const goodp = lowerExpr(args[2]);
+                if (!goodp) {
+                    VL_DO_DANGLING(thenp->deleteTree(), thenp);
+                    VL_DO_DANGLING(linep->deleteTree(), linep);
+                    return nullptr;
+                }
+                thenp = AstNode::addNext(
+                    thenp, static_cast<AstNode*>(
+                               new AstAssign{flp, goodp->cloneTree(false),
+                                             new AstConst{flp, AstConst::BitTrue{}}}));
+                elsep = new AstAssign{flp, goodp, new AstConst{flp, AstConst::BitFalse{}}};
+            }
+            AstNodeExpr* const anyp
+                = new AstGtS{flp, new AstLenN{flp, linep}, new AstConst{flp, AstConst::Signed32{}, 0}};
+            return new AstIf{flp, anyp, thenp, elsep};
+        }
+
         AstAtoN::FmtType fmt = AstAtoN::ATOI;
         if (name == "hread") {
             fmt = AstAtoN::ATOHEX;
