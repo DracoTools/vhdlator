@@ -9,6 +9,34 @@
 
 use std.env.all;
 
+-- An array whose length only elaboration fixes takes its default the same
+-- way, from the element type
+entity t_vhdl_default_sub is
+  generic (n : positive);
+end entity;
+
+architecture sim of t_vhdl_default_sub is
+  type sized is record
+    k : integer;
+    b : bit;
+  end record;
+  type recs is array (natural range <>) of sized;
+  signal gen : recs(1 to n);
+  signal genv : bit_vector(0 to n - 1);
+begin
+  check : process is
+  begin
+    assert gen(1).k = integer'left and gen(n).k = integer'left
+      report "array whose length a generic gives" severity failure;
+    assert gen(1).b = '0' report "record element of one" severity failure;
+    assert genv = (0 to n - 1 => '0')
+      report "vector whose length a generic gives" severity failure;
+    wait;
+  end process;
+end architecture;
+
+use std.env.all;
+
 entity t_vhdl_default is
 end entity;
 
@@ -39,6 +67,8 @@ architecture sim of t_vhdl_default is
   signal sr : recs;
 
 begin
+
+  u_gen : entity work.t_vhdl_default_sub generic map (n => 3);
 
   main : process is
     variable i  : integer;

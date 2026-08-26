@@ -1338,15 +1338,16 @@ private:
             if (!typep->bounded()) return nullptr;
             return lowerValue(VhdlValue::mkReal(typep->leftReal(), typep), typep, flp);
         case VhdlTypeKind::ARRAY: {
-            // A length that is not known until elaboration has no default to
-            // write here; the variable simply starts at zero
-            if (!typep->isConstrainedArray()) return nullptr;
             // Every element takes the element type's default (6.4.2.2). An
             // array of logic is packed and starts as Verilator starts it; an
             // array of anything else is unpacked, and a sparse initializer
             // with only a default says "all elements" without writing them
-            // out, whatever the array's size.
-            if (!typep->isConstrainedArray()) return nullptr;
+            // out, whatever the array's size -- including a size that only
+            // elaboration fixes, where the range travels with the type.
+            const bool hasBounds
+                = !typep->indexTypes().empty() && typep->indexTypes()[0]
+                  && (typep->indexTypes()[0]->bounded() || typep->indexTypes()[0]->boundsp());
+            if (!typep->isConstrainedArray() && !hasBounds) return nullptr;
             if (!basep->elementp()) return nullptr;
             if (!mustHave && enumIsLogic(basep->elementp()->base())) return nullptr;
             if (isStringType(basep)) {
@@ -1379,6 +1380,15 @@ private:
                 for (const VhdlType* const idxp : typep->indexTypes()) {
                     if (!idxp || !idxp->bounded()) count = 0;
                     if (count) count *= idxp->length();
+                }
+                if (!count && typep->indexTypes().size() == 1) {
+                    // A length that only elaboration fixes -- an array whose
+                    // bounds name a generic -- is as many of the element's
+                    // default as the range is long, which V3Param settles
+                    // along with the range itself
+                    if (AstNodeExpr* const lenp = boundsLength(typep, flp)) {
+                        return new AstReplicate{flp, elemp, lenp};
+                    }
                 }
                 AstNodeExpr* const outp = packedRepeat(elemp, count, flp);
                 if (!outp) VL_DO_DANGLING(elemp->deleteTree(), elemp);
