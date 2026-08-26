@@ -103,9 +103,9 @@ signal as ``COUNT``. Verilator lowercases basic identifiers, and that is the
 spelling that appears in traces, in the generated C++, and to VPI. Extended
 identifiers, written between backslashes, keep their case and are distinct
 from every basic identifier. Wherever a name is written on the command line
--- :vlopt:`-G` and :vlopt:`--top-module` -- any spelling of it is accepted.
+-- :vlopt:`-G <-G<name>>` and :vlopt:`--top-module` -- any spelling of it is accepted.
 
-A generic of the top-level entity takes its value from :vlopt:`-G`, which
+A generic of the top-level entity takes its value from :vlopt:`-G <-G<name>>`, which
 saves editing the source to try another configuration. A string generic needs
 its quotes to survive the shell:
 
