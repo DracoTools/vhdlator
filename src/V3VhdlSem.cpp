@@ -3524,6 +3524,20 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
         if (sufp) {
             std::vector<VhdlSymbol*> methods;
             methScopep->lookupLocal(sufp->name(), methods);
+            // Only what the protected type declares is a method of it. Its
+            // body may declare subprograms of its own, which are local to the
+            // body and are not reached through an object (5.6.2). A declared
+            // method has no body where it is declared; the body's own
+            // subprograms do.
+            {
+                std::vector<VhdlSymbol*> declared;
+                for (VhdlSymbol* const mp : methods) {
+                    const AstVhdlSubprogDecl* const dp
+                        = VN_CAST(mp->declp(), VhdlSubprogDecl);
+                    if (dp && !dp->hasBody()) declared.push_back(mp);
+                }
+                if (!declared.empty()) methods.swap(declared);
+            }
             if (!methods.empty()) {
                 nodep->prefixp()->vhdlSymp(objp);
                 return pick(nodep, methods, wantp, "method '" + sufp->name() + "'");
@@ -3917,7 +3931,13 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // call as in CORDIC(...)(1) -- denotes no declaration of its own, so its
     // type has to be worked out before it can be indexed (8.4)
     if (!namedPrefix) {
-        VhdlType* const typep = analyzeExpr(nodep->prefixp(), nullptr);
+        VhdlType* typep = analyzeExpr(nodep->prefixp(), nullptr);
+        // An access value is dereferenced without saying so where what it
+        // points at is what the name goes on to index (8.1)
+        if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS
+            && typep->base()->designatedp()) {
+            typep = typep->base()->designatedp();
+        }
         if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY) {
             const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
             return isSlice ? analyzeSliceName(nodep, typep) : analyzeIndexedName(nodep, typep);

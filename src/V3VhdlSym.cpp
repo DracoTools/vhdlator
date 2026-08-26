@@ -206,25 +206,60 @@ void VhdlScope::lookupLocal(const std::string& name, std::vector<VhdlSymbol*>& o
     for (auto it = range.first; it != range.second; ++it) out.push_back(it->second);
 }
 
+// Whether two declarations of one name are homographs: overloadable ones are
+// when their parameter and result type profiles agree, and a declaration is
+// hidden by a homograph of it in an inner region (12.3).
+static bool sameProfile(const VhdlSymbol* ap, const VhdlSymbol* bp) {
+    if (ap->paramTypes().size() != bp->paramTypes().size()) return false;
+    for (size_t i = 0; i < ap->paramTypes().size(); ++i) {
+        const VhdlType* const atp = ap->paramTypes()[i];
+        const VhdlType* const btp = bp->paramTypes()[i];
+        if (!atp || !btp || atp->base() != btp->base()) return false;
+    }
+    const VhdlType* const arp = ap->returnTypep();
+    const VhdlType* const brp = bp->returnTypep();
+    if (!arp != !brp) return false;
+    if (arp && brp && arp->base() != brp->base()) return false;
+    return true;
+}
+
+// Add what one region offers, leaving out anything an inner region has
+// already declared with the same profile
+static void addUnhidden(const VhdlScope* scopep, const std::string& name,
+                        std::vector<VhdlSymbol*>& out, size_t innerCount) {
+    std::vector<VhdlSymbol*> here;
+    scopep->lookupLocal(name, here);
+    for (VhdlSymbol* const symp : here) {
+        bool hidden = false;
+        for (size_t i = 0; i < innerCount && !hidden; ++i) {
+            if (out[i] != symp && sameProfile(out[i], symp)) hidden = true;
+        }
+        if (!hidden) out.push_back(symp);
+    }
+}
+
 void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) const {
     // Directly visible declarations first. The innermost region that declares
     // the name with something not overloadable wins outright, since that
-    // hides everything outside it (12.3).
+    // hides everything outside it (12.3). An overloadable declaration hides
+    // only a homograph of itself, which is why the rest are gathered.
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         const size_t before = out.size();
-        scopep->lookupLocal(name, out);
+        addUnhidden(scopep, name, out, before);
         for (size_t i = before; i < out.size(); ++i) {
             if (!out[i]->isOverloadable()) return;
         }
     }
+    const size_t directCount = out.size();
 
     // Then everything use clauses made potentially visible (12.4). These are
     // gathered from every enclosing region, not just the nearest one: a
     // package that declares its own "=" does not thereby hide the predefined
-    // "=" of every other type, because overloads coexist.
+    // "=" of every other type, because overloads coexist. A directly visible
+    // homograph does hide one, though.
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         for (const VhdlScope* const usedp : scopep->m_usedp) {
-            usedp->lookupLocal(name, out);
+            addUnhidden(usedp, name, out, directCount);
         }
     }
 
