@@ -2080,6 +2080,10 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // names the architecture with it (16.2.7)
                 unitScopep->prefixes(parts.back() + "(" + lower(archp->name()) + ")",
                                      parts.back());
+                // A configuration of this architecture names what it
+                // declares, so its region has to be findable (3.4)
+                m_unitScopes[lib + "." + parts.back() + "(" + lower(archp->name()) + ")"]
+                    = unitScopep;
             }
             iterateAndNextNull(archp->declsp());
             iterateAndNextNull(archp->stmtsp());
@@ -2104,6 +2108,35 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             VL_RESTORER(m_inPackageBody);
             m_inPackageBody = true;
             iterateAndNextNull(bodyp->declsp());
+        } else if (AstVhdlConfiguration* const cfgp = VN_CAST(unitp, VhdlConfiguration)) {
+            // A binding indication may carry generic and port maps of its
+            // own. Their actuals name what the configured architecture
+            // declares as well as what is visible where the configuration is
+            // written (3.4, 7.3.2), so that region is made visible here.
+            std::vector<std::string> parts;
+            if (flatten(cfgp->entityNamep(), parts) && !parts.empty()) {
+                std::string arch;
+                if (AstVhdlBlockConfig* const bcp = cfgp->blockConfigp()) {
+                    if (const AstVhdlEntitySpec* const specp
+                        = VN_CAST(bcp->specp(), VhdlEntitySpec)) {
+                        if (const AstVhdlName* const namep = VN_CAST(specp->namesp(), VhdlName)) {
+                            arch = lower(namep->name());
+                        }
+                    }
+                }
+                const auto archIt
+                    = m_unitScopes.find(lib + "." + parts.back() + "(" + arch + ")");
+                if (archIt != m_unitScopes.end()) m_scopep->addUse(archIt->second);
+            }
+            unitp->foreach([this](AstVhdlBinding* bindp) {
+                for (AstNode* p = bindp->genericMapp(); p; p = p->nextp()) {
+                    AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                    if (asp && asp->actualp()) analyzeExpr(asp->actualp(), nullptr);
+                }
+                // Not the port map: its actuals name the *component's*
+                // ports, which live in the component's own region and say
+                // which of the entity's ports each one becomes (7.3.2.2)
+            });
         } else {
             iterateChildren(unitp);
         }

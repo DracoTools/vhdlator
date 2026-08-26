@@ -703,6 +703,9 @@ public:
     bool protectKeyProvided() const { return !m_protectKey.empty(); }
     string protectKeyDefaulted() VL_MT_SAFE;  // Set default key if not set by user
     string topModule() const { return m_topModule; }  // As AstNode::encodeName()
+    // A VHDL configuration may be named as the top unit, and names the
+    // entity that is really elaborated (3.4)
+    void topModule(const string& flag) { m_topModule = flag; }
     bool noTraceTop() const { return m_noTraceTop; }
     string unusedRegexp() const { return m_unusedRegexp; }
     string waiverOutput() const { return m_waiverOutput; }
