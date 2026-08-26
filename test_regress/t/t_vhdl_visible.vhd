@@ -23,6 +23,7 @@ package body outer_pkg is
 end package body;
 
 use std.env.all;
+use std.textio.all;
 use work.outer_pkg.all;
 
 entity t_vhdl_visible is
@@ -39,6 +40,9 @@ architecture tb of t_vhdl_visible is
   type counter is protected
     procedure bump;
     impure function value return integer;
+    -- Overloaded on arity: naming the object's method without parentheses
+    -- can only mean the one that needs no arguments
+    impure function value(scale : integer) return integer;
   end protected;
 
   type counter is protected body
@@ -56,6 +60,10 @@ architecture tb of t_vhdl_visible is
     begin
       return n;
     end function;
+    impure function value(scale : integer) return integer is
+    begin
+      return n * scale;
+    end function;
   end protected body;
 
   type int_vec is array (1 to 3) of integer;
@@ -71,6 +79,7 @@ begin
 
   main : process is
     variable p : row_vec_ptr;
+    variable l : line;
   begin
     assert which = "inner" report "inner declaration hides the outer" severity failure;
     assert work.outer_pkg.which = "outer" report "outer by selected name" severity failure;
@@ -78,6 +87,7 @@ begin
     c.bump;
     c.bump;
     assert c.value = 2 report "protected method" severity failure;
+    assert c.value(3) = 6 report "protected method with an argument" severity failure;
 
     -- p is an access to an array; naming an element of it dereferences
     p := new row_vec'((v => (1, 2, 3)), (v => (4, 5, 6)));
@@ -85,6 +95,14 @@ begin
     p(1).v(2) := 9;
     assert p(1).v(2) = 9 report "assign through an access" severity failure;
     deallocate(p);
+
+    -- An attribute asks about what an access value points at
+    l := new string'("abcd");
+    assert l'length = 4 report "'length through an access" severity failure;
+    assert l'left = 1 report "'left through an access" severity failure;
+    assert l.all(l'left to l'left + 1) = "ab" report "slice through an access"
+      severity failure;
+    deallocate(l);
 
     report "*-* All Finished *-*";
     stop;

@@ -3538,6 +3538,17 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
                 }
                 if (!declared.empty()) methods.swap(declared);
             }
+            // Named with no parentheses, so only a method that needs no
+            // arguments can be meant (4.2.2.1)
+            {
+                std::vector<VhdlSymbol*> callable;
+                for (VhdlSymbol* const mp : methods) {
+                    if (mp->paramTypes().empty() || allParamsDefaulted(mp)) {
+                        callable.push_back(mp);
+                    }
+                }
+                if (!callable.empty()) methods.swap(callable);
+            }
             if (!methods.empty()) {
                 nodep->prefixp()->vhdlSymp(objp);
                 return pick(nodep, methods, wantp, "method '" + sufp->name() + "'");
@@ -3610,6 +3621,13 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
     }
 
     const std::string& attr = nodep->name();
+    // An access value is dereferenced without saying so where the attribute
+    // asks about what it points at (8.1), so "l'left" on a LINE is the left
+    // bound of the string it designates
+    if (prefixTypep && prefixTypep->base()->kind() == VhdlTypeKind::ACCESS
+        && prefixTypep->base()->designatedp()) {
+        prefixTypep = prefixTypep->base()->designatedp();
+    }
     const bool isArray = prefixTypep && prefixTypep->base()->kind() == VhdlTypeKind::ARRAY;
 
     // Attributes of an array ask about one of its index ranges; those of any

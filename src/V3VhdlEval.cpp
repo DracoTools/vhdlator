@@ -497,7 +497,14 @@ private:
         // so "a(0)'length" is the length of an element, not of a. The
         // expression's own type is the one the attribute asks about.
         if (VhdlType* const exprp = prefixp->vhdlTypep()) {
-            if (!exprp->isError()) return exprp;
+            if (!exprp->isError()) {
+                // An access value is dereferenced without saying so (8.1)
+                if (exprp->base()->kind() == VhdlTypeKind::ACCESS
+                    && exprp->base()->designatedp()) {
+                    return exprp->base()->designatedp();
+                }
+                return exprp;
+            }
         }
         if (symp && symp->typep()) return symp->typep();
         return nullptr;

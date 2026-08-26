@@ -621,7 +621,7 @@ void V3VhdlStd::buildTextio() {
     addProcN(s_textiop, "readline", {{"f", s_textp}, {"l", s_linep}});
     addProcN(s_textiop, "writeline", {{"f", s_textp}, {"l", s_linep}});
     addProcN(s_textiop, "tee", {{"f", s_textp}, {"l", s_linep}});
-    addFuncN(s_textiop, "endfile", s_booleanp, {{"f", s_textp}});
+    // ENDFILE comes with the file type itself, so TEXT already has it (5.5.2)
     addFuncN(s_textiop, "endline", s_booleanp, {{"l", s_linep}});
 
     // READ, WRITE and their VHDL-2008 radix forms, over the predefined types

@@ -1148,7 +1148,27 @@ private:
         // the range itself was emitted with (16.2)
         if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
             || attr == "length" || attr == "ascending") {
-            const VhdlType* const typep = nodep->prefixp()->vhdlTypep();
+            const VhdlType* typep = nodep->prefixp()->vhdlTypep();
+            // An access value is dereferenced without saying so (8.1)
+            if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS
+                && typep->base()->designatedp()) {
+                typep = typep->base()->designatedp();
+            }
+            // A STRING whose length is not fixed by its subtype -- what a
+            // LINE points at -- carries it at run time, so the bounds are
+            // read from the value rather than from the type. Such a value
+            // always runs from 1 (16.3).
+            if (typep && isStringType(typep) && !typep->isConstrainedArray()) {
+                if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                AstNodeExpr* const strp = lowerExpr(nodep->prefixp());
+                if (!strp) return nullptr;
+                if (attr == "ascending") return new AstConst{flp, AstConst::BitTrue{}};
+                if (attr == "left" || attr == "low") {
+                    VL_DO_DANGLING(strp->deleteTree(), strp);
+                    return new AstConst{flp, AstConst::Signed32{}, 1};
+                }
+                return new AstLenN{flp, strp};
+            }
             int dim = 0;
             if (argp) {
                 if (const AstConst* const constp = VN_CAST(argp, Const)) {
@@ -1713,6 +1733,15 @@ private:
             VL_DO_DANGLING(newp->deleteTree(), newp);
             return nullptr;
         }
+        // An access to STRING is a LINE, which is text rather than an object
+        // with a handle, so allocating one is just the text it holds
+        const VhdlType* const designatedp
+            = nodep->valuep() ? nodep->valuep()->vhdlTypep()
+                              : (nodep->subtypep() ? nodep->subtypep()->vhdlTypep() : nullptr);
+        if (designatedp && isStringType(designatedp)) {
+            VL_DO_DANGLING(newp->deleteTree(), newp);
+            return valuep;
+        }
         newp->addArgsp(new AstArg{flp, "", valuep});
         return newp;
     }
@@ -1942,7 +1971,8 @@ private:
         // "p.all" reads what an access value points at (8.3)
         if (nodep->isAll()) {
             AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
-            return fromp ? dereference(fromp, flp) : nullptr;
+            if (!fromp) return nullptr;
+            return derefIfAccess(fromp, nodep->prefixp(), flp);
         }
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (symp && symp->kind() == VhdlSymKind::RECORD_ELEMENT) {
