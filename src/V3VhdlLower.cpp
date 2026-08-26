@@ -842,6 +842,12 @@ private:
             // it is a static variable of the module, not a local one
             if (objp->defaultp()) {
                 varp->valuep(lowerExpr(objp->defaultp()));
+            } else if (AstNodeExpr* const spacesp = dynamicStringInit(symp->typep(), flp)) {
+                // A STRING as long as something only known while running --
+                // "variable r : string(s'range)" over an unconstrained
+                // parameter -- has to start out that long, or writing to an
+                // element of it writes nothing at all
+                varp->valuep(spacesp);
             } else {
                 varp->valuep(defaultValueFor(symp->typep(), flp));
             }
@@ -894,7 +900,59 @@ private:
     // VHDL initializes every object to the leftmost value of its subtype
     // (6.4.2.2), which for STD_LOGIC is 'U'. Two-state, that is X, and
     // --x-initial gives the randomization that most nearly stands in for it.
-    // A packed array's default is its element's default repeated. Written as
+    // A STRING whose length is an expression rather than a number, as the
+    // value that many characters. Null where the length is not one of the
+    // shapes that can be worked out here.
+    AstNodeExpr* dynamicStringInit(VhdlType* typep, FileLine* flp) {
+        if (!typep || !isStringType(typep) || typep->isConstrainedArray()) return nullptr;
+        AstNodeExpr* const lenp = dynamicLength(typep, flp);
+        if (!lenp) return nullptr;
+        return new AstReplicateN{flp, new AstConst{flp, AstConst::String{}, " "}, lenp};
+    }
+
+    // How long an array whose bounds are expressions will be, as an
+    // expression: "right - left + 1" the way the range runs, and for a range
+    // written as another object's own the length of that object
+    AstNodeExpr* dynamicLength(VhdlType* typep, FileLine* flp) {
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (indexes.size() != 1 || !indexes[0] || !indexes[0]->boundsp()) return nullptr;
+        AstVhdlRange* const rp = VN_CAST(indexes[0]->boundsp(), VhdlRange);
+        if (!rp) return nullptr;
+        if (rp->leftp() && rp->rightp()) {
+            AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+            AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+            if (!leftp || !rightp) {
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return nullptr;
+            }
+            AstNodeExpr* const spanp = rp->dir() == VhdlDir::TO
+                                           ? new AstSub{flp, rightp, leftp}
+                                           : new AstSub{flp, leftp, rightp};
+            return new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        }
+        // "s'range" of a string whose own length is only known while running
+        AstVhdlAttrName* const attrp
+            = rp->attrp() ? VN_CAST(rp->attrp(), VhdlAttrName) : nullptr;
+        if (!attrp || !attrp->prefixp()) return nullptr;
+        if (attrp->name() != "range" && attrp->name() != "reverse_range") return nullptr;
+        const VhdlType* ptypep = attrp->prefixp()->vhdlTypep();
+        if (ptypep && ptypep->base()->kind() == VhdlTypeKind::ACCESS
+            && ptypep->base()->designatedp()) {
+            ptypep = ptypep->base()->designatedp();
+        }
+        if (!ptypep || !isStringType(ptypep)) return nullptr;
+        if (ptypep->isConstrainedArray()) {
+            const std::vector<VhdlType*>& pidx = ptypep->indexTypes();
+            if (pidx.empty() || !pidx[0] || !pidx[0]->bounded()) return nullptr;
+            return new AstConst{flp, AstConst::Signed32{},
+                                static_cast<int32_t>(pidx[0]->length())};
+        }
+        AstNodeExpr* const strp = lowerExpr(attrp->prefixp());
+        return strp ? new AstLenN{flp, strp} : nullptr;
+    }
+
+    // A packed array's default is its element's default repeated.    // A packed array's default is its element's default repeated. Written as
     // a concatenation, the way a packed record's default is: the parts are
     // constants, so their widths are known before V3Width runs.
     static AstNodeExpr* packedRepeat(AstNodeExpr* elemp, int64_t count, FileLine* flp) {
@@ -1111,7 +1169,12 @@ private:
         // An enumeration value is its own position, and a position its own
         // value, so 'POS and 'VAL are identities in the emitted code (16.2.3)
         if (attr == "pos") {
-            if (argp) return argp;
+            // "T'POS(v)" is an integer, however narrow the value's own type
+            if (argp) {
+                return new AstCast{flp, argp, VFlagChildDType{},
+                                   new AstBasicDType{flp, VBasicDTypeKwd::INTEGER,
+                                                     VSigning::SIGNED}};
+            }
         } else if (attr == "val") {
             // "T'VAL(n)" is a value of T, so it is as wide as T even though
             // the position it is given is an integer
@@ -2573,6 +2636,97 @@ private:
             return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
         }
         if (args.empty()) return nullptr;
+        // "to_string(v)" is the text of the value: for a scalar the same as
+        // T'IMAGE, except that a CHARACTER or a STRING is its own characters
+        // with no quotation marks around them (16.3)
+        // "justify(v, side, field)" pads a string out to a width, on the
+        // left where it is justified RIGHT and on the right where LEFT
+        // (16.4). SIDE is declared as (RIGHT, LEFT), so RIGHT is position 0.
+        if (name == "justify" && symp->predefined() && !args.empty() && args.size() <= 3) {
+            AstNodeExpr* const valuep = lowerExpr(args[0]);
+            if (!valuep) return nullptr;
+            int64_t field = 0;
+            if (args.size() >= 3) {
+                const VhdlValue fv = V3VhdlEval::eval(args[2]);
+                if (!fv.isInt()) {
+                    unsup(flp, "justify to a width that is not static");
+                    VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                    return nullptr;
+                }
+                field = fv.toInt();
+            }
+            bool right = true;
+            if (args.size() >= 2) {
+                const VhdlValue sv = V3VhdlEval::eval(args[1]);
+                if (!sv.isInt()) {
+                    unsup(flp, "justify to a side that is not static");
+                    VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                    return nullptr;
+                }
+                right = sv.toInt() == 0;
+            }
+            if (field <= 0) return valuep;
+            return new AstSFormatF{flp,
+                                   "%" + std::string{right ? "" : "-"} + std::to_string(field)
+                                       + "s",
+                                   false, valuep};
+        }
+        // "to_string(t, unit)" writes a time in that unit (16.3). The unit
+        // is a time of its own, so the value is scaled by it and the unit's
+        // own name follows.
+        if (name == "to_string" && args.size() == 2 && symp->predefined()
+            && args[0]->vhdlTypep()
+            && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::PHYSICAL) {
+            AstNodeExpr* const valuep = lowerExpr(args[0]);
+            const VhdlValue unitv = V3VhdlEval::eval(args[1]);
+            if (!valuep) return nullptr;
+            if (unitv.isInt() && unitv.toInt() > 0) {
+                const std::string suffix = unitNameOf(args[0]->vhdlTypep(), unitv.toInt());
+                AstNodeExpr* const scaledp
+                    = new AstDivS{flp, valuep,
+                                  new AstConst{flp, AstConst::Unsized64{},
+                                               static_cast<uint64_t>(unitv.toInt())}};
+                return new AstSFormatF{flp, "%0d " + suffix, false, scaledp};
+            }
+            // The unit is only known while running -- OSVVM reads it from a
+            // setting -- so both the scaling and the unit's name are worked
+            // out then, the name by asking which unit the value is
+            AstNodeExpr* const unitp = lowerExpr(args[1]);
+            if (!unitp) {
+                VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                return nullptr;
+            }
+            AstNodeExpr* namep = nullptr;
+            for (const auto& unit : args[0]->vhdlTypep()->base()->units()) {
+                AstNodeExpr* const litp
+                    = new AstConst{flp, AstConst::String{}, " " + unit.first};
+                if (!namep) {
+                    namep = litp;
+                    continue;
+                }
+                namep = new AstCond{
+                    flp,
+                    new AstEq{flp, unitp->cloneTree(false),
+                              new AstConst{flp, AstConst::Unsized64{},
+                                           static_cast<uint64_t>(unit.second)}},
+                    litp, namep};
+            }
+            AstNodeExpr* const scaledp = new AstDivS{flp, valuep, unitp};
+            AstSFormatF* const outp = new AstSFormatF{flp, "%0d%s", false, scaledp};
+            if (namep) outp->addExprsp(namep);
+            return outp;
+        }
+        if (name == "to_string" && args.size() == 1 && symp->predefined()) {
+            const VhdlType* const vtypep = args[0]->vhdlTypep();
+            AstNodeExpr* const valuep = lowerExpr(args[0]);
+            if (!valuep) return nullptr;
+            if (vtypep && isStringType(vtypep)) return valuep;
+            if (vtypep && vtypep->base() == V3VhdlStd::characterType()->base()) {
+                return new AstSFormatF{flp, "%c", false, valuep};
+            }
+            if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp)) return namep;
+            return new AstSFormatF{flp, formatFor(vtypep, false), false, valuep};
+        }
         // An edge test is the shape a clocked process is recognised by, but
         // it may be written anywhere; compiling std_logic_1164's own body for
         // it would ask about the history of a signal-class parameter, which
@@ -4714,7 +4868,24 @@ private:
                 // "for i in v'range" over an object whose bounds are not
                 // static, which is how a width-generic design is written
                 const std::string& name = attrp->name();
-                if (name == "range" || name == "reverse_range") {
+                // A STRING whose length its subtype does not fix -- what a
+                // LINE points at, or an unconstrained parameter given one --
+                // runs from 1 to however long the value is
+                const VhdlType* strTypep
+                    = attrp->prefixp() ? attrp->prefixp()->vhdlTypep() : nullptr;
+                if (strTypep && strTypep->base()->kind() == VhdlTypeKind::ACCESS
+                    && strTypep->base()->designatedp()) {
+                    strTypep = strTypep->base()->designatedp();
+                }
+                if ((name == "range" || name == "reverse_range") && strTypep
+                    && isStringType(strTypep) && !strTypep->isConstrainedArray()) {
+                    if (AstNodeExpr* const strp = lowerExpr(attrp->prefixp())) {
+                        initp = new AstConst{flp, AstConst::Signed32{}, 1};
+                        limitp = new AstLenN{flp, strp};
+                        ascending = name == "range";
+                        if (!ascending) std::swap(initp, limitp);
+                    }
+                } else if (name == "range" || name == "reverse_range") {
                     int dim = 0;
                     if (attrp->argp()) {
                         const VhdlValue dimv = V3VhdlEval::eval(attrp->argp());
@@ -5616,6 +5787,26 @@ private:
     }
 
     // How a value of that type reads
+    // The name of the unit of a physical type whose scale is that many
+    // primary units, or the primary unit's name if none matches
+    static std::string unitNameOf(const VhdlType* typep, int64_t scale) {
+        if (!typep) return "";
+        const VhdlType* const basep = typep->base();
+        std::string best;
+        int64_t bestScale = 0;
+        for (const auto& unit : basep->units()) {
+            if (unit.second != scale) continue;
+            return unit.first;
+        }
+        for (const auto& unit : basep->units()) {
+            if (bestScale == 0 || unit.second < bestScale) {
+                bestScale = unit.second;
+                best = unit.first;
+            }
+        }
+        return best;
+    }
+
     static std::string formatFor(const VhdlType* typep, bool isImage = false) {
         if (!typep) return "%0d";
         const VhdlType* const basep = typep->base();
