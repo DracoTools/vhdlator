@@ -1203,6 +1203,11 @@ class TimingControlVisitor final : public VNVisitor {
         // Insert new vars before the timing control if we're in a function; in a process we can't
         // do that. These intra-assignment vars will later be passed to forked processes by value.
         AstNode* insertBeforep = m_underProcedure ? nullptr : controlp;
+        // Where the assignment that samples them goes. For a non-blocking
+        // assignment this moves inside the fork below, so that an assignment
+        // executed again before the first has been delivered does not
+        // overwrite the value the first is carrying.
+        AstNode* sampleBeforep = controlp;
         // Special case for NBA
         if (inAssignDly) {
             // Put it in a fork so it doesn't block
@@ -1225,6 +1230,14 @@ class TimingControlVisitor final : public VNVisitor {
             if (!beginp) beginp = new AstBegin{nodep->fileline(), "", controlp, false};
             forkp->addForksp(beginp);
             controlp = forkp;
+            // A join_none child runs until it blocks, so sampling as its first
+            // statement still happens where the assignment stands -- but the
+            // variable holding what was sampled now belongs to the child, and
+            // the next activation gets one of its own
+            if (beginp->stmtsp()) {
+                sampleBeforep = beginp->stmtsp();
+                insertBeforep = sampleBeforep;
+            }
         }
         UASSERT_OBJ(nodep, controlp, "Assignment should have timing control");
         // Move `insertBeforep` into `AstCLocalScope` if necessary to avoid jumping over
@@ -1236,7 +1249,7 @@ class TimingControlVisitor final : public VNVisitor {
                                                  const std::string& name) {
             AstVarScope* const newvscp = createTemp(flp, name, valuep->dtypep(), insertBeforep);
             valuep->replaceWith(new AstVarRef{flp, newvscp, VAccess::READ});
-            controlp->addHereThisAsNext(
+            sampleBeforep->addHereThisAsNext(
                 new AstAssign{flp, new AstVarRef{flp, newvscp, VAccess::WRITE}, valuep});
         };
         // NBAs with delays evaluate LHS indices immediately
