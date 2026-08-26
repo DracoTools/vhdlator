@@ -24,6 +24,10 @@ architecture tb of t_vhdl_attr is
   signal vseen, nseen : integer := 0;
   signal seen : integer := 0;
   signal texts : string(1 to 40) := (others => ' ');
+  -- VHDL-2008 gives BIT and BOOLEAN edge functions of their own (16.3)
+  signal b : bit := '0';
+  signal k : boolean := false;
+  signal bseen, kseen : integer := 0;
 begin
 
   -- A process with a sensitivity list, which is not a clocked one
@@ -32,6 +36,12 @@ begin
     if s'event then
       seen <= seen + 1;
     end if;
+  end process;
+
+  edges : process (b, k)
+  begin
+    if rising_edge(b) then bseen <= bseen + 1; end if;
+    if falling_edge(k) then kseen <= kseen + 1; end if;
   end process;
 
   wide : process (v, n)
@@ -44,10 +54,14 @@ begin
   begin
     wait for 10 ns;
     s <= '1';
+    b <= '1';
+    k <= true;
     v <= "0010";   -- bit 1, not bit 0
     n <= 2;        -- bit 1, not bit 0
     wait for 10 ns;
     s <= '0';
+    b <= '0';
+    k <= false;
     wait;
   end process;
 
@@ -74,6 +88,8 @@ begin
     assert s'last_value = '1' report "last_value later" severity failure;
     assert s'last_event = 5 ns report "last_event later" severity failure;
     assert seen = 2 report "seen later" severity failure;
+    assert bseen = 1 report "rising_edge of a bit" severity failure;
+    assert kseen = 1 report "falling_edge of a boolean" severity failure;
 
     report "*-* All Finished *-*";
     stop;

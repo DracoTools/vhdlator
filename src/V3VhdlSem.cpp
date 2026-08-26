@@ -3923,6 +3923,17 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         }
         return V3VhdlStd::errorType();
     }
+    if (cands.size() > 1) {
+        // An argument whose own type is already in error settles nothing, and
+        // saying the call is ambiguous on top of the mistake that made it so
+        // is noise rather than news
+        for (const VhdlType* const typep : argTypes) {
+            if (!typep || !typep->isError()) continue;
+            nodep->vhdlSymp(cands[0]);
+            return cands[0]->returnTypep() ? cands[0]->returnTypep()
+                                           : V3VhdlStd::errorType();
+        }
+    }
     VhdlType* const resultp
         = pick(nodep, cands, wantp,
                "subprogram '" + (parts.empty() ? std::string{"<name>"} : parts.back()) + "'");

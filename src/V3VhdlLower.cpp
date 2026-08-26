@@ -1796,10 +1796,22 @@ private:
         const int64_t count = (idxp->ascending() ? right - left : left - right) + 1;
         if (count <= 0) {
             // A null array has no elements, so the answer is the element
-            // type's own limit -- which needs a value this does not have
+            // type's own limit at the other end: the least of nothing is the
+            // largest value the type has (5.3.2.4)
             VL_DO_DANGLING(arrp->deleteTree(), arrp);
-            unsup(flp, std::string{wantMax ? "maximum" : "minimum"} + " over a null array");
-            return nullptr;
+            VhdlType* const elemp = typep->elementp();
+            if (!elemp || !elemp->bounded()) {
+                unsup(flp, std::string{wantMax ? "maximum" : "minimum"} + " over a null array");
+                return nullptr;
+            }
+            const bool wantHigh = !wantMax;
+            if (elemp->base()->kind() == VhdlTypeKind::FLOATING) {
+                return lowerValue(
+                    VhdlValue::mkReal(wantHigh ? elemp->highReal() : elemp->lowReal(), elemp),
+                    elemp, flp);
+            }
+            return lowerValue(VhdlValue::mkInt(wantHigh ? elemp->high() : elemp->low(), elemp),
+                              elemp, flp);
         }
         const bool signd = typep->elementp() && isSignedType(typep->elementp());
         AstNodeExpr* bestp = nullptr;

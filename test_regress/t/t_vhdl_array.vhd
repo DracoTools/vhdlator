@@ -28,6 +28,11 @@ architecture tb of t_vhdl_array is
 
   constant n : nibble := "1011";
 
+  -- MINIMUM and MAXIMUM answer for a whole array of any scalar element, and
+  -- for a null one they give the element type's limit at the other end
+  type freqs is array (natural range <>) of time;
+  constant fs : freqs(1 to 3) := (1 ns, 10 ns, 3 ns);
+
   -- A range attribute names a range wherever one is wanted, including as
   -- the constraint of a declaration
   function flip (x : bit_vector) return bit_vector is
@@ -51,6 +56,7 @@ begin
     variable a, b : integer;
     variable lo, hi : bits(0 to 1);
     variable bv : bit_vector(1 to 4) := "1101";
+    variable nofs : freqs(3 to 1);
   begin
     -- An aggregate may stand on the left of an assignment: each name takes
     -- the element of the value in its own position (10.6.2)
@@ -76,6 +82,11 @@ begin
     assert m(1, 2) = 8 report "m(1,2)" severity failure;
 
     assert flip(bv) = "1011" report "reverse_range" severity failure;
+
+    assert minimum(fs) = 1 ns report "minimum over an array" severity failure;
+    assert maximum(fs) = 10 ns report "maximum over an array" severity failure;
+    assert minimum(nofs) = time'high report "minimum over a null array" severity failure;
+    assert maximum(nofs) = time'low report "maximum over a null array" severity failure;
     report "*-* All Finished *-*";
     stop;
   end process;

@@ -296,13 +296,14 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         addFunc(scopep, ">=", boolp, {typep, typep});
         addFunc(scopep, "minimum", typep, {typep, typep});
         addFunc(scopep, "maximum", typep, {typep, typep});
-        // A one-dimensional array of a scalar also answers for the whole of
-        // itself, giving one element back (5.3.2.4)
-        if (typep->kind() == VhdlTypeKind::ARRAY && typep->elementp()
-            && typep->elementp()->isScalar()) {
-            addFunc(scopep, "minimum", typep->elementp(), {typep});
-            addFunc(scopep, "maximum", typep->elementp(), {typep});
-        }
+    }
+    // A one-dimensional array of a scalar answers for the whole of itself,
+    // giving one element back (5.3.2.4). That holds for any scalar element,
+    // where the ordering operators above need a discrete one.
+    if (typep->kind() == VhdlTypeKind::ARRAY && typep->dimensions() == 1 && typep->elementp()
+        && typep->elementp()->isScalar()) {
+        addFunc(scopep, "minimum", typep->elementp(), {typep});
+        addFunc(scopep, "maximum", typep->elementp(), {typep});
     }
 
     if (typep->isNumeric()) {
@@ -523,6 +524,13 @@ void V3VhdlStd::build() {
 
     // NOW, and the 2008 conversions between TIME and REAL/INTEGER
     addFunc(s_standardp, "now", s_delayp, {});
+    // VHDL-2008 gives BIT and BOOLEAN their own edge functions (16.3)
+    if (s_bitp && s_booleanp) {
+        addFunc(s_standardp, "rising_edge", s_booleanp, {s_bitp});
+        addFunc(s_standardp, "falling_edge", s_booleanp, {s_bitp});
+        addFunc(s_standardp, "rising_edge", s_booleanp, {s_booleanp});
+        addFunc(s_standardp, "falling_edge", s_booleanp, {s_booleanp});
+    }
 
     // Implicit operators for every predefined type
     for (VhdlType* const typep :
