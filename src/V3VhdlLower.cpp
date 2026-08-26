@@ -2839,7 +2839,54 @@ private:
         case VhdlBinaryOp::SRL: return new AstShiftR{flp, lhsp, rhsp};
         case VhdlBinaryOp::SRA: return new AstShiftRS{flp, lhsp, rhsp};
         case VhdlBinaryOp::ROL:
-        case VhdlBinaryOp::ROR: unsup(flp, "rotate operator"); return nullptr;
+        case VhdlBinaryOp::ROR: {
+            // 9.2.4 says a rotate moves every element one place and repeats
+            // that as many times as the right operand asks, with a negative
+            // count going the other way. Repeating past the length comes back
+            // round, so the count is folded into range and the rotate is the
+            // two shifts it amounts to. Both operands are read into variables
+            // first, since each is needed twice and neither may run twice.
+            const int width = exprVectorWidth(nodep->lhsp());
+            if (width <= 0) {
+                unsup(flp, "rotate of a vector whose length is not known here");
+                return nullptr;
+            }
+            AstVar* const valp = newTempVar("__Vrotv", newLogicDType(flp, width), flp);
+            AstVar* const cntp = newTempVar("__Vrotn", newIntDType(flp), flp);
+            const auto widthConst = [&]() {
+                return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(width)};
+            };
+            AstNodeExpr* placesp
+                = nodep->op() == VhdlBinaryOp::ROL
+                      ? rhsp
+                      : static_cast<AstNodeExpr*>(new AstNegate{flp, rhsp});
+            // ((n rem W) + W) rem W leaves the count in 0 .. W-1 whichever
+            // way round it was written
+            AstNodeExpr* const foldedp = new AstModDivS{
+                flp,
+                new AstAdd{flp, new AstModDivS{flp, placesp, widthConst()}, widthConst()},
+                widthConst()};
+            AstNode* stmtsp
+                = new AstAssign{flp, new AstVarRef{flp, valp, VAccess::WRITE}, lhsp};
+            stmtsp = AstNode::addNext(
+                stmtsp, static_cast<AstNode*>(new AstAssign{
+                            flp, new AstVarRef{flp, cntp, VAccess::WRITE}, foldedp}));
+            // The part that wraps is written as two shifts rather than one by
+            // W - count, because that would be a shift by the whole width
+            // when the count is zero
+            AstNodeExpr* const wrapp = new AstShiftR{
+                flp,
+                new AstShiftR{flp, new AstVarRef{flp, valp, VAccess::READ},
+                              new AstConst{flp, AstConst::Signed32{}, 1}},
+                new AstSub{flp, new AstConst{flp, AstConst::Signed32{}, width - 1},
+                           new AstVarRef{flp, cntp, VAccess::READ}}};
+            return new AstExprStmt{
+                flp, stmtsp,
+                new AstOr{flp,
+                          new AstShiftL{flp, new AstVarRef{flp, valp, VAccess::READ},
+                                        new AstVarRef{flp, cntp, VAccess::READ}},
+                          wrapp}};
+        }
         }
         unsup(flp, "binary operator");
         return nullptr;
@@ -5321,7 +5368,28 @@ private:
             return;
         }
         if (nodep->exprp()) {
-            unsup(flp, "case generate statement");
+            // A case generate elaborates the one alternative whose choices
+            // cover the selector (11.8). Written out, each alternative's
+            // choices are the test that picks it, so this is the same shape
+            // as an if generate with "others" standing for the final else.
+            std::vector<AstVhdlGenerateBody*> calts;
+            for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+                calts.push_back(VN_AS(p, VhdlGenerateBody));
+            }
+            AstNode* coutp = nullptr;
+            for (size_t i = calts.size(); i-- > 0;) {
+                AstNode* const itemsp = lowerGenerateBody(calts[i]);
+                const std::string altLabel
+                    = calts[i]->name().empty() ? label : label + "__" + calts[i]->name();
+                AstNode* const blockp = new AstGenBlock{flp, altLabel, itemsp, false};
+                AstNodeExpr* const testp = choiceTest(calts[i]->choicesp(), nodep->exprp());
+                if (!testp) {
+                    coutp = blockp;  // "when others"
+                    continue;
+                }
+                coutp = new AstGenIf{calts[i]->fileline(), testp, blockp, coutp};
+            }
+            addStmt(coutp);
             return;
         }
         // An if generate, with its elsif and else branches
@@ -5423,11 +5491,55 @@ private:
             v3Global.setHasForceableSignals();
             return new AstAssignForce{flp, lhsp, rhsp};
         }
-        if (nodep->kind() != VhdlAssignKind::SIMPLE) {
-            unsup(flp, "conditional signal assignment in a process");
-            return nullptr;
+        // Inside a process the conditional and selected forms are defined
+        // as the if and case statements they stand for (10.5.3, 10.5.4), so
+        // each alternative's waveform is assigned by the branch that picks
+        // it. Where nothing is picked and no "else" was written, no
+        // assignment happens at all -- unlike the concurrent forms, which
+        // hold the signal by assigning it to itself.
+        if (nodep->kind() == VhdlAssignKind::CONDITIONAL) {
+            std::vector<AstVhdlAlternative*> alts;
+            for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+                alts.push_back(VN_AS(p, VhdlAlternative));
+            }
+            AstNode* outp = nullptr;
+            for (size_t i = alts.size(); i-- > 0;) {
+                AstNode* const thenp = lowerSeqWaveform(nodep, alts[i]->wavesp(), sequential);
+                if (!alts[i]->condp()) {
+                    outp = thenp;  // The trailing "else"
+                    continue;
+                }
+                outp = new AstIf{alts[i]->fileline(), lowerCondition(alts[i]->condp()), thenp,
+                                 outp};
+            }
+            return outp;
         }
-        AstVhdlWaveform* const wfp = nodep->wavesp();
+        if (nodep->kind() == VhdlAssignKind::SELECTED) {
+            AstNodeVhdlExpr* const selp = nodep->selectorp();
+            if (!selp) return nullptr;
+            std::vector<AstVhdlAlternative*> alts;
+            for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+                alts.push_back(VN_AS(p, VhdlAlternative));
+            }
+            AstNode* outp = nullptr;
+            for (size_t i = alts.size(); i-- > 0;) {
+                AstNode* const thenp = lowerSeqWaveform(nodep, alts[i]->wavesp(), sequential);
+                AstNodeExpr* const testp = choiceTest(alts[i]->choicesp(), selp);
+                if (!testp) {
+                    outp = thenp;  // "when others"
+                    continue;
+                }
+                outp = new AstIf{alts[i]->fileline(), testp, thenp, outp};
+            }
+            return outp;
+        }
+        return lowerSeqWaveform(nodep, nodep->wavesp(), sequential);
+    }
+
+    // The assignment one waveform stands for, which is what each branch of a
+    // conditional or selected signal assignment reduces to
+    AstNode* lowerSeqWaveform(AstVhdlSigAssign* nodep, AstVhdlWaveform* wfp, bool sequential) {
+        FileLine* const flp = nodep->fileline();
         if (!wfp || !wfp->valuep()) return nullptr;
         // "s <= a after t1, b after t2" schedules each element at its own
         // time (10.5.2.2). Each becomes a delayed assignment of its own,
@@ -5623,19 +5735,47 @@ private:
     // A variable assignment takes effect at once (10.6)
     AstNode* lowerVarAssign(AstVhdlVarAssign* nodep) {
         FileLine* const flp = nodep->fileline();
+        // "v := a when c else b" and "with s select v := ..." are defined as
+        // the if and case statements they stand for (10.6.3, 10.6.4), so each
+        // alternative's value is assigned by the branch that picks it
         if (nodep->kind() != VhdlAssignKind::SIMPLE) {
-            unsup(flp, "conditional variable assignment");
-            return nullptr;
+            std::vector<AstVhdlAlternative*> alts;
+            for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+                alts.push_back(VN_AS(p, VhdlAlternative));
+            }
+            AstNode* outp = nullptr;
+            for (size_t i = alts.size(); i-- > 0;) {
+                AstVhdlWaveform* const wfp = alts[i]->wavesp();
+                AstNode* const thenp = wfp ? lowerVarValue(nodep, wfp->valuep(), flp) : nullptr;
+                AstNodeExpr* testp = nullptr;
+                if (nodep->kind() == VhdlAssignKind::CONDITIONAL) {
+                    if (alts[i]->condp()) testp = lowerCondition(alts[i]->condp());
+                } else if (nodep->selectorp()) {
+                    testp = choiceTest(alts[i]->choicesp(), nodep->selectorp());
+                }
+                if (!testp) {
+                    outp = thenp;  // The trailing "else", or "when others"
+                    continue;
+                }
+                outp = new AstIf{alts[i]->fileline(), testp, thenp, outp};
+            }
+            return outp;
         }
+        return lowerVarValue(nodep, nodep->valuep(), flp);
+    }
+
+    // The assignment one value stands for, which is what each branch of a
+    // conditional or selected variable assignment reduces to
+    AstNode* lowerVarValue(AstVhdlVarAssign* nodep, AstNodeVhdlExpr* valuep, FileLine* flp) {
         if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {
-            if (!nodep->valuep()) return nullptr;
-            return lowerAggregateTarget(aggp, nodep->valuep(), false, false, flp);
+            if (!valuep) return nullptr;
+            return lowerAggregateTarget(aggp, valuep, false, false, flp);
         }
-        if (nodep->valuep() && isDynTarget(nodep->targetp())) {
-            return lowerDynCopy(nodep->targetp(), nodep->valuep(), flp);
+        if (valuep && isDynTarget(nodep->targetp())) {
+            return lowerDynCopy(nodep->targetp(), valuep, flp);
         }
         AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
-        AstNodeExpr* const rhsp = nodep->valuep() ? lowerExpr(nodep->valuep()) : nullptr;
+        AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
         if (!lhsp || !rhsp) return nullptr;
         return new AstAssign{flp, lhsp, rhsp};
     }

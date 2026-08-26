@@ -26,7 +26,8 @@ begin
     wait for 10 ns;
   end process;
 
-  -- The rotate operators have no direct equivalent yet
-  q <= v rol 1;
+  -- An external name that starts from the enclosing region rather than the
+  -- design root has no equivalent to point at yet (8.7)
+  q(0) <= << signal ^.outer : bit >>;
 
 end architecture;

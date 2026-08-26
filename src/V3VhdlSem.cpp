@@ -946,6 +946,7 @@ private:
     void visit(AstVhdlBlock* nodep) override;
     void visit(AstVhdlGenerate* nodep) override;
     void visit(AstVhdlGenerateBody* nodep) override;
+    VhdlType* m_genSelTypep = nullptr;  // Selector of the case generate being analyzed
     void visit(AstVhdlLoop* nodep) override;
     // Statements, where the expected type of each expression is known
     void visit(AstVhdlSigAssign* nodep) override;
@@ -1847,6 +1848,11 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
     // it declares is inside it (11.8)
     RangeInfo info;
     if (nodep->kind() == VhdlLoopKind::FOR) info = analyzeRange(nodep->rangep(), nullptr);
+    // A case generate's selector is named outside the generate too, and each
+    // alternative's choices are of its type (11.8), the same rule the case
+    // statement follows
+    VL_RESTORER(m_genSelTypep);
+    m_genSelTypep = nodep->exprp() ? analyzeExpr(nodep->exprp(), nullptr) : nullptr;
     pushScope(nodep->name().empty() ? "generate" : nodep->name());
     if (nodep->kind() == VhdlLoopKind::FOR) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::GENERATE_PARAMETER,
@@ -1855,7 +1861,6 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
     }
-    iterateAndNextNull(nodep->exprp());
     iterateAndNextNull(nodep->altsp());
     popScope();
 }
@@ -1865,7 +1870,7 @@ void VhdlSemVisitor::visit(AstVhdlGenerateBody* nodep) {
     // rather than iterating: iterating would leave its names unresolved
     if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
     for (AstNode* p = nodep->choicesp(); p; p = p->nextp()) {
-        analyzeChoice(VN_AS(p, VhdlChoice), nullptr);
+        analyzeChoice(VN_AS(p, VhdlChoice), m_genSelTypep);
     }
     pushScope(nodep->name().empty() ? "generate body" : nodep->name());
     iterateAndNextNull(nodep->declsp());
