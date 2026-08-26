@@ -132,6 +132,7 @@ class VhdlLowerVisitor final {
     const VhdlType* m_protTypep = nullptr;
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
+    std::set<std::string> m_instantiated;  // Modules something else builds one of
     // The loops being lowered, innermost last. A labelled exit or next names
     // a loop that need not be the innermost (10.11, 10.12), which Verilator's
     // break and continue cannot express, so those become a jump out of a
@@ -170,6 +171,7 @@ public:
     }
 
     void lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    void addTraceRequest() VL_MT_DISABLED;
     static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
 private:
@@ -747,6 +749,30 @@ private:
                 rangep = new AstRange{flp, static_cast<int>(idxp->left()),
                                       static_cast<int>(idxp->right())};
             }
+            // A vector of single bits is what Verilog writes as "logic
+            // [7:0]", which is a type with a range rather than an array of
+            // one-bit elements. Saying it that way keeps the range as it was
+            // written -- including a range that runs upward, which an array
+            // of bits cannot carry through to a waveform.
+            const AstBasicDType* const elemBasicp = VN_CAST(dtypep, BasicDType);
+            if (packed && elemBasicp && elemBasicp->isBitLogic() && !elemBasicp->isRanged()
+                && elemBasicp->width() == 1 && VN_IS(rangep->leftp(), Const)
+                && VN_IS(rangep->rightp(), Const)) {
+                const int left = VN_AS(rangep->leftp(), Const)->toSInt();
+                const int right = VN_AS(rangep->rightp(), Const)->toSInt();
+                // Only where the range ends at zero, which is what Verilog
+                // writes and what its packed types are built for. A vector
+                // indexed from somewhere else stays an array of bits.
+                if (left == 0 || right == 0) {
+                    AstNodeDType* const vectorp
+                        = new AstBasicDType{flp, elemBasicp->keyword(), VSigning::NOSIGN,
+                                            VNumRange{left, right}, -1};
+                    VL_DO_DANGLING(rangep->deleteTree(), rangep);
+                    VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+                    dtypep = vectorp;
+                    continue;
+                }
+            }
             if (packed) {
                 dtypep = new AstPackArrayDType{flp, VFlagChildDType{}, dtypep, rangep};
             } else {
@@ -1001,6 +1027,10 @@ private:
             name = tryp;
         }
         AstVar* const varp = new AstVar{flp, varType, name, VFlagChildDType{}, dtypep};
+        // Something the design declared, so it is what a waveform shows. The
+        // temporaries the lowering makes for itself are not, and are made
+        // elsewhere.
+        varp->trace(true);
         m_vars.emplace(symp, varp);
         return varp;
     }
@@ -2386,6 +2416,19 @@ private:
                && atp->indexTypes()[0]->right() == ttp->indexTypes()[0]->right();
     }
 
+    // What an alias of a slice is an alias of. An index into such an alias is
+    // put onto the numbering of the object the slice comes from, so that is
+    // what has to be indexed.
+    static AstNodeVhdlExpr* aliasBase(VhdlSymbol* symp, AstNodeVhdlExpr* prefixp) {
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return prefixp;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!declp || !declp->targetp()) return prefixp;
+        AstVhdlCall* const callp = VN_CAST(declp->targetp(), VhdlCall);
+        if (!callp || !VN_IS(callp->argsp(), VhdlRange)) return prefixp;
+        if (aliasKeepsRange(symp, declp)) return prefixp;
+        return callp->prefixp();
+    }
+
     // An index into an alias, put onto the range of what it denotes
     static AstNodeExpr* aliasShift(VhdlSymbol* symp, AstNodeExpr* idxp, FileLine* flp) {
         if (!symp || symp->kind() != VhdlSymKind::ALIAS || !idxp) return idxp;
@@ -2957,9 +3000,14 @@ private:
                 AstNodeExpr* const objp = lowerExpr(dynObjp);
                 return objp ? lowerDynIndex(nodep, dynp, objp, flp) : nullptr;
             }
-            AstNodeExpr* fromp = lowerExpr(nodep->prefixp());
+            // An alias of a slice numbers its elements its own way, and
+            // aliasShift below puts an index back onto the numbering of what
+            // it denotes -- so it is that object that is indexed, not the
+            // slice, whose own indices start again from its length (6.6.2)
+            AstNodeVhdlExpr* const prefixExprp = aliasBase(objSymp, nodep->prefixp());
+            AstNodeExpr* fromp = lowerExpr(prefixExprp);
             if (!fromp) return nullptr;
-            fromp = derefIfAccess(fromp, nodep->prefixp(), flp);
+            fromp = derefIfAccess(fromp, prefixExprp, flp);
             if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
                 if (!rp->leftp() || !rp->rightp()) {
                     unsup(flp, "slice by an attribute range");
@@ -4942,6 +4990,7 @@ private:
         }
         const std::string instName
             = label.empty() ? "__Vinst" + std::to_string(++m_processNum) : label;
+        m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
     }
 
@@ -7266,6 +7315,42 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         if (archp) m_archOf[key] = archp->name();
         lowerEntity(entities[key], archp);
     }
+    if (v3Global.opt.trace()) addTraceRequest();
+}
+
+// VHDL has no $dumpfile: a design cannot ask for a waveform from inside
+// itself, the way a Verilog testbench does, so the tool asks on its behalf
+// when it was told to trace. The request goes in the design's own top, and
+// names the file after the model, which is what a VHDL simulator's own
+// waveform option would have done.
+void VhdlLowerVisitor::addTraceRequest() {
+    AstNodeModule* topp = nullptr;
+    const std::string wanted = VString::downcase(v3Global.opt.topModule());
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        if (!VN_IS(modp, Module)) continue;
+        if (!modp->fileline()->language().vhdl()) continue;
+        if (!wanted.empty()) {
+            if (VString::downcase(modp->name()) == wanted) topp = modp;
+        } else if (!m_instantiated.count(modp->name())) {
+            // Nothing else builds one of it, so it is the top -- and if more
+            // than one is, the last of them is what V3LinkLevel picks too
+            topp = modp;
+        }
+    }
+    if (!topp) return;
+    FileLine* const flp = topp->fileline();
+    const std::string suffix = v3Global.opt.traceEnabledFst()
+                                   ? ".fst"
+                                   : (v3Global.opt.traceEnabledSaif() ? ".saif" : ".vcd");
+    // Beside the model's other output, which is where it can be found again
+    const std::string name = v3Global.opt.makeDir() + "/" + v3Global.opt.prefix() + suffix;
+    AstNode* stmtsp
+        = new AstDumpCtl{flp, VDumpCtlType::FILE, new AstConst{flp, AstConst::String{}, name}};
+    stmtsp = AstNode::addNext(
+        stmtsp, static_cast<AstNode*>(new AstDumpCtl{
+                    flp, VDumpCtlType::VARS, new AstConst{flp, AstConst::Signed32{}, 0}}));
+    topp->addStmtsp(new AstInitial{flp, stmtsp});
 }
 
 // The architecture a configuration's outermost block configuration names

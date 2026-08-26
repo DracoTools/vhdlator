@@ -104,6 +104,14 @@ spelling that appears in traces, in the generated C++, and to VPI. Extended
 identifiers, written between backslashes, keep their case and are distinct
 from every basic identifier.
 
+VHDL has no ``$dumpfile``, so a design cannot ask for a waveform from inside
+itself the way a Verilog testbench does. Given :vlopt:`--trace-vcd` (or
+:vlopt:`--trace-fst`), Verilator asks on the design's behalf: the model
+writes every signal, from the top down, to :file:`{obj_dir}/{prefix}.vcd`
+beside its other output. A design that wants the file elsewhere, or wants to
+start and stop tracing, can do that from its own C++ main with
+:vlopt:`--exe` as any Verilator model can.
+
 See :ref:`VHDL Limitations` for where the compiled model diverges from
 the LRM, and :doc:`mixed-language` for instantiating VHDL from Verilog and
 Verilog from VHDL.
