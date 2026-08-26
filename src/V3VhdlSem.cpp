@@ -378,6 +378,10 @@ class VhdlSemVisitor final : public VNVisitor {
         analyzeExpr(attrp, nullptr);  // Resolves the prefix
         VhdlType* typep = attrp->prefixp() ? attrp->prefixp()->vhdlTypep() : nullptr;
         if (!typep || typep->isError()) return nullptr;
+        // An access value is dereferenced without saying so (8.1)
+        if (typep->base()->kind() == VhdlTypeKind::ACCESS && typep->base()->designatedp()) {
+            typep = typep->base()->designatedp();
+        }
         if (typep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
         // "v'range" where v is unconstrained -- a parameter, say -- is the
         // range of whatever it is given, not the whole of its index subtype.
@@ -2960,7 +2964,12 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
         std::vector<VhdlSymbol*> found;
         lookup(namep->isChar() ? vhdlCharLitName(namep->name()) : namep->name(), found);
         for (const VhdlSymbol* const symp : found) {
-            if (symp->isOverloadable() && !symp->paramTypes().empty()) continue;
+            // A subprogram whose parameters all have defaults may be called
+            // by naming it, so its result is one of the readings (4.2.2.1)
+            if (symp->isOverloadable() && !symp->paramTypes().empty()
+                && !allParamsDefaulted(symp)) {
+                continue;
+            }
             if (symp->kind() == VhdlSymKind::TYPE) continue;
             VhdlType* const typep = symp->returnTypep() ? symp->returnTypep() : symp->typep();
             if (typep) out.types.push_back(typep);
