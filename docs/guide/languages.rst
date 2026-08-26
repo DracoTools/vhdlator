@@ -102,7 +102,23 @@ VHDL is not case sensitive, so a signal declared ``Count`` is the same
 signal as ``COUNT``. Verilator lowercases basic identifiers, and that is the
 spelling that appears in traces, in the generated C++, and to VPI. Extended
 identifiers, written between backslashes, keep their case and are distinct
-from every basic identifier.
+from every basic identifier. Wherever a name is written on the command line
+-- :vlopt:`-G` and :vlopt:`--top-module` -- any spelling of it is accepted.
+
+A generic of the top-level entity takes its value from :vlopt:`-G`, which
+saves editing the source to try another configuration. A string generic needs
+its quotes to survive the shell:
+
+.. code-block:: bash
+
+     verilator --binary --timing fifo.vhd --top fifo \
+         -GWIDTH=32 -GDEPTH=256 -GNAME='"fifo0"'
+
+A file declaration that names its file -- ``file f : text open write_mode is
+"name";`` -- opens it as the declaration is elaborated: once for an
+architecture, a block or a process, and again on every call for a subprogram.
+The name is an ordinary expression, so a design that wants to write beside
+its model can take the directory as a generic rather than hard-coding it.
 
 VHDL has no ``$dumpfile``, so a design cannot ask for a waveform from inside
 itself the way a Verilog testbench does. Given :vlopt:`--trace-vcd` (or
@@ -451,11 +467,16 @@ assignment to the same signal deletes any transaction already projected for a
 later time, and that deletion is not modelled. A design that overwrites its
 own pending transactions sees both.
 
-**The delta cycle count is not observable.** Verilator settles combinational
-logic in a converge loop rather than counting deltas. Ordering within a
-simulation time step follows VHDL's rule that a signal assignment takes
-effect at the end of the step, but no construct can observe how many delta
-cycles a step took.
+**A delta cycle boundary is observable; the delta count is not.** A signal
+assignment schedules an update rather than making one, so a process that
+reads a signal it is not sensitive to sees the value the delta started with,
+which is what VHDL requires and what Verilog's ``#0`` does not give. What
+differs is how far ``wait for 0 ns`` goes: VHDL resumes the process in the
+next simulation cycle, after one signal update, while Verilator resumes it
+once the time step has settled. A testbench that steps through delta cycles
+one at a time -- ``s <= v; wait for 0 ns;`` and then reading a signal driven
+*from* ``s`` -- sees the settled value one cycle early. Ordinary designs,
+including every clocked one, cannot tell the difference.
 
 **Unconstrained values are sometimes slower.** Where the length of an
 unconstrained array is fixed at the call site -- which is every call into
