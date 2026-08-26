@@ -2534,7 +2534,10 @@ AstNodeVhdlExpr* V3VhdlParse::parseNamePrefix() {
     case VhdlTokType::STRING_LIT: {
         // An operator symbol used as a name, e.g. "and"(a, b)
         const VhdlToken tok = consume();
-        AstVhdlName* const nodep = new AstVhdlName{flp, tok.text};
+        // An operator symbol names a reserved word, which is not case
+        // sensitive (15.4.1), and the declaration side already folds it:
+        // IEEE's MATH_REAL declares "MOD" and the language writes "mod"
+        AstVhdlName* const nodep = new AstVhdlName{flp, lowerOperator(tok.text)};
         nodep->isOperator(true);
         return nodep;
     }

@@ -2755,7 +2755,9 @@ private:
                 // object's; specializing on it would be meaningless and would
                 // make the copy's own bounds checks fire
                 const int64_t length = typep->dimLength(0);
-                if (length <= 0 || length > (1 << 20)) return;
+                // Zero is a length: a null array has no elements at all (5.3.2.1).
+                // What this guard is for is a length that was never constrained.
+                if (length < 0 || length > (1 << 20)) return;
             }
             actualTypes.push_back(typep);
         }

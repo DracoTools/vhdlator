@@ -181,8 +181,19 @@ public:
     VhdlSymbol* aliasp() const { return m_aliasp; }
     void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }
     // An alias is transparent: it denotes whatever it was declared for (6.6.1)
-    const VhdlSymbol* resolved() const { return m_aliasp ? m_aliasp : this; }
-    VhdlSymbol* resolved() { return m_aliasp ? m_aliasp : this; }
+    // What the name finally denotes. An alias may name another alias, so the
+    // chain is followed to its end -- with a depth guard, since a malformed
+    // design could tie one in a knot.
+    const VhdlSymbol* resolved() const {
+        const VhdlSymbol* p = this;
+        for (int depth = 0; p->m_aliasp && depth < 32; ++depth) p = p->m_aliasp;
+        return p;
+    }
+    VhdlSymbol* resolved() {
+        VhdlSymbol* p = this;
+        for (int depth = 0; p->m_aliasp && depth < 32; ++depth) p = p->m_aliasp;
+        return p;
+    }
 
     const VhdlValue& value() const { return m_value; }
     void value(const VhdlValue& val) { m_value = val; }

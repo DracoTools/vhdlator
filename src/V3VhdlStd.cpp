@@ -340,6 +340,9 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
             addFunc(scopep, "/", typep, {typep, s_realp});
         }
         if (s_univIntp) addFunc(scopep, "/", s_univIntp, {typep, typep});
+        // "mod" and "rem" over a physical type give the same type (9.2.4)
+        addFunc(scopep, "mod", typep, {typep, typep});
+        addFunc(scopep, "rem", typep, {typep, typep});
     }
 
     // Logical operators over BOOLEAN, BIT and one-dimensional arrays of them
@@ -658,7 +661,11 @@ void V3VhdlStd::buildTextio() {
                                   {"justified", s_sidep, true},
                                   {"field", widthp, true},
                                   {"unit", s_timep, true}});
-    for (VhdlType* const typep : {s_bitVecp, s_stringp}) {
+    // The radix operations are declared for BIT_VECTOR only (16.4). Declaring
+    // them for STRING as well made every call with a literal argument
+    // ambiguous, since a string literal fits either.
+    {
+        VhdlType* const typep = s_bitVecp;
         for (const char* const op : {"hread", "oread", "bread"}) {
             addProcN(s_textiop, op, {{"l", s_linep}, {"value", typep}});
             addProcN(s_textiop, op, {{"l", s_linep}, {"value", typep}, {"good", s_booleanp}});
