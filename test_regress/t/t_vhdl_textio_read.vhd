@@ -17,6 +17,22 @@ entity t_vhdl_textio_read is
 end entity;
 
 architecture sim of t_vhdl_textio_read is
+
+  -- "file f : text is <name>" opens the file where it is declared, for
+  -- reading unless "open <mode>" says otherwise (6.4.2.5)
+  procedure check (expect : in string) is
+    file     fh   : text is "obj_vlt/t_vhdl_textio_read/str.txt";
+    variable l    : line;
+    variable str  : string(1 to expect'length);
+    variable good : boolean;
+  begin
+    readline(fh, l);
+    read(l, str, good);
+    assert good report "a file declared with a name was not open" severity failure;
+    assert str = expect report "declared file gave '" & str & "'" severity failure;
+    deallocate(l);
+  end procedure;
+
 begin
   main : process is
     file     fh   : text;
@@ -28,6 +44,7 @@ begin
     variable v    : std_logic_vector(7 downto 0);
     variable h    : std_logic_vector(7 downto 0);
     variable good : boolean;
+    variable s12  : string(1 to 12);
   begin
     -- Write a file, then read it back, so the test needs no input of its own
     file_open(fh, "obj_vlt/t_vhdl_textio_read/data.dat", write_mode);
@@ -65,6 +82,26 @@ begin
     assert boolean'image(true) = "true" report "boolean image" severity failure;
     assert boolean'image(false) = "false" report "boolean image" severity failure;
     assert severity_level'image(warning) = "warning" report "enum image" severity failure;
+
+    -- READ of a STRING takes as many characters as the value is long,
+    -- blanks and all, and says through GOOD whether the line had that many
+    file_open(fh, "obj_vlt/t_vhdl_textio_read/str.txt", write_mode);
+    write(l, string'("hello, world"));
+    writeline(fh, l);
+    file_close(fh);
+
+    file_open(fh, "obj_vlt/t_vhdl_textio_read/str.txt", read_mode);
+    readline(fh, l);
+    read(l, s12, good);
+    assert good report "read of a string said not good" severity failure;
+    assert s12 = "hello, world"
+      report "read of a string gave '" & s12 & "'" severity failure;
+    read(l, s12, good);
+    assert not good report "read past the end of a line said good" severity failure;
+    file_close(fh);
+
+    -- A file declared with a name is open where it is declared
+    check("hello, world");
 
     report "*-* All Finished *-*";
     stop;

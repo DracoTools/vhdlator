@@ -1204,6 +1204,12 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
     }
+    // "file f : t [open <mode>] is <name>" names the file to open and how
+    // (6.4.2.5). The name is a STRING and the mode a FILE_OPEN_KIND.
+    if (nodep->fileNamep()) {
+        analyzeExpr(nodep->fileNamep(), V3VhdlStd::stringType());
+    }
+    if (nodep->fileOpenp()) analyzeExpr(nodep->fileOpenp(), nullptr);
     if (nodep->defaultp()) {
         analyzeExpr(nodep->defaultp(), symp->typep());
         VhdlType* const declaredp = symp->typep();

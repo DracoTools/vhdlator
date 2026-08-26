@@ -1125,6 +1125,28 @@ private:
             }
             // A VHDL process variable keeps its value between activations, so
             // it is a static variable of the module, not a local one
+            if (objp->kind() == VhdlObjKind::FILE && objp->fileNamep()) {
+                // "file f : text is <name>" opens the file where it is
+                // declared, for reading unless "open <mode>" says otherwise
+                // (6.4.2.5); the open happens when the declaration is
+                // elaborated, so it is the first thing the region does
+                addStmt(varp);
+                AstNodeExpr* const namep = lowerExpr(objp->fileNamep());
+                if (namep) {
+                    std::string mode = "r";
+                    if (objp->fileOpenp()) {
+                        const VhdlValue kind = V3VhdlEval::eval(objp->fileOpenp());
+                        if (kind.isInt()) {
+                            mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
+                        }
+                    }
+                    addStmt(new AstAssign{
+                        flp, new AstVarRef{flp, varp, VAccess::WRITE},
+                        new AstFOpen{flp, namep,
+                                     new AstConst{flp, AstConst::String{}, mode}}});
+                }
+                return;
+            }
             if (objp->defaultp()) {
                 varp->valuep(lowerExpr(objp->defaultp()));
             } else if (AstNodeExpr* const spacesp = dynamicStringInit(symp->typep(), flp)) {
@@ -6382,6 +6404,51 @@ private:
                    && typep->base()->kind() != VhdlTypeKind::PHYSICAL) {
             unsup(flp, "READ of a " + typep->prettyName());
             return nullptr;
+        }
+
+        // READ of a STRING takes as many characters as the value is long,
+        // whatever they are -- blanks included, and no leading blank
+        // skipped. GOOD says whether the line had that many (16.4).
+        if (name == "read" && isStringType(typep)) {
+            AstNodeExpr* wantp = nullptr;
+            if (typep->isConstrainedArray() && !typep->indexTypes().empty()
+                && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded()) {
+                wantp = new AstConst{flp, AstConst::Signed32{},
+                                     static_cast<int32_t>(typep->indexTypes()[0]->length())};
+            } else {
+                wantp = new AstLenN{flp, valuep->cloneTree(false)};
+            }
+            AstNode* thenp = new AstAssign{
+                flp, valuep,
+                new AstSubstrN{flp, linep->cloneTree(false),
+                               new AstConst{flp, AstConst::Signed32{}, 0},
+                               new AstSub{flp, wantp->cloneTree(false),
+                                          new AstConst{flp, AstConst::Signed32{}, 1}}}};
+            thenp = AstNode::addNext(
+                thenp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, linep->cloneTree(false),
+                    new AstSubstrN{flp, linep->cloneTree(false), wantp->cloneTree(false),
+                                   new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                                              new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+            AstNode* elsep = nullptr;
+            if (args.size() == 3) {
+                AstNodeExpr* const goodp = lowerExpr(args[2]);
+                if (!goodp) {
+                    VL_DO_DANGLING(thenp->deleteTree(), thenp);
+                    VL_DO_DANGLING(linep->deleteTree(), linep);
+                    VL_DO_DANGLING(wantp->deleteTree(), wantp);
+                    return nullptr;
+                }
+                thenp = AstNode::addNext(
+                    thenp, static_cast<AstNode*>(
+                               new AstAssign{flp, goodp->cloneTree(false),
+                                             new AstConst{flp, AstConst::BitTrue{}}}));
+                elsep = new AstAssign{flp, goodp, new AstConst{flp, AstConst::BitFalse{}}};
+            }
+            AstNodeExpr* const enoughp
+                = new AstGteS{flp, new AstLenN{flp, linep}, wantp};
+            return new AstIf{flp, enoughp, thenp, elsep};
         }
 
         AstVar* const idxp = newTempVar("__Vtxtpos", new AstBasicDType{flp, VBasicDTypeKwd::INT},
