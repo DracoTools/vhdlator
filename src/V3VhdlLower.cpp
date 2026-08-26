@@ -3542,10 +3542,34 @@ private:
         for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
             AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
             if (!eap->choicesp()) {
-                const int64_t index = left + positional * step;
-                ++positional;
-                const int64_t slot = (index - left) * step;
-                if (slot >= 0 && slot < count) byIndex[static_cast<size_t>(slot)] = eap->valuep();
+                // A value of the aggregate's own type covers as many indices
+                // as it is long, whether it was written positionally or with
+                // a choice (9.3.3.3)
+                const int64_t slot = positional;
+                int64_t span = 1;
+                const VhdlType* const vtypep
+                    = eap->valuep() ? eap->valuep()->vhdlTypep() : nullptr;
+                if (vtypep && vtypep->base() == typep->base()) {
+                    if (vtypep->isConstrainedArray() && !vtypep->indexTypes().empty()
+                        && vtypep->indexTypes()[0] && vtypep->indexTypes()[0]->bounded()) {
+                        span = vtypep->indexTypes()[0]->length();
+                    } else {
+                        // A string literal carries its length in itself, not
+                        // in its type
+                        const VhdlValue val = V3VhdlEval::eval(eap->valuep());
+                        if (val.isStr()) span = static_cast<int64_t>(val.toStr().size());
+                    }
+                }
+                positional += span;
+                if (slot >= 0 && slot < count) {
+                    byIndex[static_cast<size_t>(slot)] = eap->valuep();
+                    if (span > 1 && slot + span <= count) {
+                        spanAt[static_cast<size_t>(slot)] = span;
+                        for (int64_t k = 1; k < span; ++k) {
+                            spanAt[static_cast<size_t>(slot + k)] = 0;
+                        }
+                    }
+                }
                 continue;
             }
             for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {

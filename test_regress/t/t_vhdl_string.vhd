@@ -43,6 +43,7 @@ begin
     constant filled : string := (1 to 3 => nul);
     constant mixed : string(1 to 4) := ('a', 'b', nul, 'c');
     variable words : name_array := ("one ", "two ", "tre ");
+    variable run : string(1 to 12);
   begin
     assert img(y) = "0101" report "img" severity failure;
 
@@ -73,6 +74,13 @@ begin
     assert filled = nuls report "an aggregate of nuls" severity failure;
     assert filled'length = 3 report "aggregate length" severity failure;
     assert mixed = "ab" & nul & "c" report "an aggregate with a nul in it" severity failure;
+
+    -- A value of the aggregate's own type covers as many indices as it is
+    -- long, written positionally as well as with a choice (9.3.3.3)
+    run := ("foo", "bar", "baz", others => nul);
+    assert run(1 to 9) = "foobarbaz" report "a run written positionally" severity failure;
+    assert run = "foobarbaz" & nul & nul & nul
+      report "and what follows it" severity failure;
 
     -- An array of strings is an array of objects, not a vector of bits
     assert words(0) = "one " report "words 0" severity failure;
