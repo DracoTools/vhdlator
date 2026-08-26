@@ -829,6 +829,21 @@ class VhdlSemVisitor final : public VNVisitor {
                     // "array (0 to 7)" gives a constrained array type, whose
                     // index subtype is anonymous (5.3.2.1)
                     indexTypep = makeRangeSubtype(info, flp);
+                } else if (!info.unbounded && info.valid) {
+                    // "array (0 to WIDTH-1)" is an ordinary constrained array
+                    // whose bounds are not numbers yet. Nothing requires an
+                    // index range here to be locally static; it is evaluated
+                    // when the type declaration is elaborated (14.4.2), by
+                    // which time the generic has a value. So the range is
+                    // kept as written for the back end to fold per instance,
+                    // rather than falling back on the index base type -- which
+                    // would make this an array of four billion elements.
+                    indexTypep
+                        = cloneSubtype(indexTypep ? indexTypep : V3VhdlStd::integerType(), flp);
+                    indexTypep->unbound();
+                    if (AstVhdlRange* const rp = VN_CAST(idxp, VhdlRange)) {
+                        indexTypep->boundsp(rp);
+                    }
                 }
                 if (!indexTypep) indexTypep = V3VhdlStd::integerType();
                 if (info.unbounded || !indexTypep->bounded()) unconstrained = true;

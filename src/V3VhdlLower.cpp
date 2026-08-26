@@ -724,7 +724,12 @@ private:
         for (size_t i = indexes.size(); i-- > 0;) {
             const VhdlType* const idxp = indexes[i];
             AstRange* rangep = nullptr;
-            if (!idxp || !idxp->bounded()) {
+            // The test asks about the array, not only about the index
+            // subtype: an unconstrained bit_vector has index subtype NATURAL,
+            // which is perfectly bounded, so asking the index alone lets a
+            // type that nothing ever constrained pass for a real array of
+            // 2**31 elements and be reported as one
+            if (!idxp || !idxp->bounded() || typep->unconstrained()) {
                 // A bound that names a generic is fixed once the instance is
                 // elaborated but is not a number now, so it goes to the back
                 // end as an expression and V3Param folds it per instance --
@@ -2719,6 +2724,14 @@ private:
         return nullptr;
     }
 
+    // The types the short-circuit rule of 9.2.2 names, and no others: a
+    // nine-value logic type is not one of them, and neither is an array
+    static bool shortCircuits(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        return basep == V3VhdlStd::booleanType() || basep == V3VhdlStd::bitType();
+    }
+
     AstNodeExpr* lowerBinary(AstVhdlBinary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -2774,11 +2787,28 @@ private:
             }
         }
         switch (nodep->op()) {
-        case VhdlBinaryOp::AND: return new AstAnd{flp, lhsp, rhsp};
-        case VhdlBinaryOp::OR: return new AstOr{flp, lhsp, rhsp};
+        // On BOOLEAN and BIT, and only there, these four are short-circuit
+        // operations: the right operand is evaluated only if the left has not
+        // already decided the answer (9.2.2). It is not an optimisation --
+        // "i <= v'high and v(i) = '1'" depends on it, and so does any impure
+        // function written on the right.
+        case VhdlBinaryOp::AND:
+            if (shortCircuits(ltypep)) return new AstLogAnd{flp, lhsp, rhsp};
+            return new AstAnd{flp, lhsp, rhsp};
+        case VhdlBinaryOp::OR:
+            if (shortCircuits(ltypep)) return new AstLogOr{flp, lhsp, rhsp};
+            return new AstOr{flp, lhsp, rhsp};
         case VhdlBinaryOp::XOR: return new AstXor{flp, lhsp, rhsp};
-        case VhdlBinaryOp::NAND: return new AstNot{flp, new AstAnd{flp, lhsp, rhsp}};
-        case VhdlBinaryOp::NOR: return new AstNot{flp, new AstOr{flp, lhsp, rhsp}};
+        case VhdlBinaryOp::NAND:
+            if (shortCircuits(ltypep)) {
+                return new AstLogNot{flp, new AstLogAnd{flp, lhsp, rhsp}};
+            }
+            return new AstNot{flp, new AstAnd{flp, lhsp, rhsp}};
+        case VhdlBinaryOp::NOR:
+            if (shortCircuits(ltypep)) {
+                return new AstLogNot{flp, new AstLogOr{flp, lhsp, rhsp}};
+            }
+            return new AstNot{flp, new AstOr{flp, lhsp, rhsp}};
         case VhdlBinaryOp::XNOR: return new AstNot{flp, new AstXor{flp, lhsp, rhsp}};
         case VhdlBinaryOp::EQ:
         case VhdlBinaryOp::MATCH_EQ:
@@ -3645,7 +3675,25 @@ private:
             unsup(flp, "aggregate of this type");
             return nullptr;
         }
-        if (count <= 0 || count > 65536) {
+        if (count <= 0) {
+            // A null array has no elements at all (5.3.2.1), so the aggregate
+            // supplies none and nothing may read them. Any value of the
+            // target's own shape will do, which is what a default assignment
+            // pattern gives.
+            AstNodeVhdlExpr* const nullValp
+                = nodep->elemsp() ? nodep->elemsp()->valuep() : nullptr;
+            AstNodeExpr* const valuep = nullValp ? lowerExpr(nullValp) : nullptr;
+            if (!valuep) return new AstConst{flp, AstConst::BitFalse{}};
+            AstPatMember* const memberp = new AstPatMember{flp, valuep, nullptr, nullptr};
+            memberp->isDefault(true);
+            return new AstPattern{flp, memberp};
+        }
+        if (count > 65536) {
+            // One value repeated is one node, however long the range is;
+            // it is writing out a hundred thousand of them that is not on
+            if (AstNodeExpr* const outp = othersOfDynamicLength(nodep, typep, flp, count)) {
+                return outp;
+            }
             unsup(flp, "aggregate of this size");
             return nullptr;
         }
@@ -3791,7 +3839,18 @@ private:
     // the instance is elaborated -- a port or signal whose width comes from a
     // generic. One value repeated as many times as the range is long, which
     // V3Param settles along with the range itself.
-    AstNodeExpr* othersOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp) {
+    AstNodeExpr* othersOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp,
+                                       int64_t knownCount = 0) {
+        // Where the range has already been folded, the repetition count is
+        // that number rather than an expression to work it out again
+        const auto lengthOf = [&]() -> AstNodeExpr* {
+            if (AstNodeExpr* const countp = boundsLength(typep, flp)) return countp;
+            if (knownCount > 0) {
+                return new AstConst{flp, AstConst::Unsized32{},
+                                    static_cast<uint32_t>(knownCount)};
+            }
+            return nullptr;
+        };
         AstVhdlElemAssoc* const eap = nodep->elemsp();
         if (!eap || eap->nextp() || !eap->choicesp()) return nullptr;
         AstVhdlChoice* const chp = eap->choicesp();
@@ -3803,7 +3862,7 @@ private:
         const bool packed
             = typep->base()->elementp() && elementPacks(typep->base()->elementp());
         if (isStringType(typep)) {
-            if (AstNodeExpr* const countp = boundsLength(typep, flp)) {
+            if (AstNodeExpr* const countp = lengthOf()) {
                 AstNodeExpr* const valuep = lowerExpr(eap->valuep());
                 if (!valuep) {
                     VL_DO_DANGLING(countp->deleteTree(), countp);
@@ -3814,13 +3873,19 @@ private:
             return nullptr;
         }
         if (packed) {
-            if (AstNodeExpr* const countp = boundsLength(typep, flp)) {
+            if (AstNodeExpr* const countp = lengthOf()) {
                 AstNodeExpr* const valuep = lowerExpr(eap->valuep());
                 if (!valuep) {
                     VL_DO_DANGLING(countp->deleteTree(), countp);
                     return nullptr;
                 }
-                return new AstReplicate{flp, valuep, countp};
+                // How many times the value repeats is the length of a range
+                // the design declared, not a number written into a
+                // replication, so the warning about a suspect replication
+                // count has nothing to say about it
+                FileLine* const rflp = new FileLine{flp};
+                rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+                return new AstReplicate{rflp, valuep, countp};
             }
         }
         // Where the length is not known here at all, the one value stands for
