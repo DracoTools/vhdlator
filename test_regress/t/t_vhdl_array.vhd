@@ -28,6 +28,10 @@ architecture tb of t_vhdl_array is
 
   constant n : nibble := "1011";
 
+  -- An array of more than one dimension, whose bounds its own value fixes
+  type int2d is array (natural range <>, natural range <>) of integer;
+  constant m : int2d := ((0, 3, 4, 5), (6, 7, 8, 9));
+
   -- An aggregate whose elements are slices of the same type spans as many
   -- indices as they are long
   constant j : bits(0 to 3) := (n(0 to 1), n(2 to 3));
@@ -54,6 +58,12 @@ begin
     assert n'length = 4 report "n'length" severity failure;
     assert n(0) = '1' and n(1) = '0' and n(3) = '1' report "n" severity failure;
     assert j = n report "j" severity failure;
+
+    assert m'length(1) = 2 report "m'length(1)" severity failure;
+    assert m'length(2) = 4 report "m'length(2)" severity failure;
+    assert m(0, 0) = 0 report "m(0,0)" severity failure;
+    assert m(0, 3) = 5 report "m(0,3)" severity failure;
+    assert m(1, 2) = 8 report "m(1,2)" severity failure;
     report "*-* All Finished *-*";
     stop;
   end process;

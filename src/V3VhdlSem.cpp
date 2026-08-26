@@ -1193,7 +1193,21 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
     }
     if (nodep->defaultp()) {
         analyzeExpr(nodep->defaultp(), symp->typep());
-        symp->typep(constrainFromValue(symp->typep(), nodep->defaultp(), nodep->fileline()));
+        VhdlType* const declaredp = symp->typep();
+        symp->typep(constrainFromValue(declaredp, nodep->defaultp(), nodep->fileline()));
+        // Where the value is what fixed the bounds, it has to be looked at
+        // again with them known: an aggregate carries the type it was checked
+        // against, and hands its elements the type that gives them
+        if (symp->typep() != declaredp && symp->typep()
+            && symp->typep()->isConstrainedArray()) {
+            if (AstVhdlAggregate* const aggp = VN_CAST(nodep->defaultp(), VhdlAggregate)) {
+                // An aggregate keeps the type it was checked against, and
+                // hands its elements the type that gives them, so both have
+                // to be forgotten before the bounds can reach them
+                aggp->foreach([](AstVhdlAggregate* p) { p->vhdlTypep(nullptr); });
+                analyzeExpr(aggp, symp->typep());
+            }
+        }
         checkValueInRange(nodep->defaultp(), symp->typep(),
                           std::string{symp->kindName()} + " '" + nodep->name() + "'");
         checkArrayValue(nodep->defaultp(), symp->typep(),
@@ -3567,9 +3581,15 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             // the elements an array type with one fewer index
             VhdlType* const subp = VhdlSymTab::newType(VhdlTypeKind::ARRAY, "",
                                                        nodep->fileline());
-            const std::vector<VhdlType*>& idx = wantp->base()->indexTypes();
+            // Where the aggregate's own type is constrained, its bounds are
+            // what the remaining dimensions have; the base type's are the
+            // index subtypes, which say nothing about how long a row is
+            const bool constrained = wantp->isConstrainedArray();
+            const std::vector<VhdlType*>& idx
+                = constrained ? wantp->indexTypes() : wantp->base()->indexTypes();
             for (size_t i = 1; i < idx.size(); ++i) subp->addIndexType(idx[i]);
             subp->elementp(wantp->base()->elementp());
+            subp->unconstrained(!constrained);
             elemTypep = subp;
         }
         // Every choice is an index value or a range of them (9.3.3.3). What
@@ -4175,21 +4195,40 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
         return outp;
     }
     // Otherwise the value's length decides, starting at the index subtype's
-    // own left bound (9.3.3.3)
-    if (typep->dimensions() != 1) return typep;
-    const int64_t len = staticLength(valuep);
-    if (len < 0) return typep;
-    VhdlType* const indexp = typep->indexTypes()[0];
-    if (!indexp || !indexp->bounded() || indexp->base()->kind() == VhdlTypeKind::FLOATING) {
-        return typep;
+    // own left bound (9.3.3.3). A value of more than one dimension says how
+    // long each of them is: the outer level fixes the first, and its first
+    // element the rest.
+    const size_t dims = typep->dimensions();
+    if (dims < 1) return typep;
+    std::vector<int64_t> lengths;
+    AstNodeVhdlExpr* levelp = valuep;
+    for (size_t d = 0; d < dims; ++d) {
+        const int64_t len = staticLength(levelp);
+        if (len < 0) return typep;
+        lengths.push_back(len);
+        if (d + 1 == dims) break;
+        AstVhdlAggregate* const aggp = VN_CAST(levelp, VhdlAggregate);
+        AstVhdlElemAssoc* const firstp = aggp ? aggp->elemsp() : nullptr;
+        if (!firstp || !firstp->valuep()) return typep;
+        levelp = firstp->valuep();
     }
-    VhdlType* const newIndexp = cloneSubtype(indexp, flp);
-    const int64_t left = indexp->left();
-    newIndexp->setBounds(left, indexp->ascending() ? left + len - 1 : left - len + 1,
-                         indexp->ascending());
+    std::vector<VhdlType*> newIndexes;
+    for (size_t d = 0; d < dims; ++d) {
+        VhdlType* const indexp = typep->indexTypes()[d];
+        if (!indexp || !indexp->bounded()
+            || indexp->base()->kind() == VhdlTypeKind::FLOATING) {
+            return typep;
+        }
+        VhdlType* const newIndexp = cloneSubtype(indexp, flp);
+        const int64_t left = indexp->left();
+        const int64_t len = lengths[d];
+        newIndexp->setBounds(left, indexp->ascending() ? left + len - 1 : left - len + 1,
+                             indexp->ascending());
+        newIndexes.push_back(newIndexp);
+    }
     VhdlType* const outp = cloneSubtype(typep, flp);
     outp->clearIndexTypes();
-    outp->addIndexType(newIndexp);
+    for (VhdlType* const idxp : newIndexes) outp->addIndexType(idxp);
     outp->unconstrained(false);
     return outp;
 }
