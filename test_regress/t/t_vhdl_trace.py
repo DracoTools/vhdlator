@@ -22,19 +22,10 @@ test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--ma
 
 test.execute()
 
-# The names and the ranges are what a waveform shows, and are checked here
-# rather than by comparing the whole file, which needs a wavediff tool
+# Every signal appears under its own name, with the range it was declared
+# with -- and one of them runs upward, which is how VHDL usually writes one
 vcd = test.obj_dir + "/Vt_vhdl_trace.vcd"
-test.file_grep(vcd, r'\$scope module t_vhdl_trace \$end')
-test.file_grep(vcd, r'\$var wire 1 \S+ clk \$end')
-test.file_grep(vcd, r'\$var wire 32 \S+ cnt \[31:0\] \$end')
-test.file_grep(vcd, r'\$var wire 8 \S+ down \[7:0\] \$end')
-# A range that runs upward is shown the way it was declared
 test.file_grep(vcd, r'\$var wire 4 \S+ up \[0:3\] \$end')
-test.file_grep(vcd, r'\$var wire 2 \S+ st \[1:0\] \$end')
-test.file_grep(vcd, r'\$var real 64 \S+ re \$end')
-# And the values change as the design runs
-test.file_grep(vcd, r'#45000000')
-test.file_grep(vcd, r'b00001111 ')
+test.vcd_identical(vcd, test.golden_filename)
 
 test.passes()
