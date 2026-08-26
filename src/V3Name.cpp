@@ -51,7 +51,13 @@ class NameVisitor final : public VNVisitorConst {
     void renameKeywordCheck(AstNode* nodep) {
         const std::string rsvd = V3LanguageWords::isKeyword(nodep->name());
         if (rsvd != "") {
-            nodep->v3warn(SYMRSVDWORD, "Symbol matches " + rsvd + ": " << nodep->prettyNameQ());
+            // VHDL has no such reserved words of its own, and its own are not
+            // these, so a name like "char" or "class" is ordinary there and
+            // says nothing worth warning about
+            if (!nodep->fileline()->language().vhdl()) {
+                nodep->v3warn(SYMRSVDWORD,
+                              "Symbol matches " + rsvd + ": " << nodep->prettyNameQ());
+            }
             const string newname = "__SYM__"s + nodep->name();
             nodep->name(newname);
             nodep->editCountInc();

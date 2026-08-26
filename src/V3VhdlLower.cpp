@@ -5667,21 +5667,47 @@ private:
             limitp = new AstVarRef{flp, limitVarp, VAccess::READ};
         }
         AstLoop* const loopp = new AstLoop{flp};
-        // Where the direction arrives with the instance, both ways are
-        // written out and the one that applies folds away with it
-        AstNodeExpr* const condp
-            = ascp ? static_cast<AstNodeExpr*>(new AstCond{
-                  flp, ascp->cloneTree(false),
-                  new AstLteS{flp, new AstVarRef{flp, varp, VAccess::READ},
-                              limitp->cloneTree(false)},
-                  new AstGteS{flp, new AstVarRef{flp, varp, VAccess::READ}, limitp}})
-                   : ascending ? static_cast<AstNodeExpr*>(new AstLteS{
-                         flp, new AstVarRef{flp, varp, VAccess::READ}, limitp})
-                               : static_cast<AstNodeExpr*>(new AstGteS{
-                                   flp, new AstVarRef{flp, varp, VAccess::READ}, limitp});
-        loopp->addStmtsp(new AstLoopTest{flp, loopp, condp});
+        // A loop over an enumeration is the one that cannot be written as a
+        // test before each iteration: the parameter is kept in just enough
+        // bits for the type's literals, so stepping past the last one wraps
+        // round to the first and "n <= right" is true again. Such a loop ends
+        // by recognising its last iteration instead. Every other loop keeps
+        // the ordinary shape, which is what Verilator's unroller looks for.
+        const bool endTest = rangep->base()->kind() == VhdlTypeKind::ENUM;
+        // Whether the range runs at all, which is asked once, before the
+        // first iteration: a null range runs none (10.10). Where the
+        // direction arrives with the instance, both ways are written out and
+        // the one that applies folds away with it.
+        AstNodeExpr* const donep
+            = endTest ? new AstNeq{flp, new AstVarRef{flp, varp, VAccess::READ},
+                                   limitp->cloneTree(false)}
+                      : nullptr;
+        AstNodeExpr* enterp = nullptr;
+        bool runsAtAll = true;
+        if (endTest && !ascp && VN_IS(initp, Const) && VN_IS(limitp, Const)) {
+            // Both bounds are numbers, so whether the range is null is known
+            // here; asking again while running would be a comparison whose
+            // answer never changes
+            const int64_t left = static_cast<int64_t>(VN_AS(initp, Const)->toSInt());
+            const int64_t right = static_cast<int64_t>(VN_AS(limitp, Const)->toSInt());
+            runsAtAll = ascending ? left <= right : left >= right;
+            VL_DO_DANGLING(limitp->deleteTree(), limitp);
+        } else {
+            enterp = ascp ? static_cast<AstNodeExpr*>(new AstCond{
+                         flp, ascp->cloneTree(false),
+                         new AstLteS{flp, new AstVarRef{flp, varp, VAccess::READ},
+                                     limitp->cloneTree(false)},
+                         new AstGteS{flp, new AstVarRef{flp, varp, VAccess::READ}, limitp}})
+                          : ascending
+                                ? static_cast<AstNodeExpr*>(new AstLteS{
+                                      flp, new AstVarRef{flp, varp, VAccess::READ}, limitp})
+                                : static_cast<AstNodeExpr*>(new AstGteS{
+                                      flp, new AstVarRef{flp, varp, VAccess::READ}, limitp});
+        }
+        if (!endTest) loopp->addStmtsp(new AstLoopTest{flp, loopp, enterp});
         m_loops.emplace_back(VhdlLoopFrame{nodep->label(), nullptr, nullptr});
         loopp->addStmtsp(lowerLoopBody(nodep));
+        if (endTest) loopp->addStmtsp(new AstLoopTest{flp, loopp, donep});
         AstNodeExpr* stepp = nullptr;
         if (ascp) {
             stepp = new AstAdd{flp, new AstVarRef{flp, varp, VAccess::READ},
@@ -5689,11 +5715,13 @@ private:
                                            new AstConst{flp, AstConst::Signed32{}, 1},
                                            new AstConst{flp, AstConst::Signed32{}, -1}}};
         } else if (ascending) {
+            // The step is as wide as the parameter, which is wide enough:
+            // it never has to hold a value the range does not
             stepp = new AstAdd{flp, new AstVarRef{flp, varp, VAccess::READ},
-                               new AstConst{flp, AstConst::Signed32{}, 1}};
+                               new AstConst{flp, AstConst::Unsized32{}, 1}};
         } else {
             stepp = new AstSub{flp, new AstVarRef{flp, varp, VAccess::READ},
-                               new AstConst{flp, AstConst::Signed32{}, 1}};
+                               new AstConst{flp, AstConst::Unsized32{}, 1}};
         }
         loopp->addContsp(
             new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, stepp});
@@ -5702,7 +5730,12 @@ private:
         AstNode* outp
             = new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, initp};
         if (preloadp) outp = AstNode::addNext(static_cast<AstNode*>(preloadp), outp);
-        return AstNode::addNext(outp, wrappedp);
+        if (!runsAtAll) {
+            VL_DO_DANGLING(wrappedp->deleteTree(), wrappedp);
+            return outp;
+        }
+        if (!endTest || !enterp) return AstNode::addNext(outp, wrappedp);
+        return AstNode::addNext(outp, new AstIf{flp, enterp, wrappedp, nullptr});
     }
 
 

@@ -75,6 +75,46 @@ begin
     assert a = 3 report "labelled next outer count" severity failure;
     assert b = 3 report "labelled next inner count" severity failure;
 
+    -- A loop over an enumeration runs once per literal, whether or not the
+    -- literals fill the bits the parameter is kept in
+    a := 0;
+    for v in boolean loop
+      a := a + 1;
+    end loop;
+    assert a = 2 report "boolean loop ran " & integer'image(a) severity failure;
+
+    a := 0;
+    for v in bit loop
+      a := a + 1;
+    end loop;
+    assert a = 2 report "bit loop ran " & integer'image(a) severity failure;
+
+    a := 0;
+    for v in severity_level loop
+      a := a + 1;
+    end loop;
+    assert a = 4 report "severity loop ran " & integer'image(a) severity failure;
+
+    -- And backwards, and over part of the range
+    a := 0;
+    for v in true downto false loop
+      a := a + 1;
+    end loop;
+    assert a = 2 report "reverse boolean loop ran " & integer'image(a) severity failure;
+
+    a := 0;
+    for v in note to warning loop
+      a := a + 1;
+    end loop;
+    assert a = 2 report "part of a range ran " & integer'image(a) severity failure;
+
+    -- A null range over an enumeration runs no iterations at all
+    a := 0;
+    for v in warning to note loop
+      a := a + 1;
+    end loop;
+    assert a = 0 report "null enumeration range ran " & integer'image(a) severity failure;
+
     report "*-* All Finished *-*";
     stop;
   end process;
