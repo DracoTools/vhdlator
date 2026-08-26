@@ -4114,9 +4114,41 @@ private:
         // A concurrent statement runs once at the start and again whenever
         // what it reads changes (11.6). One that reads nothing -- an
         // assertion about a generic, say -- therefore runs exactly once.
+        // What the statement is assigned *to* is not something it reads,
+        // even though the reference has not been marked one way or the other
+        // yet -- that happens in V3LinkLValue, long after here
+        std::set<const AstNode*> writtenp;
+        bodyp->foreach([&writtenp](const AstNodeAssign* asgp) {
+            for (const AstNode* np = asgp->lhsp(); np;) {
+                if (VN_IS(np, VarRef)) {
+                    writtenp.insert(np);
+                    break;
+                }
+                if (const AstMemberSel* const memp = VN_CAST(np, MemberSel)) {
+                    np = memp->fromp();
+                } else if (const AstStructSel* const strp = VN_CAST(np, StructSel)) {
+                    np = strp->fromp();
+                } else if (const AstSelBit* const bitp = VN_CAST(np, SelBit)) {
+                    np = bitp->fromp();
+                } else if (const AstSelExtract* const extp = VN_CAST(np, SelExtract)) {
+                    np = extp->fromp();
+                } else if (const AstSel* const selp = VN_CAST(np, Sel)) {
+                    np = selp->fromp();
+                } else {
+                    break;
+                }
+            }
+        });
         bool reads = false;
-        bodyp->foreach([&reads](const AstVarRef* refp) {
-            if (refp->access().isReadOrRW()) reads = true;
+        bodyp->foreach([&reads, &writtenp](const AstVarRef* refp) {
+            if (!refp->access().isReadOrRW()) return;
+            if (writtenp.count(refp)) return;
+            // A generic or a generate parameter has its value fixed by
+            // elaboration and never changes afterwards, so a statement that
+            // reads nothing else still runs exactly once
+            const AstVar* const varp = refp->varp();
+            if (varp && (varp->isParam() || varp->varType() == VVarType::GENVAR)) return;
+            reads = true;
         });
         if (!reads) return new AstInitial{flp, bodyp};
         return new AstAlways{flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
@@ -5132,7 +5164,18 @@ private:
             return;
         }
         AstNode* const markp = transactionMark(nodep->targetp(), delayp, false, rhsp, flp);
-        addStmt(new AstAlways{new AstAssignW{flp, lhsp, rhsp, delayp}});
+        // A concurrent signal assignment is the process it is defined to be:
+        // it runs whenever what it reads changes, and the assignment
+        // *schedules* an update rather than making one (11.6, 10.5.2.2).  It
+        // is not a continuous assignment: a continuous assignment lands in
+        // the same delta it was computed in, so a process that reads the
+        // target without being sensitive to it would see the new value where
+        // VHDL gives it the old one.
+        FileLine* const aflp = new FileLine{flp};
+        aflp->warnOff(V3ErrorCode::COMBDLY, true);
+        aflp->warnOff(V3ErrorCode::LATCH, true);
+        AstNode* const assignp = new AstAssignDly{aflp, lhsp, rhsp, delayp};
+        addStmt(concurrentProcess(assignp, nodep->postponed(), aflp));
         if (markp) addStmt(markp);
     }
 
