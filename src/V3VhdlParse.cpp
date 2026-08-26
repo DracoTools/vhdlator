@@ -2032,6 +2032,15 @@ bool V3VhdlParse::looksLikeRange() {
             case VhdlTokType::KWD_TO:
             case VhdlTokType::KWD_DOWNTO:
             case VhdlTokType::KWD_RANGE: return true;
+            case VhdlTokType::IDENTIFIER:
+                // "v'reverse_range" names a range just as "v'range" does, but
+                // its name is an ordinary identifier where "range" is a
+                // keyword, so it has to be recognised by what it says
+                if (i > 0 && peekType(i - 1) == VhdlTokType::TICK
+                    && peek(i).text == "reverse_range") {
+                    return true;
+                }
+                break;
             case VhdlTokType::COMMA:
             case VhdlTokType::SEMICOLON:
             case VhdlTokType::ARROW:

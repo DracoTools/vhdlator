@@ -28,6 +28,15 @@ architecture tb of t_vhdl_array is
 
   constant n : nibble := "1011";
 
+  -- A range attribute names a range wherever one is wanted, including as
+  -- the constraint of a declaration
+  function flip (x : bit_vector) return bit_vector is
+    variable r : bit_vector(x'reverse_range);
+  begin
+    for i in x'reverse_range loop r(i) := x(i); end loop;
+    return r;
+  end function;
+
   -- An array of more than one dimension, whose bounds its own value fixes
   type int2d is array (natural range <>, natural range <>) of integer;
   constant m : int2d := ((0, 3, 4, 5), (6, 7, 8, 9));
@@ -41,6 +50,7 @@ begin
   process
     variable a, b : integer;
     variable lo, hi : bits(0 to 1);
+    variable bv : bit_vector(1 to 4) := "1101";
   begin
     -- An aggregate may stand on the left of an assignment: each name takes
     -- the element of the value in its own position (10.6.2)
@@ -64,6 +74,8 @@ begin
     assert m(0, 0) = 0 report "m(0,0)" severity failure;
     assert m(0, 3) = 5 report "m(0,3)" severity failure;
     assert m(1, 2) = 8 report "m(1,2)" severity failure;
+
+    assert flip(bv) = "1011" report "reverse_range" severity failure;
     report "*-* All Finished *-*";
     stop;
   end process;
