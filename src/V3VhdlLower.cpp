@@ -1344,10 +1344,15 @@ private:
             // with only a default says "all elements" without writing them
             // out, whatever the array's size -- including a size that only
             // elaboration fixes, where the range travels with the type.
-            const bool hasBounds
-                = !typep->indexTypes().empty() && typep->indexTypes()[0]
-                  && (typep->indexTypes()[0]->bounded() || typep->indexTypes()[0]->boundsp());
-            if (!typep->isConstrainedArray() && !hasBounds) return nullptr;
+            // A constraint written for the array replaces the index
+            // subtype, whether or not its bounds are numbers yet. Where the
+            // index subtype is still the type's own, nothing has said how
+            // long the array is and there is no default to write.
+            const bool constrained
+                = typep->isConstrainedArray()
+                  || (typep->indexTypes().size() == 1 && basep->indexTypes().size() == 1
+                      && typep->indexTypes()[0] != basep->indexTypes()[0]);
+            if (!constrained) return nullptr;
             if (!basep->elementp()) return nullptr;
             if (!mustHave && enumIsLogic(basep->elementp()->base())) return nullptr;
             if (isStringType(basep)) {
