@@ -11,12 +11,15 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A port takes an undefined index range from its actual -- including one on a
-# record element, and one on the element of an array.
-test.top_filename = "t/t_vhdl_openport2.vhd"
+# A context declaration in one library, referenced from another. -work applies
+# to the files that follow it, so the two libraries are given in order.
+test.top_filename = "t/t_vhdl_context.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_openport2"],
+             verilator_flags2=[
+                 "--timing", "--top-module t_vhdl_context",
+                 "-work mylib", "t/t_vhdl_context_b.vhd", "-work work"
+             ],
              make_top_shell=False,
              make_main=False)
 

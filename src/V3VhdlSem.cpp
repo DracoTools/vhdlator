@@ -73,6 +73,10 @@ class VhdlSemVisitor final : public VNVisitor {
     std::map<std::string, VhdlScope*> m_libs;  // Library name -> its region
     std::map<std::string, VhdlScope*> m_unitScopes;  // "lib.unit" -> its region
     std::map<std::string, AstNodeVhdlUnit*> m_primaryUnits;  // "lib.unit" -> the unit
+    // "lib.context" -> the context declaration, whose items a context
+    // reference applies where it is written (13.3)
+    std::map<std::string, AstVhdlContextDecl*> m_contextDecls;
+    int m_contextDepth = 0;  // Guards a context that references itself
     std::string m_libname;  // Library of the unit being analyzed
     VhdlType* m_returnTypep = nullptr;  // Result type of the enclosing function
     // Values a call site fixed, for the copy of a subprogram being made now
@@ -978,6 +982,10 @@ private:
     // actual, which differ per instance (5.3.2.2, 6.5.6.3)
     struct OpenBound final {
         std::string port;  // The port the bounds belong to
+        // Where inside its type the array is: each step names a record
+        // element, or is empty for "the element of the array above". Empty
+        // for the port's own type, which is the ordinary case.
+        std::vector<std::string> path;
         int dim;  // Which of its dimensions
         std::string leftName;  // The generics carrying the bounds
         std::string rightName;
@@ -985,6 +993,10 @@ private:
     };
     std::map<VhdlScope*, std::vector<OpenBound>> m_openBounds;
     void openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlScope* scopep) VL_MT_DISABLED;
+    AstVhdlIndexConstraint* openConstraintFor(VhdlType* typep, AstVhdlIfaceDecl* ifp,
+                                              AstVhdlEntity* entp, AstVhdlComponentDecl* compp,
+                                              VhdlScope* scopep,
+                                              std::vector<std::string>& path) VL_MT_DISABLED;
     void bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
@@ -1999,6 +2011,27 @@ void VhdlSemVisitor::applyContextItem(AstVhdlContextItem* ctxp) {
             if (lnp) m_scopep->addNamed(lnp->name(), libScope(lnp->name()));
             continue;
         }
+        if (ctxp->kind() == VhdlContextKind::CONTEXT_REF) {
+            // "context lib.name;" means the context items that context
+            // declares, written out here (13.4). It is not a use clause: the
+            // declaration has nothing of its own to make visible.
+            std::vector<std::string> refParts;
+            if (!flattenUse(exprp, refParts) || refParts.empty()) continue;
+            std::string reflib = refParts.size() >= 2 ? refParts[0] : m_libname;
+            if (reflib == "work") reflib = m_libname;
+            const auto ctxIt = m_contextDecls.find(reflib + "." + refParts.back());
+            if (ctxIt == m_contextDecls.end()) {
+                err(ctxp->fileline(), "Cannot find context '" + refParts.back() + "'");
+                continue;
+            }
+            if (m_contextDepth > 16) continue;  // A context that names itself
+            VL_RESTORER(m_contextDepth);
+            ++m_contextDepth;
+            for (AstNode* p = ctxIt->second->contextp(); p; p = p->nextp()) {
+                applyContextItem(VN_AS(p, VhdlContextItem));
+            }
+            continue;
+        }
         // A use clause: "use lib.unit.all" or "use lib.unit.item"
         if (!flattenUse(exprp, parts) || parts.size() < 2) continue;
         // "use inst.all", where inst is a package instantiated in this
@@ -2195,6 +2228,11 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // ports, which live in the component's own region and say
                 // which of the entity's ports each one becomes (7.3.2.2)
             });
+        } else if (AstVhdlContextDecl* const cdeclp = VN_CAST(unitp, VhdlContextDecl)) {
+            // A context declaration declares nothing itself: it is a name for
+            // the context items a reference to it stands for (13.3), so it is
+            // recorded rather than analyzed here
+            m_contextDecls[lib + "." + lower(unitp->name())] = cdeclp;
         } else {
             iterateChildren(unitp);
         }
@@ -5279,42 +5317,117 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
         if (!subp || subp->constraintp() || !subp->typeMarkp()) continue;
         VhdlSymbol* const tsymp = lookupTypeQuiet(subp->typeMarkp());
         VhdlType* const typep = tsymp ? tsymp->typep() : nullptr;
-        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) continue;
-        if (!typep->unconstrained()) continue;
-        const size_t dims = typep->base()->indexTypes().size();
-        if (!dims) continue;
-        FileLine* const flp = ifp->fileline();
-        AstVhdlIndexConstraint* const consp = new AstVhdlIndexConstraint{flp};
-        for (size_t d = 0; d < dims; ++d) {
-            const std::string suffix = "__" + ifp->name() + "__" + std::to_string(d);
-            const std::string leftName = "__vl" + suffix;
-            const std::string rightName = "__vr" + suffix;
-            for (const std::string& name : {leftName, rightName}) {
-                AstVhdlIfaceDecl* const genp
-                    = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::CONSTANT};
-                genp->subtypep(new AstVhdlSubtypeInd{flp, new AstVhdlName{flp, "integer"}});
-                if (ifp->kind() == VhdlIfaceKind::CONSTANT) {
-                    // A generic constrained by these must see them declared
-                    // first, so they go in ahead of it
-                    ifp->addHereThisAsNext(genp);
-                } else if (entp) {
-                    entp->addGenericsp(genp);
-                } else {
-                    compp->addGenericsp(genp);
-                }
+        if (!typep) continue;
+        // Only an array port for now. The walk below reaches a record
+        // element too, and builds the right constraint for it, but the
+        // generics it makes are not reaching the instance yet -- so a record
+        // port keeps the honest "unconstrained array" message rather than
+        // gaining a confusing one about a parameter it never wrote.
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY) continue;
+        std::vector<std::string> path;
+        if (AstVhdlIndexConstraint* const consp
+            = openConstraintFor(typep, ifp, entp, compp, scopep, path)) {
+            subp->constraintp(consp);
+        }
+    }
+}
+
+// The constraint a port needs so that every dimension inside its type that
+// nothing has constrained takes its bounds from the actual. 5.3.2.2 e) says
+// this of "an interface object of an array type, or a subelement of an
+// interface object for which the subelement type is an array type", so a
+// record element and an array's own element are reached the same way its top
+// level is. Each open dimension gets a pair of integer generics, which
+// bindOpenBounds then associates with the actual's bounds and V3Param folds
+// per instance.
+AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
+                                                          AstVhdlIfaceDecl* ifp,
+                                                          AstVhdlEntity* entp,
+                                                          AstVhdlComponentDecl* compp,
+                                                          VhdlScope* scopep,
+                                                          std::vector<std::string>& path) {
+    if (!typep || path.size() > 8) return nullptr;
+    FileLine* const flp = ifp->fileline();
+    VhdlType* const basep = typep->base();
+
+    // A name for the generics that says where in the type they came from, so
+    // that two open elements of one port do not collide
+    const auto mangled = [&](size_t d) {
+        std::string out = "__" + ifp->name();
+        for (const std::string& step : path) out += "__" + (step.empty() ? "e" : step);
+        return out + "__" + std::to_string(d);
+    };
+    const auto makeGeneric = [&](const std::string& name) {
+        AstVhdlIfaceDecl* const genp = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::CONSTANT};
+        genp->subtypep(new AstVhdlSubtypeInd{flp, new AstVhdlName{flp, "integer"}});
+        if (ifp->kind() == VhdlIfaceKind::CONSTANT) {
+            // A generic constrained by these must see them declared first, so
+            // they go in ahead of it
+            ifp->addHereThisAsNext(genp);
+        } else if (entp) {
+            entp->addGenericsp(genp);
+        } else {
+            compp->addGenericsp(genp);
+        }
+    };
+
+    if (basep->kind() == VhdlTypeKind::RECORD) {
+        AstVhdlIndexConstraint* consp = nullptr;
+        // The subtype's own elements, since a subtype may already have
+        // constrained one of them and that one is not open (5.3.3)
+        for (VhdlSymbol* const elemp : typep->elements()) {
+            path.push_back(elemp->name());
+            AstVhdlIndexConstraint* const innerp
+                = openConstraintFor(elemp->typep(), ifp, entp, compp, scopep, path);
+            path.pop_back();
+            if (!innerp) continue;
+            if (!consp) consp = new AstVhdlIndexConstraint{flp};
+            // A record constraint names an element and how to constrain it,
+            // which the parser records as a call (5.3.3)
+            AstVhdlCall* const callp
+                = new AstVhdlCall{flp, new AstVhdlName{flp, elemp->name()}};
+            if (AstNode* const rangesp = innerp->rangesp()) {
+                callp->addArgsp(VN_AS(rangesp->unlinkFrBackWithNext(), NodeVhdl));
             }
+            VL_DO_DANGLING(innerp->deleteTree(), innerp);
+            consp->addRangesp(callp);
+        }
+        return consp;
+    }
+    if (basep->kind() != VhdlTypeKind::ARRAY) return nullptr;
+
+    AstVhdlIndexConstraint* consp = nullptr;
+    if (typep->unconstrained()) {
+        consp = new AstVhdlIndexConstraint{flp};
+        const size_t dims = basep->indexTypes().size();
+        for (size_t d = 0; d < dims; ++d) {
+            const std::string leftName = "__vl" + mangled(d);
+            const std::string rightName = "__vr" + mangled(d);
+            makeGeneric(leftName);
+            makeGeneric(rightName);
             AstVhdlRange* const rangep
                 = new AstVhdlRange{flp, new AstVhdlName{flp, leftName}, VhdlDir::TO,
                                    new AstVhdlName{flp, rightName}};
             // Which way round the actual's range runs is not known here
             rangep->dirUnknown(true);
             consp->addRangesp(rangep);
-            m_openBounds[scopep].push_back(OpenBound{ifp->name(), static_cast<int>(d),
+            m_openBounds[scopep].push_back(OpenBound{ifp->name(), path, static_cast<int>(d),
                                                      leftName, rightName,
                                                      ifp->kind() == VhdlIfaceKind::CONSTANT});
         }
-        subp->constraintp(consp);
     }
+    // The element may be open as well, or instead: "array (0 to 3) of
+    // bit_vector" is constrained at its top level and not below it
+    VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+    path.push_back("");
+    AstVhdlIndexConstraint* const innerp
+        = openConstraintFor(elemp, ifp, entp, compp, scopep, path);
+    path.pop_back();
+    if (innerp) {
+        if (!consp) consp = new AstVhdlIndexConstraint{flp};
+        consp->addRangesp(innerp);
+    }
+    return consp;
 }
 
 // The bounds an instance gives each of its open ports, written as the
@@ -5344,8 +5457,18 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
         if (!actualp) continue;
         FileLine* const flp = nodep->fileline();
         for (int side = 0; side < 2; ++side) {
-            AstVhdlAttrName* const attrp = new AstVhdlAttrName{
-                flp, actualp->cloneTree(false), side == 0 ? "left" : "right"};
+            // Where the open dimension is inside the port's type, the same
+            // place inside the actual is what has its bounds
+            AstNodeVhdlExpr* prefixp = actualp->cloneTree(false);
+            for (const std::string& step : bound.path) {
+                prefixp = step.empty()
+                              ? static_cast<AstNodeVhdlExpr*>(
+                                    new AstVhdlAttrName{flp, prefixp, "element"})
+                              : static_cast<AstNodeVhdlExpr*>(new AstVhdlSelected{
+                                    flp, prefixp, new AstVhdlName{flp, step}});
+            }
+            AstVhdlAttrName* const attrp
+                = new AstVhdlAttrName{flp, prefixp, side == 0 ? "left" : "right"};
             if (bound.dim > 0) {
                 AstVhdlLiteral* const dimp = new AstVhdlLiteral{
                     flp, VhdlLitKind::INTEGER, std::to_string(bound.dim + 1)};
@@ -5370,6 +5493,9 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
             continue;
         }
         VhdlType* formalTypep = nullptr;
+        // An individual association covers part of the formal, so the actual
+        // is not the whole of it and the length check does not apply
+        bool individual = false;
         if (unitScopep) {
             if (const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName)) {
                 std::vector<VhdlSymbol*> found;
@@ -5380,10 +5506,80 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                 }
             } else if (!asp->formalp()) {
                 formalTypep = formalAt(unitScopep, position);
+            } else {
+                // An individual association names one part of the formal --
+                // "r.x => v", "d(3 downto 0) => e" -- and several of them
+                // together cover it (6.5.7.1). The leftmost name is the
+                // formal; what follows says which part, and that part's
+                // subtype is what the actual is checked against.
+                AstNodeVhdlExpr* rootp = asp->formalp();
+                std::vector<AstNodeVhdl*> steps;  // Innermost last
+                while (rootp) {
+                    if (AstVhdlSelected* const selp = VN_CAST(rootp, VhdlSelected)) {
+                        steps.push_back(selp);
+                        rootp = selp->prefixp();
+                    } else if (AstVhdlCall* const callp = VN_CAST(rootp, VhdlCall)) {
+                        steps.push_back(callp);
+                        rootp = callp->prefixp();
+                    } else {
+                        break;
+                    }
+                }
+                AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
+                std::vector<VhdlSymbol*> found;
+                if (namep) unitScopep->lookupLocal(namep->name(), found);
+                // A conversion written on the formal -- "f(port) => a" -- has
+                // a function at its root, not a port, and is not this
+                if (!found.empty() && (found[0]->kind() == VhdlSymKind::PORT
+                                       || found[0]->kind() == VhdlSymKind::GENERIC)) {
+                    namep->vhdlSymp(found[0]);
+                    namep->vhdlTypep(found[0]->typep());
+                    VhdlType* typep = found[0]->typep();
+                    for (size_t i = steps.size(); i-- > 0 && typep;) {
+                        if (AstVhdlSelected* const selp = VN_CAST(steps[i], VhdlSelected)) {
+                            const AstVhdlName* const sufp
+                                = VN_CAST(selp->suffixp(), VhdlName);
+                            VhdlType* nextp = nullptr;
+                            if (sufp) {
+                                for (VhdlSymbol* const elemp : typep->elements()) {
+                                    if (elemp->name() != sufp->name()) continue;
+                                    nextp = elemp->typep();
+                                    // Which element it is, so the lowering
+                                    // can reach it
+                                    selp->vhdlSymp(elemp);
+                                }
+                            }
+                            selp->vhdlTypep(nextp);
+                            typep = nextp;
+                        } else {
+                            // An index gives the element; a slice gives the
+                            // array itself
+                            AstVhdlCall* const callp = VN_AS(steps[i], VhdlCall);
+                            if (!VN_IS(callp->argsp(), VhdlRange)) {
+                                typep = typep->elementp() ? typep->elementp()
+                                                          : typep->base()->elementp();
+                            }
+                            callp->vhdlTypep(typep);
+                            // The index or range is an expression of its own
+                            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+                                if (AstVhdlRange* const rp = VN_CAST(ap, VhdlRange)) {
+                                    analyzeRange(rp, nullptr);
+                                } else if (AstVhdlAssoc* const asp2 = VN_CAST(ap, VhdlAssoc)) {
+                                    if (asp2->actualp()) analyzeExpr(asp2->actualp(), nullptr);
+                                } else if (AstNodeVhdlExpr* const ep
+                                           = VN_CAST(ap, NodeVhdlExpr)) {
+                                    analyzeExpr(ep, nullptr);
+                                }
+                            }
+                        }
+                    }
+                    formalTypep = typep;
+                    individual = true;
+                }
             }
         }
         analyzeExpr(asp->actualp(), formalTypep);
-        if (formalTypep) {
+        if (formalTypep && !individual) {
             checkValueInRange(asp->actualp(), formalTypep, "this association");
             checkArrayValue(asp->actualp(), formalTypep, "this association");
         }

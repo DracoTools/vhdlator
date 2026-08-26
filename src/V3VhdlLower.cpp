@@ -1584,10 +1584,24 @@ private:
                 if (!totypep) return argp;
                 return new AstCast{flp, argp, VFlagChildDType{}, lowerType(totypep, flp)};
             }
-        } else if (attr == "succ") {
-            if (argp) return new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
-        } else if (attr == "pred") {
-            if (argp) return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        } else if (attr == "succ" || attr == "pred") {
+            // The next or previous value of the type, which is as wide as the
+            // type is -- the 1 that steps it is a position, not a value of
+            // that width, so widening it is not a finding (16.2.3)
+            if (argp) {
+                FileLine* const sflp = new FileLine{flp};
+                sflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                sflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                AstNodeExpr* const onep = new AstConst{sflp, AstConst::Signed32{}, 1};
+                AstNodeExpr* const stepp
+                    = attr == "succ" ? static_cast<AstNodeExpr*>(new AstAdd{sflp, argp, onep})
+                                     : static_cast<AstNodeExpr*>(new AstSub{sflp, argp, onep});
+                // The result is a value of the type, so it is as wide as the
+                // type is, not as wide as the position arithmetic
+                VhdlType* const totypep = nodep->vhdlTypep();
+                if (!totypep) return stepp;
+                return new AstCast{sflp, stepp, VFlagChildDType{}, lowerType(totypep, sflp)};
+            }
         } else if (attr == "leftof" || attr == "rightof") {
             // A step toward one end of the prefix's range, which is a step
             // down for a range that runs the other way (16.2.3). 'SUCC and
@@ -2177,8 +2191,14 @@ private:
         // which is not done here.
         if (symp->kind() == VhdlSymKind::ALIAS) {
             AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+            // Where the target is a plain name, what it denotes is already
+            // known and the expression adds nothing -- which matters for an
+            // alias of an alias, whose target names no object of its own
+            const bool plainName = declp && VN_IS(declp->targetp(), VhdlName);
+            if (symp->aliasp() && (plainName || !declp || !declp->targetp())) {
+                return lowerRef(symp->aliasp(), name, flp);
+            }
             if (declp && declp->targetp()) return lowerExpr(declp->targetp());
-            if (symp->aliasp()) return lowerRef(symp->aliasp(), name, flp);
         }
         const auto bit = m_bindExprs.find(symp);
         if (bit != m_bindExprs.end()) return lowerExpr(bit->second);
@@ -5458,9 +5478,71 @@ private:
         }
         AstPin* pinsp = nullptr;
         int pinNum = 0;
+        // A formal may name part of a port rather than the whole of it, and
+        // several such associations together cover it (6.5.7.1). One signal
+        // of the port's own type stands for the port, each part of it is
+        // wired to its actual, and the port itself is associated once.
+        std::map<const VhdlSymbol*, AstVar*> partial;
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
-            AstPin* const pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++pinNum);
-            if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            AstNodeVhdlExpr* const rootp = individualRoot(asp->formalp());
+            AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
+            VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
+            if (!symp || symp->kind() != VhdlSymKind::PORT) continue;
+            if (partial.count(symp)) continue;
+            AstVar* const tempp = newTempVar(
+                "__Vpart__" + label + "__" + symp->name(),
+                lowerType(symp->typep(), flp), flp);
+            partial.emplace(symp, tempp);
+            pinsp = AstNode::addNextNull(
+                pinsp, new AstPin{flp, ++pinNum, symp->name(),
+                                  new AstVarRef{flp, tempp, VAccess::READWRITE}});
+        }
+        for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            AstNodeVhdlExpr* const rootp = individualRoot(asp->formalp());
+            AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
+            VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
+            const auto partIt = symp ? partial.find(symp) : partial.end();
+            if (partIt == partial.end()) {
+                AstPin* const pinp = lowerAssoc(asp, ++pinNum);
+                if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
+                continue;
+            }
+            if (!asp->actualp() || asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            // The part of the standing signal the formal names, reached by
+            // lowering the formal with its root bound to that signal
+            AstNodeExpr* partp = nullptr;
+            {
+                // The formal names a port of the instantiated unit, which has
+                // no variable here; for the length of this one expression it
+                // names the signal standing in for it
+                const auto prevIt = m_vars.find(symp);
+                const bool had = prevIt != m_vars.end();
+                AstVar* const savedp = had ? prevIt->second : nullptr;
+                m_vars[symp] = partIt->second;
+                partp = lowerExpr(asp->formalp());
+                if (had) {
+                    m_vars[symp] = savedp;
+                } else {
+                    m_vars.erase(symp);
+                }
+            }
+            AstNodeExpr* const actp = lowerExpr(asp->actualp());
+            if (!partp || !actp) {
+                if (partp) VL_DO_DANGLING(partp->deleteTree(), partp);
+                if (actp) VL_DO_DANGLING(actp->deleteTree(), actp);
+                continue;
+            }
+            const AstVhdlIfaceDecl* const declp
+                = VN_CAST(symp->declp(), VhdlIfaceDecl);
+            const bool outward = declp
+                                 && (declp->mode() == VhdlMode::OUT
+                                     || declp->mode() == VhdlMode::BUFFER);
+            FileLine* const cflp = new FileLine{flp};
+            cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            addStmt(new AstAlways{outward ? new AstAssignW{cflp, actp, partp}
+                                          : new AstAssignW{cflp, partp, actp}});
         }
         AstPin* paramsp = nullptr;
         pinNum = 0;
@@ -5493,6 +5575,23 @@ private:
             = label.empty() ? "__Vinst" + std::to_string(++m_processNum) : label;
         m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
+    }
+
+    // The leftmost name of a formal that names part of a port, or null where
+    // the formal is a whole port, absent, or a conversion applied to one
+    static AstNodeVhdlExpr* individualRoot(AstNodeVhdlExpr* formalp) {
+        if (!formalp || VN_IS(formalp, VhdlName)) return nullptr;
+        AstNodeVhdlExpr* rootp = formalp;
+        while (rootp) {
+            if (AstVhdlSelected* const selp = VN_CAST(rootp, VhdlSelected)) {
+                rootp = selp->prefixp();
+            } else if (AstVhdlCall* const callp = VN_CAST(rootp, VhdlCall)) {
+                rootp = callp->prefixp();
+            } else {
+                break;
+            }
+        }
+        return rootp;
     }
 
     AstPin* lowerAssoc(AstVhdlAssoc* nodep, int pinNum) {
