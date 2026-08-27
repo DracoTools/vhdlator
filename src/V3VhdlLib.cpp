@@ -166,6 +166,18 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
                 unit.softDependsOn.push_back(
                     primaryKey(lib == "work" ? work : lib, parts.back()) + "%body");
             }
+            // A generic package is given another package by name --
+            // "fixed_pkg => IEEE.fixed_pkg" -- and that one has to be
+            // analyzed first, though no context clause says so (4.9, 6.5.5)
+            instp->foreach([&](const AstVhdlSelected* selp) {
+                if (VN_IS(selp->backp(), VhdlSelected)) return;  // Only the outermost
+                std::vector<std::string> aparts;
+                if (!flattenName(const_cast<AstVhdlSelected*>(selp), aparts)) return;
+                if (aparts.size() < 2) return;
+                const std::string alib = lower(aparts[aparts.size() - 2]);
+                unit.softDependsOn.push_back(
+                    primaryKey(alib == "work" ? work : alib, aparts.back()));
+            });
         } else {
             unit.key = primaryKey(work, unitp->name());
         }

@@ -119,10 +119,9 @@ class VhdlSemVisitor final : public VNVisitor {
     // the same region (12.3)
     void declare(VhdlSymbol* symp, FileLine* flp) {
         VhdlSymbol* const hiddenp = m_scopep->insert(symp);
-        if (hiddenp && !hiddenp->predefined()) {
-            err(flp, "Declaration of '" + symp->name() + "' conflicts with the "
-                         + hiddenp->kindName() + " of the same name declared in this region");
-        }
+        if (!hiddenp || hiddenp->predefined()) return;
+        err(flp, "Declaration of '" + symp->name() + "' conflicts with the "
+                     + hiddenp->kindName() + " of the same name declared in this region");
     }
 
     // METHODS - names
@@ -2421,6 +2420,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         VhdlUnanalyzeVisitor{copyp};
         nodep->addDeclsp(copyp);
     }
+    AstNode* firstBodyp = nullptr;
     const auto bodyIt = m_packageBodies.find(key);
     if (bodyIt != m_packageBodies.end()) {
         // The body has a context clause of its own -- IEEE's fixed_generic_pkg
@@ -2434,10 +2434,21 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         for (AstNode* p = bodyIt->second->declsp(); p; p = p->nextp()) {
             AstNodeVhdl* const copyp = VN_AS(p->cloneTree(false), NodeVhdl);
             VhdlUnanalyzeVisitor{copyp};
+            if (!firstBodyp) firstBodyp = copyp;
             nodep->addDeclsp(copyp);
         }
     }
-    iterateAndNextNull(nodep->declsp());
+    // The copy of the body is still a package body: a constant there gives a
+    // deferred one its value rather than declaring a second (6.4.2.2)
+    std::vector<AstNode*> declOrder;
+    for (AstNode* p = nodep->declsp(); p; p = p->nextp()) declOrder.push_back(p);
+    bool inBody = false;
+    for (AstNode* const p : declOrder) {
+        if (p == firstBodyp) inBody = true;
+        VL_RESTORER(m_inPackageBody);
+        m_inPackageBody = m_inPackageBody || inBody;
+        iterate(p);
+    }
     m_scopep = savedp;
 }
 
@@ -2587,6 +2598,22 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
             // so "p.thing" and "use p.all" reach what it was mapped to
             if (formalp->kind() == VhdlIfaceKind::PACKAGE && targetp->innerp()) {
                 innerp->addNamed(lower(formalp->name()), targetp->innerp());
+            }
+        }
+        // A package may be named by its library -- "fixed_pkg => IEEE.fixed_pkg"
+        // -- with no use clause bringing it into view, so the design unit
+        // itself is what to look for (4.7)
+        if (found.empty() && formalp->kind() == VhdlIfaceKind::PACKAGE && parts.size() > 1) {
+            std::string lib = parts[parts.size() - 2];
+            if (lib == "work") lib = m_libname;
+            const auto it = m_unitScopes.find(lib + "." + parts.back());
+            if (it != m_unitScopes.end()) {
+                VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::PACKAGE,
+                                                               formalp->name(), formalp);
+                symp->innerp(it->second);
+                declare(symp, flp);
+                innerp->addNamed(lower(formalp->name()), it->second);
+                return;
             }
         }
         if (found.empty()) {
@@ -3109,8 +3136,17 @@ VhdlType* VhdlSemVisitor::attrTypeQuiet(AstVhdlAttrName* nodep) {
     VhdlSymbol* const symp = lookupTypeQuiet(nodep->prefixp());
     VhdlType* const prefixp = symp ? symp->typep() : nullptr;
     if (!prefixp) return nullptr;
-    if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
-        || attr == "base" || attr == "leftof" || attr == "rightof" || attr == "pred"
+    if (attr == "left" || attr == "right" || attr == "high" || attr == "low") {
+        // Of an array these ask about one of its index ranges, not about the
+        // array (16.2.4). Answering with the array offers "arr'high" to
+        // overload resolution as a value of the array type, and every
+        // operator then refuses it.
+        if (prefixp->base()->kind() == VhdlTypeKind::ARRAY) {
+            return dimensionOf(nodep, prefixp);
+        }
+        return prefixp;
+    }
+    if (attr == "base" || attr == "leftof" || attr == "rightof" || attr == "pred"
         || attr == "succ" || attr == "val" || attr == "value") {
         return prefixp;
     }
@@ -4303,9 +4339,35 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             if (typep && typep->isError()) return V3VhdlStd::errorType();
         }
         const std::string name = parts.empty() ? std::string{"<name>"} : parts.back();
+        // Where exactly one declaration has the right formals, say which
+        // argument it was that did not fit -- "of these types" on its own
+        // leaves seven named associations to be checked by hand
+        std::string detail;
+        int arityOk = 0;
+        for (VhdlSymbol* const symp : found) {
+            const VhdlSymKind kind = symp->resolved()->kind();
+            if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
+            if (!bindActuals(symp, assocs, formalOf)) continue;
+            ++arityOk;
+            if (arityOk > 1) {
+                detail.clear();
+                break;
+            }
+            for (size_t i = 0; i < argCands.size(); ++i) {
+                if (formalOf[i] < 0) continue;
+                VhdlType* const paramp = symp->paramTypes()[formalOf[i]];
+                if (anyMatches(argCands[i], paramp)) continue;
+                detail = ": argument '" + symp->paramName(formalOf[i]) + "' expects "
+                         + (paramp ? paramp->prettyName() : std::string{"<unknown>"});
+                if (i < argTypes.size() && argTypes[i]) {
+                    detail += ", not " + argTypes[i]->prettyName();
+                }
+                break;
+            }
+        }
         err(nodep->fileline(), "No visible subprogram '" + name + "' takes "
                                    + std::to_string(argCands.size())
-                                   + " argument(s) of these types");
+                                   + " argument(s) of these types" + detail);
         for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
             if (AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
                 analyzeExpr(asp->actualp(), nullptr);
