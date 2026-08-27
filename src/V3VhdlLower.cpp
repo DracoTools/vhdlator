@@ -1890,7 +1890,11 @@ private:
     }
 
     const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
-        VhdlSymbol* const symp = boundSignal(prefixp->vhdlSymp());
+        // "r.f'event" and "v(2)'event" ask about part of a signal, and it is
+        // the whole signal whose history is kept -- the part is read out of
+        // it afterwards
+        VhdlSymbol* const symp
+            = boundSignal(const_cast<VhdlSymbol*>(rootSymOf(prefixp)));
         // Only a signal of the design has a history to keep
         if (!symp || symp->kind() != VhdlSymKind::SIGNAL) {
             if (!symp || symp->kind() != VhdlSymKind::PORT) return nullptr;
@@ -2069,10 +2073,33 @@ private:
 
     // "s /= s'past value", which is true for exactly the delta in which the
     // signal changed
+    // The same part of a signal, read out of one of the variables that keep
+    // its history. Each scalar subelement of a composite signal is a signal
+    // in its own right (14.7.3.4), so "v(2)'event" asks about that element
+    // and no other -- which means indexing the history the way the signal
+    // itself is indexed.
+    AstNodeExpr* shadowPart(AstNodeVhdlExpr* prefixp, AstVar* shadowVarp, FileLine* flp) {
+        VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(prefixp));
+        if (!rootp || VN_IS(prefixp, VhdlName)) {
+            return new AstVarRef{flp, shadowVarp, VAccess::READ};
+        }
+        const auto prevIt = m_vars.find(rootp);
+        const bool had = prevIt != m_vars.end();
+        AstVar* const savedp = had ? prevIt->second : nullptr;
+        m_vars[rootp] = shadowVarp;
+        AstNodeExpr* const outp = lowerExpr(prefixp);
+        if (had) {
+            m_vars[rootp] = savedp;
+        } else {
+            m_vars.erase(rootp);
+        }
+        return outp ? outp : new AstVarRef{flp, shadowVarp, VAccess::READ};
+    }
+
     AstNodeExpr* eventOf(AstNodeVhdlExpr* prefixp, const VhdlShadow* shp, FileLine* flp) {
         AstNodeExpr* const nowp = lowerExpr(prefixp);
         if (!nowp) return nullptr;
-        return new AstNeq{flp, nowp, new AstVarRef{flp, shp->prevp, VAccess::READ}};
+        return new AstNeq{flp, nowp, shadowPart(prefixp, shp->prevp, flp)};
     }
 
     // "now"
@@ -2123,7 +2150,7 @@ private:
     // may ask for several.
     AstNodeExpr* delayedOf(AstNodeVhdlExpr* prefixp, const VhdlShadow* shp, AstNodeExpr* argp,
                            FileLine* flp) {
-        if (!argp) return new AstVarRef{flp, shp->prevp, VAccess::READ};
+        if (!argp) return shadowPart(prefixp, shp->prevp, flp);
         AstConst* const constp = VN_CAST(argp, Const);
         if (!constp) {
             unsup(flp, "'delayed by a time that is not static");
@@ -2132,13 +2159,13 @@ private:
         const int64_t ticks = static_cast<int64_t>(constp->toUQuad());
         if (ticks == 0) {
             VL_DO_DANGLING(argp->deleteTree(), argp);
-            return new AstVarRef{flp, shp->prevp, VAccess::READ};
+            return shadowPart(prefixp, shp->prevp, flp);
         }
         if (!v3Global.opt.timing().isTrue()) {
             unsup(flp, "'delayed by a time without --timing");
             return nullptr;
         }
-        VhdlSymbol* const symp = prefixp->vhdlSymp();
+        VhdlSymbol* const symp = const_cast<VhdlSymbol*>(rootSymOf(prefixp));
         const auto varIt = symp ? m_vars.find(symp->resolved()) : m_vars.end();
         if (varIt == m_vars.end()) return nullptr;
         AstVar* const sigp = varIt->second;
@@ -2146,7 +2173,7 @@ private:
         const auto found = m_delayeds.find(key);
         if (found != m_delayeds.end()) {
             VL_DO_DANGLING(argp->deleteTree(), argp);
-            return new AstVarRef{flp, found->second, VAccess::READ};
+            return shadowPart(prefixp, found->second, flp);
         }
         VL_RESTORER(m_ftaskp);
         m_ftaskp = nullptr;
@@ -2169,7 +2196,7 @@ private:
             m_shadowsp,
             static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp}));
         m_delayeds.emplace(key, dlyp);
-        return new AstVarRef{flp, dlyp, VAccess::READ};
+        return shadowPart(prefixp, dlyp, flp);
     }
 
     // The signal attributes of 16.2.4, answered from what shadowFor and
@@ -2214,8 +2241,8 @@ private:
             // change is what prev still holds
             AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
             if (!evp) return nullptr;
-            return new AstCond{flp, evp, new AstVarRef{flp, shp->prevp, VAccess::READ},
-                               new AstVarRef{flp, shp->lastp, VAccess::READ}};
+            return new AstCond{flp, evp, shadowPart(nodep->prefixp(), shp->prevp, flp),
+                               shadowPart(nodep->prefixp(), shp->lastp, flp)};
         }
         if (attr == "event") return eventOf(nodep->prefixp(), shp, flp);
         if (attr == "last_event") {
@@ -4884,14 +4911,16 @@ private:
     }
 
     static const VhdlSymbol* rootSymOf(const AstNode* nodep) {
+        // Descend before asking: an index or a selection carries a symbol of
+        // its own -- the element it names -- and the object it is part of is
+        // the one further in
         while (nodep) {
-            if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
-                if (vp->vhdlSymp()) return vp->vhdlSymp();
-            }
             if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
                 nodep = callp->prefixp();  // An index or a slice
             } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
                 nodep = selp->prefixp();
+            } else if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
+                return vp->vhdlSymp();
             } else {
                 return nullptr;
             }
