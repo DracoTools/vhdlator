@@ -5728,6 +5728,20 @@ private:
 
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
+        // "(a, b) <= v" written as a concurrent statement is the process it
+        // is defined to be (11.6), with the value spread over the names
+        if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {
+            if (nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
+                && !nodep->wavesp()->nextp() && !nodep->wavesp()->afterp()) {
+                FileLine* const aflp = new FileLine{flp};
+                aflp->warnOff(V3ErrorCode::COMBDLY, true);
+                aflp->warnOff(V3ErrorCode::LATCH, true);
+                AstNode* const stmtsp
+                    = lowerAggregateTarget(aggp, nodep->wavesp()->valuep(), true, true, aflp);
+                if (stmtsp) addStmt(concurrentProcess(stmtsp, nodep->postponed(), aflp));
+                return;
+            }
+        }
         // A waveform with a delay, or with more than one element, schedules
         // each element at its own time (11.6, 10.5.2.2). It becomes a process
         // that assigns them, rather than a continuous assignment with a
@@ -6754,52 +6768,29 @@ private:
             unsup(flp, "aggregate target of this type");
             return nullptr;
         }
-        std::vector<AstVhdlElemAssoc*> assocs;
-        for (AstVhdlElemAssoc* p = targetp->elemsp(); p; p = VN_AS(p->nextp(), VhdlElemAssoc)) {
-            if (p->choicesp()) {
-                unsup(p->fileline(), "aggregate target with a named element");
-                return nullptr;
-            }
-            assocs.push_back(p);
-        }
-        // Where the value's own range is known, use it; an aggregate that
-        // constrains itself starts at its index subtype's leftmost value
-        int64_t index = 0;
-        int64_t step = 1;
-        int64_t length = -1;
-        if (!isRecord) {
-            if (typep->isConstrainedArray()) {
-                const VhdlType* const indexp = typep->indexTypes()[0];
-                index = indexp->left();
-                step = indexp->ascending() ? 1 : -1;
-                length = indexp->length();
-            } else {
-                const VhdlType* const indexp = typep->base()->indexTypes().empty()
-                                                   ? nullptr
-                                                   : typep->base()->indexTypes()[0];
-                if (indexp) {
-                    index = indexp->left();
-                    step = indexp->ascending() ? 1 : -1;
-                }
-                // The value has as many elements as the target names
-                int64_t total = 0;
-                for (AstVhdlElemAssoc* const ap : assocs) {
-                    const int64_t span = elementSpan(ap->valuep(), typep);
-                    if (span < 0) {
-                        unsup(ap->fileline(), "aggregate target element of an unknown length");
-                        return nullptr;
-                    }
-                    total += span;
-                }
-                length = total;
-            }
-        }
         AstNodeExpr* const rhsp = lowerExpr(valuep);
         if (!rhsp) return nullptr;
         AstNodeDType* tempDTypep = nullptr;
         if (isRecord || typep->isConstrainedArray()) {
             tempDTypep = lowerType(typep, flp);
         } else {
+            // The value has as many elements as the target names, starting at
+            // the index subtype's own leftmost value
+            const VhdlType* const indexp
+                = typep->base()->indexTypes().empty() ? nullptr : typep->base()->indexTypes()[0];
+            const int64_t index = indexp ? indexp->left() : 0;
+            const int64_t step = (indexp && !indexp->ascending()) ? -1 : 1;
+            int64_t length = 0;
+            for (AstVhdlElemAssoc* p = targetp->elemsp(); p;
+                 p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+                const int64_t span = elementSpan(p->valuep(), typep);
+                if (span < 0) {
+                    unsup(p->fileline(), "aggregate target element of an unknown length");
+                    VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                    return nullptr;
+                }
+                length += span;
+            }
             VhdlType* const elemp
                 = typep->elementp() ? typep->elementp() : typep->base()->elementp();
             AstNodeDType* const edtp = elemp ? lowerType(elemp, flp) : newLogicDType(flp, 1);
@@ -6813,53 +6804,117 @@ private:
                                    new AstUnpackArrayDType{flp, VFlagChildDType{}, edtp, rp});
         }
         AstVar* const tempp = newTempVar("__Vaggtgt", tempDTypep, flp);
-        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
+        AstNode* const outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
+        return AstNode::addNextNull(
+            outp, spreadAggregate(targetp, new AstVarRef{flp, tempp, VAccess::READ}, typep,
+                                  signalAssign, sequential, flp));
+    }
 
+    // Each name the aggregate lists takes the part of "srcp" that stands in
+    // its place. An element may itself be an aggregate, and then the part it
+    // is given is spread over the names inside it in turn (10.6.2).
+    // Takes ownership of srcp.
+    AstNode* spreadAggregate(AstVhdlAggregate* targetp, AstNodeExpr* srcp, VhdlType* typep,
+                             bool signalAssign, bool sequential, FileLine* flp) {
+        const bool isRecord = typep && typep->base()->kind() == VhdlTypeKind::RECORD;
+        if (!typep || (!isRecord && typep->base()->kind() != VhdlTypeKind::ARRAY)
+            || (!isRecord && typep->dimensions() != 1)) {
+            unsup(flp, "aggregate target of this type");
+            VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            return nullptr;
+        }
+        std::vector<AstVhdlElemAssoc*> assocs;
+        for (AstVhdlElemAssoc* p = targetp->elemsp(); p; p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+            assocs.push_back(p);
+        }
+        AstNode* outp = nullptr;
         if (isRecord) {
             const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
-            if (assocs.size() != elems.size()) {
-                err(flp, "The aggregate on the left has " + std::to_string(assocs.size())
-                             + " element(s), but the record has "
-                             + std::to_string(elems.size()));
-                return outp;
+            // A record aggregate may name its elements instead of listing
+            // them in order, and may name several at once (9.3.3.2)
+            std::vector<AstVhdlElemAssoc*> byPos{elems.size(), nullptr};
+            if (!recordTargetOrder(assocs, elems, byPos, flp)) {
+                VL_DO_DANGLING(srcp->deleteTree(), srcp);
+                return nullptr;
             }
-            for (size_t i = 0; i < assocs.size(); ++i) {
-                AstNodeExpr* const onep = lowerExpr(assocs[i]->valuep());
-                if (!onep) return outp;
-                AstNodeExpr* const fromp = new AstMemberSel{
-                    flp, new AstVarRef{flp, tempp, VAccess::READ}, VFlagChildDType{},
-                    elems[i]->name()};
-                outp = AstNode::addNext(outp,
-                                        assignOf(onep, fromp, signalAssign, sequential, flp));
+            for (size_t i = 0; i < elems.size(); ++i) {
+                AstNodeExpr* const fromp
+                    = new AstMemberSel{flp, srcp->cloneTree(false), VFlagChildDType{},
+                                       elems[i]->name()};
+                outp = AstNode::addNextNull(outp,
+                                            oneTarget(byPos[i]->valuep(), fromp,
+                                                      elems[i]->typep(), signalAssign,
+                                                      sequential, flp));
             }
+            VL_DO_DANGLING(srcp->deleteTree(), srcp);
             return outp;
         }
-
+        // Where the value's own range is known, use it; an aggregate that
+        // constrains itself starts at its index subtype's leftmost value
+        int64_t index = 0;
+        int64_t step = 1;
+        int64_t length = -1;
+        const VhdlType* indexp = nullptr;
+        if (typep->isConstrainedArray()) {
+            indexp = typep->indexTypes()[0];
+            length = indexp->length();
+        } else {
+            indexp = typep->base()->indexTypes().empty() ? nullptr
+                                                         : typep->base()->indexTypes()[0];
+        }
+        if (indexp) {
+            index = indexp->left();
+            step = indexp->ascending() ? 1 : -1;
+        }
+        VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        const bool isString = isStringType(typep);
         int64_t used = 0;
         for (size_t i = 0; i < assocs.size(); ++i) {
-            AstNodeExpr* const onep = lowerExpr(assocs[i]->valuep());
-            if (!onep) return outp;
-            int64_t span = elementSpan(assocs[i]->valuep(), typep);
+            // "(1 => a, 4 to 8 => k)" says where in the value each name
+            // takes its part from, rather than leaving it to the order
+            int64_t span = -1;
+            if (assocs[i]->choicesp()) {
+                if (!targetChoiceSpan(assocs[i], step, index, span)) {
+                    VL_DO_DANGLING(srcp->deleteTree(), srcp);
+                    return outp;
+                }
+            } else {
+                span = elementSpan(assocs[i]->valuep(), typep);
+            }
             if (span < 0) {
                 unsup(assocs[i]->fileline(), "aggregate target element of an unknown length");
+                VL_DO_DANGLING(srcp->deleteTree(), srcp);
                 return outp;
             }
             AstNodeExpr* fromp = nullptr;
-            if (span == 1) {
-                fromp = new AstSelBit{
-                    flp, new AstVarRef{flp, tempp, VAccess::READ},
-                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(index)}};
+            const int64_t last = index + (span - 1) * step;
+            AstNodeExpr* const firstIdxp
+                = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(index)};
+            AstNodeExpr* const lastIdxp
+                = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(last)};
+            if (span == 1 && !VN_IS(assocs[i]->valuep(), VhdlAggregate)) {
+                VL_DO_DANGLING(lastIdxp->deleteTree(), lastIdxp);
+                fromp = new AstSelBit{flp, srcp->cloneTree(false),
+                                      stringIndex(typep, firstIdxp, flp)};
+            } else if (isString) {
+                // A run of characters is a substring: Verilator's string is
+                // characters, not bits, so a part select of it means nothing
+                fromp = new AstSubstrN{flp, srcp->cloneTree(false),
+                                       stringIndex(typep, firstIdxp, flp),
+                                       stringIndex(typep, lastIdxp, flp)};
             } else {
-                const int64_t last = index + (span - 1) * step;
-                fromp = new AstSelExtract{
-                    flp, new AstVarRef{flp, tempp, VAccess::READ},
-                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(index)},
-                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(last)}};
+                fromp = new AstSelExtract{flp, srcp->cloneTree(false), firstIdxp, lastIdxp};
             }
             index += span * step;
             used += span;
-            outp = AstNode::addNext(outp, assignOf(onep, fromp, signalAssign, sequential, flp));
+            // A name that stands for one element takes the element's type; a
+            // name that stands for a run of them takes the array's own
+            outp = AstNode::addNextNull(
+                outp, oneTarget(assocs[i]->valuep(), fromp, span == 1 ? elemp : typep,
+                                signalAssign, sequential, flp));
         }
+        VL_DO_DANGLING(srcp->deleteTree(), srcp);
         if (length >= 0 && used != length) {
             err(flp, "The aggregate on the left covers " + std::to_string(used)
                          + " element(s), but the value has " + std::to_string(length));
@@ -6867,6 +6922,99 @@ private:
         return outp;
     }
 
+    // One name of an aggregate target, which may be an aggregate itself
+    AstNode* oneTarget(AstNodeVhdlExpr* namep, AstNodeExpr* fromp, VhdlType* typep,
+                       bool signalAssign, bool sequential, FileLine* flp) {
+        if (AstVhdlAggregate* const aggp = VN_CAST(namep, VhdlAggregate)) {
+            return spreadAggregate(aggp, fromp, typep, signalAssign, sequential, flp);
+        }
+        AstNodeExpr* const onep = lowerExpr(namep);
+        if (!onep) {
+            VL_DO_DANGLING(fromp->deleteTree(), fromp);
+            return nullptr;
+        }
+        return assignOf(onep, fromp, signalAssign, sequential, flp);
+    }
+
+    // Which element of the record each association of the target names
+    bool recordTargetOrder(const std::vector<AstVhdlElemAssoc*>& assocs,
+                           const std::vector<VhdlSymbol*>& elems,
+                           std::vector<AstVhdlElemAssoc*>& byPos, FileLine* flp) {
+        size_t pos = 0;
+        for (AstVhdlElemAssoc* const ap : assocs) {
+            if (!ap->choicesp()) {
+                if (pos >= elems.size()) break;
+                byPos[pos++] = ap;
+                continue;
+            }
+            for (AstVhdlChoice* cp = ap->choicesp(); cp; cp = VN_AS(cp->nextp(), VhdlChoice)) {
+                const AstVhdlName* const namep = VN_CAST(cp->exprp(), VhdlName);
+                if (!namep) {
+                    unsup(ap->fileline(), "aggregate target with a named element");
+                    return false;
+                }
+                bool matched = false;
+                for (size_t i = 0; i < elems.size(); ++i) {
+                    if (elems[i]->name() != namep->name()) continue;
+                    byPos[i] = ap;
+                    matched = true;
+                    break;
+                }
+                if (!matched) {
+                    unsup(ap->fileline(), "aggregate target with a named element");
+                    return false;
+                }
+            }
+        }
+        for (size_t i = 0; i < elems.size(); ++i) {
+            if (byPos[i]) continue;
+            err(flp, "The aggregate on the left has no element for '" + elems[i]->name() + "'");
+            return false;
+        }
+        return true;
+    }
+
+    // "1 => a" and "4 to 8 => k" say where in the value the name takes its
+    // part from, and how much of it. Both have to be static.
+    bool targetChoiceSpan(AstVhdlElemAssoc* assocp, int64_t step, int64_t& index,
+                          int64_t& span) {
+        if (assocp->choicesp()->nextp()) {
+            unsup(assocp->fileline(), "aggregate target with a named element");
+            return false;
+        }
+        AstVhdlChoice* const choicep = assocp->choicesp();
+        if (choicep->isOthers()) {
+            unsup(assocp->fileline(), "aggregate target with a named element");
+            return false;
+        }
+        if (AstVhdlRange* const rangep = choicep->rangep()) {
+            const VhdlValue lo = V3VhdlEval::eval(rangep->leftp());
+            const VhdlValue hi = V3VhdlEval::eval(rangep->rightp());
+            const bool up = rangep->dir() == VhdlDir::TO;
+            if (!lo.isInt() || !hi.isInt() || rangep->dirUnknown()) {
+                unsup(assocp->fileline(), "aggregate target with a named element");
+                return false;
+            }
+            if ((step < 0) == up) {
+                // The choice runs the other way from the value's own index
+                unsup(assocp->fileline(), "aggregate target with a named element");
+                return false;
+            }
+            index = lo.toInt();
+            span = (up ? hi.toInt() - lo.toInt() : lo.toInt() - hi.toInt()) + 1;
+            if (span < 0) span = 0;
+            return true;
+        }
+        AstNodeVhdlExpr* const atp = choicep->valuep();
+        const VhdlValue at = atp ? V3VhdlEval::eval(atp) : VhdlValue{};
+        if (!at.isInt()) {
+            unsup(assocp->fileline(), "aggregate target with a named element");
+            return false;
+        }
+        index = at.toInt();
+        span = 1;
+        return true;
+    }
 
     static AstNode* assignOf(AstNodeExpr* lhsp, AstNodeExpr* rhsp, bool signalAssign,
                              bool sequential, FileLine* flp) {
