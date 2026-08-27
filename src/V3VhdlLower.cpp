@@ -4602,6 +4602,29 @@ private:
         return namep ? namep->name() : "";
     }
 
+    // Whether an actual names a signal, possibly through a conversion.
+    // 6.5.7.1 keeps that an association with the signal itself; anything
+    // else is an expression, and a port associated with one has a driver of
+    // its own and so a delta of its own.
+    static bool isSignalActual(const AstNodeVhdlExpr* nodep) {
+        if (!nodep) return false;
+        if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
+            const VhdlSymbol* const symp = namep->vhdlSymp();
+            return symp
+                   && (symp->kind() == VhdlSymKind::SIGNAL
+                       || symp->kind() == VhdlSymKind::PORT);
+        }
+        if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            return isSignalActual(selp->prefixp());
+        }
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) return false;
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        const AstNodeVhdlExpr* const argp
+            = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+        return isSignalActual(argp);
+    }
+
     void lowerBlockInterface(AstNode* formalsp, AstNode* mapp, bool isGeneric) {
         // The actual for each formal, by position or by name
         std::vector<AstVhdlAssoc*> assocs;
@@ -4614,6 +4637,7 @@ private:
             FileLine* const flp = ifp->fileline();
             AstNodeVhdlExpr* actualp = nullptr;
             AstNodeVhdlExpr* outConvp = nullptr;  // "f(port) => actual" (6.5.7.1)
+            bool inertial = false;
             for (size_t i = 0; i < assocs.size(); ++i) {
                 const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
                 AstVhdlCall* const convp = VN_CAST(assocs[i]->formalp(), VhdlCall);
@@ -4624,6 +4648,7 @@ private:
                                     && formalNamed(convp->argsp()) == symp->name();
                 if (byName || byConv || (!namep && !convp && i == position)) {
                     actualp = assocs[i]->actualp();
+                    inertial = assocs[i]->inertial();
                     if (byConv) outConvp = assocs[i]->formalp();
                     break;
                 }
@@ -4649,6 +4674,9 @@ private:
                         if (convValuep) VL_DO_DANGLING(convValuep->deleteTree(), convValuep);
                         continue;
                     }
+                    // The conversion is applied to the value as it leaves
+                    // the port (6.5.7.1); the delta belongs to the port's own
+                    // driver, not to the conversion of what it drives
                     addStmt(new AstAlways{new AstAssignW{flp, targetp, convValuep}});
                     continue;
                 }
@@ -4672,25 +4700,66 @@ private:
             // that signal (11.2): a block is elaborated where it stands, so
             // there is nothing between the two, and a port of mode "inout"
             // or "buffer" has to write the signal itself rather than a copy
-            if (!isGeneric) {
+            // Written "inertial", the actual is an expression rather than
+            // the signal itself, so the port is a signal of its own with a
+            // driver (6.5.7.1) -- which is the whole reason for saying it
+            if (!isGeneric && !inertial) {
                 if (AstVarRef* const refp = VN_CAST(valuep, VarRef)) {
                     m_vars.emplace(symp, refp->varp());
                     VL_DO_DANGLING(valuep->deleteTree(), valuep);
                     continue;
                 }
             }
-            AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+            // A port the association drives is written from two blocks by
+            // construction -- once to start, once to react -- so the finding
+            // is about how this is emitted, not about the design
+            FileLine* const vflp = new FileLine{flp};
+            vflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            AstVar* const varp = newVar(symp, VVarType::VAR, vflp);
             addStmt(varp);
             if (isGeneric) {
                 varp->valuep(valuep);
                 continue;
             }
-            // An "out" port drives its actual; anything else is driven by it
-            AstNodeExpr* const portRefp = new AstVarRef{flp, varp, VAccess::READ};
+            // A conversion applied to a signal is still an association with
+            // that signal: the port follows it, converted, with nothing in
+            // between (6.5.7.1). Only a real expression gives the port a
+            // driver of its own.
+            if (!isGeneric && !inertial && isSignalActual(actualp)) {
+                AstNodeExpr* const convRefp = new AstVarRef{flp, varp, VAccess::READ};
+                if (ifp->mode() == VhdlMode::OUT || ifp->mode() == VhdlMode::BUFFER) {
+                    addStmt(new AstAlways{new AstAssignW{flp, valuep, convRefp}});
+                } else {
+                    addStmt(new AstAlways{new AstAssignW{flp, convRefp, valuep}});
+                }
+                continue;
+            }
+            // A port whose actual is an expression rather than a signal is
+            // a signal of its own with a driver (6.5.7.1): it holds its
+            // default until the association delivers, and every delivery
+            // after that arrives a delta later, as any signal assignment
+            // does. A continuous assignment would give it the value with no
+            // delta at all and no default to start from.
+            if (ifp->defaultp()) {
+                varp->valuep(lowerExpr(ifp->defaultp()));
+            } else if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp, true)) {
+                // With nothing written, the port starts at its type's own
+                // default until the association delivers (6.4.2.3)
+                varp->valuep(defp);
+            }
+            // The association is emitted twice -- once to start, once to
+            // react -- as every concurrent assignment is, so it drives from
+            // two blocks by construction
+            FileLine* const pflp = new FileLine{flp};
+            pflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            pflp->warnOff(V3ErrorCode::COMBDLY, true);
+            AstNodeExpr* const portRefp = new AstVarRef{pflp, varp, VAccess::READ};
             if (ifp->mode() == VhdlMode::OUT || ifp->mode() == VhdlMode::BUFFER) {
-                addStmt(new AstAlways{new AstAssignW{flp, valuep, portRefp}});
+                AstNodeExpr* readsp = portRefp->cloneTree(false);
+                emitWaveformProcess(new AstAssignDly{pflp, valuep, portRefp}, readsp, pflp);
             } else {
-                addStmt(new AstAlways{new AstAssignW{flp, portRefp, valuep}});
+                AstNodeExpr* readsp = valuep->cloneTree(false);
+                emitWaveformProcess(new AstAssignDly{pflp, portRefp, valuep}, readsp, pflp);
             }
         }
     }
