@@ -4566,6 +4566,11 @@ private:
     void lowerProcess(AstVhdlProcess* nodep) {
         FileLine* const flp = nodep->fileline();
         VL_RESTORER_COPY(m_prefix);
+        VL_RESTORER(m_postponed);
+        // A postponed process is not recognised as a clocked one: what makes
+        // it different is *when* it runs, which an edge-triggered block
+        // cannot say (10.3)
+        m_postponed = nodep->postponed() && v3Global.opt.timing().isTrue();
         const std::string label
             = nodep->label().empty() ? "__Vprocess" + std::to_string(++m_processNum)
                                      : nodep->label();
@@ -4574,7 +4579,7 @@ private:
 
         bool rising = false;
         AstNodeVhdlExpr* clockp = nullptr;
-        AstVhdlIf* const ifp = clockedIf(nodep, clockp, rising);
+        AstVhdlIf* const ifp = m_postponed ? nullptr : clockedIf(nodep, clockp, rising);
         AstNode* bodyp = nullptr;
         AstSenTree* sentreep = nullptr;
         if (ifp) {
@@ -4595,13 +4600,26 @@ private:
         } else {
             sentreep = sensitivity(nodep);
             bodyp = lowerStmts(nodep->stmtsp());
+            // "process (all)" is sensitive to every signal it reads (11.3).
+            // Which those are is only known once the body is lowered, and
+            // saying it as a list rather than as "@*" is what lets the
+            // process run once and then wait, as every process does.
+            if (nodep->sensAll() && v3Global.opt.timing().isTrue()) {
+                if (AstSenTree* const readsp = sensitivityOfBody(bodyp, flp)) {
+                    if (sentreep) VL_DO_DANGLING(sentreep->deleteTree(), sentreep);
+                    sentreep = readsp;
+                }
+            }
             // Every VHDL process runs once when the simulation starts, before
             // any signal has changed (11.3). Saying so in the sensitivity
             // itself, rather than emitting the body a second time, is what
             // keeps it to exactly one run: a change item may fire at time
             // zero of its own accord, when the signal starts at a value the
             // trigger's record of it does not.
-            if (sentreep && nodep->hasSensList() && !nodep->sensAll() && nodep->sensp()) {
+            // "process (all)" is a process with a sensitivity list like any
+            // other (11.3); the list is worked out rather than written, and
+            // it runs once at the start and then waits just the same
+            if (sentreep && nodep->hasSensList()) {
                 allowInitialDriver(nodep->stmtsp(), false);
                 if (v3Global.opt.timing().isTrue()) {
                     // A process with a sensitivity list is the same as one
@@ -4613,6 +4631,9 @@ private:
                     bodyp = AstNode::addNextNull(
                         bodyp, static_cast<AstNode*>(
                                    new AstEventControl{flp, sentreep, nullptr}));
+                    if (m_postponed) {
+                        bodyp = AstNode::addNextNull(bodyp, postponedWait(flp));
+                    }
                     addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, bodyp});
                     return;
                 }
@@ -6030,7 +6051,15 @@ private:
         if (AstVhdlReturn* const retp = VN_CAST(nodep, VhdlReturn)) {
             return new AstReturn{flp, retp->valuep() ? lowerExpr(retp->valuep()) : nullptr};
         }
-        if (AstVhdlWait* const waitp = VN_CAST(nodep, VhdlWait)) return lowerWait(waitp);
+        if (AstVhdlWait* const waitp = VN_CAST(nodep, VhdlWait)) {
+            AstNode* const outp = lowerWait(waitp);
+            // A postponed process resumes when its wait says, but runs at the
+            // end of the last delta of that time step (10.3)
+            if (outp && m_postponed) {
+                return AstNode::addNext(outp, postponedWait(waitp->fileline()));
+            }
+            return outp;
+        }
         if (AstVhdlProcCall* const callp = VN_CAST(nodep, VhdlProcCall)) {
             return lowerProcCall(callp);
         }
@@ -7118,6 +7147,42 @@ private:
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
+    // Every signal a lowered body reads. A signal it only writes is not one
+    // of them: a process that woke on what it had just assigned would run
+    // again for every assignment it makes.
+    AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp) {
+        if (!bodyp) return nullptr;
+        std::set<const AstVar*> signals;
+        for (const auto& pair : m_vars) {
+            if (!pair.first) continue;
+            if (pair.first->kind() == VhdlSymKind::SIGNAL
+                || pair.first->kind() == VhdlSymKind::PORT) {
+                signals.insert(pair.second);
+            }
+        }
+        std::vector<AstVar*> reads;
+        bodyp->foreachAndNext([&](AstVarRef* refp) {
+            if (!refp->access().isReadOrRW()) return;
+            // What an assignment writes it does not thereby read: a process
+            // woken by its own assignment runs again for every one it makes
+            if (const AstNodeAssign* const asgp = VN_CAST(refp->backp(), NodeAssign)) {
+                if (asgp->lhsp() == refp) return;
+            }
+            AstVar* const varp = refp->varp();
+            if (!varp || !signals.count(varp)) return;
+            if (std::find(reads.begin(), reads.end(), varp) == reads.end()) {
+                reads.push_back(varp);
+            }
+        });
+        AstSenItem* itemsp = nullptr;
+        for (AstVar* const varp : reads) {
+            itemsp = AstNode::addNext(
+                itemsp,
+                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
+        }
+        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
+    }
+
     // The sensitivity a condition implies: every signal it reads, which is
     // what "wait until" waits on when no list is written (10.2)
     static AstSenTree* sensitivityOfExpr(const AstNodeExpr* condp, FileLine* flp) {
@@ -7152,6 +7217,32 @@ private:
     // it. The change is a non-blocking assignment, so it lands with all the
     // others, and the process resumes after they have -- which is what a
     // delta cycle is, and what "wait for 0 ns" waits for.
+    // A postponed process runs at the end of the last delta of a time step
+    // (10.3, 14.7.5.3). Verilator has a postponed region of its own -- what
+    // $strobe is written in -- so a bit toggled there says when that moment
+    // has come, and a process that has just resumed waits for it.
+    AstNode* postponedWait(FileLine* flp) {
+        if (!m_postVarp) {
+            m_postVarp = new AstVar{flp, VVarType::VAR, "__Vpostponed", VFlagChildDType{},
+                                    newLogicDType(flp, 1)};
+            m_postVarp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            m_stmtsp = AstNode::addNextNull(m_stmtsp, m_postVarp);
+            FileLine* const pflp = new FileLine{flp};
+            pflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            m_shadowsp = AstNode::addNextNull(
+                m_shadowsp,
+                static_cast<AstNode*>(new AstAlwaysPostponed{
+                    pflp, new AstAssign{pflp, new AstVarRef{pflp, m_postVarp, VAccess::WRITE},
+                                        new AstNot{pflp, new AstVarRef{pflp, m_postVarp,
+                                                                       VAccess::READ}}}}));
+        }
+        AstSenTree* const senp = new AstSenTree{
+            flp, senItemFor(new AstVarRef{flp, m_postVarp, VAccess::READ}, true, flp)};
+        return new AstEventControl{flp, senp, nullptr};
+    }
+    AstVar* m_postVarp = nullptr;  // The module's postponed-region bit, if used
+    bool m_postponed = false;  // Lowering the body of a postponed process
+
     AstNode* deltaWait(FileLine* flp) {
         if (!m_deltaVarp) {
             m_deltaVarp = new AstVar{flp, VVarType::VAR, "__Vdelta", VFlagChildDType{},
