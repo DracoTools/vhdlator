@@ -1328,8 +1328,10 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
         // selected_signal_assignment ::= WITH expr SELECT [?] target <= ...  (11.6)
         consume();
         AstNodeVhdlExpr* const selectorp = parseExpression();
-        const bool matching = check(VhdlTokType::QUERY);
+        bool matching = check(VhdlTokType::QUERY);
         expect(VhdlTokType::KWD_SELECT, "'select' after the selector expression");
+        // 11.6 and 10.5.4 write the question mark after "select"
+        if (check(VhdlTokType::QUERY)) matching = true;
         AstNodeVhdlExpr* targetp = parseName();
         if (!targetp) targetp = new AstVhdlName{flp, ""};
         expect(VhdlTokType::LE, "'<=' in a selected signal assignment");
@@ -1906,8 +1908,10 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
     if (check(VhdlTokType::KWD_WITH)) {
         // VHDL-2008 selected signal or variable assignment (10.5.4, 10.6.4)
         AstNodeVhdlExpr* const selectorp = parseExpression();
-        const bool matching = check(VhdlTokType::QUERY);
+        bool matching = check(VhdlTokType::QUERY);
         expect(VhdlTokType::KWD_SELECT, "'select' after the selector expression");
+        // 11.6 and 10.5.4 write the question mark after "select"
+        if (check(VhdlTokType::QUERY)) matching = true;
         AstNodeVhdlExpr* targetp = parseName();
         if (!targetp) targetp = new AstVhdlName{flp, ""};
         if (check(VhdlTokType::VAR_ASSIGN)) {

@@ -3038,9 +3038,9 @@ private:
                          : static_cast<AstNodeExpr*>(new AstPow{flp, lhsp, rhsp});
         case VhdlBinaryOp::CONCAT: return new AstConcat{flp, lhsp, rhsp};
         case VhdlBinaryOp::SLL:
-        case VhdlBinaryOp::SLA: return new AstShiftL{flp, lhsp, rhsp};
-        case VhdlBinaryOp::SRL: return new AstShiftR{flp, lhsp, rhsp};
-        case VhdlBinaryOp::SRA: return new AstShiftRS{flp, lhsp, rhsp};
+        case VhdlBinaryOp::SRL:
+        case VhdlBinaryOp::SLA:
+        case VhdlBinaryOp::SRA: return lowerShift(nodep, lhsp, rhsp, flp);
         case VhdlBinaryOp::ROL:
         case VhdlBinaryOp::ROR: {
             // 9.2.4 says a rotate moves every element one place and repeats
@@ -3093,6 +3093,74 @@ private:
         }
         unsup(flp, "binary operator");
         return nullptr;
+    }
+
+    // The four shift operators of 9.2.4. What comes in at the vacated end is
+    // what tells them apart: "sll" and "srl" bring in the element type's own
+    // left bound, "sla" repeats the operand's rightmost element and "sra" its
+    // leftmost. A count that is negative shifts the other way instead.
+    AstNodeExpr* lowerShift(AstVhdlBinary* nodep, AstNodeExpr* lhsp, AstNodeExpr* rhsp,
+                            FileLine* flp) {
+        const VhdlBinaryOp op = nodep->op();
+        const bool arith = op == VhdlBinaryOp::SLA || op == VhdlBinaryOp::SRA;
+        const bool leftward = op == VhdlBinaryOp::SLL || op == VhdlBinaryOp::SLA;
+        const int width = exprVectorWidth(nodep->lhsp());
+        if (width <= 0) {
+            // Nothing here needs the length: the vacated end takes zero, and
+            // Verilog's shift already does that
+            if (arith) {
+                unsup(flp, "'" + std::string{leftward ? "sla" : "sra"}
+                               + "' on a vector whose length is not known here");
+                return nullptr;
+            }
+            return leftward ? static_cast<AstNodeExpr*>(new AstShiftL{flp, lhsp, rhsp})
+                            : static_cast<AstNodeExpr*>(new AstShiftR{flp, lhsp, rhsp});
+        }
+        AstVar* const valp = newTempVar("__Vshv", newLogicDType(flp, width), flp);
+        AstVar* const cntp = newTempVar("__Vshn", newIntDType(flp), flp);
+        const auto val = [&]() { return new AstVarRef{flp, valp, VAccess::READ}; };
+        const auto cnt = [&]() { return new AstVarRef{flp, cntp, VAccess::READ}; };
+        const auto widthConst = [&]() {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(width)};
+        };
+        // All ones, as wide as the operand, for building the mask that says
+        // which places the shift vacated
+        const auto allOnes = [&]() {
+            return new AstReplicate{flp, new AstConst{flp, AstConst::BitTrue{}}, widthConst()};
+        };
+        // One shifted end of the operand, repeated across the whole width
+        const auto edge = [&](bool leftmost) -> AstNodeExpr* {
+            AstNodeExpr* const bitp
+                = new AstSel{flp, val(), leftmost ? width - 1 : 0, 1};
+            return new AstReplicate{flp, bitp, widthConst()};
+        };
+        // "sla" fills from the right end, "sra" from the left; the mask picks
+        // out exactly the places the shift left empty, and is all ones when
+        // the count reaches the whole width
+        const auto filled = [&](bool toLeft, AstNodeExpr* placesp) -> AstNodeExpr* {
+            AstNodeExpr* const shiftedp
+                = toLeft ? static_cast<AstNodeExpr*>(new AstShiftL{flp, val(), placesp})
+                         : static_cast<AstNodeExpr*>(new AstShiftR{flp, val(), placesp});
+            if (!arith) return shiftedp;
+            AstNodeExpr* const maskp
+                = toLeft ? static_cast<AstNodeExpr*>(new AstNot{
+                              flp, new AstShiftL{flp, allOnes(), placesp->cloneTree(false)}})
+                         : static_cast<AstNodeExpr*>(new AstShiftL{
+                               flp, allOnes(),
+                               new AstSub{flp, widthConst(), placesp->cloneTree(false)}});
+            return new AstOr{flp, shiftedp, new AstAnd{flp, edge(!toLeft), maskp}};
+        };
+        AstNode* stmtsp = new AstAssign{flp, new AstVarRef{flp, valp, VAccess::WRITE}, lhsp};
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(
+                        new AstAssign{flp, new AstVarRef{flp, cntp, VAccess::WRITE}, rhsp}));
+        AstNodeExpr* const forwardp = filled(leftward, cnt());
+        AstNodeExpr* const backwardp = filled(!leftward, new AstNegate{flp, cnt()});
+        return new AstExprStmt{
+            flp, stmtsp,
+            new AstCond{flp,
+                        new AstGteS{flp, cnt(), new AstConst{flp, AstConst::Signed32{}, 0}},
+                        forwardp, backwardp}};
     }
 
     // The length of a constrained one-dimensional vector, or 0
@@ -5106,7 +5174,8 @@ private:
             if (nodep->kind() == VhdlAssignKind::CONDITIONAL) {
                 if (alts[i]->condp()) testp = lowerCondition(alts[i]->condp());
             } else {
-                testp = choiceTest(alts[i]->choicesp(), nodep->selectorp());
+                testp = choiceTest(alts[i]->choicesp(), nodep->selectorp(),
+                                   nodep->matching());
             }
             if (!testp || !outp) {
                 if (testp) VL_DO_DANGLING(testp->deleteTree(), testp);
@@ -5409,7 +5478,7 @@ private:
             AstVhdlAlternative* const altp = alts[i];
             AstNodeExpr* const valuep = waveformValue(altp->wavesp());
             if (!valuep) return nullptr;
-            AstNodeExpr* testp = choiceTest(altp->choicesp(), selp);
+            AstNodeExpr* testp = choiceTest(altp->choicesp(), selp, nodep->matching());
             if (!testp) {
                 outp = valuep;  // "when others"
                 continue;
@@ -5433,7 +5502,10 @@ private:
 
     // The condition that one set of choices matches the selector, or null for
     // "others"
-    AstNodeExpr* choiceTest(AstNode* choicesp, AstNodeVhdlExpr* selp) {
+    // "select?" matches with "?=", where a '-' in a choice stands for any
+    // value (10.5.4). That is Verilog's wildcard equality, and '-' is carried
+    // as x here.
+    AstNodeExpr* choiceTest(AstNode* choicesp, AstNodeVhdlExpr* selp, bool matching = false) {
         AstNodeExpr* testp = nullptr;
         for (AstNode* p = choicesp; p; p = p->nextp()) {
             AstVhdlChoice* const chp = VN_AS(p, VhdlChoice);
@@ -5457,7 +5529,9 @@ private:
                 AstNodeExpr* const selValp = lowerExpr(selp);
                 AstNodeExpr* const chValp = lowerExpr(chp->valuep());
                 if (!selValp || !chValp) return nullptr;
-                onep = new AstEq{flp, selValp, chValp};
+                onep = matching
+                           ? static_cast<AstNodeExpr*>(new AstEqWild{flp, selValp, chValp})
+                           : static_cast<AstNodeExpr*>(new AstEq{flp, selValp, chValp});
             }
             if (!onep) continue;
             testp = testp ? new AstOr{flp, testp, onep} : onep;
@@ -5989,7 +6063,8 @@ private:
             AstNode* outp = nullptr;
             for (size_t i = alts.size(); i-- > 0;) {
                 AstNode* const thenp = lowerSeqWaveform(nodep, alts[i]->wavesp(), sequential);
-                AstNodeExpr* const testp = choiceTest(alts[i]->choicesp(), selp);
+                AstNodeExpr* const testp
+                    = choiceTest(alts[i]->choicesp(), selp, nodep->matching());
                 if (!testp) {
                     outp = thenp;  // "when others"
                     continue;
@@ -6216,7 +6291,8 @@ private:
                 if (nodep->kind() == VhdlAssignKind::CONDITIONAL) {
                     if (alts[i]->condp()) testp = lowerCondition(alts[i]->condp());
                 } else if (nodep->selectorp()) {
-                    testp = choiceTest(alts[i]->choicesp(), nodep->selectorp());
+                    testp = choiceTest(alts[i]->choicesp(), nodep->selectorp(),
+                                       nodep->matching());
                 }
                 if (!testp) {
                     outp = thenp;  // The trailing "else", or "when others"
@@ -6479,7 +6555,18 @@ private:
             itemsp = AstNode::addNextNull(
                 itemsp, new AstCaseItem{flp, others ? nullptr : condsp, stmtsp});
         }
-        AstCase* const casep = new AstCase{flp, VCaseType::CT_CASE, exprp, itemsp};
+        // "case?" matches with "?=", where a '-' in a choice stands for any
+        // value (10.9). That is what Verilog's casex does with an x, and '-'
+        // is carried as x here.
+        FileLine* cflp = flp;
+        if (nodep->matching()) {
+            // Verilog's casez is the one to prefer there, but VHDL has only
+            // this one spelling and it is what the source wrote
+            cflp = new FileLine{flp};
+            cflp->warnOff(V3ErrorCode::CASEX, true);
+        }
+        AstCase* const casep = new AstCase{
+            cflp, nodep->matching() ? VCaseType::CT_CASEX : VCaseType::CT_CASE, exprp, itemsp};
         // A VHDL case must name every value of its expression's subtype, and
         // analysis has already checked that it does (10.9). An enumeration
         // lowers to the smallest number of bits that holds it, so the spare

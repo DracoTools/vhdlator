@@ -3987,8 +3987,35 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             }
             // An element may itself be an array of the same type, as in
             // "(others => (others => '0'))", so try the element type first
-            analyzeExpr(eap->valuep(), elemTypep);
-            checkValueInRange(eap->valuep(), elemTypep, "an element of this aggregate");
+            VhdlType* hintp = elemTypep;
+            // A choice that is a range may be given the whole run at once --
+            // "(3 downto 0 => x\"C\")" -- and then the value is of the
+            // aggregate's own type rather than of its element's (9.3.3.3).
+            // Which one it is is settled by what the value could be at all.
+            if (elemTypep && eap->choicesp() && eap->choicesp()->rangep()
+                && eap->valuep()) {
+                CandSet cs;
+                candidateTypes(eap->valuep(), cs);
+                bool asElement = false;
+                bool asWhole = false;
+                for (VhdlType* const tp : cs.types) {
+                    if (!tp) continue;
+                    if (tp->base() == elemTypep->base()) asElement = true;
+                    if (tp->base() == wantp->base()) asWhole = true;
+                }
+                // A string or bit-string literal names no type of its own,
+                // only that it must be an array. Where the element is not an
+                // array, the whole run is the only reading left.
+                if (cs.types.empty() && cs.need == CandSet::Need::ARRAY
+                    && elemTypep->base()->kind() != VhdlTypeKind::ARRAY) {
+                    asWhole = true;
+                } else if (cs.types.empty()) {
+                    asElement = true;
+                }
+                if (!asElement && asWhole) hintp = wantp;
+            }
+            analyzeExpr(eap->valuep(), hintp);
+            checkValueInRange(eap->valuep(), hintp, "an element of this aggregate");
         }
         // Where the context imposes no constraint -- an aggregate standing as
         // an operand, or returned where the result subtype is unconstrained
