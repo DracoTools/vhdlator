@@ -4617,7 +4617,13 @@ bool VhdlSemVisitor::fullyConstrainedRecord(const VhdlType* typep) {
 // the object's own value is what says how long it is (5.3.3).
 VhdlType* VhdlSemVisitor::constrainRecordFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                                    FileLine* flp) {
-    const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
+    // The subtype's own elements, not the base type's: a subtype written
+    // "rec_t(x(1 to 5))" has already said how long x is, and an initial value
+    // does not get to say it again (5.3.3)
+    const std::vector<VhdlSymbol*>& elems
+        = typep->elements().size() == typep->base()->elements().size()
+              ? typep->elements()
+              : typep->base()->elements();
     bool anyOpen = false;
     for (VhdlSymbol* const ep : elems) {
         if (ep->typep() && ep->typep()->base()->kind() == VhdlTypeKind::ARRAY
@@ -5318,11 +5324,12 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
         VhdlSymbol* const tsymp = lookupTypeQuiet(subp->typeMarkp());
         VhdlType* const typep = tsymp ? tsymp->typep() : nullptr;
         if (!typep) continue;
-        // Only an array port for now. The walk below reaches a record
-        // element too, and builds the right constraint for it, but the
-        // generics it makes are not reaching the instance yet -- so a record
-        // port keeps the honest "unconstrained array" message rather than
-        // gaining a confusing one about a parameter it never wrote.
+        // An array port, including an array of arrays, is a shape the back
+        // end builds from a range and nothing more, so bounds an instance
+        // settles reach it. A record is a structure with a name, and one
+        // whose element length a generic decides is a different structure
+        // per instance -- which the actual, whose length the text fixed, is
+        // not. That one keeps the message it had.
         if (typep->base()->kind() != VhdlTypeKind::ARRAY) continue;
         std::vector<std::string> path;
         if (AstVhdlIndexConstraint* const consp
@@ -5444,18 +5451,53 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
         if (found.empty()) continue;
         const int wantPos = found[0]->position();
         AstNodeVhdlExpr* actualp = nullptr;
+        AstVhdlRange* formalRangep = nullptr;
         int position = 0;
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp(), ++position) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
             if (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            // "value(data'range) => a" names part of the port, and it is that
+            // part which says how long the port is
+            if (AstVhdlCall* const callp = VN_CAST(asp->formalp(), VhdlCall)) {
+                const AstVhdlName* const rootp = VN_CAST(callp->prefixp(), VhdlName);
+                if (rootp && rootp->name() == bound.port) {
+                    formalRangep = VN_CAST(callp->argsp(), VhdlRange);
+                    if (formalRangep) {
+                        actualp = asp->actualp();
+                        break;
+                    }
+                }
+            }
             const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
             if (namep ? namep->name() == bound.port : position == wantPos) {
                 actualp = asp->actualp();
                 break;
             }
         }
-        if (!actualp) continue;
+        if (!actualp && !formalRangep) continue;
         FileLine* const flp = nodep->fileline();
+        // A formal that names a slice of the port says the bounds itself:
+        // "value(data'range) => ..." gives the port that range (6.5.7.1),
+        // and the actual is only part of what drives it
+        if (formalRangep && bound.path.empty() && bound.dim == 0) {
+            for (int side = 0; side < 2; ++side) {
+                AstNodeVhdlExpr* endp = nullptr;
+                if (formalRangep->leftp() && formalRangep->rightp()) {
+                    endp = (side == 0 ? formalRangep->leftp() : formalRangep->rightp())
+                               ->cloneTree(false);
+                } else if (AstVhdlAttrName* const rattrp
+                           = VN_CAST(formalRangep->attrp(), VhdlAttrName)) {
+                    if (!rattrp->prefixp()) continue;
+                    endp = new AstVhdlAttrName{flp, rattrp->prefixp()->cloneTree(false),
+                                               side == 0 ? "left" : "right"};
+                }
+                if (!endp) continue;
+                nodep->addGenericMapp(new AstVhdlAssoc{
+                    flp, new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
+                    endp});
+            }
+            continue;
+        }
         for (int side = 0; side < 2; ++side) {
             // Where the open dimension is inside the port's type, the same
             // place inside the actual is what has its bounds
@@ -5552,18 +5594,25 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                             selp->vhdlTypep(nextp);
                             typep = nextp;
                         } else {
-                            // An index gives the element; a slice gives the
-                            // array itself
+                            // An index gives the element; a slice gives an
+                            // array of its own, as long as its range says
                             AstVhdlCall* const callp = VN_AS(steps[i], VhdlCall);
-                            if (!VN_IS(callp->argsp(), VhdlRange)) {
-                                typep = typep->elementp() ? typep->elementp()
-                                                          : typep->base()->elementp();
-                            }
-                            callp->vhdlTypep(typep);
+                            AstVhdlRange* slicep = nullptr;
                             // The index or range is an expression of its own
                             for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
                                 if (AstVhdlRange* const rp = VN_CAST(ap, VhdlRange)) {
-                                    analyzeRange(rp, nullptr);
+                                    slicep = rp;
+                                    const RangeInfo info = analyzeRange(rp, nullptr);
+                                    if (typep && info.valid && !info.unbounded
+                                        && info.left.known() && info.right.known()) {
+                                        VhdlType* const slicedp
+                                            = cloneSubtype(typep, callp->fileline());
+                                        slicedp->clearIndexTypes();
+                                        slicedp->addIndexType(
+                                            makeRangeSubtype(info, callp->fileline()));
+                                        slicedp->unconstrained(false);
+                                        typep = slicedp;
+                                    }
                                 } else if (AstVhdlAssoc* const asp2 = VN_CAST(ap, VhdlAssoc)) {
                                     if (asp2->actualp()) analyzeExpr(asp2->actualp(), nullptr);
                                 } else if (AstNodeVhdlExpr* const ep
@@ -5571,6 +5620,11 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                                     analyzeExpr(ep, nullptr);
                                 }
                             }
+                            if (!slicep) {
+                                typep = typep->elementp() ? typep->elementp()
+                                                          : typep->base()->elementp();
+                            }
+                            callp->vhdlTypep(typep);
                         }
                     }
                     formalTypep = typep;

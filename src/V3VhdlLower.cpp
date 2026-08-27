@@ -948,25 +948,71 @@ private:
             }
         }
         VhdlType* const keyp = openElement ? typep : typep->base();
-        const auto found = m_recNames.find(keyp);
-        if (found != m_recNames.end()) return new AstRefDType{flp, found->second};
+        // Where an element's length is a generic rather than a number, the
+        // structure is not one shape but one per set of generics, and only
+        // the module it belongs to is cloned per instance. Declaring it in
+        // the shared unit would leave a reference to a module's generic
+        // outside that module, where nothing ever gives it a value.
+        const bool local = m_modp && dependsOnGeneric(keyp);
+        if (local) {
+            const auto foundl = m_recLocalNames.find({m_modp, keyp});
+            if (foundl != m_recLocalNames.end()) return new AstRefDType{flp, foundl->second};
+        } else {
+            const auto found = m_recNames.find(keyp);
+            if (found != m_recNames.end()) return new AstRefDType{flp, found->second};
+        }
         const std::string name
             = "__Vrec" + std::to_string(++m_nameNum) + "__" + keyp->name();
-        m_recNames.emplace(keyp, name);
+        if (local) {
+            m_recLocalNames.emplace(std::make_pair(m_modp, keyp), name);
+        } else {
+            m_recNames.emplace(keyp, name);
+        }
         AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
         structp->name(name);
         // In the one unit every design has, so that a class built for an
         // access or protected type sees the same declaration a module does
-        AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
-        structp->classOrPackagep(unitp);
+        AstPackage* const unitp = local ? nullptr : m_netlistp->dollarUnitPkgAddp();
+        if (unitp) structp->classOrPackagep(unitp);
         for (VhdlSymbol* const elemp : keyp->elements()) {
             structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
                                                     lowerType(elemp->typep(), flp), nullptr});
         }
-        unitp->addStmtsp(new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp});
+        AstTypedef* const tdp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
+        if (local) {
+            m_modp->addStmtsp(tdp);
+        } else {
+            unitp->addStmtsp(tdp);
+        }
         return new AstRefDType{flp, name};
     }
+
+    // Whether any bound inside this type is an expression rather than a
+    // number, which for a port constrained by its actual means a generic
+    static bool dependsOnGeneric(VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 16) return false;
+        VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::ARRAY) {
+            for (const VhdlType* const idxp : typep->indexTypes()) {
+                // A range that did not fold but was written out is one an
+                // instance settles -- a bound that names a generic. An index
+                // with no range at all is open, and lowering rejects that
+                // anyway, so it is not what this is about.
+                if (idxp && !idxp->bounded() && idxp->boundsp()) return true;
+            }
+            VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+            return dependsOnGeneric(elemp, depth + 1);
+        }
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            for (VhdlSymbol* const elemp : typep->elements()) {
+                if (dependsOnGeneric(elemp->typep(), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
     std::map<const VhdlType*, std::string> m_recNames;  // Record -> its typedef
+    // Record whose shape a generic decides -> its typedef, per module
+    std::map<std::pair<const AstNodeModule*, const VhdlType*>, std::string> m_recLocalNames;
 
     // METHODS - constants
 
@@ -1328,6 +1374,64 @@ private:
         }
         AstNodeExpr* const strp = lowerExpr(attrp->prefixp());
         return strp ? new AstLenN{flp, strp} : nullptr;
+    }
+
+    // A discrete range as two ends and a direction. Written "l to r" both
+    // ends are there to lower; written "x'range" the range is the one x
+    // already has, so it is asked of x's own subtype -- which is the form a
+    // design uses precisely where those bounds are settled by an instance
+    // rather than by the text (16.2.5).
+    bool rangeParts(AstVhdlRange* rp, AstNodeExpr*& leftp, AstNodeExpr*& rightp,
+                    bool& ascending, bool& dirKnown) {
+        leftp = nullptr;
+        rightp = nullptr;
+        ascending = true;
+        dirKnown = true;
+        if (!rp) return false;
+        FileLine* const flp = rp->fileline();
+        if (rp->leftp() && rp->rightp()) {
+            leftp = lowerExpr(rp->leftp());
+            rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+            if (!leftp || !rightp) {
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                leftp = nullptr;
+                rightp = nullptr;
+                return false;
+            }
+            ascending = rp->dir() != VhdlDir::DOWNTO;
+            dirKnown = !rp->dirUnknown();
+            return true;
+        }
+        AstVhdlAttrName* const attrp = VN_CAST(rp->attrp(), VhdlAttrName);
+        if (!attrp || !attrp->prefixp()) return false;
+        const bool reverse = attrp->name() == "reverse_range";
+        if (!reverse && attrp->name() != "range") return false;
+        const VhdlType* typep = attrp->prefixp()->vhdlTypep();
+        if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS
+            && typep->base()->designatedp()) {
+            typep = typep->base()->designatedp();
+        }
+        int dim = 0;
+        if (AstVhdlLiteral* const litp = VN_CAST(attrp->argp(), VhdlLiteral)) {
+            dim = static_cast<int>(litp->intVal()) - 1;
+        }
+        if (!dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
+            // Bounds the text already fixed
+            const VhdlType* const idxp = indexSubtype(typep, dim);
+            if (!idxp || !idxp->bounded()) return false;
+            leftp = new AstConst{flp, AstConst::Signed32{},
+                                 static_cast<int32_t>(idxp->left())};
+            rightp = new AstConst{flp, AstConst::Signed32{},
+                                  static_cast<int32_t>(idxp->right())};
+            ascending = idxp->ascending();
+            dirKnown = true;
+        }
+        if (reverse) {
+            std::swap(leftp, rightp);
+            ascending = !ascending;
+        }
+        return true;
     }
 
     // A packed array's default is its element's default repeated. Written as
@@ -3172,14 +3276,13 @@ private:
             if (!fromp) return nullptr;
             fromp = derefIfAccess(fromp, prefixExprp, flp);
             if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
-                if (!rp->leftp() || !rp->rightp()) {
-                    unsup(flp, "slice by an attribute range");
-                    return nullptr;
-                }
-                AstNodeExpr* leftp = lowerExpr(rp->leftp());
-                AstNodeExpr* rightp = lowerExpr(rp->rightp());
-                if (!leftp || !rightp) {
+                AstNodeExpr* leftp = nullptr;
+                AstNodeExpr* rightp = nullptr;
+                bool sliceAsc = true;
+                bool sliceDirKnown = true;
+                if (!rangeParts(rp, leftp, rightp, sliceAsc, sliceDirKnown)) {
                     VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                    if (!rp->leftp() || !rp->rightp()) unsup(flp, "slice by an attribute range");
                     return nullptr;
                 }
                 leftp = aliasShift(objSymp, leftp, flp);
@@ -5490,13 +5593,38 @@ private:
             VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
             if (!symp || symp->kind() != VhdlSymKind::PORT) continue;
             if (partial.count(symp)) continue;
+            // A port whose bounds an instance settles is written in terms of
+            // the entity's own generics, which mean nothing here. The formal
+            // names a part of it, and that part's subtype is written in terms
+            // this architecture can see, so it is the one to stand in.
+            VhdlType* standTypep = symp->typep();
+            if (dependsOnGeneric(standTypep) && asp->formalp()
+                && asp->formalp()->vhdlTypep()
+                && !dependsOnGeneric(asp->formalp()->vhdlTypep())) {
+                standTypep = asp->formalp()->vhdlTypep();
+            }
+            AstNodeDType* standDtypep = nullptr;
+            {
+                VL_RESTORER_COPY(m_bindExprs);
+                for (const auto& pair : genericStandIns(nodep, standTypep)) {
+                    m_bindExprs[pair.first] = pair.second;
+                }
+                standDtypep = lowerType(standTypep, flp);
+            }
             AstVar* const tempp = newTempVar(
-                "__Vpart__" + label + "__" + symp->name(),
-                lowerType(symp->typep(), flp), flp);
+                "__Vpart__" + label + "__" + symp->name(), standDtypep, flp);
             partial.emplace(symp, tempp);
+            // Which way the signal standing in for the port travels. An
+            // input read as though it were also driven here is a loop, not
+            // a connection.
+            const AstVhdlIfaceDecl* const pdeclp = VN_CAST(symp->declp(), VhdlIfaceDecl);
+            const VhdlMode pmode = pdeclp ? pdeclp->mode() : VhdlMode::IN;
+            const VAccess pinAccess = pmode == VhdlMode::IN      ? VAccess::READ
+                                      : pmode == VhdlMode::INOUT ? VAccess::READWRITE
+                                                                 : VAccess::WRITE;
             pinsp = AstNode::addNextNull(
                 pinsp, new AstPin{flp, ++pinNum, symp->name(),
-                                  new AstVarRef{flp, tempp, VAccess::READWRITE}});
+                                  new AstVarRef{flp, tempp, pinAccess}});
         }
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
@@ -5575,6 +5703,55 @@ private:
             = label.empty() ? "__Vinst" + std::to_string(++m_processNum) : label;
         m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
+    }
+
+    // A port's bounds are written in the entity's own generics, which name
+    // nothing in the architecture that instantiates it. This instance says
+    // what each of them is, so those expressions -- written in terms this
+    // architecture can see -- stand in for them while the port's type is
+    // built here.
+    std::map<const VhdlSymbol*, AstNodeVhdlExpr*> genericStandIns(AstVhdlInstance* nodep,
+                                                                  VhdlType* typep) {
+        std::map<const VhdlSymbol*, AstNodeVhdlExpr*> out;
+        std::map<int, VhdlSymbol*> wanted;  // Position -> the generic there
+        std::function<void(VhdlType*, int)> collect = [&](VhdlType* tp, int depth) {
+            if (!tp || depth > 8) return;
+            for (VhdlType* const idxp : tp->indexTypes()) {
+                if (!idxp || !idxp->boundsp()) continue;
+                idxp->boundsp()->foreach([&](AstVhdlName* namep) {
+                    VhdlSymbol* const gsymp = namep->vhdlSymp();
+                    if (gsymp && gsymp->kind() == VhdlSymKind::GENERIC) {
+                        wanted.emplace(gsymp->position(), gsymp);
+                    }
+                });
+            }
+            VhdlType* const basep = tp->base();
+            collect(tp->elementp() ? tp->elementp() : basep->elementp(), depth + 1);
+            for (VhdlSymbol* const ep : tp->elements()) collect(ep->typep(), depth + 1);
+        };
+        collect(typep, 0);
+        if (wanted.empty()) return out;
+        int position = 0;
+        for (AstNode* p = nodep->genericMapp(); p; p = p->nextp(), ++position) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            if (AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                if (VhdlSymbol* const gsymp = fnamep->vhdlSymp()) {
+                    out.emplace(gsymp, asp->actualp());
+                    continue;
+                }
+                for (const auto& pair : wanted) {
+                    if (pair.second->name() == fnamep->name()) {
+                        out.emplace(pair.second, asp->actualp());
+                    }
+                }
+                continue;
+            }
+            if (asp->formalp()) continue;
+            const auto it = wanted.find(position);
+            if (it != wanted.end()) out.emplace(it->second, asp->actualp());
+        }
+        return out;
     }
 
     // The leftmost name of a formal that names part of a port, or null where
