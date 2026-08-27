@@ -7353,6 +7353,14 @@ private:
                 outp, static_cast<AstNode*>(
                           new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}}));
         }
+        // "read" and "write" are declared implicitly for every file type
+        // (5.5.2), and they are not the ones std.textio declares: the first
+        // argument there is a LINE, here it is the file itself
+        if ((name == "read" || name == "write") && !args.empty()
+            && args[0]->vhdlTypep()
+            && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::FILE) {
+            return lowerFileReadWrite(name == "read", args, flp);
+        }
         if (name == "read" || name == "hread" || name == "oread" || name == "bread") {
             return lowerTextioRead(name, args, flp);
         }
@@ -7417,6 +7425,226 @@ private:
     // walking a list of characters at run time as an event-driven simulator
     // must. The line is shortened by what was read, which is what makes
     // successive READs walk along one line.
+    // One element of an array a file holds, indexed the way the array is.
+    // The base is already lowered, so an aggregate written out in the call
+    // has been put in a variable and this indexes that.
+    AstNode* lowerFileElement(bool reading, AstNodeExpr* filep, AstNodeExpr* basep,
+                              VhdlType* valTypep, int64_t which, FileLine* flp) {
+        const VhdlType* const idxp = valTypep->indexTypes()[0];
+        const int64_t index = idxp->ascending() ? idxp->left() + which : idxp->left() - which;
+        AstNodeExpr* const elemp
+            = new AstSelBit{flp, basep->cloneTree(false),
+                            new AstConst{flp, AstConst::Signed32{},
+                                         static_cast<int32_t>(index)}};
+        VhdlType* const elemTypep
+            = valTypep->elementp() ? valTypep->elementp() : valTypep->base()->elementp();
+        return lowerFileScalar(reading, filep->cloneTree(false), elemp, elemTypep, flp);
+    }
+
+    // One value in a file: a CHARACTER is one byte, and anything else that
+    // fits in a machine word is eight bytes, least significant first. The
+    // LRM leaves the representation to the implementation and asks only that
+    // a design reading its own file back gets what it wrote (5.5.2).
+    AstNode* lowerFileScalar(bool reading, AstNodeExpr* filep, AstNodeExpr* valuep,
+                             const VhdlType* valTypep, FileLine* flp) {
+        const bool isChar = valTypep && V3VhdlStd::characterType()
+                            && valTypep->base() == V3VhdlStd::characterType()->base();
+        if (isChar) {
+            if (!reading) {
+                return new AstDisplay{flp, VDisplayType::DT_WRITE, "%c", filep, valuep};
+            }
+            AstNode* const outp = new AstAssign{flp, valuep, new AstFGetC{flp, filep}};
+            return outp;
+        }
+        static constexpr int BYTES = 8;
+        FileLine* const wflp = new FileLine{flp};
+        wflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        wflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        AstVar* const accp = newTempVar(
+            "__Vfacc",
+            new AstBasicDType{wflp, VBasicDTypeKwd::LOGIC, VSigning::UNSIGNED, VNumRange{63, 0},
+                              -1},
+            wflp);
+        AstNode* outp = nullptr;
+        if (!reading) {
+            outp = new AstAssign{wflp, new AstVarRef{wflp, accp, VAccess::WRITE}, valuep};
+            for (int k = 0; k < BYTES; ++k) {
+                outp = AstNode::addNext(
+                    outp,
+                    static_cast<AstNode*>(new AstDisplay{
+                        wflp, VDisplayType::DT_WRITE, "%c", filep->cloneTree(false),
+                        new AstAnd{wflp,
+                                   new AstShiftR{wflp, new AstVarRef{wflp, accp, VAccess::READ},
+                                                 new AstConst{wflp, AstConst::Signed32{}, 8 * k}},
+                                   new AstConst{wflp, AstConst::Unsized64{}, 255}}}));
+            }
+            VL_DO_DANGLING(filep->deleteTree(), filep);
+            return outp;
+        }
+        AstVar* const chp = newTempVar("__Vfrdc", newIntDType(wflp), wflp);
+        outp = new AstAssign{wflp, new AstVarRef{wflp, accp, VAccess::WRITE},
+                             new AstConst{wflp, AstConst::Unsized64{}, 0}};
+        for (int k = 0; k < BYTES; ++k) {
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{wflp, new AstVarRef{wflp, chp, VAccess::WRITE},
+                                        new AstFGetC{wflp, filep->cloneTree(false)}}));
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstAssign{
+                    wflp, new AstVarRef{wflp, accp, VAccess::WRITE},
+                    new AstOr{wflp, new AstVarRef{wflp, accp, VAccess::READ},
+                              new AstShiftL{wflp,
+                                            new AstAnd{wflp,
+                                                       new AstVarRef{wflp, chp, VAccess::READ},
+                                                       new AstConst{wflp, AstConst::Unsized64{},
+                                                                    255}},
+                                            new AstConst{wflp, AstConst::Signed32{}, 8 * k}}}}));
+        }
+        VL_DO_DANGLING(filep->deleteTree(), filep);
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAssign{
+                      wflp, valuep, new AstVarRef{wflp, accp, VAccess::READ}}));
+        return outp;
+    }
+
+    // The READ and WRITE a file type declares for itself (5.5.2). What the
+    // file holds is the values themselves: a file of CHARACTER is bytes, a
+    // file of STRING the characters one after another, and an array whose
+    // elements do not pack goes element by element.
+    AstNode* lowerFileReadWrite(bool reading, std::vector<AstNodeVhdlExpr*>& args,
+                                FileLine* flp) {
+        if (args.size() < 2 || args.size() > 3) return nullptr;
+        VhdlType* const valTypep = args[1]->vhdlTypep();
+        const bool isStr = isStringType(valTypep);
+        AstNodeExpr* const filep = lowerExpr(args[0]);
+        if (!filep) return nullptr;
+        if (isStr) {
+            AstNodeExpr* const valuep = lowerExpr(args[1]);
+            if (!valuep) return nullptr;
+            if (!reading) {
+                return new AstDisplay{flp, VDisplayType::DT_WRITE, "%s", filep, valuep};
+            }
+            // "read(f, s, len)" fills as much of s as the file still holds
+            // and says how much that was. One character at a time, since
+            // $fgets would stop at an end of line and this is not text.
+            AstVar* const idxp = newTempVar("__Vfrdi", newIntDType(flp), flp);
+            AstVar* const chp = newTempVar("__Vfrdc", newIntDType(flp), flp);
+            AstVar* const accp = newTempVar(
+                "__Vfrds", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            AstNodeExpr* wantp = nullptr;
+            if (const int len = vectorWidth(valTypep)) {
+                wantp = new AstConst{flp, AstConst::Signed32{}, len};
+            } else {
+                wantp = new AstLenN{flp, valuep->cloneTree(false)};
+            }
+            AstLoop* const loopp = new AstLoop{flp};
+            loopp->addStmtsp(new AstLoopTest{
+                flp, loopp, new AstLtS{flp, new AstVarRef{flp, idxp, VAccess::READ}, wantp}});
+            loopp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, chp, VAccess::WRITE},
+                                           new AstFGetC{flp, filep->cloneTree(false)}});
+            loopp->addStmtsp(new AstIf{
+                flp,
+                new AstLtS{flp, new AstVarRef{flp, chp, VAccess::READ},
+                           new AstConst{flp, AstConst::Signed32{}, 0}},
+                new AstBreak{flp}, nullptr});
+            loopp->addStmtsp(new AstAssign{
+                flp, new AstVarRef{flp, accp, VAccess::WRITE},
+                new AstConcatN{flp, new AstVarRef{flp, accp, VAccess::READ},
+                               new AstSFormatF{flp, "%c", false,
+                                               new AstVarRef{flp, chp, VAccess::READ}}}});
+            loopp->addStmtsp(new AstAssign{
+                flp, new AstVarRef{flp, idxp, VAccess::WRITE},
+                new AstAdd{flp, new AstVarRef{flp, idxp, VAccess::READ},
+                           new AstConst{flp, AstConst::Signed32{}, 1}}});
+            VL_DO_DANGLING(filep->deleteTree(), filep);
+            AstNode* outp = new AstAssign{flp, new AstVarRef{flp, idxp, VAccess::WRITE},
+                                          new AstConst{flp, AstConst::Signed32{}, 0}};
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, new AstVarRef{flp, accp, VAccess::WRITE},
+                                        new AstConst{flp, AstConst::String{}, ""}}));
+            outp = AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, valuep, new AstVarRef{flp, accp, VAccess::READ}}));
+            if (args.size() == 3) {
+                AstNodeExpr* const outLenp = lowerExpr(args[2]);
+                if (!outLenp) return nullptr;
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(new AstAssign{
+                              flp, outLenp, new AstVarRef{flp, idxp, VAccess::READ}}));
+            }
+            return outp;
+        }
+        const bool unpackedArray = valTypep
+                                   && valTypep->base()->kind() == VhdlTypeKind::ARRAY
+                                   && !elementPacks(valTypep->base()->elementp());
+        if (unpackedArray) {
+            if (!valTypep->isConstrainedArray() || valTypep->dimensions() != 1
+                || valTypep->dimLength(0) <= 0 || valTypep->dimLength(0) > 4096) {
+                VL_DO_DANGLING(filep->deleteTree(), filep);
+                unsup(flp, std::string{reading ? "READ" : "WRITE"} + " of a file of this type");
+                return nullptr;
+            }
+            const int64_t count = valTypep->dimLength(0);
+            AstNodeExpr* basep = lowerExpr(args[1]);
+            if (!basep) return nullptr;
+            AstNode* outp = nullptr;
+            // A value that is not a name cannot be indexed one element at a
+            // time, so it is held in a variable of its own first
+            if (!reading && !repeatable(basep)) {
+                AstVar* const holdp = newTempVar("__Vfval", lowerType(valTypep, flp), flp);
+                outp = new AstAssign{flp, new AstVarRef{flp, holdp, VAccess::WRITE}, basep};
+                basep = new AstVarRef{flp, holdp, VAccess::READ};
+            }
+            AstVar* cntp = nullptr;
+            if (reading) {
+                // "read(f, v, len)" fills as much of v as the file still
+                // holds and says how many elements that was
+                cntp = newTempVar("__Vfcnt", newIntDType(flp), flp);
+                outp = AstNode::addNextNull(
+                    outp, static_cast<AstNode*>(
+                              new AstAssign{flp, new AstVarRef{flp, cntp, VAccess::WRITE},
+                                            new AstConst{flp, AstConst::Signed32{}, 0}}));
+            }
+            for (int64_t i = 0; i < count; ++i) {
+                AstNode* partp = lowerFileElement(reading, filep, basep, valTypep, i, flp);
+                if (!partp) return nullptr;
+                if (reading) {
+                    partp = AstNode::addNext(
+                        partp, static_cast<AstNode*>(new AstAssign{
+                                   flp, new AstVarRef{flp, cntp, VAccess::WRITE},
+                                   new AstAdd{flp, new AstVarRef{flp, cntp, VAccess::READ},
+                                              new AstConst{flp, AstConst::Signed32{}, 1}}}));
+                    partp = new AstIf{
+                        flp,
+                        new AstLogNot{flp, new AstFEof{flp, filep->cloneTree(false)}}, partp,
+                        nullptr};
+                }
+                outp = AstNode::addNextNull(outp, partp);
+            }
+            VL_DO_DANGLING(basep->deleteTree(), basep);
+            VL_DO_DANGLING(filep->deleteTree(), filep);
+            if (reading && args.size() == 3) {
+                AstNodeExpr* const outLenp = lowerExpr(args[2]);
+                if (!outLenp) return nullptr;
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(new AstAssign{
+                              flp, outLenp, new AstVarRef{flp, cntp, VAccess::READ}}));
+            }
+            return outp;
+        }
+        if (valTypep && valTypep->base()->kind() == VhdlTypeKind::RECORD) {
+            VL_DO_DANGLING(filep->deleteTree(), filep);
+            unsup(flp, std::string{reading ? "READ" : "WRITE"} + " of a file of this type");
+            return nullptr;
+        }
+        AstNodeExpr* const valuep = lowerExpr(args[1]);
+        if (!valuep) return nullptr;
+        return lowerFileScalar(reading, filep, valuep, valTypep, flp);
+    }
+
     AstNode* lowerTextioRead(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
                              FileLine* flp) {
         if (args.size() < 2 || args.size() > 3) return nullptr;
@@ -7655,7 +7883,8 @@ private:
             flp, filep,
             new AstFOpen{flp, namep, new AstConst{flp, AstConst::String{}, mode}}};
         if (statusp) {
-            // OPEN_OK is zero, NAME_ERROR the second value (16.3)
+            // FILE_OPEN_STATUS is (OPEN_OK, STATUS_ERROR, NAME_ERROR,
+            // MODE_ERROR), so a file that would not open is 2 (16.3)
             AstNodeExpr* const statusRefp = lowerExpr(statusp);
             if (statusRefp) {
                 outp = AstNode::addNext(
@@ -7666,7 +7895,7 @@ private:
                                     new AstNeq{flp, filep->cloneTree(false),
                                                new AstConst{flp, AstConst::Signed32{}, 0}},
                                     new AstConst{flp, AstConst::WidthedValue{}, 2, 0},
-                                    new AstConst{flp, AstConst::WidthedValue{}, 2, 1}}}));
+                                    new AstConst{flp, AstConst::WidthedValue{}, 2, 2}}}));
             }
         }
         return outp;
