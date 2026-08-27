@@ -3081,15 +3081,24 @@ private:
                 unsup(flp, "rotate of a vector whose length is not known here");
                 return nullptr;
             }
+            return rotateOf(lhsp, rhsp, width, nodep->op() == VhdlBinaryOp::ROL, flp);
+        }
+        }
+        unsup(flp, "binary operator");
+        return nullptr;
+    }
+
+    // A rotate by a count, written as the two shifts it amounts to (9.2.4)
+    AstNodeExpr* rotateOf(AstNodeExpr* lhsp, AstNodeExpr* rhsp, int width, bool leftward,
+                          FileLine* flp) {
+        {
             AstVar* const valp = newTempVar("__Vrotv", newLogicDType(flp, width), flp);
             AstVar* const cntp = newTempVar("__Vrotn", newIntDType(flp), flp);
             const auto widthConst = [&]() {
                 return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(width)};
             };
             AstNodeExpr* placesp
-                = nodep->op() == VhdlBinaryOp::ROL
-                      ? rhsp
-                      : static_cast<AstNodeExpr*>(new AstNegate{flp, rhsp});
+                = leftward ? rhsp : static_cast<AstNodeExpr*>(new AstNegate{flp, rhsp});
             // ((n rem W) + W) rem W leaves the count in 0 .. W-1 whichever
             // way round it was written
             AstNodeExpr* const foldedp = new AstModDivS{
@@ -3117,9 +3126,6 @@ private:
                                         new AstVarRef{flp, cntp, VAccess::READ}},
                           wrapp}};
         }
-        }
-        unsup(flp, "binary operator");
-        return nullptr;
     }
 
     // The four shift operators of 9.2.4. What comes in at the vacated end is
@@ -3527,6 +3533,29 @@ private:
     // emits it into the module that calls it, and later calls find it. The
     // same path serves a subprogram declared in an enclosing region that has
     // not been reached yet.
+    // Why a subprogram could not be emitted, where the reason is one the
+    // reader can act on. A subprogram whose parameter or result has no length
+    // of its own is emitted once per call site with the lengths that call
+    // supplies; where a call cannot say them, it is that which is missing,
+    // not the subprogram.
+    std::string whyNotEmitted(VhdlSymbol* symp) {
+        if (!symp) return "";
+        for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
+            const VhdlType* const typep = symp->paramTypes()[i];
+            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                && !typep->isConstrainedArray() && !isStringType(typep)) {
+                return " whose parameter '" + symp->paramName(i)
+                       + "' has no length at this call";
+            }
+        }
+        const VhdlType* const retp = symp->returnTypep();
+        if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
+            && !retp->isConstrainedArray() && !isStringType(retp)) {
+            return " whose result has no length at this call";
+        }
+        return "";
+    }
+
     AstNodeFTask* emitOnDemand(VhdlSymbol* symp) {
         if (!symp) return nullptr;
         AstVhdlSubprogDecl* declp = symp->bodyp();
@@ -3613,7 +3642,7 @@ private:
         // A predefined operator named rather than written: "\"+\"(a, b)", or
         // reached through a generic subprogram bound to one (4.5.3, 6.5.5)
         if (AstNodeExpr* const outp = lowerOperatorCall(symp, nodep, flp)) return outp;
-        unsup(flp, "call to '" + symp->name() + "'");
+        unsup(flp, "call to '" + symp->name() + "'" + whyNotEmitted(symp));
         return nullptr;
     }
 
@@ -3816,6 +3845,19 @@ private:
                 return new AstShiftRS{flp, firstp, lowerExpr(args[1])};
             }
             return new AstShiftR{flp, firstp, lowerExpr(args[1])};
+        }
+        if (name == "rotate_left" || name == "rotate_right") {
+            // 16.5 defines these as the rotate of 9.2.4 applied to the
+            // vector, so they are the same two shifts
+            if (args.size() < 2) return nullptr;
+            const int width = exprVectorWidth(args[0]);
+            AstNodeExpr* const placesp = lowerExpr(args[1]);
+            if (width <= 0 || !placesp) {
+                if (placesp) VL_DO_DANGLING(placesp->deleteTree(), placesp);
+                unsup(flp, "'" + name + "' of a vector whose length is not known here");
+                return nullptr;
+            }
+            return rotateOf(firstp, placesp, width, name == "rotate_left", flp);
         }
         if (name == "and_reduce") return new AstRedAnd{flp, firstp};
         if (name == "or_reduce") return new AstRedOr{flp, firstp};
@@ -6926,7 +6968,8 @@ private:
         if (it == m_funcs.end() && symp && emitOnDemand(symp)) it = m_funcs.find(symp);
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
             unsup(flp, "procedure call to '"
-                           + (symp ? symp->name() : std::string{"<name>"}) + "'");
+                           + (symp ? symp->name() : std::string{"<name>"}) + "'"
+                           + whyNotEmitted(symp));
             return nullptr;
         }
         AstTaskRef* const refp = new AstTaskRef{flp, it->second->name(), nullptr};

@@ -955,6 +955,8 @@ public:
                                      const std::vector<VhdlValue>& actualValues,
                                      const std::string& name) VL_MT_DISABLED;
     void findReturnedType(AstNode* stmtsp, VhdlType*& foundp) VL_MT_DISABLED;
+    VhdlType* intrinsicResultType(VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
+                                  VhdlType* resultp) VL_MT_DISABLED;
     VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
                                      const std::vector<VhdlType*>& actualTypes,
                                      const std::string& name) VL_MT_DISABLED;
@@ -1505,14 +1507,25 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         if (!isTemplate) {
             iterateAndNextNull(nodep->declsp());
             iterateAndNextNull(nodep->stmtsp());
-            // A function whose result type leaves something open -- a record
-            // with an element of an unconstrained array type -- gets it from
-            // what the body returns (5.3.3)
-            if (symp->returnTypep() && !fullyConstrainedRecord(symp->returnTypep())
-                && symp->returnTypep()->base()->kind() == VhdlTypeKind::RECORD) {
+            // A function whose result type leaves something open gets it
+            // from what the body returns (5.3.3, 4.2.1). That is a record
+            // with an element of an unconstrained array type, and it is
+            // equally an unconstrained array: in a copy made for one call
+            // site the body's own declarations have folded, so the object it
+            // returns has a length even where the result subtype never did.
+            VhdlType* const retp = symp->returnTypep();
+            const bool openRecord = retp && retp->base()->kind() == VhdlTypeKind::RECORD
+                                    && !fullyConstrainedRecord(retp);
+            const bool openArray = retp && retp->base()->kind() == VhdlTypeKind::ARRAY
+                                   && !retp->isConstrainedArray()
+                                   && retp->base() != V3VhdlStd::stringType()->base();
+            if (openRecord || openArray) {
                 VhdlType* foundp = nullptr;
                 findReturnedType(nodep->stmtsp(), foundp);
-                if (foundp) symp->returnTypep(foundp);
+                if (foundp && (foundp->base()->kind() != VhdlTypeKind::ARRAY
+                               || foundp->isConstrainedArray())) {
+                    symp->returnTypep(foundp);
+                }
             }
         }
         m_returnTypep = oldReturnp;
@@ -4421,7 +4434,63 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             }
         }
     }
+    // Some functions leave their result subtype open and then say the length
+    // in the call itself. numeric_std's TO_SIGNED and TO_UNSIGNED take it as
+    // an argument, RESIZE too, and the shifts and rotates give a result as
+    // long as what they were handed. The frontend emits these as native
+    // operations rather than compiling their bodies, so nothing else works
+    // the length out -- and without it a call that passes the result on
+    // cannot be specialized, and so cannot be emitted at all.
+    if (VhdlType* const sizedp = intrinsicResultType(nodep->vhdlSymp(), assocs, resultp)) {
+        return sizedp;
+    }
     return resultp;
+}
+
+// The result subtype of one of the functions above, or null where this is
+// not one of them or the length does not fold
+VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
+                                              const std::vector<AstVhdlAssoc*>& assocs,
+                                              VhdlType* resultp) {
+    if (!symp || !resultp) return nullptr;
+    if (resultp->base()->kind() != VhdlTypeKind::ARRAY || resultp->isConstrainedArray()) {
+        return nullptr;
+    }
+    if (resultp->base()->indexTypes().size() != 1) return nullptr;
+    const std::string& name = symp->name();
+    int64_t length = -1;
+    if (name == "to_signed" || name == "to_unsigned" || name == "resize") {
+        if (assocs.size() != 2 || !assocs[1] || !assocs[1]->actualp()) return nullptr;
+        const VhdlValue val = V3VhdlEval::eval(assocs[1]->actualp());
+        if (val.isInt()) {
+            length = val.toInt();
+        } else {
+            // "resize(arg, size_res)" says the length with another array
+            const VhdlType* const sizep = assocs[1]->actualp()->vhdlTypep();
+            if (!sizep || !sizep->isConstrainedArray()) return nullptr;
+            length = sizep->dimLength(0);
+        }
+    } else if (name == "shift_left" || name == "shift_right" || name == "rotate_left"
+               || name == "rotate_right") {
+        if (assocs.empty() || !assocs[0] || !assocs[0]->actualp()) return nullptr;
+        const VhdlType* const argp = assocs[0]->actualp()->vhdlTypep();
+        if (!argp || !argp->isConstrainedArray()) return nullptr;
+        length = argp->dimLength(0);
+    } else {
+        return nullptr;
+    }
+    if (length < 0 || length > (1 << 20)) return nullptr;
+    const VhdlType* const idxp = resultp->base()->indexTypes()[0];
+    if (!idxp) return nullptr;
+    FileLine* const flp = resultp->fileline();
+    VhdlType* const outp = cloneSubtype(resultp, flp);
+    VhdlType* const newIndexp = cloneSubtype(const_cast<VhdlType*>(idxp), flp);
+    // numeric_std counts a vector down from its length less one (16.5)
+    newIndexp->setBounds(length - 1, 0, false);
+    outp->clearIndexTypes();
+    outp->addIndexType(newIndexp);
+    outp->unconstrained(false);
+    return outp;
 }
 
 // A delay may not be negative (10.5.2.1, 10.2)
