@@ -317,7 +317,17 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp, VInFilter* filterp) {
     // Then rewrite it as the AST the rest of Verilator works on. Lowering a
     // tree that failed analysis would report the same problems a second time
     // in less useful terms, so it only runs on a clean one.
-    if (analyzed) V3VhdlLower::lower(order, rootp);
+    if (analyzed) {
+        // An entity with a generic type was copied once per type the design
+        // gave it, and those copies are design units the back end has to
+        // build. They did not exist when the order was computed, and each
+        // follows the entity it was copied from, so they go on the end.
+        std::vector<AstNodeVhdlUnit*> withCopies = order;
+        for (AstNodeVhdlUnit* const unitp : V3VhdlSem::specializedUnits()) {
+            withCopies.push_back(unitp);
+        }
+        V3VhdlLower::lower(withCopies, rootp);
+    }
 
     // The VHDL tree has served its purpose; nothing downstream may see one
     V3VhdlSem::clear();

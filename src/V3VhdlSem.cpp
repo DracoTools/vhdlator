@@ -87,6 +87,27 @@ class VhdlSemVisitor final : public VNVisitor {
     bool m_inPackageBody = false;
     int m_ifacePos = 0;  // Position of the interface element being declared
     bool m_errored = false;
+    // An entity with a generic type is one entity per type the design hands
+    // it. What the copies are, so that the same type asks for one copy only.
+    struct VhdlEntitySpec final {
+        std::string key;  // "lib.entity" of the original
+        std::vector<VhdlType*> types;  // What its generic types were bound to
+        std::vector<VhdlScope*> packages;  // And its generic packages
+        std::string name;  // Name the copy was given
+        VhdlScope* scopep = nullptr;  // The copy's own region
+    };
+    std::vector<VhdlEntitySpec> m_entitySpecs;
+    // The types a copy's generic types stand for, while the copy is analyzed
+    std::map<std::string, VhdlType*> m_boundGenTypes;
+    // And the regions its generic packages stand for
+    std::map<std::string, VhdlScope*> m_boundGenPackages;
+    std::map<std::string, AstVhdlArchitecture*> m_archUnits;  // "lib.entity" -> its body
+    // Which entity a configuration specification binds a component or an
+    // instance label to (7.3.1). An entity with a generic type is copied for
+    // the instance, so which entity it is has to be known here.
+    std::map<std::string, std::string> m_specBindings;  // Component or label -> entity
+    int m_specUnitCount = 0;  // Numbers the copies
+    int m_specDepth = 0;  // A copy may instantiate another; guards a cycle
 
     VL_UNCOPYABLE(VhdlSemVisitor);
 
@@ -528,6 +549,26 @@ class VhdlSemVisitor final : public VNVisitor {
     }
 
     // METHODS - types
+
+    // The type a generic type is given. Usually a type mark, but VHDL-2008
+    // lets the actual be any subtype indication, so "T => std_logic_vector(7
+    // downto 0)" hands over the constraint as well as the type (6.5.5); the
+    // parser could not tell that from a call.
+    VhdlType* resolveTypeActual(AstNodeVhdlExpr* nodep) {
+        if (!nodep) return nullptr;
+        if (VhdlSymbol* const symp = lookupTypeQuiet(nodep)) {
+            nodep->vhdlSymp(symp);
+            return symp->typep();
+        }
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->prefixp()) return nullptr;
+        VhdlSymbol* const basep = lookupTypeQuiet(callp->prefixp());
+        if (!basep || !basep->typep()) return nullptr;
+        VhdlType* const outp = cloneSubtype(basep->typep(), nodep->fileline());
+        applyConstraint(outp, basep->typep(), nullptr, callp->argsp(), nodep->fileline());
+        nodep->vhdlTypep(outp);
+        return outp;
+    }
 
     // Resolve a type mark to the type it names
     VhdlType* resolveTypeMark(AstNodeVhdlExpr* markp) {
@@ -1036,6 +1077,7 @@ private:
     void visit(AstVhdlProcCall* nodep) override;
     void visit(AstVhdlNext* nodep) override;
     void visit(AstVhdlInstance* nodep) override;
+    void visit(AstVhdlConfigSpec* nodep) override;
     // A port whose subtype is left unconstrained takes its bounds from the
     // actual, which differ per instance (5.3.2.2, 6.5.6.3)
     struct OpenBound final {
@@ -1056,6 +1098,12 @@ private:
                                               VhdlScope* scopep,
                                               std::vector<std::string>& path) VL_MT_DISABLED;
     void bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    VhdlScope* specializeEntity(AstVhdlInstance* nodep, const std::string& entKey)
+        VL_MT_DISABLED;
+    void analyzeSpecializedUnit(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
+    void retargetInstance(AstVhdlInstance* nodep, const std::string& newName,
+                          const std::vector<AstVhdlIfaceDecl*>& generics,
+                          const std::vector<AstVhdlAssoc*>& assocs) VL_MT_DISABLED;
     void bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
     bool defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim, int64_t& leftr,
@@ -1327,6 +1375,16 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
+    // In a copy of an entity made for one instance, a generic subprogram or
+    // package the instance said nothing about is the one visible where the
+    // instance is written, which "is <>" asks for (6.5.5). Inside the copy
+    // that is the ordinary visible declaration, so declaring the generic
+    // again would only make every use of it ambiguous.
+    if (nodep->isBound()
+        && (nodep->kind() == VhdlIfaceKind::SUBPROGRAM
+            || nodep->kind() == VhdlIfaceKind::PACKAGE)) {
+        return;
+    }
     // A generic subprogram is declared by its own profile, so that calls to
     // it inside the package resolve before any instantiation (6.5.4)
     if (nodep->kind() == VhdlIfaceKind::SUBPROGRAM && nodep->profilep()) {
@@ -1358,6 +1416,18 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
         // formal's region is that package's, and every use of it is checked
         // against the template. What the instantiation actually supplies is
         // bound later, in bindPackageGeneric, when the unit is copied.
+        // In a copy of the entity made for one instance, the generic package
+        // is the package that instance named -- an instantiated one, whose
+        // types and constants are settled -- rather than the template
+        const auto boundIt = m_boundGenPackages.find(nodep->name());
+        if (boundIt != m_boundGenPackages.end()) {
+            symp->innerp(boundIt->second);
+            m_scopep->addNamed(lower(nodep->name()), boundIt->second);
+            nodep->bound(true);
+            nodep->vhdlSymp(symp);
+            declare(symp, nodep->fileline());
+            return;
+        }
         std::string key = lower(nodep->newFrom());
         const size_t dot = key.rfind('.');
         if (dot == std::string::npos) {
@@ -1379,11 +1449,19 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
         return;
     }
     if (nodep->kind() == VhdlIfaceKind::TYPE) {
-        // A generic type stands for whatever the instantiation supplies, so
-        // give it a type of its own that matches nothing else yet (6.5.5)
-        VhdlType* const typep
-            = VhdlSymTab::newType(VhdlTypeKind::ERROR, nodep->name(), nodep->fileline());
-        symp->typep(typep);
+        // In a copy of the entity made for one instance, the generic type is
+        // the type that instance named, and the copy is an ordinary entity
+        const auto boundIt = m_boundGenTypes.find(nodep->name());
+        if (boundIt != m_boundGenTypes.end()) {
+            symp->typep(boundIt->second);
+            nodep->bound(true);
+        } else {
+            // A generic type stands for whatever the instantiation supplies, so
+            // give it a type of its own that matches nothing else yet (6.5.5)
+            VhdlType* const typep
+                = VhdlSymTab::newType(VhdlTypeKind::ERROR, nodep->name(), nodep->fileline());
+            symp->typep(typep);
+        }
     } else {
         symp->typep(resolveSubtype(nodep->subtypep()));
     }
@@ -2235,6 +2313,9 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // declares, so its region has to be findable (3.4)
                 m_unitScopes[lib + "." + parts.back() + "(" + lower(archp->name()) + ")"]
                     = unitScopep;
+                // Default binding takes the architecture analyzed last (7.3.3),
+                // which is the one an entity copied for a generic type gets
+                m_archUnits[lib + "." + parts.back()] = archp;
             }
             iterateAndNextNull(archp->declsp());
             iterateAndNextNull(archp->stmtsp());
@@ -3106,7 +3187,17 @@ void VhdlSemVisitor::specializeResolvers() {
     }
 }
 
+// The entity and architecture copies made for generic types. They are design
+// units like any other and have to reach lowering, but they did not exist
+// when the units were put in dependency order.
+static std::vector<AstNodeVhdlUnit*> s_specUnits;
+
+void V3VhdlSem::addSpecializedUnit(AstNodeVhdlUnit* unitp) { s_specUnits.push_back(unitp); }
+
+const std::vector<AstNodeVhdlUnit*>& V3VhdlSem::specializedUnits() { return s_specUnits; }
+
 bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    s_specUnits.clear();
     V3VhdlStd::build();
     VhdlSemVisitor visitor;
     visitor.analyzeUnits(unitsp);
@@ -3126,6 +3217,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
 }
 
 void V3VhdlSem::clear() {
+    s_specUnits.clear();
     V3VhdlStd::clear();
     VhdlSymTab::clear();
 }
@@ -5384,12 +5476,14 @@ void VhdlSemVisitor::visit(AstVhdlReturn* nodep) {
 void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
     std::vector<std::string> parts;
     VhdlScope* unitScopep = nullptr;
+    std::string entKey;
     if (flatten(nodep->unitp(), parts) && !parts.empty()) {
         if (parts.size() > 1) {
             // "entity lib.name" names the entity directly (11.7)
             std::string lib = parts[0];
             if (lib == "work") lib = m_libname;
-            const auto it = m_unitScopes.find(lib + "." + parts.back());
+            entKey = lib + "." + parts.back();
+            const auto it = m_unitScopes.find(entKey);
             if (it != m_unitScopes.end()) unitScopep = it->second;
         } else {
             std::vector<VhdlSymbol*> found;
@@ -5402,13 +5496,43 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
                     break;
                 }
             }
+            // Default binding is to the entity of the same name (7.3.3),
+            // which is the entity a generic type would be settled on, whether
+            // the instance named it directly or through a component. A
+            // configuration specification may have named a different one.
+            std::string entity = parts.back();
+            const auto labelIt = m_specBindings.find(nodep->label());
+            const auto compIt = m_specBindings.find(entity);
+            if (!nodep->label().empty() && labelIt != m_specBindings.end()) {
+                entity = labelIt->second;
+            } else if (compIt != m_specBindings.end()) {
+                entity = compIt->second;
+            }
+            entKey = m_libname + "." + entity;
             if (!unitScopep) {
-                // Default binding is to the entity of the same name (7.3.3),
-                // which may not have been analyzed into this library yet
-                const auto it = m_unitScopes.find(m_libname + "." + parts.back());
+                // The entity may not have been analyzed into this library yet
+                const auto it = m_unitScopes.find(entKey);
                 if (it != m_unitScopes.end()) unitScopep = it->second;
             }
         }
+    }
+    // Which port each position names, for a binding indication that says
+    // the entity's ports and the component's go by different names (7.3.2.2)
+    if (unitScopep) {
+        std::map<int, std::string> byPosition;
+        for (const auto& pair : unitScopep->direct()) {
+            const VhdlSymbol* const symp = pair.second;
+            if (symp->kind() != VhdlSymKind::PORT || symp->position() < 0) continue;
+            byPosition[symp->position()] = symp->name();
+        }
+        std::vector<std::string> names;
+        for (const auto& pair : byPosition) names.push_back(pair.second);
+        nodep->formalPorts(names);
+    }
+    // An entity with a generic type is copied per type the design gives it,
+    // and this instance is of the copy rather than of the original (6.5.5)
+    if (!entKey.empty()) {
+        if (VhdlScope* const specp = specializeEntity(nodep, entKey)) unitScopep = specp;
     }
     bindOpenBounds(nodep, unitScopep);
     analyzeAssociations(nodep->genericMapp(), unitScopep);
@@ -5417,6 +5541,253 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
     // actual is often a literal, whose bounds come from how long it is
     bindOpenGenericBounds(nodep, unitScopep);
     analyzeAssociations(nodep->portMapp(), unitScopep);
+}
+
+// "for u1 : comp use entity work.thing" says which entity an instance is
+// built from (7.3.1). Where that entity has a generic type, the copy made for
+// this instance has to be of the right entity, so the binding is recorded as
+// the architecture's declarations are analyzed -- which is before any of its
+// statements, so every instance sees it.
+void VhdlSemVisitor::visit(AstVhdlConfigSpec* nodep) {
+    AstVhdlEntitySpec* const specp = nodep->specp();
+    AstVhdlBinding* const bindingp = nodep->bindingp();
+    if (!specp || !bindingp || !bindingp->unitp()) return;
+    std::vector<std::string> parts;
+    if (!flatten(bindingp->unitp(), parts) || parts.empty()) return;
+    const std::string entity = parts.back();
+    std::vector<std::string> names;
+    for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
+        if (const AstVhdlName* const namep = VN_CAST(p, VhdlName)) names.push_back(namep->name());
+    }
+    if (specp->entityClass() == "component" && !names.empty()) {
+        m_specBindings[names.back()] = entity;
+        names.pop_back();
+    }
+    if (specp->all() || specp->others()) return;
+    for (const std::string& label : names) m_specBindings[label] = entity;
+}
+
+// An instance of an entity that was copied for its generic types names the
+// copy. Every generic it still passes is named rather than positional: the
+// generic types stay in the copy's clause, so that their names go on meaning
+// something inside it, but they are not values, and a pin numbered by
+// position would count them.
+void VhdlSemVisitor::retargetInstance(AstVhdlInstance* nodep, const std::string& newName,
+                                      const std::vector<AstVhdlIfaceDecl*>& generics,
+                                      const std::vector<AstVhdlAssoc*>& assocs) {
+    nodep->specModule(newName);
+    for (size_t i = 0; i < generics.size(); ++i) {
+        AstVhdlAssoc* const asp = assocs[i];
+        if (!asp) continue;
+        if (generics[i]->kind() == VhdlIfaceKind::TYPE
+            || generics[i]->kind() == VhdlIfaceKind::PACKAGE) {
+            asp->unlinkFrBack();
+            VL_DO_DANGLING(asp->deleteTree(), asp);
+            continue;
+        }
+        if (!asp->formalp()) {
+            asp->formalp(new AstVhdlName{asp->fileline(), generics[i]->name()});
+        }
+    }
+}
+
+// One design unit of a copy made for a generic type. An entity and the
+// architecture bound to it are copied together, and each is analyzed exactly
+// as the original was -- in a region built from its own context clause, so
+// the copy sees the names the original saw and nothing else.
+void VhdlSemVisitor::analyzeSpecializedUnit(AstNodeVhdlUnit* unitp) {
+    VL_RESTORER(m_scopep);
+    VL_RESTORER(m_rootp);
+    VL_RESTORER_COPY(m_libname);
+    VL_RESTORER(m_ifacePos);
+    setupUnitContext(unitp);
+    const std::string lib = m_libname;
+    VhdlScope* const unitScopep = pushScope(unitp->name());
+    unitScopep->prefixes(lib + ":" + lower(unitp->name()), lib + ":" + lower(unitp->name()));
+    if (AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity)) {
+        openPortGenerics(entp->genericsp(), entp, unitScopep);
+        openPortGenerics(entp->portsp(), entp, unitScopep);
+        m_ifacePos = 0;
+        iterateAndNextNull(entp->genericsp());
+        fillOpenGenericDefaults(unitScopep);
+        m_ifacePos = 0;
+        iterateAndNextNull(entp->portsp());
+        iterateAndNextNull(entp->declsp());
+        m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
+        m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
+        libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
+        return;
+    }
+    AstVhdlArchitecture* const archp = VN_AS(unitp, VhdlArchitecture);
+    std::vector<std::string> parts;
+    if (flatten(archp->entityNamep(), parts) && !parts.empty()) {
+        const auto it = m_unitScopes.find(lib + "." + parts.back());
+        if (it != m_unitScopes.end()) m_scopep->addUse(it->second);
+        unitScopep->prefixes(parts.back() + "(" + lower(archp->name()) + ")", parts.back());
+        m_unitScopes[lib + "." + parts.back() + "(" + lower(archp->name()) + ")"] = unitScopep;
+    }
+    iterateAndNextNull(archp->declsp());
+    iterateAndNextNull(archp->stmtsp());
+    analyzeDrivers(archp);
+}
+
+// "generic (type T)" is not a value an instance passes but a type it chooses,
+// and a different choice is a different entity (6.5.5). One copy of the
+// entity and of its architecture is made per set of types, so what reaches
+// the back end is an ordinary entity whose ports have ordinary types --
+// which is how VHDL elaboration describes it, and what keeps the generated
+// model as fast as one written out by hand.
+//
+// Returns the copy's own region, so that the association checks that follow
+// see the ports as the copy has them, or null when nothing was specialized.
+VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::string& entKey) {
+    const auto unitIt = m_primaryUnits.find(entKey);
+    if (unitIt == m_primaryUnits.end()) return nullptr;
+    AstVhdlEntity* const entp = VN_CAST(unitIt->second, VhdlEntity);
+    if (!entp) return nullptr;
+    std::vector<AstVhdlIfaceDecl*> generics;
+    bool anyOpen = false;
+    for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
+        AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+        generics.push_back(ifp);
+        const bool isKind = ifp->kind() == VhdlIfaceKind::TYPE
+                            || ifp->kind() == VhdlIfaceKind::PACKAGE;
+        if (isKind && !ifp->isBound()) anyOpen = true;
+    }
+    if (!anyOpen) return nullptr;
+    // Which actual each generic is given, whether by name or by position
+    std::vector<AstNodeVhdlExpr*> actuals(generics.size(), nullptr);
+    std::vector<AstVhdlAssoc*> assocs(generics.size(), nullptr);
+    size_t position = 0;
+    for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+        AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+        if (!asp) continue;
+        size_t index = generics.size();
+        if (asp->formalp()) {
+            std::vector<std::string> fparts;
+            if (flatten(asp->formalp(), fparts) && !fparts.empty()) {
+                for (size_t i = 0; i < generics.size(); ++i) {
+                    if (generics[i]->name() == fparts.back()) index = i;
+                }
+            }
+        } else {
+            index = position++;
+        }
+        if (index < generics.size()) {
+            actuals[index] = asp->actualp();
+            assocs[index] = asp;
+        }
+    }
+    std::vector<VhdlType*> actualTypes;
+    std::vector<VhdlScope*> actualPackages;
+    for (size_t i = 0; i < generics.size(); ++i) {
+        if (generics[i]->kind() == VhdlIfaceKind::TYPE) {
+            if (!actuals[i]) {
+                err(nodep->fileline(),
+                    "Generic type '" + generics[i]->name() + "' of the instantiated entity '"
+                        + entp->name() + "' is given no type");
+                return nullptr;
+            }
+            VhdlType* const typep = resolveTypeActual(actuals[i]);
+            if (!typep || typep->isError()) return nullptr;
+            actualTypes.push_back(typep);
+            continue;
+        }
+        if (generics[i]->kind() != VhdlIfaceKind::PACKAGE) continue;
+        // A generic package is given a package that has been instantiated,
+        // so that its types and constants are settled (6.5.5)
+        VhdlScope* scopep = nullptr;
+        if (actuals[i]) {
+            std::vector<std::string> aparts;
+            std::vector<VhdlSymbol*> found;
+            if (flatten(actuals[i], aparts) && !aparts.empty()) lookup(aparts.back(), found);
+            for (VhdlSymbol* const psymp : found) {
+                if (psymp->kind() == VhdlSymKind::PACKAGE && psymp->innerp()) {
+                    scopep = psymp->innerp();
+                    break;
+                }
+            }
+        }
+        if (!scopep) return nullptr;  // Leaves the honest "cannot be lowered"
+        actualPackages.push_back(scopep);
+    }
+    // The same actuals ask for the copy that was already made
+    for (const VhdlEntitySpec& spec : m_entitySpecs) {
+        if (spec.key != entKey || spec.types != actualTypes) continue;
+        if (spec.packages != actualPackages) continue;
+        retargetInstance(nodep, spec.name, generics, assocs);
+        return spec.scopep;
+    }
+    AstVhdlArchitecture* const archp = m_archUnits.count(entKey) ? m_archUnits[entKey] : nullptr;
+    if (!archp) {
+        err(nodep->fileline(), "Entity '" + entp->name()
+                                   + "' has a generic type but no architecture to copy");
+        return nullptr;
+    }
+    // A copy may instantiate an entity that is copied in its turn. VHDL has
+    // no recursive instantiation, so the chain is finite; the bound is here
+    // only so that a malformed design stops rather than filling memory, and
+    // stopping leaves the ordinary "cannot be lowered yet" to be reported.
+    if (m_specDepth > 32) return nullptr;
+    const std::string newName = entp->name() + "__g" + std::to_string(++m_specUnitCount);
+    AstVhdlEntity* const entCopyp = entp->cloneTree(false);
+    entCopyp->name(newName);
+    VhdlUnanalyzeVisitor{entCopyp};
+    // A generic subprogram or package the instance said nothing about is
+    // whatever is visible where the instance is written, which is what
+    // "is <>" asks for. In the copy that is the ordinary visible one, so the
+    // generic is settled and nothing declares it again (6.5.5).
+    {
+        size_t index = 0;
+        for (AstNode* p = entCopyp->genericsp(); p; p = p->nextp(), ++index) {
+            AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            const bool isSub = ifp->kind() == VhdlIfaceKind::SUBPROGRAM;
+            if (isSub && index < actuals.size() && !actuals[index]) ifp->bound(true);
+        }
+    }
+    AstVhdlArchitecture* const archCopyp = archp->cloneTree(false);
+    VhdlUnanalyzeVisitor{archCopyp};
+    {
+        AstNodeVhdlExpr* const oldp = archCopyp->entityNamep();
+        AstVhdlName* const newp = new AstVhdlName{oldp->fileline(), newName};
+        oldp->replaceWith(newp);
+        VL_DO_DANGLING(oldp->deleteTree(), oldp);
+    }
+    entp->addNextHere(entCopyp);
+    archp->addNextHere(archCopyp);
+    V3VhdlSem::addSpecializedUnit(entCopyp);
+    V3VhdlSem::addSpecializedUnit(archCopyp);
+    VhdlScope* copyScopep = nullptr;
+    {
+        VL_RESTORER_COPY(m_boundGenTypes);
+        VL_RESTORER_COPY(m_boundGenPackages);
+        m_boundGenTypes.clear();
+        m_boundGenPackages.clear();
+        size_t nextType = 0;
+        size_t nextPkg = 0;
+        for (size_t i = 0; i < generics.size(); ++i) {
+            if (generics[i]->kind() == VhdlIfaceKind::TYPE) {
+                m_boundGenTypes[generics[i]->name()] = actualTypes[nextType++];
+            } else if (generics[i]->kind() == VhdlIfaceKind::PACKAGE) {
+                m_boundGenPackages[generics[i]->name()] = actualPackages[nextPkg++];
+            }
+        }
+        ++m_specDepth;
+        analyzeSpecializedUnit(entCopyp);
+        const std::string copyKey
+            = (entCopyp->libname().empty() ? "work" : lower(entCopyp->libname())) + "."
+              + lower(newName);
+        const auto copyIt = m_unitScopes.find(copyKey);
+        if (copyIt != m_unitScopes.end()) copyScopep = copyIt->second;
+        m_boundGenTypes.clear();
+        m_boundGenPackages.clear();
+        analyzeSpecializedUnit(archCopyp);
+        --m_specDepth;
+    }
+    m_entitySpecs.push_back(
+        VhdlEntitySpec{entKey, actualTypes, actualPackages, newName, copyScopep});
+    retargetInstance(nodep, newName, generics, assocs);
+    return copyScopep;
 }
 
 // The bounds a default value gives an unconstrained object: its own, where it

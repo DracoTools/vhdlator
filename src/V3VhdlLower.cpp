@@ -1152,6 +1152,10 @@ private:
         if (nodep->kind() == VhdlIfaceKind::TYPE
             || nodep->kind() == VhdlIfaceKind::SUBPROGRAM
             || nodep->kind() == VhdlIfaceKind::PACKAGE) {
+            // In a copy of the entity made for one instance the generic type
+            // is already the type that instance named, so there is nothing
+            // for the back end to be passed
+            if (nodep->isBound()) return;
             unsup(flp, "generic type, subprogram or package");
             return;
         }
@@ -6056,6 +6060,9 @@ private:
             const auto compIt = m_bindings.find(modName);
             if (compIt != m_bindings.end()) modName = compIt->second;
         }
+        // Where the entity had a generic type, this instance is of the copy
+        // made for the types it named (6.5.5)
+        if (!nodep->specModule().empty()) modName = nodep->specModule();
         // Only one architecture of an entity is built, so naming a different
         // one for this instance would need a module of its own
         if (!archName.empty()) {
@@ -6067,6 +6074,35 @@ private:
                 return;
             }
         }
+        // A binding indication may say which of the entity's ports each of
+        // the component's becomes (7.3.2.2). The two usually go by the same
+        // name, and then there is nothing to do; where they do not, the
+        // instance wrote the component's names and the entity wants its own.
+        const AstVhdlBinding* bindingp = nullptr;
+        {
+            const auto bindIt = m_bindingMaps.find(
+                !label.empty() && m_instanceBindings.count(label) ? label : parts.back());
+            if (bindIt != m_bindingMaps.end()) bindingp = bindIt->second;
+        }
+        std::map<std::string, std::vector<std::string>> renamed;  // Component port -> entity's
+        bool anyRenamed = false;
+        if (bindingp && bindingp->portMapp()) {
+            for (AstNode* p = bindingp->portMapp(); p; p = p->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->formalp() || !asp->actualp()) continue;
+                std::vector<std::string> fparts;
+                std::vector<std::string> aparts;
+                if (!flattenName(asp->formalp(), fparts) || fparts.empty()) continue;
+                if (asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+                if (!flattenName(asp->actualp(), aparts) || aparts.empty()) {
+                    unsup(flp, "binding indication whose actual is not a port name");
+                    return;
+                }
+                renamed[aparts.back()].push_back(fparts.back());
+                if (aparts.back() != fparts.back()) anyRenamed = true;
+            }
+        }
+        if (!anyRenamed) renamed.clear();
         AstPin* pinsp = nullptr;
         int pinNum = 0;
         // A formal may name part of a port rather than the whole of it, and
@@ -6074,6 +6110,7 @@ private:
         // of the port's own type stands for the port, each part of it is
         // wired to its actual, and the port itself is associated once.
         std::map<const VhdlSymbol*, AstVar*> partial;
+        size_t portPosition = 0;  // Which port a positional association names
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
             AstNodeVhdlExpr* const rootp = individualRoot(asp->formalp());
@@ -6121,6 +6158,34 @@ private:
             VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
             const auto partIt = symp ? partial.find(symp) : partial.end();
             if (partIt == partial.end()) {
+                if (!renamed.empty()) {
+                    // Which of the component's ports this association names,
+                    // by name where it was written and by position otherwise
+                    std::string compPort;
+                    if (asp->formalp()) {
+                        std::vector<std::string> fparts;
+                        if (flattenName(asp->formalp(), fparts) && !fparts.empty()) {
+                            compPort = fparts.back();
+                        }
+                    } else if (portPosition < nodep->formalPorts().size()) {
+                        compPort = nodep->formalPorts()[portPosition];
+                    }
+                    ++portPosition;
+                    const auto renIt = renamed.find(compPort);
+                    if (renIt != renamed.end()) {
+                        // One of the component's ports may feed more than one
+                        // of the entity's, so each gets a pin of its own
+                        for (const std::string& entPort : renIt->second) {
+                            AstNodeExpr* const actp
+                                = asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)
+                                      ? nullptr
+                                      : lowerExpr(asp->actualp());
+                            pinsp = AstNode::addNextNull(
+                                pinsp, new AstPin{asp->fileline(), ++pinNum, entPort, actp});
+                        }
+                        continue;
+                    }
+                }
                 AstPin* const pinp = lowerAssoc(asp, ++pinNum);
                 if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
@@ -6169,22 +6234,26 @@ private:
         // A binding indication may give the generics and the ports itself,
         // which is how a configuration supplies what the instance left out
         // (7.3.2). What the instance wrote comes first and wins.
-        const auto mapIt = m_bindingMaps.find(
-            !label.empty() && m_instanceBindings.count(label) ? label : parts.back());
-        if (mapIt != m_bindingMaps.end() && mapIt->second) {
-            for (AstNode* p = mapIt->second->genericMapp(); p; p = p->nextp()) {
+        if (bindingp) {
+            for (AstNode* p = bindingp->genericMapp(); p; p = p->nextp()) {
+                // A binding indication may be what chooses a generic type,
+                // and then the entity has to be copied for it just as an
+                // instance's own generic map would have it copied (6.5.5)
+                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                const AstNodeVhdlExpr* const actp = asp ? asp->actualp() : nullptr;
+                const VhdlSymbol* const asymp = actp ? actp->vhdlSymp() : nullptr;
+                if (asymp
+                    && (asymp->kind() == VhdlSymKind::TYPE
+                        || asymp->kind() == VhdlSymKind::PACKAGE)) {
+                    unsup(flp, "binding indication that chooses a generic type or package");
+                    return;
+                }
                 AstPin* const pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++pinNum);
                 if (pinp && !pinNamed(paramsp, pinp->name())) {
                     paramsp = AstNode::addNext(paramsp, pinp);
                 } else if (pinp) {
                     VL_DO_DANGLING(pinp->deleteTree(), pinp);
                 }
-            }
-            // A port map on the binding says which of the entity's ports
-            // each of the component's becomes (7.3.2.2). Where the two agree
-            // by name, which is the ordinary case, there is nothing to do.
-            if (mapIt->second->portMapp()) {
-                unsup(flp, "binding indication with a port map of its own");
             }
         }
         const std::string instName
@@ -9024,6 +9093,20 @@ std::set<const VhdlSymbol*> VhdlLowerVisitor::s_partialDriven;
 //######################################################################
 // Design units
 
+// Whether a generic type, subprogram or package of this entity is still
+// waiting for an instance to say what it is
+static bool hasUnboundGeneric(const AstVhdlEntity* entp) {
+    if (!entp) return false;
+    for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
+        const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+        const bool isKind = ifp->kind() == VhdlIfaceKind::TYPE
+                            || ifp->kind() == VhdlIfaceKind::SUBPROGRAM
+                            || ifp->kind() == VhdlIfaceKind::PACKAGE;
+        if (isKind && !ifp->isBound()) return true;
+    }
+    return false;
+}
+
 void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Whether any signal transaction in the design is delivered at a time of
     // its own. This decides whether a process whose timeout expires has to
@@ -9125,6 +9208,10 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             if (archIt != archs.end()) archp = archIt->second;
         }
         if (archp) m_archOf[key] = archp->name();
+        // An entity whose generic type nothing settled is not a design: it is
+        // the template the copies were made from, and each instance of it is
+        // an instance of one of those copies instead (6.5.5)
+        if (hasUnboundGeneric(entities[key])) continue;
         lowerEntity(entities[key], archp);
     }
     if (v3Global.opt.trace()) addTraceRequest();

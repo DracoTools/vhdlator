@@ -43,6 +43,10 @@ public:
 
     // Release the symbol table
     static void clear() VL_MT_DISABLED;
+    // Entity and architecture copies made for a generic type, which lowering
+    // has to build alongside the units that were ordered before analysis
+    static void addSpecializedUnit(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
+    static const std::vector<AstNodeVhdlUnit*>& specializedUnits() VL_MT_DISABLED;
 };
 
 #endif  // Guard

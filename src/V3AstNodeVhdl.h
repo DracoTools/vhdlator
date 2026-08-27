@@ -700,6 +700,10 @@ class AstVhdlIfaceDecl final : public AstNodeVhdlDecl {
     // stands for, and whether the map was written as a box (6.5.5)
     std::string m_newFrom;
     bool m_boxMap = false;
+    // A generic type an instance has already settled: the copy of the entity
+    // made for that instance declares the actual type under this name, so
+    // there is nothing left for the back end to be given (6.5.5)
+    bool m_bound = false;
 
 public:
     AstVhdlIfaceDecl(FileLine* fl, const std::string& name, VhdlIfaceKind kind)
@@ -715,6 +719,8 @@ public:
     bool modeExplicit() const { return m_modeExplicit; }
     VhdlSignalKind signalKind() const { return m_signalKind; }
     void signalKind(VhdlSignalKind kind) { m_signalKind = kind; }
+    bool isBound() const { return m_bound; }
+    void bound(bool flag) { m_bound = flag; }
     std::string newFrom() const { return m_newFrom; }
     void newFrom(const std::string& name) { m_newFrom = name; }
     bool boxMap() const { return m_boxMap; }
@@ -1136,6 +1142,14 @@ class AstVhdlInstance final : public AstNodeVhdlStmt {
     // @astgen op3 := portMapp : List[AstVhdlAssoc]
     std::string m_kind;  // "component", "entity", "configuration" or "" if implicit
     std::string m_archName;  // Architecture identifier for "entity x(arch)"
+    // The ports of the unit this instantiates, in the order they were
+    // declared, so that a positional association can be told which port it
+    // names. Only a binding indication that renames the ports needs this.
+    std::vector<std::string> m_formalPorts;
+    // Where the entity had a generic type, the copy made for this instance.
+    // Kept beside the written name rather than replacing it, so that a
+    // configuration specification naming the component still finds it.
+    std::string m_specModule;
 
 public:
     AstVhdlInstance(FileLine* fl, AstNodeVhdlExpr* unitp)
@@ -1145,6 +1159,10 @@ public:
     ASTGEN_MEMBERS_AstVhdlInstance;
     std::string kind() const { return m_kind; }
     void kind(const std::string& s) { m_kind = s; }
+    const std::vector<std::string>& formalPorts() const { return m_formalPorts; }
+    void formalPorts(const std::vector<std::string>& names) { m_formalPorts = names; }
+    std::string specModule() const { return m_specModule; }
+    void specModule(const std::string& name) { m_specModule = name; }
     std::string archName() const { return m_archName; }
     void archName(const std::string& s) { m_archName = s; }
 };
