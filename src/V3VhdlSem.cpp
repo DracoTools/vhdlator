@@ -1075,6 +1075,7 @@ public:
     // Give every resolved signal's resolution function the copy that takes as
     // many driver values as it has drivers
     void specializeResolvers() VL_MT_DISABLED;
+    bool reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
 
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
@@ -1173,6 +1174,8 @@ private:
                                  FileLine* flp) VL_MT_DISABLED;
     VhdlType* constrainRecordFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                       FileLine* flp) VL_MT_DISABLED;
+    VhdlType* constrainElementFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                        FileLine* flp) VL_MT_DISABLED;
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
     static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
@@ -1785,6 +1788,12 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     if (objectAlias) {
         VhdlType* const typep = analyzeExpr(nodep->targetp(), symp->typep());
         if (!symp->typep() && typep && !typep->isError()) symp->typep(typep);
+        // An alias written with a subtype of its own may constrain the index
+        // and leave the element alone, in which case the element is what the
+        // aliased object already has (5.3.2.2)
+        if (symp->typep()) {
+            symp->typep(constrainFromValue(symp->typep(), nodep->targetp(), nodep->fileline()));
+        }
     }
     nodep->vhdlSymp(symp);
     declare(symp, nodep->fileline());
@@ -3092,6 +3101,7 @@ private:
         const auto it = m_specializations.find(key);
         if (it != m_specializations.end()) {
             nodep->vhdlSymp(it->second);
+            takeResultType(nodep, it->second);
             return;
         }
         AstVhdlSubprogDecl* const bodyp = symp->bodyp();
@@ -3107,8 +3117,21 @@ private:
         if (newp) {
             m_madeSyms.insert(newp);
             nodep->vhdlSymp(newp);
+            takeResultType(nodep, newp);
             m_madeOne = true;
         }
+    }
+
+    // The copy's result has a length where the original's had none, so the
+    // call has one too -- which is what lets a constant declared with the
+    // unconstrained type take its bounds from what the call returns (6.4.2.2)
+    static void takeResultType(AstVhdlCall* nodep, const VhdlSymbol* symp) {
+        if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return;
+        VhdlType* const retp = symp->returnTypep();
+        if (!retp || !retp->lengthEmittable()) return;
+        const VhdlType* const hadp = nodep->vhdlTypep();
+        if (hadp && hadp->lengthEmittable()) return;
+        nodep->vhdlTypep(retp);
     }
 };
 
@@ -3293,6 +3316,11 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     VhdlSpecVisitor specializer{visitor};
     for (int round = 0; round < 20; ++round) {
         if (!specializer.pass(unitsp)) break;
+    }
+    // A constant whose bounds came from a call now has them, and another
+    // constant may take its own bounds from that one, so repeat
+    for (int round = 0; round < 8; ++round) {
+        if (!visitor.reconstrainDecls(unitsp)) break;
     }
     // A resolution function is called once per resolved signal rather than
     // from anywhere in the source, so its copy is made here rather than by
@@ -5098,7 +5126,11 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
     if (typep->base()->kind() == VhdlTypeKind::RECORD) {
         return constrainRecordFromValue(typep, valuep, flp);
     }
-    if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->unconstrained()) return typep;
+    if (typep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
+    // An array of arrays may have its index constrained and its element not
+    // -- "t_slv_array(0 to n-1)" over an element type of std_logic_vector --
+    // and then the element takes its bounds from the value too (5.3.2.2)
+    if (!typep->unconstrained()) return constrainElementFromValue(typep, valuep, flp);
     // A value that is itself constrained hands over its index ranges directly
     VhdlType* const valueTypep = valuep->vhdlTypep();
     if (valueTypep && valueTypep->isConstrainedArray()
@@ -5146,6 +5178,56 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
     for (VhdlType* const idxp : newIndexes) outp->addIndexType(idxp);
     outp->unconstrained(false);
     return outp;
+}
+
+// The element of an array whose index is constrained but whose element is not
+VhdlType* VhdlSemVisitor::constrainElementFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                                   FileLine* flp) {
+    if (typep->lengthEmittable()) return typep;
+    VhdlType* const elemp = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+    if (!elemp || elemp->base()->kind() != VhdlTypeKind::ARRAY || elemp->lengthEmittable()) {
+        return typep;
+    }
+    VhdlType* const valueTypep = valuep->vhdlTypep();
+    if (!valueTypep || valueTypep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
+    VhdlType* const valElemp
+        = valueTypep->elementp() ? valueTypep->elementp() : valueTypep->base()->elementp();
+    if (!valElemp || !valElemp->lengthEmittable()) return typep;
+    VhdlType* const outp = cloneSubtype(typep, flp);
+    outp->elementp(valElemp);
+    return outp;
+}
+
+// An object declared with an unconstrained array type takes its bounds from
+// its initial value (6.4.2.2). Where that value is a call, the length only
+// appears once the call has the copy made for its actuals, which is after the
+// whole design has been analyzed -- so the declarations are looked at again.
+bool VhdlSemVisitor::reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    std::map<const VhdlSymbol*, VhdlType*> settled;
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([&](AstVhdlObjectDecl* declp) {
+            VhdlSymbol* const symp = declp->vhdlSymp();
+            if (!symp || !declp->defaultp()) return;
+            VhdlType* const declaredp = symp->typep();
+            if (!declaredp || declaredp->lengthEmittable()) return;
+            VhdlType* const newp
+                = constrainFromValue(declaredp, declp->defaultp(), declp->fileline());
+            if (!newp || newp == declaredp || !newp->lengthEmittable()) return;
+            symp->typep(newp);
+            settled.emplace(symp, newp);
+        });
+    }
+    if (settled.empty()) return false;
+    // Every name that reads the object was given the type it had before
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([&](AstNodeVhdlExpr* exprp) {
+            const auto it = settled.find(exprp->vhdlSymp());
+            if (it == settled.end()) return;
+            if (exprp->vhdlTypep() && exprp->vhdlTypep()->lengthEmittable()) return;
+            exprp->vhdlTypep(it->second);
+        });
+    }
+    return true;
 }
 
 // An array value must have exactly as many elements as the constrained
