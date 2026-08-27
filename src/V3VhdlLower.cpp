@@ -6023,6 +6023,7 @@ private:
     }
 
     std::map<std::string, std::string> m_archOf;  // "lib.entity" -> architecture built
+    std::set<std::string> m_altArchMods;  // "lib.module" built from another architecture
     std::map<std::string, std::string> m_bindings;  // Component -> entity
     std::map<std::string, std::string> m_instanceBindings;  // Label -> entity
     // The same, said by a configuration declaration rather than inside the
@@ -6041,6 +6042,30 @@ private:
             if (p->name() == name) return true;
         }
         return false;
+    }
+
+    // The names an instance wrote for itself when it said which architecture
+    // it wants, as in "entity work.sub(one)" (7.3.2). The parser could not
+    // tell that shape from a call, so the architecture arrives as an argument.
+    static bool instanceNamesArch(const AstVhdlInstance* nodep, std::string& entName,
+                                  std::string& archName) {
+        const AstVhdlCall* const callp = VN_CAST(nodep->unitp(), VhdlCall);
+        if (!callp) return false;
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (!asp || asp->nextp() || !asp->actualp()) return false;
+        std::vector<std::string> archParts;
+        if (!flattenName(asp->actualp(), archParts) || archParts.empty()) return false;
+        std::vector<std::string> parts;
+        if (!flattenName(callp->prefixp(), parts) || parts.empty()) return false;
+        entName = parts.back();
+        archName = archParts.back();
+        return true;
+    }
+
+    // The module an entity built from an architecture other than the design's
+    // own choice goes by, so that both can stand in the netlist at once
+    static std::string altArchName(const std::string& entName, const std::string& archName) {
+        return entName + "__a" + archName;
     }
 
     // An instance binds to the entity of the same name, which is VHDL's
@@ -6080,15 +6105,20 @@ private:
         // Where the entity had a generic type, this instance is of the copy
         // made for the types it named (6.5.5)
         if (!nodep->specModule().empty()) modName = nodep->specModule();
-        // Only one architecture of an entity is built, so naming a different
-        // one for this instance would need a module of its own
+        // An entity may have several architectures, of which one is the
+        // design's own choice; an instance that names another is of the
+        // module built from that one instead (7.3.2)
         if (!archName.empty()) {
             const std::string libname = m_modp ? m_modp->libname() : "work";
             const auto archIt = m_archOf.find(libname + "." + modName);
             if (archIt != m_archOf.end() && archIt->second != archName) {
-                unsup(flp, "instance of architecture '" + archName + "' where '"
-                               + archIt->second + "' is the one built");
-                return;
+                const std::string altName = altArchName(modName, archName);
+                if (!m_altArchMods.count(libname + "." + altName)) {
+                    unsup(flp, "instance of architecture '" + archName + "' where '"
+                                   + archIt->second + "' is the one built");
+                    return;
+                }
+                modName = altName;
             }
         }
         // A binding indication may say which of the entity's ports each of
@@ -6836,6 +6866,7 @@ private:
         }
         return outp;
     }
+
 
     static AstNode* assignOf(AstNodeExpr* lhsp, AstNodeExpr* rhsp, bool signalAssign,
                              bool sequential, FileLine* flp) {
@@ -9030,10 +9061,11 @@ private:
     // METHODS - design units
 
     // The module an entity and its architecture become
-    void lowerEntity(AstVhdlEntity* entp, AstVhdlArchitecture* archp) {
+    void lowerEntity(AstVhdlEntity* entp, AstVhdlArchitecture* archp,
+                     const std::string& asName = "") {
         FileLine* const flp = entp->fileline();
         const std::string libname = entp->libname().empty() ? "work" : entp->libname();
-        m_modp = new AstModule{flp, entp->name(), libname};
+        m_modp = new AstModule{flp, asName.empty() ? entp->name() : asName, libname};
         // VHDL counts time in its primary unit, which for TIME is the
         // femtosecond (16.3), so that is the module's time unit, and the
         // design's precision must be at least as fine. Verilator keeps the
@@ -9216,6 +9248,9 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         }
         unsup(unitp->fileline(), std::string{"design unit "} + unitp->typeName());
     }
+    // Which architecture each entity is built from has to be settled before
+    // any of them is lowered, since an instance asks for it by name
+    std::map<std::string, AstVhdlArchitecture*> builtArch;
     for (const std::string& key : order) {
         AstVhdlArchitecture* archp = nullptr;
         const auto pickIt = chosen.find(key);
@@ -9227,12 +9262,42 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             const auto archIt = archs.find(key);
             if (archIt != archs.end()) archp = archIt->second;
         }
+        builtArch[key] = archp;
         if (archp) m_archOf[key] = archp->name();
+    }
+    // An entity may have several architectures, and an instance may name the
+    // one it wants (7.3.2). Only one of them is the design's own choice, so
+    // find which others some instance asks for; each of those becomes a
+    // module of its own, so that both stand in the netlist at once.
+    std::map<std::string, std::set<std::string>> alsoBuild;  // "lib.entity" -> architectures
+    for (const auto& pair : namedArchs) {
+        const std::string lib = pair.second->libname().empty() ? "work" : pair.second->libname();
+        pair.second->foreach([&](AstVhdlInstance* instp) {
+            std::string entName;
+            std::string archName;
+            if (!instanceNamesArch(instp, entName, archName)) return;
+            const std::string key = lib + "." + entName;
+            const auto builtIt = builtArch.find(key);
+            if (builtIt == builtArch.end() || !builtIt->second) return;
+            if (builtIt->second->name() == archName) return;
+            if (!namedArchs.count(key + "." + archName)) return;
+            if (hasUnboundGeneric(entities[key])) return;
+            alsoBuild[key].insert(archName);
+            m_altArchMods.insert(lib + "." + altArchName(entName, archName));
+        });
+    }
+    for (const std::string& key : order) {
         // An entity whose generic type nothing settled is not a design: it is
         // the template the copies were made from, and each instance of it is
         // an instance of one of those copies instead (6.5.5)
         if (hasUnboundGeneric(entities[key])) continue;
-        lowerEntity(entities[key], archp);
+        lowerEntity(entities[key], builtArch[key]);
+        const auto alsoIt = alsoBuild.find(key);
+        if (alsoIt == alsoBuild.end()) continue;
+        for (const std::string& wanted : alsoIt->second) {
+            lowerEntity(entities[key], namedArchs[key + "." + wanted],
+                        altArchName(entities[key]->name(), wanted));
+        }
     }
     if (v3Global.opt.trace()) addTraceRequest();
 }
