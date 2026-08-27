@@ -870,19 +870,6 @@ private:
         return new AstAdd{flp, diffp, new AstConst{flp, AstConst::Signed32{}, 1}};
     }
 
-    // Whether an element type can live inside a packed array
-    static bool elementPacks(const VhdlType* typep) {
-        // A STRING is text here rather than a vector of characters, so an
-        // array of them is an array of objects, not of bits (16.3)
-        if (isStringType(typep)) return false;
-        const VhdlType* const basep = typep->base();
-        switch (basep->kind()) {
-        case VhdlTypeKind::ENUM: return true;
-        case VhdlTypeKind::ARRAY: return basep->elementp() && elementPacks(basep->elementp());
-        default: return false;
-        }
-    }
-
     // Whether every element of a record can live inside a packed structure.
     // One that cannot -- a real, a string, an unpacked array, an access value
     // -- makes the whole record unpacked.
@@ -913,6 +900,23 @@ private:
             }
         }
         return true;
+    }
+
+    // Whether an element type can live inside a packed array
+    static bool elementPacks(const VhdlType* typep) {
+        // A STRING is text here rather than a vector of characters, so an
+        // array of them is an array of objects, not of bits (16.3)
+        if (isStringType(typep)) return false;
+        const VhdlType* const basep = typep->base();
+        switch (basep->kind()) {
+        case VhdlTypeKind::ENUM: return true;
+        case VhdlTypeKind::ARRAY: return basep->elementp() && elementPacks(basep->elementp());
+        // An array of records is a packed array of packed structures where
+        // every element of the record packs, which is what lets a port of one
+        // connect by width rather than by C++ structure type
+        case VhdlTypeKind::RECORD: return recordPacks(typep);
+        default: return false;
+        }
     }
 
     AstNodeDType* lowerRecordType(VhdlType* typep, FileLine* flp) {
