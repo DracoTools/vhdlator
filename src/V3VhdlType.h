@@ -248,6 +248,25 @@ public:
         }
         return true;
     }
+    // Whether this array says how long it is -- as a number now, or as an
+    // expression that folds once the instance is elaborated. A bound naming
+    // a generic is a length; an index the text left open ("<>") is not one
+    // until a value gives it one.
+    bool lengthEmittable() const {
+        if (base()->kind() != VhdlTypeKind::ARRAY) return true;
+        if (m_indexTypes.empty()) return false;
+        for (size_t i = 0; i < m_indexTypes.size(); ++i) {
+            if (dimOpen(i)) return false;
+            const VhdlType* const idxp = m_indexTypes[i];
+            if (!idxp) return false;
+            if (!idxp->bounded() && !idxp->boundsp()) return false;
+        }
+        const VhdlType* const elemp = m_elementp ? m_elementp : base()->m_elementp;
+        if (elemp && elemp != this && elemp->base()->kind() == VhdlTypeKind::ARRAY) {
+            return elemp->lengthEmittable();
+        }
+        return true;
+    }
     // Length of one dimension, counting from zero
     int64_t dimLength(size_t dim) const {
         if (dim >= m_indexTypes.size() || !m_indexTypes[dim]) return 0;

@@ -696,6 +696,7 @@ class VhdlSemVisitor final : public VNVisitor {
             return;
         }
         std::vector<VhdlType*> indexes;
+        std::vector<bool> openAt;  // Which of them the text left open
         const std::vector<VhdlType*>& baseIndexes = basep->base()->indexTypes();
         size_t dim = 0;
         for (AstNode* rp = firstp; rp; rp = rp->nextp()) {
@@ -715,6 +716,16 @@ class VhdlSemVisitor final : public VNVisitor {
             AstNode* itemp = rp;
             if (AstVhdlAssoc* const asp = VN_CAST(rp, VhdlAssoc)) {
                 if (!asp->formalp() && asp->actualp()) itemp = asp->actualp();
+            }
+            // "t(open)(7 downto 0)" leaves this dimension as it was and
+            // constrains the element instead (5.3.3). As it was means as the
+            // base type had it: open where the base left it open, and still
+            // constrained where the base already said how long it is.
+            if (VN_IS(itemp, VhdlOpen)) {
+                indexes.push_back(wantp ? wantp : V3VhdlStd::integerType());
+                openAt.push_back(basep->base()->dimOpen(dim));
+                ++dim;
+                continue;
             }
             RangeInfo info = analyzeRange(itemp, wantp);
             if (!info.valid) {
@@ -752,6 +763,7 @@ class VhdlSemVisitor final : public VNVisitor {
                 }
             }
             indexes.push_back(idxp ? idxp : V3VhdlStd::integerType());
+            openAt.push_back(info.unbounded);
             ++dim;
         }
         if (indexes.empty()) return;
@@ -762,10 +774,14 @@ class VhdlSemVisitor final : public VNVisitor {
         }
         typep->clearIndexTypes();
         bool unconstrained = false;
-        for (VhdlType* const idxp : indexes) {
-            if (!idxp->bounded()) {
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            VhdlType* const idxp = indexes[i];
+            const bool open = i < openAt.size() && openAt[i];
+            if (open || !idxp->bounded()) {
                 unconstrained = true;
-                if (!idxp->boundsp()) typep->setDimOpen(typep->dimensions());
+                // "t(open)(7 downto 0)" says nothing about this dimension,
+                // however bounded the index subtype it keeps may be (5.3.3)
+                if (open || !idxp->boundsp()) typep->setDimOpen(typep->dimensions());
             }
             typep->addIndexType(idxp);
         }
@@ -781,10 +797,19 @@ class VhdlSemVisitor final : public VNVisitor {
             if (AstVhdlAssoc* const asp = VN_CAST(itemp, VhdlAssoc)) {
                 if (!asp->formalp() && asp->actualp()) itemp = asp->actualp();
             }
-            AstVhdlCall* const callp = VN_CAST(itemp, VhdlCall);
-            const AstVhdlName* const namep
-                = callp ? VN_CAST(callp->prefixp(), VhdlName) : nullptr;
-            if (!namep) {
+            // "rec(f(1 to 3)(1 to 2))" constrains the element as well as
+            // the index, and the parser could only read that as a call of a
+            // call. Peel them apart: the innermost is the element's own
+            // constraint, the outermost is f's (5.3.3).
+            std::vector<AstNode*> constraints;  // f's own first
+            AstNode* rootp = itemp;
+            while (AstVhdlCall* const cp = VN_CAST(rootp, VhdlCall)) {
+                constraints.push_back(cp->argsp());
+                rootp = cp->prefixp();
+            }
+            std::reverse(constraints.begin(), constraints.end());
+            const AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
+            if (!namep || constraints.empty()) {
                 err(flp, "A record constraint names an element and how to constrain it");
                 return;
             }
@@ -801,7 +826,18 @@ class VhdlSemVisitor final : public VNVisitor {
             VhdlType* const elemTypep = elems[pos]->typep();
             if (!elemTypep) return;
             VhdlType* const newTypep = cloneSubtype(elemTypep, flp);
-            applyConstraint(newTypep, elemTypep, nullptr, callp->argsp(), flp);
+            applyConstraint(newTypep, elemTypep, nullptr, constraints[0], flp);
+            // Each further list constrains the element of the one before it
+            VhdlType* levelp = newTypep;
+            for (size_t d = 1; d < constraints.size() && levelp; ++d) {
+                VhdlType* const innerp
+                    = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
+                if (!innerp) break;
+                VhdlType* const newInnerp = cloneSubtype(innerp, flp);
+                applyConstraint(newInnerp, innerp, nullptr, constraints[d], flp);
+                levelp->elementp(newInnerp);
+                levelp = newInnerp;
+            }
             VhdlSymbol* const newSymp = VhdlSymTab::newSymbol(VhdlSymKind::RECORD_ELEMENT,
                                                              elems[pos]->name(),
                                                              elems[pos]->declp());
@@ -2928,8 +2964,10 @@ private:
         // compiled, so making copies of it is wasted work
         if (V3VhdlStd::isIntrinsicName(symp->name())) return false;
         for (const VhdlType* const typep : symp->paramTypes()) {
+            // A bound that names a generic is a length: the back end folds it
+            // per instance, so one copy of the subprogram serves every call
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
-                && !typep->isConstrainedArray()) {
+                && !typep->lengthEmittable()) {
                 return true;
             }
         }
@@ -2942,7 +2980,7 @@ private:
     static bool resultIsUnconstrained(const VhdlSymbol* symp) {
         const VhdlType* const retp = symp->returnTypep();
         return retp && retp->base()->kind() == VhdlTypeKind::ARRAY
-               && !retp->isConstrainedArray();
+               && !retp->lengthEmittable();
     }
 
     void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {

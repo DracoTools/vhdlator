@@ -3798,14 +3798,14 @@ private:
         for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
             const VhdlType* const typep = symp->paramTypes()[i];
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
-                && !typep->isConstrainedArray() && !isStringType(typep)) {
+                && !typep->lengthEmittable() && !isStringType(typep)) {
                 return " whose parameter '" + symp->paramName(i)
                        + "' has no length at this call";
             }
         }
         const VhdlType* const retp = symp->returnTypep();
         if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
-            && !retp->isConstrainedArray() && !isStringType(retp)) {
+            && !retp->lengthEmittable() && !isStringType(retp)) {
             return " whose result has no length at this call";
         }
         return "";
@@ -8692,7 +8692,7 @@ private:
         // deciding a length it does not have.
         for (const VhdlType* const typep : symp->paramTypes()) {
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
-                && !typep->isConstrainedArray() && !isStringType(typep)) {
+                && !typep->lengthEmittable() && !isStringType(typep)) {
                 return nullptr;
             }
         }
@@ -8703,7 +8703,7 @@ private:
         if (nodep->isFunction()) {
             const VhdlType* const retp = returnType(nodep, symp);
             if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
-                && !retp->isConstrainedArray() && !isStringType(retp)) {
+                && !retp->lengthEmittable() && !isStringType(retp)) {
                 return nullptr;
             }
         }
