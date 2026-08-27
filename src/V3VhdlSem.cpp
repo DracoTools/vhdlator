@@ -5990,6 +5990,59 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
 // it. V3Param then builds one module per set of bounds -- exactly what it
 // does for a width generic written by hand, and what VHDL elaboration says
 // should happen.
+// A STRING is text here rather than a vector of characters (16.3)
+static bool isStdStringType(const VhdlType* typep) {
+    const VhdlType* const strp = V3VhdlStd::stringType();
+    return typep && strp && typep->base() == strp->base();
+}
+
+// Whether an element type can live inside a packed array, which decides
+// whether a record becomes one machine word or a C++ structure
+static bool packableElement(const VhdlType* typep, int depth = 0) {
+    if (!typep || depth > 16) return false;
+    if (isStdStringType(typep)) return false;
+    const VhdlType* const basep = typep->base();
+    switch (basep->kind()) {
+    case VhdlTypeKind::ENUM: return true;
+    case VhdlTypeKind::ARRAY:
+        return basep->elementp() && packableElement(basep->elementp(), depth + 1);
+    default: return false;
+    }
+}
+
+// Whether a record whose open elements an instance would settle can be a
+// packed structure. It matters here and not only in the lowering: a packed
+// one is a vector, so a port of it connects to the actual by width whatever
+// the instance made its elements; an unpacked one is a named C++ structure,
+// and a structure whose shape a generic decides is a different structure in
+// the module that declares the port from the one that connects to it. That
+// is the case this cannot do, so those ports keep their honest error.
+static bool recordWouldPack(const VhdlType* typep, int depth = 0) {
+    if (!typep || depth > 16) return false;
+    for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+        const VhdlType* const etypep = elemp->typep();
+        if (!etypep) return false;
+        switch (etypep->base()->kind()) {
+        case VhdlTypeKind::ENUM:
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::UNIVERSAL_INTEGER:
+        case VhdlTypeKind::PHYSICAL: break;
+        case VhdlTypeKind::ARRAY:
+            // Not asked whether it is constrained: constraining it is what
+            // this is for
+            if (isStdStringType(etypep)) return false;
+            if (!etypep->base()->elementp()) return false;
+            if (!packableElement(etypep->base()->elementp(), depth + 1)) return false;
+            break;
+        case VhdlTypeKind::RECORD:
+            if (!recordWouldPack(etypep, depth + 1)) return false;
+            break;
+        default: return false;
+        }
+    }
+    return true;
+}
+
 void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlScope* scopep) {
     AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity);
     AstVhdlComponentDecl* const compp = VN_CAST(unitp, VhdlComponentDecl);
@@ -6012,7 +6065,10 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
         // whose element length a generic decides is a different structure
         // per instance -- which the actual, whose length the text fixed, is
         // not. That one keeps the message it had.
-        if (typep->base()->kind() != VhdlTypeKind::ARRAY) continue;
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY
+            && !(typep->base()->kind() == VhdlTypeKind::RECORD && recordWouldPack(typep))) {
+            continue;
+        }
         std::vector<std::string> path;
         if (AstVhdlIndexConstraint* const consp
             = openConstraintFor(typep, ifp, entp, compp, scopep, path)) {
@@ -6134,10 +6190,32 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
         const int wantPos = found[0]->position();
         AstNodeVhdlExpr* actualp = nullptr;
         AstVhdlRange* formalRangep = nullptr;
+        size_t skipSteps = 0;  // How much of the path the formal already named
         int position = 0;
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp(), ++position) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
             if (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            // "p.a => x" associates one element of the port, and then it is
+            // x that says how long p.a is, not how long p is (6.5.7.1)
+            {
+                std::vector<std::string> steps;  // Outermost first
+                AstNodeVhdlExpr* rootp = asp->formalp();
+                while (AstVhdlSelected* const selp = VN_CAST(rootp, VhdlSelected)) {
+                    const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+                    if (!sufp) break;
+                    steps.insert(steps.begin(), sufp->name());
+                    rootp = selp->prefixp();
+                }
+                const AstVhdlName* const rnamep = VN_CAST(rootp, VhdlName);
+                if (!steps.empty()) {
+                    if (!rnamep || rnamep->name() != bound.port) continue;
+                    if (steps.size() > bound.path.size()) continue;
+                    if (!std::equal(steps.begin(), steps.end(), bound.path.begin())) continue;
+                    actualp = asp->actualp();
+                    skipSteps = steps.size();
+                    break;
+                }
+            }
             // "value(data'range) => a" names part of the port, and it is that
             // part which says how long the port is
             if (AstVhdlCall* const callp = VN_CAST(asp->formalp(), VhdlCall)) {
@@ -6149,9 +6227,11 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                         break;
                     }
                 }
+                continue;
             }
             const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
-            if (namep ? namep->name() == bound.port : position == wantPos) {
+            if (namep ? namep->name() == bound.port
+                      : (!asp->formalp() && position == wantPos)) {
                 actualp = asp->actualp();
                 break;
             }
@@ -6184,7 +6264,8 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
             // Where the open dimension is inside the port's type, the same
             // place inside the actual is what has its bounds
             AstNodeVhdlExpr* prefixp = actualp->cloneTree(false);
-            for (const std::string& step : bound.path) {
+            for (size_t si = skipSteps; si < bound.path.size(); ++si) {
+                const std::string& step = bound.path[si];
                 prefixp = step.empty()
                               ? static_cast<AstNodeVhdlExpr*>(
                                     new AstVhdlAttrName{flp, prefixp, "element"})

@@ -897,7 +897,12 @@ private:
             case VhdlTypeKind::PHYSICAL: break;
             case VhdlTypeKind::ARRAY:
                 if (isStringType(etypep)) return false;
-                if (!etypep->isConstrainedArray()) return false;
+                // A length that names a generic is a length: the element is
+                // still a vector, and the structure is still one word. Asking
+                // only whether it folds now would make a record whose element
+                // an instance settles unpacked in the entity and packed in
+                // the architecture that connects to it.
+                if (!etypep->lengthEmittable()) return false;
                 if (!etypep->base()->elementp()) return false;
                 if (!elementPacks(etypep->base()->elementp())) return false;
                 break;
@@ -6131,7 +6136,10 @@ private:
             // names a part of it, and that part's subtype is written in terms
             // this architecture can see, so it is the one to stand in.
             VhdlType* standTypep = symp->typep();
-            if (dependsOnGeneric(standTypep) && asp->formalp()
+            // Only where the formal names a slice of the port: "p.a => x"
+            // names one element of a record, and the signal standing in for
+            // the port is the whole record, not that element
+            if (VN_IS(asp->formalp(), VhdlCall) && dependsOnGeneric(standTypep)
                 && asp->formalp()->vhdlTypep()
                 && !dependsOnGeneric(asp->formalp()->vhdlTypep())) {
                 standTypep = asp->formalp()->vhdlTypep();
