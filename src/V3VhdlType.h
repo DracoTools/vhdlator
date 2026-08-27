@@ -99,6 +99,15 @@ class VhdlType final {
     std::vector<VhdlType*> m_indexTypes;
     VhdlType* m_elementp = nullptr;
     bool m_unconstrained = false;  // Array with an unconstrained index
+    // Which dimensions the "<>" was written for, one bit each. An array may
+    // leave one dimension open and constrain another -- "array (t_two, t_enum)"
+    // constrains both, yet t_two's bounds name a generic -- so knowing only
+    // that the array is not fully constrained is not enough to tell which
+    // index has no range of its own. Not every path that builds an array
+    // records this, so until one does, every dimension of an unconstrained
+    // array counts as open, which is what the whole type flag used to mean.
+    uint32_t m_openDims = 0;
+    bool m_openDimsKnown = false;
     // RECORD: its elements, in declaration order
     std::vector<VhdlSymbol*> m_elements;
     // ACCESS, FILE: the designated type
@@ -252,11 +261,26 @@ public:
     // Array
     const std::vector<VhdlType*>& indexTypes() const { return m_indexTypes; }
     void addIndexType(VhdlType* typep) { m_indexTypes.push_back(typep); }
-    void clearIndexTypes() { m_indexTypes.clear(); }
+    void clearIndexTypes() {
+        m_indexTypes.clear();
+        m_openDims = 0;
+        m_openDimsKnown = false;
+    }
     VhdlType* elementp() const { return m_elementp; }
     void elementp(VhdlType* typep) { m_elementp = typep; }
     bool unconstrained() const { return m_unconstrained; }
     void unconstrained(bool flag) { m_unconstrained = flag; }
+    // Whether this dimension is the one nothing constrained
+    bool dimOpen(size_t dim) const {
+        if (!m_unconstrained) return false;
+        if (!m_openDimsKnown) return true;  // Which dimension was never recorded
+        return dim < 32 && (m_openDims & (1U << dim));
+    }
+    void setDimOpen(size_t dim) {
+        if (dim < 32) m_openDims |= (1U << dim);
+    }
+    // Every open dimension of this array has now been named
+    void openDimsKnown() { m_openDimsKnown = true; }
     size_t dimensions() const { return m_indexTypes.size(); }
 
     // Record
@@ -299,6 +323,8 @@ public:
         m_indexTypes = otherp->m_indexTypes;
         m_elementp = otherp->m_elementp;
         m_unconstrained = otherp->m_unconstrained;
+        m_openDims = otherp->m_openDims;
+        m_openDimsKnown = otherp->m_openDimsKnown;
         m_elements = otherp->m_elements;
         m_designatedp = otherp->m_designatedp;
         m_units = otherp->m_units;

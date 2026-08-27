@@ -729,7 +729,7 @@ private:
             // which is perfectly bounded, so asking the index alone lets a
             // type that nothing ever constrained pass for a real array of
             // 2**31 elements and be reported as one
-            if (!idxp || !idxp->bounded() || typep->unconstrained()) {
+            if (!idxp || !idxp->bounded() || typep->dimOpen(i)) {
                 // A bound that names a generic is fixed once the instance is
                 // elaborated but is not a number now, so it goes to the back
                 // end as an expression and V3Param folds it per instance --
@@ -4474,7 +4474,9 @@ private:
 
     bool ownConstraint(AstVhdlAggregate* nodep, VhdlType* typep, int64_t& left, int64_t& step,
                        int64_t& count) {
-        if (typep->dimensions() != 1) return false;
+        // In a multidimensional aggregate the choices are those of the first
+        // dimension, and each element covers the rest (9.3.3.3), so the same
+        // reckoning applies -- it is the first index that is being described
         const VhdlType* const indexp = typep->base()->indexTypes().empty()
                                            ? nullptr
                                            : typep->base()->indexTypes()[0];

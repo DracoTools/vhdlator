@@ -630,6 +630,10 @@ class VhdlSemVisitor final : public VNVisitor {
             // A range constraint narrows a scalar type (5.2.1)
             const RangeInfo info = analyzeRange(rp, basep->isScalar() ? basep : nullptr);
             applyRange(typep, info);
+            // A scalar range whose bounds name a generic is still the range
+            // this subtype has; it is only not a pair of numbers yet. Keep it
+            // so that an array indexed by this subtype can emit it (14.4.2).
+            if (!info.unbounded && info.valid && !typep->bounded()) typep->boundsp(rp);
             checkSubrange(typep, basep, flp);
             return;
         }
@@ -718,9 +722,13 @@ class VhdlSemVisitor final : public VNVisitor {
         typep->clearIndexTypes();
         bool unconstrained = false;
         for (VhdlType* const idxp : indexes) {
+            if (!idxp->bounded()) {
+                unconstrained = true;
+                if (!idxp->boundsp()) typep->setDimOpen(typep->dimensions());
+            }
             typep->addIndexType(idxp);
-            if (!idxp->bounded()) unconstrained = true;
         }
+        typep->openDimsKnown();
         typep->unconstrained(unconstrained);
     }
 
@@ -870,17 +878,37 @@ class VhdlSemVisitor final : public VNVisitor {
                     // kept as written for the back end to fold per instance,
                     // rather than falling back on the index base type -- which
                     // would make this an array of four billion elements.
+                    // The index may be written as the name of a subtype
+                    // rather than as a range -- "array (t_two) of boolean"
+                    // -- and then the range to keep is the one that subtype
+                    // was declared with, not this name
+                    AstNode* const inheritedp = indexTypep ? indexTypep->boundsp() : nullptr;
                     indexTypep
                         = cloneSubtype(indexTypep ? indexTypep : V3VhdlStd::integerType(), flp);
                     indexTypep->unbound();
-                    if (AstVhdlRange* const rp = VN_CAST(idxp, VhdlRange)) {
+                    AstVhdlRange* const rp = VN_CAST(idxp, VhdlRange);
+                    // A range written out has its own two bounds; one written
+                    // as a type mark or as "x'range" does not, and then the
+                    // range to keep is the one the subtype it names carries
+                    if (rp && rp->leftp() && rp->rightp()) {
+                        indexTypep->boundsp(rp);
+                    } else if (inheritedp) {
+                        indexTypep->boundsp(inheritedp);
+                    } else if (rp) {
                         indexTypep->boundsp(rp);
                     }
                 }
                 if (!indexTypep) indexTypep = V3VhdlStd::integerType();
-                if (info.unbounded || !indexTypep->bounded()) unconstrained = true;
+                if (info.unbounded || !indexTypep->bounded()) {
+                    unconstrained = true;
+                    // Only a "<>" leaves a dimension with no range at all. A
+                    // bound that names a generic is a range, just not a number
+                    // yet, and the back end folds it per instance.
+                    if (info.unbounded) typep->setDimOpen(typep->dimensions());
+                }
                 typep->addIndexType(indexTypep);
             }
+            typep->openDimsKnown();
             typep->unconstrained(unconstrained);
             typep->elementp(resolveSubtype(arrp->elementp()));
             return typep;
