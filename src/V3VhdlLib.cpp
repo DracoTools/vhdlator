@@ -94,7 +94,7 @@ std::string workLib(const AstNodeVhdlUnit* unitp) {
 
 // Add the dependency a context item implies, if any
 void addContextDependency(const AstVhdlContextItem* itemp, const std::string& work,
-                          std::vector<std::string>& deps) {
+                          std::vector<std::string>& deps, std::vector<std::string>& libs) {
     if (itemp->kind() == VhdlContextKind::LIBRARY) return;  // Makes a name visible only
     for (AstNode* nodep = itemp->namesp(); nodep; nodep = nodep->nextp()) {
         std::vector<std::string> parts;
@@ -102,6 +102,12 @@ void addContextDependency(const AstVhdlContextItem* itemp, const std::string& wo
         if (parts.size() < 2) continue;  // "use foo;" names nothing analyzable
         std::string lib = parts[0];
         if (lib == "work") lib = work;
+        // "use work.all" makes every primary unit of the library directly
+        // visible (12.4), so it names no one unit to follow
+        if (parts.size() == 2 && parts[1] == "all") {
+            libs.push_back(lib);
+            continue;
+        }
         deps.push_back(lib + "." + parts[1]);
     }
 }
@@ -183,7 +189,8 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
         }
 
         for (AstNode* itemp = unitp->contextp(); itemp; itemp = itemp->nextp()) {
-            addContextDependency(VN_AS(itemp, VhdlContextItem), work, unit.dependsOn);
+            addContextDependency(VN_AS(itemp, VhdlContextItem), work, unit.dependsOn,
+                                 unit.followsLibs);
         }
         // "package p is new work.poly generic map (<>)" needs work.poly
         // analyzed first, and says so nowhere in the context clause (6.5.5)
@@ -210,6 +217,23 @@ const std::vector<AstNodeVhdlUnit*>& V3VhdlLib::ordered() { return s_ordered; }
 
 bool V3VhdlLib::computeOrder() {
     s_ordered.clear();
+    // "use work.all" is not a dependency on one unit but on all of them, and
+    // which those are is only known once every file has been read (12.4)
+    for (Unit& unit : s_units) {
+        for (const std::string& lib : unit.followsLibs) {
+            const std::string prefix = lib + ".";
+            for (const Unit& otherp : s_units) {
+                if (&otherp == &unit) continue;
+                if (otherp.key.compare(0, prefix.size(), prefix) != 0) continue;
+                // Only a primary unit can be named: an architecture or a
+                // package body is not something a use clause reaches, and
+                // following one would put a unit after its own architecture
+                if (otherp.key.find('(') != std::string::npos) continue;
+                if (otherp.key.find('%') != std::string::npos) continue;
+                unit.softDependsOn.push_back(otherp.key);
+            }
+        }
+    }
     bool dupOk = true;
     for (const auto& pair : s_duplicates) {
         pair.first->fileline()->v3error(
@@ -259,6 +283,10 @@ bool V3VhdlLib::computeOrder() {
                     continue;
                 }
                 const size_t next = it->second;
+                // A soft dependency only says which order to take two units
+                // in, so where it would close a cycle it is simply dropped --
+                // "use work.all" names the whole library, itself included
+                if (soft && state[next] == 1) continue;
                 if (state[next] == 1) {
                     s_units[next].nodep->fileline()->v3error(
                         "Circular dependency between design units: '"

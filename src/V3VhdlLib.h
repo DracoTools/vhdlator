@@ -45,6 +45,9 @@ public:
         // instantiation takes the body of what it copies, but an
         // uninstantiated package need not have one.
         std::vector<std::string> softDependsOn;
+        // Libraries whose every primary unit this one must follow, which is
+        // what "use work.all" asks for (12.4)
+        std::vector<std::string> followsLibs;
     };
 
     // Register a parsed file's design units
