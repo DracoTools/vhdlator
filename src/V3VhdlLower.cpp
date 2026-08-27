@@ -3577,29 +3577,175 @@ private:
         return nodep;
     }
 
+    // An integer expression as a sum of terms with integer coefficients and
+    // a constant. Two slice bounds move together when their term parts are
+    // the same, however differently they are written: "8*(i+1)-1" and "8*i"
+    // differ by seven, which no comparison of the two expressions shows.
+    struct LinearForm final {
+        // Opaque subexpression and how many of it. Kept as trees and matched
+        // by shape: two writings of the same term are different nodes.
+        // Each term: what it is, how many of it, and whether it names a
+        // generic. A term left over decides the width, and only a generic
+        // folds when the instance is elaborated -- anything else never
+        // folds, and a width that never folds is not a part select at all.
+        struct Term final {
+            AstNodeExpr* exprp = nullptr;
+            int64_t coeff = 0;
+            bool generic = false;
+        };
+        std::vector<Term> terms;
+        int64_t konst = 0;
+        bool ok = true;
+        void clear() {
+            for (auto& term : terms) {
+                if (term.exprp) VL_DO_DANGLING(term.exprp->deleteTree(), term.exprp);
+            }
+            terms.clear();
+        }
+    };
+
+    void linearAdd(LinearForm& form, AstNodeVhdlExpr* nodep, int64_t scale, int depth) {
+        if (!form.ok || !nodep || depth > 16) {
+            form.ok = false;
+            return;
+        }
+        const VhdlValue folded = V3VhdlEval::eval(nodep);
+        if (folded.isInt()) {
+            form.konst += scale * folded.toInt();
+            return;
+        }
+        if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
+            if (binp->op() == VhdlBinaryOp::ADD || binp->op() == VhdlBinaryOp::SUB) {
+                const int64_t rscale = binp->op() == VhdlBinaryOp::ADD ? scale : -scale;
+                linearAdd(form, binp->lhsp(), scale, depth + 1);
+                linearAdd(form, binp->rhsp(), rscale, depth + 1);
+                return;
+            }
+            if (binp->op() == VhdlBinaryOp::MUL) {
+                const VhdlValue lhs = V3VhdlEval::eval(binp->lhsp());
+                const VhdlValue rhs = V3VhdlEval::eval(binp->rhsp());
+                if (rhs.isInt()) {
+                    linearAdd(form, binp->lhsp(), scale * rhs.toInt(), depth + 1);
+                    return;
+                }
+                if (lhs.isInt()) {
+                    linearAdd(form, binp->rhsp(), scale * lhs.toInt(), depth + 1);
+                    return;
+                }
+                // Neither side is a number -- "(i+1)*WORD_BITS", where the
+                // width is a generic -- so the product is spread over the
+                // sum, which is what makes the two ends of the slice
+                // cancel: i*W + W, against i*W
+                AstVhdlBinary* const sump = VN_CAST(binp->lhsp(), VhdlBinary);
+                AstNodeVhdlExpr* otherp = binp->rhsp();
+                if (!sump || (sump->op() != VhdlBinaryOp::ADD
+                              && sump->op() != VhdlBinaryOp::SUB)) {
+                    AstVhdlBinary* const rsump = VN_CAST(binp->rhsp(), VhdlBinary);
+                    if (rsump
+                        && (rsump->op() == VhdlBinaryOp::ADD
+                            || rsump->op() == VhdlBinaryOp::SUB)) {
+                        spreadProduct(form, rsump, binp->lhsp(), scale, depth);
+                        return;
+                    }
+                } else {
+                    spreadProduct(form, sump, otherp, scale, depth);
+                    return;
+                }
+            }
+        }
+        if (AstVhdlUnary* const unp = VN_CAST(nodep, VhdlUnary)) {
+            if (unp->op() == VhdlUnaryOp::NEGATE) {
+                linearAdd(form, unp->lhsp(), -scale, depth + 1);
+                return;
+            }
+            if (unp->op() == VhdlUnaryOp::IDENTITY) {
+                linearAdd(form, unp->lhsp(), scale, depth + 1);
+                return;
+            }
+        }
+        // Anything else is a term of its own, matched by what it lowers to
+        const VhdlSymbol* const termSymp = rootSymOf(nodep);
+        const bool isGeneric = termSymp && termSymp->kind() == VhdlSymKind::GENERIC;
+        AstNodeExpr* const exprp = lowerExpr(nodep);
+        if (!exprp) {
+            form.ok = false;
+            return;
+        }
+        for (auto& term : form.terms) {
+            if (term.exprp && term.exprp->sameTree(exprp)) {
+                term.coeff += scale;
+                VL_DO_DANGLING(exprp->deleteTree(), exprp);
+                return;
+            }
+        }
+        form.terms.push_back(LinearForm::Term{exprp, scale, isGeneric});
+    }
+
+    // "(a +/- b) * c" spread as "a*c +/- b*c", so that a width written with
+    // a generic still cancels between the two ends of a slice
+    void spreadProduct(LinearForm& form, AstVhdlBinary* sump, AstNodeVhdlExpr* otherp,
+                       int64_t scale, int depth) {
+        FileLine* const flp = sump->fileline();
+        AstVhdlBinary* const leftp
+            = new AstVhdlBinary{flp, VhdlBinaryOp::MUL,
+                                sump->lhsp()->cloneTree(false),
+                                otherp->cloneTree(false)};
+        AstVhdlBinary* const rightp
+            = new AstVhdlBinary{flp, VhdlBinaryOp::MUL,
+                                sump->rhsp()->cloneTree(false),
+                                otherp->cloneTree(false)};
+        linearAdd(form, leftp, scale, depth + 1);
+        linearAdd(form, rightp, sump->op() == VhdlBinaryOp::ADD ? scale : -scale, depth + 1);
+        VL_DO_DANGLING(leftp->deleteTree(), leftp);
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+    }
+
     // The indexed part select a moving slice becomes, or null if its bounds
     // do not move together
     AstNodeExpr* indexedSlice(AstVhdlRange* rp, AstNodeExpr* fromp, AstNodeExpr* leftp,
                               AstNodeExpr* rightp, FileLine* flp) {
-        int64_t leftOff = 0;
-        int64_t rightOff = 0;
-        AstNodeVhdlExpr* const leftBasep = peelOffset(rp->leftp(), leftOff);
-        AstNodeVhdlExpr* const rightBasep = peelOffset(rp->rightp(), rightOff);
-        if (leftBasep == rightBasep) {
-            // Same expression node on both ends, as in v(i + 7 downto i)
-        } else {
-            AstNodeExpr* const ap = lowerExpr(leftBasep);
-            AstNodeExpr* const bp = lowerExpr(rightBasep);
-            const bool same = ap && bp && ap->sameTree(bp);
-            if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
-            if (bp) VL_DO_DANGLING(bp->deleteTree(), bp);
-            if (!same) return nullptr;
+        LinearForm span;
+        linearAdd(span, rp->leftp(), 1, 0);
+        linearAdd(span, rp->rightp(), -1, 0);
+        if (!span.ok) {
+            span.clear();
+            return nullptr;
         }
         const bool downto = rp->dir() == VhdlDir::DOWNTO;
-        const int64_t width = downto ? leftOff - rightOff + 1 : rightOff - leftOff + 1;
-        if (width < 1 || width > (1 << 20)) return nullptr;
-        AstNodeExpr* const widthp
-            = new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(width)};
+        const int64_t sign = downto ? 1 : -1;
+        // What is left after the two ends cancel is the width. Usually a
+        // number; where the design wrote the width as a generic it is an
+        // expression, which folds once the instance is elaborated -- and
+        // that is soon enough for a part select.
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0 && !term.generic) {
+                span.clear();
+                return nullptr;
+            }
+        }
+        AstNodeExpr* widthp = nullptr;
+        for (auto& term : span.terms) {
+            if (term.coeff == 0 || !term.exprp) continue;
+            AstNodeExpr* termp = term.exprp;
+            term.exprp = nullptr;
+            const int64_t coeff = sign * term.coeff;
+            if (coeff != 1) {
+                termp = new AstMul{flp, termp,
+                                   new AstConst{flp, AstConst::Signed32{},
+                                                static_cast<int32_t>(coeff)}};
+            }
+            widthp = widthp ? new AstAdd{flp, widthp, termp} : termp;
+        }
+        span.clear();
+        const int64_t konst = sign * span.konst + 1;
+        if (!widthp) {
+            if (konst < 1 || konst > (1 << 20)) return nullptr;
+            widthp = new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(konst)};
+        } else if (konst != 0) {
+            widthp = new AstAdd{flp, widthp,
+                                new AstConst{flp, AstConst::Signed32{},
+                                             static_cast<int32_t>(konst)}};
+        }
         // The select counts up from the low end and down from the high one
         if (downto) {
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
