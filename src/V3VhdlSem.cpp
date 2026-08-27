@@ -2945,6 +2945,17 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                        std::set<const VhdlSymbol*>& partial, bool follow) {
     if (!nodep) return;
     if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
+        // A force overrides every driver rather than being one of them, and
+        // a release hands the signal back to the drivers it already had
+        // (10.5.2.1), so neither adds a driver
+        if (asgp->force() || asgp->release()) {
+            collectDrivenSyms(nodep->op1p(), whole, partial, true);
+            collectDrivenSyms(nodep->op2p(), whole, partial, true);
+            collectDrivenSyms(nodep->op3p(), whole, partial, true);
+            collectDrivenSyms(nodep->op4p(), whole, partial, true);
+            if (follow) collectDrivenSyms(nodep->nextp(), whole, partial, true);
+            return;
+        }
         if (const VhdlSymbol* const symp = driverRootSym(asgp->targetp())) {
             if (VN_IS(asgp->targetp(), VhdlName)) {
                 whole.insert(symp);

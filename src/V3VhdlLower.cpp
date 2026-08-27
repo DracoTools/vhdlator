@@ -1959,6 +1959,111 @@ private:
         return &m_shadows.emplace(symp, sh).first->second;
     }
 
+    // A signal something forces is driven from two places: its drivers, and
+    // the force that overrides them until it is released (10.5.2.1). The
+    // drivers write a variable of their own, so that releasing gives back
+    // the value they have been keeping all along, and the signal itself is
+    // whichever of the two is in charge.
+    struct VhdlForced final {
+        AstVar* drvp = nullptr;  // What the ordinary drivers write
+        AstVar* valp = nullptr;  // The value the force put there
+        AstVar* enp = nullptr;  // Whether the force is in charge
+    };
+    std::set<const VhdlSymbol*> m_needForce;
+    std::map<const VhdlSymbol*, VhdlForced> m_forced;
+    std::map<const VhdlSymbol*, AstVar*> m_forceDrv;  // Symbol -> what drivers write
+
+    void collectForced(AstNode* nodep) {
+        if (!nodep) return;
+        nodep->foreachAndNext([this](AstVhdlSigAssign* asgp) {
+            if (!asgp->force() && !asgp->release()) return;
+            if (const VhdlSymbol* const symp = rootSymOf(asgp->targetp())) {
+                m_needForce.insert(symp->resolved());
+            }
+        });
+    }
+
+    void makeForced(FileLine* flp) {
+        for (const VhdlSymbol* const symp : m_needForce) {
+            if (m_forced.count(symp)) continue;
+            const auto varIt = m_vars.find(symp);
+            if (varIt == m_vars.end()) continue;
+            AstVar* const sigp = varIt->second;
+            VL_RESTORER(m_ftaskp);
+            m_ftaskp = nullptr;
+            VhdlForced fc;
+            const std::string base
+                = "__Vfrc" + std::to_string(++m_nameNum) + "__" + symp->name();
+            FileLine* const mflp = new FileLine{flp};
+            mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            AstNodeDType* const dtypep = lowerType(symp->typep(), flp);
+            fc.drvp = newTempVar(base + "__drv", dtypep, mflp);
+            fc.valp = newTempVar(base + "__val", lowerType(symp->typep(), flp), mflp);
+            fc.enp = newTempVar(base + "__en", newLogicDType(flp, 1), flp);
+            fc.enp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            // The drivers keep what the signal started with, so that a
+            // release hands back a value it really had
+            // Both start where the signal starts. Saying so matters beyond
+            // the value: a variable with no initial value and only one
+            // reader may be moved inside the function that reads it, and
+            // these two have to keep what they hold from one evaluation to
+            // the next.
+            if (sigp->valuep()) {
+                fc.drvp->valuep(VN_AS(sigp->valuep()->cloneTree(false), NodeExpr));
+                fc.valp->valuep(VN_AS(sigp->valuep()->cloneTree(false), NodeExpr));
+            } else {
+                if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp, true)) {
+                    fc.drvp->valuep(defp);
+                }
+                if (AstNodeExpr* const def2p = defaultValueFor(symp->typep(), flp, true)) {
+                    fc.valp->valuep(def2p);
+                }
+            }
+            // A process rather than a continuous assignment: the value a
+            // force holds and the value the drivers keep are both written
+            // from processes, and substituting a continuous assignment into
+            // its readers loses which of them is in charge
+            AstSenTree* const senp = new AstSenTree{
+                mflp, new AstSenItem{mflp, VEdgeType::ET_CHANGED,
+                                     new AstVarRef{mflp, fc.enp, VAccess::READ}}};
+            senp->addSensesp(new AstSenItem{mflp, VEdgeType::ET_CHANGED,
+                                            new AstVarRef{mflp, fc.valp, VAccess::READ}});
+            senp->addSensesp(new AstSenItem{mflp, VEdgeType::ET_CHANGED,
+                                            new AstVarRef{mflp, fc.drvp, VAccess::READ}});
+            AstNode* const bodyp = new AstAssign{
+                mflp, new AstVarRef{mflp, sigp, VAccess::WRITE},
+                new AstCond{mflp, new AstVarRef{mflp, fc.enp, VAccess::READ},
+                            new AstVarRef{mflp, fc.valp, VAccess::READ},
+                            new AstVarRef{mflp, fc.drvp, VAccess::READ}}};
+            m_shadowsp = AstNode::addNextNull(
+                m_shadowsp,
+                static_cast<AstNode*>(new AstAlways{mflp, VAlwaysKwd::ALWAYS, senp, bodyp}));
+            m_shadowsp = AstNode::addNextNull(
+                m_shadowsp, static_cast<AstNode*>(new AstInitial{mflp, bodyp->cloneTree(false)}));
+            m_forced.emplace(symp, fc);
+            m_forceDrv.emplace(symp, fc.drvp);
+        }
+    }
+
+    // The left-hand side of an ordinary driver. For a signal something else
+    // forces, that is the variable the drivers keep rather than the signal.
+    AstNodeExpr* lowerDriveTarget(AstNodeVhdlExpr* targetp) {
+        VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(targetp));
+        const auto it = rootp ? m_forceDrv.find(rootp->resolved()) : m_forceDrv.end();
+        if (it == m_forceDrv.end()) return lowerExpr(targetp);
+        const auto prevIt = m_vars.find(rootp);
+        const bool had = prevIt != m_vars.end();
+        AstVar* const savedp = had ? prevIt->second : nullptr;
+        m_vars[rootp] = it->second;
+        AstNodeExpr* const outp = lowerExpr(targetp);
+        if (had) {
+            m_vars[rootp] = savedp;
+        } else {
+            m_vars.erase(rootp);
+        }
+        return outp;
+    }
+
     // Which signals need their transactions recorded. Collected before any
     // statement is lowered, because the assignment that marks a transaction
     // is lowered long before the attribute that reads it comes into view.
@@ -5299,7 +5404,7 @@ private:
         VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
         AstVar* const savedp = m_vars[keyp];
         m_vars[keyp] = drv.valp;
-        AstNodeExpr* const valLhsp = lowerExpr(targetp);
+        AstNodeExpr* const valLhsp = lowerDriveTarget(targetp);
         m_vars[keyp] = savedp;
         if (!valLhsp) {
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
@@ -5355,7 +5460,7 @@ private:
                            AstNodeExpr*& readsp, FileLine* flp) {
         AstNode* stmtsp = nullptr;
         for (AstVhdlWaveform* p = wavesp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
-            AstNodeExpr* const onep = lowerExpr(targetp);
+            AstNodeExpr* const onep = lowerDriveTarget(targetp);
             AstNodeExpr* const valuep = lowerExpr(p->valuep());
             if (!onep || !valuep) return nullptr;
             readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
@@ -5437,7 +5542,7 @@ private:
             emitWaveformProcess(outp, readsp, flp);
             return;
         }
-        AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+        AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         if (!lhsp) return;
         AstNodeExpr* rhsp = nullptr;
         AstNode* delayp = nullptr;
@@ -5548,7 +5653,7 @@ private:
                 if (!outp) {
                     // Without an else the signal keeps its value, which for a
                     // concurrent assignment means assigning itself
-                    outp = lowerExpr(nodep->targetp());
+                    outp = lowerDriveTarget(nodep->targetp());
                 }
                 outp = new AstCond{alts[i]->fileline(), lowerCondition(alts[i]->condp()),
                                    valuep, outp};
@@ -6115,20 +6220,81 @@ private:
         FileLine* const flp = nodep->fileline();
         // "s <= force v" drives the signal regardless of what else does,
         // until "s <= release" hands it back (10.5.2.1, VHDL-2008)
-        if (nodep->release()) {
-            AstNodeExpr* const lhsp = lowerTarget(nodep->targetp());
-            if (!lhsp) return nullptr;
-            v3Global.setHasForceableSignals();
-            return new AstRelease{flp, lhsp};
-        }
-        if (nodep->force()) {
+        if (nodep->release() || nodep->force()) {
+            // 10.5.2.1 makes both of these signal assignments, so they take
+            // effect at the end of the delta like any other. Which of the
+            // force and the drivers is in charge is a signal of its own.
+            VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(nodep->targetp()));
+            const auto it = rootp ? m_forced.find(rootp->resolved()) : m_forced.end();
+            if (it == m_forced.end()) {
+                // An external name reaches a signal somewhere else in the
+                // design, which has no driver pair here. Verilog's own force
+                // is what is left: it overrides the value, though a release
+                // then keeps it rather than handing back what the drivers
+                // hold.
+                AstNodeExpr* const extLhsp = lowerTarget(nodep->targetp());
+                if (!extLhsp) return nullptr;
+                v3Global.setHasForceableSignals();
+                if (nodep->release()) return new AstRelease{flp, extLhsp};
+                AstVhdlWaveform* const extWfp = nodep->wavesp();
+                AstNodeExpr* const extRhsp
+                    = extWfp && extWfp->valuep() ? lowerExpr(extWfp->valuep()) : nullptr;
+                if (!extRhsp) {
+                    VL_DO_DANGLING(extLhsp->deleteTree(), extLhsp);
+                    return nullptr;
+                }
+                return new AstAssignForce{flp, extLhsp, extRhsp};
+            }
+            const VhdlForced& fc = it->second;
+            FileLine* const mflp = new FileLine{flp};
+            mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            mflp->warnOff(V3ErrorCode::COMBDLY, true);
+            if (nodep->release()) {
+                AstNode* outp
+                    = new AstAssignDly{mflp, new AstVarRef{mflp, fc.enp, VAccess::WRITE},
+                                       new AstConst{mflp, AstConst::BitFalse{}}};
+                // Handing the signal back is a transaction on it (10.5.2.1)
+                return AstNode::addNextNull(
+                    outp, transactionMark(nodep->targetp(), nullptr, true, nullptr, mflp));
+            }
             AstVhdlWaveform* const forcep = nodep->wavesp();
             if (!forcep || !forcep->valuep()) return nullptr;
-            AstNodeExpr* const lhsp = lowerTarget(nodep->targetp());
             AstNodeExpr* const rhsp = lowerExpr(forcep->valuep());
-            if (!lhsp || !rhsp) return nullptr;
-            v3Global.setHasForceableSignals();
-            return new AstAssignForce{flp, lhsp, rhsp};
+            if (!rhsp) return nullptr;
+            // A force may name part of the signal, and then only that part
+            // is forced; what is not named keeps coming from the drivers,
+            // which the enable bit cannot express -- so the value the force
+            // holds starts from what the drivers have.
+            AstNode* outp = new AstAssign{mflp, new AstVarRef{mflp, fc.valp, VAccess::WRITE},
+                                          new AstVarRef{mflp, fc.drvp, VAccess::READ}};
+            const auto prevIt = m_vars.find(rootp);
+            const bool had = prevIt != m_vars.end();
+            AstVar* const savedp = had ? prevIt->second : nullptr;
+            m_vars[rootp] = fc.valp;
+            // Not lowerDriveTarget: what a force writes is the value the
+            // force holds, not what the drivers keep
+            AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+            if (had) {
+                m_vars[rootp] = savedp;
+            } else {
+                m_vars.erase(rootp);
+            }
+            if (!lhsp) {
+                VL_DO_DANGLING(outp->deleteTree(), outp);
+                VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                return nullptr;
+            }
+            outp = AstNode::addNext(outp,
+                                    static_cast<AstNode*>(new AstAssign{mflp, lhsp, rhsp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssignDly{mflp, new AstVarRef{mflp, fc.enp, VAccess::WRITE},
+                                           new AstConst{mflp, AstConst::BitTrue{}}}));
+            // Driving the signal is a transaction on it, whatever it was
+            // driven with (10.5.2.1)
+            outp = AstNode::addNextNull(
+                outp, transactionMark(nodep->targetp(), nullptr, true, nullptr, mflp));
+            return outp;
         }
         // Inside a process the conditional and selected forms are defined
         // as the if and case statements they stand for (10.5.3, 10.5.4), so
@@ -6192,7 +6358,7 @@ private:
             }
             AstNode* outp = nullptr;
             for (AstVhdlWaveform* p = wfp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
-                AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+                AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
                 AstNodeExpr* const rhsp = lowerExpr(p->valuep());
                 if (!lhsp || !rhsp) return outp;
                 AstNode* const delayp
@@ -6228,7 +6394,7 @@ private:
             return AstNode::addNextNull(
                 driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp), markp);
         }
-        AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+        AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp = lowerExpr(wfp->valuep());
         if (!lhsp || !rhsp) return nullptr;
         AstNode* const markp = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
@@ -6415,7 +6581,7 @@ private:
         if (valuep && isDynTarget(nodep->targetp())) {
             return lowerDynCopy(nodep->targetp(), valuep, flp);
         }
-        AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
+        AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
         if (!lhsp || !rhsp) return nullptr;
         return new AstAssign{flp, lhsp, rhsp};
@@ -8587,6 +8753,8 @@ private:
         if (archp) {
             collectActive(archp->declsp());
             collectActive(archp->stmtsp());
+            collectForced(archp->declsp());
+            collectForced(archp->stmtsp());
         }
         m_bindings.clear();
         m_instanceBindings.clear();
@@ -8618,6 +8786,7 @@ private:
             // Every signal now has its variable, so the transaction bits that
             // the statements will mark can be made
             makeActives(flp);
+            makeForced(flp);
             for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
                 lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
