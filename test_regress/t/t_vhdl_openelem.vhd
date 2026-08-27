@@ -27,6 +27,29 @@ begin
 end architecture;
 
 -------------------------------------------------------------------------------
+-- A declaration constrained by "x'range" takes the range x was given, even
+-- where x is a port whose own bounds the instance settled (16.2.4)
+
+entity sub_range is
+    port ( addr : in bit_vector; q : out bit_vector );
+end entity;
+
+architecture test of sub_range is
+    signal held : bit_vector(addr'range);
+begin
+    held <= addr;
+    q <= held;
+
+    chk : process (addr) is
+        variable local : bit_vector(addr'range);
+    begin
+        local := addr;
+        assert local'left = 7 report "range left" severity failure;
+        assert local'right = 0 report "range right" severity failure;
+    end process;
+end architecture;
+
+-------------------------------------------------------------------------------
 -- A formal that names a slice of an unconstrained port says how long the
 -- port is (6.5.7.1)
 
@@ -57,9 +80,12 @@ architecture test of t_vhdl_openelem is
     signal vov : vov_t(0 to 2)(1 to 7) := (others => (others => '0'));
     signal n : integer;
     signal d : bit_vector(2 to 9) := "10110011";
+    signal a : bit_vector(7 downto 0) := "10110011";
+    signal qa : bit_vector(7 downto 0);
 begin
     u2 : entity work.sub_vov port map (vov, n);
     u3 : entity work.sub_slice port map (value(d'range) => d);
+    u4 : entity work.sub_range port map (a, qa);
 
     check : process is
     begin
@@ -70,6 +96,7 @@ begin
         assert r.x(5) = 40 report "own last" severity failure;
         assert d(d'range) = "10110011" report "attr slice" severity failure;
         assert n = 307 report "array of array port" severity failure;
+        assert qa = "10110011" report "range from a port" severity failure;
         report "*-* All Finished *-*";
         std.env.stop;
     end process;

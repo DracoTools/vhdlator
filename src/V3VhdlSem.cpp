@@ -288,10 +288,19 @@ class VhdlSemVisitor final : public VNVisitor {
             takeBoundsFrom(info, info.typep);
             return info;
         }
+        // "v'range" written where a range is expected reaches here as the
+        // attribute name itself, since a parenthesized name is a call until
+        // something says otherwise (16.2.4)
+        AstNodeVhdlExpr* bareAttrp = nullptr;
+        if (AstVhdlAttrName* const attrp = VN_CAST(rangep, VhdlAttrName)) {
+            if (attrp->name() == "range" || attrp->name() == "reverse_range") {
+                bareAttrp = attrp;
+            }
+        }
         AstVhdlRange* const rp = VN_CAST(rangep, VhdlRange);
-        if (!rp) return info;
+        if (!rp && !bareAttrp) return info;
         info.valid = true;
-        if (AstNodeVhdlExpr* const namep = rp->attrp()) {
+        if (AstNodeVhdlExpr* const namep = bareAttrp ? bareAttrp : rp->attrp()) {
             // A type mark used as a range, or prefix'RANGE (16.2.4)
             bool reversed = false;
             VhdlType* const typep = rangeOfName(namep, reversed);
@@ -392,9 +401,21 @@ class VhdlSemVisitor final : public VNVisitor {
         // Reporting the index subtype's own range instead would make a slice
         // written with it look four billion elements long (16.2.4).
         if (typep->unconstrained()) {
-            VhdlType* const openp
-                = cloneSubtype(dimensionOf(attrp, typep), attrp->fileline());
-            if (openp) openp->unbound();
+            VhdlType* const dimp = dimensionOf(attrp, typep);
+            VhdlType* const openp = cloneSubtype(dimp, attrp->fileline());
+            if (openp) {
+                openp->unbound();
+                // Where the range is one an instance settles rather than one
+                // the text folded, "v'range" is that same range: the
+                // expression travels with it, so a signal declared from it
+                // gets the bounds the port was given (16.2.4)
+                // A STRING whose length is only known while running carries
+                // it with the value, so its range is read from the value
+                // rather than from an expression written here
+                if (typep->base() != V3VhdlStd::stringType()->base()) {
+                    openp->boundsp(dimp ? dimp->boundsp() : nullptr);
+                }
+            }
             return openp;
         }
         return dimensionOf(attrp, typep);
@@ -674,9 +695,17 @@ class VhdlSemVisitor final : public VNVisitor {
                 // static, but it is still a range: a bound that names a
                 // generic is fixed once the instance is elaborated, so keep
                 // it as written for the back end to fold then (10.3)
+                // "x'range" is x's own range: where x's bounds are ones an
+                // instance settles, that expression is what this range is,
+                // and it says more than the attribute name does
+                AstNode* const inheritedp = idxp ? idxp->boundsp() : nullptr;
                 idxp = cloneSubtype(idxp ? idxp : V3VhdlStd::integerType(), flp);
                 idxp->unbound();
-                if (VN_IS(rp, VhdlRange)) idxp->boundsp(rp);
+                if (inheritedp) {
+                    idxp->boundsp(inheritedp);
+                } else if (VN_IS(rp, VhdlRange)) {
+                    idxp->boundsp(rp);
+                }
             }
             indexes.push_back(idxp ? idxp : V3VhdlStd::integerType());
             ++dim;
