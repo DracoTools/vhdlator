@@ -736,6 +736,11 @@ class AstVhdlObjectDecl final : public AstNodeVhdlDecl {
     // @astgen op4 := fileNamep : Optional[AstNodeVhdlExpr]  // file ... is <expr>
     const VhdlObjKind m_kind;
     VhdlSignalKind m_signalKind = VhdlSignalKind::NONE;
+    // A constant standing for a generic an instantiation supplied, whose
+    // value is fixed by elaboration rather than by analysis. It has to reach
+    // the back end as a parameter, not as a variable, because a type declared
+    // in the same package may be as long as it says (4.9).
+    bool m_elabConstant = false;
 
 public:
     AstVhdlObjectDecl(FileLine* fl, const std::string& name, VhdlObjKind kind)
@@ -743,6 +748,8 @@ public:
         , m_kind{kind} {}
     ASTGEN_MEMBERS_AstVhdlObjectDecl;
     VhdlObjKind kind() const { return m_kind; }
+    bool isElabConstant() const { return m_elabConstant; }
+    void elabConstant(bool flag) { m_elabConstant = flag; }
     VhdlSignalKind signalKind() const { return m_signalKind; }
     void signalKind(VhdlSignalKind kind) { m_signalKind = kind; }
     void dump(std::ostream& str) const override;

@@ -1203,7 +1203,10 @@ private:
             case VhdlObjKind::CONSTANT:
                 // A constant with a folded value needs no storage at all
                 if (symp->hasValue()) return;
-                varType = VVarType::VAR;
+                // One standing for a generic an instantiation supplied is a
+                // parameter: its value is settled by elaboration, and a range
+                // written in terms of it has to fold with it (4.9)
+                varType = objp->isElabConstant() ? VVarType::LPARAM : VVarType::VAR;
                 break;
             case VhdlObjKind::VARIABLE:
             case VhdlObjKind::SHARED_VARIABLE: varType = VVarType::VAR; break;
@@ -2394,7 +2397,12 @@ private:
             VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
             return madeIt->second;
         }
-        AstVar* const varp = newVarOfType(symp, VVarType::VAR, dtypep, flp);
+        // A constant standing for a generic an instantiation supplied is a
+        // parameter, not a variable: a type declared beside it may be as long
+        // as it says, and that range has to fold with it (4.9)
+        const VVarType varType
+            = declp->isElabConstant() ? VVarType::LPARAM : VVarType::VAR;
+        AstVar* const varp = newVarOfType(symp, varType, dtypep, flp);
         if (declp->defaultp()) {
             varp->valuep(lowerExpr(declp->defaultp()));
         } else {

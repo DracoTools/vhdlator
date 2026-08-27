@@ -106,6 +106,12 @@ class VhdlSemVisitor final : public VNVisitor {
     // instance label to (7.3.1). An entity with a generic type is copied for
     // the instance, so which entity it is has to be known here.
     std::map<std::string, std::string> m_specBindings;  // Component or label -> entity
+    // Constants synthesized for a package generic whose value is not static,
+    // waiting to be added to the instantiation's declarations
+    std::vector<AstNodeVhdl*> m_pendingPkgDecls;
+    // Whether the generics being bound are a package instantiation's, which
+    // is the only place a synthesized constant has declarations to live in
+    bool m_inPkgInst = false;
     int m_specUnitCount = 0;  // Numbers the copies
     int m_specDepth = 0;  // A copy may instantiate another; guards a cycle
 
@@ -2529,6 +2535,8 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         for (const auto& pair : ctxp->named()) intop->addNamed(pair.first, pair.second);
     }
     intop->addUse(savedp);
+    VL_RESTORER(m_inPkgInst);
+    m_inPkgInst = true;
     size_t position = 0;
     for (AstNode* p = pkgp->genericsp(); p; p = p->nextp(), ++position) {
         AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
@@ -2571,6 +2579,10 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     if (AstNode* const stalep = nodep->declsp()) {
         VL_DO_DANGLING(stalep->unlinkFrBackWithNext()->deleteTree(), stalep);
     }
+    // A generic whose value is not static became a constant of its own, and
+    // it comes first: the package's own declarations may name it
+    for (AstNodeVhdl* const declp : m_pendingPkgDecls) nodep->addDeclsp(declp);
+    m_pendingPkgDecls.clear();
     // The declarations, and the body's too, so that a subprogram declared in
     // the package has the body the copy needs
     for (AstNode* p = pkgp->declsp(); p; p = p->nextp()) {
@@ -2791,8 +2803,43 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
     if (val.known()) {
         symp->value(val);
     } else {
-        err(flp, "The value of generic '" + formalp->name()
-                     + "' of an instantiated package must be static");
+        // A value that names a generic of the enclosing entity is fixed once
+        // the instance is elaborated but is not a number now. The copy's
+        // declarations are emitted into the module that instantiates the
+        // package, so the generic becomes an ordinary constant of that module
+        // whose value is the expression written here, and the back end folds
+        // it per instance (4.9). A generic *subprogram* instantiation has no
+        // declarations of its own to put such a constant in, so there the
+        // value must still be one that folds.
+        if (!m_inPkgInst) {
+            err(flp, "The value of generic '" + formalp->name()
+                         + "' of an instantiated package must be static");
+            declare(symp, flp);
+            return;
+        }
+        // The symbol built above is simply not declared; the symbol table
+        // owns it and frees it with the rest.
+        //
+        // The constant is given a name of its own, because the actual is very
+        // often the generic of the same name -- "generic map (item_w =>
+        // item_w)" -- and a declaration that names itself in its own value is
+        // a circle. An alias then gives it the name the package wrote.
+        const std::string hiddenName = "__vpkgg_" + formalp->name();
+        AstVhdlObjectDecl* const declp = new AstVhdlObjectDecl{
+            formalp->fileline(), hiddenName, VhdlObjKind::CONSTANT};
+        if (formalp->subtypep()) {
+            declp->subtypep(formalp->subtypep()->cloneTree(false));
+        }
+        declp->defaultp(actualp->cloneTree(false));
+        declp->elabConstant(true);
+        VhdlUnanalyzeVisitor{static_cast<AstNode*>(declp)};
+        AstVhdlAliasDecl* const aliasp = new AstVhdlAliasDecl{
+            formalp->fileline(), formalp->name(),
+            new AstVhdlName{formalp->fileline(), hiddenName}};
+        m_pendingPkgDecls.push_back(declp);
+        m_pendingPkgDecls.push_back(aliasp);
+        m_scopep = innerp;
+        return;
     }
     declare(symp, flp);
 }
