@@ -6111,6 +6111,72 @@ private:
         return outp ? outp : new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
     }
 
+    // A port associated with an expression rather than with a signal is an
+    // implicit signal of its own, driven by an implicit concurrent
+    // assignment of that expression (6.5.6.3). It therefore holds its default
+    // until the expression is first delivered, and every delivery after that
+    // arrives a delta later -- which wiring the expression straight to the
+    // port would not: the port would follow it with no delta at all.
+    AstPin* portExprSignal(AstPin* pinp, AstVhdlAssoc* asp, const std::string& label,
+                           FileLine* flp) {
+        if (!pinp || !pinp->exprp() || !asp->actualp()) return pinp;
+        if (asp->drives() || asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) return pinp;
+        if (isSignalActual(asp->actualp())) return pinp;
+        // Only an expression that is not globally static: one that reads no
+        // signal cannot change while the design runs, and such an actual is
+        // associated with the port directly (6.5.6.3)
+        if (!readsSignal(asp->actualp())) return pinp;
+        AstNodeExpr* const exprp = VN_CAST(pinp->exprp(), NodeExpr);
+        if (!exprp) return pinp;
+        // Written from two blocks by construction -- once to start, once to
+        // react -- so the finding is about how this is emitted, not about
+        // the design
+        FileLine* const pflp = new FileLine{flp};
+        pflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        pflp->warnOff(V3ErrorCode::COMBDLY, true);
+        // "The signal has the same subtype as the formal port", which for a
+        // concatenation is the only place its length is written down
+        VhdlType* typep = nullptr;
+        if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+            const VhdlSymbol* const psymp = fnamep->vhdlSymp();
+            if (psymp && psymp->kind() == VhdlSymKind::PORT) typep = psymp->typep();
+        }
+        if (typep && (!typep->lengthEmittable() || dependsOnGeneric(typep))) typep = nullptr;
+        if (!typep) typep = asp->actualp()->vhdlTypep();
+        // Where neither says how long the signal is here -- a port whose
+        // bounds this instance settles, most often -- the expression goes to
+        // the port as it did, which costs the delta rather than the design
+        if (!typep || !typep->lengthEmittable() || dependsOnGeneric(typep)) return pinp;
+        AstNodeDType* const dtypep = lowerType(typep, flp);
+        if (!dtypep) return pinp;
+        AstVar* const tempp = newTempVar(
+            "__Vpexpr__" + label + "__" + std::to_string(++m_processNum), dtypep, pflp);
+        if (AstNodeExpr* const defp = defaultValueFor(typep, flp, true)) tempp->valuep(defp);
+        AstNodeExpr* const valuep = exprp->unlinkFrBack();
+        AstNodeExpr* const readsp = valuep->cloneTree(false);
+        // Emitted twice -- once to start, once to react -- as every
+        // concurrent assignment is, so it drives from two blocks
+        emitWaveformProcess(
+            new AstAssignDly{pflp, new AstVarRef{pflp, tempp, VAccess::WRITE}, valuep}, readsp,
+            pflp);
+        pinp->exprp(new AstVarRef{flp, tempp, VAccess::READ});
+        return pinp;
+    }
+
+    // Whether an expression reads a signal or a port, which is what makes it
+    // able to change while the design runs
+    static bool readsSignal(AstNodeVhdlExpr* nodep) {
+        bool found = false;
+        nodep->foreach([&](AstNodeVhdlExpr* refp) {
+            const VhdlSymbol* const symp = refp->vhdlSymp();
+            if (symp
+                && (symp->kind() == VhdlSymKind::SIGNAL || symp->kind() == VhdlSymKind::PORT)) {
+                found = true;
+            }
+        });
+        return found;
+    }
+
     // A port of mode out is one driver of the signal it is associated with,
     // so where that signal is resolved the port is wired to this driver's own
     // value rather than to the signal (6.5.6.3, 14.7.2). An instance drives
@@ -6944,7 +7010,8 @@ private:
                         continue;
                     }
                 }
-                AstPin* const pinp = lowerPortAssoc(asp, ++pinNum, flp);
+                AstPin* const pinp
+                    = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
                 if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }

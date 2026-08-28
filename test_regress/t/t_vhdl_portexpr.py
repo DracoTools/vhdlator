@@ -11,8 +11,10 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A port whose actual is an expression is a signal with a driver of its own,
-# a force process runs at the end of the last delta of a time step.
+# A port associated with an expression rather than with a signal is an
+# implicit signal of its own, driven by an implicit concurrent assignment of
+# that expression (6.5.6.3). It holds its default until that assignment first
+# delivers, and every delivery after that arrives a delta later.
 test.top_filename = "t/t_vhdl_portexpr.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
