@@ -1089,6 +1089,9 @@ public:
     void specializeResolvers() VL_MT_DISABLED;
     bool reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void mergeIndividualFormals(AstVhdlCall* nodep) VL_MT_DISABLED;
+    void mergeIndividualGenerics(AstVhdlInstance* nodep) VL_MT_DISABLED;
+    void mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp,
+                           bool alwaysIn) VL_MT_DISABLED;
     static bool formalIsReadOnly(const VhdlSymbol* symp,
                                  const std::string& formal) VL_MT_DISABLED;
     void spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
@@ -4560,10 +4563,20 @@ bool VhdlSemVisitor::formalIsReadOnly(const VhdlSymbol* symp, const std::string&
 // one whose actual is the aggregate they describe. A part named for an "out"
 // parameter would need the value copied back out again, and is left alone.
 void VhdlSemVisitor::mergeIndividualFormals(AstVhdlCall* nodep) {
+    mergeIndividualIn(nodep->argsp(), nodep, false);
+}
+
+// The same for an instance's generic map. A generic is only ever read, so
+// there is nothing to carry back out and no need to ask.
+void VhdlSemVisitor::mergeIndividualGenerics(AstVhdlInstance* nodep) {
+    mergeIndividualIn(nodep->genericMapp(), nullptr, true);
+}
+
+void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, bool alwaysIn) {
     // Which formal each association names, where it names part of one
     std::vector<std::string> rootOf;
     bool any = false;
-    for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
+    for (AstNode* argp = assocsp; argp; argp = argp->nextp()) {
         const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
         std::string root;
         if (asp && asp->formalp() && !VN_IS(asp->formalp(), VhdlName)) {
@@ -4589,9 +4602,9 @@ void VhdlSemVisitor::mergeIndividualFormals(AstVhdlCall* nodep) {
     // signal -- would need the value carried back out again, which an
     // aggregate cannot do. Those are left as they were written.
     std::vector<VhdlSymbol*> cands;
-    {
+    if (!alwaysIn && callp) {
         std::vector<std::string> parts;
-        if (flatten(nodep->prefixp(), parts) && !parts.empty()) lookup(parts.back(), cands);
+        if (flatten(callp->prefixp(), parts) && !parts.empty()) lookup(parts.back(), cands);
     }
     // Each formal named in parts, in the order its first part was written
     std::vector<std::string> order;
@@ -4610,7 +4623,7 @@ void VhdlSemVisitor::mergeIndividualFormals(AstVhdlCall* nodep) {
         size_t i = 0;
         bool ok = true;
         std::vector<AstVhdlAssoc*> parts;
-        for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp(), ++i) {
+        for (AstNode* argp = assocsp; argp; argp = argp->nextp(), ++i) {
             if (rootOf[i] != root) continue;
             AstVhdlAssoc* const asp = VN_AS(argp, VhdlAssoc);
             if (!asp->actualp()) ok = false;
@@ -6064,6 +6077,18 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
         std::vector<std::string> names;
         for (const auto& pair : byPosition) names.push_back(pair.second);
         nodep->formalPorts(names);
+        // The same for the generics. One synthesized to carry another's
+        // bounds has no place in the clause and is skipped, so a positional
+        // generic map reaches what the design wrote.
+        std::map<int, std::string> genByPosition;
+        for (const auto& pair : unitScopep->direct()) {
+            const VhdlSymbol* const symp = pair.second;
+            if (symp->kind() != VhdlSymKind::GENERIC || symp->position() < 0) continue;
+            genByPosition[symp->position()] = symp->name();
+        }
+        std::vector<std::string> genNames;
+        for (const auto& pair : genByPosition) genNames.push_back(pair.second);
+        nodep->formalGenerics(genNames);
     }
     // An entity with a generic type is copied per type the design gives it,
     // and this instance is of the copy rather than of the original (6.5.5)
@@ -6071,6 +6096,9 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
         if (VhdlScope* const specp = specializeEntity(nodep, entKey)) unitScopep = specp;
     }
     bindOpenBounds(nodep, unitScopep);
+    // "gB(2) => (...)" names part of one generic; together the parts are the
+    // whole of it (6.5.7.1), and a generic is only ever read
+    mergeIndividualGenerics(nodep);
     analyzeAssociations(nodep->genericMapp(), unitScopep);
     // A generic left unconstrained is bound from the actual's own subtype,
     // which is only known once the generic map has been analyzed -- and the
@@ -6388,6 +6416,17 @@ void VhdlSemVisitor::fillOpenGenericDefaults(VhdlScope* scopep) {
     }
 }
 
+// Whether the instance's generic map already names that formal, so that a
+// bound worked out here is not written into it twice
+static bool genericMapNames(const AstVhdlInstance* nodep, const std::string& name) {
+    for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+        const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+        const AstVhdlName* const namep = asp ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+        if (namep && namep->name() == name) return true;
+    }
+    return false;
+}
+
 void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) {
     if (!unitScopep) return;
     const auto it = m_openBounds.find(unitScopep);
@@ -6419,6 +6458,7 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
         int64_t right = 0;
         if (!defaultBounds(found[0], actualp, bound.dim, left, right)) continue;
         FileLine* const flp = nodep->fileline();
+        if (genericMapNames(nodep, bound.leftName)) continue;
         for (int side = 0; side < 2; ++side) {
             const int64_t value = side == 0 ? left : right;
             AstVhdlLiteral* const litp

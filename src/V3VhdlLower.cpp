@@ -1178,6 +1178,18 @@ private:
     bool m_anyAfter = false;
 
     // An interface element of a generic or port clause (6.5)
+    // Whether a value of this type is one the back end can carry as a
+    // parameter. An array whose element does not pack has none: a parameter
+    // holds one value, and such an array is a list of structures.
+    bool parameterizable(const VhdlType* typep) {
+        if (!typep) return true;
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY) return true;
+        if (isStringType(typep)) return true;
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        return !elemp || elemp->base()->kind() != VhdlTypeKind::RECORD || recordPacks(elemp);
+    }
+
     void lowerInterface(AstVhdlIfaceDecl* nodep, bool isGeneric, int& pinNum) {
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (!symp) return;
@@ -1193,6 +1205,13 @@ private:
             return;
         }
         if (isGeneric) {
+            // A generic is a parameter, and a parameter carries a value the
+            // back end can fold. A composite that does not pack has no such
+            // value: elaboration would have to hand over a structure.
+            if (!parameterizable(symp->typep())) {
+                unsup(flp, "generic '" + symp->name() + "' of a type that is not one value");
+                return;
+            }
             // A generic is a parameter, so V3Param clones a module per set of
             // values exactly as VHDL elaboration would
             AstVar* const varp = newVar(symp, VVarType::GPARAM, flp);
@@ -6722,9 +6741,21 @@ private:
         }
         AstPin* paramsp = nullptr;
         pinNum = 0;
+        size_t genPosition = 0;  // Which generic a positional association names
         for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
-            AstPin* const pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++pinNum);
-            if (pinp) paramsp = AstNode::addNext(paramsp, pinp);
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            AstPin* const pinp = lowerAssoc(asp, ++pinNum);
+            if (!pinp) continue;
+            // A generic carrying another's bounds stands ahead of it in the
+            // clause but has no place in it, so a positional association is
+            // given the name of the generic it actually reaches (6.5.7.1)
+            if (!asp->formalp()) {
+                if (genPosition < nodep->formalGenerics().size()) {
+                    pinp->name(nodep->formalGenerics()[genPosition]);
+                }
+                ++genPosition;
+            }
+            paramsp = AstNode::addNext(paramsp, pinp);
         }
         // A binding indication may give the generics and the ports itself,
         // which is how a configuration supplies what the instance left out
