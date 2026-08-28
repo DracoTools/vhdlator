@@ -6655,7 +6655,53 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                 std::vector<VhdlSymbol*> found;
                 if (namep) unitScopep->lookupLocal(namep->name(), found);
                 // A conversion written on the formal -- "f(port) => a" -- has
-                // a function at its root, not a port, and is not this
+                // a function or a type mark at its root, and the port it
+                // applies to is its argument (6.5.7.1). Naming that port here
+                // is what lets the association be wired through the
+                // conversion rather than straight to the actual.
+                if (found.empty() || found[0]->kind() != VhdlSymKind::PORT) {
+                    if (AstVhdlCall* const convp = VN_CAST(asp->formalp(), VhdlCall)) {
+                        AstVhdlAssoc* const argp = VN_CAST(convp->argsp(), VhdlAssoc);
+                        AstNodeVhdlExpr* const argValp
+                            = argp ? argp->actualp() : VN_CAST(convp->argsp(), NodeVhdlExpr);
+                        AstVhdlName* const pnamep
+                            = convp->argsp() && !convp->argsp()->nextp()
+                                  ? VN_CAST(argValp, VhdlName)
+                                  : nullptr;
+                        if (pnamep && !pnamep->vhdlSymp()) {
+                            std::vector<VhdlSymbol*> pfound;
+                            unitScopep->lookupLocal(pnamep->name(), pfound);
+                            if (!pfound.empty()
+                                && pfound[0]->kind() == VhdlSymKind::PORT) {
+                                pnamep->vhdlSymp(pfound[0]);
+                                pnamep->vhdlTypep(pfound[0]->typep());
+                                // The conversion itself is a name of this
+                                // region -- a type mark or a function of one
+                                // parameter -- so it is resolved here
+                                AstVhdlName* const cnamep
+                                    = VN_CAST(convp->prefixp(), VhdlName);
+                                if (cnamep && !cnamep->vhdlSymp()) {
+                                    std::vector<VhdlSymbol*> cfound;
+                                    lookup(cnamep->name(), cfound);
+                                    for (VhdlSymbol* const csymp : cfound) {
+                                        if (csymp->kind() == VhdlSymKind::TYPE) {
+                                            cnamep->vhdlSymp(csymp);
+                                            convp->vhdlTypep(csymp->typep());
+                                            break;
+                                        }
+                                        if (csymp->kind() == VhdlSymKind::FUNCTION
+                                            && csymp->paramTypes().size() == 1) {
+                                            cnamep->vhdlSymp(csymp);
+                                            convp->vhdlSymp(csymp);
+                                            convp->vhdlTypep(csymp->returnTypep());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (!found.empty() && (found[0]->kind() == VhdlSymKind::PORT
                                        || found[0]->kind() == VhdlSymKind::GENERIC)) {
                     namep->vhdlSymp(found[0]);

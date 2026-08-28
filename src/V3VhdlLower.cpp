@@ -6226,6 +6226,66 @@ private:
         if (!anyRenamed) renamed.clear();
         AstPin* pinsp = nullptr;
         int pinNum = 0;
+        // "f(p) => a" converts what the port drives on its way out to the
+        // actual (6.5.7.1): the port is a signal of its own here, and the
+        // actual follows the conversion of it.
+        std::set<const AstVhdlAssoc*> converted;
+        for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            AstVhdlCall* const convp = VN_CAST(asp->formalp(), VhdlCall);
+            if (!convp || !asp->actualp() || asp->isOpen()) continue;
+            const AstVhdlName* const convNamep = VN_CAST(convp->prefixp(), VhdlName);
+            if (!convNamep) continue;
+            const AstVhdlAssoc* const argp = VN_CAST(convp->argsp(), VhdlAssoc);
+            const AstNodeVhdlExpr* const argValp
+                = argp ? argp->actualp() : VN_CAST(convp->argsp(), NodeVhdlExpr);
+            const AstVhdlName* const portNamep
+                = convp->argsp() && !convp->argsp()->nextp() ? VN_CAST(argValp, VhdlName)
+                                                             : nullptr;
+            VhdlSymbol* const portSymp = portNamep ? portNamep->vhdlSymp() : nullptr;
+            if (!portSymp || portSymp->kind() != VhdlSymKind::PORT) continue;
+            AstNodeExpr* const targetp = lowerExpr(asp->actualp());
+            if (!targetp || !isAssignable(targetp)) {
+                if (targetp) VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                continue;
+            }
+            AstNodeDType* dtypep = nullptr;
+            {
+                VL_RESTORER_COPY(m_bindExprs);
+                for (const auto& pair : genericStandIns(nodep, portSymp->typep())) {
+                    m_bindExprs[pair.first] = pair.second;
+                }
+                dtypep = lowerType(portSymp->typep(), flp);
+            }
+            AstVar* const tempp
+                = newTempVar("__Vconv__" + label + "__" + portSymp->name(), dtypep, flp);
+            // The signal standing in for the port starts where the port
+            // does, so the conversion of it is right before anything runs
+            tempp->valuep(defaultValueFor(portSymp->typep(), flp));
+            // The conversion reads the port's own signal, so the name it
+            // applies to stands for that signal while it is lowered
+            m_vars.emplace(portSymp, tempp);
+            AstNodeExpr* const convValuep = lowerExpr(asp->formalp());
+            m_vars.erase(portSymp);
+            if (!convValuep) {
+                VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                continue;
+            }
+            FileLine* const cflp = new FileLine{flp};
+            cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            // A port association is transparent: the actual holds the
+            // conversion of what the port drives from the start, not one
+            // delta later (6.5.7.1) -- so the conversion is applied once as
+            // the design elaborates as well as whenever the port changes
+            addStmt(new AstInitial{
+                cflp, new AstAssign{cflp, targetp->cloneTree(false),
+                                    convValuep->cloneTree(false)}});
+            addStmt(new AstAlways{new AstAssignW{cflp, targetp, convValuep}});
+            pinsp = AstNode::addNextNull(
+                pinsp, new AstPin{flp, ++pinNum, portSymp->name(),
+                                  new AstVarRef{flp, tempp, VAccess::WRITE}});
+            converted.insert(asp);
+        }
         // A formal may name part of a port rather than the whole of it, and
         // several such associations together cover it (6.5.7.1). One signal
         // of the port's own type stands for the port, each part of it is
@@ -6234,6 +6294,7 @@ private:
         size_t portPosition = 0;  // Which port a positional association names
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (converted.count(asp)) continue;
             AstNodeVhdlExpr* const rootp = individualRoot(asp->formalp());
             AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
             VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
@@ -6278,6 +6339,7 @@ private:
         }
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (converted.count(asp)) continue;
             AstNodeVhdlExpr* const rootp = individualRoot(asp->formalp());
             AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
             VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
