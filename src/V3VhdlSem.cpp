@@ -5020,6 +5020,26 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     return resultp;
 }
 
+// Whether a length written as an expression is one the declaration it sizes
+// can carry: it may name a port's bounds or a generic, which elaboration
+// settles, but not a variable, whose value is not known until it runs
+static bool sizeTravels(AstNodeVhdlExpr* nodep) {
+    if (!nodep) return false;
+    bool ok = true;
+    nodep->foreach([&](AstNodeVhdlExpr* refp) {
+        const VhdlSymbol* const symp = refp->vhdlSymp();
+        if (!symp) return;
+        switch (symp->kind()) {
+        case VhdlSymKind::VARIABLE:
+        case VhdlSymKind::SHARED_VARIABLE:
+        case VhdlSymKind::PARAMETER:
+        case VhdlSymKind::LOOP_PARAMETER: ok = false; break;
+        default: break;
+        }
+    });
+    return ok;
+}
+
 // The result subtype of one of the functions above, or null where this is
 // not one of them or the length does not fold
 VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
@@ -5032,11 +5052,17 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
     if (resultp->base()->indexTypes().size() != 1) return nullptr;
     const std::string& name = symp->name();
     int64_t length = -1;
+    AstNodeVhdlExpr* sizeExprp = nullptr;  // Where the length is not a number here
     if (name == "to_signed" || name == "to_unsigned" || name == "resize") {
         if (assocs.size() != 2 || !assocs[1] || !assocs[1]->actualp()) return nullptr;
         const VhdlValue val = V3VhdlEval::eval(assocs[1]->actualp());
         if (val.isInt()) {
             length = val.toInt();
+        } else if (sizeTravels(assocs[1]->actualp())) {
+            // "to_signed(v, y'length)" where y is a port whose bounds the
+            // instance settles: the length is not a number here, but it is
+            // an expression the back end folds per instance
+            sizeExprp = assocs[1]->actualp();
         } else {
             // "resize(arg, size_res)" says the length with another array
             const VhdlType* const sizep = assocs[1]->actualp()->vhdlTypep();
@@ -5052,14 +5078,28 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
     } else {
         return nullptr;
     }
-    if (length < 0 || length > (1 << 20)) return nullptr;
+    if (!sizeExprp && (length < 0 || length > (1 << 20))) return nullptr;
     const VhdlType* const idxp = resultp->base()->indexTypes()[0];
     if (!idxp) return nullptr;
     FileLine* const flp = resultp->fileline();
     VhdlType* const outp = cloneSubtype(resultp, flp);
     VhdlType* const newIndexp = cloneSubtype(const_cast<VhdlType*>(idxp), flp);
-    // numeric_std counts a vector down from its length less one (16.5)
-    newIndexp->setBounds(length - 1, 0, false);
+    if (sizeExprp) {
+        // numeric_std counts a vector down from its length less one (16.5),
+        // written out so that elaboration works it out
+        AstVhdlLiteral* const onep = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, "1"};
+        onep->intVal(1);
+        AstVhdlLiteral* const zerop = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, "0"};
+        zerop->intVal(0);
+        AstNodeVhdlExpr* const leftp = new AstVhdlBinary{
+            flp, VhdlBinaryOp::SUB, sizeExprp->cloneTree(false), onep};
+        // The range is what the expression says, not the index subtype's own
+        newIndexp->unbound();
+        newIndexp->boundsp(new AstVhdlRange{flp, leftp, VhdlDir::DOWNTO, zerop});
+    } else {
+        // numeric_std counts a vector down from its length less one (16.5)
+        newIndexp->setBounds(length - 1, 0, false);
+    }
     outp->clearIndexTypes();
     outp->addIndexType(newIndexp);
     outp->unconstrained(false);
@@ -5469,9 +5509,12 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
     // -- "t_slv_array(0 to n-1)" over an element type of std_logic_vector --
     // and then the element takes its bounds from the value too (5.3.2.2)
     if (!typep->unconstrained()) return constrainElementFromValue(typep, valuep, flp);
-    // A value that is itself constrained hands over its index ranges directly
+    // A value that is itself constrained hands over its index ranges
+    // directly, whether it says its length as a number or as an expression
+    // elaboration settles
     VhdlType* const valueTypep = valuep->vhdlTypep();
-    if (valueTypep && valueTypep->isConstrainedArray()
+    if (valueTypep && valueTypep->base()->kind() == VhdlTypeKind::ARRAY
+        && !valueTypep->unconstrained() && valueTypep->lengthEmittable()
         && valueTypep->dimensions() == typep->dimensions()) {
         VhdlType* const outp = cloneSubtype(typep, flp);
         outp->clearIndexTypes();

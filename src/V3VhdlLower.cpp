@@ -4434,6 +4434,17 @@ private:
                 // The width comes from another object's range, which V3Width
                 // resolves from the context of the assignment
                 sized = firstp;
+            } else if (resultp && resultp->lengthEmittable()) {
+                // A width that names a generic or a port's bounds is not a
+                // number here. The result's own subtype says it, and what the
+                // value is given to has that subtype, so the width comes from
+                // the assignment exactly as it does for RESIZE. Narrowing the
+                // integer to it is what the conversion is for.
+                FileLine* const cflp = new FileLine{flp};
+                cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                flp = cflp;
+                sized = firstp;
             } else {
                 unsup(flp, "conversion to a width that is not locally static");
                 return nullptr;
