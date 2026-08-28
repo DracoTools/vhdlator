@@ -707,6 +707,15 @@ private:
                           new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(low)}};
     }
 
+    // Whether an operand is a literal with a Z in it. Z is the one metavalue
+    // this runtime keeps, so a comparison against it has to be the exact one;
+    // 'U', 'X', 'W' and '-' all collapse to Verilog's X on both sides of an
+    // ordinary comparison, which is what the accepted divergence says.
+    static bool hasMetaConst(const AstNodeExpr* nodep) {
+        const AstConst* const constp = VN_CAST(nodep, Const);
+        return constp && constp->num().isAnyZ();
+    }
+
     static AstNodeDType* newLogicDType(FileLine* flp, int bits) {
         if (bits <= 1) return new AstBasicDType{flp, VBasicDTypeKwd::LOGIC};
         return new AstBasicDType{flp, VFlagLogicPacked{}, bits};
@@ -3147,12 +3156,20 @@ private:
         case VhdlBinaryOp::XNOR: return new AstNot{flp, new AstXor{flp, lhsp, rhsp}};
         case VhdlBinaryOp::EQ:
         case VhdlBinaryOp::MATCH_EQ:
-            return real ? static_cast<AstNodeExpr*>(new AstEqD{flp, lhsp, rhsp})
-                        : static_cast<AstNodeExpr*>(new AstEq{flp, lhsp, rhsp});
+            if (real) return new AstEqD{flp, lhsp, rhsp};
+            // A logic literal with a Z in it is compared exactly: "s = 'Z'"
+            // is true when s is 'Z' (9.2.3), where Verilog's "==" answers X.
+            if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
+                return new AstEqCase{flp, lhsp, rhsp};
+            }
+            return new AstEq{flp, lhsp, rhsp};
         case VhdlBinaryOp::NE:
         case VhdlBinaryOp::MATCH_NE:
-            return real ? static_cast<AstNodeExpr*>(new AstNeqD{flp, lhsp, rhsp})
-                        : static_cast<AstNodeExpr*>(new AstNeq{flp, lhsp, rhsp});
+            if (real) return new AstNeqD{flp, lhsp, rhsp};
+            if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
+                return new AstNeqCase{flp, lhsp, rhsp};
+            }
+            return new AstNeq{flp, lhsp, rhsp};
         case VhdlBinaryOp::LT:
         case VhdlBinaryOp::MATCH_LT:
             if (real) return new AstLtD{flp, lhsp, rhsp};
