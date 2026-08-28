@@ -5390,6 +5390,13 @@ private:
             addStmt(new AstInitial{flp, bodyp});
             return;
         }
+        // A process whose first statement is a wait suspends before it does
+        // anything (10.2). Left as the block's own first statement the back
+        // end would read it as what the block is sensitive to, and run the
+        // body once at the start -- so it is kept inside a block of its own.
+        if (!sentreep && VN_IS(bodyp, EventControl)) {
+            bodyp = new AstBegin{flp, "", bodyp, false};
+        }
         addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, sentreep, bodyp});
     }
 
@@ -8373,9 +8380,32 @@ private:
             AstNodeExpr* const exprp = lowerExpr(namep);
             if (!exprp) continue;
             itemsp = AstNode::addNext(
-                itemsp, senItemFor(exprp, isOneBitType(typeOfExpr(namep)), flp));
+                itemsp, senItemFor(shadowSensitivity(exprp, namep, flp),
+                                   isOneBitType(typeOfExpr(namep)), flp));
         }
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
+    }
+
+    // "wait on s(2 downto 1)" and "process (r.f)" wake on an event on that
+    // part of the signal and on no other (10.2, 11.3). The back end is
+    // sensitive to whole variables, so a signal of the module follows the
+    // part and the process waits on that instead -- which changes exactly
+    // when the part does. A whole signal needs none of this.
+    AstNodeExpr* shadowSensitivity(AstNodeExpr* exprp, AstNodeVhdlExpr* namep, FileLine* flp) {
+        if (VN_IS(exprp, VarRef) || !m_modp) return exprp;
+        const VhdlType* const typep = typeOfExpr(namep);
+        if (!typep) return exprp;
+        AstNodeDType* const dtypep = lowerType(const_cast<VhdlType*>(typep), flp);
+        if (!dtypep) return exprp;
+        AstVar* const tempp
+            = new AstVar{flp, VVarType::VAR, "__Vsens" + std::to_string(++m_tempNum),
+                         VFlagChildDType{}, dtypep};
+        m_modp->addStmtsp(tempp);
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        m_modp->addStmtsp(new AstAlways{new AstAssignW{
+            cflp, new AstVarRef{cflp, tempp, VAccess::WRITE}, exprp}});
+        return new AstVarRef{flp, tempp, VAccess::READ};
     }
 
     // Every signal a lowered body reads. A signal it only writes is not one
