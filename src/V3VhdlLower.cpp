@@ -474,12 +474,24 @@ private:
     // to be read from the same object the elements are. A name is; anything
     // that could run a function or change something is not.
     static bool repeatable(const AstNodeExpr* nodep) {
+        if (!nodep) return false;
         if (VN_IS(nodep, VarRef) || VN_IS(nodep, Const)) return true;
         if (const AstMemberSel* const memp = VN_CAST(nodep, MemberSel)) {
             return repeatable(memp->fromp());
         }
         if (const AstStructSel* const strp = VN_CAST(nodep, StructSel)) {
             return repeatable(strp->fromp());
+        }
+        // One element of an array of them -- "reg(i).state.list" -- names the
+        // same object each time so long as which element it is cannot change
+        // between the reads, which are next to each other in what is emitted
+        if (const AstSelBit* const selp = VN_CAST(nodep, SelBit)) {
+            return repeatable(selp->fromp()) && selp->bitp()
+                   && const_cast<AstNodeExpr*>(selp->bitp())->isPure();
+        }
+        if (const AstArraySel* const selp = VN_CAST(nodep, ArraySel)) {
+            return repeatable(selp->fromp()) && selp->bitp()
+                   && const_cast<AstNodeExpr*>(selp->bitp())->isPure();
         }
         return false;
     }
