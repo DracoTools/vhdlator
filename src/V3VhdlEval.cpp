@@ -255,6 +255,12 @@ private:
 
     VhdlValue evalSymbol(VhdlSymbol* symp) {
         if (!symp) return VhdlValue{};
+        // An alias is another name for what it denotes (6.6), and so has the
+        // same value. A chain of them is bounded by the source.
+        for (int depth = 0; symp->kind() == VhdlSymKind::ALIAS && depth < 32; ++depth) {
+            if (!symp->aliasp()) return VhdlValue{};
+            symp = symp->aliasp();
+        }
         switch (symp->kind()) {
         case VhdlSymKind::ENUM_LITERAL:
             return VhdlValue::mkInt(symp->position(), symp->typep());

@@ -7742,6 +7742,15 @@ private:
                 if (actualp) passed.push_back(AstVhdlExprPair{formals[i]->name(), actualp});
                 continue;
             }
+            // An alias is another name for what it denotes (6.6), so a
+            // signal parameter given one is given the object itself
+            for (int depth = 0; actualp && depth < 32; ++depth) {
+                const VhdlSymbol* const asymp = actualp->vhdlSymp();
+                if (!asymp || asymp->kind() != VhdlSymKind::ALIAS) break;
+                AstVhdlAliasDecl* const adeclp = VN_CAST(asymp->declp(), VhdlAliasDecl);
+                if (!adeclp || !adeclp->targetp()) break;
+                actualp = adeclp->targetp();
+            }
             // A signal actual is a signal of the design, either named plainly
             // or with a part of it selected in a way that is decided now
             VhdlSymbol* const actualSymp = actualp ? actualp->vhdlSymp() : nullptr;
