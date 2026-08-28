@@ -144,6 +144,25 @@ class VhdlLowerVisitor final {
         AstJumpBlock* bodyp = nullptr;  // Wraps the body; jumping ends the pass
     };
     std::vector<VhdlLoopFrame> m_loops;
+    // What a configuration declaration chose for one instance: the entity to
+    // build it from, which architecture of that entity, and the binding
+    // indication itself, which may carry generic and port maps (3.4.3)
+    struct CfgBind final {
+        std::string entity;  // Empty means the instance is left unbound
+        std::string arch;
+        AstVhdlBinding* bindingp = nullptr;
+    };
+    // What it chose for the instances of one block. A block statement or a
+    // generate configures its own instances, so these nest as the design does
+    struct CfgScope final {
+        std::map<std::string, CfgBind> comps;  // Component name -> its binding
+        std::map<std::string, CfgBind> insts;  // Instance label -> its binding
+        std::map<std::string, CfgScope> blocks;  // Block or generate label -> its own
+    };
+    std::map<std::string, CfgScope> m_cfgScopes;  // "lib.entity" -> what configures it
+    const CfgScope* m_cfgScopep = nullptr;  // The one for the block being lowered
+    // "lib.configuration" -> the entity and architecture it names (3.4)
+    std::map<std::string, std::pair<std::string, std::string>> m_configOf;
     std::string m_prefix;  // Name prefix for declarations inside a process
     std::string m_blockPrefix;  // Labels of the blocks being lowered, outermost first
     std::map<const VhdlType*, AstNodeFTask*> m_valueFuncs;  // "T'VALUE" readers, per type
@@ -5086,6 +5105,8 @@ private:
             // ports, makes it more than that.
             VL_RESTORER(m_guardVarp);
             VL_RESTORER_COPY(m_blockPrefix);
+            VL_RESTORER(m_cfgScopep);
+            m_cfgScopep = cfgScopeIn(blockp->label());
             if (!blockp->label().empty()) m_blockPrefix += blockp->label() + "__";
             if (blockp->guardp()) lowerGuard(blockp, flp);
             if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
@@ -6449,40 +6470,110 @@ private:
             component = names.back();
             names.pop_back();
         }
-        if (!component.empty()) {
+        // "all" and "others" speak for every instance of the component;
+        // a specification that names instances binds those alone (7.3.1)
+        if (!component.empty() && (specp->all() || specp->others())) {
             m_bindings[component] = entity;
             m_bindingMaps[component] = bindingp;
         }
-        if (specp->all() || specp->others()) return;
         for (const std::string& label : names) {
             m_instanceBindings[label] = entity;
             m_bindingMaps[label] = bindingp;
         }
     }
+    // What a binding indication inside a configuration declaration names:
+    // the entity to build the instance from, and which architecture of it
+    // (7.3.2.1). "use configuration work.c" names neither directly -- it
+    // names a configuration, which made both choices already.
+    bool cfgBindOf(AstVhdlBinding* bindingp, const std::string& lib, CfgBind& out) {
+        if (!bindingp) return false;
+        out.bindingp = bindingp;
+        if (bindingp->kind() == "open") return true;  // Deliberately left unbound
+        if (!bindingp->unitp()) return false;
+        AstNodeVhdlExpr* unitp = bindingp->unitp();
+        if (AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) unitp = callp->prefixp();
+        std::vector<std::string> parts;
+        if (!flattenName(unitp, parts) || parts.empty()) return false;
+        out.entity = parts.back();
+        out.arch = bindingp->archName();
+        if (bindingp->kind() != "configuration") return true;
+        const std::string cfgLib = parts.size() > 1 ? parts[parts.size() - 2] : lib;
+        auto it = m_configOf.find(cfgLib + "." + out.entity);
+        if (it == m_configOf.end()) it = m_configOf.find(lib + "." + out.entity);
+        if (it == m_configOf.end()) return false;
+        out.entity = it->second.first;
+        out.arch = it->second.second;
+        return true;
+    }
+    // Which instances of the block a component configuration speaks for
+    static void recordCfgBind(AstVhdlEntitySpec* specp, const CfgBind& bind, CfgScope& scope) {
+        std::vector<std::string> names;
+        for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
+            if (const AstVhdlName* const namep = VN_CAST(p, VhdlName)) {
+                names.push_back(namep->name());
+            }
+        }
+        if (names.empty()) return;
+        const std::string component = names.back();
+        names.pop_back();
+        if (specp->all() || specp->others()) {
+            scope.comps[component] = bind;
+            return;
+        }
+        for (const std::string& label : names) scope.insts[label] = bind;
+    }
     // The component configurations inside a configuration declaration say
     // which entity each instance is built from, in the same words a
-    // configuration specification uses (3.4.3)
-    void recordConfigBindings(AstVhdlBlockConfig* nodep) {
-        for (AstVhdlBlockConfig* p = nodep; p; p = VN_AS(p->nextp(), VhdlBlockConfig)) {
-            if (AstVhdlEntitySpec* const specp = VN_CAST(p->specp(), VhdlEntitySpec)) {
-                recordBinding(specp, p->bindingp());
+    // configuration specification uses (3.4.3). What one says reaches the
+    // statements of its own block alone, so the blocks and generates nest
+    // (3.4.2) -- two blocks may configure the same component name
+    // differently, and each instance follows the block it stands in.
+    void buildCfgScope(AstVhdlBlockConfig* itemsp, CfgScope& scope, const std::string& lib) {
+        for (AstVhdlBlockConfig* p = itemsp; p; p = VN_AS(p->nextp(), VhdlBlockConfig)) {
+            AstVhdlEntitySpec* const specp = VN_CAST(p->specp(), VhdlEntitySpec);
+            if (!specp) continue;
+            if (specp->entityClass() == "component") {
+                CfgBind bind;
+                if (cfgBindOf(p->bindingp(), lib, bind)) recordCfgBind(specp, bind, scope);
+                continue;
             }
-            recordConfigBindings(p->itemsp());
+            // A block specification names a block or a generate statement.
+            // "g(0 to 3)" says which of a generate's iterations it applies
+            // to; the iterations are elaborated later, by which time the
+            // instances are gone, so all of them follow what it says.
+            AstNodeVhdlExpr* namep = specp->namesp();
+            if (AstVhdlCall* const callp = VN_CAST(namep, VhdlCall)) namep = callp->prefixp();
+            std::vector<std::string> parts;
+            if (!namep || !flattenName(namep, parts) || parts.empty()) continue;
+            buildCfgScope(p->itemsp(), scope.blocks[parts.back()], lib);
         }
+    }
+    // What a configuration declaration says about one block inside the one
+    // being lowered. Nothing said outside that block reaches into it (3.4.2).
+    const CfgScope* cfgScopeIn(const std::string& label) const {
+        if (!m_cfgScopep || label.empty()) return nullptr;
+        const auto it = m_cfgScopep->blocks.find(label);
+        return it == m_cfgScopep->blocks.end() ? nullptr : &it->second;
+    }
+    // Every entity and architecture some configuration asks for
+    static void cfgScopeArchs(const CfgScope& scope,
+                              std::vector<std::pair<std::string, std::string>>& out) {
+        for (const auto& pair : scope.comps) {
+            if (!pair.second.arch.empty()) out.emplace_back(pair.second.entity, pair.second.arch);
+        }
+        for (const auto& pair : scope.insts) {
+            if (!pair.second.arch.empty()) out.emplace_back(pair.second.entity, pair.second.arch);
+        }
+        for (const auto& pair : scope.blocks) cfgScopeArchs(pair.second, out);
     }
 
     std::map<std::string, std::string> m_archOf;  // "lib.entity" -> architecture built
     std::set<std::string> m_altArchMods;  // "lib.module" built from another architecture
     std::map<std::string, std::string> m_bindings;  // Component -> entity
     std::map<std::string, std::string> m_instanceBindings;  // Label -> entity
-    // The same, said by a configuration declaration rather than inside the
-    // architecture, and kept per entity until that entity is lowered
-    std::map<std::string, std::map<std::string, std::string>> m_cfgBindings;
-    std::map<std::string, std::map<std::string, std::string>> m_cfgInstBindings;
     // The binding indication itself, which may carry generic and port maps
     // of its own for the instance it binds (7.3.2)
     std::map<std::string, AstVhdlBinding*> m_bindingMaps;
-    std::map<std::string, std::map<std::string, AstVhdlBinding*>> m_cfgBindingMaps;
 
     // Whether a pin of that name is already among these
     static bool pinNamed(AstPin* pinsp, const std::string& name) {
@@ -6544,12 +6635,41 @@ private:
         // A configuration specification may have said which entity this
         // component or instance is built from (7.3)
         const std::string label = nodep->label();
-        const auto instIt = m_instanceBindings.find(label);
-        if (!label.empty() && instIt != m_instanceBindings.end()) {
-            modName = instIt->second;
+        // A configuration declaration says the same from outside the
+        // architecture, and says it of this block alone (3.4.3)
+        const CfgBind* cfgBindp = nullptr;
+        if (m_cfgScopep) {
+            const auto cInstIt = m_cfgScopep->insts.find(label);
+            if (!label.empty() && cInstIt != m_cfgScopep->insts.end()) {
+                cfgBindp = &cInstIt->second;
+            } else {
+                const auto cCompIt = m_cfgScopep->comps.find(modName);
+                if (cCompIt != m_cfgScopep->comps.end()) cfgBindp = &cCompIt->second;
+            }
+        }
+        if (cfgBindp) {
+            if (cfgBindp->entity.empty()) {
+                // "use open" leaves the instance deliberately unbound, so
+                // nothing is built for it (7.3.2)
+                const VhdlSymbol* const openSymp
+                    = nodep->unitp() ? nodep->unitp()->vhdlSymp() : nullptr;
+                const AstVhdlComponentDecl* const openDeclp
+                    = openSymp && openSymp->kind() == VhdlSymKind::COMPONENT
+                          ? VN_CAST(openSymp->declp(), VhdlComponentDecl)
+                          : nullptr;
+                if (openDeclp) lowerUnboundInstance(nodep, openDeclp, flp);
+                return;
+            }
+            modName = cfgBindp->entity;
+            if (!cfgBindp->arch.empty()) archName = cfgBindp->arch;
         } else {
-            const auto compIt = m_bindings.find(modName);
-            if (compIt != m_bindings.end()) modName = compIt->second;
+            const auto instIt = m_instanceBindings.find(label);
+            if (!label.empty() && instIt != m_instanceBindings.end()) {
+                modName = instIt->second;
+            } else {
+                const auto compIt = m_bindings.find(modName);
+                if (compIt != m_bindings.end()) modName = compIt->second;
+            }
         }
         // Where the entity had a generic type, this instance is of the copy
         // made for the types it named (6.5.5)
@@ -6575,7 +6695,9 @@ private:
         // name, and then there is nothing to do; where they do not, the
         // instance wrote the component's names and the entity wants its own.
         const AstVhdlBinding* bindingp = nullptr;
-        {
+        if (cfgBindp) {
+            bindingp = cfgBindp->bindingp;
+        } else {
             const auto bindIt = m_bindingMaps.find(
                 !label.empty() && m_instanceBindings.count(label) ? label : parts.back());
             if (bindIt != m_bindingMaps.end()) bindingp = bindIt->second;
@@ -7019,6 +7141,8 @@ private:
         const std::string label = nodep->label().empty()
                                       ? "__Vgen" + std::to_string(++m_processNum)
                                       : nodep->label();
+        VL_RESTORER(m_cfgScopep);
+        m_cfgScopep = cfgScopeIn(nodep->label());
         if (nodep->kind() == VhdlLoopKind::FOR) {
             VhdlSymbol* const symp = nodep->vhdlSymp();
             VhdlType* const rangep = symp ? symp->typep() : nullptr;
@@ -10053,13 +10177,8 @@ private:
         m_bindingMaps.clear();
         {
             // What a configuration declaration said about this entity
-            const std::string key = libname + "." + entp->name();
-            const auto cbIt = m_cfgBindings.find(key);
-            if (cbIt != m_cfgBindings.end()) m_bindings = cbIt->second;
-            const auto ciIt = m_cfgInstBindings.find(key);
-            if (ciIt != m_cfgInstBindings.end()) m_instanceBindings = ciIt->second;
-            const auto cmIt = m_cfgBindingMaps.find(key);
-            if (cmIt != m_cfgBindingMaps.end()) m_bindingMaps = cmIt->second;
+            const auto scopeIt = m_cfgScopes.find(libname + "." + entp->name());
+            m_cfgScopep = scopeIt == m_cfgScopes.end() ? nullptr : &scopeIt->second;
         }
         m_prefix.clear();
         m_stmtsp = nullptr;
@@ -10151,6 +10270,18 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             }
         }
     }
+    // A binding indication may name a configuration, and a configuration may
+    // be written before the one that names it, so what each of them chose is
+    // read off first (3.4)
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        AstVhdlConfiguration* const cfgp = VN_CAST(unitp, VhdlConfiguration);
+        if (!cfgp) continue;
+        std::vector<std::string> parts;
+        if (!flattenName(cfgp->entityNamep(), parts) || parts.empty()) continue;
+        const std::string lib = unitp->libname().empty() ? "work" : unitp->libname();
+        m_configOf[lib + "." + cfgp->name()]
+            = {parts.back(), topArchitectureOf(cfgp->blockConfigp())};
+    }
     // An entity and an architecture become one module, so pair them up
     // first. VHDL's default binding takes the architecture analyzed last
     // (7.3.3), which is what keeping the newest one gives.
@@ -10193,23 +10324,12 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 && VString::downcase(v3Global.opt.topModule()) == cfgp->name()) {
                 v3Global.opt.topModule(parts.back());
             }
-            {
-                // Kept per configured entity: the maps are emptied for each
-                // entity as it is lowered
-                VL_RESTORER_COPY(m_bindings);
-                VL_RESTORER_COPY(m_instanceBindings);
-                VL_RESTORER_COPY(m_bindingMaps);
-                m_bindings.clear();
-                m_instanceBindings.clear();
-                m_bindingMaps.clear();
-                recordConfigBindings(cfgp->blockConfigp());
-                const std::string key = lib + "." + parts.back();
-                for (const auto& pair : m_bindings) m_cfgBindings[key][pair.first] = pair.second;
-                for (const auto& pair : m_instanceBindings) {
-                    m_cfgInstBindings[key][pair.first] = pair.second;
-                }
-                for (const auto& pair : m_bindingMaps) m_cfgBindingMaps[key][pair.first]
-                    = pair.second;
+            // The outermost block configuration is the architecture's; what
+            // it holds configures the architecture's own statements, and the
+            // blocks and generates inside it configure theirs
+            if (cfgp->blockConfigp()) {
+                buildCfgScope(cfgp->blockConfigp()->itemsp(), m_cfgScopes[lib + "." + parts.back()],
+                              lib);
             }
             continue;
         }
@@ -10248,6 +10368,21 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // find which others some instance asks for; each of those becomes a
     // module of its own, so that both stand in the netlist at once.
     std::map<std::string, std::set<std::string>> alsoBuild;  // "lib.entity" -> architectures
+    for (const auto& pair : m_cfgScopes) {
+        const std::string lib = pair.first.substr(0, pair.first.find('.'));
+        std::vector<std::pair<std::string, std::string>> wanted;
+        cfgScopeArchs(pair.second, wanted);
+        for (const auto& want : wanted) {
+            const std::string key = lib + "." + want.first;
+            const auto builtIt = builtArch.find(key);
+            if (builtIt == builtArch.end() || !builtIt->second) continue;
+            if (builtIt->second->name() == want.second) continue;
+            if (!namedArchs.count(key + "." + want.second)) continue;
+            if (hasUnboundGeneric(entities[key])) continue;
+            alsoBuild[key].insert(want.second);
+            m_altArchMods.insert(lib + "." + altArchName(want.first, want.second));
+        }
+    }
     for (const auto& pair : namedArchs) {
         const std::string lib = pair.second->libname().empty() ? "work" : pair.second->libname();
         pair.second->foreach([&](AstVhdlInstance* instp) {
