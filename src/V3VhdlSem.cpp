@@ -3092,6 +3092,9 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp) {
 // lands: those functions are written against unconstrained operands, but
 // every call site has a static width.
 
+bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
+                     std::vector<int>& formalOf) VL_MT_DISABLED;
+
 class VhdlSpecVisitor final : public VNVisitor {
     // STATE
     VhdlSemVisitor& m_sem;
@@ -3217,19 +3220,66 @@ private:
         return ok;
     }
 
+    // The default written for one parameter of a subprogram, or null
+    static AstNodeVhdlExpr* paramDefaultOf(const VhdlSymbol* symp, size_t which) {
+        const AstVhdlSubprogDecl* declp = symp->bodyp();
+        if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        if (!declp) return nullptr;
+        AstNode* p = declp->paramsp();
+        // A generic subprogram's generics come ahead of its parameters (4.2.1)
+        for (int g = 0; g < declp->genericCount() && p; ++g) p = p->nextp();
+        for (size_t i = 0; p; p = p->nextp(), ++i) {
+            if (i == which) {
+                AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+                return ifp ? ifp->defaultp() : nullptr;
+            }
+        }
+        return nullptr;
+    }
+
     void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
         if (!needsSpecializing(symp)) return;
         // A copy is never itself specialized: it was made for one call site
         // and has nothing left to fix
         if (m_madeSyms.count(symp)) return;
         const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
-        // The actual types, which must all be known for the copy to be made
+        // The actual types, which must all be known for the copy to be made.
+        // Which formal each actual names, since a named association may put
+        // them in any order and a formal with a default may be left out
+        // altogether (6.5.7.1)
+        std::vector<AstVhdlAssoc*> assocs;
+        for (AstNode* p = argsp; p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp()) return;
+            assocs.push_back(asp);
+        }
+        const size_t nparams = symp->paramTypes().size();
+        std::vector<int> formalOf;
+        if (!vhdlBindActuals(symp, assocs, formalOf)) return;
+        std::vector<AstVhdlAssoc*> byFormal(nparams, nullptr);
+        for (size_t k = 0; k < assocs.size(); ++k) {
+            const int f = formalOf[k];
+            if (f < 0 || static_cast<size_t>(f) >= nparams) return;
+            byFormal[f] = assocs[k];
+        }
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
-        size_t i = 0;
-        for (AstNode* p = argsp; p; p = p->nextp(), ++i) {
-            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
-            if (!asp || !asp->actualp() || i >= symp->paramTypes().size()) return;
+        for (size_t i = 0; i < nparams; ++i) {
+            AstVhdlAssoc* const asp = byFormal[i];
+            if (!asp) {
+                // A formal the call leaves out takes its default, and the
+                // copy is made for that default's own subtype and value
+                AstNodeVhdlExpr* const defp = paramDefaultOf(symp, i);
+                if (!defp) return;
+                if (byValue) {
+                    const VhdlValue val = V3VhdlEval::eval(defp);
+                    actualValues.push_back(val.isInt() ? val : VhdlValue{});
+                }
+                VhdlType* const dtypep
+                    = defp->vhdlTypep() ? defp->vhdlTypep() : symp->paramTypes()[i];
+                actualTypes.push_back(dtypep);
+                continue;
+            }
             if (byValue) {
                 const VhdlValue val = V3VhdlEval::eval(asp->actualp());
                 actualValues.push_back(val.isInt() ? val : VhdlValue{});
@@ -4795,6 +4845,14 @@ void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, boo
 bool VhdlSemVisitor::bindActuals(const VhdlSymbol* symp,
                                  const std::vector<AstVhdlAssoc*>& assocs,
                                  std::vector<int>& formalOf) {
+    return vhdlBindActuals(symp, assocs, formalOf);
+}
+
+// Which formal each actual of a call names: positional up to the first named
+// one, by name after that, and a formal with a default may be left out
+// (6.5.7.1). False where the call cannot be read that way at all.
+bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
+                     std::vector<int>& formalOf) {
     const size_t formals = symp->paramTypes().size();
     formalOf.assign(assocs.size(), -1);
     std::vector<bool> filled(formals, false);
