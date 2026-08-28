@@ -1113,6 +1113,13 @@ public:
     static bool formalIsReadOnly(const VhdlSymbol* symp,
                                  const std::string& formal) VL_MT_DISABLED;
     void spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    // Whether every element of a record has a length of its own (5.3.3)
+    static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
+    // A record subtype whose open elements take their bounds from the values
+    // written for them one at a time (5.3.3, 6.5.7.1)
+    VhdlType* constrainRecordFromParts(VhdlType* typep,
+                                       const std::vector<AstNodeVhdlExpr*>& byPos,
+                                       FileLine* flp) VL_MT_DISABLED;
 
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
@@ -1216,7 +1223,6 @@ private:
                                       FileLine* flp) VL_MT_DISABLED;
     VhdlType* constrainElementFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                         FileLine* flp) VL_MT_DISABLED;
-    static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
     static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
@@ -1249,7 +1255,8 @@ private:
     VhdlType* analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) VL_MT_DISABLED;
     static bool bindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
-                            std::vector<int>& formalOf) VL_MT_DISABLED;
+                            std::vector<int>& formalOf,
+                            std::vector<std::string>* elemOf = nullptr) VL_MT_DISABLED;
     VhdlType* analyzeSelected(AstVhdlSelected* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wantp) VL_MT_DISABLED;
@@ -3143,7 +3150,12 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp) {
 // every call site has a static width.
 
 bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
-                     std::vector<int>& formalOf) VL_MT_DISABLED;
+                     std::vector<int>& formalOf,
+                     std::vector<std::string>* elemOf = nullptr) VL_MT_DISABLED;
+// The subtype an actual must have: the parameter's own, or, where the formal
+// part names one element of it, that element's (6.5.7.1)
+VhdlType* vhdlFormalTypeAt(const VhdlSymbol* symp, int idx,
+                           const std::string& elem) VL_MT_DISABLED;
 
 class VhdlSpecVisitor final : public VNVisitor {
     // STATE
@@ -3196,6 +3208,12 @@ private:
             // per instance, so one copy of the subprogram serves every call
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
                 && !typep->lengthEmittable()) {
+                return true;
+            }
+            // A record may have an element of an unconstrained array type,
+            // and then the call is what says how long that element is (5.3.3)
+            if (typep && typep->base()->kind() == VhdlTypeKind::RECORD
+                && !VhdlSemVisitor::fullyConstrainedRecord(typep)) {
                 return true;
             }
         }
@@ -3305,16 +3323,48 @@ private:
         }
         const size_t nparams = symp->paramTypes().size();
         std::vector<int> formalOf;
-        if (!vhdlBindActuals(symp, assocs, formalOf)) return;
+        std::vector<std::string> elemOf;
+        if (!vhdlBindActuals(symp, assocs, formalOf, &elemOf)) return;
         std::vector<AstVhdlAssoc*> byFormal(nparams, nullptr);
+        // A formal whose elements the call names one at a time has no actual
+        // of its own; its subtype is the one its elements' actuals make up
+        std::map<size_t, std::vector<AstNodeVhdlExpr*>> individual;
         for (size_t k = 0; k < assocs.size(); ++k) {
             const int f = formalOf[k];
             if (f < 0 || static_cast<size_t>(f) >= nparams) return;
+            if (!elemOf[k].empty()) {
+                VhdlType* const recTypep = symp->paramTypes()[f];
+                if (!recTypep) return;
+                auto it = individual.find(f);
+                if (it == individual.end()) {
+                    it = individual
+                             .emplace(f, std::vector<AstNodeVhdlExpr*>(
+                                             recTypep->elements().size(), nullptr))
+                             .first;
+                }
+                for (size_t e = 0; e < recTypep->elements().size(); ++e) {
+                    if (recTypep->elements()[e]->name() == elemOf[k]) {
+                        it->second[e] = assocs[k]->actualp();
+                    }
+                }
+                continue;
+            }
             byFormal[f] = assocs[k];
         }
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
         for (size_t i = 0; i < nparams; ++i) {
+            const auto indIt = individual.find(i);
+            if (indIt != individual.end()) {
+                VhdlType* const madep = m_sem.constrainRecordFromParts(
+                    symp->paramTypes()[i], indIt->second, nodep->fileline());
+                // Nothing is gained by a copy that still does not know how
+                // long the elements are
+                if (!VhdlSemVisitor::fullyConstrainedRecord(madep)) return;
+                if (byValue) actualValues.push_back(VhdlValue{});
+                actualTypes.push_back(madep);
+                continue;
+            }
             AstVhdlAssoc* const asp = byFormal[i];
             if (!asp) {
                 // A formal the call leaves out takes its default, and the
@@ -3353,6 +3403,15 @@ private:
                 // -- but a bound that names a generic is a length even though
                 // it is not a number here, and the copy carries it as written.
                 if (length < 0 && !lengthTravels(typep)) return;
+            }
+            // The same for a record with an element of an unconstrained array
+            // type: only an actual that says how long its elements are is
+            // worth making a copy for (5.3.3)
+            if (symp->paramTypes()[i]
+                && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::RECORD
+                && !VhdlSemVisitor::fullyConstrainedRecord(symp->paramTypes()[i])
+                && !VhdlSemVisitor::fullyConstrainedRecord(typep)) {
+                return;
             }
             actualTypes.push_back(typep);
         }
@@ -3897,12 +3956,14 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
             }
             if (usable) {
                 std::vector<int> formalOf;
+                std::vector<std::string> elemOf;
                 for (VhdlSymbol* const symp : found) {
-                    if (!bindActuals(symp, assocs, formalOf)) continue;
+                    if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
                     bool fits = true;
                     for (size_t i = 0; i < argCands.size() && fits; ++i) {
                         if (formalOf[i] < 0) continue;
-                        if (!anyMatches(argCands[i], symp->paramTypes()[formalOf[i]])) {
+                        if (!anyMatches(argCands[i],
+                                        vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]))) {
                             fits = false;
                         }
                     }
@@ -4930,18 +4991,54 @@ void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, boo
 
 bool VhdlSemVisitor::bindActuals(const VhdlSymbol* symp,
                                  const std::vector<AstVhdlAssoc*>& assocs,
-                                 std::vector<int>& formalOf) {
-    return vhdlBindActuals(symp, assocs, formalOf);
+                                 std::vector<int>& formalOf,
+                                 std::vector<std::string>* elemOf) {
+    return vhdlBindActuals(symp, assocs, formalOf, elemOf);
+}
+
+// One element of a record type, by name
+static const VhdlSymbol* vhdlElementNamed(const VhdlType* typep, const std::string& name) {
+    if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return nullptr;
+    for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+        if (elemp && elemp->name() == name) return elemp;
+    }
+    return nullptr;
+}
+
+VhdlType* vhdlFormalTypeAt(const VhdlSymbol* symp, int idx, const std::string& elem) {
+    if (!symp || idx < 0 || static_cast<size_t>(idx) >= symp->paramTypes().size()) return nullptr;
+    VhdlType* const typep = symp->paramTypes()[idx];
+    if (elem.empty()) return typep;
+    const VhdlSymbol* const elemp = vhdlElementNamed(typep, elem);
+    return elemp ? elemp->typep() : nullptr;
+}
+
+// "p(r.x => a, r.y => b)" names the parts of one parameter one at a time: the
+// parameter and the element of it this association element names (6.5.7.1)
+static bool vhdlIndividualFormal(const AstNodeVhdlExpr* formalp, std::string& root,
+                                 std::string& elem) {
+    const AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected);
+    if (!selp) return false;
+    const AstVhdlName* const prefixp = VN_CAST(selp->prefixp(), VhdlName);
+    const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
+    if (!prefixp || !suffixp) return false;
+    root = prefixp->name();
+    elem = suffixp->name();
+    return true;
 }
 
 // Which formal each actual of a call names: positional up to the first named
 // one, by name after that, and a formal with a default may be left out
 // (6.5.7.1). False where the call cannot be read that way at all.
 bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
-                     std::vector<int>& formalOf) {
+                     std::vector<int>& formalOf, std::vector<std::string>* elemOf) {
     const size_t formals = symp->paramTypes().size();
     formalOf.assign(assocs.size(), -1);
+    if (elemOf) elemOf->assign(assocs.size(), std::string{});
     std::vector<bool> filled(formals, false);
+    // A formal whose elements are associated one at a time is named once per
+    // element, and each of its elements exactly once (6.5.7.1)
+    std::map<size_t, std::set<std::string>> individual;
     bool named = false;
     for (size_t i = 0; i < assocs.size(); ++i) {
         AstVhdlAssoc* const asp = assocs[i];
@@ -4955,11 +5052,33 @@ bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& a
             continue;
         }
         named = true;
-        if (!formalNamep) return false;  // A conversion or an indexed formal
+        if (!formalNamep) {
+            // The elements of one formal, associated one at a time (6.5.7.1)
+            std::string root;
+            std::string elem;
+            if (!vhdlIndividualFormal(asp->formalp(), root, elem)) {
+                return false;  // A conversion, a slice or an indexed formal
+            }
+            const int idx = symp->paramIndex(root);
+            if (idx < 0) return false;
+            if (!vhdlElementNamed(symp->paramTypes()[idx], elem)) return false;
+            if (filled[idx] && !individual.count(idx)) return false;
+            if (!individual[idx].insert(elem).second) return false;  // Twice over
+            formalOf[i] = idx;
+            if (elemOf) (*elemOf)[i] = elem;
+            filled[idx] = true;
+            continue;
+        }
         const int idx = symp->paramIndex(formalNamep->name());
         if (idx < 0 || filled[idx]) return false;
         formalOf[i] = idx;
         filled[idx] = true;
+    }
+    // Every element of a formal associated individually must be there: what
+    // is left out has no actual at all, and no default can supply it
+    for (const auto& pair : individual) {
+        const VhdlType* const typep = symp->paramTypes()[pair.first];
+        if (!typep || typep->base()->elements().size() != pair.second.size()) return false;
     }
     for (size_t i = 0; i < formals; ++i) {
         if (!filled[i] && !symp->paramHasDefault(i)) return false;
@@ -5153,17 +5272,18 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // Otherwise a subprogram call, resolved by its arguments and its context
     std::vector<VhdlSymbol*> cands;
     std::vector<int> formalOf;
+    std::vector<std::string> elemOf;
     int best = -1;
     for (VhdlSymbol* const symp : found) {
         // An alias of a subprogram is called like the subprogram it names
         const VhdlSymKind kind = symp->resolved()->kind();
         if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
-        if (!bindActuals(symp, assocs, formalOf)) continue;
+        if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
         bool ok = true;
         int score = 0;
         for (size_t i = 0; i < argCands.size() && ok; ++i) {
             if (formalOf[i] < 0) continue;
-            VhdlType* const paramp = symp->paramTypes()[formalOf[i]];
+            VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
             if (!anyMatches(argCands[i], paramp)) ok = false;
             if (exactMatch(argCands[i], paramp)) ++score;
         }
@@ -5187,7 +5307,7 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         for (VhdlSymbol* const symp : found) {
             const VhdlSymKind kind = symp->resolved()->kind();
             if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
-            if (!bindActuals(symp, assocs, formalOf)) continue;
+            if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
             ++arityOk;
             if (arityOk > 1) {
                 detail.clear();
@@ -5195,9 +5315,10 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             }
             for (size_t i = 0; i < argCands.size(); ++i) {
                 if (formalOf[i] < 0) continue;
-                VhdlType* const paramp = symp->paramTypes()[formalOf[i]];
+                VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
                 if (anyMatches(argCands[i], paramp)) continue;
-                detail = ": argument '" + symp->paramName(formalOf[i]) + "' expects "
+                detail = ": argument '" + symp->paramName(formalOf[i])
+                         + (elemOf[i].empty() ? "" : "." + elemOf[i]) + "' expects "
                          + (paramp ? paramp->prettyName() : std::string{"<unknown>"});
                 if (i < argTypes.size() && argTypes[i]) {
                     detail += ", not " + argTypes[i]->prettyName();
@@ -5222,9 +5343,9 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                 for (VhdlSymbol* const symp : found) {
                     const VhdlSymKind kind = symp->resolved()->kind();
                     if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
-                    if (!bindActuals(symp, assocs, formalOf)) continue;
+                    if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
                     if (formalOf[i] < 0) continue;
-                    VhdlType* const paramp = symp->paramTypes()[formalOf[i]];
+                    VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
                     if (anyMatches(argCands[i], paramp)) {
                         anyOk = true;
                         break;
@@ -5266,10 +5387,10 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         = pick(nodep, cands, wantp,
                "subprogram '" + (parts.empty() ? std::string{"<name>"} : parts.back()) + "'");
     // The chosen signature now settles every actual
-    if (nodep->vhdlSymp() && bindActuals(nodep->vhdlSymp(), assocs, formalOf)) {
+    if (nodep->vhdlSymp() && bindActuals(nodep->vhdlSymp(), assocs, formalOf, &elemOf)) {
         for (size_t i = 0; i < assocs.size(); ++i) {
             if (!assocs[i] || !assocs[i]->actualp() || formalOf[i] < 0) continue;
-            VhdlType* const paramp = nodep->vhdlSymp()->paramTypes()[formalOf[i]];
+            VhdlType* const paramp = vhdlFormalTypeAt(nodep->vhdlSymp(), formalOf[i], elemOf[i]);
             analyzeExpr(assocs[i]->actualp(), paramp);
             // A parameter written against an unconstrained array takes its
             // index range from the actual (5.3.2.2). Where the actual is a
@@ -5767,8 +5888,17 @@ VhdlType* VhdlSemVisitor::constrainRecordFromValue(VhdlType* typep, AstNodeVhdlE
             }
         }
     }
+    return constrainRecordFromParts(typep, byPos, flp);
+}
+
+// A record subtype whose open elements take their bounds from the values
+// given for them, one per element in declaration order (5.3.3)
+VhdlType* VhdlSemVisitor::constrainRecordFromParts(VhdlType* typep,
+                                                   const std::vector<AstNodeVhdlExpr*>& byPos,
+                                                   FileLine* flp) {
+    const std::vector<VhdlSymbol*>& elems = typep->elements();
     VhdlType* outp = nullptr;
-    for (size_t i = 0; i < elems.size(); ++i) {
+    for (size_t i = 0; i < elems.size() && i < byPos.size(); ++i) {
         VhdlType* const elemTypep = elems[i]->typep();
         if (!elemTypep || !byPos[i]) continue;
         if (elemTypep->base()->kind() != VhdlTypeKind::ARRAY || !elemTypep->unconstrained()) {

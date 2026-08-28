@@ -3308,6 +3308,9 @@ private:
         }
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (symp && symp->kind() == VhdlSymKind::RECORD_ELEMENT) {
+            // An element of a formal the call associated one element at a
+            // time is the actual signal itself (6.5.7.1)
+            if (AstNodeVhdlExpr* const boundp = elementBindOf(nodep)) return lowerExpr(boundp);
             AstNodeExpr* fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
             fromp = derefIfAccess(fromp, nodep->prefixp(), flp);
@@ -3325,6 +3328,18 @@ private:
         flattenName(nodep, parts);
         unsup(flp, "name '" + (parts.empty() ? std::string{"?"} : parts.back()) + "'");
         return nullptr;
+    }
+
+    // Where a selected name reads an element of a formal whose elements were
+    // associated one at a time, the actual that element was given (6.5.7.1)
+    AstNodeVhdlExpr* elementBindOf(const AstVhdlSelected* nodep) {
+        if (m_bindElems.empty() || !nodep->vhdlSymp()) return nullptr;
+        const AstVhdlName* const prefixp = VN_CAST(nodep->prefixp(), VhdlName);
+        if (!prefixp || !prefixp->vhdlSymp()) return nullptr;
+        const auto it = m_bindElems.find(prefixp->vhdlSymp());
+        if (it == m_bindElems.end()) return nullptr;
+        const auto eit = it->second.find(nodep->vhdlSymp()->name());
+        return eit == it->second.end() ? nullptr : eit->second;
     }
 
     // An operator a design declares itself is an ordinary function whose name
@@ -5763,6 +5778,20 @@ private:
             }
         }
         return nullptr;
+    }
+
+    // "p(iface.d => sd)" names one element of one formal (6.5.7.1): which
+    // formal, and which element of it
+    static bool individualFormal(const AstNodeVhdlExpr* formalp, std::string& root,
+                                 std::string& elem) {
+        const AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected);
+        if (!selp) return false;
+        const AstVhdlName* const prefixp = VN_CAST(selp->prefixp(), VhdlName);
+        const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
+        if (!prefixp || !suffixp) return false;
+        root = prefixp->name();
+        elem = suffixp->name();
+        return true;
     }
 
     static bool staticSelectKey(const AstNodeVhdlExpr* nodep, std::string& out) {
@@ -8734,17 +8763,47 @@ private:
         std::map<const VhdlSymbol*, AstNodeVhdlExpr*> exprBind;
         std::map<const VhdlSymbol*, VhdlActive> activeBind;
         std::map<const VhdlSymbol*, VhdlSymbol*> symBind;
+        std::map<const VhdlSymbol*, std::map<std::string, AstNodeVhdlExpr*>> elemBind;
         std::string key = symp->name();
         for (size_t i = 0; i < formals.size(); ++i) {
             AstNodeVhdlExpr* actualp = nullptr;
+            // The elements of this formal that the call named one at a time
+            std::map<std::string, AstNodeVhdlExpr*> parts;
             for (size_t a = 0; a < assocs.size(); ++a) {
                 const AstVhdlName* const namep
                     = assocs[a]->formalp() ? VN_CAST(assocs[a]->formalp(), VhdlName) : nullptr;
                 if (namep) {
                     if (namep->name() == formals[i]->name()) actualp = assocs[a]->actualp();
-                } else if (a == i) {
-                    actualp = assocs[a]->actualp();
+                    continue;
                 }
+                if (assocs[a]->formalp()) {
+                    std::string root;
+                    std::string elem;
+                    if (individualFormal(assocs[a]->formalp(), root, elem)
+                        && root == formals[i]->name()) {
+                        parts.emplace(elem, assocs[a]->actualp());
+                    }
+                    continue;
+                }
+                if (a == i) actualp = assocs[a]->actualp();
+            }
+            if (!parts.empty()) {
+                // Each element is a signal of the design in its own right, so
+                // the formal gets no object and every reference to one of its
+                // elements lowers to that element's actual
+                if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) return nullptr;
+                std::map<std::string, AstNodeVhdlExpr*> resolved;
+                for (const auto& pair : parts) {
+                    AstNodeVhdlExpr* const partp = pair.second;
+                    const VhdlSymbol* const rootp = partp ? baseSymOf(partp) : nullptr;
+                    std::string path;
+                    if (!rootp || !m_vars.count(rootp) || m_drivers.count(rootp)) return nullptr;
+                    if (!staticSelectKey(partp, path)) return nullptr;
+                    resolved.emplace(pair.first, partp);
+                    key += "|" + pair.first + "=" + path;
+                }
+                elemBind.emplace(formals[i]->vhdlSymp(), resolved);
+                continue;
             }
             if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) {
                 if (actualp) passed.push_back(AstVhdlExprPair{formals[i]->name(), actualp});
@@ -8758,6 +8817,21 @@ private:
                 AstVhdlAliasDecl* const adeclp = VN_CAST(asymp->declp(), VhdlAliasDecl);
                 if (!adeclp || !adeclp->targetp()) break;
                 actualp = adeclp->targetp();
+            }
+            // An actual that is itself a formal whose elements were named one
+            // at a time carries those elements on into this copy
+            if (actualp) {
+                const VhdlSymbol* const passedp = actualp->vhdlSymp();
+                const auto elIt = passedp ? m_bindElems.find(passedp) : m_bindElems.end();
+                if (elIt != m_bindElems.end()) {
+                    elemBind.emplace(formals[i]->vhdlSymp(), elIt->second);
+                    for (const auto& pair : elIt->second) {
+                        std::string path;
+                        if (!staticSelectKey(pair.second, path)) return nullptr;
+                        key += "|" + pair.first + "=" + path;
+                    }
+                    continue;
+                }
             }
             // A signal actual is a signal of the design, either named plainly
             // or with a part of it selected in a way that is decided now
@@ -8789,7 +8863,7 @@ private:
             if (acIt != m_actives.end()) activeBind.emplace(formals[i]->vhdlSymp(), acIt->second);
             key += "|" + std::to_string(reinterpret_cast<uintptr_t>(varIt->second));
         }
-        if (bind.empty() && exprBind.empty()) return nullptr;
+        if (bind.empty() && exprBind.empty() && elemBind.empty()) return nullptr;
         auto copyIt = m_signalCopies.find(key);
         if (copyIt == m_signalCopies.end()) {
             // The formals belong to the one declaration, so building a copy
@@ -8806,9 +8880,11 @@ private:
                 VL_RESTORER_COPY(m_prefix);
                 VL_RESTORER_COPY(m_bindExprs);
                 VL_RESTORER_COPY(m_bindSymbols);
+                VL_RESTORER_COPY(m_bindElems);
                 m_bindSignals = bind;
                 m_bindExprs = exprBind;
                 m_bindSymbols = symBind;
+                m_bindElems = elemBind;
                 m_ftaskp = nullptr;
                 m_prefix.clear();
                 for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
@@ -10004,6 +10080,11 @@ private:
     // one -- "drive(r.y, 3)" -- which has no variable of its own to stand
     // for it, so the actual's own name is lowered again at each reference
     std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_bindExprs;
+    // A signal-class formal of a record type whose elements the call named
+    // one at a time -- "p(iface.d => sd, iface.v => sv)" -- so the formal
+    // stands for no one object and each element is a signal of its own
+    // (6.5.7.1). Each reference to an element lowers to the actual's name.
+    std::map<const VhdlSymbol*, std::map<std::string, AstNodeVhdlExpr*>> m_bindElems;
     std::map<std::string, AstNodeFTask*> m_signalCopies;
 
     void lowerSubprogram(AstVhdlSubprogDecl* nodep) { lowerSubprogramInto(nodep, ""); }
@@ -10076,6 +10157,10 @@ private:
             // Bound to part of a signal rather than to a whole one, which
             // likewise needs no port: the body names that part directly
             if (m_bindExprs.count(psymp)) continue;
+            // A formal whose elements were associated one at a time stands
+            // for no one object, and each of its elements names its own
+            // actual wherever the body reads or drives it (6.5.7.1)
+            if (m_bindElems.count(psymp)) continue;
             AstVar* const varp = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
                                             lowerType(psymp->typep(), flp)};
             switch (ifp->mode()) {
