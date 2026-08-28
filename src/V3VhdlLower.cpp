@@ -168,6 +168,8 @@ class VhdlLowerVisitor final {
     std::map<const VhdlType*, AstNodeFTask*> m_valueFuncs;  // "T'VALUE" readers, per type
     std::set<std::string> m_instNames;  // Instance labels the module has used
     int m_processNum = 0;  // For naming unlabelled processes
+    // Set by a statement that advanced the driver index itself
+    bool m_countedDrivers = false;
     bool m_errored = false;
 
     VL_UNCOPYABLE(VhdlLowerVisitor);
@@ -5086,7 +5088,12 @@ private:
         for (const VhdlSymbol* const symp : driven) {
             if (m_drivers.count(symp)) resolved.push_back(symp);
         }
+        VL_RESTORER(m_countedDrivers);
+        m_countedDrivers = false;
         lowerConcurrent(nodep);
+        // A generate written out once per iteration counted its own, since
+        // how many there were is what made it write them out
+        if (m_countedDrivers) return;
         for (const VhdlSymbol* const symp : resolved) ++m_driverUsed[symp];
     }
 
@@ -7199,6 +7206,61 @@ private:
     // parameter, or once if its condition holds (11.8). Verilator's own
     // generate machinery does the elaboration, so lowering only has to build
     // the right shape.
+    // Whether the statements of a generate drive a signal that is resolved
+    bool drivesResolved(AstVhdlGenerate* nodep) {
+        std::set<const VhdlSymbol*> driven;
+        collectDriven(nodep, driven);
+        for (const VhdlSymbol* const dsymp : driven) {
+            if (m_drivers.count(dsymp)) return true;
+        }
+        return false;
+    }
+
+    // A for generate written out once per iteration, with its parameter a
+    // constant in each copy. Each copy is a driver of whatever it drives,
+    // which is why the loop cannot be left for the back end to unroll.
+    void unrollGenerate(AstVhdlGenerate* nodep, VhdlSymbol* symp, VhdlType* rangep,
+                        const std::string& label, FileLine* flp) {
+        std::set<const VhdlSymbol*> driven;
+        collectDriven(nodep, driven);
+        std::vector<const VhdlSymbol*> resolved;
+        for (const VhdlSymbol* const dsymp : driven) {
+            if (m_drivers.count(dsymp)) resolved.push_back(dsymp);
+        }
+        m_countedDrivers = true;
+        const int64_t left = rangep->left();
+        const int64_t right = rangep->right();
+        const bool up = rangep->ascending();
+        const int64_t count = up ? right - left + 1 : left - right + 1;
+        for (int64_t k = 0; k < count; ++k) {
+            const int64_t value = up ? left + k : left - k;
+            // The name a copy goes by. A negative index is spelled with an
+            // 'n', since the back end's names have no sign in them.
+            const std::string suffix = value < 0 ? "n" + std::to_string(-value)
+                                                 : std::to_string(value);
+            AstVar* const paramp
+                = new AstVar{flp, VVarType::LPARAM, "__Vgenv__" + symp->name() + "__" + suffix,
+                             VFlagChildDType{}, new AstBasicDType{flp, VBasicDTypeKwd::INTEGER}};
+            paramp->valuep(new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(value)});
+            const auto prevIt = m_vars.find(symp);
+            const bool had = prevIt != m_vars.end();
+            AstVar* const savedp = had ? prevIt->second : nullptr;
+            m_vars[symp] = paramp;
+            AstNode* const itemsp = lowerGenerateBody(nodep->altsp());
+            if (had) {
+                m_vars[symp] = savedp;
+            } else {
+                m_vars.erase(symp);
+            }
+            AstGenBlock* const blockp
+                = new AstGenBlock{flp, label + "__" + suffix, nullptr, false};
+            blockp->addItemsp(paramp);
+            if (itemsp) blockp->addItemsp(itemsp);
+            addStmt(blockp);
+            for (const VhdlSymbol* const dsymp : resolved) ++m_driverUsed[dsymp];
+        }
+    }
+
     void lowerGenerate(AstVhdlGenerate* nodep) {
         FileLine* const flp = nodep->fileline();
         const std::string label = nodep->label().empty()
@@ -7209,6 +7271,14 @@ private:
         if (nodep->kind() == VhdlLoopKind::FOR) {
             VhdlSymbol* const symp = nodep->vhdlSymp();
             VhdlType* const rangep = symp ? symp->typep() : nullptr;
+            // Each iteration of a generate that drives a resolved signal is
+            // one driver of it (11.8, 14.7.2), and the drivers are separate
+            // objects, so the body is written out once per iteration rather
+            // than left as a loop for the back end to unroll
+            if (symp && rangep && rangep->bounded() && drivesResolved(nodep)) {
+                unrollGenerate(nodep, symp, rangep, label, flp);
+                return;
+            }
             AstNodeExpr* fromp = nullptr;
             AstNodeExpr* limitp = nullptr;
             bool ascending = true;

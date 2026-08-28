@@ -3407,9 +3407,23 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             }
             std::set<const VhdlSymbol*> whole;
             collectDrivenSyms(p, whole, partial, false);
-            const bool inGenerate = VN_IS(p, VhdlGenerate);
+            const AstVhdlGenerate* const genp = VN_CAST(p, VhdlGenerate);
+            const bool inGenerate = genp;
+            // Every iteration of a for generate elaborates the statements of
+            // its body again, and each copy is a driver of its own (11.8)
+            int repeat = 1;
+            if (genp && genp->kind() == VhdlLoopKind::FOR) {
+                const VhdlSymbol* const gsymp = genp->vhdlSymp();
+                const VhdlType* const rangep = gsymp ? gsymp->typep() : nullptr;
+                if (rangep && rangep->bounded()) {
+                    const int64_t len = rangep->ascending() ? rangep->right() - rangep->left() + 1
+                                                            : rangep->left() - rangep->right() + 1;
+                    repeat = len <= 0 ? 0 : static_cast<int>(len);
+                }
+            }
+            if (!repeat) continue;
             for (const VhdlSymbol* const symp : whole) {
-                ++counts[symp];
+                counts[symp] += repeat;
                 if (!inGenerate) outsideGenerate.insert(symp);
                 if (!where.count(symp)) where[symp] = p->fileline();
             }
