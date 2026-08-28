@@ -763,8 +763,16 @@ private:
                                    + std::to_string(idxp->length()) + " elements");
                     return dtypep;
                 }
-                rangep = new AstRange{flp, static_cast<int>(idxp->left()),
-                                      static_cast<int>(idxp->right())};
+                // A null array has no elements at all (5.3.2.1). Verilog has
+                // no zero-width type, so one element stands for it: nothing
+                // may index it, and every value of it is equal to every
+                // other, which is what a null value means. Its 'LENGTH still
+                // folds to zero, since that comes from the type and not from
+                // the width emitted here.
+                const int64_t left = idxp->left();
+                const int64_t right = idxp->length() <= 0 ? left : idxp->right();
+                rangep = new AstRange{flp, static_cast<int>(left),
+                                      static_cast<int>(right)};
             }
             // A vector of single bits is what Verilog writes as "logic
             // [7:0]", which is a type with a range rather than an array of
