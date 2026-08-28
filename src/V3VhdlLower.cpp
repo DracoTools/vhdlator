@@ -1320,6 +1320,8 @@ private:
             // An uninstantiated generic subprogram is a template, never
             // called as it stands (4.4)
             if (subp->genericCount() != 0 && !subp->isInstance()) return;
+            // One a copy was made of for every call site is a template too
+            if (subp->specialized()) return;
             // One with a signal parameter is a template too, of a different
             // kind: what its formal names, and so what that formal's history
             // attributes answer from, is only known at a call site, so a copy

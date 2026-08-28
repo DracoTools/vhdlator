@@ -536,8 +536,15 @@ class VhdlSemVisitor final : public VNVisitor {
     }
 
     // A choice must denote a value of the index range it selects from (9.3.3.3)
+    static bool isNullRange(const VhdlType* typep) {
+        if (!typep || !typep->bounded()) return false;
+        return typep->ascending() ? typep->left() > typep->right()
+                                  : typep->left() < typep->right();
+    }
+
     void checkChoiceInRange(FileLine* flp, const VhdlValue& val, VhdlType* typep) {
         if (!typep || !typep->bounded() || !val.known()) return;
+        if (isNullRange(typep)) return;
         if (V3VhdlEval::inRange(val, typep)) return;
         err(flp, "Choice " + val.prettyName() + " is outside the index range, which is "
                      + rangeText(typep));
@@ -548,6 +555,11 @@ class VhdlSemVisitor final : public VNVisitor {
     // so that only a certain violation is reported.
     void checkValueInRange(AstNodeVhdlExpr* nodep, VhdlType* typep, const std::string& what) {
         if (!nodep || !typep || !typep->bounded() || !typep->isScalar()) return;
+        // A null range holds no value at all (5.2.1), so every value is
+        // outside it and saying so tells no one anything. Code that indexes a
+        // null array guards itself -- "if v'length > 0 then v(v'high)" --
+        // and that guard is a run-time test, not one this can see.
+        if (isNullRange(typep)) return;
         const VhdlValue val = V3VhdlEval::eval(nodep);
         if (!val.known() || V3VhdlEval::inRange(val, typep)) return;
         err(nodep->fileline(), "Value " + val.prettyName() + " is outside the range of " + what
@@ -1569,10 +1581,12 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             ifp->kind() == VhdlIfaceKind::SIGNAL ? VhdlSymKind::SIGNAL : VhdlSymKind::PARAMETER,
             ifp->name(), ifp);
         psymp->typep(typep);
-        // Only a constant read into the subprogram may be folded: one the
-        // body may write is not the same value throughout (4.2.2.1)
+        // Only a value read into the subprogram may be folded: one the body
+        // may write is not the same throughout (4.2.2.1). A parameter
+        // written without a class is a constant where its mode is "in".
         if (paramNum < specValues.size() && specValues[paramNum].known()
-            && ifp->kind() == VhdlIfaceKind::CONSTANT && ifp->mode() == VhdlMode::IN) {
+            && ifp->kind() != VhdlIfaceKind::SIGNAL && ifp->kind() != VhdlIfaceKind::FILE
+            && ifp->mode() == VhdlMode::IN) {
             psymp->value(specValues[paramNum]);
         }
         ifp->vhdlSymp(psymp);
@@ -2960,7 +2974,7 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     VhdlSymbol* const newSymp = copyp->vhdlSymp();
     if (newSymp && newSymp->returnTypep()
         && newSymp->returnTypep()->base()->kind() == VhdlTypeKind::ARRAY
-        && !newSymp->returnTypep()->isConstrainedArray()) {
+        && !newSymp->returnTypep()->lengthEmittable()) {
         VhdlType* foundp = nullptr;
         findReturnedType(copyp->stmtsp(), foundp);
         if (!foundp) {
@@ -2968,7 +2982,7 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
             // parameter of the same type says how long that is
             for (VhdlType* const typep : newSymp->paramTypes()) {
                 if (typep && typep->base() == newSymp->returnTypep()->base()
-                    && typep->isConstrainedArray()) {
+                    && typep->lengthEmittable()) {
                     foundp = typep;
                     break;
                 }
@@ -2976,7 +2990,10 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
         }
         if (foundp) newSymp->returnTypep(foundp);
     }
-    // The copy belongs beside the original, so lowering finds it
+    // The copy belongs beside the original, so lowering finds it. The
+    // original is a template from here on: every call names a copy, and
+    // emitting it would mean emitting a body whose lengths nothing settled.
+    originalp->specialized(true);
     originalp->addNextHere(copyp);
     return newSymp;
 }
@@ -2990,9 +3007,12 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp) {
                 // written with its own range does (9.3.3.3)
                 VhdlType* const typep = constrainFromValue(
                     retp->valuep()->vhdlTypep(), retp->valuep(), retp->fileline());
-                if (typep && (typep->isConstrainedArray() || fullyConstrainedRecord(typep))) {
-                    foundp = typep;
-                }
+                const bool usable
+                    = typep
+                      && (typep->base()->kind() == VhdlTypeKind::ARRAY
+                              ? typep->lengthEmittable()
+                              : fullyConstrainedRecord(typep));
+                if (usable) foundp = typep;
             }
             continue;
         }
@@ -3087,7 +3107,7 @@ private:
                 return true;
             }
         }
-        return resultIsUnconstrained(symp);
+        return resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
     }
 
     // A function whose result has no length of its own gets that length from
@@ -3099,12 +3119,71 @@ private:
                && !retp->lengthEmittable();
     }
 
+    // A subprogram whose body declares something as long as one of its own
+    // parameters -- "variable r : bit_vector(1 to n)", or a type declared
+    // inside it whose element is that long -- needs a copy per value, since
+    // by the time the declaration is emitted the length has to be a number.
+    static bool bodyNeedsParamValues(const VhdlSymbol* symp) {
+        AstVhdlSubprogDecl* const declp = symp->bodyp();
+        if (!declp) return false;
+        std::set<const VhdlSymbol*> params;
+        AstNode* p = declp->paramsp();
+        for (int g = 0; p && g < declp->genericCount(); ++g) p = p->nextp();
+        for (; p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            // Only a value read into the subprogram is the same throughout
+            // it: one the body may write is not (4.2.2.1). A parameter
+            // written without a class is a constant where its mode is "in".
+            if (ifp->kind() != VhdlIfaceKind::SIGNAL && ifp->kind() != VhdlIfaceKind::FILE
+                && ifp->mode() == VhdlMode::IN && ifp->vhdlSymp()) {
+                params.insert(ifp->vhdlSymp());
+            }
+        }
+        if (params.empty()) return false;
+        bool found = false;
+        declp->foreach([&](AstVhdlSubtypeInd* sip) {
+            if (found) return;
+            sip->foreach([&](AstNodeVhdlExpr* refp) {
+                if (refp->vhdlSymp() && params.count(refp->vhdlSymp())) found = true;
+            });
+        });
+        return found;
+    }
+
+    // Whether the length of an actual is one the copy can carry: a number, or
+    // an expression written in terms the region the copy is analyzed in can
+    // see. A bound naming a generic folds once the instance is elaborated; one
+    // naming a parameter of the subprogram the call is written in means
+    // nothing outside that subprogram.
+    static bool lengthTravels(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8) return false;
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY) return true;
+        if (!typep->lengthEmittable()) return false;
+        bool ok = true;
+        for (const VhdlType* const idxp : typep->indexTypes()) {
+            if (!idxp) return false;
+            if (idxp->bounded()) continue;
+            AstNode* const boundsp = idxp->boundsp();
+            if (!boundsp) return false;
+            boundsp->foreach([&](AstNodeVhdlExpr* refp) {
+                const VhdlSymbol* const refSymp = refp->vhdlSymp();
+                if (refSymp && refSymp->kind() == VhdlSymKind::PARAMETER) ok = false;
+            });
+        }
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (ok && elemp && elemp != typep && elemp->base()->kind() == VhdlTypeKind::ARRAY) {
+            ok = lengthTravels(elemp, depth + 1);
+        }
+        return ok;
+    }
+
     void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
         if (!needsSpecializing(symp)) return;
         // A copy is never itself specialized: it was made for one call site
         // and has nothing left to fix
         if (m_madeSyms.count(symp)) return;
-        const bool byValue = resultIsUnconstrained(symp);
+        const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
         // The actual types, which must all be known for the copy to be made
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
@@ -3120,14 +3199,21 @@ private:
             // Only a length that is known is worth specializing on
             if (symp->paramTypes()[i]
                 && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::ARRAY) {
-                if (!typep || !typep->isConstrainedArray()) return;
+                // A bound that names a generic is a length even though it
+                // is not a number here, and the copy carries it as written --
+                // but one that names a parameter of the subprogram the call
+                // is written in means nothing where the copy is analyzed
+                if (!typep || (!typep->isConstrainedArray() && !lengthTravels(typep))) return;
                 // A length of two billion is an index subtype's range, not an
                 // object's; specializing on it would be meaningless and would
                 // make the copy's own bounds checks fire
                 const int64_t length = typep->dimLength(0);
+                if (length > (1 << 20)) return;
                 // Zero is a length: a null array has no elements at all (5.3.2.1).
-                // What this guard is for is a length that was never constrained.
-                if (length < 0 || length > (1 << 20)) return;
+                // What this guard is for is a length that was never constrained
+                // -- but a bound that names a generic is a length even though
+                // it is not a number here, and the copy carries it as written.
+                if (length < 0 && !lengthTravels(typep)) return;
             }
             actualTypes.push_back(typep);
         }

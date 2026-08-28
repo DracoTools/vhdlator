@@ -772,6 +772,9 @@ class AstVhdlSubprogDecl final : public AstNodeVhdlDecl {
     // defaults to whatever is visible where it is instantiated (6.5.5)
     bool m_defaultsToVisible = false;
     bool m_isInstance = false;  // A copy made by "is new", which is callable
+    // A copy was made of this one for a call site, so it is a template: the
+    // calls name the copies, and it has nothing left to emit
+    bool m_specialized = false;
     std::string m_templateName;  // What the copy was made from, for recursion
 
 public:
@@ -792,6 +795,8 @@ public:
     void defaultsToVisible(bool flag) { m_defaultsToVisible = flag; }
     bool isInstance() const { return m_isInstance; }
     void isInstance(bool flag) { m_isInstance = flag; }
+    bool specialized() const { return m_specialized; }
+    void specialized(bool flag) { m_specialized = flag; }
     const std::string& templateName() const { return m_templateName; }
     void templateName(const std::string& name) { m_templateName = name; }
     bool isOperator() const { return m_isOperator; }
