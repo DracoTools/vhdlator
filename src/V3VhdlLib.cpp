@@ -163,14 +163,20 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             unit.key = primaryKey(work, unitp->name());
             std::vector<std::string> parts;
             if (flattenName(instp->uninstantiatedp(), parts) && !parts.empty()) {
+                // The uninstantiated package may be nested inside another --
+                // "work.axi4s.make" -- and then it is the outer one that is
+                // the design unit to analyze first (4.9)
                 const std::string lib
                     = parts.size() >= 2 ? lower(parts[parts.size() - 2]) : work;
-                unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, parts.back()));
+                const std::string key
+                    = parts.size() >= 3
+                          ? primaryKey(parts[0] == "work" ? work : parts[0], parts[1])
+                          : primaryKey(lib == "work" ? work : lib, parts.back());
+                unit.dependsOn.push_back(key);
                 // And its body, where it has one, since the copy takes that
                 // too -- but an uninstantiated package need not have a body,
                 // so this only says which order to take them in
-                unit.softDependsOn.push_back(
-                    primaryKey(lib == "work" ? work : lib, parts.back()) + "%body");
+                unit.softDependsOn.push_back(key + "%body");
             }
             // A generic package is given another package by name --
             // "fixed_pkg => IEEE.fixed_pkg" -- and that one has to be

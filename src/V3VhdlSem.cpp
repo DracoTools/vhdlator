@@ -1076,6 +1076,7 @@ public:
     // many driver values as it has drivers
     void specializeResolvers() VL_MT_DISABLED;
     bool reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    void spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
 
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
@@ -1087,6 +1088,7 @@ private:
     void visit(AstVhdlSubprogDecl* nodep) override;
     void visit(AstVhdlComponentDecl* nodep) override;
     void visit(AstVhdlAliasDecl* nodep) override;
+    void visit(AstVhdlPackage* nodep) override;
     void visit(AstVhdlPackageInst* nodep) override;
     void visit(AstVhdlSubprogInst* nodep) override;
 
@@ -2372,6 +2374,8 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             iterateAndNextNull(archp->stmtsp());
             analyzeDrivers(archp);
         } else if (AstVhdlPackage* const pkgp = VN_CAST(unitp, VhdlPackage)) {
+            // A package's own name is visible inside it (12.1)
+            unitScopep->addNamed(lower(unitp->name()), unitScopep);
             iterateAndNextNull(pkgp->genericsp());
             iterateAndNextNull(pkgp->declsp());
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
@@ -2490,6 +2494,25 @@ public:
 // unconstrained subprogram is: the copy is analyzed from scratch, so
 // everything inside it -- a type whose bounds name a generic, a subprogram
 // whose body does -- comes out as ordinary VHDL with every bound known.
+// A package declared inside another declarative region rather than as a
+// design unit of its own (4.7). It has a region of its own, and its name is
+// how the outside reaches into it.
+void VhdlSemVisitor::visit(AstVhdlPackage* nodep) {
+    VhdlScope* const outerp = m_scopep;
+    VhdlScope* const innerp = pushScope(nodep->name());
+    // A package's own name is visible inside it (12.1), so a nested package
+    // may write "outer.t" for a type the outer one declares
+    innerp->addNamed(lower(nodep->name()), innerp);
+    iterateAndNextNull(nodep->genericsp());
+    iterateAndNextNull(nodep->declsp());
+    m_scopep = outerp;
+    outerp->addNamed(lower(nodep->name()), innerp);
+    VhdlSymbol* const symp
+        = VhdlSymTab::newSymbol(VhdlSymKind::PACKAGE, nodep->name(), nodep);
+    symp->innerp(innerp);
+    declare(symp, nodep->fileline());
+}
+
 void VhdlSemVisitor::visit(AstVhdlPackageInst* nodep) {
     VhdlScope* const outerp = m_scopep;
     VhdlScope* const innerp = pushScope(nodep->name());
@@ -2518,9 +2541,38 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         if (lib == "work") lib = m_libname;
         key = lib + "." + lower(parts.back());
     }
+    bool nested = false;
     const auto unitIt = m_primaryUnits.find(key);
-    AstVhdlPackage* const pkgp
+    AstVhdlPackage* pkgp
         = unitIt == m_primaryUnits.end() ? nullptr : VN_CAST(unitIt->second, VhdlPackage);
+    if (!pkgp && parts.size() >= 3) {
+        // The uninstantiated package may be one declared inside another --
+        // "package p is new work.axi4s.make" -- and then the design unit is
+        // the outer one and the rest of the name walks into it (4.9)
+        std::string olib = lower(parts[0]);
+        if (olib == "work") olib = m_libname;
+        const auto outerIt = m_primaryUnits.find(olib + "." + lower(parts[1]));
+        AstVhdlPackage* nestedp
+            = outerIt == m_primaryUnits.end() ? nullptr : VN_CAST(outerIt->second, VhdlPackage);
+        for (size_t i = 2; nestedp && i < parts.size(); ++i) {
+            AstVhdlPackage* foundp = nullptr;
+            for (AstNode* p = nestedp->declsp(); p; p = p->nextp()) {
+                AstVhdlPackage* const np = VN_CAST(p, VhdlPackage);
+                if (np && lower(np->name()) == lower(parts[i])) {
+                    foundp = np;
+                    break;
+                }
+            }
+            nestedp = foundp;
+        }
+        pkgp = nestedp;
+        if (pkgp) {
+            // The copy is analyzed as if written where the nested package
+            // is, so the outer package's own declarations are visible to it
+            key = olib + "." + lower(parts[1]);
+            nested = true;
+        }
+    }
     if (!pkgp) {
         err(nodep->fileline(), "Cannot find package '" + parts.back() + "' to instantiate");
         return;
@@ -2542,6 +2594,12 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         const VhdlScope* const ctxp = scopeIt->second->parentp();
         for (VhdlScope* const usedp : ctxp->uses()) intop->addUse(usedp);
         for (const auto& pair : ctxp->named()) intop->addNamed(pair.first, pair.second);
+    }
+    // A package nested in another names what that one declares, and may name
+    // the outer package itself -- "subtype t is axi4s.axis_t(...)"
+    if (nested && scopeIt != m_unitScopes.end()) {
+        intop->addUse(scopeIt->second);
+        intop->addNamed(lower(parts[1]), scopeIt->second);
     }
     intop->addUse(savedp);
     VL_RESTORER(m_inPkgInst);
@@ -2600,7 +2658,9 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         nodep->addDeclsp(copyp);
     }
     AstNode* firstBodyp = nullptr;
-    const auto bodyIt = m_packageBodies.find(key);
+    // A nested package has no body of its own; the key here names the outer
+    // one, whose body is not what this copy takes
+    const auto bodyIt = nested ? m_packageBodies.end() : m_packageBodies.find(key);
     if (bodyIt != m_packageBodies.end()) {
         // The body has a context clause of its own -- IEEE's fixed_generic_pkg
         // body uses MATH_REAL where its declaration does not
@@ -3322,6 +3382,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     for (int round = 0; round < 8; ++round) {
         if (!visitor.reconstrainDecls(unitsp)) break;
     }
+    visitor.spreadElabConstants(unitsp);
     // A resolution function is called once per resolved signal rather than
     // from anywhere in the source, so its copy is made here rather than by
     // the pass above
@@ -4335,9 +4396,14 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
         }
         return wantp;
     }
-    // A record aggregate: positional elements take the element types in order
+    // A record aggregate: positional elements take the element types in order.
+    // The subtype's own element list is the one to ask: a subtype may
+    // constrain an element the base record leaves unconstrained (5.3.3).
     size_t pos = 0;
-    const std::vector<VhdlSymbol*>& elems = wantp->base()->elements();
+    const std::vector<VhdlSymbol*>& elems
+        = wantp->elements().size() == wantp->base()->elements().size()
+              ? wantp->elements()
+              : wantp->base()->elements();
     for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
         AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
         VhdlType* fieldp = nullptr;
@@ -5196,6 +5262,29 @@ VhdlType* VhdlSemVisitor::constrainElementFromValue(VhdlType* typep, AstNodeVhdl
     VhdlType* const outp = cloneSubtype(typep, flp);
     outp->elementp(valElemp);
     return outp;
+}
+
+// A constant that an elaboration constant's value names has to be one too: a
+// generic an instantiation supplied is emitted as a parameter, and a
+// parameter's value may only name other parameters (4.9)
+void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    for (int round = 0; round < 16; ++round) {
+        bool changed = false;
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            unitp->foreach([&](AstVhdlObjectDecl* declp) {
+                if (!declp->isElabConstant() || !declp->defaultp()) return;
+                declp->defaultp()->foreach([&](AstNodeVhdlExpr* exprp) {
+                    const VhdlSymbol* const symp = exprp->vhdlSymp();
+                    if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
+                    AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
+                    if (!otherp || otherp->isElabConstant()) return;
+                    otherp->elabConstant(true);
+                    changed = true;
+                });
+            });
+        }
+        if (!changed) break;
+    }
 }
 
 // An object declared with an unconstrained array type takes its bounds from

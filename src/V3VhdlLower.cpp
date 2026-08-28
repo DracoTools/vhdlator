@@ -4246,6 +4246,14 @@ private:
         int64_t count = 0;
         if (typep->isConstrainedArray()) {
             const VhdlType* const indexp = typep->indexTypes()[0];
+            // A bound that names a generic is a length but not a number
+            // here, so how many times the value repeats is the range's own
+            // length, worked out where the instance is elaborated
+            if (!indexp->bounded()) {
+                if (AstNodeExpr* const outp = othersOfDynamicLength(nodep, typep, flp)) {
+                    return outp;
+                }
+            }
             left = indexp->left();
             step = indexp->ascending() ? 1 : -1;
             count = indexp->length();
