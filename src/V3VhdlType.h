@@ -77,6 +77,7 @@ class VhdlType final {
     // declaration arrives, and everything that already names it must see the
     // completion (5.4.2)
     VhdlTypeKind m_kind;
+    bool m_genericFormal = false;  // A generic type nothing has bound yet
     std::string m_name;  // Declared name, or empty for an anonymous type
     VhdlType* m_base = nullptr;  // The type this constrains; self if a type
     FileLine* m_fileline = nullptr;  // Where it was declared
@@ -184,6 +185,11 @@ public:
                || m_kind == VhdlTypeKind::UNIVERSAL_REAL;
     }
     bool isError() const { return m_kind == VhdlTypeKind::ERROR; }
+    // A generic type formal, before an instantiation says what it stands
+    // for. It is a type of its own and matches nothing else (6.5.5), which
+    // is what keeps two subprograms that differ only in it apart.
+    bool isGenericFormal() const { return m_genericFormal; }
+    void genericFormal(bool flag) { m_genericFormal = flag; }
 
     // Scalar range (5.2.1)
     bool bounded() const { return m_bounded; }

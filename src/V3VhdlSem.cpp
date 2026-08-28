@@ -144,11 +144,24 @@ class VhdlSemVisitor final : public VNVisitor {
         m_errored = true;
     }
 
+    // A copy of a package made for one instantiation, while it is analyzed.
+    // Substituting a generic type may make two declarations of a name the
+    // same profile -- "f(e : t_element)" and "f(n : integer)" where the
+    // instantiation binds t_element to INTEGER. The template told them
+    // apart, and the copy is that template with the actuals written in
+    // (4.9), so neither is a redeclaration of the other and every call in it
+    // means what it meant there.
+    bool m_inPackageInstance = false;
+    // Which subprogram each call of the template resolved to, keyed by the
+    // copy's own node
+    std::map<const AstNode*, const VhdlSymbol*> m_templateSyms;
+
     // Declare 'symp', complaining if it illegally hides something declared in
     // the same region (12.3)
     void declare(VhdlSymbol* symp, FileLine* flp) {
         VhdlSymbol* const hiddenp = m_scopep->insert(symp);
         if (!hiddenp || hiddenp->predefined()) return;
+        if (m_inPackageInstance) return;
         err(flp, "Declaration of '" + symp->name() + "' conflicts with the "
                      + hiddenp->kindName() + " of the same name declared in this region");
     }
@@ -638,7 +651,10 @@ class VhdlSemVisitor final : public VNVisitor {
         }
         std::reverse(argLists.begin(), argLists.end());  // Outermost first
         VhdlType* const basep = resolveTypeMark(markp);
-        if (!basep || basep->isError()) {
+        // A generic type nothing has bound yet stands in for a real type and
+        // has to keep its own identity: replacing it with the one error type
+        // makes every parameter of it look like every other (6.5.5)
+        if (!basep || (basep->isError() && !basep->isGenericFormal())) {
             nodep->vhdlTypep(V3VhdlStd::errorType());
             return nodep->vhdlTypep();
         }
@@ -1113,6 +1129,7 @@ private:
     void visit(AstVhdlSubprogInst* nodep) override;
 
     void instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* intop) VL_MT_DISABLED;
+    void recordTemplateSyms(AstNode* origp, AstNode* copyp) VL_MT_DISABLED;
     void bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlExpr* actualp,
                             VhdlScope* outerp) VL_MT_DISABLED;
     std::map<std::string, AstVhdlPackageBody*> m_packageBodies;  // "lib.name" -> its body
@@ -1537,6 +1554,7 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
             // give it a type of its own that matches nothing else yet (6.5.5)
             VhdlType* const typep
                 = VhdlSymTab::newType(VhdlTypeKind::ERROR, nodep->name(), nodep->fileline());
+            typep->genericFormal(true);
             symp->typep(typep);
         }
     } else {
@@ -2700,6 +2718,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     // the package has the body the copy needs
     for (AstNode* p = pkgp->declsp(); p; p = p->nextp()) {
         AstNodeVhdl* const copyp = VN_AS(p->cloneTree(false), NodeVhdl);
+        recordTemplateSyms(p, copyp);
         VhdlUnanalyzeVisitor{copyp};
         nodep->addDeclsp(copyp);
     }
@@ -2718,6 +2737,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         }
         for (AstNode* p = bodyIt->second->declsp(); p; p = p->nextp()) {
             AstNodeVhdl* const copyp = VN_AS(p->cloneTree(false), NodeVhdl);
+            recordTemplateSyms(p, copyp);
             VhdlUnanalyzeVisitor{copyp};
             if (!firstBodyp) firstBodyp = copyp;
             nodep->addDeclsp(copyp);
@@ -2731,10 +2751,39 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     for (AstNode* const p : declOrder) {
         if (p == firstBodyp) inBody = true;
         VL_RESTORER(m_inPackageBody);
+        VL_RESTORER(m_inPackageInstance);
         m_inPackageBody = m_inPackageBody || inBody;
+        m_inPackageInstance = true;
         iterate(p);
     }
+    // Not cleared here: the copy's subprogram bodies are analyzed after this
+    // returns, and it is those that hold the calls needing the template's
+    // answer. The map is keyed by node, so it stays true however long it lives.
     m_scopep = savedp;
+}
+
+// Which subprogram each call of the template resolved to, recorded against
+// the copy's own node. The two trees are clones of each other, so walking
+// them together pairs the nodes up. Substituting the generics may leave two
+// declarations of a name with the same profile, and then only the template
+// knows which one a call inside the package meant (4.9).
+void VhdlSemVisitor::recordTemplateSyms(AstNode* origp, AstNode* copyp) {
+    while (origp && copyp) {
+        if (const AstNodeVhdlExpr* const ep = VN_CAST(origp, NodeVhdlExpr)) {
+            const VhdlSymbol* const symp = ep->vhdlSymp();
+            if (symp
+                && (symp->kind() == VhdlSymKind::FUNCTION
+                    || symp->kind() == VhdlSymKind::PROCEDURE)) {
+                m_templateSyms.emplace(copyp, symp);
+            }
+        }
+        recordTemplateSyms(origp->op1p(), copyp->op1p());
+        recordTemplateSyms(origp->op2p(), copyp->op2p());
+        recordTemplateSyms(origp->op3p(), copyp->op3p());
+        recordTemplateSyms(origp->op4p(), copyp->op4p());
+        origp = origp->nextp();
+        copyp = copyp->nextp();
+    }
 }
 
 // "function add1 is new adder generic map (1);" (4.4). The instance is a copy
@@ -3626,6 +3675,14 @@ void V3VhdlSem::clear() {
 
 bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
     if (!fromp || !top) return true;
+    // A generic type nothing has bound yet is a type of its own: it matches
+    // itself and nothing else, which is what keeps two subprograms that
+    // differ only in it from being the same subprogram (6.5.5). Until an
+    // instantiation says what it stands for, treating it as matching
+    // anything makes every such pair a homograph.
+    if (fromp->base()->isGenericFormal() || top->base()->isGenericFormal()) {
+        return fromp->base() == top->base();
+    }
     if (fromp->isError() || top->isError()) return true;
     if (fromp->base() == top->base()) return true;
     // An integer or real literal has an anonymous universal type, which is
@@ -3971,6 +4028,34 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
     if (cands.empty()) {
         err(nodep->fileline(), "No visible " + what + " matches this use");
         return V3VhdlStd::errorType();
+    }
+    if (cands.size() > 1) {
+        // Inside a copy of an instantiated package, a call means what it
+        // meant in the template: substituting the generics may have left two
+        // declarations of the name with the same profile, and nothing here
+        // could tell them apart any more (4.9)
+        const auto tmplIt = m_templateSyms.find(nodep);
+        if (tmplIt != m_templateSyms.end()) {
+            // A subprogram is written twice -- a declaration and a body --
+            // and the template may have named either, so both places count
+            const auto placesOf = [](const VhdlSymbol* symp) {
+                std::set<std::string> out;
+                if (symp->declp()) out.insert(symp->declp()->fileline()->ascii());
+                if (symp->bodyp()) out.insert(symp->bodyp()->fileline()->ascii());
+                return out;
+            };
+            const std::set<std::string> want = placesOf(tmplIt->second);
+            std::vector<VhdlSymbol*> same;
+            for (VhdlSymbol* const symp : cands) {
+                for (const std::string& place : placesOf(symp)) {
+                    if (want.count(place)) {
+                        same.push_back(symp);
+                        break;
+                    }
+                }
+            }
+            if (same.size() == 1) cands.swap(same);
+        }
     }
     if (cands.size() > 1) {
         // A declaration hides a homograph of it declared further out (12.3).
