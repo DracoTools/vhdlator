@@ -145,6 +145,7 @@ class VhdlLowerVisitor final {
     std::vector<VhdlLoopFrame> m_loops;
     std::string m_prefix;  // Name prefix for declarations inside a process
     std::string m_blockPrefix;  // Labels of the blocks being lowered, outermost first
+    std::map<const VhdlType*, AstNodeFTask*> m_valueFuncs;  // "T'VALUE" readers, per type
     std::set<std::string> m_instNames;  // Instance labels the module has used
     int m_processNum = 0;  // For naming unlabelled processes
     bool m_errored = false;
@@ -1894,11 +1895,284 @@ private:
             if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp)) return namep;
             return new AstSFormatF{flp, formatFor(vtypep, true), false, valuep};
         }
+        // "t'value(s)" is the value whose image is s (16.2.3)
+        if (attr == "value" && nodep->argp()) {
+            const VhdlType* wantp = nodep->vhdlTypep();
+            if (!wantp && nodep->prefixp()) wantp = nodep->prefixp()->vhdlTypep();
+            if (!wantp && nodep->prefixp() && nodep->prefixp()->vhdlSymp()) {
+                wantp = nodep->prefixp()->vhdlSymp()->typep();
+            }
+            if (AstNodeFTask* const funcp = valueFuncFor(wantp, flp)) {
+                AstNodeExpr* const textp = lowerExpr(nodep->argp());
+                if (!textp) return nullptr;
+                AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), nullptr};
+                refp->taskp(VN_AS(funcp, Func));
+                refp->addArgsp(new AstArg{flp, "", textp});
+                return refp;
+            }
+        }
         // A user-defined attribute stands for the static expression an
         // attribute specification gave the prefix (7.2)
         if (AstNodeExpr* const userp = lowerUserAttr(nodep, attr)) return userp;
         unsup(flp, "attribute '" + attr);
         return nullptr;
+    }
+
+    // "while (cond) body", which the AST writes as a loop whose first
+    // statement tests the condition
+    static AstNode* whileLoop(FileLine* flp, AstNodeExpr* condp, AstNode* bodyp) {
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{flp, loopp, condp});
+        loopp->addStmtsp(bodyp);
+        return loopp;
+    }
+
+    // A local variable of a generated helper function
+    static AstVar* newFuncLocal(const std::string& name, AstNodeDType* dtypep, FileLine* flp) {
+        AstVar* const varp = new AstVar{flp, VVarType::BLOCKTEMP, name, VFlagChildDType{}, dtypep};
+        varp->funcLocal(true);
+        varp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        varp->trace(false);
+        return varp;
+    }
+
+    static AstNodeExpr* rd(AstVar* varp, FileLine* flp) {
+        return new AstVarRef{flp, varp, VAccess::READ};
+    }
+    static AstNodeExpr* wr(AstVar* varp, FileLine* flp) {
+        return new AstVarRef{flp, varp, VAccess::WRITE};
+    }
+    static AstNodeExpr* i32(int64_t v, FileLine* flp) {
+        return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+    }
+
+    // "T'VALUE(s)" is the value whose image is s, with leading and trailing
+    // whitespace ignored (16.2.3). One function per type does the reading:
+    // the text is not known until it runs, so this is a real parser rather
+    // than a fold.
+    AstNodeFTask* valueFuncFor(const VhdlType* typep, FileLine* origFlp) {
+        if (!typep || !m_modp) return nullptr;
+        // The reader works a character at a time and counts in whole
+        // integers, so the widths it mixes are deliberate
+        FileLine* const flp = new FileLine{origFlp};
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        const VhdlType* const basep = typep->base();
+        const VhdlTypeKind kind = basep->kind();
+        const bool isEnum = kind == VhdlTypeKind::ENUM;
+        const bool isReal = kind == VhdlTypeKind::FLOATING;
+        const bool isPhys = kind == VhdlTypeKind::PHYSICAL;
+        const bool isInt = kind == VhdlTypeKind::INTEGER
+                           || kind == VhdlTypeKind::UNIVERSAL_INTEGER;
+        if (!isEnum && !isReal && !isPhys && !isInt) return nullptr;
+        if (isEnum && (basep->literals().empty() || basep->literals().size() > 256)) {
+            return nullptr;
+        }
+        const auto it = m_valueFuncs.find(basep);
+        if (it != m_valueFuncs.end()) return it->second;
+
+        const std::string name = "__Vvalue" + std::to_string(m_valueFuncs.size()) + "__"
+                                 + VString::downcase(basep->prettyName());
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        AstNodeDType* const retDTypep
+            = isReal ? static_cast<AstNodeDType*>(
+                           new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE})
+                     : lowerType(const_cast<VhdlType*>(typep), flp);
+        funcp->fvarp(newReturnVar(name, retDTypep, flp));
+        AstVar* const sp = new AstVar{flp, VVarType::PORT, "s", VFlagChildDType{},
+                                      new AstBasicDType{flp, VBasicDTypeKwd::STRING}};
+        sp->direction(VDirection::INPUT);
+        sp->declDirection(VDirection::INPUT);
+        sp->funcLocal(true);
+        sp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        sp->trace(false);
+        funcp->addStmtsp(sp);
+
+        AstNodeDType* const intDTypep = new AstBasicDType{flp, VBasicDTypeKwd::INTEGER};
+        AstVar* const lop = newFuncLocal("lo", intDTypep, flp);
+        AstVar* const hip = newFuncLocal("hi", intDTypep->cloneTree(false), flp);
+        funcp->addStmtsp(lop);
+        funcp->addStmtsp(hip);
+        AstNode* bodyp = new AstAssign{flp, wr(lop, flp), i32(0, flp)};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(hip, flp),
+                       new AstSub{flp, new AstLenN{flp, rd(sp, flp)}, i32(1, flp)}}));
+        // Leading and trailing blanks are not part of the image (16.2.3)
+        const auto isBlank = [&](AstNodeExpr* charp) -> AstNodeExpr* {
+            return new AstLogOr{
+                flp, new AstEq{flp, charp, i32(' ', flp)},
+                new AstEq{flp, charp->cloneTree(false), i32('\t', flp)}};
+        };
+        bodyp = AstNode::addNext(
+            bodyp,
+            whileLoop(flp,
+                      new AstLogAnd{flp, new AstLte{flp, rd(lop, flp), rd(hip, flp)},
+                                    isBlank(new AstGetcN{flp, rd(sp, flp), rd(lop, flp)})},
+                      new AstAssign{flp, wr(lop, flp),
+                                    new AstAdd{flp, rd(lop, flp), i32(1, flp)}}));
+        bodyp = AstNode::addNext(
+            bodyp,
+            whileLoop(flp,
+                      new AstLogAnd{flp, new AstLte{flp, rd(lop, flp), rd(hip, flp)},
+                                    isBlank(new AstGetcN{flp, rd(sp, flp), rd(hip, flp)})},
+                      new AstAssign{flp, wr(hip, flp),
+                                    new AstSub{flp, rd(hip, flp), i32(1, flp)}}));
+
+        if (isEnum) {
+            AstVar* const tp = newFuncLocal(
+                "t", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            funcp->addStmtsp(tp);
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, wr(tp, flp),
+                           new AstSubstrN{flp, rd(sp, flp), rd(lop, flp), rd(hip, flp)}}));
+            // A basic identifier reads without regard to case; a character
+            // literal does not (15.4, 15.6)
+            AstVar* const up = newFuncLocal(
+                "u", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            funcp->addStmtsp(up);
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, wr(up, flp), new AstToLowerN{flp, rd(tp, flp)}}));
+            const std::vector<VhdlSymbol*>& literals = basep->literals();
+            AstNodeExpr* outp = i32(0, flp);
+            for (size_t i = literals.size(); i-- > 0;) {
+                const std::string& litName = literals[i]->name();
+                const bool isChar = litName.size() >= 2 && litName.front() == '\'';
+                AstNodeExpr* const gotp
+                    = isChar ? rd(tp, flp) : rd(up, flp);
+                outp = new AstCond{
+                    flp,
+                    new AstEqN{flp, gotp,
+                               new AstConst{flp, AstConst::String{},
+                                            isChar ? litName : VString::downcase(litName)}},
+                    i32(literals[i]->position(), flp), outp};
+            }
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, outp}));
+            funcp->addStmtsp(bodyp);
+            m_modp->addStmtsp(funcp);
+            m_valueFuncs.emplace(basep, funcp);
+            return funcp;
+        }
+        if (isReal) {
+            bodyp = AstNode::addNext(
+                bodyp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                    new AstAtoN{flp,
+                                new AstSubstrN{flp, rd(sp, flp), rd(lop, flp), rd(hip, flp)},
+                                AstAtoN::ATOREAL}}));
+            funcp->addStmtsp(bodyp);
+            m_modp->addStmtsp(funcp);
+            m_valueFuncs.emplace(basep, funcp);
+            return funcp;
+        }
+        // An integer, or the abstract part of a physical literal. An
+        // underscore is a separator and no part of the value (15.5.2).
+        AstVar* const rp = newFuncLocal("r", intDTypep->cloneTree(false), flp);
+        AstVar* const negp = newFuncLocal("neg", newLogicDType(flp, 1), flp);
+        AstVar* const ip = newFuncLocal("i", intDTypep->cloneTree(false), flp);
+        AstVar* const donep = newFuncLocal("done", newLogicDType(flp, 1), flp);
+        AstVar* const cp = newFuncLocal("c", newLogicDType(flp, 8), flp);
+        funcp->addStmtsp(rp);
+        funcp->addStmtsp(negp);
+        funcp->addStmtsp(ip);
+        funcp->addStmtsp(donep);
+        funcp->addStmtsp(cp);
+        bodyp = AstNode::addNext(bodyp, static_cast<AstNode*>(
+                                            new AstAssign{flp, wr(rp, flp), i32(0, flp)}));
+        bodyp = AstNode::addNext(bodyp, static_cast<AstNode*>(new AstAssign{
+                                            flp, wr(negp, flp),
+                                            new AstConst{flp, AstConst::BitFalse{}}}));
+        bodyp = AstNode::addNext(bodyp, static_cast<AstNode*>(new AstAssign{
+                                            flp, wr(donep, flp),
+                                            new AstConst{flp, AstConst::BitFalse{}}}));
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{flp, wr(ip, flp), rd(lop, flp)}));
+        AstNode* const signp = new AstIf{
+            flp,
+            new AstLogAnd{flp, new AstLte{flp, rd(ip, flp), rd(hip, flp)},
+                          new AstEq{flp, new AstGetcN{flp, rd(sp, flp), rd(ip, flp)},
+                                    i32('-', flp)}},
+            AstNode::addNext(
+                static_cast<AstNode*>(new AstAssign{flp, wr(negp, flp),
+                                                    new AstConst{flp, AstConst::BitTrue{}}}),
+                static_cast<AstNode*>(new AstAssign{
+                    flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}})),
+            new AstIf{flp,
+                      new AstLogAnd{
+                          flp, new AstLte{flp, rd(ip, flp), rd(hip, flp)},
+                          new AstEq{flp, new AstGetcN{flp, rd(sp, flp), rd(ip, flp)},
+                                    i32('+', flp)}},
+                      new AstAssign{flp, wr(ip, flp),
+                                    new AstAdd{flp, rd(ip, flp), i32(1, flp)}}}};
+        bodyp = AstNode::addNext(bodyp, signp);
+        AstNode* const digitp = new AstIf{
+            flp, new AstEq{flp, rd(cp, flp), i32('_', flp)},
+            new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}},
+            new AstIf{
+                flp,
+                new AstLogAnd{flp, new AstGte{flp, rd(cp, flp), i32('0', flp)},
+                              new AstLte{flp, rd(cp, flp), i32('9', flp)}},
+                AstNode::addNext(
+                    static_cast<AstNode*>(new AstAssign{
+                        flp, wr(rp, flp),
+                        new AstAdd{flp, new AstMul{flp, rd(rp, flp), i32(10, flp)},
+                                   new AstSub{flp, rd(cp, flp), i32('0', flp)}}}),
+                    static_cast<AstNode*>(new AstAssign{
+                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}})),
+                new AstAssign{flp, wr(donep, flp), new AstConst{flp, AstConst::BitTrue{}}}}};
+        AstNode* loopBodyp = new AstAssign{flp, wr(cp, flp),
+                                           new AstGetcN{flp, rd(sp, flp), rd(ip, flp)}};
+        loopBodyp = AstNode::addNext(loopBodyp, digitp);
+        bodyp = AstNode::addNext(
+            bodyp, whileLoop(flp,
+                             new AstLogAnd{flp, new AstLte{flp, rd(ip, flp), rd(hip, flp)},
+                                           new AstLogNot{flp, rd(donep, flp)}},
+                             loopBodyp));
+        AstNodeExpr* valuep = new AstCond{flp, rd(negp, flp),
+                                          new AstNegate{flp, rd(rp, flp)}, rd(rp, flp)};
+        if (isPhys) {
+            // The unit name follows the number, and says what the value is
+            // counted in (15.8). It reads without regard to case.
+            AstVar* const unitp = newFuncLocal(
+                "unit", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            funcp->addStmtsp(unitp);
+            bodyp = AstNode::addNext(
+                bodyp,
+                whileLoop(flp,
+                          new AstLogAnd{flp, new AstLte{flp, rd(ip, flp), rd(hip, flp)},
+                                        isBlank(new AstGetcN{flp, rd(sp, flp), rd(ip, flp)})},
+                          new AstAssign{flp, wr(ip, flp),
+                                        new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+            bodyp = AstNode::addNext(
+                bodyp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, wr(unitp, flp),
+                    new AstToLowerN{flp, new AstSubstrN{flp, rd(sp, flp), rd(ip, flp),
+                                                        rd(hip, flp)}}}));
+            AstNodeExpr* scalep = i32(1, flp);
+            for (const auto& unit : basep->units()) {
+                scalep = new AstCond{
+                    flp,
+                    new AstEqN{flp, rd(unitp, flp),
+                               new AstConst{flp, AstConst::String{},
+                                            VString::downcase(unit.first)}},
+                    i32(unit.second, flp), scalep};
+            }
+            valuep = new AstMul{flp, valuep, scalep};
+        }
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, valuep}));
+        funcp->addStmtsp(bodyp);
+        m_modp->addStmtsp(funcp);
+        m_valueFuncs.emplace(basep, funcp);
+        return funcp;
     }
 
     // The value an attribute specification gave the named prefix, lowered in
@@ -7196,6 +7470,77 @@ private:
         return new AstAssignW{flp, lhsp, rhsp};
     }
 
+    // "s(1 to 5) := t" and "s(3) := c" write part of a STRING. Verilator's
+    // string is characters rather than bits, so a part select of it means
+    // nothing: the whole string is rebuilt around the part that changed.
+    // Returns null where the target is not part of a STRING.
+    static bool isStringPart(const AstNodeVhdlExpr* targetp) {
+        const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        if (!callp || !callp->prefixp()) return false;
+        const VhdlType* const strTypep = callp->prefixp()->vhdlTypep();
+        return strTypep && isStringType(strTypep);
+    }
+
+    AstNode* lowerStringPartAssign(AstNodeVhdlExpr* targetp, AstNodeExpr* valuep,
+                                   bool signalAssign, bool sequential, FileLine* flp) {
+        if (!isStringPart(targetp)) return nullptr;
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        const VhdlType* const strTypep = callp->prefixp()->vhdlTypep();
+        AstNodeExpr* const wholep = lowerExpr(callp->prefixp());
+        if (!wholep) return nullptr;
+        AstNodeExpr* outp = nullptr;
+        if (AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
+            AstNodeExpr* leftp = nullptr;
+            AstNodeExpr* rightp = nullptr;
+            bool ascending = true;
+            bool dirKnown = true;
+            if (!rangeParts(rp, leftp, rightp, ascending, dirKnown) || !leftp || !rightp) {
+                VL_DO_DANGLING(wholep->deleteTree(), wholep);
+                return nullptr;
+            }
+            AstNodeExpr* const lop = stringIndex(strTypep, leftp, flp);
+            AstNodeExpr* const hip = stringIndex(strTypep, rightp, flp);
+            AstNodeExpr* const headp
+                = new AstSubstrN{flp, wholep->cloneTree(false),
+                                 new AstConst{flp, AstConst::Signed32{}, 0},
+                                 new AstSub{flp, lop->cloneTree(false),
+                                            new AstConst{flp, AstConst::Signed32{}, 1}}};
+            AstNodeExpr* const tailp
+                = new AstSubstrN{flp, wholep->cloneTree(false),
+                                 new AstAdd{flp, hip->cloneTree(false),
+                                            new AstConst{flp, AstConst::Signed32{}, 1}},
+                                 new AstSub{flp, new AstLenN{flp, wholep->cloneTree(false)},
+                                            new AstConst{flp, AstConst::Signed32{}, 1}}};
+            VL_DO_DANGLING(lop->deleteTree(), lop);
+            VL_DO_DANGLING(hip->deleteTree(), hip);
+            outp = new AstConcatN{flp, new AstConcatN{flp, headp, valuep}, tailp};
+        } else {
+            AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            AstNodeVhdlExpr* const idxValp
+                = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+            if (!idxValp || (callp->argsp() && callp->argsp()->nextp())) {
+                VL_DO_DANGLING(wholep->deleteTree(), wholep);
+                return nullptr;
+            }
+            AstNodeExpr* const idxp = lowerExpr(idxValp);
+            if (!idxp) {
+                VL_DO_DANGLING(wholep->deleteTree(), wholep);
+                return nullptr;
+            }
+            outp = new AstPutcN{flp, wholep->cloneTree(false),
+                                stringIndex(strTypep, idxp, flp), valuep};
+        }
+        AstNodeExpr* const lhsp = lowerDriveTarget(callp->prefixp());
+        VL_DO_DANGLING(wholep->deleteTree(), wholep);
+        if (!lhsp) {
+            VL_DO_DANGLING(outp->deleteTree(), outp);
+            return nullptr;
+        }
+        if (!signalAssign) return new AstAssign{flp, lhsp, outp};
+        if (sequential) return new AstAssignDly{flp, lhsp, outp};
+        return new AstAssignW{flp, lhsp, outp};
+    }
+
     // A variable assignment takes effect at once (10.6)
     AstNode* lowerVarAssign(AstVhdlVarAssign* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -7235,6 +7580,16 @@ private:
         if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {
             if (!valuep) return nullptr;
             return lowerAggregateTarget(aggp, valuep, false, false, flp);
+        }
+        if (valuep && isStringPart(nodep->targetp())) {
+            AstNodeExpr* const strValp = lowerExpr(valuep);
+            if (strValp) {
+                if (AstNode* const outp = lowerStringPartAssign(nodep->targetp(), strValp,
+                                                                false, false, flp)) {
+                    return outp;
+                }
+                VL_DO_DANGLING(strValp->deleteTree(), strValp);
+            }
         }
         if (valuep && isDynTarget(nodep->targetp())) {
             return lowerDynCopy(nodep->targetp(), valuep, flp);
@@ -9407,6 +9762,7 @@ private:
         m_names.clear();
         m_instNames.clear();
         m_blockPrefix.clear();
+        m_valueFuncs.clear();
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();
