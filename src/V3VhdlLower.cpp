@@ -4548,6 +4548,23 @@ private:
         return new AstSFormatF{flp, "%c", false, loweredp};
     }
 
+    // The range a choice denotes, where it is a subtype mark rather than a
+    // range written out: "(engrange => x)" covers every index of that
+    // subtype (9.3.3.1, 5.3.2.1). False where the choice is not one.
+    static bool choiceNamesSubtype(const AstVhdlChoice* chp, int64_t& lo, int64_t& hi) {
+        const AstNodeVhdlExpr* const valp = chp->valuep();
+        if (!valp) return false;
+        const VhdlSymbol* const symp = valp->vhdlSymp();
+        if (!symp || symp->kind() != VhdlSymKind::TYPE) return false;
+        const VhdlType* const typep = symp->typep();
+        if (!typep || !typep->bounded() || typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            return false;
+        }
+        lo = typep->low();
+        hi = typep->high();
+        return true;
+    }
+
     AstNodeExpr* lowerAggregate(AstVhdlAggregate* nodep) {
         FileLine* const flp = nodep->fileline();
         VhdlType* const typep = nodep->vhdlTypep();
@@ -4680,7 +4697,9 @@ private:
                 }
                 int64_t lo = 0;
                 int64_t hi = 0;
-                if (AstVhdlRange* const rp = chp->rangep()) {
+                if (choiceNamesSubtype(chp, lo, hi)) {
+                    // A subtype mark stands for every index of that subtype
+                } else if (AstVhdlRange* const rp = chp->rangep()) {
                     // "v'range => x" names every index of v, which its own
                     // subtype says (16.2.3) rather than an expression
                     if (!rp->leftp() && rp->attrp()) {
@@ -4909,7 +4928,9 @@ private:
                 named = true;
                 int64_t lo = 0;
                 int64_t hi = 0;
-                if (AstVhdlRange* const rp = chp->rangep()) {
+                if (choiceNamesSubtype(chp, lo, hi)) {
+                    // A subtype mark stands for every index of that subtype
+                } else if (AstVhdlRange* const rp = chp->rangep()) {
                     const VhdlValue a = V3VhdlEval::eval(rp->leftp());
                     const VhdlValue b = V3VhdlEval::eval(rp->rightp());
                     if (!a.isInt() || !b.isInt()) return false;

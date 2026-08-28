@@ -15,7 +15,15 @@ architecture test of t_vhdl_aggdir is
     signal a : std_logic_vector(11 downto 0) := x"FAE";
     signal b : std_logic_vector(11 downto 0) := x"182";
     signal r : std_logic_vector(31 downto 0);
+
+    -- A choice may be a subtype mark, which stands for every index of it
+    -- (9.3.3.1, 5.3.2.1)
+    subtype engrange is natural range 3 downto 0;
+    signal e : std_logic := '1';
+    signal w : std_logic_vector(engrange);
 begin
+
+    w <= (engrange => e);
 
     -- Each aggregate has no subtype of its own here, so its choices say
     -- which way its index runs (9.3.3.3): "15 downto 12" puts 15 at the left
@@ -26,6 +34,7 @@ begin
     begin
         wait for 1 ns;
         assert r = x"FFAE0182" report "sign extended pair" severity failure;
+        assert w = "1111" report "subtype choice" severity failure;
         report "*-* All Finished *-*";
         std.env.finish;
     end process;
