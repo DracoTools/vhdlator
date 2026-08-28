@@ -3519,10 +3519,17 @@ private:
                 new AstAdd{flp, new AstModDivS{flp, lhsp, rhsp->cloneTree(false)},
                            rhsp->cloneTree(false)},
                 rhsp};
-        case VhdlBinaryOp::POW:
+        case VhdlBinaryOp::POW: {
             if (real) return new AstPowD{flp, lhsp, rhsp};
-            return signd ? static_cast<AstNodeExpr*>(new AstPowSS{flp, lhsp, rhsp})
-                         : static_cast<AstNodeExpr*>(new AstPow{flp, lhsp, rhsp});
+            // "**" on INTEGER gives an INTEGER (9.2.8). Saying so here rather
+            // than leaving the width to be worked out is what lets one stand
+            // in a range, where the width pass reaches it already settled.
+            AstNodeExpr* const powp
+                = signd ? static_cast<AstNodeExpr*>(new AstPowSS{flp, lhsp, rhsp})
+                        : static_cast<AstNodeExpr*>(new AstPow{flp, lhsp, rhsp});
+            powp->dtypeSetInteger();
+            return powp;
+        }
         case VhdlBinaryOp::CONCAT: return new AstConcat{flp, lhsp, rhsp};
         case VhdlBinaryOp::SLL:
         case VhdlBinaryOp::SRL:
@@ -6953,21 +6960,37 @@ private:
                                       : nodep->label();
         if (nodep->kind() == VhdlLoopKind::FOR) {
             VhdlSymbol* const symp = nodep->vhdlSymp();
-            if (!symp || !symp->typep() || !symp->typep()->bounded()) {
+            VhdlType* const rangep = symp ? symp->typep() : nullptr;
+            AstNodeExpr* fromp = nullptr;
+            AstNodeExpr* limitp = nullptr;
+            bool ascending = true;
+            if (rangep && !rangep->bounded() && rangep->boundsp()) {
+                // A range that names a generic is fixed once the instance is
+                // elaborated: the bounds go to the back end as expressions
+                bool dirKnown = true;
+                if (!dynamicBounds(rangep, 0, flp, fromp, limitp, ascending, &dirKnown)
+                    || !dirKnown) {
+                    if (fromp) VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                    if (limitp) VL_DO_DANGLING(limitp->deleteTree(), limitp);
+                    fromp = nullptr;
+                    limitp = nullptr;
+                }
+            }
+            if (!fromp && (!symp || !rangep || !rangep->bounded())) {
                 unsup(flp, "generate over a range that is not locally static");
                 return;
             }
-            VhdlType* const rangep = symp->typep();
-            const bool ascending = rangep->ascending();
             AstVar* const genvarp
                 = new AstVar{flp, VVarType::GENVAR, m_prefix + symp->name(), VFlagChildDType{},
-                             lowerType(rangep, flp)};
+                             new AstBasicDType{flp, VBasicDTypeKwd::INTEGER}};
             m_vars.emplace(symp, genvarp);
+            if (!fromp) {
+                ascending = rangep->ascending();
+                fromp = lowerValue(VhdlValue::mkInt(rangep->left(), rangep), rangep, flp);
+                limitp = lowerValue(VhdlValue::mkInt(rangep->right(), rangep), rangep, flp);
+            }
             AstNode* const initp = new AstAssign{
-                flp, new AstVarRef{flp, genvarp, VAccess::WRITE},
-                lowerValue(VhdlValue::mkInt(rangep->left(), rangep), rangep, flp)};
-            AstNodeExpr* const limitp
-                = lowerValue(VhdlValue::mkInt(rangep->right(), rangep), rangep, flp);
+                flp, new AstVarRef{flp, genvarp, VAccess::WRITE}, fromp};
             AstNodeExpr* const condp
                 = ascending ? static_cast<AstNodeExpr*>(new AstLteS{
                                   flp, new AstVarRef{flp, genvarp, VAccess::READ}, limitp})

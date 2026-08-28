@@ -1173,7 +1173,8 @@ private:
                        int64_t& rightr) VL_MT_DISABLED;
     void constrainBlockPorts(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
 
-    VhdlType* loopParamType(const RangeInfo& info, FileLine* flp) VL_MT_DISABLED;
+    VhdlType* loopParamType(const RangeInfo& info, FileLine* flp,
+                            AstVhdlRange* rangep = nullptr) VL_MT_DISABLED;
     void analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeIndexedName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
     VhdlType* analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
@@ -2133,7 +2134,8 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
     if (nodep->kind() == VhdlLoopKind::FOR) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::GENERATE_PARAMETER,
                                                        nodep->paramName(), nodep);
-        symp->typep(loopParamType(info, nodep->fileline()));
+        symp->typep(loopParamType(info, nodep->fileline(),
+                                  VN_CAST(nodep->rangep(), VhdlRange)));
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
     }
@@ -2176,9 +2178,22 @@ void VhdlSemVisitor::visit(AstVhdlLoop* nodep) {
 
 // The subtype of a loop or generate parameter: the range's type, narrowed to
 // the range itself where it is static (10.10, 11.8)
-VhdlType* VhdlSemVisitor::loopParamType(const RangeInfo& info, FileLine* flp) {
+VhdlType* VhdlSemVisitor::loopParamType(const RangeInfo& info, FileLine* flp,
+                                        AstVhdlRange* rangep) {
     if (!info.typep || info.typep->isError()) return V3VhdlStd::integerType();
-    if (!info.left.known() || !info.right.known()) return info.typep;
+    if (!info.left.known() || !info.right.known()) {
+        // A range that names a generic -- "for i in 0 to COUNT-1" -- is fixed
+        // once the instance is elaborated but is not a number here. Handing
+        // back the base type instead would say the loop runs over every value
+        // NATURAL has, which is not a design.
+        if (rangep && rangep->leftp() && rangep->rightp()) {
+            VhdlType* const outp = cloneSubtype(info.typep, flp);
+            outp->unbound();
+            outp->boundsp(rangep);
+            return outp;
+        }
+        return info.typep;
+    }
     return makeRangeSubtype(info, flp);
 }
 
