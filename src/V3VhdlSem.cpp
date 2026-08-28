@@ -3360,11 +3360,17 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::map<const VhdlSymbol*, int> counts;
     std::map<const VhdlSymbol*, FileLine*> where;
     std::set<const VhdlSymbol*> partial;
+    // A signal every one of whose drivers is inside a generate statement may
+    // well have one driver once the design is elaborated: which branches are
+    // taken is not known until the generics have values (11.8)
+    std::set<const VhdlSymbol*> outsideGenerate;
     for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
         std::set<const VhdlSymbol*> whole;
         collectDrivenSyms(p, whole, partial, false);
+        const bool inGenerate = VN_IS(p, VhdlGenerate);
         for (const VhdlSymbol* const symp : whole) {
             ++counts[symp];
+            if (!inGenerate) outsideGenerate.insert(symp);
             if (!where.count(symp)) where[symp] = p->fileline();
         }
     }
@@ -3378,6 +3384,14 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
         // with one it may still change the value it is given (6.5.2). Only
         // the *absence* of one is an error, and only for several drivers.
         if (pair.second < 2 && !resolvep) continue;
+        if (!resolvep && !outsideGenerate.count(symp)) {
+            // Every driver is inside a generate statement, so how many there
+            // are is settled by elaboration rather than here. They are left
+            // as ordinary assignments; if two really do elaborate, the back
+            // end says so where it can see it.
+            symp->driverCount(1);
+            continue;
+        }
         if (!resolvep) {
             // The one place the language says this must be an error, and the
             // only way a design can be told its drivers will not be combined
