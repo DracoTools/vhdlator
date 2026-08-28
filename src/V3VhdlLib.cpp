@@ -54,7 +54,6 @@ std::set<std::string> s_reportedMissing;  // Keys already complained about
 // Units whose key was already taken. Reported by computeOrder rather than by
 // addFile, so that every library diagnostic comes from one place and a
 // duplicate does not stop the missing and circular checks from running.
-std::vector<std::pair<AstNodeVhdlUnit*, AstNodeVhdlUnit*>> s_duplicates;
 
 // Lowercase, since VHDL library and unit names are case insensitive
 std::string lower(const std::string& in) {
@@ -128,7 +127,6 @@ void V3VhdlLib::clear() {
     s_byKey.clear();
     s_ordered.clear();
     s_reportedMissing.clear();
-    s_duplicates.clear();
 }
 
 void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
@@ -211,7 +209,10 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
 
         const auto it = s_byKey.find(unit.key);
         if (it != s_byKey.end()) {
-            s_duplicates.emplace_back(unitp, s_units[it->second].nodep);
+            // Analyzing a design unit deletes any earlier one of the same
+            // simple name in the same library (13.5), so the last one written
+            // is the one the design is built from
+            s_units[it->second] = unit;
             continue;
         }
         s_byKey.emplace(unit.key, s_units.size());
@@ -239,13 +240,6 @@ bool V3VhdlLib::computeOrder() {
                 unit.softDependsOn.push_back(otherp.key);
             }
         }
-    }
-    bool dupOk = true;
-    for (const auto& pair : s_duplicates) {
-        pair.first->fileline()->v3error(
-            "Design unit is declared more than once; the earlier one is at "
-            << pair.second->fileline()->ascii());
-        dupOk = false;
     }
     // 0 = not visited, 1 = on the stack, 2 = emitted
     std::vector<uint8_t> state(s_units.size(), 0);
@@ -314,7 +308,7 @@ bool V3VhdlLib::computeOrder() {
         }
     }
     UINFO(3, "VHDL analysis order: " << s_ordered.size() << " unit(s)");
-    return ok && dupOk;
+    return ok;
 }
 
 void V3VhdlLib::selfTest() {

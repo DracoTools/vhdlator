@@ -4,14 +4,9 @@
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
 -- SPDX-License-Identifier: CC0-1.0
 --
--- A design unit declared twice, two units that depend on each other, and a
--- unit that depends on one no library holds.
-
-package dup is
-end package;
-
-package dup is
-end package;
+-- Two units that depend on each other, and a unit that depends on one no
+-- library holds. A unit declared twice is not among them: analyzing one
+-- deletes any earlier unit of the same name (13.5), so the last wins.
 
 use work.circ_b.all;
 package circ_a is
