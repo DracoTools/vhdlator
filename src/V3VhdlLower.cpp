@@ -8422,6 +8422,11 @@ private:
             }
         }
         std::vector<AstVar*> reads;
+        // A statement that reads only one element of a signal is sensitive to
+        // that element and to nothing else (11.6). Where every read of a
+        // signal names the same part of it, and by a fixed index, that part
+        // is what the statement waits on.
+        std::map<const AstVar*, AstNodeExpr*> partOf;  // Null once two parts differ
         bodyp->foreachAndNext([&](AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             // What an assignment writes it does not thereby read: a process
@@ -8431,17 +8436,83 @@ private:
             }
             AstVar* const varp = refp->varp();
             if (!varp || !signals.count(varp)) return;
+            AstNodeExpr* const partp = staticPartRead(refp);
+            const auto it = partOf.find(varp);
+            if (it == partOf.end()) {
+                partOf.emplace(varp, partp);
+            } else if (it->second && (!partp || !it->second->sameTree(partp))) {
+                it->second = nullptr;  // Two different parts: the whole of it
+            }
             if (std::find(reads.begin(), reads.end(), varp) == reads.end()) {
                 reads.push_back(varp);
             }
         });
         AstSenItem* itemsp = nullptr;
         for (AstVar* const varp : reads) {
-            itemsp = AstNode::addNext(
-                itemsp,
-                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
+            AstNodeExpr* const partp = partOf[varp];
+            AstNodeExpr* sensp = nullptr;
+            bool oneBit = isOneBitVar(varp);
+            if (partp) {
+                sensp = shadowOfPart(partp->cloneTree(false), flp);
+                oneBit = VN_IS(partp, SelBit) ? isOneBitVar(varp) : false;
+            }
+            if (!sensp) sensp = new AstVarRef{flp, varp, VAccess::READ};
+            itemsp = AstNode::addNext(itemsp, senItemFor(sensp, oneBit, flp));
         }
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
+    }
+
+    // The part of a signal a reference names, where a fixed index says which
+    // -- "v(1)" or "v(3 downto 1)". Null where the whole signal is read, or
+    // where which part is read is not decided until it runs.
+    static AstNodeExpr* staticPartRead(AstVarRef* refp) {
+        AstNode* upp = refp->backp();
+        AstNodeExpr* outp = nullptr;
+        while (upp) {
+            if (const AstSelBit* const bitp = VN_CAST(upp, SelBit)) {
+                if (bitp->fromp() != (outp ? outp : static_cast<AstNodeExpr*>(refp))) break;
+                if (!VN_IS(bitp->bitp(), Const)) return nullptr;
+                outp = VN_AS(upp, NodeExpr);
+            } else if (const AstSelExtract* const extp = VN_CAST(upp, SelExtract)) {
+                if (extp->fromp() != (outp ? outp : static_cast<AstNodeExpr*>(refp))) break;
+                if (!VN_IS(extp->leftp(), Const) || !VN_IS(extp->rightp(), Const)) {
+                    return nullptr;
+                }
+                outp = VN_AS(upp, NodeExpr);
+            } else {
+                break;
+            }
+            upp = upp->backp();
+        }
+        return outp;
+    }
+
+    // A signal of the module that follows part of another, so that what a
+    // statement waits on changes exactly when the part it reads does.
+    // Takes ownership of partp.
+    AstNodeExpr* shadowOfPart(AstNodeExpr* partp, FileLine* flp) {
+        if (!m_modp) {
+            VL_DO_DANGLING(partp->deleteTree(), partp);
+            return nullptr;
+        }
+        // As wide as the part it follows, which its fixed indices say
+        int bits = 1;
+        if (const AstSelExtract* const extp = VN_CAST(partp, SelExtract)) {
+            const int left = VN_AS(extp->leftp(), Const)->toSInt();
+            const int right = VN_AS(extp->rightp(), Const)->toSInt();
+            bits = (left > right ? left - right : right - left) + 1;
+        }
+        AstVar* const tempp
+            = new AstVar{flp, VVarType::VAR, "__Vsens" + std::to_string(++m_tempNum),
+                         VFlagChildDType{}, newLogicDType(flp, bits)};
+        m_modp->addStmtsp(tempp);
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        m_modp->addStmtsp(new AstAlways{new AstAssignW{
+            cflp, new AstVarRef{cflp, tempp, VAccess::WRITE}, partp}});
+        return new AstVarRef{flp, tempp, VAccess::READ};
     }
 
     // The sensitivity a condition implies: every signal it reads, which is
