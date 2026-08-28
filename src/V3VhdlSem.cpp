@@ -42,6 +42,7 @@
 #include <cctype>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -5011,8 +5012,15 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         if (typep && typep->isError()) return typep;
     }
 
-    // An object prefix makes it an indexed name or a slice (8.4, 8.5)
-    for (VhdlSymbol* const symp : found) {
+    // An object prefix makes it an indexed name or a slice (8.4, 8.5).
+    // Only where the prefix is a simple name: the search above looked the
+    // last identifier of the prefix up in the enclosing region, and for
+    // "r.data(0)" that finds whatever else is called "data" here rather than
+    // the record's element. A selected prefix denotes what 8.3 says it
+    // denotes, and the search below asks it.
+    for (VhdlSymbol* const symp : VN_IS(nodep->prefixp(), VhdlSelected)
+                                      ? std::vector<VhdlSymbol*>{}
+                                      : found) {
         // An alias of an object is indexed like the object; an alias of a
         // subprogram is a call, which the search below settles
         if (!symp->isObject()) {
@@ -5118,6 +5126,34 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                     }
                 }
                 break;
+            }
+        }
+        if (detail.empty() && arityOk > 1) {
+            // Several declarations take that many arguments, so name the one
+            // argument none of them accepts where there is exactly one such
+            for (size_t i = 0; i < argCands.size() && detail.empty(); ++i) {
+                bool anyOk = false;
+                std::set<std::string> wanted;
+                for (VhdlSymbol* const symp : found) {
+                    const VhdlSymKind kind = symp->resolved()->kind();
+                    if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
+                    if (!bindActuals(symp, assocs, formalOf)) continue;
+                    if (formalOf[i] < 0) continue;
+                    VhdlType* const paramp = symp->paramTypes()[formalOf[i]];
+                    if (anyMatches(argCands[i], paramp)) {
+                        anyOk = true;
+                        break;
+                    }
+                    if (paramp) wanted.insert(paramp->prettyName());
+                }
+                if (anyOk || wanted.empty()) continue;
+                detail = ": argument " + std::to_string(i + 1) + " is ";
+                detail += (i < argTypes.size() && argTypes[i]) ? argTypes[i]->prettyName()
+                                                              : std::string{"of no known type"};
+                detail += ", and every declaration wants ";
+                std::string list;
+                for (const std::string& w : wanted) list += (list.empty() ? "" : " or ") + w;
+                detail += list + " there";
             }
         }
         err(nodep->fileline(), "No visible subprogram '" + name + "' takes "
