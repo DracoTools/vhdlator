@@ -68,6 +68,8 @@ std::string lower(const std::string& in) {
 //######################################################################
 // The analyzer
 
+class VhdlSpecVisitor;
+
 class VhdlSemVisitor final : public VNVisitor {
     // STATE
     VhdlScope* m_scopep = nullptr;  // Region being filled
@@ -155,6 +157,8 @@ class VhdlSemVisitor final : public VNVisitor {
     // Which subprogram each call of the template resolved to, keyed by the
     // copy's own node
     std::map<const AstNode*, const VhdlSymbol*> m_templateSyms;
+    // The pass that gives each call to an unconstrained subprogram its copy
+    VhdlSpecVisitor* m_specp = nullptr;
 
     // Declare 'symp', complaining if it illegally hides something declared in
     // the same region (12.3)
@@ -1120,6 +1124,11 @@ public:
     static bool formalIsReadOnly(const VhdlSymbol* symp,
                                  const std::string& formal) VL_MT_DISABLED;
     void spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    // The pass that gives each call to an unconstrained subprogram a copy.
+    // A copy's own body is source like any other, and what it calls has to
+    // be settled before its result subtype can be read off what it returns.
+    void specializer(VhdlSpecVisitor* specp) { m_specp = specp; }
+    void specializeWithin(AstNode* nodep) VL_MT_DISABLED;
     // Whether every element of a record has a length of its own (5.3.3)
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
     // A record subtype whose open elements take their bounds from the values
@@ -3081,6 +3090,10 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     if (newSymp && newSymp->returnTypep()
         && newSymp->returnTypep()->base()->kind() == VhdlTypeKind::ARRAY
         && !newSymp->returnTypep()->lengthEmittable()) {
+        // What the body returns may itself be a call whose own result
+        // subtype only one call site settles, so that call gets its copy
+        // before the length is read off it (4.2.1)
+        if (m_specp) specializeWithin(copyp->stmtsp());
         VhdlType* foundp = nullptr;
         findReturnedType(copyp->stmtsp(), foundp);
         if (!foundp) {
@@ -3189,10 +3202,9 @@ public:
         for (AstNodeVhdlUnit* const unitp : unitsp) iterate(unitp);
         return m_madeOne;
     }
-    void passOver(AstNode* nodep) {
-        m_madeOne = false;
-        iterateAndNextNull(nodep);
-    }
+    // The same over one subtree, without disturbing whether the round that
+    // is running has made a copy
+    void passOver(AstNode* nodep) { iterateAndNextNull(nodep); }
     bool madeOne() const { return m_madeOne; }
 
 private:
@@ -3489,6 +3501,10 @@ private:
     }
 };
 
+void VhdlSemVisitor::specializeWithin(AstNode* nodep) {
+    if (m_specp) m_specp->passOver(nodep);
+}
+
 //######################################################################
 // Drivers (6.5.2, 14.7.2)
 
@@ -3717,6 +3733,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // appears; the bound is defensive, since a chain that never settles is a
     // recursion on data-dependent lengths, which has no static answer.
     VhdlSpecVisitor specializer{visitor};
+    visitor.specializer(&specializer);
     for (int round = 0; round < 20; ++round) {
         if (!specializer.pass(unitsp)) break;
     }
