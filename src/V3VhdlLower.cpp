@@ -124,6 +124,10 @@ class VhdlLowerVisitor final {
     // A protected type becomes a class, and a shared variable of it an
     // instance of that class (5.6). The class is built once, on first use.
     std::map<const VhdlType*, AstClass*> m_protClasses;
+    // The names those classes have been given. A generic package instantiated
+    // twice has two protected types of the one name, and each needs a class
+    // of its own in the emitted code (4.9).
+    std::set<std::string> m_protClassNames;
     AstClass* m_protClassp = nullptr;  // Protected type being built, if any
     // The body whose declarations belong to that class, and the type whose
     // own declarative region declares its methods (5.6.2). What is declared
@@ -278,8 +282,12 @@ private:
     AstClass* protectedClass(VhdlType* basep, FileLine* flp) {
         const auto it = m_protClasses.find(basep);
         if (it != m_protClasses.end()) return it->second;
-        AstClass* const classp = new AstClass{
-            flp, "__Vprot_" + basep->name(), m_modp ? m_modp->libname() : ""};
+        std::string name = "__Vprot_" + basep->name();
+        while (!m_protClassNames.insert(name).second) {
+            name = "__Vprot_" + basep->name() + "__V" + std::to_string(++m_nameNum);
+        }
+        AstClass* const classp
+            = new AstClass{flp, name, m_modp ? m_modp->libname() : ""};
         m_protClasses.emplace(basep, classp);
         v3Global.setHasClasses();
         // The class goes where the object of it does. A protected type's

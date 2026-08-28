@@ -639,12 +639,22 @@ class VhdlSemVisitor final : public VNVisitor {
     VhdlType* resolveSubtype(AstVhdlSubtypeInd* nodep) {
         if (!nodep) return V3VhdlStd::errorType();
         if (nodep->vhdlTypep()) return nodep->vhdlTypep();
+        return resolveSubtypeOf(nodep->typeMarkp(), nodep->constraintp(), nodep->resolutionp(),
+                                nodep, nodep->fileline());
+    }
+
+    // The same, where the subtype indication was not written as one: a
+    // generic type may be given "std_logic_vector(7 downto 0)" in a generic
+    // map, which is a subtype indication however it reaches here (6.5.7.2)
+    VhdlType* resolveSubtypeOf(AstNodeVhdlExpr* markExprp, AstNodeVhdl* constraintp,
+                               AstNodeVhdlExpr* resolutionExprp, AstVhdlSubtypeInd* cachep,
+                               FileLine* flp) {
         // The parser could not tell "std_logic_vector(7 downto 0)" from a
         // call, so a constrained type mark arrives as one (8.1)
         // "t(3 downto 0)(7 downto 0)" constrains the array and then its
         // element, and arrives as a call of a call (5.3.2.1)
         std::vector<AstNode*> argLists;
-        AstNodeVhdlExpr* markp = nodep->typeMarkp();
+        AstNodeVhdlExpr* markp = markExprp;
         while (AstVhdlCall* const cp = VN_CAST(markp, VhdlCall)) {
             argLists.push_back(cp->argsp());
             markp = cp->prefixp();
@@ -655,38 +665,35 @@ class VhdlSemVisitor final : public VNVisitor {
         // has to keep its own identity: replacing it with the one error type
         // makes every parameter of it look like every other (6.5.5)
         if (!basep || (basep->isError() && !basep->isGenericFormal())) {
-            nodep->vhdlTypep(V3VhdlStd::errorType());
-            return nodep->vhdlTypep();
+            if (cachep) cachep->vhdlTypep(V3VhdlStd::errorType());
+            return V3VhdlStd::errorType();
         }
-        AstNodeVhdl* const constraintp = nodep->constraintp();
-        if (!constraintp && argLists.empty() && !nodep->resolutionp()) {
-            nodep->vhdlTypep(basep);
+        if (!constraintp && argLists.empty() && !resolutionExprp) {
+            if (cachep) cachep->vhdlTypep(basep);
             return basep;
         }
         // A constrained subtype is a distinct subtype of the same type
-        VhdlType* const typep = cloneSubtype(basep, nodep->fileline());
+        VhdlType* const typep = cloneSubtype(basep, flp);
         // Set before applying the constraint, so that a subtype indication
         // mentioning itself stops rather than recursing
-        nodep->vhdlTypep(typep);
+        if (cachep) cachep->vhdlTypep(typep);
         VhdlType* curp = typep;
         VhdlType* curBasep = basep;
         for (size_t i = 0; i < argLists.size(); ++i) {
             if (i > 0) {
                 VhdlType* const elemp = curp->elementp();
                 if (!elemp) break;
-                VhdlType* const newElemp = cloneSubtype(elemp, nodep->fileline());
+                VhdlType* const newElemp = cloneSubtype(elemp, flp);
                 curp->elementp(newElemp);
                 curBasep = elemp;
                 curp = newElemp;
             }
-            applyConstraint(curp, curBasep, nullptr, argLists[i], nodep->fileline());
+            applyConstraint(curp, curBasep, nullptr, argLists[i], flp);
         }
-        if (constraintp) {
-            applyConstraint(typep, basep, constraintp, nullptr, nodep->fileline());
-        }
-        if (nodep->resolutionp()) {
+        if (constraintp) applyConstraint(typep, basep, constraintp, nullptr, flp);
+        if (resolutionExprp) {
             VhdlSymbol* const resp
-                = lookupOne(nodep->resolutionp(), VhdlSymKind::FUNCTION, "resolution function");
+                = lookupOne(resolutionExprp, VhdlSymKind::FUNCTION, "resolution function");
             if (resp) typep->resolutionp(resp);
         }
         return typep;
@@ -2879,7 +2886,10 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
     VhdlScope* const innerp = m_scopep;
     if (formalp->kind() == VhdlIfaceKind::TYPE) {
         m_scopep = outerp;
-        VhdlType* const typep = resolveTypeMark(actualp);
+        // The actual is a subtype indication, not merely a type mark:
+        // "t_element => std_logic_vector(7 downto 0)" says how long the
+        // elements of every object of it are (6.5.7.2)
+        VhdlType* const typep = resolveSubtypeOf(actualp, nullptr, nullptr, nullptr, flp);
         m_scopep = innerp;
         VhdlSymbol* const symp
             = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, formalp->name(), formalp);
