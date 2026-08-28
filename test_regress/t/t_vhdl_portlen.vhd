@@ -19,8 +19,11 @@ architecture rtl of sat is
     -- here, but an expression elaboration folds
     constant hi : signed := to_signed(3, y'length);
     constant lo : signed := to_signed(1, x'length);
+    -- An operator that gives a result as long as what it was handed (16.5),
+    -- so this constant is as long as those
+    constant mid : signed := hi - lo;
 begin
-    y <= hi when x > lo else hi - 1;
+    y <= hi when x > mid else mid;
 end architecture;
 
 library ieee;
@@ -45,6 +48,8 @@ begin
         wait for 1 ns;
         assert b = "0011" report "b" severity failure;
         assert d = "00000010" report "d" severity failure;
+        assert b'length = 4 report "blen" severity failure;
+        assert d'length = 8 report "dlen" severity failure;
         report "*-* All Finished *-*";
         std.env.finish;
     end process;

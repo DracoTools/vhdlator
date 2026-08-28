@@ -4091,6 +4091,28 @@ VhdlType* VhdlSemVisitor::analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) {
     return resultp;
 }
 
+// Whether the result of this operator is as long as the operands it was
+// handed, rather than a length of its own
+static bool sameLengthAsOperands(VhdlBinaryOp op) {
+    switch (op) {
+    case VhdlBinaryOp::AND:
+    case VhdlBinaryOp::OR:
+    case VhdlBinaryOp::NAND:
+    case VhdlBinaryOp::NOR:
+    case VhdlBinaryOp::XOR:
+    case VhdlBinaryOp::XNOR:
+    case VhdlBinaryOp::ADD:
+    case VhdlBinaryOp::SUB:
+    case VhdlBinaryOp::SLL:
+    case VhdlBinaryOp::SRL:
+    case VhdlBinaryOp::SLA:
+    case VhdlBinaryOp::SRA:
+    case VhdlBinaryOp::ROL:
+    case VhdlBinaryOp::ROR: return true;
+    default: return false;
+    }
+}
+
 VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
     // Resolve the operand that can stand alone first, so its type can settle
     // the one that cannot
@@ -4147,6 +4169,27 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
     if (nodep->vhdlSymp() && nodep->vhdlSymp()->paramTypes().size() == 2) {
         analyzeExpr(nodep->lhsp(), nodep->vhdlSymp()->paramTypes()[0]);
         analyzeExpr(nodep->rhsp(), nodep->vhdlSymp()->paramTypes()[1]);
+    }
+    // An operator declared to return an unconstrained array may give a result
+    // as long as what it was handed, and then an operand's own subtype says
+    // how long it is. Only for the operators that do: "&" is as long as both
+    // together, and numeric_std's "*" as long as both operands' lengths
+    // added, so neither takes its length from one of them (9.2.2, 16.5).
+    if (resultp && resultp->base()->kind() == VhdlTypeKind::ARRAY
+        && !resultp->lengthEmittable() && sameLengthAsOperands(nodep->op())) {
+        VhdlType* bestp = nullptr;
+        for (AstNodeVhdlExpr* const opp : {nodep->lhsp(), nodep->rhsp()}) {
+            VhdlType* const typep = opp ? opp->vhdlTypep() : nullptr;
+            if (!typep || typep->base() != resultp->base() || !typep->lengthEmittable()) {
+                continue;
+            }
+            // Of two lengths, the result is the longer (16.5)
+            if (!bestp || (typep->isConstrainedArray() && bestp->isConstrainedArray()
+                           && typep->dimLength(0) > bestp->dimLength(0))) {
+                bestp = typep;
+            }
+        }
+        if (bestp) return bestp;
     }
     return resultp;
 }
