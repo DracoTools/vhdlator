@@ -108,6 +108,9 @@ class VhdlSymbol final {
     // Unknown for anything whose value is not fixed until elaboration.
     VhdlValue m_value;
     bool m_deferred = false;  // A deferred constant, whose value is in the body
+    // Where a deferred constant was given its value: the declaration in the
+    // package body completes the one in the package, which has none (6.4.2.2)
+    AstNode* m_fullDeclp = nullptr;
     VhdlSymbol* m_aliasp = nullptr;  // What an alias denotes (6.6)
     // A subprogram given the FOREIGN attribute (16.2) binds to a C symbol
     // instead of having a body here. The string says which, and which ABI.
@@ -150,6 +153,8 @@ public:
     void hasBody(bool flag) { m_hasBody = flag; }
     bool deferred() const { return m_deferred; }
     void deferred(bool flag) { m_deferred = flag; }
+    AstNode* fullDeclp() const { return m_fullDeclp; }
+    void fullDeclp(AstNode* nodep) { m_fullDeclp = nodep; }
 
     AstVhdlSubprogDecl* bodyp() const { return m_bodyp; }
     void bodyp(AstVhdlSubprogDecl* nodep) { m_bodyp = nodep; }

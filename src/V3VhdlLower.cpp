@@ -2747,7 +2747,11 @@ private:
         const auto it = m_vars.find(symp);
         if (it != m_vars.end()) return it->second;
         if (!symp->isObject() || symp->predefined()) return nullptr;
-        AstVhdlObjectDecl* const declp = VN_CAST(symp->declp(), VhdlObjectDecl);
+        // A deferred constant is declared in the package and given its value
+        // in the package body, and it is that second declaration which says
+        // what the value is (6.4.2.2)
+        AstVhdlObjectDecl* const declp
+            = VN_CAST(symp->fullDeclp() ? symp->fullDeclp() : symp->declp(), VhdlObjectDecl);
         if (!declp) return nullptr;
         // The type is lowered first: a protected type becomes a class whose
         // own body may name this same object, and that reference must find

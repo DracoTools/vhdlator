@@ -1395,6 +1395,9 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             if (otherp->kind() == VhdlSymKind::CONSTANT && otherp->deferred()) {
                 symp = otherp;
                 symp->deferred(false);
+                // The value is written here, not where the constant was
+                // declared, and it is this declaration that carries it
+                symp->fullDeclp(nodep);
                 break;
             }
         }
@@ -5684,8 +5687,15 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
             const VhdlSymbol* const symp = refp->vhdlSymp();
             if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
             AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
-            if (!otherp || otherp->isElabConstant()) return;
-            otherp->elabConstant(true);
+            // A deferred constant is written twice: once in the package with
+            // no value and once in the body with one. Both say the same
+            // constant, so both have to know it is settled by elaboration.
+            AstVhdlObjectDecl* const fullp = VN_CAST(symp->fullDeclp(), VhdlObjectDecl);
+            if ((!otherp || otherp->isElabConstant()) && (!fullp || fullp->isElabConstant())) {
+                return;
+            }
+            if (otherp) otherp->elabConstant(true);
+            if (fullp) fullp->elabConstant(true);
             changed = true;
         });
     };
