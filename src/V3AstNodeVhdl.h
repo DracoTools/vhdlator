@@ -238,6 +238,10 @@ class AstVhdlAssoc final : public AstNodeVhdl {
     // @astgen op1 := formalp : Optional[AstNodeVhdlExpr]
     // @astgen op2 := actualp : Optional[AstNodeVhdlExpr]  // Absent means OPEN
     bool m_inertial = false;  // Actual was written "inertial expression"
+    // The formal is a port the instance drives, so the association is one
+    // driver of the actual, exactly as a signal assignment to it would be
+    // (6.5.6.3, 14.7.2)
+    bool m_drives = false;
 
 public:
     AstVhdlAssoc(FileLine* fl, AstNodeVhdlExpr* formalp, AstNodeVhdlExpr* actualp)
@@ -248,6 +252,8 @@ public:
     ASTGEN_MEMBERS_AstVhdlAssoc;
     bool inertial() const { return m_inertial; }
     void inertial(bool flag) { m_inertial = flag; }
+    bool drives() const { return m_drives; }
+    void drives(bool flag) { m_drives = flag; }
     bool isOpen() const { return !actualp(); }
 };
 

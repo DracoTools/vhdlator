@@ -5074,6 +5074,12 @@ private:
     // index of the driver a signal is being written from is known from where
     // the lowering is, not from the statement itself
     void lowerConcurrentDriver(AstNodeVhdlStmt* nodep) {
+        if (VN_IS(nodep, VhdlBlock)) {
+            // A block is not a driver of its own: each statement inside it is
+            // one, and is counted as it is lowered (11.2)
+            lowerConcurrent(nodep);
+            return;
+        }
         std::set<const VhdlSymbol*> driven;
         collectDriven(nodep, driven);
         std::vector<const VhdlSymbol*> resolved;
@@ -5114,7 +5120,9 @@ private:
             }
             for (AstNode* p = blockp->declsp(); p; p = p->nextp()) lowerDecl(p);
             for (AstNode* p = blockp->stmtsp(); p; p = p->nextp()) {
-                lowerConcurrent(VN_AS(p, NodeVhdlStmt));
+                // A block is transparent to resolution: each statement of it
+                // is a driver of its own, as it would be outside the block
+                lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
             return;
         }
@@ -5795,6 +5803,19 @@ private:
     static void collectDriven(AstNode* nodep, std::set<const VhdlSymbol*>& out,
                               bool follow = false) {
         if (!nodep) return;
+        if (const AstVhdlAssoc* const asp = VN_CAST(nodep, VhdlAssoc)) {
+            // An instance's out port is a driver of the signal associated
+            // with it, as much as an assignment to that signal is (6.5.6.3)
+            if (asp->drives() && asp->actualp()) {
+                if (const VhdlSymbol* const symp = rootSymOf(asp->actualp())) {
+                    if (VN_IS(asp->actualp(), VhdlName)) {
+                        out.insert(symp);
+                    } else {
+                        s_partialDriven.insert(symp);
+                    }
+                }
+            }
+        }
         if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
             if (const VhdlSymbol* const symp = rootSymOf(asgp->targetp())) {
                 // A driver belongs to the longest static prefix of the name
@@ -6077,6 +6098,45 @@ private:
             outp = new AstCond{flp, testp, valuep, outp};
         }
         return outp ? outp : new AstConst{flp, AstConst::WidthedValue{}, 1, 1};
+    }
+
+    // A port of mode out is one driver of the signal it is associated with,
+    // so where that signal is resolved the port is wired to this driver's own
+    // value rather than to the signal (6.5.6.3, 14.7.2). An instance drives
+    // from the moment it is elaborated, so its driver is always on.
+    // Between this call and unbindPortDriver, the actual's name means that
+    // driver's own value rather than the signal. Returns null, and binds
+    // nothing, where the signal is not resolved.
+    VhdlSymbol* bindPortDriver(AstVhdlAssoc* asp, FileLine* flp, AstVar*& savedp) {
+        const VhdlSymbol* const symp
+            = asp->drives() && asp->actualp() ? rootSymOf(asp->actualp()) : nullptr;
+        const auto it = symp ? m_drivers.find(symp) : m_drivers.end();
+        if (it == m_drivers.end()
+            || m_driverUsed[symp] >= static_cast<int>(it->second.size())) {
+            return nullptr;
+        }
+        const VhdlDriver& drv = it->second[m_driverUsed[symp]];
+        VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
+        savedp = m_vars[keyp];
+        m_vars[keyp] = drv.valp;
+        if (drv.enp) {
+            // Resolved by the logic tables, where a driver says whether it
+            // drives at all; this one always does, and forcingly
+            addStmt(new AstInitial{
+                flp, new AstAssign{flp, new AstVarRef{flp, drv.enp, VAccess::WRITE},
+                                   new AstConst{flp, AstConst::WidthedValue{}, 1, 1}}});
+        }
+        return keyp;
+    }
+    void unbindPortDriver(VhdlSymbol* keyp, AstVar* savedp) {
+        if (keyp) m_vars[keyp] = savedp;
+    }
+    AstPin* lowerPortAssoc(AstVhdlAssoc* asp, int pinNum, FileLine* flp) {
+        AstVar* savedp = nullptr;
+        VhdlSymbol* const keyp = bindPortDriver(asp, flp, savedp);
+        AstPin* const pinp = lowerAssoc(asp, pinNum);
+        unbindPortDriver(keyp, savedp);
+        return pinp;
     }
 
     // An assignment to a signal that has several drivers writes this driver's
@@ -6857,6 +6917,8 @@ private:
                     ++portPosition;
                     const auto renIt = renamed.find(compPort);
                     if (renIt != renamed.end()) {
+                        AstVar* savedp = nullptr;
+                        VhdlSymbol* const keyp = bindPortDriver(asp, flp, savedp);
                         // One of the component's ports may feed more than one
                         // of the entity's, so each gets a pin of its own
                         for (const std::string& entPort : renIt->second) {
@@ -6867,10 +6929,11 @@ private:
                             pinsp = AstNode::addNextNull(
                                 pinsp, new AstPin{asp->fileline(), ++pinNum, entPort, actp});
                         }
+                        unbindPortDriver(keyp, savedp);
                         continue;
                     }
                 }
-                AstPin* const pinp = lowerAssoc(asp, ++pinNum);
+                AstPin* const pinp = lowerPortAssoc(asp, ++pinNum, flp);
                 if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }

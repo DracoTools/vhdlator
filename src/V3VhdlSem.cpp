@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <string>
 #include <utility>
@@ -1213,6 +1214,8 @@ private:
     };
     std::vector<NeedResolve> m_needResolve;  // Signals awaiting a sized resolver
     static VhdlType* formalAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
+    static const VhdlSymbol* portAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
+    void markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
     // Expressions (clauses 8, 9, 12.5)
@@ -3328,6 +3331,18 @@ const VhdlSymbol* driverRootSym(const AstNode* nodep) {
 void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                        std::set<const VhdlSymbol*>& partial, bool follow) {
     if (!nodep) return;
+    if (const AstVhdlAssoc* const asp = VN_CAST(nodep, VhdlAssoc)) {
+        // An instance's out port drives the signal it is associated with
+        if (asp->drives() && asp->actualp()) {
+            if (const VhdlSymbol* const symp = driverRootSym(asp->actualp())) {
+                if (VN_IS(asp->actualp(), VhdlName)) {
+                    whole.insert(symp);
+                } else {
+                    partial.insert(symp);
+                }
+            }
+        }
+    }
     if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
         // A force overrides every driver rather than being one of them, and
         // a release hands the signal back to the drivers it already had
@@ -3382,16 +3397,25 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     // well have one driver once the design is elaborated: which branches are
     // taken is not known until the generics have values (11.8)
     std::set<const VhdlSymbol*> outsideGenerate;
-    for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
-        std::set<const VhdlSymbol*> whole;
-        collectDrivenSyms(p, whole, partial, false);
-        const bool inGenerate = VN_IS(p, VhdlGenerate);
-        for (const VhdlSymbol* const symp : whole) {
-            ++counts[symp];
-            if (!inGenerate) outsideGenerate.insert(symp);
-            if (!where.count(symp)) where[symp] = p->fileline();
+    // A block statement is not a driver of its own: the statements inside it
+    // are, and so are those of a block inside that one (11.2)
+    std::function<void(AstNode*)> walk = [&](AstNode* stmtsp) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            if (const AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+                walk(blockp->stmtsp());
+                continue;
+            }
+            std::set<const VhdlSymbol*> whole;
+            collectDrivenSyms(p, whole, partial, false);
+            const bool inGenerate = VN_IS(p, VhdlGenerate);
+            for (const VhdlSymbol* const symp : whole) {
+                ++counts[symp];
+                if (!inGenerate) outsideGenerate.insert(symp);
+                if (!where.count(symp)) where[symp] = p->fileline();
+            }
         }
-    }
+    };
+    walk(archp->stmtsp());
     for (const auto& pair : counts) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
         if (partial.count(symp)) continue;  // Its elements are driven, not it
@@ -6206,6 +6230,44 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
     // actual is often a literal, whose bounds come from how long it is
     bindOpenGenericBounds(nodep, unitScopep);
     analyzeAssociations(nodep->portMapp(), unitScopep);
+    markDrivingPorts(nodep, unitScopep);
+}
+
+// A port of mode out drives whatever signal the instance associates with it,
+// and that is one driver of the signal like any other (6.5.6.3, 14.7.2). A
+// signal an instance drives and a process drives too therefore needs
+// resolving, and a signal two instances drive needs it as well.
+void VhdlSemVisitor::markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitScopep) {
+    if (!unitScopep) return;
+    int position = 0;
+    for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+        AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+        const int here = position++;
+        if (!asp->actualp()) continue;
+        const VhdlSymbol* portp = nullptr;
+        if (!asp->formalp()) {
+            portp = portAt(unitScopep, here);
+        } else if (const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName)) {
+            const VhdlSymbol* const symp = namep->vhdlSymp();
+            if (symp && symp->kind() == VhdlSymKind::PORT) portp = symp;
+        }
+        // An individual association -- "d(3) => x" -- or one through a
+        // conversion drives part of the actual rather than the whole of it,
+        // which the driver count treats as it treats a partial assignment
+        if (!portp) continue;
+        const AstVhdlIfaceDecl* const declp = VN_CAST(portp->declp(), VhdlIfaceDecl);
+        if (!declp || declp->mode() != VhdlMode::OUT) continue;
+        asp->drives(true);
+    }
+}
+
+// The port at that position of an entity or component's clause
+const VhdlSymbol* VhdlSemVisitor::portAt(VhdlScope* scopep, int position) {
+    for (const auto& pair : scopep->direct()) {
+        VhdlSymbol* const symp = pair.second;
+        if (symp->kind() == VhdlSymKind::PORT && symp->position() == position) return symp;
+    }
+    return nullptr;
 }
 
 // "for u1 : comp use entity work.thing" says which entity an instance is
