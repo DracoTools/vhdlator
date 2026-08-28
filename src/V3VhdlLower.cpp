@@ -805,6 +805,18 @@ private:
         return new AstRange{flp, leftp, rightp};
     }
 
+    // What "x'RANGE" runs over: the index subtype of what the attribute's
+    // prefix denotes, which is where a range attribute gets its bounds
+    static const VhdlType* attrRangeSubtype(const AstNodeVhdl* attrNodep) {
+        const AstVhdlAttrName* const attrp = VN_CAST(attrNodep, VhdlAttrName);
+        if (!attrp || !attrp->prefixp()) return nullptr;
+        const VhdlType* ptypep = attrp->prefixp()->vhdlTypep();
+        if (!ptypep && attrp->prefixp()->vhdlSymp()) {
+            ptypep = attrp->prefixp()->vhdlSymp()->typep();
+        }
+        return indexSubtype(ptypep, 0);
+    }
+
     // The index subtype of one dimension, or of a scalar type itself
     static const VhdlType* indexSubtype(const VhdlType* typep, int dim = 0) {
         if (!typep) return nullptr;
@@ -4340,14 +4352,26 @@ private:
                 int64_t lo = 0;
                 int64_t hi = 0;
                 if (AstVhdlRange* const rp = chp->rangep()) {
-                    const VhdlValue a = V3VhdlEval::eval(rp->leftp());
-                    const VhdlValue b = V3VhdlEval::eval(rp->rightp());
-                    if (!a.isInt() || !b.isInt()) {
-                        unsup(chp->fileline(), "aggregate choice that is not static");
-                        return nullptr;
+                    // "v'range => x" names every index of v, which its own
+                    // subtype says (16.2.3) rather than an expression
+                    if (!rp->leftp() && rp->attrp()) {
+                        const VhdlType* const idxp = attrRangeSubtype(rp->attrp());
+                        if (!idxp || !idxp->bounded()) {
+                            unsup(chp->fileline(), "aggregate choice that is not static");
+                            return nullptr;
+                        }
+                        lo = idxp->low();
+                        hi = idxp->high();
+                    } else {
+                        const VhdlValue a = V3VhdlEval::eval(rp->leftp());
+                        const VhdlValue b = V3VhdlEval::eval(rp->rightp());
+                        if (!a.isInt() || !b.isInt()) {
+                            unsup(chp->fileline(), "aggregate choice that is not static");
+                            return nullptr;
+                        }
+                        lo = std::min(a.toInt(), b.toInt());
+                        hi = std::max(a.toInt(), b.toInt());
                     }
-                    lo = std::min(a.toInt(), b.toInt());
-                    hi = std::max(a.toInt(), b.toInt());
                 } else {
                     const VhdlValue v = V3VhdlEval::eval(chp->valuep());
                     if (!v.isInt()) {
@@ -4435,11 +4459,29 @@ private:
                                        int64_t knownCount = 0) {
         // Where the range has already been folded, the repetition count is
         // that number rather than an expression to work it out again
+        AstVhdlElemAssoc* const firstp = nodep->elemsp();
         const auto lengthOf = [&]() -> AstNodeExpr* {
             if (AstNodeExpr* const countp = boundsLength(typep, flp)) return countp;
             if (knownCount > 0) {
                 return new AstConst{flp, AstConst::Unsized32{},
                                     static_cast<uint32_t>(knownCount)};
+            }
+            // An aggregate standing as an operand has no bounds of its own,
+            // so a single range choice is what says how long it is (9.3.3.3)
+            // -- and that range may name a generic rather than a number
+            AstVhdlChoice* const chp = firstp ? firstp->choicesp() : nullptr;
+            AstVhdlRange* const rp = chp && !chp->nextp() ? chp->rangep() : nullptr;
+            if (rp && rp->leftp() && rp->rightp() && !rp->dirUnknown()) {
+                AstNodeExpr* const lop = lowerExpr(rp->leftp());
+                AstNodeExpr* const hip = lop ? lowerExpr(rp->rightp()) : nullptr;
+                if (!hip) {
+                    if (lop) VL_DO_DANGLING(lop->deleteTree(), lop);
+                    return nullptr;
+                }
+                AstNodeExpr* const spanp = rp->dir() == VhdlDir::TO
+                                               ? new AstSub{flp, hip, lop}
+                                               : new AstSub{flp, lop, hip};
+                return new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}};
             }
             return nullptr;
         };
