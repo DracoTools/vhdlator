@@ -9292,13 +9292,26 @@ private:
         for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
             lowerInterface(VN_AS(p, VhdlIfaceDecl), false, pinNum);
         }
-        for (AstNode* p = entp->declsp(); p; p = p->nextp()) lowerDecl(p);
+        // An entity may have a statement part of its own, whose statements
+        // are passive: an assertion that holds for every instance of it,
+        // whatever architecture is bound (3.2.4)
+        std::vector<AstNodeVhdlStmt*> entStmtsp;
+        for (AstNode* p = entp->declsp(); p; p = p->nextp()) {
+            if (AstNodeVhdlStmt* const stmtp = VN_CAST(p, NodeVhdlStmt)) {
+                entStmtsp.push_back(stmtp);
+                continue;
+            }
+            lowerDecl(p);
+        }
         if (archp) {
             for (AstNode* p = archp->declsp(); p; p = p->nextp()) lowerDecl(p);
-            // Every signal now has its variable, so the transaction bits that
-            // the statements will mark can be made
-            makeActives(flp);
-            makeForced(flp);
+        }
+        // Every signal now has its variable, so the transaction bits that
+        // the statements will mark can be made
+        makeActives(flp);
+        makeForced(flp);
+        for (AstNodeVhdlStmt* const stmtp : entStmtsp) lowerConcurrentDriver(stmtp);
+        if (archp) {
             for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
                 lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
