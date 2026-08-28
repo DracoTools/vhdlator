@@ -1264,6 +1264,10 @@ private:
     static bool scopeEncloses(const VhdlScope* outerp, const VhdlScope* innerp) VL_MT_DISABLED;
     // Set while the call that is a statement of its own is resolved
     bool m_procCall = false;
+    // Set while a copy made for one call site is analyzed: the bounds inside
+    // it fold because the call supplied them, not because the design wrote
+    // them, so a range that does not fit is a run-time condition
+    bool m_inSpecialized = false;
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
@@ -2991,7 +2995,15 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     m_scopep = regionp;
     m_returnTypep = nullptr;
     m_specValues = actualValues;
-    iterate(copyp);
+    {
+        // What the call supplies makes the body's bounds fold, but they are
+        // not static where the design wrote them: a slice or an index out of
+        // range in here is a condition to be met while running, not an error
+        // in the source (8.4, 8.5)
+        VL_RESTORER(m_inSpecialized);
+        m_inSpecialized = true;
+        iterate(copyp);
+    }
     m_specValues.clear();
     m_scopep = savedp;
     m_returnTypep = savedReturnp;
@@ -5303,7 +5315,7 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
                                            + std::string{info.ascending ? "'to'" : "'downto'"}
                                            + " but " + arrayp->prettyName() + " is indexed "
                                            + (indexp->ascending() ? "'to'" : "'downto'"));
-            } else {
+            } else if (!m_inSpecialized) {
                 checkSubrange(sliceIndexp, indexp, nodep->fileline());
             }
         }
