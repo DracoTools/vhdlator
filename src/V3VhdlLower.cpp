@@ -4475,6 +4475,10 @@ private:
                 // count has nothing to say about it
                 FileLine* const rflp = new FileLine{flp};
                 rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+                // A null array has no elements at all (5.3.2.1), so a range
+                // that elaboration makes empty repeats the value no times --
+                // which is a legal VHDL aggregate, not a suspect replication
+                rflp->warnOff(V3ErrorCode::ZEROREPL, true);
                 return new AstReplicate{rflp, valuep, countp};
             }
         }
@@ -6330,6 +6334,28 @@ private:
                     paramsp = AstNode::addNext(paramsp, pinp);
                 } else if (pinp) {
                     VL_DO_DANGLING(pinp->deleteTree(), pinp);
+                }
+            }
+        }
+        // A component's generic may have a default the entity's has not, and
+        // an instance that says nothing about it takes the component's
+        // (6.5.6.2). The module is built from the entity, so that default
+        // has to travel with the instance.
+        {
+            const VhdlSymbol* const compSymp
+                = nodep->unitp() ? nodep->unitp()->vhdlSymp() : nullptr;
+            const AstVhdlComponentDecl* const compp
+                = compSymp && compSymp->kind() == VhdlSymKind::COMPONENT
+                      ? VN_CAST(compSymp->declp(), VhdlComponentDecl)
+                      : nullptr;
+            if (compp) {
+                for (AstNode* p = compp->genericsp(); p; p = p->nextp()) {
+                    const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+                    if (!ifp->defaultp() || pinNamed(paramsp, ifp->name())) continue;
+                    AstNodeExpr* const valuep = lowerExpr(ifp->defaultp());
+                    if (!valuep) continue;
+                    paramsp = AstNode::addNextNull(
+                        paramsp, new AstPin{flp, ++pinNum, ifp->name(), valuep});
                 }
             }
         }

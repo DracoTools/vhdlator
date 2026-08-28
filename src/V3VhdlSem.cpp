@@ -5268,19 +5268,31 @@ VhdlType* VhdlSemVisitor::constrainElementFromValue(VhdlType* typep, AstNodeVhdl
 // generic an instantiation supplied is emitted as a parameter, and a
 // parameter's value may only name other parameters (4.9)
 void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    const auto markIn = [](AstNode* exprp, bool& changed) {
+        exprp->foreach([&](AstNodeVhdlExpr* refp) {
+            const VhdlSymbol* const symp = refp->vhdlSymp();
+            if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
+            AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
+            if (!otherp || otherp->isElabConstant()) return;
+            otherp->elabConstant(true);
+            changed = true;
+        });
+    };
     for (int round = 0; round < 16; ++round) {
         bool changed = false;
         for (AstNodeVhdlUnit* const unitp : unitsp) {
             unitp->foreach([&](AstVhdlObjectDecl* declp) {
                 if (!declp->isElabConstant() || !declp->defaultp()) return;
-                declp->defaultp()->foreach([&](AstNodeVhdlExpr* exprp) {
-                    const VhdlSymbol* const symp = exprp->vhdlSymp();
-                    if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
-                    AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
-                    if (!otherp || otherp->isElabConstant()) return;
-                    otherp->elabConstant(true);
-                    changed = true;
-                });
+                markIn(declp->defaultp(), changed);
+            });
+            // A component's generic may have a default the entity's has not,
+            // and an instance that says nothing about it hands that default
+            // over as a parameter of the module (6.5.6.2)
+            unitp->foreach([&](AstVhdlComponentDecl* compp) {
+                for (AstNode* p = compp->genericsp(); p; p = p->nextp()) {
+                    AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+                    if (ifp->defaultp()) markIn(ifp->defaultp(), changed);
+                }
             });
         }
         if (!changed) break;
