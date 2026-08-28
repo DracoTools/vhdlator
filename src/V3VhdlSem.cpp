@@ -5689,6 +5689,23 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
             changed = true;
         });
     };
+    // A constant a constraint names decides how long an object is, and the
+    // back end folds a length rather than reading one, so such a constant is
+    // settled by elaboration too. Only a constraint: a loop's range and an
+    // aggregate's choice are read while running, and a constant named there
+    // may as well stay a variable -- which matters, because a constant whose
+    // value is a call on a protected object cannot fold at all.
+    {
+        bool ignored = false;
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            // The whole indication, not the constraint alone: an index
+            // constraint is written the way a call is -- "bit_vector(n - 1
+            // downto 0)" -- and the parser could not tell the two apart, so
+            // the bounds arrive as the type mark's arguments
+            unitp->foreach([&](AstVhdlSubtypeInd* indp) { markIn(indp, ignored); });
+            unitp->foreach([&](AstVhdlTypeDecl* declp) { markIn(declp, ignored); });
+        }
+    }
     for (int round = 0; round < 16; ++round) {
         bool changed = false;
         for (AstNodeVhdlUnit* const unitp : unitsp) {

@@ -1288,7 +1288,11 @@ private:
                 // One standing for a generic an instantiation supplied is a
                 // parameter: its value is settled by elaboration, and a range
                 // written in terms of it has to fold with it (4.9)
-                varType = objp->isElabConstant() ? VVarType::LPARAM : VVarType::VAR;
+                // A constant of a subprogram is elaborated afresh on every
+                // call and what it is given may name a parameter of that
+                // call, so it stays a variable however it is used elsewhere
+                varType = objp->isElabConstant() && !m_ftaskp && !m_protClassp ? VVarType::LPARAM
+                                                                              : VVarType::VAR;
                 break;
             case VhdlObjKind::VARIABLE:
             case VhdlObjKind::SHARED_VARIABLE: varType = VVarType::VAR; break;
