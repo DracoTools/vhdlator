@@ -4853,6 +4853,8 @@ private:
         if (!indexp || !indexp->bounded()) return false;
         int64_t positional = 0;
         bool named = false;
+        bool sawRange = false;
+        bool rangeAscending = true;
         int64_t lowest = INT64_MAX;
         int64_t highest = INT64_MIN;
         for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
@@ -4875,6 +4877,14 @@ private:
                     if (!a.isInt() || !b.isInt()) return false;
                     lo = std::min(a.toInt(), b.toInt());
                     hi = std::max(a.toInt(), b.toInt());
+                    // A choice written as a range says which way the
+                    // aggregate's own index runs (9.3.3.3), whatever the
+                    // index subtype does: "(15 downto 12 => s, 11 downto 0
+                    // => v)" is sixteen bits with 15 at the left
+                    if (!sawRange && !rp->dirUnknown()) {
+                        sawRange = true;
+                        rangeAscending = rp->dir() == VhdlDir::TO;
+                    }
                 } else {
                     const VhdlValue v = V3VhdlEval::eval(chp->valuep());
                     if (!v.isInt()) return false;
@@ -4884,7 +4894,7 @@ private:
                 highest = std::max(highest, hi);
             }
         }
-        step = indexp->ascending() ? 1 : -1;
+        step = (sawRange ? rangeAscending : indexp->ascending()) ? 1 : -1;
         if (named) {
             if (lowest > highest) return false;
             left = step > 0 ? lowest : highest;

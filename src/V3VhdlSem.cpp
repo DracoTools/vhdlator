@@ -5085,6 +5085,8 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
     if (!indexp || !indexp->bounded()) return nullptr;
     int64_t positional = 0;
     bool named = false;
+    bool sawRange = false;
+    bool rangeAscending = true;
     int64_t lowest = INT64_MAX;
     int64_t highest = INT64_MIN;
     for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
@@ -5105,6 +5107,12 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
                 if (!info.left.isInt() || !info.right.isInt()) return nullptr;
                 lo = std::min(info.left.toInt(), info.right.toInt());
                 hi = std::max(info.left.toInt(), info.right.toInt());
+                // A choice written as a range says which way the aggregate's
+                // own index runs, whatever the index subtype does (9.3.3.3)
+                if (!sawRange) {
+                    sawRange = true;
+                    rangeAscending = info.left.toInt() <= info.right.toInt();
+                }
             } else {
                 const VhdlValue v = V3VhdlEval::eval(chp->valuep());
                 if (!v.isInt()) return nullptr;
@@ -5114,20 +5122,21 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
             highest = std::max(highest, hi);
         }
     }
+    const bool ascending = sawRange ? rangeAscending : indexp->ascending();
     int64_t left = 0;
     int64_t right = 0;
     if (named) {
         if (lowest > highest) return nullptr;
-        left = indexp->ascending() ? lowest : highest;
-        right = indexp->ascending() ? highest : lowest;
+        left = ascending ? lowest : highest;
+        right = ascending ? highest : lowest;
     } else {
         if (positional <= 0) return nullptr;
         left = indexp->left();
-        right = indexp->ascending() ? left + positional - 1 : left - positional + 1;
+        right = ascending ? left + positional - 1 : left - positional + 1;
     }
     VhdlType* const outp = cloneSubtype(typep, nodep->fileline());
     VhdlType* const newIndexp = cloneSubtype(indexp, nodep->fileline());
-    newIndexp->setBounds(left, right, indexp->ascending());
+    newIndexp->setBounds(left, right, ascending);
     outp->clearIndexTypes();
     outp->addIndexType(newIndexp);
     outp->unconstrained(false);
