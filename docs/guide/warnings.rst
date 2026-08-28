@@ -2681,6 +2681,31 @@ List Of Warnings
    To resolve this, rename the inner or outer variable to an unique name.
 
 
+.. option:: VHDLUNBOUND
+
+   Warns that a VHDL component instance has no entity bound to it: no entity
+   of the component's name was analyzed, and no configuration or binding
+   indication says which entity to use. IEEE 1076-2008 7.3.3 allows this --
+   the instance is simply not elaborated, and whatever an output formal
+   would have driven takes that formal's default value -- so it is a warning
+   rather than an error, and a design that leaves a component unbound on
+   purpose still builds.
+
+   Most often it means a file was left off the command line.
+
+   Faulty example:
+
+   .. code-block:: vhdl
+
+      component nowhere is
+        port (y : out integer := 55);
+      end component;
+      c1 : component nowhere port map (b);   -- No entity "nowhere"
+
+   To resolve this, analyze the entity the component stands for, or write a
+   configuration that binds the instance to one.
+
+
 .. option:: WAITCONST
 
    Warns that a `wait` statement awaits a constant condition, which means it

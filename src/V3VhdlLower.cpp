@@ -133,6 +133,7 @@ class VhdlLowerVisitor final {
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::set<std::string> m_instantiated;  // Modules something else builds one of
+    std::set<std::string> m_knownEntities;  // "lib.entity" of every entity there is
     // The loops being lowered, innermost last. A labelled exit or next names
     // a loop that need not be the innermost (10.11, 10.12), which Verilator's
     // break and continue cannot express, so those become a jump out of a
@@ -6829,6 +6830,28 @@ private:
                 }
             }
         }
+        // A component with no entity of its name is unbound: the instance is
+        // not elaborated at all, and each actual associated with a formal
+        // that has a default takes that default (7.3.3, 12.4.3). Refusing it
+        // would stop a design that deliberately leaves a component unbound.
+        {
+            const VhdlSymbol* const compSymp
+                = nodep->unitp() ? nodep->unitp()->vhdlSymp() : nullptr;
+            const AstVhdlComponentDecl* const declp
+                = compSymp && compSymp->kind() == VhdlSymKind::COMPONENT
+                      ? VN_CAST(compSymp->declp(), VhdlComponentDecl)
+                      : nullptr;
+            const std::string entLib = m_modp ? m_modp->libname() : "work";
+            if (declp && !m_knownEntities.count(entLib + "." + modName)) {
+                flp->v3warn(VHDLUNBOUND,
+                            "Component instance '"
+                                + (label.empty() ? modName : label)
+                                + "' has no entity bound to it: no entity '" + modName
+                                + "' was analyzed");
+                lowerUnboundInstance(nodep, declp, flp);
+                return;
+            }
+        }
         // A component's generic may have a default the entity's has not, and
         // an instance that says nothing about it takes the component's
         // (6.5.6.2). The module is built from the entity, so that default
@@ -6866,6 +6889,44 @@ private:
         }
         m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
+    }
+
+    // An instance of a component no entity is bound to. Nothing is
+    // elaborated for it; what an "out" formal would have driven takes the
+    // default that formal was declared with (7.3.3, 12.4.3).
+    void lowerUnboundInstance(AstVhdlInstance* nodep, const AstVhdlComponentDecl* declp,
+                              FileLine* flp) {
+        std::vector<AstVhdlIfaceDecl*> ports;
+        for (AstNode* p = declp->portsp(); p; p = p->nextp()) {
+            ports.push_back(VN_AS(p, VhdlIfaceDecl));
+        }
+        size_t position = 0;
+        for (AstNode* p = nodep->portMapp(); p; p = p->nextp(), ++position) {
+            AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+            if (!asp->actualp() || asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            const AstVhdlIfaceDecl* formalp = nullptr;
+            if (const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName)) {
+                for (AstVhdlIfaceDecl* const ifp : ports) {
+                    if (ifp->name() == namep->name()) formalp = ifp;
+                }
+            } else if (!asp->formalp() && position < ports.size()) {
+                formalp = ports[position];
+            }
+            if (!formalp || !formalp->defaultp()) continue;
+            if (formalp->mode() != VhdlMode::OUT && formalp->mode() != VhdlMode::BUFFER
+                && formalp->mode() != VhdlMode::INOUT) {
+                continue;
+            }
+            AstNodeExpr* const targetp = lowerDriveTarget(asp->actualp());
+            AstNodeExpr* const valuep = targetp ? lowerExpr(formalp->defaultp()) : nullptr;
+            if (!targetp || !valuep) {
+                if (targetp) VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                continue;
+            }
+            // Nothing else drives it, so the value it starts at is the
+            // value it keeps
+            addStmt(new AstInitial{flp, new AstAssign{flp, targetp, valuep}});
+        }
     }
 
     // A port's bounds are written in the entity's own generics, which name
@@ -10157,6 +10218,17 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Which architecture each entity is built from has to be settled before
     // any of them is lowered, since an instance asks for it by name
     std::map<std::string, AstVhdlArchitecture*> builtArch;
+    for (const auto& pair : entities) m_knownEntities.insert(pair.first);
+    // A module the other frontend read is a design unit as much as an entity
+    // is: a VHDL architecture may instantiate a Verilog module through a
+    // component of the same name, and that component is bound
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        m_knownEntities.insert(VString::downcase(modp->libname().empty() ? "work"
+                                                                        : modp->libname())
+                               + "." + VString::downcase(modp->name()));
+        m_knownEntities.insert("work." + VString::downcase(modp->name()));
+    }
     for (const std::string& key : order) {
         AstVhdlArchitecture* archp = nullptr;
         const auto pickIt = chosen.find(key);

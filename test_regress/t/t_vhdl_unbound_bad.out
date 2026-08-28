@@ -1,0 +1,4 @@
+%Warning-VHDLUNBOUND: t/t_vhdl_unbound_bad.vhd:21:10: Component instance 'c1' has no entity bound to it: no entity 'nowhere' was analyzed
+                      ... For warning description see https://verilator.org/warn/VHDLUNBOUND?v=latest
+                      ... Use "/* verilator lint_off VHDLUNBOUND */" and lint_on around source to disable this message.
+%Error: Exiting due to

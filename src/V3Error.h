@@ -190,6 +190,7 @@ public:
         USERINFO,       // Elaboration time $info
         USERWARN,       // Elaboration time $warning
         VARHIDDEN,      // Hiding variable
+        VHDLUNBOUND,    // VHDL component instance with no entity bound to it
         WAITCONST,      // Wait condition is constant
         WIDTH,          // Width mismatch
         WIDTHCONCAT,    // Unsized numbers/parameters in concatenations
@@ -244,7 +245,8 @@ public:
             "STMTDLY", "SUPERNFIRST", "SYMRSVDWORD", "SYNCASYNCNET", "TICKCOUNT", "TIMESCALEMOD",
             "UNDRIVEN", "UNOPT", "UNOPTFLAT", "UNOPTTHREADS", "UNPACKED", "UNSATCONSTR",
             "UNSIGNED", "UNUSED", "UNUSEDGENVAR", "UNUSEDLOOP", "UNUSEDPARAM", "UNUSEDSIGNAL",
-            "USERERROR", "USERFATAL", "USERINFO", "USERWARN", "VARHIDDEN", "WAITCONST", "WIDTH",
+            "USERERROR", "USERFATAL", "USERINFO", "USERWARN", "VARHIDDEN", "VHDLUNBOUND",
+            "WAITCONST", "WIDTH",
             "WIDTHCONCAT", "WIDTHEXPAND", "WIDTHTRUNC", "WIDTHXZEXPAND", "ZERODLY", "ZEROREPL",
             " MAX"};
         return names[m_e];
