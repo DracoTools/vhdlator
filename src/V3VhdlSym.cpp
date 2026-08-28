@@ -263,9 +263,38 @@ void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) c
         }
     }
 
-    // The same region may be reached by more than one route
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
+    // The same region may be reached by more than one route. Which one it
+    // was found by must not decide the answer, so the order the regions were
+    // looked at in is kept rather than sorting by address.
+    std::set<const VhdlSymbol*> seen;
+    std::vector<VhdlSymbol*> kept;
+    for (VhdlSymbol* const symp : out) {
+        if (seen.insert(symp).second) kept.push_back(symp);
+    }
+    out.swap(kept);
+
+    // Two use clauses may each make a type of the same name potentially
+    // visible, and 12.4 c) says neither is then directly visible. The common
+    // case is a design that declares its own BOOLEAN_VECTOR or INTEGER_VECTOR
+    // beside the one VHDL-2008 added to STD.STANDARD, and refusing that
+    // outright helps no one: the design's own declaration is what it meant,
+    // and STD.STANDARD's is still reachable by its selected name.
+    if (out.size() > directCount + 1) {
+        bool anyOwn = false;
+        for (size_t i = directCount; i < out.size(); ++i) {
+            if (!out[i]->isOverloadable() && !out[i]->predefined()) anyOwn = true;
+        }
+        if (anyOwn) {
+            std::vector<VhdlSymbol*> pruned;
+            for (size_t i = 0; i < out.size(); ++i) {
+                if (i >= directCount && !out[i]->isOverloadable() && out[i]->predefined()) {
+                    continue;
+                }
+                pruned.push_back(out[i]);
+            }
+            out.swap(pruned);
+        }
+    }
 }
 
 void VhdlScope::addUse(VhdlScope* scopep) {

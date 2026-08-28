@@ -4770,6 +4770,14 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                          + (paramp ? paramp->prettyName() : std::string{"<unknown>"});
                 if (i < argTypes.size() && argTypes[i]) {
                     detail += ", not " + argTypes[i]->prettyName();
+                    // Two types of the same name is what a design that
+                    // declares one STD.STANDARD also declares looks like, and
+                    // saying the name twice tells no one anything (12.4)
+                    if (paramp && paramp->prettyName() == argTypes[i]->prettyName()) {
+                        detail += " -- two different types of that name, one at "
+                                  + std::string{paramp->base()->fileline()->ascii()} + " and one at "
+                                  + std::string{argTypes[i]->base()->fileline()->ascii()};
+                    }
                 }
                 break;
             }
