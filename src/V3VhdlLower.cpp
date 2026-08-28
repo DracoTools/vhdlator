@@ -144,6 +144,8 @@ class VhdlLowerVisitor final {
     };
     std::vector<VhdlLoopFrame> m_loops;
     std::string m_prefix;  // Name prefix for declarations inside a process
+    std::string m_blockPrefix;  // Labels of the blocks being lowered, outermost first
+    std::set<std::string> m_instNames;  // Instance labels the module has used
     int m_processNum = 0;  // For naming unlabelled processes
     bool m_errored = false;
 
@@ -4667,6 +4669,8 @@ private:
             // A guard, or a header giving the block its own generics and
             // ports, makes it more than that.
             VL_RESTORER(m_guardVarp);
+            VL_RESTORER_COPY(m_blockPrefix);
+            if (!blockp->label().empty()) m_blockPrefix += blockp->label() + "__";
             if (blockp->guardp()) lowerGuard(blockp, flp);
             if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
                 lowerBlockHeader(headerp);
@@ -6197,6 +6201,7 @@ private:
             // the port is the whole record, not that element
             if (VN_IS(asp->formalp(), VhdlCall) && dependsOnGeneric(standTypep)
                 && asp->formalp()->vhdlTypep()
+                && asp->formalp()->vhdlTypep()->base() == standTypep->base()
                 && !dependsOnGeneric(asp->formalp()->vhdlTypep())) {
                 standTypep = asp->formalp()->vhdlTypep();
             }
@@ -6328,8 +6333,19 @@ private:
                 }
             }
         }
-        const std::string instName
+        std::string instName
             = label.empty() ? "__Vinst" + std::to_string(++m_processNum) : label;
+        // A block is a declarative region of its own (11.2), so two blocks
+        // may each label an instance the same; the module they flatten into
+        // needs one name for each of them
+        if (!m_instNames.insert(instName).second) {
+            std::string alt = m_blockPrefix + instName;
+            int n = 0;
+            while (!m_instNames.insert(alt).second) {
+                alt = m_blockPrefix + instName + "__" + std::to_string(++n);
+            }
+            instName = alt;
+        }
         m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
     }
@@ -9231,6 +9247,8 @@ private:
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_names.clear();
+        m_instNames.clear();
+        m_blockPrefix.clear();
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();

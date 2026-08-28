@@ -5733,7 +5733,16 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
     std::vector<std::string> parts;
     VhdlScope* unitScopep = nullptr;
     std::string entKey;
-    if (flatten(nodep->unitp(), parts) && !parts.empty()) {
+    // "entity work.reg4(behav)" names the architecture as well (7.3.2), which
+    // the parser could not tell from a call; the entity is the prefix
+    AstNodeVhdlExpr* unitNamep = nodep->unitp();
+    if (AstVhdlCall* const callp = VN_CAST(unitNamep, VhdlCall)) {
+        AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (asp && !asp->nextp() && asp->actualp() && callp->prefixp()) {
+            unitNamep = callp->prefixp();
+        }
+    }
+    if (flatten(unitNamep, parts) && !parts.empty()) {
         if (parts.size() > 1) {
             // "entity lib.name" names the entity directly (11.7)
             std::string lib = parts[0];
@@ -5747,7 +5756,7 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
             for (VhdlSymbol* const symp : found) {
                 if (symp->kind() == VhdlSymKind::COMPONENT
                     || symp->kind() == VhdlSymKind::ENTITY) {
-                    nodep->unitp()->vhdlSymp(symp);
+                    unitNamep->vhdlSymp(symp);
                     unitScopep = symp->innerp();
                     break;
                 }
@@ -6352,6 +6361,28 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
     if (!unitScopep) return;
     const auto it = m_openBounds.find(unitScopep);
     if (it == m_openBounds.end()) return;
+    // "x(0) => a, x(1) => b" names the elements of the port one at a time,
+    // and together they say how long it is (6.5.7.1). Which indices were
+    // named has to be known before any one of them is looked at.
+    std::map<std::string, std::pair<int64_t, int64_t>> indexed;  // Port -> lowest, highest
+    for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+        const AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+        const AstVhdlCall* const callp
+            = asp->formalp() ? VN_CAST(asp->formalp(), VhdlCall) : nullptr;
+        if (!callp || VN_IS(callp->argsp(), VhdlRange)) continue;
+        const AstVhdlName* const rootp = VN_CAST(callp->prefixp(), VhdlName);
+        const AstVhdlAssoc* const argp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (!rootp || !argp || argp->nextp() || !argp->actualp()) continue;
+        const VhdlValue at = V3VhdlEval::eval(argp->actualp());
+        if (!at.isInt()) continue;
+        const auto found = indexed.find(rootp->name());
+        if (found == indexed.end()) {
+            indexed.emplace(rootp->name(), std::make_pair(at.toInt(), at.toInt()));
+        } else {
+            found->second.first = std::min(found->second.first, at.toInt());
+            found->second.second = std::max(found->second.second, at.toInt());
+        }
+    }
     for (const OpenBound& bound : it->second) {
         if (bound.isGeneric) continue;
         // Where the port is in the clause, so a positional map finds it
@@ -6407,8 +6438,29 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                 break;
             }
         }
-        if (!actualp && !formalRangep) continue;
         FileLine* const flp = nodep->fileline();
+        // The elements the port map named one at a time are the whole of it,
+        // and its index range runs the way its index subtype does (6.5.7.1)
+        if (bound.path.empty() && bound.dim == 0) {
+            const auto idxIt = indexed.find(bound.port);
+            if (idxIt != indexed.end()) {
+                // The predefined array types are indexed by NATURAL, which
+                // runs upward, so the lowest index named is the left bound
+                for (int side = 0; side < 2; ++side) {
+                    const int64_t val
+                        = side == 0 ? idxIt->second.first : idxIt->second.second;
+                    AstVhdlLiteral* const litp = new AstVhdlLiteral{
+                        flp, VhdlLitKind::INTEGER, std::to_string(val)};
+                    litp->intVal(val);
+                    nodep->addGenericMapp(new AstVhdlAssoc{
+                        flp,
+                        new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
+                        litp});
+                }
+                continue;
+            }
+        }
+        if (!actualp && !formalRangep) continue;
         // A formal that names a slice of the port says the bounds itself:
         // "value(data'range) => ..." gives the port that range (6.5.7.1),
         // and the actual is only part of what drives it
