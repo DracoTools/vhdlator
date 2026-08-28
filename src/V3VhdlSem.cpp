@@ -1088,6 +1088,9 @@ public:
     // many driver values as it has drivers
     void specializeResolvers() VL_MT_DISABLED;
     bool reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    void mergeIndividualFormals(AstVhdlCall* nodep) VL_MT_DISABLED;
+    static bool formalIsReadOnly(const VhdlSymbol* symp,
+                                 const std::string& formal) VL_MT_DISABLED;
     void spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
 
 private:
@@ -4517,6 +4520,140 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
 // first and take the formals in order; a named one names its formal. Any
 // formal left without an actual must have a default (6.5.7.1). Returns false
 // if the actuals cannot be bound to this subprogram at all.
+// Whether a subprogram only reads the parameter of that name. A parameter it
+// writes, or one of the signal class, has to be the object itself.
+bool VhdlSemVisitor::formalIsReadOnly(const VhdlSymbol* symp, const std::string& formal) {
+    if (!symp) return true;
+    const AstVhdlSubprogDecl* declp = symp->bodyp();
+    if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+    if (!declp) return true;
+    AstNode* p = declp->paramsp();
+    for (int g = 0; p && g < declp->genericCount(); ++g) p = p->nextp();
+    for (; p; p = p->nextp()) {
+        const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+        if (ifp->name() != formal) continue;
+        if (ifp->kind() == VhdlIfaceKind::SIGNAL || ifp->kind() == VhdlIfaceKind::FILE) {
+            return false;
+        }
+        return ifp->mode() == VhdlMode::IN;
+    }
+    return true;
+}
+
+// "f(r.x => 1, r.y => 2)" and "p(v(0) => a, v(1) => b)" name the parts of one
+// parameter one at a time (6.5.7.1). Together they cover it, so they say what
+// the whole of it is: the associations for each such formal are replaced by
+// one whose actual is the aggregate they describe. A part named for an "out"
+// parameter would need the value copied back out again, and is left alone.
+void VhdlSemVisitor::mergeIndividualFormals(AstVhdlCall* nodep) {
+    // Which formal each association names, where it names part of one
+    std::vector<std::string> rootOf;
+    bool any = false;
+    for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
+        const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
+        std::string root;
+        if (asp && asp->formalp() && !VN_IS(asp->formalp(), VhdlName)) {
+            const AstNodeVhdlExpr* rootp = asp->formalp();
+            while (rootp) {
+                if (const AstVhdlSelected* const selp = VN_CAST(rootp, VhdlSelected)) {
+                    rootp = selp->prefixp();
+                } else if (const AstVhdlCall* const callp = VN_CAST(rootp, VhdlCall)) {
+                    rootp = callp->prefixp();
+                } else {
+                    break;
+                }
+            }
+            if (const AstVhdlName* const namep = VN_CAST(rootp, VhdlName)) {
+                root = namep->name();
+                any = true;
+            }
+        }
+        rootOf.push_back(root);
+    }
+    if (!any) return;
+    // A part named for a parameter the subprogram writes -- an "out" or a
+    // signal -- would need the value carried back out again, which an
+    // aggregate cannot do. Those are left as they were written.
+    std::vector<VhdlSymbol*> cands;
+    {
+        std::vector<std::string> parts;
+        if (flatten(nodep->prefixp(), parts) && !parts.empty()) lookup(parts.back(), cands);
+    }
+    // Each formal named in parts, in the order its first part was written
+    std::vector<std::string> order;
+    for (const std::string& root : rootOf) {
+        if (root.empty()) continue;
+        if (std::find(order.begin(), order.end(), root) == order.end()) order.push_back(root);
+    }
+    for (const std::string& root : order) {
+        bool writable = false;
+        for (const VhdlSymbol* const candp : cands) {
+            if (!formalIsReadOnly(candp->resolved(), root)) writable = true;
+        }
+        if (writable) continue;
+        AstVhdlAggregate* aggp = nullptr;
+        AstVhdlAssoc* firstp = nullptr;
+        size_t i = 0;
+        bool ok = true;
+        std::vector<AstVhdlAssoc*> parts;
+        for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp(), ++i) {
+            if (rootOf[i] != root) continue;
+            AstVhdlAssoc* const asp = VN_AS(argp, VhdlAssoc);
+            if (!asp->actualp()) ok = false;
+            parts.push_back(asp);
+        }
+        if (!ok || parts.empty()) continue;
+        for (AstVhdlAssoc* const asp : parts) {
+            // What part of the formal this names: an element by name, or an
+            // index. Only one step deep, which is what a formal part is.
+            AstVhdlChoice* choicep = nullptr;
+            if (const AstVhdlSelected* const selp = VN_CAST(asp->formalp(), VhdlSelected)) {
+                const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+                if (sufp && VN_IS(selp->prefixp(), VhdlName)) {
+                    choicep = new AstVhdlChoice{
+                        asp->fileline(), new AstVhdlName{asp->fileline(), sufp->name()}};
+                }
+            } else if (AstVhdlCall* const callp = VN_CAST(asp->formalp(), VhdlCall)) {
+                AstVhdlAssoc* const idxp = VN_CAST(callp->argsp(), VhdlAssoc);
+                AstNodeVhdlExpr* const idxValp
+                    = idxp ? idxp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+                if (idxValp && VN_IS(callp->prefixp(), VhdlName) && callp->argsp()
+                    && !callp->argsp()->nextp()) {
+                    choicep = new AstVhdlChoice{asp->fileline(),
+                                                idxValp->cloneTree(false)};
+                }
+            }
+            if (!choicep) {
+                ok = false;
+                break;
+            }
+            AstNodeVhdlExpr* const valuep = asp->actualp()->cloneTree(false);
+            AstVhdlElemAssoc* const elemp
+                = new AstVhdlElemAssoc{asp->fileline(), choicep, valuep};
+            if (!aggp) {
+                aggp = new AstVhdlAggregate{asp->fileline()};
+                firstp = asp;
+            }
+            aggp->addElemsp(elemp);
+        }
+        if (!ok || !aggp) {
+            if (aggp) VL_DO_DANGLING(aggp->deleteTree(), aggp);
+            continue;
+        }
+        // The first of them becomes the whole association; the rest go
+        for (AstVhdlAssoc* const asp : parts) {
+            if (asp == firstp) continue;
+            VL_DO_DANGLING(asp->unlinkFrBack()->deleteTree(), asp);
+        }
+        AstNodeVhdlExpr* const oldFormalp = firstp->formalp()->unlinkFrBack();
+        VL_DO_DANGLING(oldFormalp->deleteTree(), oldFormalp);
+        firstp->formalp(new AstVhdlName{firstp->fileline(), root});
+        AstNodeVhdlExpr* const oldActualp = firstp->actualp()->unlinkFrBack();
+        VL_DO_DANGLING(oldActualp->deleteTree(), oldActualp);
+        firstp->actualp(aggp);
+    }
+}
+
 bool VhdlSemVisitor::bindActuals(const VhdlSymbol* symp,
                                  const std::vector<AstVhdlAssoc*>& assocs,
                                  std::vector<int>& formalOf) {
@@ -4634,6 +4771,11 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             return convertedType(symp->typep(), VN_CAST(nodep->argsp(), VhdlAssoc));
         }
     }
+
+    // "f(r.x => 1, r.y => 2)" associates the parts of one parameter one at a
+    // time (6.5.7.1). Together they are the whole of it, so they are gathered
+    // into the aggregate they describe and the call has one actual again.
+    mergeIndividualFormals(nodep);
 
     // Gather what each actual could be, without settling any of them, so the
     // whole set can filter the overloads (12.5)
