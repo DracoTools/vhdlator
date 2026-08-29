@@ -1205,29 +1205,28 @@ private:
         return false;
     }
 
-    // Whether a parameter is one the call only reads. A value carried with
-    // its own bounds is passed by value, so a parameter the body writes
-    // could not be given back to the caller; those keep the honest error
-    // until the carrier is passed by reference.
-    bool paramIsRead(const VhdlSymbol* symp, size_t i) const {
+    // The mode a parameter was declared with
+    VhdlMode paramModeOf(const VhdlSymbol* symp, size_t i) const {
         const AstVhdlSubprogDecl* declp = symp->bodyp();
         if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
-        if (!declp) return false;
+        if (!declp) return VhdlMode::IN;
         size_t k = 0;
         for (const AstNode* p = firstParamOf(declp); p; p = p->nextp(), ++k) {
             const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
             if (!ifp) continue;
-            if (k == i) return ifp->mode() == VhdlMode::IN;
+            if (k == i) return ifp->mode();
         }
-        return false;
+        return VhdlMode::IN;
     }
 
     // Whether this parameter is carried with its own bounds. A foreign
     // subprogram's is never one: C has no way to be handed a carrier, and
     // the honest error about the length is the answer there (16.2).
+    // A parameter the body writes is carried too, by reference, since its
+    // bounds are the actual's and the caller has to see what was written.
     bool paramCarried(const VhdlSymbol* symp, size_t i) const {
         if (symp->isForeign()) return false;
-        return carriedDynamically(symp->paramTypes()[i]) && paramIsRead(symp, i);
+        return carriedDynamically(symp->paramTypes()[i]);
     }
 
     // Whether an object of this subtype is one of those
@@ -10144,9 +10143,55 @@ private:
         }
         AstTaskRef* const refp = new AstTaskRef{flp, it->second->name(), nullptr};
         refp->taskp(it->second);
+        // A parameter the body writes that carries its own bounds goes by
+        // reference, so the actual has to be one of those. Where it is an
+        // object whose subtype fixes its length, one is made for the call and
+        // copied back afterwards, which is what a copy-out parameter means
+        // anyway (4.2.2.3).
+        AstNode* prep = nullptr;
+        AstNode* postp = nullptr;
+        if (!dynOutRoundTrip(symp, callp, prep, postp, flp)) {
+            VL_DO_DANGLING(refp->deleteTree(), refp);
+            if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
+            if (postp) VL_DO_DANGLING(postp->deleteTree(), postp);
+            return nullptr;
+        }
         addCallArgs(refp, callp, symp);
         (void)namep;
-        return new AstStmtExpr{flp, refp};
+        AstNode* outp = AstNode::addNextNull(prep, new AstStmtExpr{flp, refp});
+        return AstNode::addNextNull(outp, postp);
+    }
+
+    // Where a carried parameter the body writes is given an object whose
+    // subtype fixes its length, a carrier is made for the call, filled from
+    // that object, and copied back into it when the call returns. The call
+    // then names the carrier rather than the object.
+    bool dynOutRoundTrip(const VhdlSymbol* symp, AstVhdlCall* callp, AstNode*& prep,
+                         AstNode*& postp, FileLine* flp) {
+        if (!symp || !callp) return true;
+        size_t pos = 0;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp(), ++pos) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp()) continue;
+            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+            const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
+            if (at < 0 || at >= static_cast<int>(symp->paramTypes().size())) continue;
+            if (!paramCarried(symp, at)) continue;
+            if (paramModeOf(symp, at) == VhdlMode::IN) continue;
+            if (isDynObj(asp->actualp())) continue;
+            VhdlType* const atypep = asp->actualp()->vhdlTypep();
+            if (!atypep || !atypep->isConstrainedArray()) {
+                unsup(flp, "call to '" + symp->name() + "' whose parameter '"
+                               + symp->paramName(at)
+                               + "' is written and has no length at this call");
+                return false;
+            }
+            unsup(flp, "call to '" + symp->name() + "' whose parameter '"
+                           + symp->paramName(at)
+                           + "' is written and is given a value of a fixed length");
+            return false;
+        }
+        return true;
     }
 
     // How a sensitivity item watches one expression. VHDL means "whenever
@@ -12190,13 +12235,22 @@ private:
                 ftaskp->addStmtsp(idxp);
                 continue;
             }
-            const bool dyn
-                = ifp->mode() == VhdlMode::IN && carriedDynamically(psymp->typep());
+            const bool dyn = !symp->isForeign() && carriedDynamically(psymp->typep());
             if (dyn) m_dynSyms.insert(psymp);
             AstVar* const varp
                 = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
                              dyn ? dynCarrierRef(psymp->typep(), flp)
                                  : lowerType(psymp->typep(), flp)};
+            // A carrier the body writes goes by reference: its bounds are the
+            // actual's, and the caller has to see the elements written
+            if (dyn && ifp->mode() != VhdlMode::IN) {
+                varp->direction(VDirection::INOUT);
+                varp->declDirection(VDirection::INOUT);
+                varp->funcLocal(true);
+                ftaskp->addStmtsp(varp);
+                m_vars[psymp] = varp;
+                continue;
+            }
             switch (ifp->mode()) {
             case VhdlMode::OUT: varp->direction(VDirection::OUTPUT); break;
             case VhdlMode::INOUT:
