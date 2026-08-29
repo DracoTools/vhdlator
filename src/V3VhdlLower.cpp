@@ -9842,6 +9842,68 @@ private:
     int m_tempNum = 0;
 
     // "c == ' ' || c == HT", the test that finds the edges of an item
+    // Whether a character may appear in a basic identifier (15.4), which is
+    // what bounds the name of an enumeration literal on a line
+    static AstNodeExpr* isIdentChar(AstNodeExpr* charp, FileLine* flp) {
+        const auto between = [&](uint32_t lo, uint32_t hi) -> AstNodeExpr* {
+            return new AstLogAnd{
+                flp,
+                new AstGteS{flp, charp->cloneTree(false),
+                            new AstConst{flp, AstConst::WidthedValue{}, 8, lo}},
+                new AstLteS{flp, charp->cloneTree(false),
+                            new AstConst{flp, AstConst::WidthedValue{}, 8, hi}}};
+        };
+        AstNodeExpr* outp = between('a', 'z');
+        outp = new AstLogOr{flp, outp, between('A', 'Z')};
+        outp = new AstLogOr{flp, outp, between('0', '9')};
+        outp = new AstLogOr{flp, outp,
+                            new AstEq{flp, charp->cloneTree(false),
+                                      new AstConst{flp, AstConst::WidthedValue{}, 8, '_'}}};
+        VL_DO_DANGLING(charp->deleteTree(), charp);
+        return outp;
+    }
+
+    // Whether a character is one this radix can read. A logic type spells
+    // its own nine values, in either case; BIT has only two (16.4).
+    static AstNodeExpr* isRadixChar(AstNodeExpr* charp, const std::string& name, bool bitOnly,
+                                    FileLine* flp) {
+        std::string ok;
+        if (name == "hread") {
+            ok = "0123456789abcdefABCDEF";
+        } else if (name == "oread") {
+            ok = "01234567";
+        } else {
+            ok = bitOnly ? "01" : "01uUxXzZwWlLhH-";
+        }
+        AstNodeExpr* outp = nullptr;
+        for (const char c : ok) {
+            AstNodeExpr* const eqp
+                = new AstEq{flp, charp->cloneTree(false),
+                            new AstConst{flp, AstConst::WidthedValue{}, 8,
+                                         static_cast<uint32_t>(static_cast<uint8_t>(c))}};
+            outp = outp ? static_cast<AstNodeExpr*>(new AstLogOr{flp, outp, eqp}) : eqp;
+        }
+        VL_DO_DANGLING(charp->deleteTree(), charp);
+        return outp;
+    }
+
+    static AstNodeExpr* isChar(AstNodeExpr* charp, char c, FileLine* flp) {
+        return new AstEq{flp, charp,
+                         new AstConst{flp, AstConst::WidthedValue{}, 8,
+                                      static_cast<uint32_t>(static_cast<uint8_t>(c))}};
+    }
+
+    static AstNodeExpr* isDigitChar(AstNodeExpr* charp, FileLine* flp) {
+        AstNodeExpr* const outp = new AstLogAnd{
+            flp,
+            new AstGteS{flp, charp->cloneTree(false),
+                        new AstConst{flp, AstConst::WidthedValue{}, 8, uint32_t{'0'}}},
+            new AstLteS{flp, charp->cloneTree(false),
+                        new AstConst{flp, AstConst::WidthedValue{}, 8, uint32_t{'9'}}}};
+        VL_DO_DANGLING(charp->deleteTree(), charp);
+        return outp;
+    }
+
     static AstNodeExpr* isBlank(AstNodeExpr* charp, FileLine* flp) {
         // getc gives one character, so the comparisons are eight bits wide
         return new AstLogOr{
@@ -10076,9 +10138,89 @@ private:
         return lowerFileScalar(reading, filep, valuep, valTypep, flp);
     }
 
+    // Advances posp over an abstract literal (15.5): an optional sign, then
+    // digits and underscores, an optional point with more digits, and an
+    // optional exponent. Reading stops at the first character that cannot
+    // continue one, which is what leaves "5.152,61.4" with its comma on the
+    // line -- a whitespace-delimited item would have swallowed the lot.
+    // fracp is set when a point was seen, since such a value is scaled as a
+    // real rather than counted in whole units.
+    AstNode* scanNumber(AstNodeExpr* linep, AstVar* posp, AstVar* begp, AstVar* fracp,
+                        AstVar* digp, bool allowPoint, FileLine* flp) {
+        AstVar* const expp = newTempVar("__Vtxtexp", new AstBasicDType{flp, VBasicDTypeKwd::BIT},
+                                        flp);
+        AstVar* const jexp = newTempVar("__Vtxtjex", new AstBasicDType{flp, VBasicDTypeKwd::BIT},
+                                        flp);
+        const auto pos = [&]() { return new AstVarRef{flp, posp, VAccess::READ}; };
+        const auto ch = [&]() { return new AstGetcN{flp, linep->cloneTree(false), pos()}; };
+        const auto rd = [&](AstVar* varp) { return new AstVarRef{flp, varp, VAccess::READ}; };
+        const auto set = [&](AstVar* varp, bool val) -> AstNode* {
+            return new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE},
+                                 val ? new AstConst{flp, AstConst::BitTrue{}}
+                                     : new AstConst{flp, AstConst::BitFalse{}}};
+        };
+        const auto stopIf = [&](AstNodeExpr* condp) -> AstNode* {
+            return new AstIf{flp, condp, new AstBreak{flp}, nullptr};
+        };
+        AstNode* outp = set(fracp, false);
+        outp = AstNode::addNext(outp, set(expp, false));
+        outp = AstNode::addNext(outp, set(digp, false));
+        outp = AstNode::addNext(outp, set(jexp, false));
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(
+                      new AstAssign{flp, new AstVarRef{flp, begp, VAccess::WRITE}, pos()}));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLtS{flp, pos(), new AstLenN{flp, linep->cloneTree(false)}}});
+        // A digit is always part of it; the rest depend on what came before
+        AstNode* const digitp
+            = AstNode::addNext(set(digp, true), set(jexp, false));
+        AstNode* const underp = AstNode::addNext(
+            static_cast<AstNode*>(stopIf(new AstLogNot{flp, rd(digp)})), set(jexp, false));
+        AstNode* pointp = stopIf(new AstLogOr{
+            flp, new AstLogOr{flp, rd(fracp), rd(expp)}, new AstLogNot{flp, rd(digp)}});
+        pointp = AstNode::addNext(pointp, set(fracp, true));
+        pointp = AstNode::addNext(pointp, set(digp, false));
+        pointp = AstNode::addNext(pointp, set(jexp, false));
+        AstNode* markp = stopIf(new AstLogOr{flp, rd(expp), new AstLogNot{flp, rd(digp)}});
+        markp = AstNode::addNext(markp, set(expp, true));
+        markp = AstNode::addNext(markp, set(digp, false));
+        markp = AstNode::addNext(markp, set(jexp, true));
+        AstNode* signp = stopIf(new AstLogNot{
+            flp, new AstLogOr{flp, rd(jexp), new AstEq{flp, pos(), rd(begp)}}});
+        signp = AstNode::addNext(signp, set(jexp, false));
+        AstNode* const elsep = new AstBreak{flp};
+        AstNode* chainp = new AstIf{
+            flp,
+            new AstLogOr{flp, isChar(ch(), '+', flp), isChar(ch(), '-', flp)}, signp, elsep};
+        chainp = new AstIf{
+            flp, new AstLogOr{flp, isChar(ch(), 'e', flp), isChar(ch(), 'E', flp)}, markp,
+            chainp};
+        if (allowPoint) {
+            chainp = new AstIf{flp, isChar(ch(), '.', flp), pointp, chainp};
+        } else {
+            VL_DO_DANGLING(pointp->deleteTree(), pointp);
+        }
+        chainp = new AstIf{flp, isChar(ch(), '_', flp), underp, chainp};
+        chainp = new AstIf{flp, isDigitChar(ch(), flp), digitp, chainp};
+        loopp->addStmtsp(chainp);
+        loopp->addStmtsp(new AstAssign{
+            flp, new AstVarRef{flp, posp, VAccess::WRITE},
+            new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+        VL_DO_DANGLING(linep->deleteTree(), linep);
+        return outp;
+    }
+
     AstNode* lowerTextioRead(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
-                             FileLine* flp) {
+                             FileLine* origFlp) {
         if (args.size() < 2 || args.size() > 3) return nullptr;
+        // The reader works a character at a time and counts in whole
+        // integers, so the widths it mixes are deliberate
+        FileLine* const flp = new FileLine{origFlp};
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
         AstNodeExpr* const linep = lowerExpr(args[0]);
         AstNodeExpr* const valuep = lowerExpr(args[1]);
         if (!linep || !valuep) return nullptr;
@@ -10120,6 +10262,250 @@ private:
             AstNodeExpr* const anyp
                 = new AstGtS{flp, new AstLenN{flp, linep}, new AstConst{flp, AstConst::Signed32{}, 0}};
             return new AstIf{flp, anyp, thenp, elsep};
+        }
+
+        // READ of a physical type takes an abstract literal and then the
+        // name of a unit -- "15 sec" -- and the value is counted in the
+        // primary unit (16.4, 5.2.4). As for an enumeration, the line is
+        // left alone unless both parts were there.
+        if (name == "read" && typep && typep->base()->kind() == VhdlTypeKind::PHYSICAL
+            && !typep->base()->units().empty()) {
+            AstVar* const posp = newTempVar(
+                "__Vtxtpos", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+            AstVar* const begp = newTempVar(
+                "__Vtxtbeg", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+            AstVar* const nump = newTempVar(
+                "__Vtxtnum", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            AstVar* const unitp = newTempVar(
+                "__Vtxtunit", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            AstVar* const fracp = newTempVar(
+                "__Vtxtfrac", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+            AstVar* const okp = newTempVar(
+                "__Vtxtok", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+            AstVar* const scalep = newTempVar(
+                "__Vtxtscale", new AstBasicDType{flp, VBasicDTypeKwd::LONGINT}, flp);
+            const auto pos = [&]() { return new AstVarRef{flp, posp, VAccess::READ}; };
+            const auto len = [&]() { return new AstLenN{flp, linep->cloneTree(false)}; };
+            const auto setPos = [&](AstNodeExpr* valp) {
+                return new AstAssign{flp, new AstVarRef{flp, posp, VAccess::WRITE}, valp};
+            };
+            const auto bump = [&]() {
+                return setPos(new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}});
+            };
+            const auto skipBlanks = [&]() {
+                AstLoop* const loopp = new AstLoop{flp};
+                loopp->addStmtsp(new AstLoopTest{
+                    flp, loopp,
+                    new AstLogAnd{flp, new AstLtS{flp, pos(), len()},
+                                  isBlank(new AstGetcN{flp, linep->cloneTree(false), pos()},
+                                          flp)}});
+                loopp->addStmtsp(bump());
+                return loopp;
+            };
+            AstNode* outp = setPos(new AstConst{flp, AstConst::Signed32{}, 0});
+            outp = AstNode::addNext(outp, static_cast<AstNode*>(skipBlanks()));
+            AstVar* const digp = newTempVar(
+                "__Vtxtdig", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+            outp = AstNode::addNext(
+                outp, scanNumber(linep->cloneTree(false), posp, begp, fracp, digp, true, flp));
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, nump, VAccess::WRITE},
+                    new AstSubstrN{flp, linep->cloneTree(false),
+                                   new AstVarRef{flp, begp, VAccess::READ},
+                                   new AstSub{flp, pos(),
+                                              new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, new AstVarRef{flp, okp, VAccess::WRITE},
+                                        new AstVarRef{flp, digp, VAccess::READ}}));
+            outp = AstNode::addNext(outp, static_cast<AstNode*>(skipBlanks()));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, new AstVarRef{flp, begp, VAccess::WRITE}, pos()}));
+            AstLoop* const uscanp = new AstLoop{flp};
+            uscanp->addStmtsp(new AstLoopTest{
+                flp, uscanp,
+                new AstLogAnd{
+                    flp, new AstLtS{flp, pos(), len()},
+                    isIdentChar(new AstGetcN{flp, linep->cloneTree(false), pos()}, flp)}});
+            uscanp->addStmtsp(bump());
+            outp = AstNode::addNext(outp, static_cast<AstNode*>(uscanp));
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, unitp, VAccess::WRITE},
+                    new AstToLowerN{
+                        flp, new AstSubstrN{flp, linep->cloneTree(false),
+                                            new AstVarRef{flp, begp, VAccess::READ},
+                                            new AstSub{flp, pos(),
+                                                       new AstConst{flp, AstConst::Signed32{},
+                                                                    1}}}}}));
+            // A unit name that is not one of this type's is not a value
+            AstNode* unitsp = new AstAssign{
+                flp, new AstVarRef{flp, scalep, VAccess::WRITE},
+                new AstConst{flp, AstConst::Signed32{}, 0}};
+            for (const auto& unit : typep->base()->units()) {
+                V3Number num{flp, 64, 0};
+                num.setQuad(static_cast<uint64_t>(unit.second));
+                num.isSigned(true);
+                unitsp = AstNode::addNext(
+                    unitsp,
+                    static_cast<AstNode*>(new AstIf{
+                        flp,
+                        new AstEqN{flp, new AstVarRef{flp, unitp, VAccess::READ},
+                                   new AstConst{flp, AstConst::String{}, unit.first}},
+                        new AstAssign{flp, new AstVarRef{flp, scalep, VAccess::WRITE},
+                                      new AstConst{flp, num}},
+                        nullptr}));
+            }
+            outp = AstNode::addNext(outp, unitsp);
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, okp, VAccess::WRITE},
+                    new AstLogAnd{flp, new AstVarRef{flp, okp, VAccess::READ},
+                                  new AstNeq{flp, new AstVarRef{flp, scalep, VAccess::READ},
+                                             new AstConst{flp, AstConst::Signed32{}, 0}}}}));
+            // A literal written without a point keeps every bit of its value;
+            // one written with a point is scaled as a real and rounded
+            AstNodeExpr* const wholep = new AstMul{
+                flp, new AstAtoN{flp, new AstVarRef{flp, nump, VAccess::READ}, AstAtoN::ATOI},
+                new AstVarRef{flp, scalep, VAccess::READ}};
+            AstNodeExpr* const partp = new AstRToIRoundS{
+                flp,
+                new AstMulD{
+                    flp, new AstAtoN{flp, new AstVarRef{flp, nump, VAccess::READ},
+                                     AstAtoN::ATOREAL},
+                    new AstIToRD{flp, new AstVarRef{flp, scalep, VAccess::READ}}}};
+            AstNode* takep = new AstAssign{
+                flp, valuep,
+                new AstCond{flp, new AstVarRef{flp, fracp, VAccess::READ}, partp, wholep}};
+            takep = AstNode::addNext(
+                takep,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, linep->cloneTree(false),
+                    new AstSubstrN{flp, linep->cloneTree(false), pos(),
+                                   new AstSub{flp, len(),
+                                              new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstIf{
+                          flp, new AstVarRef{flp, okp, VAccess::READ}, takep, nullptr}));
+            if (args.size() == 3) {
+                if (AstNodeExpr* const goodp = lowerExpr(args[2])) {
+                    outp = AstNode::addNext(
+                        outp, static_cast<AstNode*>(
+                                  new AstAssign{flp, goodp,
+                                                new AstVarRef{flp, okp, VAccess::READ}}));
+                }
+            }
+            VL_DO_DANGLING(linep->deleteTree(), linep);
+            return outp;
+        }
+
+        // READ of an enumeration takes the name of a literal, which is how
+        // textio reads a BOOLEAN -- "true" or "false", in either case (16.4).
+        // The line is left alone unless a literal matched, so the GOOD form
+        // can be asked again at the same place.
+        if (name == "read" && typep && typep->base()->kind() == VhdlTypeKind::ENUM
+            && !isLogicish(typep) && !isBitish(typep)) {
+            AstVar* const posp = newTempVar(
+                "__Vtxtpos", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+            AstVar* const begp = newTempVar(
+                "__Vtxtbeg", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+            AstVar* const tokp = newTempVar(
+                "__Vtxtitem", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+            AstVar* const okp = newTempVar(
+                "__Vtxtok", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+            const auto pos = [&]() { return new AstVarRef{flp, posp, VAccess::READ}; };
+            const auto len = [&]() { return new AstLenN{flp, linep->cloneTree(false)}; };
+            AstNode* outp = new AstAssign{flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                                          new AstConst{flp, AstConst::Signed32{}, 0}};
+            // Leading blanks are not part of the item (16.4)
+            AstLoop* const skipp = new AstLoop{flp};
+            skipp->addStmtsp(new AstLoopTest{
+                flp, skipp,
+                new AstLogAnd{flp, new AstLtS{flp, pos(), len()},
+                              isBlank(new AstGetcN{flp, linep->cloneTree(false), pos()}, flp)}});
+            skipp->addStmtsp(new AstAssign{
+                flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+            outp = AstNode::addNext(outp, static_cast<AstNode*>(skipp));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, new AstVarRef{flp, begp, VAccess::WRITE}, pos()}));
+            // The name runs to the first character that cannot be in one
+            AstLoop* const scanp = new AstLoop{flp};
+            scanp->addStmtsp(new AstLoopTest{
+                flp, scanp,
+                new AstLogAnd{
+                    flp, new AstLtS{flp, pos(), len()},
+                    isIdentChar(new AstGetcN{flp, linep->cloneTree(false), pos()}, flp)}});
+            scanp->addStmtsp(new AstAssign{
+                flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+            outp = AstNode::addNext(outp, static_cast<AstNode*>(scanp));
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, tokp, VAccess::WRITE},
+                    new AstToLowerN{
+                        flp, new AstSubstrN{flp, linep->cloneTree(false),
+                                            new AstVarRef{flp, begp, VAccess::READ},
+                                            new AstSub{flp, pos(),
+                                                       new AstConst{flp, AstConst::Signed32{},
+                                                                    1}}}}}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(
+                          new AstAssign{flp, new AstVarRef{flp, okp, VAccess::WRITE},
+                                        new AstConst{flp, AstConst::BitFalse{}}}));
+            // An identifier names a literal; a character literal cannot be
+            // written as one, so those are not offered
+            const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
+            const int bits = bitsFor(lits.size());
+            for (size_t i = 0; i < lits.size(); ++i) {
+                const std::string& litName = lits[i]->name();
+                if (litName.size() == 3 && litName.front() == '\'') continue;
+                AstNode* hitp = new AstAssign{
+                    flp, valuep->cloneTree(false),
+                    new AstConst{flp, AstConst::WidthedValue{}, bits,
+                                 static_cast<uint32_t>(i)}};
+                hitp = AstNode::addNext(
+                    hitp, static_cast<AstNode*>(
+                              new AstAssign{flp, new AstVarRef{flp, okp, VAccess::WRITE},
+                                            new AstConst{flp, AstConst::BitTrue{}}}));
+                outp = AstNode::addNext(
+                    outp,
+                    static_cast<AstNode*>(new AstIf{
+                        flp,
+                        new AstEqN{flp, new AstVarRef{flp, tokp, VAccess::READ},
+                                   new AstConst{flp, AstConst::String{}, litName}},
+                        hitp, nullptr}));
+            }
+            // Only a name that was read is taken off the line (16.4)
+            outp = AstNode::addNext(
+                outp,
+                static_cast<AstNode*>(new AstIf{
+                    flp, new AstVarRef{flp, okp, VAccess::READ},
+                    new AstAssign{flp, linep->cloneTree(false),
+                                  new AstSubstrN{flp, linep->cloneTree(false), pos(),
+                                                 new AstSub{flp, len(),
+                                                            new AstConst{flp,
+                                                                         AstConst::Signed32{},
+                                                                         1}}}},
+                    nullptr}));
+            if (args.size() == 3) {
+                if (AstNodeExpr* const goodp = lowerExpr(args[2])) {
+                    outp = AstNode::addNext(
+                        outp, static_cast<AstNode*>(
+                                  new AstAssign{flp, goodp,
+                                                new AstVarRef{flp, okp, VAccess::READ}}));
+                }
+            }
+            VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            VL_DO_DANGLING(linep->deleteTree(), linep);
+            return outp;
         }
 
         AstAtoN::FmtType fmt = AstAtoN::ATOI;
@@ -10186,95 +10572,184 @@ private:
             return new AstIf{flp, enoughp, thenp, elsep};
         }
 
-        AstVar* const idxp = newTempVar("__Vtxtpos", new AstBasicDType{flp, VBasicDTypeKwd::INT},
-                                        flp);
+        // READ of a value of a logic type takes one character per bit -- one
+        // hexadecimal digit per four under HREAD -- skipping blanks before
+        // each, which is what reading a BIT_VECTOR one BIT at a time comes
+        // to (16.4). A whitespace-delimited item is the wrong unit here:
+        // "1 1 0 0 0 0 1 1" is eight bits, and "11111" read into four leaves
+        // the fifth character on the line.
+        if ((isLogicish(typep) || isBitish(typep))
+            && (typep->base()->kind() != VhdlTypeKind::ARRAY
+                || (typep->isConstrainedArray() && !typep->indexTypes().empty()
+                    && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded()))) {
+            const bool scalar = typep->base()->kind() != VhdlTypeKind::ARRAY;
+            const int64_t bits = scalar ? 1 : typep->indexTypes()[0]->length();
+            const int64_t per = name == "hread" ? 4 : (name == "oread" ? 3 : 1);
+            const int64_t chars = (bits + per - 1) / per;
+            if (bits > 0 && chars > 0 && chars <= 4096) {
+                AstVar* const posp = newTempVar(
+                    "__Vtxtpos", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+                AstVar* const cntp = newTempVar(
+                    "__Vtxtcnt", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+                AstVar* const accp = newTempVar(
+                    "__Vtxtitem", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+                AstVar* const okp = newTempVar(
+                    "__Vtxtok", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+                const auto pos = [&]() { return new AstVarRef{flp, posp, VAccess::READ}; };
+                const auto len = [&]() { return new AstLenN{flp, linep->cloneTree(false)}; };
+                const auto setOk = [&](bool val) {
+                    return new AstAssign{flp, new AstVarRef{flp, okp, VAccess::WRITE},
+                                         val ? new AstConst{flp, AstConst::BitTrue{}}
+                                             : new AstConst{flp, AstConst::BitFalse{}}};
+                };
+                AstNode* outp = new AstAssign{flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                                              new AstConst{flp, AstConst::Signed32{}, 0}};
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(
+                              new AstAssign{flp, new AstVarRef{flp, cntp, VAccess::WRITE},
+                                            new AstConst{flp, AstConst::Signed32{}, 0}}));
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(
+                              new AstAssign{flp, new AstVarRef{flp, accp, VAccess::WRITE},
+                                            new AstConst{flp, AstConst::String{}, ""}}));
+                outp = AstNode::addNext(outp, static_cast<AstNode*>(setOk(true)));
+                AstLoop* const loopp = new AstLoop{flp};
+                loopp->addStmtsp(new AstLoopTest{
+                    flp, loopp,
+                    new AstLtS{flp, new AstVarRef{flp, cntp, VAccess::READ},
+                               new AstConst{flp, AstConst::Signed32{},
+                                            static_cast<int32_t>(chars)}}});
+                AstLoop* const skipp = new AstLoop{flp};
+                skipp->addStmtsp(new AstLoopTest{
+                    flp, skipp,
+                    new AstLogAnd{flp, new AstLtS{flp, pos(), len()},
+                                  isBlank(new AstGetcN{flp, linep->cloneTree(false), pos()},
+                                          flp)}});
+                skipp->addStmtsp(new AstAssign{
+                    flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                    new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+                loopp->addStmtsp(skipp);
+                // The line may run out, or hold a character this radix has no
+                // meaning for; either way there is no value and GOOD says so
+                AstNode* const stopp = AstNode::addNext(
+                    static_cast<AstNode*>(setOk(false)), new AstBreak{flp});
+                loopp->addStmtsp(new AstIf{flp, new AstGteS{flp, pos(), len()}, stopp, nullptr});
+                loopp->addStmtsp(new AstIf{
+                    flp,
+                    new AstLogNot{flp,
+                                  isRadixChar(new AstGetcN{flp, linep->cloneTree(false), pos()},
+                                              name, isBitish(typep), flp)},
+                    AstNode::addNext(static_cast<AstNode*>(setOk(false)), new AstBreak{flp}),
+                    nullptr});
+                loopp->addStmtsp(new AstAssign{
+                    flp, new AstVarRef{flp, accp, VAccess::WRITE},
+                    new AstConcatN{flp, new AstVarRef{flp, accp, VAccess::READ},
+                                   new AstSFormatF{flp, "%c", false,
+                                                   new AstGetcN{flp, linep->cloneTree(false),
+                                                                pos()}}}});
+                loopp->addStmtsp(new AstAssign{
+                    flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                    new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+                loopp->addStmtsp(new AstAssign{
+                    flp, new AstVarRef{flp, cntp, VAccess::WRITE},
+                    new AstAdd{flp, new AstVarRef{flp, cntp, VAccess::READ},
+                               new AstConst{flp, AstConst::Signed32{}, 1}}});
+                outp = AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+                AstNode* takep = new AstAssign{
+                    flp, valuep,
+                    sizedTo(new AstAtoN{flp, new AstVarRef{flp, accp, VAccess::READ}, fmt},
+                            static_cast<int>(bits), flp)};
+                takep = AstNode::addNext(
+                    takep,
+                    static_cast<AstNode*>(new AstAssign{
+                        flp, linep->cloneTree(false),
+                        new AstSubstrN{flp, linep->cloneTree(false), pos(),
+                                       new AstSub{flp, len(),
+                                                  new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(new AstIf{
+                              flp, new AstVarRef{flp, okp, VAccess::READ}, takep, nullptr}));
+                if (args.size() == 3) {
+                    if (AstNodeExpr* const goodp = lowerExpr(args[2])) {
+                        outp = AstNode::addNext(
+                            outp, static_cast<AstNode*>(
+                                      new AstAssign{flp, goodp,
+                                                    new AstVarRef{flp, okp, VAccess::READ}}));
+                    }
+                }
+                VL_DO_DANGLING(linep->deleteTree(), linep);
+                return outp;
+            }
+        }
+
+        // What is left is a number: an integer, a real, or the count of a
+        // physical value. It runs to the first character that cannot be part
+        // of one, and the line keeps what it did not read (16.4).
+        AstVar* const posp = newTempVar("__Vtxtpos",
+                                        new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+        AstVar* const begp = newTempVar("__Vtxtbeg",
+                                        new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+        AstVar* const fracp = newTempVar("__Vtxtfrac",
+                                         new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+        AstVar* const digp = newTempVar("__Vtxtdig",
+                                        new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
         AstVar* const tokp = newTempVar("__Vtxtitem",
                                         new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
-
+        const auto pos = [&]() { return new AstVarRef{flp, posp, VAccess::READ}; };
+        const auto len = [&]() { return new AstLenN{flp, linep->cloneTree(false)}; };
+        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                                      new AstConst{flp, AstConst::Signed32{}, 0}};
         // Leading blanks are not part of the item (16.4)
         AstLoop* const skipp = new AstLoop{flp};
         skipp->addStmtsp(new AstLoopTest{
-            flp, skipp, isBlank(new AstGetcN{flp, linep->cloneTree(false),
-                                             new AstConst{flp, AstConst::Signed32{}, 0}},
-                                flp)});
+            flp, skipp,
+            new AstLogAnd{flp, new AstLtS{flp, pos(), len()},
+                          isBlank(new AstGetcN{flp, linep->cloneTree(false), pos()}, flp)}});
         skipp->addStmtsp(new AstAssign{
-            flp, linep->cloneTree(false),
-            new AstSubstrN{flp, linep->cloneTree(false),
-                           new AstConst{flp, AstConst::Signed32{}, 1},
-                           new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
-                                      new AstConst{flp, AstConst::Signed32{}, 1}}}});
-        AstNode* outp = skipp;
-
-        // The item runs to the next blank, or to the end of the line
+            flp, new AstVarRef{flp, posp, VAccess::WRITE},
+            new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(skipp));
         outp = AstNode::addNext(
-            outp, static_cast<AstNode*>(
-                      new AstAssign{flp, new AstVarRef{flp, idxp, VAccess::WRITE},
-                                    new AstConst{flp, AstConst::Signed32{}, 0}}));
-        AstLoop* const scanp = new AstLoop{flp};
-        scanp->addStmtsp(new AstLoopTest{
-            flp, scanp,
-            new AstLogAnd{
-                flp,
-                new AstLtS{flp, new AstVarRef{flp, idxp, VAccess::READ},
-                           new AstLenN{flp, linep->cloneTree(false)}},
-                new AstLogNot{flp, isBlank(new AstGetcN{flp, linep->cloneTree(false),
-                                                        new AstVarRef{flp, idxp, VAccess::READ}},
-                                           flp)}}});
-        scanp->addStmtsp(new AstAssign{
-            flp, new AstVarRef{flp, idxp, VAccess::WRITE},
-            new AstAdd{flp, new AstVarRef{flp, idxp, VAccess::READ},
-                       new AstConst{flp, AstConst::Signed32{}, 1}}});
-        outp = AstNode::addNext(outp, static_cast<AstNode*>(scanp));
-
-        // Split the line into the item and what is left of it
+            outp, scanNumber(linep->cloneTree(false), posp, begp, fracp, digp,
+                             fmt == AstAtoN::ATOREAL, flp));
         outp = AstNode::addNext(
             outp,
             static_cast<AstNode*>(new AstAssign{
                 flp, new AstVarRef{flp, tokp, VAccess::WRITE},
                 new AstSubstrN{flp, linep->cloneTree(false),
-                               new AstConst{flp, AstConst::Signed32{}, 0},
-                               new AstSub{flp, new AstVarRef{flp, idxp, VAccess::READ},
+                               new AstVarRef{flp, begp, VAccess::READ},
+                               new AstSub{flp, pos(),
                                           new AstConst{flp, AstConst::Signed32{}, 1}}}}));
-        outp = AstNode::addNext(
-            outp,
+        AstNode* takep = new AstAssign{
+            flp, valuep, new AstAtoN{flp, new AstVarRef{flp, tokp, VAccess::READ}, fmt}};
+        takep = AstNode::addNext(
+            takep,
             static_cast<AstNode*>(new AstAssign{
                 flp, linep->cloneTree(false),
-                new AstSubstrN{flp, linep->cloneTree(false),
-                               new AstVarRef{flp, idxp, VAccess::READ},
-                               new AstSub{flp, new AstLenN{flp, linep->cloneTree(false)},
+                new AstSubstrN{flp, linep->cloneTree(false), pos(),
+                               new AstSub{flp, len(),
                                           new AstConst{flp, AstConst::Signed32{}, 1}}}}));
-
-        // The value itself
-        AstNodeExpr* readp = nullptr;
-        if (isStringType(typep)) {
-            readp = new AstVarRef{flp, tokp, VAccess::READ};
-        } else {
-            readp = new AstAtoN{flp, new AstVarRef{flp, tokp, VAccess::READ}, fmt};
-            // The conversions give an integer, so a vector target is taken
-            // from its low bits rather than warned about
-            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
-                && typep->isConstrainedArray() && !typep->indexTypes().empty()) {
-                const int64_t bits = typep->indexTypes()[0]->length();
-                if (bits > 0 && bits <= 4096) {
-                    readp = sizedTo(readp, static_cast<int>(bits), flp);
-                }
-            }
-        }
+        AstNodeExpr* const anyp = new AstLogAnd{
+            flp,
+            new AstGtS{flp, new AstLenN{flp, new AstVarRef{flp, tokp, VAccess::READ}},
+                       new AstConst{flp, AstConst::Signed32{}, 0}},
+            new AstVarRef{flp, digp, VAccess::READ}};
         outp = AstNode::addNext(outp,
-                                static_cast<AstNode*>(new AstAssign{flp, valuep, readp}));
-
+                                static_cast<AstNode*>(new AstIf{flp, anyp->cloneTree(false),
+                                                                takep, nullptr}));
         // The GOOD form says whether there was anything to read, and does not
         // fail when there was not (16.4)
         if (args.size() == 3) {
-            AstNodeExpr* const goodp = lowerExpr(args[2]);
-            if (goodp) {
+            if (AstNodeExpr* const goodp = lowerExpr(args[2])) {
                 outp = AstNode::addNext(
-                    outp, static_cast<AstNode*>(new AstAssign{
-                              flp, goodp,
-                              new AstNeq{flp, new AstVarRef{flp, idxp, VAccess::READ},
-                                         new AstConst{flp, AstConst::Signed32{}, 0}}}));
+                    outp, static_cast<AstNode*>(new AstAssign{flp, goodp, anyp}));
+            } else {
+                VL_DO_DANGLING(anyp->deleteTree(), anyp);
             }
+        } else {
+            VL_DO_DANGLING(anyp->deleteTree(), anyp);
         }
+        VL_DO_DANGLING(linep->deleteTree(), linep);
         return outp;
     }
 
