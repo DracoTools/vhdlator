@@ -641,6 +641,16 @@ class TimingControlVisitor final : public VNVisitor {
             if (AstNodeVarRef* varp = VN_CAST(nodep, NodeVarRef)) {
                 return varp->varp()->isFuncLocal();
             }
+            // A globally evaluated trigger must not read through a handle that a pass
+            // generated and only a process assigns. The dynamic scope V3Fork makes for a
+            // fork's captured variables is one: its handle is null until the process reaches
+            // that fork, and V3Task hoists the handle out of the function to the module, so
+            // the trigger is no longer seen to reference a function local and would
+            // dereference null before anything has run.
+            if (const AstMemberSel* const memberp = VN_CAST(nodep, MemberSel)) {
+                const AstVarRef* const fromp = VN_CAST(memberp->fromp(), VarRef);
+                if (fromp && fromp->varp()->isInternal()) return true;
+            }
             return !nodep->isPure();
         });
     }
