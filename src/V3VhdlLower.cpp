@@ -222,6 +222,14 @@ private:
 
     // The storage a VHDL type needs (5.2 - 5.5). A fresh tree each call, since
     // a data type node belongs to one parent.
+    // Whether an integer type's own range needs more than thirty-two bits
+    static bool needsWideInt(const VhdlType* basep) {
+        if (!basep || !basep->bounded()) return false;
+        const int64_t lo = basep->low();
+        const int64_t hi = basep->high();
+        return lo < -2147483648LL || hi > 2147483647LL;
+    }
+
     AstNodeDType* lowerType(VhdlType* typep, FileLine* flp) {
         if (!typep || typep->isError()) return newLogicDType(flp, 1);
         VhdlType* const basep = typep->base();
@@ -231,6 +239,12 @@ private:
             return newLogicDType(flp, bitsFor(basep->literals().size()));
         case VhdlTypeKind::INTEGER:
         case VhdlTypeKind::UNIVERSAL_INTEGER:
+            // A declared integer type may need more than the 32 bits the
+            // predefined INTEGER has: "type t is range -2**40 to 2**40" is
+            // an ordinary integer type of the language (5.2.3)
+            if (needsWideInt(basep)) {
+                return new AstBasicDType{flp, VBasicDTypeKwd::LONGINT, VSigning::SIGNED};
+            }
             // Verilog's "integer" is four-state and VHDL's has no metavalues
             // at all, so "int" is the closer of the two -- and it is the type
             // DPI can carry across to C
@@ -1119,7 +1133,16 @@ private:
             return new AstConst{flp, AstConst::Unsized64{},
                                 static_cast<uint64_t>(val.toInt())};
         }
-        return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(val.toInt())};
+        // A value that does not fit in thirty-two bits, or one of a type whose
+        // own range does not, is written out as sixty-four (5.2.3)
+        const int64_t iv = val.toInt();
+        if (iv < -2147483648LL || iv > 2147483647LL || needsWideInt(basep)) {
+            V3Number num{flp, 64, 0};
+            num.setQuad(static_cast<uint64_t>(iv));
+            num.isSigned(true);
+            return new AstConst{flp, num};
+        }
+        return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(iv)};
     }
 
     // One bit of a logic type. Z and X survive into the AST exactly as the

@@ -3934,6 +3934,16 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
             out.chars = "01";
             return;
         case VhdlLitKind::NULLLIT: out.need = CandSet::Need::ACCESS; return;
+        case VhdlLitKind::INTEGER:
+            // Of the anonymous universal type until the context names one
+            // (9.3.2), so it must not be settled here: analyzing it with no
+            // context would fix it as universal, and a named integer type of
+            // its own width would never reach it
+            out.types.push_back(V3VhdlStd::universalIntegerType());
+            return;
+        case VhdlLitKind::REAL:
+            out.types.push_back(V3VhdlStd::universalRealType());
+            return;
         default: break;
         }
     }
