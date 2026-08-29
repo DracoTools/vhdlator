@@ -2779,9 +2779,6 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         m_inPackageInstance = true;
         iterate(p);
     }
-    // Not cleared here: the copy's subprogram bodies are analyzed after this
-    // returns, and it is those that hold the calls needing the template's
-    // answer. The map is keyed by node, so it stays true however long it lives.
     m_scopep = savedp;
 }
 
@@ -3122,6 +3119,20 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp) {
     for (AstNode* p = stmtsp; p && !foundp; p = p->nextp()) {
         if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
             if (retp->valuep() && retp->valuep()->vhdlTypep()) {
+                // A conversion keeps the length of what it converts (9.3.6),
+                // and where that is a call whose copy was only just made,
+                // the length arrived after the conversion was first read
+                if (AstVhdlCall* const convp = VN_CAST(retp->valuep(), VhdlCall)) {
+                    const VhdlSymbol* const symp
+                        = convp->prefixp() ? convp->prefixp()->vhdlSymp() : nullptr;
+                    const VhdlType* const hadp = convp->vhdlTypep();
+                    if (symp && symp->kind() == VhdlSymKind::TYPE
+                        && (!hadp || !hadp->lengthEmittable())) {
+                        VhdlType* const madep = convertedType(
+                            symp->typep(), VN_CAST(convp->argsp(), VhdlAssoc));
+                        if (madep && madep->lengthEmittable()) convp->vhdlTypep(madep);
+                    }
+                }
                 // The returned value may constrain itself, as an aggregate
                 // written with its own range does (9.3.3.3)
                 VhdlType* const typep = constrainFromValue(
@@ -3214,6 +3225,13 @@ private:
         trySpecialize(nodep, nodep->vhdlSymp(), nodep->argsp());
     }
 
+    // STRING is carried dynamically, so a parameter or result of it needs no
+    // length decided here and is no reason to make a copy
+    static bool isStringType(const VhdlType* typep) {
+        const VhdlType* const strp = V3VhdlStd::stringType();
+        return typep && strp && typep->base() == strp->base();
+    }
+
     // Whether a subprogram has a parameter or result whose length is not
     // known until it is called
     static bool needsSpecializing(const VhdlSymbol* symp) {
@@ -3247,8 +3265,13 @@ private:
     // the copy is made for the values as well as for the types
     static bool resultIsUnconstrained(const VhdlSymbol* symp) {
         const VhdlType* const retp = symp->returnTypep();
-        return retp && retp->base()->kind() == VhdlTypeKind::ARRAY
-               && !retp->lengthEmittable();
+        if (!retp) return false;
+        // A record result may have an element of an unconstrained array
+        // type, and then what the body builds is what says how long it is
+        if (retp->base()->kind() == VhdlTypeKind::RECORD) {
+            return !VhdlSemVisitor::fullyConstrainedRecord(retp);
+        }
+        return retp->base()->kind() == VhdlTypeKind::ARRAY && !retp->lengthEmittable();
     }
 
     // A subprogram whose body declares something as long as one of its own
@@ -3408,7 +3431,14 @@ private:
             }
             VhdlType* typep = asp->actualp()->vhdlTypep();
             // Only a length that is known is worth specializing on
-            if (symp->paramTypes()[i]
+            // A STRING the call cannot measure -- the result of a function,
+            // say -- is carried dynamically rather than by length, so it is
+            // no reason to leave every other parameter of the call unsettled
+            const bool looseString
+                = isStringType(symp->paramTypes()[i])
+                  && (!typep || (!typep->isConstrainedArray() && !lengthTravels(typep)));
+            if (looseString) typep = symp->paramTypes()[i];
+            if (!looseString && symp->paramTypes()[i]
                 && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::ARRAY) {
                 // A bound that names a generic is a length even though it
                 // is not a number here, and the copy carries it as written --
@@ -4123,7 +4153,9 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         // declarations of the name with the same profile, and nothing here
         // could tell them apart any more (4.9)
         const auto tmplIt = m_templateSyms.find(nodep);
-        if (tmplIt != m_templateSyms.end()) {
+        const VhdlSymbol* const tmplp
+            = tmplIt == m_templateSyms.end() ? nullptr : tmplIt->second;
+        if (tmplp) {
             // A subprogram is written twice -- a declaration and a body --
             // and the template may have named either, so both places count
             const auto placesOf = [](const VhdlSymbol* symp) {
@@ -4132,7 +4164,7 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
                 if (symp->bodyp()) out.insert(symp->bodyp()->fileline()->ascii());
                 return out;
             };
-            const std::set<std::string> want = placesOf(tmplIt->second);
+            const std::set<std::string> want = placesOf(tmplp);
             std::vector<VhdlSymbol*> same;
             for (VhdlSymbol* const symp : cands) {
                 for (const std::string& place : placesOf(symp)) {

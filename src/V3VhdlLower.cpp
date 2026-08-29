@@ -10107,6 +10107,23 @@ private:
     std::map<const VhdlSymbol*, std::map<std::string, AstNodeVhdlExpr*>> m_bindElems;
     std::map<std::string, AstNodeFTask*> m_signalCopies;
 
+    // Whether every element of a record has a length the back end can fold
+    static bool recordLengthEmittable(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return true;
+        for (const VhdlSymbol* const elemp : typep->elements()) {
+            const VhdlType* const etp = elemp ? elemp->typep() : nullptr;
+            if (!etp) continue;
+            if (etp->base()->kind() == VhdlTypeKind::ARRAY && !etp->lengthEmittable()
+                && !isStringType(etp)) {
+                return false;
+            }
+            if (etp->base()->kind() == VhdlTypeKind::RECORD && !recordLengthEmittable(etp)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void lowerSubprogram(AstVhdlSubprogDecl* nodep) { lowerSubprogramInto(nodep, ""); }
 
     AstNodeFTask* lowerSubprogramInto(AstVhdlSubprogDecl* nodep, const std::string& copyName) {
@@ -10130,6 +10147,12 @@ private:
                 && !typep->lengthEmittable() && !isStringType(typep)) {
                 return nullptr;
             }
+            // A record whose element has no length of its own is a template
+            // in the same way: the call is what says how long it is (5.3.3)
+            if (typep && typep->base()->kind() == VhdlTypeKind::RECORD
+                && !recordLengthEmittable(typep)) {
+                return nullptr;
+            }
         }
         // The same where only the *result* has no length of its own: the
         // copies made for the call sites carry the lengths their bodies
@@ -10139,6 +10162,10 @@ private:
             const VhdlType* const retp = returnType(nodep, symp);
             if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
                 && !retp->lengthEmittable() && !isStringType(retp)) {
+                return nullptr;
+            }
+            if (retp && retp->base()->kind() == VhdlTypeKind::RECORD
+                && !recordLengthEmittable(retp)) {
                 return nullptr;
             }
         }
