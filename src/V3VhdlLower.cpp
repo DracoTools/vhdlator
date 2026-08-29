@@ -4472,19 +4472,25 @@ private:
             VL_RESTORER(m_ftaskp);
             VL_RESTORER(m_protClassp);
             VL_RESTORER_COPY(m_prefix);
+            // A subprogram reached for the first time from inside a
+            // statement belongs to the module, not to the statement. Left
+            // where the call is, one reached from a branch of an if-generate
+            // is emitted into that branch and deleted with it when the branch
+            // is not the one taken -- and the call in the branch that *is*
+            // taken then names a subprogram that is no longer there.
             // A subprogram declared outside a protected type is not one of
             // its methods, however it was first reached, so it and whatever
-            // it declares belong to the module (5.6.2)
-            const bool outside = m_protClassp && !inProtectedBody(symp);
+            // it declares belong to the module too (5.6.2)
+            const bool method = m_protClassp && inProtectedBody(symp);
             AstNode* const outerStmtsp = m_stmtsp;
-            if (outside) {
+            if (!method) {
                 m_protClassp = nullptr;
                 m_stmtsp = nullptr;
             }
             m_ftaskp = nullptr;
             m_prefix.clear();
             lowerSubprogram(declp);
-            if (outside) {
+            if (!method) {
                 if (m_stmtsp && m_modp) m_modp->addStmtsp(m_stmtsp);
                 m_stmtsp = outerStmtsp;
             }
