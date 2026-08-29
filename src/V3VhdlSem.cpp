@@ -5490,6 +5490,24 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         if (score == best) cands.push_back(symp);
     }
     if (cands.empty()) {
+        // A function whose parameters all have defaults may be called by
+        // naming it (4.2.2.1), and then a following parenthesis indexes the
+        // result rather than passing arguments: "cfg.get_val(3)" where
+        // get_val takes nothing and returns an array (8.1).
+        for (VhdlSymbol* const symp : found) {
+            if (symp->resolved()->kind() != VhdlSymKind::FUNCTION) continue;
+            VhdlSymbol* const fp = symp->resolved();
+            if (!fp->paramTypes().empty() && !allParamsDefaulted(fp)) continue;
+            VhdlType* const retp = fp->returnTypep();
+            if (!retp || retp->base()->kind() != VhdlTypeKind::ARRAY) continue;
+            AstNodeVhdlExpr* const oldPrefixp = nodep->prefixp()->unlinkFrBack();
+            AstVhdlCall* const innerp = new AstVhdlCall{oldPrefixp->fileline(), oldPrefixp};
+            innerp->vhdlSymp(fp);
+            innerp->vhdlTypep(retp);
+            nodep->prefixp(innerp);
+            const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
+            return isSlice ? analyzeSliceName(nodep, retp) : analyzeIndexedName(nodep, retp);
+        }
         for (const VhdlType* const typep : argTypes) {
             if (typep && typep->isError()) return V3VhdlStd::errorType();
         }
