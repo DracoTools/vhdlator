@@ -3952,7 +3952,26 @@ private:
                                const VhdlType* rtypep) {
         if (!symp) return false;
         if (symp->kind() != VhdlSymKind::FUNCTION) return false;
-        return isLogicish(ltypep) || isLogicish(rtypep);
+        if (!isLogicish(ltypep) && !isLogicish(rtypep)) return false;
+        return inArithmeticPackage(symp);
+    }
+    // Whether a subprogram was declared in one of the packages whose
+    // arithmetic is emitted as Verilator's own. An operator a design writes
+    // for itself is compiled instead, however its operands are shaped: it is
+    // free to mean something else, and std_logic_unsigned's own unary "-",
+    // which returns a value one bit longer than its operand, shows that two
+    // operators of the same name over the same type need not agree.
+    static bool inArithmeticPackage(const VhdlSymbol* symp) {
+        static const std::set<std::string> pkgs{
+            "numeric_std",        "numeric_bit",        "numeric_std_unsigned",
+            "numeric_bit_unsigned", "std_logic_1164",   "std_logic_arith",
+            "std_logic_unsigned", "std_logic_signed",   "std_logic_misc",
+        };
+        for (const VhdlScope* scopep = symp->declScopep(); scopep;
+             scopep = scopep->parentp()) {
+            if (pkgs.count(scopep->name())) return true;
+        }
+        return false;
     }
     // A logic value or an array of them, which is what the IEEE packages
     // operate on. Recognising the shape rather than the name means SIGNED,
