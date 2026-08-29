@@ -97,6 +97,7 @@ class VhdlSemVisitor final : public VNVisitor {
         std::string key;  // "lib.entity" of the original
         std::vector<VhdlType*> types;  // What its generic types were bound to
         std::vector<VhdlScope*> packages;  // And its generic packages
+        std::vector<VhdlSymbol*> subprograms;  // And its generic subprograms
         std::string name;  // Name the copy was given
         VhdlScope* scopep = nullptr;  // The copy's own region
     };
@@ -105,6 +106,8 @@ class VhdlSemVisitor final : public VNVisitor {
     std::map<std::string, VhdlType*> m_boundGenTypes;
     // And the regions its generic packages stand for
     std::map<std::string, VhdlScope*> m_boundGenPackages;
+    // And the subprograms its generic subprograms stand for
+    std::map<std::string, VhdlSymbol*> m_boundGenSubs;
     std::map<std::string, AstVhdlArchitecture*> m_archUnits;  // "lib.entity" -> its body
     // Which entity a configuration specification binds a component or an
     // instance label to (7.3.1). An entity with a generic type is copied for
@@ -586,6 +589,73 @@ class VhdlSemVisitor final : public VNVisitor {
     }
 
     // METHODS - types
+
+    // The subprogram a generic subprogram is given (6.5.5). The actual is a
+    // name, possibly selected -- "work.helpers.same" -- or an operator
+    // symbol, and the one that matches the formal's profile is the one meant.
+    VhdlSymbol* resolveSubprogramActual(AstNodeVhdlExpr* nodep, AstVhdlIfaceDecl* formalp) {
+        if (!nodep) return nullptr;
+        std::vector<std::string> parts;
+        std::vector<VhdlSymbol*> found;
+        // An operator is named by its symbol -- "op => \"+\"" -- which reads
+        // as a string literal until it is known to be a designator (4.5.3)
+        if (const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral)) {
+            if (litp->kind() == VhdlLitKind::STRING) parts.push_back(lower(litp->text()));
+        }
+        if (!parts.empty()) {
+            lookup(parts.back(), found);
+        } else if (flatten(nodep, parts) && !parts.empty()) {
+            VhdlScope* scopep = m_scopep;
+            bool viaScope = parts.size() > 1;
+            for (size_t i = 0; i + 1 < parts.size() && viaScope; ++i) {
+                VhdlScope* const nextp = scopep ? scopep->findNamed(parts[i]) : nullptr;
+                if (!nextp) {
+                    viaScope = false;
+                } else {
+                    scopep = nextp;
+                }
+            }
+            if (viaScope && scopep) {
+                scopep->lookupLocal(parts.back(), found);
+            } else {
+                lookup(parts.back(), found);
+            }
+        }
+        // The formal's own profile picks which of them is meant
+        const VhdlSymbol* wantp
+            = formalp->profilep() ? formalp->profilep()->vhdlSymp() : nullptr;
+        VhdlSymbol* firstp = nullptr;
+        for (VhdlSymbol* const symp : found) {
+            VhdlSymbol* const rootp = symp->resolved();
+            if (rootp->kind() != VhdlSymKind::FUNCTION
+                && rootp->kind() != VhdlSymKind::PROCEDURE) {
+                continue;
+            }
+            if (!firstp) firstp = rootp;
+            if (!wantp) continue;
+            if (rootp->paramTypes().size() != wantp->paramTypes().size()) continue;
+            bool fits = true;
+            for (size_t i = 0; i < rootp->paramTypes().size() && fits; ++i) {
+                const VhdlType* const ap = rootp->paramTypes()[i];
+                const VhdlType* const bp = wantp->paramTypes()[i];
+                if (ap && bp && ap->base() != bp->base()) fits = false;
+            }
+            const VhdlType* const arp = rootp->returnTypep();
+            const VhdlType* const brp = wantp->returnTypep();
+            if (!arp != !brp) fits = false;
+            if (arp && brp && arp->base() != brp->base()) fits = false;
+            if (!fits) continue;
+            nodep->vhdlSymp(rootp);
+            return rootp;
+        }
+        if (firstp) {
+            nodep->vhdlSymp(firstp);
+            return firstp;
+        }
+        err(nodep->fileline(), "Generic subprogram '" + formalp->name()
+                                   + "' is given no subprogram of that name");
+        return nullptr;
+    }
 
     // The type a generic type is given. Usually a type mark, but VHDL-2008
     // lets the actual be any subtype indication, so "T => std_logic_vector(7
@@ -1245,7 +1315,8 @@ private:
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
-    void analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep,
+                             bool generics = false) VL_MT_DISABLED;
     void analyzeDrivers(AstVhdlArchitecture* archp) VL_MT_DISABLED;
     static bool isLogicValued(const VhdlType* typep) VL_MT_DISABLED;
     struct NeedResolve final {
@@ -1256,6 +1327,8 @@ private:
     };
     std::vector<NeedResolve> m_needResolve;  // Signals awaiting a sized resolver
     static VhdlType* formalAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
+    static VhdlSymbol* formalSymAt(VhdlScope* scopep, int position,
+                                   bool generics) VL_MT_DISABLED;
     static const VhdlSymbol* portAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
     void markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
@@ -1503,6 +1576,30 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
         && (nodep->kind() == VhdlIfaceKind::SUBPROGRAM
             || nodep->kind() == VhdlIfaceKind::PACKAGE)) {
         return;
+    }
+    // In a copy of an entity made for one instance, a generic subprogram is
+    // the subprogram that instance named, so the name denotes it directly
+    if (nodep->kind() == VhdlIfaceKind::SUBPROGRAM) {
+        const auto boundIt = m_boundGenSubs.find(nodep->name());
+        if (boundIt != m_boundGenSubs.end()) {
+            VhdlSymbol* const targetp = boundIt->second;
+            VhdlSymbol* const aliasp
+                = VhdlSymTab::newSymbol(targetp->kind(), nodep->name(), nodep);
+            aliasp->aliasp(targetp);
+            aliasp->typep(targetp->typep());
+            aliasp->returnTypep(targetp->returnTypep());
+            for (size_t i = 0; i < targetp->paramTypes().size(); ++i) {
+                aliasp->addParam(targetp->paramName(i), targetp->paramTypes()[i],
+                                 targetp->paramHasDefault(i));
+            }
+            aliasp->bodyp(targetp->bodyp());
+            aliasp->innerp(targetp->innerp());
+            aliasp->predefined(targetp->predefined());
+            nodep->bound(true);
+            nodep->vhdlSymp(aliasp);
+            declare(aliasp, nodep->fileline());
+            return;
+        }
     }
     // A generic subprogram is declared by its own profile, so that calls to
     // it inside the package resolve before any instantiation (6.5.4)
@@ -2092,7 +2189,7 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
     // The maps are written outside the block's own region, since they name
     // what is visible where the block appears (11.2)
     if (nodep->headerp()) {
-        analyzeAssociations(nodep->headerp()->genericMapp(), nullptr);
+        analyzeAssociations(nodep->headerp()->genericMapp(), nullptr, true);
         analyzeAssociations(nodep->headerp()->portMapp(), nullptr);
     }
     // The guard expression names what is visible where the block appears; the
@@ -6722,7 +6819,7 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
     // "gB(2) => (...)" names part of one generic; together the parts are the
     // whole of it (6.5.7.1), and a generic is only ever read
     mergeIndividualGenerics(nodep);
-    analyzeAssociations(nodep->genericMapp(), unitScopep);
+    analyzeAssociations(nodep->genericMapp(), unitScopep, true);
     // A generic left unconstrained is bound from the actual's own subtype,
     // which is only known once the generic map has been analyzed -- and the
     // actual is often a literal, whose bounds come from how long it is
@@ -6805,7 +6902,8 @@ void VhdlSemVisitor::retargetInstance(AstVhdlInstance* nodep, const std::string&
         AstVhdlAssoc* const asp = assocs[i];
         if (!asp) continue;
         if (generics[i]->kind() == VhdlIfaceKind::TYPE
-            || generics[i]->kind() == VhdlIfaceKind::PACKAGE) {
+            || generics[i]->kind() == VhdlIfaceKind::PACKAGE
+            || generics[i]->kind() == VhdlIfaceKind::SUBPROGRAM) {
             asp->unlinkFrBack();
             VL_DO_DANGLING(asp->deleteTree(), asp);
             continue;
@@ -6876,7 +6974,8 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
         AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
         generics.push_back(ifp);
         const bool isKind = ifp->kind() == VhdlIfaceKind::TYPE
-                            || ifp->kind() == VhdlIfaceKind::PACKAGE;
+                            || ifp->kind() == VhdlIfaceKind::PACKAGE
+                            || ifp->kind() == VhdlIfaceKind::SUBPROGRAM;
         if (isKind && !ifp->isBound()) anyOpen = true;
     }
     if (!anyOpen) return nullptr;
@@ -6905,7 +7004,18 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
     }
     std::vector<VhdlType*> actualTypes;
     std::vector<VhdlScope*> actualPackages;
+    std::vector<VhdlSymbol*> actualSubs;
     for (size_t i = 0; i < generics.size(); ++i) {
+        if (generics[i]->kind() == VhdlIfaceKind::SUBPROGRAM) {
+            // A generic subprogram the instance says nothing about is
+            // whatever is visible where the instance is written, which the
+            // copy sees anyway ("is <>", 6.5.5)
+            if (!actuals[i]) continue;
+            VhdlSymbol* const subp = resolveSubprogramActual(actuals[i], generics[i]);
+            if (!subp) return nullptr;  // Leaves the honest report
+            actualSubs.push_back(subp);
+            continue;
+        }
         if (generics[i]->kind() == VhdlIfaceKind::TYPE) {
             if (!actuals[i]) {
                 err(nodep->fileline(),
@@ -6932,6 +7042,16 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
                     break;
                 }
             }
+            // A package instantiated as a design unit of its own is not a
+            // declaration of the region the instance is written in: it is
+            // reached by its library name, "work.complex_real" (4.9, 13.2)
+            if (!scopep && !aparts.empty()) {
+                std::string lib = aparts.size() >= 2 ? lower(aparts[aparts.size() - 2])
+                                                     : std::string{"work"};
+                if (lib == "work") lib = m_libname;
+                const auto unitIt2 = m_unitScopes.find(lib + "." + lower(aparts.back()));
+                if (unitIt2 != m_unitScopes.end()) scopep = unitIt2->second;
+            }
         }
         if (!scopep) return nullptr;  // Leaves the honest "cannot be lowered"
         actualPackages.push_back(scopep);
@@ -6940,6 +7060,7 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
     for (const VhdlEntitySpec& spec : m_entitySpecs) {
         if (spec.key != entKey || spec.types != actualTypes) continue;
         if (spec.packages != actualPackages) continue;
+        if (spec.subprograms != actualSubs) continue;
         retargetInstance(nodep, spec.name, generics, assocs);
         return spec.scopep;
     }
@@ -6986,15 +7107,20 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
     {
         VL_RESTORER_COPY(m_boundGenTypes);
         VL_RESTORER_COPY(m_boundGenPackages);
+        VL_RESTORER_COPY(m_boundGenSubs);
         m_boundGenTypes.clear();
         m_boundGenPackages.clear();
+        m_boundGenSubs.clear();
         size_t nextType = 0;
         size_t nextPkg = 0;
+        size_t nextSub = 0;
         for (size_t i = 0; i < generics.size(); ++i) {
             if (generics[i]->kind() == VhdlIfaceKind::TYPE) {
                 m_boundGenTypes[generics[i]->name()] = actualTypes[nextType++];
             } else if (generics[i]->kind() == VhdlIfaceKind::PACKAGE) {
                 m_boundGenPackages[generics[i]->name()] = actualPackages[nextPkg++];
+            } else if (generics[i]->kind() == VhdlIfaceKind::SUBPROGRAM && actuals[i]) {
+                m_boundGenSubs[generics[i]->name()] = actualSubs[nextSub++];
             }
         }
         ++m_specDepth;
@@ -7006,11 +7132,12 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
         if (copyIt != m_unitScopes.end()) copyScopep = copyIt->second;
         m_boundGenTypes.clear();
         m_boundGenPackages.clear();
+        m_boundGenSubs.clear();
         analyzeSpecializedUnit(archCopyp);
         --m_specDepth;
     }
     m_entitySpecs.push_back(
-        VhdlEntitySpec{entKey, actualTypes, actualPackages, newName, copyScopep});
+        VhdlEntitySpec{entKey, actualTypes, actualPackages, actualSubs, newName, copyScopep});
     retargetInstance(nodep, newName, generics, assocs);
     return copyScopep;
 }
@@ -7484,7 +7611,8 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
 
 // Each actual takes the type of the formal it is associated with, by position
 // or by name
-void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep) {
+void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep,
+                                        bool generics) {
     int position = 0;
     for (AstNode* p = assocsp; p; p = p->nextp()) {
         AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
@@ -7493,6 +7621,7 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
             continue;
         }
         VhdlType* formalTypep = nullptr;
+        const VhdlSymbol* formalSymp = nullptr;
         // An individual association covers part of the formal, so the actual
         // is not the whole of it and the length check does not apply
         bool individual = false;
@@ -7503,9 +7632,11 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                 if (!found.empty()) {
                     asp->formalp()->vhdlSymp(found[0]);
                     formalTypep = found[0]->typep();
+                    formalSymp = found[0];
                 }
             } else if (!asp->formalp()) {
-                formalTypep = formalAt(unitScopep, position);
+                formalSymp = formalSymAt(unitScopep, position, generics);
+                formalTypep = formalSymp ? formalSymp->typep() : nullptr;
             } else {
                 // An individual association names one part of the formal --
                 // "r.x => v", "d(3 downto 0) => e" -- and several of them
@@ -7636,6 +7767,18 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                 }
             }
         }
+        // A generic that is a type, a package or a subprogram is given a
+        // *name*, not an expression: "t => std_logic_vector(7 downto 0)",
+        // "p => work.complex_real", "f => falling_edge" (6.5.5). Reading
+        // them as expressions asks for a value none of them has.
+        if (formalSymp
+            && (formalSymp->kind() == VhdlSymKind::TYPE
+                || formalSymp->kind() == VhdlSymKind::PACKAGE
+                || formalSymp->kind() == VhdlSymKind::FUNCTION
+                || formalSymp->kind() == VhdlSymKind::PROCEDURE)) {
+            ++position;
+            continue;
+        }
         analyzeExpr(asp->actualp(), formalTypep);
         if (formalTypep && !individual) {
             checkValueInRange(asp->actualp(), formalTypep, "this association");
@@ -7647,15 +7790,34 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
 
 // The formal at one position. A component's declarations are held in a map,
 // so the order comes from the declaration node rather than the scope.
-VhdlType* VhdlSemVisitor::formalAt(VhdlScope* scopep, int position) {
+// A generic and a port may stand at the same position, since each clause is
+// numbered from the start of itself, so which clause is being associated has
+// to be said rather than guessed.
+VhdlSymbol* VhdlSemVisitor::formalSymAt(VhdlScope* scopep, int position, bool generics) {
     for (const auto& pair : scopep->direct()) {
         VhdlSymbol* const symp = pair.second;
-        if (symp->position() == position
-            && (symp->kind() == VhdlSymKind::PORT || symp->kind() == VhdlSymKind::GENERIC)) {
-            return symp->typep();
+        if (symp->position() != position) continue;
+        switch (symp->kind()) {
+        case VhdlSymKind::PORT:
+            if (!generics) return symp;
+            break;
+        case VhdlSymKind::GENERIC:
+        case VhdlSymKind::TYPE:
+        case VhdlSymKind::PACKAGE:
+        case VhdlSymKind::FUNCTION:
+        case VhdlSymKind::PROCEDURE:
+            if (generics) return symp;
+            break;
+        default: break;
         }
     }
     return nullptr;
+}
+
+VhdlType* VhdlSemVisitor::formalAt(VhdlScope* scopep, int position) {
+    VhdlSymbol* const symp = formalSymAt(scopep, position, false);
+    if (!symp) return nullptr;
+    return symp->typep();
 }
 
 void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) {

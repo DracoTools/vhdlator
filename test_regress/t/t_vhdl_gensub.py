@@ -11,8 +11,9 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A generic subprogram is a template, called only through an instance made
-# with "is new", whose generics may be values, types or other subprograms.
+# A generic that is a subprogram or a package is given a *name*, not an
+# expression (6.5.5), and the entity is copied for each instance so that the
+# name denotes what that instance said.
 test.top_filename = "t/t_vhdl_gensub.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],

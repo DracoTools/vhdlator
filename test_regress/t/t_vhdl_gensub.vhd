@@ -1,110 +1,91 @@
 -- DESCRIPTION: Verilator: VHDL Test module
 --
--- This file ONLY is placed under the Creative Commons Public Domain.
+-- This file ONLY is placed under the Creative Commons Public Domain, for
+-- any use, without warranty, 2026 by Wilson Snyder.
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
 -- SPDX-License-Identifier: CC0-1.0
---
--- A generic subprogram is a template: it is never called as it stands, only
--- through an instance made with "is new" (4.4, 6.5.5). Its generics may be
--- values, types or other subprograms, and one written "is <>" takes whatever
--- is visible where the instance is made.
 
-package t_vhdl_gensub_pkg is
+library ieee;
+use ieee.std_logic_1164.all;
 
-  function adder generic (n : integer) (x : integer) return integer;
-
-  function apply generic (type t;
-                          function op (l, r : t) return t is <>)
-                         (a, b : t) return t;
-
-  procedure bump generic (type t;
-                          function "+" (l, r : t) return t is <>;
-                          step : t) (signal s : inout t);
-
+-- A generic package, instantiated as a design unit of its own
+package holder is
+  generic (type t);
+  type box is record
+    v : t;
+  end record;
+  function unwrap(b : box) return t;
 end package;
 
-package body t_vhdl_gensub_pkg is
-
-  function adder generic (n : integer) (x : integer) return integer is
+package body holder is
+  function unwrap(b : box) return t is
   begin
-    return x + n;
+    return b.v;
   end function;
-
-  function apply generic (type t;
-                          function op (l, r : t) return t is <>)
-                         (a, b : t) return t is
-  begin
-    return op(a, b);
-  end function;
-
-  procedure bump generic (type t;
-                          function "+" (l, r : t) return t is <>;
-                          step : t) (signal s : inout t) is
-  begin
-    s <= s + step;
-  end procedure;
-
 end package body;
 
-use std.env.all;
-use work.t_vhdl_gensub_pkg.all;
+package int_holder is new work.holder generic map (t => integer);
+
+-- An entity whose generics are a subprogram and a package, not values
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity edged is
+  generic (function edge(signal s : std_ulogic) return boolean;
+           package hold is new work.holder generic map (<>));
+  port (clock : in std_ulogic; d : in hold.box; q : out hold.box);
+end entity;
+
+architecture arch of edged is
+begin
+  reg : process(clock)
+    variable b : hold.box;
+  begin
+    if edge(clock) then
+      b.v := hold.unwrap(d);
+      q <= b;
+    end if;
+  end process;
+end architecture;
+
+library ieee;
+use ieee.std_logic_1164.all;
 
 entity t_vhdl_gensub is
 end entity;
 
-architecture tb of t_vhdl_gensub is
-
-  -- The body is in a package body this instantiation cannot see
-  function add1 is new adder generic map (1);
-  function add10 is new adder generic map (n => 10);
-
-  -- "op" is left to whatever "+" is visible here, for each type in turn
-  function apply_int is new apply generic map (t => integer, op => "+");
-  function apply_real is new apply generic map (t => real, op => "+");
-
-  procedure bump_int is new bump generic map (t => integer, step => 3);
-
-  -- A generic subprogram declared here, and recursive: the call to its own
-  -- name inside the body means the instance
-  function fact generic (type t;
-                         function "*" (l, r : t) return t is <>;
-                         function "-" (l, r : t) return t is <>;
-                         function "<" (l, r : t) return boolean is <>;
-                         one : t) (n : t) return t is
-  begin
-    if n < one then
-      return one;
-    else
-      return n * fact(n - one);
-    end if;
-  end function;
-
-  function fact_int is new fact generic map (t => integer, one => 1);
-
-  signal counter : integer := 0;
-
+architecture a of t_vhdl_gensub is
+  signal clock : std_ulogic := '0';
+  signal d, qf, qr : work.int_holder.box := (v => 0);
 begin
 
-  process is
+  -- The subprogram is named without arguments, and the package by its
+  -- library: neither is an expression (6.5.5)
+  ufall : entity work.edged
+    generic map (edge => falling_edge, hold => work.int_holder)
+    port map (clock => clock, d => d, q => qf);
+
+  urise : entity work.edged
+    generic map (edge => rising_edge, hold => work.int_holder)
+    port map (clock => clock, d => d, q => qr);
+
+  main : process is
   begin
-    assert add1(1) = 2 report "a value generic" severity failure;
-    assert add10(1) = 11 report "a value generic by name" severity failure;
-
-    assert apply_int(2, 3) = 5 report "a type generic" severity failure;
-    assert apply_real(0.5, 0.25) = 0.75 report "the same one on real" severity failure;
-
-    assert fact_int(5) = 120 report "recursion through the instance" severity failure;
-
-    bump_int(counter);
+    d <= (v => 7);
     wait for 1 ns;
-    assert counter = 3 report "a signal parameter of an instance" severity failure;
-    bump_int(counter);
+    clock <= '1';
     wait for 1 ns;
-    assert counter = 6 report "and again" severity failure;
+    assert qr.v = 7 report "rising took " & integer'image(qr.v) severity failure;
+
+    d <= (v => 9);
+    wait for 1 ns;
+    clock <= '0';
+    wait for 1 ns;
+    assert qf.v = 9 report "falling took " & integer'image(qf.v) severity failure;
+    assert qr.v = 7 report "rising moved" severity failure;
 
     report "*-* All Finished *-*";
-    stop;
-    wait;
+    std.env.finish;
   end process;
 
 end architecture;
