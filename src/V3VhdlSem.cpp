@@ -3340,6 +3340,31 @@ private:
         iterateChildren(nodep);
         trySpecialize(nodep, nodep->vhdlSymp(), nodep->argsp());
     }
+    // An operator a design declares is an ordinary subprogram whose name
+    // happens to be an operator symbol (4.5.2), so it is copied per use in
+    // the same way. std_logic_unsigned's "*" is one: its result is as long
+    // as its operands together, which only the use says.
+    void visit(AstVhdlBinary* nodep) override {
+        iterateChildren(nodep);
+        trySpecializeOperator(nodep, nodep->vhdlSymp(), {nodep->lhsp(), nodep->rhsp()});
+    }
+    void visit(AstVhdlUnary* nodep) override {
+        iterateChildren(nodep);
+        trySpecializeOperator(nodep, nodep->vhdlSymp(), {nodep->lhsp()});
+    }
+    void trySpecializeOperator(AstNodeVhdlExpr* nodep, VhdlSymbol* symp,
+                               std::vector<AstNodeVhdlExpr*> args) {
+        if (!symp) return;
+        symp = symp->resolved();
+        if (symp->predefined()) return;  // Emitted as a native operation
+        if (!needsSpecializing(symp)) return;
+        if (m_madeSyms.count(symp)) return;
+        if (symp->paramTypes().size() != args.size()) return;
+        for (AstNodeVhdlExpr* const argp : args) {
+            if (!argp) return;
+        }
+        specializeWithActuals(nodep, symp, args, {});
+    }
 
     // STRING is carried dynamically, so a parameter or result of it needs no
     // length decided here and is no reason to make a copy
@@ -3471,7 +3496,6 @@ private:
         // A copy is never itself specialized: it was made for one call site
         // and has nothing left to fix
         if (m_madeSyms.count(symp)) return;
-        const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
         // The actual types, which must all be known for the copy to be made.
         // Which formal each actual names, since a named association may put
         // them in any order and a formal with a default may be left out
@@ -3512,6 +3536,21 @@ private:
             }
             byFormal[f] = assocs[k];
         }
+        std::vector<AstNodeVhdlExpr*> byFormalExpr(nparams, nullptr);
+        for (size_t i = 0; i < nparams; ++i) {
+            if (byFormal[i]) byFormalExpr[i] = byFormal[i]->actualp();
+        }
+        specializeWithActuals(nodep, symp, byFormalExpr, individual);
+    }
+
+    // The copy itself, given what each formal is associated with. An operator
+    // the design declared is a subprogram like any other (4.5.2), and its
+    // operands are its actuals, so it comes here too.
+    void specializeWithActuals(AstNodeVhdlExpr* nodep, VhdlSymbol* symp,
+                               const std::vector<AstNodeVhdlExpr*>& byFormalExpr,
+                               const std::map<size_t, std::vector<AstNodeVhdlExpr*>>& individual) {
+        const size_t nparams = symp->paramTypes().size();
+        const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
         for (size_t i = 0; i < nparams; ++i) {
@@ -3526,8 +3565,8 @@ private:
                 actualTypes.push_back(madep);
                 continue;
             }
-            AstVhdlAssoc* const asp = byFormal[i];
-            if (!asp) {
+            AstNodeVhdlExpr* const actp = byFormalExpr[i];
+            if (!actp) {
                 // A formal the call leaves out takes its default, and the
                 // copy is made for that default's own subtype and value
                 AstNodeVhdlExpr* const defp = paramDefaultOf(symp, i);
@@ -3542,10 +3581,10 @@ private:
                 continue;
             }
             if (byValue) {
-                const VhdlValue val = V3VhdlEval::eval(asp->actualp());
+                const VhdlValue val = V3VhdlEval::eval(actp);
                 actualValues.push_back(val.isInt() ? val : VhdlValue{});
             }
-            VhdlType* typep = asp->actualp()->vhdlTypep();
+            VhdlType* typep = actp->vhdlTypep();
             // Only a length that is known is worth specializing on
             // A STRING the call cannot measure -- the result of a function,
             // say -- is carried dynamically rather than by length, so it is
@@ -3637,7 +3676,7 @@ private:
     // The copy's result has a length where the original's had none, so the
     // call has one too -- which is what lets a constant declared with the
     // unconstrained type take its bounds from what the call returns (6.4.2.2)
-    static void takeResultType(AstVhdlCall* nodep, const VhdlSymbol* symp) {
+    static void takeResultType(AstNodeVhdlExpr* nodep, const VhdlSymbol* symp) {
         if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return;
         VhdlType* const retp = symp->returnTypep();
         if (!retp || !retp->lengthEmittable()) return;
