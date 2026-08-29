@@ -1145,14 +1145,19 @@ private:
         return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(iv)};
     }
 
-    // One bit of a logic type. Z and X survive into the AST exactly as the
-    // Verilog ones do, so V3Unknown handles them identically.
+    // One bit of a logic type. Z survives into the AST as the Verilog one
+    // does, since it is representable. 'U', 'X', 'W' and '-' do not: this
+    // runtime has no metavalues, and writing them as Verilog X would leave
+    // what they stand for to --x-assign -- which under "unique" makes a
+    // table of them a table of random bits, and std_logic_1164 and the
+    // Synopsys packages are written as tables over the nine values. They
+    // are written as zero, which is what --x-assign gives them by default.
     static AstNodeExpr* newLogicConst(FileLine* flp, LogicVal value) {
         V3Number num{flp, 1, 0};
         switch (value) {
         case LogicVal::ZERO: num.setLong(0); break;
         case LogicVal::ONE: num.setLong(1); break;
-        case LogicVal::X: num.setAllBitsX(); break;
+        case LogicVal::X: num.setLong(0); break;
         case LogicVal::Z: num.setAllBitsZ(); break;
         }
         return new AstConst{flp, num};
@@ -3540,6 +3545,63 @@ private:
         return basep == V3VhdlStd::booleanType() || basep == V3VhdlStd::bitType();
     }
 
+    // Whether a type is one value of a logic type -- STD_ULOGIC and the like
+    static bool isScalarLogic(const VhdlType* typep) {
+        return typep && typep->base()->kind() == VhdlTypeKind::ENUM && enumIsLogic(typep);
+    }
+
+    // Whether an expression is written as one of the four literals that this
+    // runtime cannot tell apart from X
+    static bool metavalueLiteral(const AstNodeVhdlExpr* nodep) {
+        std::string name;
+        if (const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral)) {
+            if (litp->kind() != VhdlLitKind::CHARACTER) return false;
+            name = litp->text();
+        } else if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
+            if (!namep->isChar()) return false;
+            name = namep->name();
+        } else {
+            return false;
+        }
+        if (name.size() == 3 && name.front() == '\'' && name.back() == '\'') {
+            name = name.substr(1, 1);
+        }
+        if (name.size() != 1) return false;
+        const char c = name[0];
+        return c == 'U' || c == 'X' || c == 'W' || c == '-';
+    }
+
+    // Whether an expression is written as the '-' of 10.9, the one metavalue
+    // a matching case reads as "any value"
+    static bool dontCareLiteral(const AstNodeVhdlExpr* nodep) {
+        if (const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral)) {
+            return litp->kind() == VhdlLitKind::CHARACTER && litp->text() == "'-'";
+        }
+        if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
+            return namep->isChar() && (namep->name() == "'-'" || namep->name() == "-");
+        }
+        return false;
+    }
+
+    // Whether a type is an array of a logic type, so that a string written
+    // for it stands for a vector rather than for text
+    static bool isLogicArray(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        return enumIsLogic(typep->base()->elementp());
+    }
+
+    // Whether a case choice names a value this runtime cannot hold, so that
+    // it can never be taken. Both a single 'U'/'X'/'W'/'-' and a string with
+    // one in it count -- the latter is how a selected assignment over a
+    // vector is usually written.
+    static bool metavalueChoice(const AstNodeVhdlExpr* nodep) {
+        if (metavalueLiteral(nodep)) return true;
+        const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
+        if (!litp || litp->kind() != VhdlLitKind::STRING) return false;
+        if (!isLogicArray(nodep->vhdlTypep())) return false;
+        return litp->text().find_first_of("UuXxWw-") != std::string::npos;
+    }
+
     AstNodeExpr* lowerBinary(AstVhdlBinary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -3552,6 +3614,21 @@ private:
             }
             unsup(flp, "user-defined operator \"" + symp->name() + "\"");
             return nullptr;
+        }
+        // Comparing one value of a logic type with 'U', 'X', 'W' or '-'
+        // never holds: this runtime has no metavalues, and those four map
+        // onto the one X that cannot occur (see the accepted divergences).
+        // Left as an ordinary comparison it would find X written as zero and
+        // match every '0' -- worse than saying no, which is what the mapping
+        // means. 'Z' is representable, so it is compared as it stands.
+        if (nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE) {
+            if (isScalarLogic(ltypep) && isScalarLogic(rtypep)
+                && (metavalueLiteral(nodep->lhsp()) || metavalueLiteral(nodep->rhsp()))) {
+                if (nodep->op() == VhdlBinaryOp::EQ) {
+                    return new AstConst{flp, AstConst::BitFalse{}};
+                }
+                return new AstConst{flp, AstConst::BitTrue{}};
+            }
         }
         AstNodeExpr* lhsp = lowerExpr(nodep->lhsp());
         AstNodeExpr* rhsp = lowerExpr(nodep->rhsp());
@@ -8581,6 +8658,20 @@ private:
         AstNodeExpr* const exprp = lowerExpr(nodep->exprp());
         if (!exprp) return nullptr;
         AstCaseItem* itemsp = nullptr;
+        // A choice may name 'Z', or '-' in a matching case, and those reach
+        // the emitted case as the Verilog values they stand for. Verilator
+        // reads such a constant as a mistake for casex or casez, which is
+        // sound advice for Verilog but not here: VHDL has only the one
+        // spelling of each, and the analyzer has already checked the choices
+        // against the expression's subtype (10.9).
+        const auto quietXZ = [&](AstNodeExpr* exprp) {
+            AstConst* const constp = VN_CAST(exprp, Const);
+            if (!constp || !constp->num().isAnyXZ()) return exprp;
+            FileLine* const qflp = new FileLine{constp->fileline()};
+            qflp->warnOff(V3ErrorCode::CASEWITHX, true);
+            constp->fileline(qflp);
+            return exprp;
+        };
         for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
             AstVhdlAlternative* const altp = VN_AS(p, VhdlAlternative);
             AstNodeExpr* condsp = nullptr;
@@ -8613,10 +8704,34 @@ private:
                     continue;
                 }
                 if (chp->valuep()) {
-                    condsp = AstNode::addNextNull(condsp, lowerExpr(chp->valuep()));
+                    // A choice naming a value this runtime cannot hold can
+                    // never be taken, and left in it would match the zero the
+                    // value is written as -- so it is dropped, which is the
+                    // answer the equality operator gives for the same
+                    // comparison. A matching case is the exception: there a
+                    // '-' is the "any value" of 10.9, which is what Verilog's
+                    // casex reads an X as, so it is passed on as one.
+                    if (nodep->matching() && dontCareLiteral(chp->valuep())
+                        && isScalarLogic(chp->valuep()->vhdlTypep())) {
+                        V3Number num{chp->fileline(), 1, 0};
+                        num.setAllBitsX();
+                        condsp = AstNode::addNextNull(
+                            condsp, quietXZ(new AstConst{chp->fileline(), num}));
+                        continue;
+                    }
+                    if (!nodep->matching() && metavalueChoice(chp->valuep())) continue;
+                    if (AstNodeExpr* const cvp = lowerExpr(chp->valuep())) {
+                        condsp = AstNode::addNextNull(condsp, quietXZ(cvp));
+                    }
                 }
             }
             AstNode* const stmtsp = lowerStmts(altp->stmtsp());
+            if (!others && !condsp) {
+                // Every choice named a value this runtime cannot hold, so
+                // nothing reaches these statements
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                continue;
+            }
             itemsp = AstNode::addNextNull(
                 itemsp, new AstCaseItem{flp, others ? nullptr : condsp, stmtsp});
         }
