@@ -5266,10 +5266,84 @@ private:
             return;
         }
         if (AstVhdlProcCall* const callp = VN_CAST(nodep, VhdlProcCall)) {
-            addStmt(concurrentProcess(lowerStmt(callp), callp->postponed(), flp));
+            // A concurrent procedure call is a process that calls it and then
+            // waits on the signal parameters it reads (11.4). Those are not
+            // read by the call itself -- the copy made for it names them
+            // directly -- so the sensitivity comes from the actuals.
+            AstSenTree* const senp
+                = callp->postponed() ? nullptr : signalCallSensitivity(callp, flp);
+            AstNode* const bodyp = lowerStmt(callp);
+            if (senp && bodyp) {
+                // The call, then the wait, over and over: one process, not a
+                // fresh one on every change. The procedure may itself wait,
+                // and then the process is inside it until it returns.
+                if (!v3Global.opt.timing().isTrue()) {
+                    VL_DO_DANGLING(senp->deleteTree(), senp);
+                    addStmt(concurrentProcess(bodyp, callp->postponed(), flp));
+                    return;
+                }
+                AstNode* const loopp = AstNode::addNext(
+                    bodyp, static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
+                addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, loopp});
+                return;
+            }
+            if (senp) VL_DO_DANGLING(senp->deleteTree(), senp);
+            addStmt(concurrentProcess(bodyp, callp->postponed(), flp));
             return;
         }
         unsup(flp, std::string{"concurrent statement "} + nodep->typeName());
+    }
+
+    // What a concurrent procedure call waits on: every signal named in the
+    // actual of a parameter of mode "in" or "inout", whatever the class of
+    // the formal -- a constant parameter given a signal counts too (11.4).
+    // Null where it has none, and the ordinary rule decides instead.
+    AstSenTree* signalCallSensitivity(AstVhdlProcCall* nodep, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(nodep->callp(), VhdlCall);
+        VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nullptr;
+        VhdlSymbol* const symp = namedp ? namedp->resolved() : nullptr;
+        if (!symp || !callp) return nullptr;
+        AstVhdlSubprogDecl* const declp = declOf(symp);
+        if (!declp) return nullptr;
+        std::vector<AstVhdlIfaceDecl*> formals;
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
+            formals.push_back(VN_AS(p, VhdlIfaceDecl));
+        }
+        std::vector<AstVhdlAssoc*> assocs;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            if (AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc)) assocs.push_back(asp);
+        }
+        std::vector<AstVar*> varps;
+        for (size_t i = 0; i < formals.size(); ++i) {
+            if (formals[i]->kind() == VhdlIfaceKind::FILE) continue;
+            if (formals[i]->mode() == VhdlMode::OUT) continue;
+            AstNodeVhdlExpr* actualp = nullptr;
+            for (size_t a = 0; a < assocs.size(); ++a) {
+                const AstVhdlName* const namep
+                    = assocs[a]->formalp() ? VN_CAST(assocs[a]->formalp(), VhdlName) : nullptr;
+                if (namep) {
+                    if (namep->name() == formals[i]->name()) actualp = assocs[a]->actualp();
+                } else if (!assocs[a]->formalp() && a == i) {
+                    actualp = assocs[a]->actualp();
+                }
+            }
+            if (!actualp) continue;
+            // Only a signal is waited on. A constant or a variable named
+            // there is read once and never changes the process's mind.
+            const VhdlSymbol* const rootp = rootSymOf(actualp);
+            if (!rootp || rootp->resolved()->kind() != VhdlSymKind::SIGNAL) continue;
+            AstNodeExpr* const onep = lowerExpr(actualp);
+            if (!onep) continue;
+            collectVars(onep, varps);
+            VL_DO_DANGLING(onep->deleteTree(), onep);
+        }
+        AstSenItem* itemsp = nullptr;
+        for (AstVar* const varp : varps) {
+            itemsp = AstNode::addNext(
+                itemsp,
+                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
+        }
+        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
     // The process a concurrent statement is. A postponed one runs only once
