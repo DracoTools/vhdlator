@@ -3023,6 +3023,71 @@ private:
         return newp;
     }
 
+    // "new t'(l to r => v)", where the range is worked out while running:
+    // every element is the one value, so the object is made that long and
+    // filled with it. Null where the value is not of that shape.
+    AstNodeExpr* dynAllocFromRun(AstNodeVhdlExpr* valuep, const DynAccess* dynp,
+                                 FileLine* flp) {
+        AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate);
+        if (!aggp || !aggp->elemsp() || aggp->elemsp()->nextp()) return nullptr;
+        AstVhdlElemAssoc* const eap = aggp->elemsp();
+        AstVhdlChoice* const chp = eap->choicesp();
+        if (!chp || chp->nextp() || !chp->rangep() || !eap->valuep()) return nullptr;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        bool dirKnown = true;
+        if (!rangeParts(chp->rangep(), leftp, rightp, ascending, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstNodeExpr* const elemp = lowerExpr(eap->valuep());
+        if (!elemp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstVar* const objVarp = newTempVar(
+            "__Vdynobj", new AstClassRefDType{flp, dynp->classp, nullptr}, flp);
+        AstVar* const cntVarp = newTempVar("__Vdyncnt", newIntDType(flp), flp);
+        AstVar* const idxVarp = newTempVar("__Vdynj", newIntDType(flp), flp);
+        idxVarp->usedLoopIdx(true);
+        AstNodeExpr* const spanp = ascending
+                                       ? new AstSub{flp, rightp, leftp->cloneTree(false)}
+                                       : new AstSub{flp, leftp->cloneTree(false), rightp};
+        AstNode* stmtsp = new AstAssign{
+            flp, new AstVarRef{flp, cntVarp, VAccess::WRITE},
+            new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}}};
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssign{
+                        flp, new AstVarRef{flp, objVarp, VAccess::WRITE},
+                        dynNew(new AstVarRef{flp, cntVarp, VAccess::READ}, leftp,
+                               ascending ? 1 : -1, flp)}));
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(
+                        new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                      new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLtS{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                       new AstVarRef{flp, cntVarp, VAccess::READ}}});
+        loopp->addStmtsp(new AstAssign{
+            flp,
+            new AstSelBit{flp,
+                          memberOf(new AstVarRef{flp, objVarp, VAccess::READ},
+                                   dynp->datap->name(), flp),
+                          new AstVarRef{flp, idxVarp, VAccess::READ}},
+            elemp});
+        loopp->addContsp(new AstAssign{
+            flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+            new AstAdd{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        stmtsp = AstNode::addNext(stmtsp, static_cast<AstNode*>(loopp));
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, objVarp, VAccess::READ}};
+    }
+
     // "new t'(v)" for an array whose bounds only the value gives: the object
     // is made the size of the value, and the value copied into it. The
     // statements that do so travel with the expression, since an allocator
@@ -3037,6 +3102,9 @@ private:
         }
         VhdlType* const typep = valuep->vhdlTypep();
         if (!dynBoundedArray(typep)) {
+            // "new t'(l to r => v)": the aggregate says its own range, and
+            // the bounds may only be known while running
+            if (AstNodeExpr* const outp = dynAllocFromRun(valuep, dynp, flp)) return outp;
             unsup(flp, "allocator for a value whose bounds are not known");
             return nullptr;
         }
