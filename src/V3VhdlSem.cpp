@@ -582,6 +582,12 @@ class VhdlSemVisitor final : public VNVisitor {
         // null array guards itself -- "if v'length > 0 then v(v'high)" --
         // and that guard is a run-time test, not one this can see.
         if (isNullRange(typep)) return;
+        // In a copy made for one call site the values that call supplies make
+        // expressions fold that the design never wrote as static, so a branch
+        // the guard around it rules out folds too: "if c >= 0 then f(c) else
+        // f(-c)" would report -c as out of range on the arm that cannot run.
+        // Such a value is checked while running, as the LRM asks (4.2.2.1).
+        if (m_inSpecialized) return;
         const VhdlValue val = V3VhdlEval::eval(nodep);
         if (!val.known() || V3VhdlEval::inRange(val, typep)) return;
         err(nodep->fileline(), "Value " + val.prettyName() + " is outside the range of " + what
