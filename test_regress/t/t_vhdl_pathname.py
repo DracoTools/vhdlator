@@ -11,8 +11,10 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# 'INSTANCE_NAME and 'PATH_NAME name where a declaration is: every region from
-# the design unit down, and a subprogram's own type profile with it.
+# 'PATH_NAME and 'INSTANCE_NAME name every region from the design unit down
+# (16.2.7). The body of a generate is not one of them: the generate
+# statement's own label is, and an unlabelled body contributed an empty
+# component and a stray colon.
 test.top_filename = "t/t_vhdl_pathname.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],

@@ -547,8 +547,12 @@ private:
         const std::string& prefix = inst ? scopep->instPrefix() : scopep->pathPrefix();
         if (!prefix.empty()) return prefix + ":";
         std::string name = scopep->name();
+        // The body of a generate is not a named region of its own: the
+        // generate statement's own label is what the path holds (16.2.7), so
+        // an unlabelled body contributes nothing rather than an empty name
+        if (name == "generate body") return scopePath(scopep->parentp(), inst);
         if (name == "process" || name == "block" || name == "generate"
-            || name == "generate body" || name == "loop") {
+            || name == "loop") {
             name.clear();
         }
         const std::string up = scopePath(scopep->parentp(), inst);
