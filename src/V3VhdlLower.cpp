@@ -201,6 +201,7 @@ public:
 
     void lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void addTraceRequest() VL_MT_DISABLED;
+    void markPackageSignalRefs() VL_MT_DISABLED;
     static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
 private:
@@ -3788,6 +3789,15 @@ private:
         if (it != m_vars.end()) {
             return new AstVarRef{flp, it->second, VAccess::READ};
         }
+        // A signal or a shared variable the design never declared inside a
+        // module is one a package declared, and there is one of it
+        if ((symp->kind() == VhdlSymKind::SIGNAL
+             || symp->kind() == VhdlSymKind::SHARED_VARIABLE)
+            && !symp->hasValue()) {
+            if (AstVar* const varp = pkgSignalVar(symp, flp)) {
+                return new AstVarRef{flp, varp, VAccess::READ};
+            }
+        }
         if (symp->hasValue()) {
             // A folded array constant is a plain number, and a number has no
             // index range, so indexing or slicing it would count from the
@@ -3846,6 +3856,53 @@ private:
 
     // The variable a folded array constant is kept in, made on first use and
     // belonging to the module rather than to whatever is being built now
+    // A signal a package declares is one signal for the whole design, not one
+    // per module that uses it (6.4.2.3), so it is emitted once into the unit
+    // every module can see and every reference finds the same object. VUnit's
+    // message passing is built on one of these.
+    std::map<const VhdlSymbol*, AstVar*> m_pkgSigs;
+
+    // Whether a package is where the declaration stands. A signal of a module
+    // that this has simply not reached yet is not one of these, and giving it
+    // an object of its own would leave the module's drives going somewhere
+    // nothing reads.
+    static bool declaredInPackage(const VhdlSymbol* symp) {
+        for (const AstNode* p = symp->declp(); p; p = p->backp()) {
+            if (VN_IS(p, VhdlPackage) || VN_IS(p, VhdlPackageBody)) return true;
+            if (VN_IS(p, VhdlArchitecture) || VN_IS(p, VhdlEntity)) return false;
+        }
+        return false;
+    }
+
+    AstVar* pkgSignalVar(VhdlSymbol* symp, FileLine* flp) {
+        if (!declaredInPackage(symp)) return nullptr;
+        const auto found = m_pkgSigs.find(symp);
+        if (found != m_pkgSigs.end()) {
+            m_vars[symp] = found->second;
+            return found->second;
+        }
+        AstPackage* const unitp = m_netlistp ? m_netlistp->dollarUnitPkgAddp() : nullptr;
+        if (!unitp) return nullptr;
+        std::string name = symp->name();
+        if (const VhdlScope* const scopep = symp->declScopep()) {
+            name = scopep->name() + "__" + name;
+        }
+        AstVar* const varp = new AstVar{flp, VVarType::VAR, "__Vpkg__" + name,
+                                        VFlagChildDType{}, lowerType(symp->typep(), flp)};
+        varp->lifetime(VLifetime::STATIC_EXPLICIT);
+        varp->trace(false);
+        AstVhdlObjectDecl* const declp = VN_CAST(symp->declp(), VhdlObjectDecl);
+        if (declp && declp->defaultp()) {
+            varp->valuep(lowerExpr(declp->defaultp()));
+        } else {
+            varp->valuep(defaultValueFor(symp->typep(), flp));
+        }
+        unitp->addStmtsp(varp);
+        m_pkgSigs.emplace(symp, varp);
+        m_vars[symp] = varp;
+        return varp;
+    }
+
     AstVar* constVarFor(VhdlSymbol* symp, FileLine* flp) {
         AstVar* const varp = newVar(symp, VVarType::VAR, flp);
         varp->valuep(lowerValue(symp->value(), symp->typep(), flp));
@@ -10252,6 +10309,12 @@ private:
             // A signal actual is a signal of the design, either named plainly
             // or with a part of it selected in a way that is decided now
             VhdlSymbol* const actualSymp = actualp ? actualp->vhdlSymp() : nullptr;
+            // A signal a package declares has no variable of this module's
+            // own; there is one of it, in the unit every module sees
+            if (actualSymp && actualSymp->kind() == VhdlSymKind::SIGNAL
+                && !m_vars.count(actualSymp)) {
+                pkgSignalVar(actualSymp, actualp->fileline());
+            }
             const auto varIt
                 = actualSymp ? m_vars.find(actualSymp) : m_vars.end();
             if (!actualSymp || varIt == m_vars.end() || VN_IS(actualp, VhdlSelected)
@@ -12683,7 +12746,20 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                         altArchName(entities[key]->name(), wanted));
         }
     }
+    markPackageSignalRefs();
     if (v3Global.opt.trace()) addTraceRequest();
+}
+
+// A reference to a signal a package declares has to say which package it is
+// in, or V3Scope cannot find the one object all the modules share.
+void VhdlLowerVisitor::markPackageSignalRefs() {
+    if (m_pkgSigs.empty() || !m_netlistp) return;
+    std::set<const AstVar*> varps;
+    for (const auto& pair : m_pkgSigs) varps.insert(pair.second);
+    AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
+    m_netlistp->foreach([&](AstVarRef* refp) {
+        if (varps.count(refp->varp())) refp->classOrPackagep(unitp);
+    });
 }
 
 // VHDL has no $dumpfile: a design cannot ask for a waveform from inside
