@@ -4838,12 +4838,15 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             // An element may itself be an array of the same type, as in
             // "(others => (others => '0'))", so try the element type first
             VhdlType* hintp = elemTypep;
-            // A choice that is a range may be given the whole run at once --
-            // "(3 downto 0 => x\"C\")" -- and then the value is of the
-            // aggregate's own type rather than of its element's (9.3.3.3).
-            // Which one it is is settled by what the value could be at all.
-            if (elemTypep && eap->choicesp() && eap->choicesp()->rangep()
-                && eap->valuep()) {
+            // An element association may give the whole run at once -- a
+            // choice that is a range, as in "(3 downto 0 => x\"C\")", or a
+            // positional element as in "('1', x\"5a\")" -- and then the value
+            // is of the aggregate's own type rather than of its element's
+            // (9.3.3.3). Which one it is is settled by what the value could
+            // be at all.
+            const bool wholeRun
+                = !eap->choicesp() || (eap->choicesp()->rangep() != nullptr);
+            if (elemTypep && wholeRun && eap->valuep()) {
                 CandSet cs;
                 candidateTypes(eap->valuep(), cs);
                 bool asElement = false;
@@ -4862,7 +4865,10 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                 } else if (cs.types.empty()) {
                     asElement = true;
                 }
-                if (!asElement && asWhole) hintp = wantp;
+                // The aggregate's own type, but not its constraint: what the
+                // value covers is as long as the value is, not as long as
+                // the whole aggregate
+                if (!asElement && asWhole) hintp = wantp->base();
             }
             analyzeExpr(eap->valuep(), hintp);
             checkValueInRange(eap->valuep(), hintp, "an element of this aggregate");

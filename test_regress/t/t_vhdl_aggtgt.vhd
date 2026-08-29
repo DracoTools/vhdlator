@@ -14,6 +14,7 @@ end entity;
 architecture a of t_vhdl_aggtgt is
   signal sel : integer := 6;
   signal g1, g2 : std_logic := 'U';
+  signal wide : std_logic_vector(8 downto 0) := (others => '0');
 begin
 
   -- A selected signal assignment whose target is an aggregate
@@ -39,6 +40,12 @@ begin
     wait for 1 ns;
     assert g1 = '0' report "g1 again is " & to_string(g1) severity failure;
     assert g2 = '1' report "g2 again is " & to_string(g2) severity failure;
+
+    -- An element of an aggregate may be of the aggregate's own type rather
+    -- than of its element type, positionally as well as by choice (9.3.3.3)
+    wide <= ('1', x"5a");
+    wait for 1 ns;
+    assert wide = "1" & x"5a" report "wide is " & to_string(wide) severity failure;
 
     report "*-* All Finished *-*";
     std.env.finish;
