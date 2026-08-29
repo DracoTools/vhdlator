@@ -746,6 +746,33 @@ private:
         return typep && strp && typep->base() == strp->base();
     }
 
+    // An array indexed by a logic type -- "array (STD_ULOGIC) of X", which is
+    // how a design writes a table over the nine values -- is indexed here by
+    // the *position* of the value, while a value of such a type is carried as
+    // one bit. The bit is turned back into a position at the index.
+    AstNodeExpr* logicIndex(const VhdlType* arrayTypep, size_t dim, AstNodeExpr* indexp,
+                            FileLine* flp) {
+        if (!arrayTypep || !indexp) return indexp;
+        const std::vector<VhdlType*>& idxs = arrayTypep->base()->indexTypes();
+        if (dim >= idxs.size() || !idxs[dim]) return indexp;
+        const VhdlType* const idxp = idxs[dim]->base();
+        if (!enumIsLogic(idxp)) return indexp;
+        int64_t zero = -1;
+        int64_t one = -1;
+        for (const VhdlSymbol* const litp : idxp->literals()) {
+            if (litp->name() == "'0'") zero = litp->position();
+            if (litp->name() == "'1'") one = litp->position();
+        }
+        if (zero < 0 || one < 0) return indexp;
+        // Only '0' and '1' survive the two-state model, so those are the two
+        // positions a value can stand for (see the accepted divergences)
+        return new AstCond{flp, indexp,
+                           new AstConst{flp, AstConst::Signed32{},
+                                        static_cast<int32_t>(one)},
+                           new AstConst{flp, AstConst::Signed32{},
+                                        static_cast<int32_t>(zero)}};
+    }
+
     // The index a STRING's own range starts at. Verilator's string is indexed
     // from zero; VHDL indexes STRING from its range, which is 1 for the
     // predefined subtype and for every string literal (16.3).
@@ -4138,7 +4165,8 @@ private:
                 return new AstSelExtract{flp, fromp, leftp, rightp};
             }
             AstNodeExpr* outp = fromp;
-            for (AstNode* p = nodep->argsp(); p; p = p->nextp()) {
+            size_t dim = 0;
+            for (AstNode* p = nodep->argsp(); p; p = p->nextp(), ++dim) {
                 AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                 if (!asp || !asp->actualp()) continue;
                 AstNodeExpr* indexp = lowerExpr(asp->actualp());
@@ -4148,6 +4176,7 @@ private:
                 }
                 indexp = aliasShift(objSymp, indexp, flp);
                 indexp = stringIndex(prefixTypep, indexp, flp);
+                indexp = logicIndex(prefixTypep, dim, indexp, flp);
                 outp = new AstSelBit{flp, outp, indexp};
             }
             return outp;

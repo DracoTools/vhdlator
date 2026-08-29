@@ -50,6 +50,20 @@ path = "include/vhdl/ieee/**"
 SPDX-FileCopyrightText = "2019 IEEE P1076 WG Authors"
 SPDX-License-Identifier = "Apache-2.0"
 
+# The four packages Synopsys published in 1990-1992 and every simulator
+# ships beside the IEEE ones, unmodified. Their own notice allows use and
+# distribution without restriction so long as it is kept, so it is kept.
+[[annotations]]
+path = [
+    "include/vhdl/ieee/std_logic_arith.vhdl",
+    "include/vhdl/ieee/std_logic_misc.vhdl",
+    "include/vhdl/ieee/std_logic_misc-body.vhdl",
+    "include/vhdl/ieee/std_logic_signed.vhdl",
+    "include/vhdl/ieee/std_logic_unsigned.vhdl",
+]
+SPDX-FileCopyrightText = "1990-1992 Synopsys, Inc."
+SPDX-License-Identifier = "LicenseRef-Synopsys-STD-LOGIC"
+
 [[annotations]]
 path = "test_regress/t/uvm/**"
 SPDX-FileCopyrightText = [

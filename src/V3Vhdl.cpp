@@ -136,6 +136,14 @@ const VhdlBundledUnit VHDL_IEEE_UNITS[] = {
     {"float_generic_pkg", "fixed_float_types numeric_std math_real fixed_pkg",
      "float_generic_pkg.vhdl float_generic_pkg-body.vhdl"},
     {"float_pkg", "float_generic_pkg", "float_pkg.vhdl"},
+    // Not IEEE's, but written into the IEEE library by every design that
+    // uses them and shipped by every other simulator. Synopsys' notice
+    // allows them to be distributed unchanged, which is how they are here.
+    {"std_logic_arith", "std_logic_1164", "std_logic_arith.vhdl"},
+    {"std_logic_unsigned", "std_logic_arith", "std_logic_unsigned.vhdl"},
+    {"std_logic_signed", "std_logic_arith", "std_logic_signed.vhdl"},
+    {"std_logic_misc", "std_logic_1164",
+     "std_logic_misc.vhdl std_logic_misc-body.vhdl"},
 };
 
 std::vector<std::string> splitWords(const std::string& text) {
