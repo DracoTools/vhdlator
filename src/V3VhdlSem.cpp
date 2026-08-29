@@ -1235,6 +1235,8 @@ private:
     VhdlType* convertedType(VhdlType* top, AstVhdlAssoc* argp) VL_MT_DISABLED;
     VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) VL_MT_DISABLED;
+    VhdlType* aggregateTargetType(AstNodeVhdlExpr* valuep, AstNode* wavesp,
+                                  AstNode* altsp) VL_MT_DISABLED;
     VhdlType* constrainRecordFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                       FileLine* flp) VL_MT_DISABLED;
     VhdlType* constrainElementFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
@@ -6387,8 +6389,41 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
 //######################################################################
 // Statements, where the context fixes the type each expression must have
 
+// An aggregate target says nothing about its own type: it takes it from the
+// value assigned to it (10.5.2.1). The value may be a string literal, whose
+// type is settled by context and not by itself, so the first value that
+// settles one is what the target and every other value are read against.
+VhdlType* VhdlSemVisitor::aggregateTargetType(AstNodeVhdlExpr* valuep, AstNode* wavesp,
+                                              AstNode* altsp) {
+    std::vector<AstNodeVhdlExpr*> values;
+    if (valuep) values.push_back(valuep);
+    const auto addWaves = [&values](AstNode* wp) {
+        for (; wp; wp = wp->nextp()) {
+            AstVhdlWaveform* const wfp = VN_CAST(wp, VhdlWaveform);
+            if (wfp && wfp->valuep()) values.push_back(wfp->valuep());
+        }
+    };
+    addWaves(wavesp);
+    for (AstNode* ap = altsp; ap; ap = ap->nextp()) {
+        addWaves(VN_AS(ap, VhdlAlternative)->wavesp());
+    }
+    for (AstNodeVhdlExpr* const vp : values) {
+        CandSet cands;
+        candidateTypes(vp, cands);
+        if (cands.types.size() == 1 && cands.types[0] && !cands.types[0]->isError()) {
+            return cands.types[0];
+        }
+    }
+    return nullptr;
+}
+
 void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
-    VhdlType* const targetp = analyzeExpr(nodep->targetp(), nullptr);
+    VhdlType* wantp = nullptr;
+    if (VN_IS(nodep->targetp(), VhdlAggregate)) {
+        wantp = aggregateTargetType(nullptr, nodep->wavesp(), nodep->altsp());
+    }
+    VhdlType* targetp = analyzeExpr(nodep->targetp(), wantp);
+    if (wantp && (!targetp || targetp->isError())) targetp = wantp;
     // Every waveform element is of the target's type (10.5.2.2)
     for (AstNode* wp = nodep->wavesp(); wp; wp = wp->nextp()) {
         AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
@@ -6420,7 +6455,12 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
-    VhdlType* const targetp = analyzeExpr(nodep->targetp(), nullptr);
+    VhdlType* wantp = nullptr;
+    if (VN_IS(nodep->targetp(), VhdlAggregate)) {
+        wantp = aggregateTargetType(nodep->valuep(), nullptr, nodep->altsp());
+    }
+    VhdlType* targetp = analyzeExpr(nodep->targetp(), wantp);
+    if (wantp && (!targetp || targetp->isError())) targetp = wantp;
     if (nodep->valuep()) {
         analyzeExpr(nodep->valuep(), targetp);
         checkAssignedValue(nodep->valuep(), targetp);

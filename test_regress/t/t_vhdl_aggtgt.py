@@ -11,8 +11,10 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# An aggregate standing as the target of an assignment (10.5.2.1, 10.6.2):
-# nested, naming its elements, over a string, and written concurrently.
+# The target of a selected assignment may be an aggregate, and the type of
+# an aggregate target is the type of the value assigned to it (10.5.2.1,
+# 11.6) -- which is what tells a bare string literal in one alternative
+# that it is a vector rather than a STRING.
 test.top_filename = "t/t_vhdl_aggtgt.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],

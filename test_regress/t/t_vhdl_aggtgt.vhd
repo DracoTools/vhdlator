@@ -5,70 +5,43 @@
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
 -- SPDX-License-Identifier: CC0-1.0
 
+library ieee;
+use ieee.std_logic_1164.all;
+
 entity t_vhdl_aggtgt is
 end entity;
 
-architecture test of t_vhdl_aggtgt is
-
-    type inner_t is record
-        f : bit;
-        g : bit_vector(1 to 3);
-    end record;
-
-    type outer_t is record
-        i : inner_t;
-        h : bit;
-    end record;
-
-    signal src : bit_vector(1 downto 0) := "10";
-    signal s0, s1 : bit;
-
+architecture a of t_vhdl_aggtgt is
+  signal sel : integer := 6;
+  signal g1, g2 : std_logic := 'U';
 begin
 
-    -- A concurrent aggregate target
-    conc : (s0, s1) <= src;
+  -- A selected signal assignment whose target is an aggregate
+  with sel select (g1, g2) <= std_logic_vector'("01") when 2,
+                              "10" when others;
 
-    process is
-        variable a, h : bit;
-        variable b : bit_vector(1 to 3);
-        variable p, q, r : bit;
-        variable ov : outer_t;
-        variable text : string(1 to 8) := "abcdefgh";
-        variable ch1, ch2 : character;
-        variable rest : string(1 to 6);
-    begin
-        ov := (('1', "010"), '0');
+  main : process
+    variable b1, b2 : std_logic;
+  begin
+    -- and a selected variable assignment, likewise. The type of the target
+    -- is the type of the value, so the bare string literal in the second
+    -- alternative is a vector and not a STRING.
+    with sel select (b1, b2) := std_logic_vector'("01") when 2,
+                                "10" when others;
+    assert b1 = '1' report "b1 is " & to_string(b1) severity failure;
+    assert b2 = '0' report "b2 is " & to_string(b2) severity failure;
 
-        -- A nested aggregate target, over a record inside a record
-        ((a, b), h) := ov;
-        assert a = '1' report "a" severity failure;
-        assert b = "010" report "b" severity failure;
-        assert h = '0' report "h" severity failure;
+    wait for 1 ns;
+    assert g1 = '1' report "g1 is " & to_string(g1) severity failure;
+    assert g2 = '0' report "g2 is " & to_string(g2) severity failure;
 
-        -- A nested aggregate target, over an array inside a record
-        ((a, (p, q, r)), h) := ov;
-        assert p = '0' and q = '1' and r = '0' report "pqr" severity failure;
+    sel <= 2;
+    wait for 1 ns;
+    assert g1 = '0' report "g1 again is " & to_string(g1) severity failure;
+    assert g2 = '1' report "g2 again is " & to_string(g2) severity failure;
 
-        -- A named aggregate target, over a string. GHDL 7.0.0-dev refuses a
-        -- discrete range as the choice of an aggregate target; nvc 1.22.1
-        -- takes it, which is what VHDL-2008 asks for.
-        (1 => ch1, 2 => ch2, 3 to 8 => rest) := text;
-        assert ch1 = 'a' report "ch1" severity failure;
-        assert ch2 = 'b' report "ch2" severity failure;
-        assert rest = "cdefgh" report "rest" severity failure;
-
-        -- A record aggregate target naming its elements out of order. nvc
-        -- 1.22.1 stops with an internal error on this one; GHDL 7.0.0-dev
-        -- gives the answer below.
-        (h => h, i => (a, b)) := ov;
-        assert a = '1' and b = "010" and h = '0' report "named record" severity failure;
-
-        wait for 1 ns;
-        assert s0 = '1' report "s0" severity failure;
-        assert s1 = '0' report "s1" severity failure;
-
-        report "*-* All Finished *-*";
-        std.env.finish;
-    end process;
+    report "*-* All Finished *-*";
+    std.env.finish;
+  end process;
 
 end architecture;

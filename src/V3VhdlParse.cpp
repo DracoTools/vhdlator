@@ -1332,7 +1332,11 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
         expect(VhdlTokType::KWD_SELECT, "'select' after the selector expression");
         // 11.6 and 10.5.4 write the question mark after "select"
         if (check(VhdlTokType::QUERY)) matching = true;
-        AstNodeVhdlExpr* targetp = parseName();
+        // The target may be an aggregate, which assigns each element of the
+        // value to a target of its own (10.5.2.1, 11.6)
+        AstNodeVhdlExpr* targetp = (peekType() == VhdlTokType::LPAREN)
+                                       ? parseParenOrAggregate()
+                                       : parseName();
         if (!targetp) targetp = new AstVhdlName{flp, ""};
         expect(VhdlTokType::LE, "'<=' in a selected signal assignment");
         AstVhdlSigAssign* const nodep
@@ -1912,7 +1916,11 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
         expect(VhdlTokType::KWD_SELECT, "'select' after the selector expression");
         // 11.6 and 10.5.4 write the question mark after "select"
         if (check(VhdlTokType::QUERY)) matching = true;
-        AstNodeVhdlExpr* targetp = parseName();
+        // The target may be an aggregate, which assigns each element of the
+        // value to a target of its own (10.5.2.1, 11.6)
+        AstNodeVhdlExpr* targetp = (peekType() == VhdlTokType::LPAREN)
+                                       ? parseParenOrAggregate()
+                                       : parseName();
         if (!targetp) targetp = new AstVhdlName{flp, ""};
         if (check(VhdlTokType::VAR_ASSIGN)) {
             AstVhdlVarAssign* const nodep
