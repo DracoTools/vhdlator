@@ -2311,6 +2311,7 @@ private:
                               flp);
         sh.everp = newTempVar(base + "__ever", newLogicDType(flp, 1), flp);
         sh.transp = newTempVar(base + "__trans", newLogicDType(flp, 1), flp);
+        sh.transp->valuep(new AstConst{flp, AstConst::BitTrue{}});
         // A signal starts out equal to its own past, so nothing reads as an
         // event before anything has happened. That past is the value the
         // signal itself starts at, which is its own initial value where it
@@ -2495,8 +2496,12 @@ private:
                                                     VNumRange{63, 0}, -1},
                                   flp);
             ac.everp = newTempVar(base + "__ever", newLogicDType(flp, 1), flp);
-            ac.togglep->valuep(new AstConst{flp, AstConst::BitFalse{}});
-            ac.prevp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            // 16.2.4 leaves the initial value of S'TRANSACTION undefined and
+            // calls a description that depends on it erroneous, but nvc
+            // 1.22.1 and GHDL 7.0.0-dev agree on '1', and a testbench that
+            // reads it before the first transaction should see what they see
+            ac.togglep->valuep(new AstConst{flp, AstConst::BitTrue{}});
+            ac.prevp->valuep(new AstConst{flp, AstConst::BitTrue{}});
             ac.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
             AstNode* stmtsp = new AstAssignDly{flp,
                                                new AstVarRef{flp, ac.prevp, VAccess::WRITE},
@@ -6367,20 +6372,40 @@ private:
     AstNode* waveformStmts(AstNodeVhdlExpr* targetp, AstVhdlWaveform* wavesp,
                            AstNodeExpr*& readsp, FileLine* flp) {
         AstNode* stmtsp = nullptr;
+        // A transaction happens when each element is delivered, and the bit
+        // that records it flips *then* rather than now: a delayed assignment
+        // of "not t" reads t as it stands when the assignment is made, so
+        // three of them scheduled together would all deliver the same value.
+        // The flips are therefore a sequence of waits, after the whole
+        // waveform has been scheduled.
+        AstNodeExpr* prevDelayp = nullptr;
+        AstNode* marksp = nullptr;
         for (AstVhdlWaveform* p = wavesp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
             AstNodeExpr* const onep = lowerDriveTarget(targetp);
             AstNodeExpr* const valuep = lowerExpr(p->valuep());
             if (!onep || !valuep) return nullptr;
             readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
                             : valuep->cloneTree(false);
-            AstNode* const delayp
-                = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+            AstNodeExpr* const afterp = p->afterp() ? lowerExpr(p->afterp()) : nullptr;
+            AstNode* const delayp = afterp ? new AstDelay{flp, afterp, false} : nullptr;
             stmtsp = AstNode::addNextNull(
                 stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
-            stmtsp = AstNode::addNextNull(stmtsp,
-                                          transactionMark(targetp, delayp, true, nullptr, flp));
+            if (AstNode* const flipp = transactionMark(targetp, nullptr, true, nullptr, flp)) {
+                // The wait before it is how much later than the last element
+                // this one is delivered, since the waveform's times increase
+                AstNodeExpr* stepp = afterp ? afterp->cloneTree(false) : nullptr;
+                if (stepp && prevDelayp) {
+                    stepp = new AstSub{flp, stepp, prevDelayp->cloneTree(false)};
+                }
+                if (stepp) {
+                    marksp = AstNode::addNextNull(
+                        marksp, static_cast<AstNode*>(new AstDelay{flp, stepp, false}));
+                }
+                marksp = AstNode::addNextNull(marksp, flipp);
+            }
+            if (afterp) prevDelayp = afterp;
         }
-        return stmtsp;
+        return AstNode::addNextNull(stmtsp, marksp);
     }
 
     // A concurrent statement is a process that runs once at time zero and
