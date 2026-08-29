@@ -2444,11 +2444,18 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
             libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
         } else if (AstVhdlArchitecture* const archp = VN_CAST(unitp, VhdlArchitecture)) {
-            // An architecture sees its entity's declarations (3.3)
+            // An architecture continues its entity's declarative region
+            // (3.3, 12.1), so a port is directly visible in it -- and hides
+            // an enumeration literal of that name a use clause brought in
             std::vector<std::string> parts;
             if (flatten(archp->entityNamep(), parts) && !parts.empty()) {
                 const auto it = m_unitScopes.find(lib + "." + parts.back());
-                if (it != m_unitScopes.end()) m_scopep->addUse(it->second);
+                if (it != m_unitScopes.end()) {
+                    m_scopep->addExtends(it->second);
+                    // and reachable by selection, for a package the entity
+                    // declares: "use pack_int.all" in the architecture
+                    m_scopep->addUse(it->second);
+                }
                 // An instance path names the entity, and the instance form
                 // names the architecture with it (16.2.7)
                 unitScopep->prefixes(parts.back() + "(" + lower(archp->name()) + ")",

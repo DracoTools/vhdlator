@@ -224,7 +224,8 @@ static bool sameProfile(const VhdlSymbol* ap, const VhdlSymbol* bp) {
 }
 
 // Add what one region offers, leaving out anything an inner region has
-// already declared with the same profile
+// already declared that hides it: a homograph, which for a declaration that
+// cannot be overloaded is any declaration of the same name at all (12.3)
 static void addUnhidden(const VhdlScope* scopep, const std::string& name,
                         std::vector<VhdlSymbol*>& out, size_t innerCount) {
     std::vector<VhdlSymbol*> here;
@@ -232,7 +233,9 @@ static void addUnhidden(const VhdlScope* scopep, const std::string& name,
     for (VhdlSymbol* const symp : here) {
         bool hidden = false;
         for (size_t i = 0; i < innerCount && !hidden; ++i) {
-            if (out[i] != symp && sameProfile(out[i], symp)) hidden = true;
+            if (out[i] == symp) continue;
+            if (sameProfile(out[i], symp)) hidden = true;
+            if (!out[i]->isOverloadable() && out[i]->homographOf(symp)) hidden = true;
         }
         if (!hidden) out.push_back(symp);
     }
@@ -246,6 +249,10 @@ void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) c
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         const size_t before = out.size();
         addUnhidden(scopep, name, out, before);
+        // A region this one continues declares into the same region (12.1)
+        for (const VhdlScope* const extp : scopep->m_extendsp) {
+            addUnhidden(extp, name, out, before);
+        }
         for (size_t i = before; i < out.size(); ++i) {
             if (!out[i]->isOverloadable()) return;
         }
@@ -295,6 +302,14 @@ void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) c
             out.swap(pruned);
         }
     }
+}
+
+void VhdlScope::addExtends(VhdlScope* scopep) {
+    if (!scopep || scopep == this) return;
+    for (const VhdlScope* const otherp : m_extendsp) {
+        if (otherp == scopep) return;
+    }
+    m_extendsp.push_back(scopep);
 }
 
 void VhdlScope::addUse(VhdlScope* scopep) {

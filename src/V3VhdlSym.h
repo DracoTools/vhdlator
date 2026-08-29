@@ -279,6 +279,10 @@ class VhdlScope final {
     // Made potentially visible by a use clause (12.4). Searched only when the
     // enclosing regions declare nothing of that name.
     std::vector<VhdlScope*> m_usedp;
+    // Regions this one continues (12.1): an architecture continues its
+    // entity's, a package body its package's. What they declare is directly
+    // visible here, not merely potentially visible.
+    std::vector<VhdlScope*> m_extendsp;
     // Selected-name targets: libraries and packages reachable as "lib.pkg"
     std::map<std::string, VhdlScope*> m_named;
 
@@ -316,6 +320,11 @@ public:
 
     // Make another region's declarations potentially visible (use ... .all)
     void addUse(VhdlScope* scopep) VL_MT_DISABLED;
+
+    // Continue another region here, so that its declarations are directly
+    // visible in this one (12.1)
+    void addExtends(VhdlScope* scopep) VL_MT_DISABLED;
+    const std::vector<VhdlScope*>& extends() const { return m_extendsp; }
 
     // Register a region reachable by selection, e.g. a library or package
     void addNamed(const std::string& name, VhdlScope* scopep) VL_MT_DISABLED;
