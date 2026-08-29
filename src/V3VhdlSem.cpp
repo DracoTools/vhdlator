@@ -1685,6 +1685,10 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             for (VhdlSymbol* const otherp : outer) local.push_back(otherp);
         }
         for (VhdlSymbol* const otherp : local) {
+            // Only another subprogram of the design can be the declaration
+            // this body completes. A name STD.STANDARD also declares -- TIME
+            // has a unit called MIN -- is a homograph of it and is not (4.3).
+            if (otherp->kind() != symp->kind() || otherp->predefined()) continue;
             if (!otherp->hasBody() && symp->homographOf(otherp)) {
                 reusep = otherp;
                 break;
@@ -3993,9 +3997,19 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
         std::vector<VhdlSymbol*> found;
         if (flatten(callp->prefixp(), parts) && !parts.empty()) lookup(parts.back(), found);
         dropUninstantiated(found);
-        bool onlySubprograms = !found.empty();
+        // A name that also denotes a type or an object makes this a
+        // conversion or an indexed name, which the ordinary path settles.
+        // A procedure of the same name does not: it cannot stand in an
+        // expression, so the functions are still the only readings (4.5.3).
+        bool onlySubprograms = false;
         for (const VhdlSymbol* const symp : found) {
-            if (symp->kind() != VhdlSymKind::FUNCTION) onlySubprograms = false;
+            const VhdlSymKind kind = symp->resolved()->kind();
+            if (kind == VhdlSymKind::FUNCTION) {
+                onlySubprograms = true;
+            } else if (kind != VhdlSymKind::PROCEDURE) {
+                onlySubprograms = false;
+                break;
+            }
         }
         if (onlySubprograms) {
             std::vector<CandSet> argCands;
