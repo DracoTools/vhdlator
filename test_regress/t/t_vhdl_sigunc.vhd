@@ -15,7 +15,7 @@ use ieee.std_logic_1164.all;
 package sigunc_pkg is
   subtype any_ev_t is std_logic_vector;
   subtype ev_t is any_ev_t(0 to 3);
-  signal net : ev_t := "0000";
+  signal net : ev_t := "ZZZZ";
 
   impure function is_set(signal e : any_ev_t) return boolean;
   procedure raise_it(signal e : inout any_ev_t);
@@ -51,7 +51,7 @@ entity t_vhdl_sigunc is
 end entity;
 
 architecture a of t_vhdl_sigunc is
-  signal other : std_logic_vector(7 downto 4) := "0000";
+  signal other : std_logic_vector(7 downto 4) := "ZZZZ";
 begin
   process
   begin
