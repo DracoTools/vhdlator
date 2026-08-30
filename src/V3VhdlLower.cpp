@@ -1586,11 +1586,105 @@ private:
     }
 
     std::map<const VhdlType*, AstNodeFTask*> m_dynEqFuncs;
+    std::map<const VhdlType*, AstNodeFTask*> m_dynFillFuncs;
     std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynOfFuncs;
 
     // "a = b" over two values that carry their own bounds is a length and
     // then an element at a time, which is a loop, so it is a function of its
     // own -- one per type, emitted where it is first wanted.
+    // "(v'range => '0')" written against a value whose length only running
+    // decides: every element the same, and the bounds taken from that value,
+    // which is the only thing that knows them (9.3.3.3)
+    AstNodeFTask* dynFillFunc(VhdlType* typep, FileLine* flp) {
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynFillFuncs.find(basep);
+        if (it != m_dynFillFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
+        if (!elemDTypep) return nullptr;
+        const std::string name
+            = "__Vdynfill" + std::to_string(m_dynFillFuncs.size()) + "__" + basep->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, dynCarrierRef(typep, flp), flp));
+        AstVar* const cp = new AstVar{flp, VVarType::PORT, "c", VFlagChildDType{},
+                                      dynCarrierRef(typep, flp)};
+        AstVar* const ep = new AstVar{flp, VVarType::PORT, "e", VFlagChildDType{}, elemDTypep};
+        for (AstVar* const argp : {cp, ep}) {
+            argp->direction(VDirection::INPUT);
+            argp->declDirection(VDirection::INPUT);
+            argp->funcLocal(true);
+            argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            argp->trace(false);
+            funcp->addStmtsp(argp);
+        }
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        funcp->addStmtsp(kp);
+        const auto out = [&]() {
+            return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
+        };
+        for (const char* const part : {"lft", "rgt", "dsc"}) {
+            funcp->addStmtsp(new AstAssign{flp, dynPart(out(), part, flp),
+                                           dynPart(rd(cp, flp), part, flp)});
+        }
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "q", flp),
+            new AstNewDynamic{flp, dynCarrierLength(rd(cp, flp), flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(kp, flp),
+                                       new AstConst{flp, AstConst::Signed32{}, 0}});
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLtS{flp, rd(kp, flp), dynCarrierLength(rd(cp, flp), flp)}});
+        loopp->addStmtsp(new AstAssign{
+            flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)}, rd(ep, flp)});
+        loopp->addStmtsp(new AstAssign{
+            flp, wr(kp, flp),
+            new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        funcp->addStmtsp(loopp);
+        m_modp->addStmtsp(funcp);
+        m_dynFillFuncs.emplace(basep, funcp);
+        return funcp;
+    }
+
+    // Such an aggregate, as a value carrying the bounds of the one it is
+    // compared with
+    AstNodeExpr* dynFillOf(AstNodeVhdlExpr* aggp, AstNodeVhdlExpr* boundsp, VhdlType* carrp,
+                           FileLine* flp) {
+        AstNodeVhdlExpr* const valuep = uniformAggregateValue(aggp);
+        if (!valuep) return nullptr;
+        AstNodeFTask* const fillp = dynFillFunc(carrp, flp);
+        if (!fillp) return nullptr;
+        AstNodeExpr* const srcp = lowerExpr(boundsp);
+        if (!srcp) return nullptr;
+        AstNodeExpr* const elemp = lowerExpr(valuep);
+        if (!elemp) {
+            VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            return nullptr;
+        }
+        AstFuncRef* const refp = new AstFuncRef{
+            flp, fillp->name(),
+            AstNode::addNext(new AstArg{flp, "", srcp}, new AstArg{flp, "", elemp})};
+        refp->taskp(VN_AS(fillp, Func));
+        return refp;
+    }
+
+    // An aggregate that gives every element the same value: one association,
+    // whose choices are "others" or a range, and whose value does not depend
+    // on which element it is
+    static AstNodeVhdlExpr* uniformAggregateValue(AstNodeVhdlExpr* nodep) {
+        AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
+        if (!aggp || !aggp->elemsp() || aggp->elemsp()->nextp()) return nullptr;
+        AstVhdlElemAssoc* const assocp = aggp->elemsp();
+        if (!assocp->choicesp()) return nullptr;
+        for (AstVhdlChoice* choicep = assocp->choicesp(); choicep;
+             choicep = VN_AS(choicep->nextp(), VhdlChoice)) {
+            if (!choicep->isOthers() && !choicep->rangep()) return nullptr;
+        }
+        return assocp->valuep();
+    }
+
     AstNodeFTask* dynEqFunc(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
         const auto it = m_dynEqFuncs.find(basep);
@@ -2885,7 +2979,8 @@ private:
             bool dirKnown = true;
             // A signal parameter's bounds came from the signal the call
             // passed, and those folded long ago: the answer is a number
-            if (const VhdlType* const idxp = indexSubtype(typep, dim)) {
+            if (const VhdlType* const idxp
+                = typep && typep->isConstrainedArray() ? indexSubtype(typep, dim) : nullptr) {
                 if (idxp->bounded() && !idxp->boundsp()) {
                     if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                     const int64_t lo = idxp->left();
@@ -4676,7 +4771,12 @@ private:
                 = carriedDynamically(ltypep) ? ltypep : rtypep;
             AstNodeFTask* const eqp = carrp ? dynEqFunc(carrp, flp) : nullptr;
             AstNodeExpr* const ap = eqp ? asDynCarrier(nodep->lhsp(), carrp, flp) : nullptr;
-            AstNodeExpr* const bp = ap ? asDynCarrier(nodep->rhsp(), carrp, flp) : nullptr;
+            AstNodeExpr* bp = ap ? asDynCarrier(nodep->rhsp(), carrp, flp) : nullptr;
+            // The other side may be "(v'range => '0')", which is as long as
+            // the value it is compared with and no longer
+            if (ap && !bp && isDynValue(nodep->lhsp())) {
+                bp = dynFillOf(nodep->rhsp(), nodep->lhsp(), carrp, flp);
+            }
             if (ap && bp) {
                 AstFuncRef* const refp = new AstFuncRef{
                     flp, eqp->name(),
@@ -12644,6 +12744,7 @@ private:
         // The helpers a carrier needs belong to the module they were emitted
         // into, so the next one starts without them
         m_dynEqFuncs.clear();
+        m_dynFillFuncs.clear();
         m_dynOfFuncs.clear();
         m_dynToFuncs.clear();
         m_dynBitsFuncs.clear();
