@@ -67,6 +67,16 @@ architecture a of t_vhdl_dynlen is
     end loop;
   end procedure;
 
+  -- An object declared with such a value takes its bounds from it, which is
+  -- the only thing that says how long it is
+  function viaConst (k : natural) return integer is
+    constant c : int_vec := build(k);
+    variable s : integer := 0;
+  begin
+    for i in c'range loop s := s + c(i); end loop;
+    return s;
+  end function;
+
   function viaOut (k : natural) return integer is
     variable src : int_vec(1 to k);
     variable dst : int_vec(1 to k);
@@ -107,6 +117,8 @@ begin
 
     n := 3;
     assert viaOut(n) = 15 report "written by reference" severity failure;
+    n := 4;
+    assert viaConst(n) = 10 report "declared from such a value" severity failure;
     n := 5;
 
     -- The width a conversion is given need not be a number here either

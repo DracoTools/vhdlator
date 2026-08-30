@@ -2282,9 +2282,19 @@ private:
                 return;
             }
             if (dynDecl) {
-                // A carrier is given its bounds and its room where it is
-                // declared, since nothing else knows how long it is
                 addStmt(varp);
+                // An object declared with a value that carries its own bounds
+                // takes them from it -- which is the only thing that says how
+                // long "constant c : t := f(x)" is (6.4.2.2)
+                if (objp->defaultp() && isDynValue(objp->defaultp())) {
+                    if (AstNodeExpr* const srcp = lowerExpr(objp->defaultp())) {
+                        addStmt(new AstAssign{
+                            flp, new AstVarRef{flp, varp, VAccess::WRITE}, srcp});
+                    }
+                    return;
+                }
+                // Otherwise a carrier is given its bounds and its room where
+                // it is declared, since nothing else knows how long it is
                 addStmt(dynCarrierInit(varp, symp->typep(), flp));
                 if (objp->defaultp()) {
                     if (AstNode* const setp
