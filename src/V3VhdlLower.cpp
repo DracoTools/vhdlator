@@ -1226,7 +1226,22 @@ private:
     // bounds are the actual's and the caller has to see what was written.
     bool paramCarried(const VhdlSymbol* symp, size_t i) const {
         if (symp->isForeign()) return false;
+        if (paramIsSignal(symp, i)) return false;
         return carriedDynamically(symp->paramTypes()[i]);
+    }
+
+    // Whether a parameter is of the signal class
+    bool paramIsSignal(const VhdlSymbol* symp, size_t i) const {
+        const AstVhdlSubprogDecl* declp = symp->bodyp();
+        if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        if (!declp) return false;
+        size_t k = 0;
+        for (const AstNode* p = firstParamOf(declp); p; p = p->nextp(), ++k) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (!ifp) continue;
+            if (k == i) return ifp->kind() == VhdlIfaceKind::SIGNAL;
+        }
+        return false;
     }
 
     // Whether an object of this subtype is one of those
@@ -12261,7 +12276,11 @@ private:
                 ftaskp->addStmtsp(idxp);
                 continue;
             }
-            const bool dyn = !symp->isForeign() && carriedDynamically(psymp->typep());
+            // A signal parameter is bound to the caller's own signal, not
+            // handed a value, so it is never one of these: a copy of the
+            // subprogram is made for the call instead (4.2.2.3)
+            const bool dyn = !symp->isForeign() && ifp->kind() != VhdlIfaceKind::SIGNAL
+                             && carriedDynamically(psymp->typep());
             if (dyn) m_dynSyms.insert(psymp);
             AstVar* const varp
                 = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
