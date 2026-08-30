@@ -2814,6 +2814,20 @@ private:
         if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
             || attr == "length" || attr == "ascending") {
             const VhdlType* typep = nodep->prefixp()->vhdlTypep();
+            // A signal parameter is bound to the caller's own signal, so its
+            // bounds are that signal's however its declaration left them
+            // open: inside the copy made for the call they are known (4.2.2.3)
+            if (VhdlSymbol* const pfxp = nodep->prefixp()->vhdlSymp()) {
+                VhdlSymbol* const boundp = boundSignal(pfxp);
+                if (boundp != pfxp && boundp->typep()) {
+                    typep = boundp->typep();
+                } else {
+                    const auto eIt = m_bindExprs.find(pfxp);
+                    if (eIt != m_bindExprs.end() && eIt->second && eIt->second->vhdlTypep()) {
+                        typep = eIt->second->vhdlTypep();
+                    }
+                }
+            }
             // An access value is dereferenced without saying so (8.1)
             if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS
                 && typep->base()->designatedp()) {
@@ -2869,6 +2883,33 @@ private:
             AstNodeExpr* rightp = nullptr;
             bool ascending = true;
             bool dirKnown = true;
+            // A signal parameter's bounds came from the signal the call
+            // passed, and those folded long ago: the answer is a number
+            if (const VhdlType* const idxp = indexSubtype(typep, dim)) {
+                if (idxp->bounded() && !idxp->boundsp()) {
+                    if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                    const int64_t lo = idxp->left();
+                    const int64_t hi = idxp->right();
+                    const bool asc = idxp->ascending();
+                    if (attr == "ascending") {
+                        return new AstConst{flp, AstConst::BitTrue{}, asc};
+                    }
+                    int64_t val = 0;
+                    if (attr == "left") {
+                        val = lo;
+                    } else if (attr == "right") {
+                        val = hi;
+                    } else if (attr == "high") {
+                        val = asc ? hi : lo;
+                    } else if (attr == "low") {
+                        val = asc ? lo : hi;
+                    } else {
+                        val = idxp->isNull() ? 0 : (asc ? hi - lo : lo - hi) + 1;
+                    }
+                    return new AstConst{flp, AstConst::Signed32{},
+                                        static_cast<int32_t>(val)};
+                }
+            }
             if (dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                 if (!dirKnown) {
@@ -3236,8 +3277,14 @@ private:
     // copy of the body made for one call site, that signal is known, and its
     // history is the one the formal's attributes ask about (4.2.2.3).
     VhdlSymbol* boundSignal(VhdlSymbol* symp) const {
-        const auto it = m_bindSymbols.find(symp);
-        return it == m_bindSymbols.end() ? symp : it->second;
+        // A copy may call another, so a formal may stand for a formal that
+        // stands for a signal; the signal at the end of the chain is the one
+        for (int depth = 0; symp && depth < 32; ++depth) {
+            const auto it = m_bindSymbols.find(symp);
+            if (it == m_bindSymbols.end() || it->second == symp) break;
+            symp = it->second;
+        }
+        return symp;
     }
 
     const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
@@ -10433,7 +10480,7 @@ private:
             // Which signal the formal names, so that inside the copy its
             // history attributes -- 'EVENT, 'LAST_VALUE and the rest -- are
             // answered from the actual's record rather than from nothing
-            symBind.emplace(formals[i]->vhdlSymp(), actualSymp->resolved());
+            symBind.emplace(formals[i]->vhdlSymp(), boundSignal(actualSymp->resolved()));
             // An assignment inside the copy is a transaction on the actual,
             // so the formal answers from the actual's transaction bit
             const auto acIt = m_actives.find(actualSymp->resolved());
@@ -12188,7 +12235,22 @@ private:
         // call site got a copy with the lengths it supplies, and only those
         // copies are emitted. Emitting the template as well would mean
         // deciding a length it does not have.
+        // A signal parameter this copy has already bound is not what makes a
+        // template: the actual is a signal of the design, and its length is
+        // that signal's, whatever the parameter was declared without (4.2.2.3)
+        std::vector<const VhdlSymbol*> paramSyms;
+        for (AstNode* p = firstParamOf(nodep); p; p = p->nextp()) {
+            paramSyms.push_back(VN_AS(p, VhdlIfaceDecl)->vhdlSymp());
+        }
+        const auto boundHere = [&](size_t i) {
+            if (i >= paramSyms.size()) return false;
+            const VhdlSymbol* const psymp = paramSyms[i];
+            if (!psymp) return false;
+            return m_bindSignals.count(psymp) || m_bindExprs.count(psymp)
+                   || m_bindElems.count(psymp) || m_bindDynSigs.count(psymp);
+        };
         for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
+            if (boundHere(i)) continue;
             const VhdlType* const typep = symp->paramTypes()[i];
             if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
                 && !typep->lengthEmittable() && !isStringType(typep)
