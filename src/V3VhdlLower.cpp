@@ -1355,6 +1355,20 @@ private:
     // elements. Nothing else knows how long the value is, so this is where
     // the length is settled -- once, when the declaration is elaborated
     // (14.4.2.5), which is what makes a later assignment to a bound harmless.
+    // Where a range is "p'left to p'right" over one object, that object --
+    // whose own range is the one being written out
+    static AstNodeVhdlExpr* sameBoundsPrefix(const AstVhdlRange* rangep) {
+        const AstVhdlAttrName* const lp = VN_CAST(rangep->leftp(), VhdlAttrName);
+        const AstVhdlAttrName* const rp = VN_CAST(rangep->rightp(), VhdlAttrName);
+        if (!lp || !rp || lp->name() != "left" || rp->name() != "right") return nullptr;
+        if (!lp->prefixp() || !rp->prefixp()) return nullptr;
+        if (!lp->prefixp()->vhdlSymp() || !rp->prefixp()->vhdlSymp()) return nullptr;
+        if (lp->prefixp()->vhdlSymp()->resolved() != rp->prefixp()->vhdlSymp()->resolved()) {
+            return nullptr;
+        }
+        return lp->prefixp();
+    }
+
     AstNode* dynCarrierInit(AstVar* varp, const VhdlType* typep, FileLine* flp) {
         const VhdlType* const idxp
             = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
@@ -1372,6 +1386,26 @@ private:
         } else {
             return nullptr;
         }
+        // Which way a range runs is how it was written, not what its bounds
+        // happen to be: "1 to 0" is an ascending range that holds nothing,
+        // and reading it as descending would make it two elements long
+        // (5.2.1). Only bounds an instance settles leave it open.
+        AstNodeExpr* dscp = nullptr;
+        if (idxp && idxp->bounded()) {
+            dscp = new AstConst{flp, AstConst::BitTrue{}, !idxp->ascending()};
+        } else if (const AstVhdlRange* const vrp
+                   = idxp ? VN_CAST(idxp->boundsp(), VhdlRange) : nullptr) {
+            if (!vrp->dirUnknown()) {
+                dscp = new AstConst{flp, AstConst::BitTrue{}, vrp->dir() != VhdlDir::TO};
+            } else if (AstNodeVhdlExpr* const prefixp = sameBoundsPrefix(vrp)) {
+                // "v'range", written out as "v'left to v'right": which way it
+                // runs is which way v's own range runs, and v knows (16.2.4)
+                AstVhdlAttrName ascAttr{flp, prefixp->cloneTree(false), "ascending"};
+                if (AstNodeExpr* const ascp = lowerAttr(&ascAttr)) {
+                    dscp = new AstLogNot{flp, ascp};
+                }
+            }
+        }
         const auto ref = [&]() { return new AstVarRef{flp, varp, VAccess::WRITE}; };
         AstNode* outp = new AstAssign{flp, dynPart(ref(), "lft", flp), leftp};
         outp = AstNode::addNext(
@@ -1381,8 +1415,11 @@ private:
             outp,
             static_cast<AstNode*>(new AstAssign{
                 flp, dynPart(ref(), "dsc", flp),
-                new AstLtS{flp, dynPart(new AstVarRef{flp, varp, VAccess::READ}, "rgt", flp),
-                           dynPart(new AstVarRef{flp, varp, VAccess::READ}, "lft", flp)}}));
+                dscp ? dscp
+                     : static_cast<AstNodeExpr*>(new AstLtS{
+                           flp,
+                           dynPart(new AstVarRef{flp, varp, VAccess::READ}, "rgt", flp),
+                           dynPart(new AstVarRef{flp, varp, VAccess::READ}, "lft", flp)})}));
         // A null range holds nothing at all (5.3.2.1), so the count is never
         // negative however the bounds were written
         AstNodeExpr* const spanp = new AstSub{

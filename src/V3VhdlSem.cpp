@@ -461,7 +461,25 @@ class VhdlSemVisitor final : public VNVisitor {
                 // it with the value, so its range is read from the value
                 // rather than from an expression written here
                 if (typep->base() != V3VhdlStd::stringType()->base()) {
-                    openp->boundsp(dimp ? dimp->boundsp() : nullptr);
+                    AstNode* boundsp = dimp ? dimp->boundsp() : nullptr;
+                    // Where nothing here says the bounds either, "v'range" is
+                    // "v'left to v'right" and nothing shorter: an object
+                    // declared with it is as long as v turns out to be, and
+                    // reading the index subtype's own range instead would say
+                    // a length that is not v's (16.2.4)
+                    if (!boundsp && attrp->prefixp()) {
+                        FileLine* const flp = attrp->fileline();
+                        AstVhdlRange* const rangep = new AstVhdlRange{
+                            flp,
+                            new AstVhdlAttrName{flp, attrp->prefixp()->cloneTree(false),
+                                                "left"},
+                            VhdlDir::TO,
+                            new AstVhdlAttrName{flp, attrp->prefixp()->cloneTree(false),
+                                                "right"}};
+                        rangep->dirUnknown(true);
+                        boundsp = rangep;
+                    }
+                    openp->boundsp(boundsp);
                 }
             }
             return openp;
