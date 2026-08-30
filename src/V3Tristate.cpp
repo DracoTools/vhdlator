@@ -447,6 +447,7 @@ class TristateVisitor final : public TristateBaseVisitor {
     VarToAssignsMap m_assigns;  // Assigns in current module
     int m_unique = 0;
     bool m_alhs = false;  // On LHS of assignment
+    bool m_inStaticInit = false;  // Under a variable's initial value
     bool m_inAlias = false;  // Inside alias statement
     bool m_processedIfaces = false;  // Interface modules already processed (interfaces-first pass)
     VStrength m_currentStrength = VStrength::STRONG;  // Current strength of assignment,
@@ -1568,6 +1569,15 @@ class TristateVisitor final : public TristateBaseVisitor {
     void visit(AstAnd* nodep) override { visitAndOr(nodep, true); }
     void visit(AstOr* nodep) override { visitAndOr(nodep, false); }
 
+    // A variable's initial value is not a driver: it is what the variable
+    // holds before anything drives it, so a 'z' there does not make the
+    // variable a tristate net, and procedural writes to it must survive
+    void visit(AstInitialStatic* nodep) override {
+        VL_RESTORER(m_inStaticInit);
+        m_inStaticInit = true;
+        iterateChildren(nodep);
+    }
+
     void visitAssign(AstNodeAssign* nodep) {
         VL_RESTORER(m_alhs);
         VL_RESTORER(m_currentStrength);
@@ -1594,7 +1604,10 @@ class TristateVisitor final : public TristateBaseVisitor {
             iterateAndNextNull(nodep->lhsp());
             m_alhs = false;
             associateLogic(nodep->rhsp(), nodep);
-            associateLogic(nodep, nodep->lhsp());
+            // A variable's initial value is what it holds before anything
+            // drives it, not a driver of it: a 'z' there leaves the variable
+            // an ordinary variable, so a procedural write to it stands
+            if (!m_inStaticInit) associateLogic(nodep, nodep->lhsp());
         } else {
             if (nodep->user2() & U2_NONGRAPH) {
                 return;  // Iterated here, or created assignment to ignore
