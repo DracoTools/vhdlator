@@ -35,13 +35,14 @@ begin
     variable n : natural := 3;
     variable zeros : unsigned(7 downto 0) := (others => '0');
     variable ones : unsigned(7 downto 0) := (others => '1');
+    variable g : unsigned(10 downto 0) := grow(ones, 3);
   begin
     assert is_zero(grow(zeros, n)) report "zeros not seen as zero" severity failure;
     assert not is_zero(grow(ones, n)) report "ones seen as zero" severity failure;
 
-    -- The other way round, and against a value that is not all zeros
-    assert grow(ones, n) /= (grow(ones, n)'range => '0')
-      report "ones matched all zeros" severity failure;
+    -- The same against a value held in an object whose bounds it decided
+    assert g /= (g'range => '0') report "ones matched all zeros" severity failure;
+    assert g'length = 11 report "wrong length" severity failure;
 
     n := 0;
     assert is_zero(grow(zeros, n)) report "zeros of unchanged length" severity failure;

@@ -1183,6 +1183,7 @@ public:
                                      const std::vector<VhdlValue>& actualValues,
                                      const std::string& name) VL_MT_DISABLED;
     void findReturnedType(AstNode* stmtsp, VhdlType*& foundp) VL_MT_DISABLED;
+    static bool returnsACall(AstNode* stmtsp) VL_MT_DISABLED;
     VhdlType* intrinsicResultType(VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
                                   VhdlType* resultp) VL_MT_DISABLED;
     VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
@@ -3209,9 +3210,12 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
         if (m_specp) specializeWithin(copyp->stmtsp());
         VhdlType* foundp = nullptr;
         findReturnedType(copyp->stmtsp(), foundp);
-        if (!foundp) {
+        if (!foundp && !returnsACall(copyp->stmtsp())) {
             // "return v and m" gives a result as long as its operands, so a
-            // parameter of the same type says how long that is
+            // parameter of the same type says how long that is. What a *call*
+            // returns is another matter: "return resize(v, v'length + n)" is
+            // as long as the call makes it, which may be longer than any
+            // parameter -- so the result carries its own bounds instead.
             for (VhdlType* const typep : newSymp->paramTypes()) {
                 if (typep && typep->base() == newSymp->returnTypep()->base()
                     && typep->lengthEmittable()) {
@@ -3228,6 +3232,38 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     originalp->specialized(true);
     originalp->addNextHere(copyp);
     return newSymp;
+}
+
+// Whether any return statement returns what a call gives, whose length is
+// the call's business and not any parameter's
+bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
+    for (AstNode* p = stmtsp; p; p = p->nextp()) {
+        if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+            AstVhdlCall* const callp = VN_CAST(retp->valuep(), VhdlCall);
+            const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
+            if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
+            // A type conversion keeps the length of what it converts, and is
+            // dealt with where the returned type is read
+            if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
+            // An object the body returns whose own subtype says a length that
+            // does not fold -- numeric_std's RESIZE returns a
+            // "(NEW_SIZE-1 downto 0)" -- is as long as that says, whatever
+            // any parameter is
+            if (retp->valuep() && retp->valuep()->vhdlTypep()) {
+                const VhdlType* const typep = retp->valuep()->vhdlTypep();
+                if (typep->base()->kind() == VhdlTypeKind::ARRAY
+                    && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
+                    && typep->indexTypes()[0]->boundsp()) {
+                    return true;
+                }
+            }
+        }
+        if (p->op1p() && returnsACall(p->op1p())) return true;
+        if (p->op2p() && returnsACall(p->op2p())) return true;
+        if (p->op3p() && returnsACall(p->op3p())) return true;
+        if (p->op4p() && returnsACall(p->op4p())) return true;
+    }
+    return false;
 }
 
 // The type of the first return statement that has a length of its own

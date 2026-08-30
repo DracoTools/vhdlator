@@ -1593,8 +1593,9 @@ private:
     // then an element at a time, which is a loop, so it is a function of its
     // own -- one per type, emitted where it is first wanted.
     // "(v'range => '0')" written against a value whose length only running
-    // decides: every element the same, and the bounds taken from that value,
-    // which is the only thing that knows them (9.3.3.3)
+    // decides: every element the same, and the bounds handed over as numbers,
+    // since they are the bounds of the value it is written against and
+    // nothing else knows them (9.3.3.3)
     AstNodeFTask* dynFillFunc(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
         const auto it = m_dynFillFuncs.find(basep);
@@ -1608,10 +1609,14 @@ private:
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(typep, flp), flp));
-        AstVar* const cp = new AstVar{flp, VVarType::PORT, "c", VFlagChildDType{},
-                                      dynCarrierRef(typep, flp)};
+        AstVar* const lp = new AstVar{flp, VVarType::PORT, "l", VFlagChildDType{},
+                                      newIntDType(flp)};
+        AstVar* const rp = new AstVar{flp, VVarType::PORT, "r", VFlagChildDType{},
+                                      newIntDType(flp)};
+        AstVar* const dp = new AstVar{flp, VVarType::PORT, "d", VFlagChildDType{},
+                                      new AstBasicDType{flp, VBasicDTypeKwd::BIT}};
         AstVar* const ep = new AstVar{flp, VVarType::PORT, "e", VFlagChildDType{}, elemDTypep};
-        for (AstVar* const argp : {cp, ep}) {
+        for (AstVar* const argp : {lp, rp, dp, ep}) {
             argp->direction(VDirection::INPUT);
             argp->declDirection(VDirection::INPUT);
             argp->funcLocal(true);
@@ -1619,24 +1624,35 @@ private:
             argp->trace(false);
             funcp->addStmtsp(argp);
         }
+        AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
         AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        funcp->addStmtsp(np);
         funcp->addStmtsp(kp);
         const auto out = [&]() {
             return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
         };
-        for (const char* const part : {"lft", "rgt", "dsc"}) {
-            funcp->addStmtsp(new AstAssign{flp, dynPart(out(), part, flp),
-                                           dynPart(rd(cp, flp), part, flp)});
-        }
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), rd(lp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rd(rp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp), rd(dp, flp)});
+        // "left downto right" holds left-right+1 elements, "left to right"
+        // right-left+1, and a range that runs the wrong way holds none
         funcp->addStmtsp(new AstAssign{
-            flp, dynPart(out(), "q", flp),
-            new AstNewDynamic{flp, dynCarrierLength(rd(cp, flp), flp), nullptr}});
+            flp, wr(np, flp),
+            new AstAdd{flp,
+                       new AstCond{flp, rd(dp, flp), new AstSub{flp, rd(lp, flp), rd(rp, flp)},
+                                   new AstSub{flp, rd(rp, flp), rd(lp, flp)}},
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        funcp->addStmtsp(new AstIf{
+            flp, new AstLtS{flp, rd(np, flp), new AstConst{flp, AstConst::Signed32{}, 0}},
+            new AstAssign{flp, wr(np, flp), new AstConst{flp, AstConst::Signed32{}, 0}},
+            nullptr});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(np, flp), nullptr}});
         funcp->addStmtsp(new AstAssign{flp, wr(kp, flp),
                                        new AstConst{flp, AstConst::Signed32{}, 0}});
         AstLoop* const loopp = new AstLoop{flp};
-        loopp->addStmtsp(new AstLoopTest{
-            flp, loopp,
-            new AstLtS{flp, rd(kp, flp), dynCarrierLength(rd(cp, flp), flp)}});
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}});
         loopp->addStmtsp(new AstAssign{
             flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)}, rd(ep, flp)});
         loopp->addStmtsp(new AstAssign{
@@ -1658,14 +1674,22 @@ private:
         if (!fillp) return nullptr;
         AstNodeExpr* const srcp = lowerExpr(boundsp);
         if (!srcp) return nullptr;
+        // Its bounds are read three times over, so the value it is written
+        // against has to be one that can be named again
+        if (!repeatable(srcp)) {
+            VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            return nullptr;
+        }
         AstNodeExpr* const elemp = lowerExpr(valuep);
         if (!elemp) {
             VL_DO_DANGLING(srcp->deleteTree(), srcp);
             return nullptr;
         }
-        AstFuncRef* const refp = new AstFuncRef{
-            flp, fillp->name(),
-            AstNode::addNext(new AstArg{flp, "", srcp}, new AstArg{flp, "", elemp})};
+        AstArg* argsp = new AstArg{flp, "", dynPart(srcp->cloneTree(false), "lft", flp)};
+        argsp->addNext(new AstArg{flp, "", dynPart(srcp->cloneTree(false), "rgt", flp)});
+        argsp->addNext(new AstArg{flp, "", dynPart(srcp, "dsc", flp)});
+        argsp->addNext(new AstArg{flp, "", elemp});
+        AstFuncRef* const refp = new AstFuncRef{flp, fillp->name(), argsp};
         refp->taskp(VN_AS(fillp, Func));
         return refp;
     }
@@ -2933,10 +2957,18 @@ private:
             // always runs from 1 (16.3).
             // A value whose length only running decides carries its own
             // bounds, so the attribute reads them from the value
-            if (isDynObj(nodep->prefixp())) {
+            if (isDynValue(nodep->prefixp())) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                 AstNodeExpr* const carrp = lowerExpr(nodep->prefixp());
                 if (!carrp) return nullptr;
+                // 'HIGH and 'LOW read the carrier twice over -- which end is
+                // which depends on the direction -- so those need something
+                // that can be named again; the rest read it once
+                if ((attr == "high" || attr == "low") && !repeatable(carrp)) {
+                    VL_DO_DANGLING(carrp->deleteTree(), carrp);
+                    unsup(flp, "'" + attr + " of a value whose length only running decides");
+                    return nullptr;
+                }
                 if (AstNodeExpr* const outp = dynCarrierAttr(carrp, attr, flp)) return outp;
                 VL_DO_DANGLING(carrp->deleteTree(), carrp);
                 unsup(flp, "'" + attr + " of a value whose length only running decides");
@@ -5923,9 +5955,12 @@ private:
                     flp, firstp,
                     new AstConst{flp, AstConst::Unsized32{},
                                  static_cast<uint32_t>(widthVal.toInt())}};
-            } else if (name == "resize") {
+            } else if (name == "resize" && !(resultp && carriedDynamically(resultp))) {
                 // The width comes from another object's range, which V3Width
-                // resolves from the context of the assignment
+                // resolves from the context of the assignment. That works
+                // only where the value is given to something whose subtype
+                // says the width; a result that carries its own bounds is
+                // built below with the length the call names.
                 sized = firstp;
             } else if (resultp && resultp->lengthEmittable()) {
                 // A width that names a generic or a port's bounds is not a
@@ -5945,10 +5980,15 @@ private:
                 AstNodeFTask* const bitsp
                     = widthp ? dynBitsFunc(resultp, name == "to_signed", flp) : nullptr;
                 if (bitsp) {
+                    // The bits go in as one whole number, however wide the
+                    // value they came from was
+                    FileLine* const wflp = new FileLine{flp};
+                    wflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                    wflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
                     AstFuncRef* const refp = new AstFuncRef{
-                        flp, bitsp->name(),
-                        AstNode::addNext(new AstArg{flp, "", firstp},
-                                         new AstArg{flp, "", widthp})};
+                        wflp, bitsp->name(),
+                        AstNode::addNext(new AstArg{wflp, "", firstp},
+                                         new AstArg{wflp, "", widthp})};
                     refp->taskp(VN_AS(bitsp, Func));
                     return refp;
                 }
@@ -12669,7 +12709,10 @@ private:
         if (foundp) return foundp;
         // Where the returned expression has no length of its own -- "return v
         // and m", whose operator gives a result as long as its operands --
-        // a parameter of the same type does
+        // a parameter of the same type does. What a *call* gives back is not
+        // one of those: "return resize(v, v'length + n)" is as long as the
+        // call makes it, which no parameter says.
+        if (returnsACallResult(nodep->stmtsp())) return declaredp;
         for (const VhdlType* const typep : symp->paramTypes()) {
             if (typep && typep->base() == declaredp->base() && typep->isConstrainedArray()) {
                 return const_cast<VhdlType*>(typep);
@@ -12677,6 +12720,31 @@ private:
         }
         return declaredp;
     }
+    // Whether any return statement returns what a call gives back, or an
+    // object whose own subtype says a length that does not fold
+    static bool returnsACallResult(AstNode* stmtsp) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+                AstVhdlCall* const callp = VN_CAST(retp->valuep(), VhdlCall);
+                const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
+                if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
+                if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
+                const VhdlType* const typep
+                    = retp->valuep() ? retp->valuep()->vhdlTypep() : nullptr;
+                if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                    && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
+                    && typep->indexTypes()[0]->boundsp()) {
+                    return true;
+                }
+            }
+            if (p->op1p() && returnsACallResult(p->op1p())) return true;
+            if (p->op2p() && returnsACallResult(p->op2p())) return true;
+            if (p->op3p() && returnsACallResult(p->op3p())) return true;
+            if (p->op4p() && returnsACallResult(p->op4p())) return true;
+        }
+        return false;
+    }
+
     static void findReturnType(AstNode* stmtsp, VhdlType*& foundp) {
         for (AstNode* p = stmtsp; p && !foundp; p = p->nextp()) {
             if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
