@@ -5604,6 +5604,22 @@ private:
         // "to_string(t, unit)" writes a time in that unit (16.3). The unit
         // is a time of its own, so the value is scaled by it and the unit's
         // own name follows.
+        // "to_string(x, n)" over a REAL is the value rounded to n digits
+        // after the point, and to n of 0 is its image (16.3)
+        if (name == "to_string" && args.size() == 2 && symp->predefined()
+            && args[0]->vhdlTypep()
+            && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::FLOATING) {
+            const VhdlValue digitsv = V3VhdlEval::eval(args[1]);
+            if (!digitsv.isInt() || digitsv.toInt() < 0 || digitsv.toInt() > 32) {
+                unsup(flp, "TO_STRING of a real to a number of digits that is not static");
+                return nullptr;
+            }
+            AstNodeExpr* const valuep = lowerExpr(args[0]);
+            if (!valuep) return nullptr;
+            if (digitsv.toInt() == 0) return new AstSFormatF{flp, "%g", false, valuep};
+            return new AstSFormatF{
+                flp, "%0." + std::to_string(digitsv.toInt()) + "f", false, valuep};
+        }
         if (name == "to_string" && args.size() == 2 && symp->predefined()
             && args[0]->vhdlTypep()
             && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::PHYSICAL) {

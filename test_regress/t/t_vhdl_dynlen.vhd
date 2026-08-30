@@ -125,6 +125,10 @@ begin
     assert to_integer(unsigned(std_logic_vector(to_unsigned(9, n)))) = 9
       report "conversion" severity failure;
 
+    -- A real to a number of digits, which OSVVM reports with
+    assert to_string(3.14159, 2) = "3.14" report "to_string two" severity failure;
+    assert to_string(3.14159, 4) = "3.1416" report "to_string four" severity failure;
+
     report "*-* All Finished *-*";
     std.env.finish;
   end process;
