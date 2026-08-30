@@ -1190,6 +1190,21 @@ private:
                     case VhdlSymKind::SIGNAL:
                     case VhdlSymKind::PORT:
                     case VhdlSymKind::PARAMETER: return true;
+                    case VhdlSymKind::CONSTANT: {
+                        // A constant declared from what the call supplies --
+                        // "constant len : positive := n + 1" inside a
+                        // subprogram -- has a value only running knows,
+                        // however constant it is once it has one (4.3.1.1).
+                        // A constant an elaborated design settles is not one
+                        // of those, and neither is one written as a number.
+                        const AstVhdlObjectDecl* const declp
+                            = VN_CAST(symp->resolved()->declp(), VhdlObjectDecl);
+                        if (declp && declp->defaultp()
+                            && boundsOnlyRunningDecides(declp->defaultp(), depth + 1)) {
+                            return true;
+                        }
+                        break;
+                    }
                     default: break;
                     }
                 }
