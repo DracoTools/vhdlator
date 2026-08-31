@@ -1265,8 +1265,16 @@ private:
             // folds per instance. Unless the object is itself one of these,
             // and then its length is not known until it is handed over.
             if (const AstVhdlAttrName* const attrp = VN_CAST(p, VhdlAttrName)) {
-                if (attrp->prefixp() && attrp->prefixp()->vhdlSymp()
-                    && m_dynSyms.count(attrp->prefixp()->vhdlSymp()->resolved())) {
+                const VhdlSymbol* const psymp
+                    = attrp->prefixp() && attrp->prefixp()->vhdlSymp()
+                          ? attrp->prefixp()->vhdlSymp()->resolved()
+                          : nullptr;
+                if (psymp && m_dynSyms.count(psymp)) return true;
+                // Text is carried dynamically wherever it goes, so a string
+                // whose own subtype fixes no length answers 'LENGTH only
+                // when it has a value, and that is not until it runs
+                if (psymp && psymp->isObject() && isStringType(psymp->typep())
+                    && !psymp->typep()->lengthEmittable()) {
                     return true;
                 }
                 if (boundsOnlyRunningDecides(attrp->argp(), depth + 1)) return true;
@@ -1825,6 +1833,8 @@ private:
         if (const AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
             return isDynValue(qp->valuep(), depth + 1);
         }
+        // A slice of one is another, with the bounds it was written with
+        if (isDynSlice(nodep)) return true;
         // An operator over such a value gives back another: nothing along
         // the way decided a length the operand did not have
         if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
@@ -5542,6 +5552,162 @@ private:
     }
 
 
+    std::map<const VhdlType*, AstNodeFTask*> m_dynSliceFuncs;
+
+    // A slice of a value that carries its own bounds is another such value:
+    // it has the bounds the slice was written with, and its elements are the
+    // ones of the whole that those bounds pick out (8.5). Which places those
+    // are is not known until it runs, so this is a loop.
+    AstNodeFTask* dynSliceFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynSliceFuncs.find(basep);
+        if (it != m_dynSliceFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp
+            = newDynFunc("__Vdynslice", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+        AstVar* const lp = dynArg(funcp, "l", newIntDType(flp), flp);
+        AstVar* const rp = dynArg(funcp, "r", newIntDType(flp), flp);
+        AstVar* const dp = dynArg(funcp, "d", bitDType(flp), flp);
+        AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        funcp->addStmtsp(np);
+        funcp->addStmtsp(kp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(np, flp),
+            new AstAdd{flp,
+                       new AstCond{flp, rd(dp, flp), new AstSub{flp, rd(lp, flp), rd(rp, flp)},
+                                   new AstSub{flp, rd(rp, flp), rd(lp, flp)}},
+                       i32(1, flp)}});
+        funcp->addStmtsp(new AstIf{flp, new AstLtS{flp, rd(np, flp), i32(0, flp)},
+                                   new AstAssign{flp, wr(np, flp), i32(0, flp)}, nullptr});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), rd(lp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rd(rp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp), rd(dp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(np, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
+        AstNode* bodyp = new AstAssign{
+            flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)},
+            new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp),
+                          dynOffset(rd(cp, flp), dynSliceIndex(lp, dp, kp, flp), flp)}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
+        m_modp->addStmtsp(funcp);
+        m_dynSliceFuncs.emplace(basep, funcp);
+        return funcp;
+    }
+
+    // The index the k'th element of a slice has, counted from the slice's
+    // own left bound and the way it runs
+    static AstNodeExpr* dynSliceIndex(AstVar* lp, AstVar* dp, AstVar* kp, FileLine* flp) {
+        return new AstCond{flp, rd(dp, flp), new AstSub{flp, rd(lp, flp), rd(kp, flp)},
+                           new AstAdd{flp, rd(lp, flp), rd(kp, flp)}};
+    }
+
+    // Whether an expression is a slice of a value that carries its own
+    // bounds, and if it is, the range it was written with
+    bool isDynSlice(const AstNodeVhdlExpr* nodep) const {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->prefixp()) return false;
+        if (!VN_IS(callp->argsp(), VhdlRange)) return false;
+        AstNodeVhdlExpr* const basep
+            = aliasBase(callp->vhdlSymp(), const_cast<AstNodeVhdlExpr*>(callp->prefixp()));
+        return isDynObj(basep);
+    }
+    AstVhdlRange* dynSliceRange(AstNodeVhdlExpr* nodep) {
+        if (!isDynSlice(nodep)) return nullptr;
+        return VN_CAST(VN_AS(nodep, VhdlCall)->argsp(), VhdlRange);
+    }
+
+    // Writing into such a slice: the elements are put back where the whole
+    // keeps them, one at a time, since which places those are is only known
+    // when it runs
+    AstNode* dynSliceAssign(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rangep = dynSliceRange(targetp);
+        if (!rangep) return nullptr;
+        // An alias of a slice numbers its elements its own way, so it is
+        // what the alias denotes that is written, at the indices the alias's
+        // own numbering maps onto (6.6.2)
+        VhdlSymbol* const objSymp = callp->vhdlSymp();
+        AstNodeVhdlExpr* const prefixExprp = aliasBase(objSymp, callp->prefixp());
+        VhdlType* const carrp = prefixExprp->vhdlTypep();
+        if (!carrp) return nullptr;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, asc, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        leftp = aliasShift(objSymp, leftp, flp);
+        rightp = aliasShift(objSymp, rightp, flp);
+        // "(others => '0')" is as long as the slice it is written into and
+        // needs no source of its own (9.3.3.3)
+        AstNodeVhdlExpr* const uniformp = uniformAggregateValue(valuep);
+        AstNodeExpr* const fillp = uniformp ? lowerExpr(uniformp) : nullptr;
+        AstNodeExpr* const srcp = fillp ? nullptr : asDynCarrier(valuep, carrp, flp);
+        AstNodeExpr* const objp
+            = (srcp || fillp) ? lowerDriveTarget(prefixExprp) : nullptr;
+        if (!objp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (srcp) VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            if (fillp) VL_DO_DANGLING(fillp->deleteTree(), fillp);
+            return nullptr;
+        }
+        AstVar* const lp = newTempVar("__Vdynsl", newIntDType(flp), flp);
+        AstVar* const rp = newTempVar("__Vdynsr", newIntDType(flp), flp);
+        AstVar* const dp = newTempVar("__Vdynsd", bitDType(flp), flp);
+        AstVar* const np = newTempVar("__Vdynsn", newIntDType(flp), flp);
+        AstVar* const kp = newTempVar("__Vdynsk", newIntDType(flp), flp);
+        AstVar* const sp = newTempVar("__Vdynss", dynCarrierRef(carrp, flp), flp);
+        AstNode* outp = new AstAssign{flp, wr(lp, flp), leftp};
+        const auto add = [&](AstNode* stmtp) {
+            outp = AstNode::addNext(outp, stmtp);
+        };
+        add(new AstAssign{flp, wr(rp, flp), rightp});
+        add(new AstAssign{flp, wr(dp, flp), new AstConst{flp, AstConst::BitTrue{}, !asc}});
+        if (srcp) add(new AstAssign{flp, wr(sp, flp), srcp});
+        add(new AstAssign{
+            flp, wr(np, flp),
+            new AstAdd{flp,
+                       new AstCond{flp, rd(dp, flp), new AstSub{flp, rd(lp, flp), rd(rp, flp)},
+                                   new AstSub{flp, rd(rp, flp), rd(lp, flp)}},
+                       i32(1, flp)}});
+        // What is written must be as long as the slice, which only running
+        // can check (10.5.2.1)
+        if (srcp) {
+            add(new AstIf{flp,
+                          new AstNeq{flp, rd(np, flp), dynCarrierLength(rd(sp, flp), flp)},
+                          new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                         "Array lengths do not match", nullptr, nullptr},
+                          nullptr});
+        }
+        add(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
+        AstNode* bodyp = new AstAssign{
+            flp,
+            new AstSelBit{flp, dynPart(objp->cloneTree(false), "q", flp),
+                          dynOffset(objp->cloneTree(false),
+                                    dynSliceIndex(lp, dp, kp, flp), flp)},
+            srcp ? new AstSelBit{flp, dynPart(rd(sp, flp), "q", flp), rd(kp, flp)}
+                 : fillp};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+        add(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
+        VL_DO_DANGLING(objp->deleteTree(), objp);
+        return outp;
+    }
+
     // An operand as a carrier of the type the operator is working in, which
     // an integer becomes by being spread over as many places as it takes
     AstNodeExpr* dynOperand(AstNodeVhdlExpr* nodep, VhdlType* carrp, FileLine* flp) {
@@ -6266,6 +6432,28 @@ private:
                 }
                 leftp = aliasShift(objSymp, leftp, flp);
                 rightp = aliasShift(objSymp, rightp, flp);
+                // A slice of a value that carries its own bounds is another
+                // such value, made a place at a time (8.5)
+                if (isDynObj(nodep->prefixp())) {
+                    VhdlType* const carrp = nodep->prefixp()->vhdlTypep();
+                    AstNodeFTask* const funcp
+                        = carrp && sliceDirKnown ? dynSliceFunc(carrp, flp) : nullptr;
+                    if (!funcp) {
+                        VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                        VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                        unsup(flp, "slice of a value whose length only running decides");
+                        return nullptr;
+                    }
+                    AstArg* argsp = new AstArg{flp, "", fromp};
+                    argsp->addNext(new AstArg{flp, "", leftp});
+                    argsp->addNext(new AstArg{flp, "", rightp});
+                    argsp->addNext(new AstArg{
+                        flp, "", new AstConst{flp, AstConst::BitTrue{}, !sliceAsc}});
+                    AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+                    refp->taskp(VN_AS(funcp, Func));
+                    return refp;
+                }
                 if (prefixTypep && isStringType(prefixTypep)) {
                     // A slice of a STRING is a substring: Verilator's string
                     // is characters, not bits, so a part select of it means
@@ -10829,6 +11017,14 @@ private:
         }
         if (valuep && isDynTarget(nodep->targetp())) {
             return lowerDynCopy(nodep->targetp(), valuep, flp);
+        }
+        // A slice of a value that carries its own bounds, written into
+        if (valuep && dynSliceRange(nodep->targetp())) {
+            if (AstNode* const outp = dynSliceAssign(nodep->targetp(), valuep, flp)) {
+                return outp;
+            }
+            unsup(flp, "slice of a value whose length only running decides, written into");
+            return nullptr;
         }
         // One record in two shapes: copied element by element, each element
         // converted between carried and fixed as it goes
