@@ -1788,6 +1788,11 @@ private:
         if (const AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
             return isDynValue(qp->valuep(), depth + 1);
         }
+        // An operator over such a value gives back another: nothing along
+        // the way decided a length the operand did not have
+        if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
+            return dynBinaryCarries(bp);
+        }
         return false;
     }
 
@@ -2247,7 +2252,7 @@ private:
         return refp;
     }
 
-    std::map<const VhdlType*, AstNodeFTask*> m_dynBitsFuncs;
+    std::map<std::pair<const VhdlType*, bool>, AstNodeFTask*> m_dynBitsFuncs;
 
     // An integer spread over as many bits as a width says, as a value that
     // carries its own bounds: what TO_UNSIGNED and RESIZE give when what
@@ -2260,8 +2265,9 @@ private:
         flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
         flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
         VhdlType* const basep = typep->base();
-        const auto it = m_dynBitsFuncs.find(basep);
-        if (it != m_dynBitsFuncs.end() && !signd) return it->second;
+        const auto key = std::make_pair(static_cast<const VhdlType*>(basep), signd);
+        const auto it = m_dynBitsFuncs.find(key);
+        if (it != m_dynBitsFuncs.end()) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vdynbits" + std::to_string(m_dynBitsFuncs.size()) + "__"
                                  + basep->name();
@@ -2317,11 +2323,11 @@ private:
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
         m_modp->addStmtsp(funcp);
-        if (!signd) m_dynBitsFuncs.emplace(basep, funcp);
+        m_dynBitsFuncs.emplace(key, funcp);
         return funcp;
     }
 
-    std::map<const VhdlType*, AstNodeFTask*> m_dynIntFuncs;
+    std::map<std::pair<const VhdlType*, bool>, AstNodeFTask*> m_dynIntFuncs;
 
     // The integer a value that carries its own bounds stands for, read with
     // the signedness its type has. Its elements are one bit each and its
@@ -2331,8 +2337,9 @@ private:
         flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
         flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
         VhdlType* const basep = typep->base();
-        const auto it = m_dynIntFuncs.find(basep);
-        if (it != m_dynIntFuncs.end() && !signd) return it->second;
+        const auto key = std::make_pair(static_cast<const VhdlType*>(basep), signd);
+        const auto it = m_dynIntFuncs.find(key);
+        if (it != m_dynIntFuncs.end()) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vdynint" + std::to_string(m_dynIntFuncs.size()) + "__"
                                  + basep->name();
@@ -2382,7 +2389,398 @@ private:
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
         m_modp->addStmtsp(funcp);
-        if (!signd) m_dynIntFuncs.emplace(basep, funcp);
+        m_dynIntFuncs.emplace(key, funcp);
+        return funcp;
+    }
+
+    // ---- Arithmetic over values that carry their own bounds ---------------
+    // The operators of numeric_std are declared over unconstrained operands,
+    // so any of them can be reached by a value whose length only running
+    // decides. None can be a machine instruction there: nothing has decided
+    // how wide the machine would have to be. Each is a generated function
+    // over the carrier's elements instead -- one per type, emitted where it
+    // is first wanted -- which is the slow path the unconstrained tiers
+    // promise and the only one that answers at a width nothing settled.
+
+    // One input of such a helper
+    AstVar* dynArg(AstFunc* funcp, const std::string& name, AstNodeDType* dtypep,
+                   FileLine* flp) {
+        AstVar* const argp = new AstVar{flp, VVarType::PORT, name, VFlagChildDType{}, dtypep};
+        argp->direction(VDirection::INPUT);
+        argp->declDirection(VDirection::INPUT);
+        argp->funcLocal(true);
+        argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        argp->trace(false);
+        funcp->addStmtsp(argp);
+        return argp;
+    }
+    AstFunc* newDynFunc(const std::string& prefix, VhdlType* typep, AstNodeDType* retp,
+                        FileLine* flp) {
+        const std::string name
+            = prefix + std::to_string(++m_nameNum) + "__" + typep->base()->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, retp, flp));
+        return funcp;
+    }
+    static AstNodeDType* bitDType(FileLine* flp) {
+        return new AstBasicDType{flp, VBasicDTypeKwd::BIT};
+    }
+    // A file position at which the widths these helpers mix on purpose are
+    // not remarked upon: bits are taken out of whole integers throughout
+    static FileLine* dynFl(FileLine* origFlp) {
+        FileLine* const flp = new FileLine{origFlp};
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        return flp;
+    }
+
+    std::map<const VhdlType*, AstNodeFTask*> m_dynShiftFuncs;
+
+    // "sll", "srl", "rol" and "ror" over a carrier: the result is as long as
+    // the operand and holds what stood n places along, with the vacated end
+    // taking the element type's own left value (9.2.4). A negative count
+    // moves the other way. numeric_std normalizes its result to
+    // "length-1 downto 0"; the predefined array operator keeps the operand's
+    // own range, and "norm" says which of the two this call is.
+    AstNodeFTask* dynShiftFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynShiftFuncs.find(basep);
+        if (it != m_dynShiftFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
+        if (!elemDTypep) return nullptr;
+        AstFunc* const funcp
+            = newDynFunc("__Vdynshift", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+        AstVar* const np = dynArg(funcp, "n", newIntDType(flp), flp);
+        AstVar* const fp = dynArg(funcp, "f", elemDTypep, flp);
+        AstVar* const rotp = dynArg(funcp, "rot", bitDType(flp), flp);
+        AstVar* const normp = dynArg(funcp, "norm", bitDType(flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        AstVar* const jp = newFuncLocal("j", newIntDType(flp), flp);
+        for (AstVar* const vp : {lenp, ip, jp}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, wr(lenp, flp),
+                                       dynCarrierLength(rd(cp, flp), flp)});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "lft", flp),
+            new AstCond{flp, rd(normp, flp), new AstSub{flp, rd(lenp, flp), i32(1, flp)},
+                        dynPart(rd(cp, flp), "lft", flp)}});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "rgt", flp),
+            new AstCond{flp, rd(normp, flp), i32(0, flp), dynPart(rd(cp, flp), "rgt", flp)}});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "dsc", flp),
+            new AstCond{flp, rd(normp, flp), new AstConst{flp, AstConst::BitTrue{}},
+                        dynPart(rd(cp, flp), "dsc", flp)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(lenp, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+        AstNode* bodyp
+            = new AstAssign{flp, wr(jp, flp), new AstAdd{flp, rd(ip, flp), rd(np, flp)}};
+        // A rotation takes the place it came from around the ends
+        bodyp = AstNode::addNext(
+            bodyp,
+            static_cast<AstNode*>(new AstIf{
+                flp,
+                new AstLogAnd{flp, rd(rotp, flp),
+                              new AstGtS{flp, rd(lenp, flp), i32(0, flp)}},
+                new AstAssign{flp, wr(jp, flp),
+                              new AstModDivS{flp,
+                                             new AstAdd{flp,
+                                                        new AstModDivS{flp, rd(jp, flp),
+                                                                       rd(lenp, flp)},
+                                                        rd(lenp, flp)},
+                                             rd(lenp, flp)}},
+                nullptr}));
+        bodyp = AstNode::addNext(
+            bodyp,
+            static_cast<AstNode*>(new AstIf{
+                flp,
+                new AstLogAnd{flp, new AstGteS{flp, rd(jp, flp), i32(0, flp)},
+                              new AstLtS{flp, rd(jp, flp), rd(lenp, flp)}},
+                new AstAssign{flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(ip, flp)},
+                              new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp),
+                                            rd(jp, flp)}},
+                new AstAssign{flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(ip, flp)},
+                              rd(fp, flp)}}));
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
+        m_modp->addStmtsp(funcp);
+        m_dynShiftFuncs.emplace(basep, funcp);
+        return funcp;
+    }
+
+    // The place a carrier holds for the bit p up from its right end, with
+    // what lies beyond its own length: nothing for an unsigned value, its
+    // sign repeated for a signed one (9.3.6)
+    AstNodeExpr* dynBitAt(AstVar* cp, AstVar* lenp, AstNodeExpr* pp, AstVar* signdp,
+                          FileLine* flp) {
+        return new AstCond{
+            flp, new AstLtS{flp, pp->cloneTree(false), rd(lenp, flp)},
+            new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp),
+                          new AstSub{flp, new AstSub{flp, rd(lenp, flp), i32(1, flp)}, pp}},
+            new AstCond{flp,
+                        new AstLogAnd{flp, rd(signdp, flp),
+                                      new AstGtS{flp, rd(lenp, flp), i32(0, flp)}},
+                        new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), i32(0, flp)},
+                        i32(0, flp)}};
+    }
+
+    std::map<const VhdlType*, AstNodeFTask*> m_dynAddFuncs;
+
+    // "+" and "-" over carriers, a place at a time from the right end with a
+    // carry, which is all a width nothing decided leaves. Subtraction is the
+    // addition of the complement, so one function does both. How long the
+    // result is depends on the operator: numeric_std makes a sum as long as
+    // the longer operand, but as long as the vector alone where the other
+    // side is an integer, and "wsel" says which of the three (16.5).
+    AstNodeFTask* dynAddFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynAddFuncs.find(basep);
+        if (it != m_dynAddFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp = newDynFunc("__Vdynadd", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
+        AstVar* const bp = dynArg(funcp, "b", dynCarrierRef(typep, flp), flp);
+        AstVar* const subp = dynArg(funcp, "sub", bitDType(flp), flp);
+        AstVar* const signdp = dynArg(funcp, "signd", bitDType(flp), flp);
+        AstVar* const wselp = dynArg(funcp, "wsel", newIntDType(flp), flp);
+        AstVar* const lap = newFuncLocal("la", newIntDType(flp), flp);
+        AstVar* const lbp = newFuncLocal("lb", newIntDType(flp), flp);
+        AstVar* const wp = newFuncLocal("w", newIntDType(flp), flp);
+        AstVar* const pp = newFuncLocal("p", newIntDType(flp), flp);
+        AstVar* const cyp = newFuncLocal("cy", newIntDType(flp), flp);
+        AstVar* const sp = newFuncLocal("s", newIntDType(flp), flp);
+        for (AstVar* const vp : {lap, lbp, wp, pp, cyp, sp}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lap, flp), dynCarrierLength(rd(ap, flp), flp)});
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lbp, flp), dynCarrierLength(rd(bp, flp), flp)});
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(wp, flp),
+            new AstCond{flp, new AstEq{flp, rd(wselp, flp), i32(1, flp)}, rd(lap, flp),
+                        new AstCond{flp, new AstEq{flp, rd(wselp, flp), i32(2, flp)},
+                                    rd(lbp, flp),
+                                    new AstCond{flp,
+                                                new AstGtS{flp, rd(lap, flp), rd(lbp, flp)},
+                                                rd(lap, flp), rd(lbp, flp)}}}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp),
+                                       new AstSub{flp, rd(wp, flp), i32(1, flp)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), i32(0, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(wp, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(cyp, flp), rd(subp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, wr(pp, flp), i32(0, flp)});
+        AstNodeExpr* const bbitp = dynBitAt(bp, lbp, rd(pp, flp), signdp, flp);
+        AstNode* bodyp = new AstAssign{
+            flp, wr(sp, flp),
+            new AstAdd{flp,
+                       new AstAdd{flp, dynBitAt(ap, lap, rd(pp, flp), signdp, flp),
+                                  new AstCond{flp, rd(subp, flp),
+                                              new AstSub{flp, i32(1, flp),
+                                                         bbitp->cloneTree(false)},
+                                              bbitp}},
+                       rd(cyp, flp)}};
+        bodyp = AstNode::addNext(
+            bodyp,
+            static_cast<AstNode*>(new AstAssign{
+                flp,
+                new AstSelBit{flp, dynPart(out(), "q", flp),
+                              new AstSub{flp, new AstSub{flp, rd(wp, flp), i32(1, flp)},
+                                         rd(pp, flp)}},
+                new AstAnd{flp, rd(sp, flp), i32(1, flp)}}));
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(cyp, flp),
+                       new AstShiftR{flp, rd(sp, flp), i32(1, flp)}}));
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(pp, flp), new AstAdd{flp, rd(pp, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(pp, flp), rd(wp, flp)}, bodyp));
+        m_modp->addStmtsp(funcp);
+        m_dynAddFuncs.emplace(basep, funcp);
+        return funcp;
+    }
+
+    std::map<const VhdlType*, AstNodeFTask*> m_dynCmpFuncs;
+
+    // "<", "<=", ">" and ">=" over carriers, answered as -1, 0 or 1. The two
+    // are compared place by place from the top over one place more than the
+    // longer, so that a signed operand's sign is compared with the other's;
+    // over that one extra place the two-complement order is the plain order
+    // once the sign bit is flipped (9.2.3).
+    AstNodeFTask* dynCmpFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynCmpFuncs.find(basep);
+        if (it != m_dynCmpFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp
+            = newDynFunc("__Vdyncmp", typep, new AstBasicDType{flp, VBasicDTypeKwd::INTEGER},
+                         flp);
+        AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
+        AstVar* const bp = dynArg(funcp, "b", dynCarrierRef(typep, flp), flp);
+        AstVar* const signdp = dynArg(funcp, "signd", bitDType(flp), flp);
+        AstVar* const lap = newFuncLocal("la", newIntDType(flp), flp);
+        AstVar* const lbp = newFuncLocal("lb", newIntDType(flp), flp);
+        AstVar* const wp = newFuncLocal("w", newIntDType(flp), flp);
+        AstVar* const pp = newFuncLocal("p", newIntDType(flp), flp);
+        AstVar* const xp = newFuncLocal("x", newIntDType(flp), flp);
+        AstVar* const yp = newFuncLocal("y", newIntDType(flp), flp);
+        for (AstVar* const vp : {lap, lbp, wp, pp, xp, yp}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const auto outr
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::READ}; };
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lap, flp), dynCarrierLength(rd(ap, flp), flp)});
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lbp, flp), dynCarrierLength(rd(bp, flp), flp)});
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(wp, flp),
+            new AstAdd{flp,
+                       new AstCond{flp, new AstGtS{flp, rd(lap, flp), rd(lbp, flp)},
+                                   rd(lap, flp), rd(lbp, flp)},
+                       i32(1, flp)}});
+        funcp->addStmtsp(new AstAssign{flp, out(), i32(0, flp)});
+        funcp->addStmtsp(new AstAssign{flp, wr(pp, flp),
+                                       new AstSub{flp, rd(wp, flp), i32(1, flp)}});
+        AstNode* bodyp = new AstAssign{flp, wr(xp, flp),
+                                       dynBitAt(ap, lap, rd(pp, flp), signdp, flp)};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(yp, flp), dynBitAt(bp, lbp, rd(pp, flp), signdp, flp)}));
+        // The topmost place is the sign, and flipping it there turns the
+        // two-complement order into the plain one
+        AstNode* flipp = new AstAssign{flp, wr(xp, flp),
+                                       new AstSub{flp, i32(1, flp), rd(xp, flp)}};
+        flipp = AstNode::addNext(
+            flipp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(yp, flp), new AstSub{flp, i32(1, flp), rd(yp, flp)}}));
+        bodyp = AstNode::addNext(
+            bodyp,
+            static_cast<AstNode*>(new AstIf{
+                flp,
+                new AstLogAnd{flp, rd(signdp, flp),
+                              new AstEq{flp, rd(pp, flp),
+                                        new AstSub{flp, rd(wp, flp), i32(1, flp)}}},
+                flipp, nullptr}));
+        bodyp = AstNode::addNext(
+            bodyp,
+            static_cast<AstNode*>(new AstIf{
+                flp, new AstGtS{flp, rd(xp, flp), rd(yp, flp)},
+                new AstAssign{flp, out(), i32(1, flp)},
+                new AstIf{flp, new AstLtS{flp, rd(xp, flp), rd(yp, flp)},
+                          new AstAssign{flp, out(), i32(-1, flp)}, nullptr}}));
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(pp, flp), new AstSub{flp, rd(pp, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(
+            flp,
+            new AstLogAnd{flp, new AstGteS{flp, rd(pp, flp), i32(0, flp)},
+                          new AstEq{flp, outr(), i32(0, flp)}},
+            bodyp));
+        m_modp->addStmtsp(funcp);
+        m_dynCmpFuncs.emplace(basep, funcp);
+        return funcp;
+    }
+
+    std::map<const VhdlType*, AstNodeFTask*> m_dynDivFuncs;
+
+    // "/", "mod" and "rem" over a carrier by an integer, which numeric_std
+    // makes as long as the vector operand. Long division a place at a time
+    // from the top: the running remainder stays below the divisor, so each
+    // place of the quotient is one bit and no division is needed to find it.
+    AstNodeFTask* dynDivFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynDivFuncs.find(basep);
+        if (it != m_dynDivFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp = newDynFunc("__Vdyndiv", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+        AstVar* const vp = dynArg(funcp, "v", new AstBasicDType{flp, VBasicDTypeKwd::INTEGER},
+                                  flp);
+        AstVar* const remp = dynArg(funcp, "wantrem", bitDType(flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        AstVar* const accp
+            = newFuncLocal("acc", new AstBasicDType{flp, VBasicDTypeKwd::LONGINT}, flp);
+        for (AstVar* const av : {lenp, ip, accp}) funcp->addStmtsp(av);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, wr(lenp, flp),
+                                       dynCarrierLength(rd(cp, flp), flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp),
+                                       new AstSub{flp, rd(lenp, flp), i32(1, flp)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), i32(0, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(lenp, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(accp, flp), i32(0, flp)});
+        funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+        // Nothing is divisible by nothing, which is an error the LRM leaves
+        // to the run rather than the analysis (9.2.7)
+        AstNode* zerop = new AstDisplay{flp, VDisplayType::DT_ERROR, "Division by zero",
+                                        nullptr, nullptr};
+        AstNode* divp = new AstAssign{
+            flp, wr(accp, flp),
+            new AstAdd{flp, new AstMul{flp, rd(accp, flp), i32(2, flp)},
+                       new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), rd(ip, flp)}}};
+        divp = AstNode::addNext(
+            divp,
+            static_cast<AstNode*>(new AstIf{
+                flp, new AstGteS{flp, rd(accp, flp), rd(vp, flp)},
+                AstNode::addNext(
+                    static_cast<AstNode*>(new AstAssign{
+                        flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(ip, flp)},
+                        i32(1, flp)}),
+                    static_cast<AstNode*>(new AstAssign{
+                        flp, wr(accp, flp), new AstSub{flp, rd(accp, flp), rd(vp, flp)}})),
+                new AstAssign{flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(ip, flp)},
+                              i32(0, flp)}}));
+        divp = AstNode::addNext(
+            divp, static_cast<AstNode*>(new AstAssign{
+                      flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+        AstNode* loopsp
+            = whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, divp);
+        // What is left over, spread back over the same places, when the
+        // remainder rather than the quotient is what was asked for
+        AstNode* remsp = new AstAssign{flp, wr(ip, flp), i32(0, flp)};
+        AstNode* rbodyp = new AstAssign{
+            flp,
+            new AstSelBit{flp, dynPart(out(), "q", flp),
+                          new AstSub{flp, new AstSub{flp, rd(lenp, flp), i32(1, flp)},
+                                     rd(ip, flp)}},
+            new AstCond{flp, new AstLtS{flp, rd(ip, flp), i32(63, flp)},
+                        new AstAnd{flp, new AstShiftR{flp, rd(accp, flp), rd(ip, flp)},
+                                   i32(1, flp)},
+                        i32(0, flp)}};
+        rbodyp = AstNode::addNext(
+            rbodyp, static_cast<AstNode*>(new AstAssign{
+                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+        remsp = AstNode::addNext(
+            remsp, whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, rbodyp));
+        loopsp = AstNode::addNext(
+            loopsp, static_cast<AstNode*>(new AstIf{flp, rd(remp, flp), remsp, nullptr}));
+        funcp->addStmtsp(new AstIf{
+            flp, new AstLteS{flp, rd(vp, flp), i32(0, flp)}, zerop, loopsp});
+        m_modp->addStmtsp(funcp);
+        m_dynDivFuncs.emplace(basep, funcp);
         return funcp;
     }
 
@@ -5106,6 +5504,163 @@ private:
         return litp->text().find_first_of("UuXxWw-") != std::string::npos;
     }
 
+
+    // An operand as a carrier of the type the operator is working in, which
+    // an integer becomes by being spread over as many places as it takes
+    AstNodeExpr* dynOperand(AstNodeVhdlExpr* nodep, VhdlType* carrp, FileLine* flp) {
+        if (isDynValue(nodep)) return lowerExpr(nodep);
+        if (AstNodeExpr* const outp = asDynCarrier(nodep, carrp, flp)) return outp;
+        // An integer beside a vector is taken at its own full width; what
+        // lies above it is the sign, which the operators extend themselves
+        const VhdlType* const typep = nodep->vhdlTypep();
+        if (!typep || !isIntegerType(typep)) return nullptr;
+        AstNodeFTask* const bitsp = dynBitsFunc(carrp, false, flp);
+        if (!bitsp) return nullptr;
+        AstNodeExpr* const valuep = lowerExpr(nodep);
+        if (!valuep) return nullptr;
+        AstArg* argsp = new AstArg{flp, "", valuep};
+        argsp->addNext(new AstArg{flp, "", i32(32, flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, bitsp->name(), argsp};
+        refp->taskp(VN_AS(bitsp, Func));
+        return refp;
+    }
+
+    // Whether an operator gives back a value that carries its own bounds
+    // because one of its operands does
+    bool dynBinaryCarries(const AstVhdlBinary* nodep) const {
+        switch (nodep->op()) {
+        case VhdlBinaryOp::SLL:
+        case VhdlBinaryOp::SRL:
+        case VhdlBinaryOp::ROL:
+        case VhdlBinaryOp::ROR:
+        case VhdlBinaryOp::ADD:
+        case VhdlBinaryOp::SUB:
+        case VhdlBinaryOp::DIV:
+        case VhdlBinaryOp::MOD:
+        case VhdlBinaryOp::REM: break;
+        default: return false;
+        }
+        VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
+        VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
+        const bool ldyn = isDynValue(nodep->lhsp());
+        if (!ldyn && !isDynValue(nodep->rhsp())) return false;
+        return carriedDynamically(ldyn ? ltypep : rtypep);
+    }
+
+    // A binary operator one of whose operands carries its own bounds. What
+    // it gives back carries its bounds too, since nothing here settled a
+    // length any more than the operand had one.
+    AstNodeExpr* lowerDynBinary(AstVhdlBinary* nodep, FileLine* flp) {
+        const VhdlBinaryOp op = nodep->op();
+        VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
+        VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
+        const bool ldyn = isDynValue(nodep->lhsp());
+        VhdlType* const carrp = ldyn ? ltypep : rtypep;
+        if (!carriedDynamically(carrp)) return nullptr;
+        const VhdlSymbol* const symp = nodep->vhdlSymp();
+        // Which of the two is a vector says whether the arithmetic is
+        // signed; an integer operand is signed whatever the vector is
+        const bool signd = isSignedType(carrp);
+        // numeric_std normalizes the range of its result; the predefined
+        // array operators keep the one the operand was written with
+        const bool norm = symp && inArithmeticPackage(symp);
+        const auto call = [&](AstNodeFTask* funcp, std::vector<AstNodeExpr*> args) {
+            AstArg* argsp = nullptr;
+            for (AstNodeExpr* const argp : args) {
+                AstArg* const onep = new AstArg{flp, "", argp};
+                if (argsp) {
+                    argsp->addNext(onep);
+                } else {
+                    argsp = onep;
+                }
+            }
+            AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+            refp->taskp(VN_AS(funcp, Func));
+            return refp;
+        };
+        const auto bit = [&](bool v) -> AstNodeExpr* {
+            return new AstConst{flp, AstConst::BitTrue{}, v};
+        };
+        switch (op) {
+        case VhdlBinaryOp::SLL:
+        case VhdlBinaryOp::SRL:
+        case VhdlBinaryOp::ROL:
+        case VhdlBinaryOp::ROR: {
+            if (!ldyn) return nullptr;  // The count is the right operand
+            AstNodeFTask* const funcp = dynShiftFunc(carrp, flp);
+            if (!funcp) return nullptr;
+            AstNodeExpr* const cp = lowerExpr(nodep->lhsp());
+            AstNodeExpr* const np = cp ? lowerExpr(nodep->rhsp()) : nullptr;
+            if (!np) {
+                if (cp) VL_DO_DANGLING(cp->deleteTree(), cp);
+                return nullptr;
+            }
+            const bool leftward = op == VhdlBinaryOp::SLL || op == VhdlBinaryOp::ROL;
+            const bool rot = op == VhdlBinaryOp::ROL || op == VhdlBinaryOp::ROR;
+            AstNodeExpr* const placesp
+                = leftward ? np : static_cast<AstNodeExpr*>(new AstNegate{flp, np});
+            return call(funcp,
+                        {cp, placesp, new AstConst{flp, AstConst::BitFalse{}}, bit(rot),
+                         bit(norm)});
+        }
+        case VhdlBinaryOp::ADD:
+        case VhdlBinaryOp::SUB: {
+            AstNodeFTask* const funcp = dynAddFunc(carrp, flp);
+            if (!funcp) return nullptr;
+            AstNodeExpr* const ap = dynOperand(nodep->lhsp(), carrp, flp);
+            AstNodeExpr* const bp = ap ? dynOperand(nodep->rhsp(), carrp, flp) : nullptr;
+            if (!bp) {
+                if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
+                return nullptr;
+            }
+            // A sum with an integer is as long as the vector alone (16.5)
+            const int wsel = norm && isIntegerType(rtypep)   ? 1
+                             : norm && isIntegerType(ltypep) ? 2
+                                                             : 0;
+            return call(funcp, {ap, bp, bit(op == VhdlBinaryOp::SUB), bit(signd),
+                                i32(wsel, flp)});
+        }
+        case VhdlBinaryOp::DIV:
+        case VhdlBinaryOp::MOD:
+        case VhdlBinaryOp::REM: {
+            // Only a division of a carried value by an integer is done here
+            if (!ldyn || signd || isDynValue(nodep->rhsp())) return nullptr;
+            const VhdlType* const rt = rtypep;
+            if (!rt || !isIntegerType(rt)) return nullptr;
+            AstNodeFTask* const funcp = dynDivFunc(carrp, flp);
+            if (!funcp) return nullptr;
+            AstNodeExpr* const cp = lowerExpr(nodep->lhsp());
+            AstNodeExpr* const vp = cp ? lowerExpr(nodep->rhsp()) : nullptr;
+            if (!vp) {
+                if (cp) VL_DO_DANGLING(cp->deleteTree(), cp);
+                return nullptr;
+            }
+            return call(funcp, {cp, vp, bit(op != VhdlBinaryOp::DIV)});
+        }
+        case VhdlBinaryOp::LT:
+        case VhdlBinaryOp::LE:
+        case VhdlBinaryOp::GT:
+        case VhdlBinaryOp::GE: {
+            AstNodeFTask* const funcp = dynCmpFunc(carrp, flp);
+            if (!funcp) return nullptr;
+            AstNodeExpr* const ap = dynOperand(nodep->lhsp(), carrp, flp);
+            AstNodeExpr* const bp = ap ? dynOperand(nodep->rhsp(), carrp, flp) : nullptr;
+            if (!bp) {
+                if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
+                return nullptr;
+            }
+            AstNodeExpr* const cmpp = call(funcp, {ap, bp, bit(signd)});
+            switch (op) {
+            case VhdlBinaryOp::LT: return new AstLtS{flp, cmpp, i32(0, flp)};
+            case VhdlBinaryOp::LE: return new AstLteS{flp, cmpp, i32(0, flp)};
+            case VhdlBinaryOp::GT: return new AstGtS{flp, cmpp, i32(0, flp)};
+            default: return new AstGteS{flp, cmpp, i32(0, flp)};
+            }
+        }
+        default: return nullptr;
+        }
+    }
+
     AstNodeExpr* lowerBinary(AstVhdlBinary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -5161,6 +5716,11 @@ private:
             if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
             unsup(flp, "comparison of a value whose length only running decides");
             return nullptr;
+        }
+        // The rest of the operators over a value that carries its own
+        // bounds: each is a loop over its elements, in a function of its own
+        if (isDynValue(nodep->lhsp()) || isDynValue(nodep->rhsp())) {
+            if (AstNodeExpr* const outp = lowerDynBinary(nodep, flp)) return outp;
         }
         AstNodeExpr* lhsp = lowerExpr(nodep->lhsp());
         AstNodeExpr* rhsp = lowerExpr(nodep->rhsp());
@@ -13323,6 +13883,10 @@ private:
         m_dynToFuncs.clear();
         m_dynBitsFuncs.clear();
         m_dynIntFuncs.clear();
+        m_dynShiftFuncs.clear();
+        m_dynAddFuncs.clear();
+        m_dynCmpFuncs.clear();
+        m_dynDivFuncs.clear();
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();
