@@ -368,6 +368,18 @@ private:
                         onep = dynAsFixed(asp->actualp(), formalp, asp->fileline());
                     }
                 }
+                // A record in one shape handed to a parameter of the other
+                if (!onep && symp) {
+                    const int at = namep ? symp->paramIndex(namep->name())
+                                         : static_cast<int>(pos);
+                    VhdlType* const formalp
+                        = at >= 0 && at < static_cast<int>(symp->paramTypes().size())
+                              ? symp->paramTypes()[at]
+                              : nullptr;
+                    if (formalp) {
+                        onep = recordAsShape(asp->actualp(), formalp, asp->fileline());
+                    }
+                }
                 if (!onep) onep = lowerExpr(asp->actualp());
                 refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "", onep});
             }
@@ -1005,10 +1017,13 @@ private:
     // Whether every element of a record can live inside a packed structure.
     // One that cannot -- a real, a string, an unpacked array, an access value
     // -- makes the whole record unpacked.
-    static bool recordPacks(const VhdlType* typep) {
+    bool recordPacks(const VhdlType* typep) const {
         for (const VhdlSymbol* const elemp : typep->elements()) {
             const VhdlType* const etypep = elemp->typep();
             if (!etypep) return false;
+            // An element that carries its own bounds is a structure, and a
+            // structure does not fit inside a packed one
+            if (elementCarried(etypep)) return false;
             switch (etypep->base()->kind()) {
             case VhdlTypeKind::ENUM:
             case VhdlTypeKind::INTEGER:
@@ -1035,7 +1050,7 @@ private:
     }
 
     // Whether an element type can live inside a packed array
-    static bool elementPacks(const VhdlType* typep) {
+    bool elementPacks(const VhdlType* typep) const {
         // A STRING is text here rather than a vector of characters, so an
         // array of them is an array of objects, not of bits (16.3)
         if (isStringType(typep)) return false;
@@ -1051,6 +1066,29 @@ private:
         }
     }
 
+    // A record element whose length nothing here settles carries its own
+    // bounds, exactly as a value of that type does anywhere else (5.3.3)
+    AstNodeDType* memberDType(VhdlType* etp, FileLine* flp, bool noCarry = false) {
+        if (!noCarry && elementCarried(etp)) return dynCarrierRef(etp, flp);
+        return lowerType(etp, flp);
+    }
+
+    // Whether a record element is one that carries its own bounds. The base
+    // type decides, not the subtype: two values of a record are assignable
+    // when they share a base type (5.2), so every subtype of it has to have
+    // the same shape, and a constraint only says what bounds to start with.
+    bool elementCarried(const VhdlType* etp) const {
+        if (!etp) return false;
+        const VhdlType* const ebasep = etp->base();
+        if (ebasep->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!ebasep->unconstrained()) return false;
+        // A subtype that constrains the element with bounds this can emit
+        // makes it an ordinary member: only a length nothing here settles,
+        // or one that only running settles, needs to be carried
+        if (etp->isConstrainedArray() && !lengthOnlyRunningDecides(etp)) return false;
+        return carriedDynamically(etp);
+    }
+
     AstNodeDType* lowerRecordType(VhdlType* typep, FileLine* flp) {
         // Packed where it can be, so that a record of vectors is one machine
         // word; unpacked where an element will not fit in one
@@ -1060,7 +1098,7 @@ private:
         structp->name(typep->name());
         for (VhdlSymbol* const elemp : typep->elements()) {
             structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
-                                                    lowerType(elemp->typep(), flp), nullptr});
+                                                    memberDType(elemp->typep(), flp), nullptr});
         }
         return structp;
     }
@@ -1080,12 +1118,25 @@ private:
         // subtype as before.
         // A STRING element is not one of them: it is carried as a string,
         // which is the same member however long the value is.
+        // An element that carries its own bounds is the same member whatever
+        // constrains it, so those subtypes share the base's structure; it is
+        // an element a subtype fixes a length for that needs one of its own.
+        // An element this subtype fixes a length for is a member of its own
+        // shape, so the subtype needs a structure of its own. One that
+        // carries its own bounds is the same member however long it is, so
+        // those subtypes share the base's structure and are assignable to
+        // one another without conversion.
+        const std::vector<VhdlSymbol*>& baseElems = typep->base()->elements();
+        const std::vector<VhdlSymbol*>& thisElems = typep->elements();
         bool openElement = false;
-        for (VhdlSymbol* const elemp : typep->base()->elements()) {
-            VhdlType* const etp = elemp->typep();
-            if (etp && etp->base()->kind() == VhdlTypeKind::ARRAY && etp->unconstrained()
-                && !isStringType(etp)) {
-                openElement = true;
+        for (size_t i = 0; i < baseElems.size(); ++i) {
+            VhdlType* const bep = baseElems[i] ? baseElems[i]->typep() : nullptr;
+            if (!bep) continue;
+            VhdlType* const etp
+                = i < thisElems.size() && thisElems[i] ? thisElems[i]->typep() : bep;
+            if (bep->base()->kind() == VhdlTypeKind::ARRAY && bep->unconstrained()
+                && !isStringType(bep)) {
+                if (!recordMayCarry(typep) || !elementCarried(etp)) openElement = true;
             }
         }
         VhdlType* const keyp = openElement ? typep : typep->base();
@@ -1115,9 +1166,11 @@ private:
         // access or protected type sees the same declaration a module does
         AstPackage* const unitp = local ? nullptr : m_netlistp->dollarUnitPkgAddp();
         if (unitp) structp->classOrPackagep(unitp);
+        const bool noCarry = !recordMayCarry(keyp);
         for (VhdlSymbol* const elemp : keyp->elements()) {
-            structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
-                                                    lowerType(elemp->typep(), flp), nullptr});
+            structp->addMembersp(
+                new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
+                                   memberDType(elemp->typep(), flp, noCarry), nullptr});
         }
         AstTypedef* const tdp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
         if (local) {
@@ -1385,6 +1438,106 @@ private:
     }
 
     AstNode* dynCarrierInit(AstVar* varp, const VhdlType* typep, FileLine* flp) {
+        return dynCarrierInitOn(new AstVarRef{flp, varp, VAccess::WRITE}, typep, flp);
+    }
+
+    // The same for a record whose elements carry their own bounds: each of
+    // them is given its bounds where the object is declared, since the
+    // subtype that constrains the record is what says how long they are
+    AstNode* dynRecordInit(AstVar* varp, const VhdlType* typep, FileLine* flp) {
+        AstNode* outp = nullptr;
+        for (const VhdlSymbol* const elemp : typep->elements()) {
+            if (!elemp || !elementCarried(elemp->typep())) continue;
+            AstNode* const onep = dynCarrierInitOn(
+                dynPart(new AstVarRef{flp, varp, VAccess::WRITE}, elemp->name(), flp),
+                elemp->typep(), flp);
+            if (onep) outp = AstNode::addNextNull(outp, onep);
+        }
+        return outp;
+    }
+
+    // Whether any element of this record carries its own bounds
+    // Whether a record type has, anywhere in it, an element whose length its
+    // own declaration does not say
+    static bool recordHasOpenElement(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+            const VhdlType* const etp = elemp ? elemp->typep() : nullptr;
+            if (!etp) continue;
+            if (etp->base()->kind() == VhdlTypeKind::ARRAY && etp->unconstrained()
+                && !isStringType(etp)) {
+                return true;
+            }
+            if (etp->base()->kind() == VhdlTypeKind::RECORD
+                && recordHasOpenElement(etp, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // A record whose element is itself a record with an element of no length
+    // of its own. The shape of the inner one then depends on what constrains
+    // it, and there is no conversion for that yet.
+    static bool recordHasNestedOpen(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+            const VhdlType* const etp = elemp ? elemp->typep() : nullptr;
+            if (etp && etp->base()->kind() == VhdlTypeKind::RECORD
+                && recordHasOpenElement(etp)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether this record *value* leaves an element open -- as against the
+    // declaration leaving it open and a subtype saying what it is
+    static bool recordOpenHere(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        for (const VhdlSymbol* const elemp : typep->elements()) {
+            const VhdlType* const etp = elemp ? elemp->typep() : nullptr;
+            if (!etp) continue;
+            if (etp->base()->kind() == VhdlTypeKind::ARRAY && etp->unconstrained()
+                && !isStringType(etp)) {
+                return true;
+            }
+            if (etp->base()->kind() == VhdlTypeKind::RECORD
+                && recordOpenHere(etp, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // A record on a port, and every record inside it: an element of one is
+    // reached through the port too, so it keeps the same shape
+    void markPortRecord(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || typep->base()->kind() != VhdlTypeKind::RECORD) return;
+        if (!m_portRecords.insert(typep->base()).second) return;
+        for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+            if (elemp) markPortRecord(elemp->typep(), depth + 1);
+        }
+    }
+
+    // Whether a record's elements are held as carriers at all
+    bool recordMayCarry(const VhdlType* typep) const {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        // A record of records is left as it was: the inner one's shape
+        // depends on what constrains it, and there is no conversion for that
+        if (recordHasNestedOpen(typep)) return false;
+        return !m_portRecords.count(typep->base());
+    }
+
+    bool recordCarriesElement(const VhdlType* typep) const {
+        if (!recordMayCarry(typep)) return false;
+        for (const VhdlSymbol* const elemp : typep->elements()) {
+            if (elemp && elementCarried(elemp->typep())) return true;
+        }
+        return false;
+    }
+
+    AstNode* dynCarrierInitOn(AstNodeExpr* protop, const VhdlType* typep, FileLine* flp) {
         const VhdlType* const idxp
             = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
         AstNodeExpr* leftp = nullptr;
@@ -1421,7 +1574,7 @@ private:
                 }
             }
         }
-        const auto ref = [&]() { return new AstVarRef{flp, varp, VAccess::WRITE}; };
+        const auto ref = [&]() { return protop->cloneTree(false); };
         AstNode* outp = new AstAssign{flp, dynPart(ref(), "lft", flp), leftp};
         outp = AstNode::addNext(
             outp, static_cast<AstNode*>(
@@ -1433,18 +1586,18 @@ private:
                 dscp ? dscp
                      : static_cast<AstNodeExpr*>(new AstLtS{
                            flp,
-                           dynPart(new AstVarRef{flp, varp, VAccess::READ}, "rgt", flp),
-                           dynPart(new AstVarRef{flp, varp, VAccess::READ}, "lft", flp)})}));
+                           dynPart(protop->cloneTree(false), "rgt", flp),
+                           dynPart(protop->cloneTree(false), "lft", flp)})}));
         // A null range holds nothing at all (5.3.2.1), so the count is never
         // negative however the bounds were written
         AstNodeExpr* const spanp = new AstSub{
             flp,
-            new AstCond{flp, dynPart(new AstVarRef{flp, varp, VAccess::READ}, "dsc", flp),
-                        dynPart(new AstVarRef{flp, varp, VAccess::READ}, "lft", flp),
-                        dynPart(new AstVarRef{flp, varp, VAccess::READ}, "rgt", flp)},
-            new AstCond{flp, dynPart(new AstVarRef{flp, varp, VAccess::READ}, "dsc", flp),
-                        dynPart(new AstVarRef{flp, varp, VAccess::READ}, "rgt", flp),
-                        dynPart(new AstVarRef{flp, varp, VAccess::READ}, "lft", flp)}};
+            new AstCond{flp, dynPart(protop->cloneTree(false), "dsc", flp),
+                        dynPart(protop->cloneTree(false), "lft", flp),
+                        dynPart(protop->cloneTree(false), "rgt", flp)},
+            new AstCond{flp, dynPart(protop->cloneTree(false), "dsc", flp),
+                        dynPart(protop->cloneTree(false), "rgt", flp),
+                        dynPart(protop->cloneTree(false), "lft", flp)}};
         AstNodeExpr* const countp
             = new AstCond{flp,
                           new AstLtS{flp, spanp->cloneTree(false),
@@ -1455,6 +1608,7 @@ private:
             outp, static_cast<AstNode*>(new AstAssign{
                       flp, dynPart(ref(), "q", flp),
                       new AstNewDynamic{flp, countp, nullptr}}));
+        VL_DO_DANGLING(protop->deleteTree(), protop);
         return outp;
     }
 
@@ -1897,10 +2051,105 @@ private:
         return funcp;
     }
 
+    std::map<std::pair<const VhdlType*, const VhdlType*>, AstNodeFTask*> m_dynOfExprFuncs;
+
+    // The same, where the length is not a number here but an expression the
+    // elaborated design settles -- a record element written "data(data'range)"
+    // over a port, say. The bounds go in as they were written and the back
+    // end folds them per instance.
+    AstNodeFTask* dynOfFixedExprFunc(VhdlType* carrierTypep, VhdlType* fixedTypep,
+                                     FileLine* flp) {
+        const VhdlType* const idxp = fixedTypep->indexTypes().empty()
+                                         ? nullptr
+                                         : fixedTypep->indexTypes()[0];
+        if (!idxp) return nullptr;
+        const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
+                                        static_cast<const VhdlType*>(fixedTypep));
+        const auto it = m_dynOfExprFuncs.find(key);
+        if (it != m_dynOfExprFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        AstRange* const rangep = boundsRange(idxp, flp);
+        if (!rangep) return nullptr;
+        AstNodeDType* const argDTypep = lowerType(fixedTypep, flp);
+        if (!argDTypep) {
+            VL_DO_DANGLING(rangep->deleteTree(), rangep);
+            return nullptr;
+        }
+        const std::string name = "__Vdynofx" + std::to_string(m_dynOfExprFuncs.size()) + "__"
+                                 + carrierTypep->base()->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
+        AstVar* const vp
+            = new AstVar{flp, VVarType::PORT, "v", VFlagChildDType{}, argDTypep};
+        vp->direction(VDirection::INPUT);
+        vp->declDirection(VDirection::INPUT);
+        vp->funcLocal(true);
+        vp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        vp->trace(false);
+        funcp->addStmtsp(vp);
+        AstNodeExpr* const leftp = rangep->leftp()->unlinkFrBack();
+        AstNodeExpr* const rightp = rangep->rightp()->unlinkFrBack();
+        const bool ascending = rangep->ascending();
+        VL_DO_DANGLING(rangep->deleteTree(), rangep);
+        const auto out = [&]() {
+            return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
+        };
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), leftp});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rightp});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "dsc", flp),
+            new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+        AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        funcp->addStmtsp(np);
+        funcp->addStmtsp(kp);
+        AstNodeExpr* const lp = dynPart(new AstVarRef{flp, VN_AS(funcp->fvarp(), Var),
+                                                      VAccess::READ},
+                                        "lft", flp);
+        AstNodeExpr* const rp = dynPart(new AstVarRef{flp, VN_AS(funcp->fvarp(), Var),
+                                                      VAccess::READ},
+                                        "rgt", flp);
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(np, flp),
+            new AstAdd{flp, ascending ? new AstSub{flp, rp, lp} : new AstSub{flp, lp, rp},
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(np, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(kp, flp),
+                                       new AstConst{flp, AstConst::Signed32{}, 0}});
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}});
+        AstNodeExpr* const lft = dynPart(new AstVarRef{flp, VN_AS(funcp->fvarp(), Var),
+                                                       VAccess::READ},
+                                         "lft", flp);
+        AstNodeExpr* const atp
+            = ascending ? static_cast<AstNodeExpr*>(new AstAdd{flp, lft, rd(kp, flp)})
+                        : static_cast<AstNodeExpr*>(new AstSub{flp, lft, rd(kp, flp)});
+        loopp->addStmtsp(new AstAssign{
+            flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)},
+            new AstSelBit{flp, rd(vp, flp), atp}});
+        loopp->addStmtsp(new AstAssign{
+            flp, wr(kp, flp),
+            new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        funcp->addStmtsp(loopp);
+        m_modp->addStmtsp(funcp);
+        m_dynOfExprFuncs.emplace(key, funcp);
+        return funcp;
+    }
+
     // Whatever an expression is worth, as a value that carries its own bounds
-    AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp) {
+    AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
+                              VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerExpr(nodep);
-        VhdlType* const typep = nodep->vhdlTypep();
+        VhdlType* typep = nodep->vhdlTypep();
+        // A string literal is as long as what it is written against says
+        // (9.3.2), and the analyzer leaves that to the context
+        if ((!typep || !typep->isConstrainedArray()) && asLongAsp
+            && asLongAsp->isConstrainedArray()) {
+            typep = asLongAsp;
+        }
         if (!typep || !typep->isConstrainedArray()) return nullptr;
         AstNodeFTask* const funcp = dynOfFixedFunc(carrierTypep, typep, flp);
         if (!funcp) return nullptr;
@@ -2163,8 +2412,19 @@ private:
     // a parameter or a call's result, and neither is reached through a
     // selection or an index.
     bool isDynObj(const AstNodeVhdlExpr* nodep) const {
-        const AstVhdlName* const namep = VN_CAST(nodep, VhdlName);
-        return namep && namep->vhdlSymp() && m_dynSyms.count(namep->vhdlSymp()->resolved());
+        if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
+            return namep->vhdlSymp() && m_dynSyms.count(namep->vhdlSymp()->resolved());
+        }
+        // An element of a record whose length nothing settles is held in a
+        // carrier of its own, and naming the element names that carrier
+        if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            const VhdlType* const ptypep
+                = selp->prefixp() ? selp->prefixp()->vhdlTypep() : nullptr;
+            if (ptypep && ptypep->base()->kind() == VhdlTypeKind::RECORD) {
+                return recordMayCarry(ptypep) && elementCarried(selp->vhdlTypep());
+            }
+        }
+        return false;
     }
 
     static AstNodeExpr* dynIndex(AstNodeExpr* fromp, AstNodeExpr* indexp, FileLine* flp) {
@@ -2172,6 +2432,9 @@ private:
         return new AstSelBit{flp, dynPart(fromp, "q", flp), offp};
     }
 
+    // Record base types that appear on a port, and so keep the shape
+    // elaboration gives them rather than carrying their elements
+    std::set<const VhdlType*> m_portRecords;
     std::map<const VhdlType*, std::string> m_recNames;  // Record -> its typedef
     // Record whose shape a generic decides -> its typedef, per module
     std::map<std::pair<const AstNodeModule*, const VhdlType*>, std::string> m_recLocalNames;
@@ -2488,6 +2751,25 @@ private:
                         addStmt(setp);
                     }
                 }
+                return;
+            }
+            // A record with an element that carries its own bounds is given
+            // those bounds where it is declared, since the subtype that
+            // constrains the record is what says how long the element is
+            if (objp->kind() != VhdlObjKind::FILE && recordCarriesElement(symp->typep())) {
+                addStmt(varp);
+                AstNode* setp = dynRecordInit(varp, symp->typep(), flp);
+                if (objp->defaultp()) {
+                    if (AstNodeExpr* const srcp = lowerExpr(objp->defaultp())) {
+                        setp = AstNode::addNextNull(
+                            setp, new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE},
+                                                srcp});
+                    }
+                }
+                // A declaration of a subprogram runs on every call; anywhere
+                // else it is elaborated once, before the design runs, and a
+                // statement cannot stand loose among a module's own
+                addStmt(setp ? (m_ftaskp ? setp : new AstInitial{flp, setp}) : nullptr);
                 return;
             }
             if (objp->defaultp()) {
@@ -2811,7 +3093,12 @@ private:
             AstNodeExpr* outp = nullptr;
             AstNode* itemsp = nullptr;
             for (VhdlSymbol* const elemp : typep->elements()) {
-                AstNodeExpr* const onep = defaultValueFor(elemp->typep(), flp, true);
+                // An element that carries its own bounds has no value that
+                // can be written here: it is given its bounds and its
+                // elements where the object is declared
+                AstNodeExpr* const onep = elementCarried(elemp->typep())
+                                              ? nullptr
+                                              : defaultValueFor(elemp->typep(), flp, true);
                 if (!onep) {
                     if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
                     if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
@@ -4851,11 +5138,13 @@ private:
         // an element at a time, which a function of the type does (9.2.3)
         if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
             && (isDynValue(nodep->lhsp()) || isDynValue(nodep->rhsp()))) {
-            VhdlType* const carrp
-                = carriedDynamically(ltypep) ? ltypep : rtypep;
+            // Whichever side is carried says which carrier the two are
+            // compared as; the other is made into one of the same type
+            VhdlType* const carrp = isDynValue(nodep->lhsp()) ? ltypep : rtypep;
             AstNodeFTask* const eqp = carrp ? dynEqFunc(carrp, flp) : nullptr;
-            AstNodeExpr* const ap = eqp ? asDynCarrier(nodep->lhsp(), carrp, flp) : nullptr;
-            AstNodeExpr* bp = ap ? asDynCarrier(nodep->rhsp(), carrp, flp) : nullptr;
+            AstNodeExpr* const ap
+                = eqp ? asDynCarrier(nodep->lhsp(), carrp, flp, rtypep) : nullptr;
+            AstNodeExpr* bp = ap ? asDynCarrier(nodep->rhsp(), carrp, flp, ltypep) : nullptr;
             // The other side may be "(v'range => '0')", which is as long as
             // the value it is compared with and no longer
             if (ap && !bp && isDynValue(nodep->lhsp())) {
@@ -9737,6 +10026,142 @@ private:
     }
 
     // A variable assignment takes effect at once (10.6)
+    // Two values of one record type whose elements are held differently --
+    // one carrying its own bounds, the other as long as its subtype says --
+    // are the same value in two shapes, and are copied element by element
+    // with each element converted as it goes (5.2, 5.3.3)
+    // The type an expression is actually emitted as: what a call gives back
+    // is the type of the copy that was made for it, not what the declaration
+    // said, and a record's shape follows from that
+    VhdlType* shapeTypeOf(AstNodeVhdlExpr* nodep) const {
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            const VhdlSymbol* const symp
+                = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+            if (symp && symp->kind() == VhdlSymKind::FUNCTION) {
+                if (VhdlType* const retp = emittedReturnType(symp)) return retp;
+            }
+        }
+        return nodep ? nodep->vhdlTypep() : nullptr;
+    }
+
+    bool recordShapesDiffer(const VhdlType* ap, const VhdlType* bp) const {
+        if (!ap || !bp) return false;
+        if (ap->base() != bp->base()) return false;
+        if (ap->base()->kind() != VhdlTypeKind::RECORD) return false;
+        const std::vector<VhdlSymbol*>& ae = ap->elements();
+        const std::vector<VhdlSymbol*>& be = bp->elements();
+        if (ae.size() != be.size()) return false;
+        if (!recordMayCarry(ap) || !recordMayCarry(bp)) return false;
+        for (size_t i = 0; i < ae.size(); ++i) {
+            if (!ae[i] || !be[i]) return false;
+            if (elementCarried(ae[i]->typep()) != elementCarried(be[i]->typep())) return true;
+        }
+        return false;
+    }
+
+    AstNode* recordShapeCopy(AstNodeExpr* targetp, VhdlType* ttypep, AstNodeExpr* srcp,
+                             VhdlType* stypep, FileLine* flp) {
+        AstNode* outp = nullptr;
+        AstNodeExpr* holdp = srcp;
+        // The source is read once per element, so it has to be something
+        // that can be named again
+        if (!repeatable(srcp)) {
+            AstVar* const tmpp = newTempVar("__Vrecsrc", lowerType(stypep, flp), flp);
+            outp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, srcp};
+            holdp = new AstVarRef{flp, tmpp, VAccess::READ};
+        }
+        const std::vector<VhdlSymbol*>& te = ttypep->elements();
+        const std::vector<VhdlSymbol*>& se = stypep->elements();
+        for (size_t i = 0; i < te.size() && i < se.size(); ++i) {
+            VhdlType* const ttp = te[i]->typep();
+            VhdlType* const stp = se[i]->typep();
+            AstNodeExpr* const tmemp = dynPart(targetp->cloneTree(false), te[i]->name(), flp);
+            AstNodeExpr* const smemp = dynPart(holdp->cloneTree(false), se[i]->name(), flp);
+            AstNodeExpr* valp = smemp;
+            if (elementCarried(ttp) && !elementCarried(stp)) {
+                AstNodeFTask* funcp = dynOfFixedFunc(ttp, stp, flp);
+                if (!funcp) funcp = dynOfFixedExprFunc(ttp, stp, flp);
+                if (!funcp) return recordShapeFail(outp, targetp, holdp, srcp, valp, flp);
+                AstFuncRef* const refp
+                    = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", smemp}};
+                refp->taskp(VN_AS(funcp, Func));
+                valp = refp;
+            } else if (!elementCarried(ttp) && elementCarried(stp)) {
+                AstNodeFTask* const funcp = dynToFixedFunc(stp, ttp, flp);
+                if (!funcp) return recordShapeFail(outp, targetp, holdp, srcp, valp, flp);
+                AstFuncRef* const refp
+                    = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", smemp}};
+                refp->taskp(VN_AS(funcp, Func));
+                valp = refp;
+            }
+            outp = AstNode::addNextNull(outp, new AstAssign{flp, tmemp, valp});
+        }
+        VL_DO_DANGLING(targetp->deleteTree(), targetp);
+        if (holdp != srcp) VL_DO_DANGLING(holdp->deleteTree(), holdp);
+        return outp;
+    }
+
+    std::map<std::pair<const VhdlType*, const VhdlType*>, AstNodeFTask*> m_recShapeFuncs;
+
+    // The same conversion as an expression, for where a record in one shape
+    // is handed to something that wants the other
+    AstNodeFTask* recordShapeFunc(VhdlType* fromp, VhdlType* top, FileLine* flp) {
+        const auto key = std::make_pair(static_cast<const VhdlType*>(fromp),
+                                        static_cast<const VhdlType*>(top));
+        const auto it = m_recShapeFuncs.find(key);
+        if (it != m_recShapeFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        const std::string name = "__Vrecshape" + std::to_string(m_recShapeFuncs.size()) + "__"
+                                 + top->base()->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, lowerType(top, flp), flp));
+        AstVar* const vp = new AstVar{flp, VVarType::PORT, "v", VFlagChildDType{},
+                                      lowerType(fromp, flp)};
+        vp->direction(VDirection::INPUT);
+        vp->declDirection(VDirection::INPUT);
+        vp->funcLocal(true);
+        vp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        vp->trace(false);
+        funcp->addStmtsp(vp);
+        AstNode* const bodyp = recordShapeCopy(
+            new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, top,
+            new AstVarRef{flp, vp, VAccess::READ}, fromp, flp);
+        if (!bodyp) {
+            VL_DO_DANGLING(funcp->deleteTree(), funcp);
+            return nullptr;
+        }
+        funcp->addStmtsp(bodyp);
+        m_modp->addStmtsp(funcp);
+        m_recShapeFuncs.emplace(key, funcp);
+        return funcp;
+    }
+
+    // A record value put into the shape something else expects, as an
+    // expression
+    AstNodeExpr* recordAsShape(AstNodeVhdlExpr* valuep, VhdlType* wantp, FileLine* flp) {
+        VhdlType* const havep = shapeTypeOf(valuep);
+        if (!recordShapesDiffer(havep, wantp)) return nullptr;
+        AstNodeFTask* const funcp = recordShapeFunc(havep, wantp, flp);
+        if (!funcp) return nullptr;
+        AstNodeExpr* const srcp = lowerExpr(valuep);
+        if (!srcp) return nullptr;
+        AstFuncRef* const refp
+            = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", srcp}};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
+    AstNode* recordShapeFail(AstNode* outp, AstNodeExpr* targetp, AstNodeExpr* holdp,
+                             AstNodeExpr* srcp, AstNodeExpr* valp, FileLine* flp) {
+        unsup(flp, "record whose element has no length of its own copied here");
+        if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+        VL_DO_DANGLING(targetp->deleteTree(), targetp);
+        if (holdp != srcp) VL_DO_DANGLING(holdp->deleteTree(), holdp);
+        VL_DO_DANGLING(valp->deleteTree(), valp);
+        return nullptr;
+    }
+
     AstNode* lowerVarAssign(AstVhdlVarAssign* nodep) {
         FileLine* const flp = nodep->fileline();
         // "v := a when c else b" and "with s select v := ..." are defined as
@@ -9788,6 +10213,19 @@ private:
         }
         if (valuep && isDynTarget(nodep->targetp())) {
             return lowerDynCopy(nodep->targetp(), valuep, flp);
+        }
+        // One record in two shapes: copied element by element, each element
+        // converted between carried and fixed as it goes
+        if (valuep
+            && recordShapesDiffer(shapeTypeOf(nodep->targetp()), shapeTypeOf(valuep))) {
+            AstNodeExpr* const tgtp = lowerDriveTarget(nodep->targetp());
+            AstNodeExpr* const srcp = tgtp ? lowerExpr(valuep) : nullptr;
+            if (!srcp) {
+                if (tgtp) VL_DO_DANGLING(tgtp->deleteTree(), tgtp);
+                return nullptr;
+            }
+            return recordShapeCopy(tgtp, shapeTypeOf(nodep->targetp()), srcp,
+                                   shapeTypeOf(valuep), flp);
         }
         // A value that carries its own bounds put into an object that has
         // its own: the elements are copied across, and the lengths have to
@@ -12393,13 +12831,29 @@ private:
     std::map<std::string, AstNodeFTask*> m_signalCopies;
 
     // Whether every element of a record has a length the back end can fold
+    // Whether a value of this type can be carried with its own bounds
+    // beside it, judged by its shape alone
+    static bool carrierPossible(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ARRAY) return false;
+        if (isStringType(typep)) return false;
+        if (basep->indexTypes().size() != 1) return false;
+        const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        if (!elemp) return false;
+        if (elemp->base()->kind() == VhdlTypeKind::ARRAY && !elemp->lengthEmittable()) {
+            return false;
+        }
+        return true;
+    }
+
     static bool recordLengthEmittable(const VhdlType* typep) {
         if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return true;
         for (const VhdlSymbol* const elemp : typep->elements()) {
             const VhdlType* const etp = elemp ? elemp->typep() : nullptr;
             if (!etp) continue;
             if (etp->base()->kind() == VhdlTypeKind::ARRAY && !etp->lengthEmittable()
-                && !isStringType(etp)) {
+                && !isStringType(etp) && !carrierPossible(etp)) {
                 return false;
             }
             if (etp->base()->kind() == VhdlTypeKind::RECORD && !recordLengthEmittable(etp)) {
@@ -12962,6 +13416,18 @@ static bool hasUnboundGeneric(const AstVhdlEntity* entp) {
 }
 
 void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    // A record type that appears on a port keeps the shape elaboration gives
+    // it: the instance says how long its elements are, one structure is made
+    // per set of lengths, and a pin has no way to convert between shapes. So
+    // such a type is never carried, wherever else in the design it is used.
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([this](AstVhdlIfaceDecl* ifp) {
+            if (ifp->kind() != VhdlIfaceKind::SIGNAL) return;
+            const VhdlSymbol* const symp = ifp->vhdlSymp();
+            const VhdlType* const typep = symp ? symp->typep() : nullptr;
+            markPortRecord(typep);
+        });
+    }
     // Whether any signal transaction in the design is delivered at a time of
     // its own. This decides whether a process whose timeout expires has to
     // stand aside for a signal update in the same cycle, and it is a property
