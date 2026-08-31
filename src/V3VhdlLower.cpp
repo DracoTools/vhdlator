@@ -13881,9 +13881,15 @@ private:
         std::vector<std::pair<const VhdlSymbol*, AstVar*>> captureVars;
         if (captureIt != m_captureOf.end()) {
             for (VhdlSymbol* const capp : captureIt->second) {
-                AstVar* const varp
-                    = new AstVar{flp, VVarType::PORT, "__Vcap__" + capp->name(),
-                                 VFlagChildDType{}, lowerType(capp->typep(), flp)};
+                // An object the enclosing subprogram holds in a carrier is
+                // reached as one here too: its length is no more decided
+                // inside than out
+                AstNodeDType* const capDTypep
+                    = m_dynSyms.count(capp->resolved()) ? dynCarrierRef(capp->typep(), flp)
+                                                        : lowerType(capp->typep(), flp);
+                AstVar* const varp = new AstVar{flp, VVarType::PORT,
+                                                "__Vcap__" + capp->name(),
+                                                VFlagChildDType{}, capDTypep};
                 // Passed by reference whether or not this subprogram writes
                 // it: it may hand it on to another that does, and the object
                 // it stands for is the enclosing subprogram's own
