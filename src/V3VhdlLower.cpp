@@ -1284,6 +1284,17 @@ private:
                     && !psymp->typep()->lengthEmittable()) {
                     return true;
                 }
+                // An object of a type nothing constrains has the length its
+                // own value gives it, and says so whether or not its
+                // declaration has been reached: a subprogram's signature is
+                // settled before the declarations of its body are lowered
+                if (psymp
+                    && (psymp->kind() == VhdlSymKind::VARIABLE
+                        || psymp->kind() == VhdlSymKind::SHARED_VARIABLE
+                        || psymp->kind() == VhdlSymKind::CONSTANT)
+                    && carriedDynamically(psymp->typep())) {
+                    return true;
+                }
                 if (boundsOnlyRunningDecides(attrp->argp(), depth + 1)) return true;
                 continue;
             }
