@@ -105,6 +105,7 @@ class VhdlLowerVisitor final {
     // into its own list rather than straight into the module.
     AstNode* m_stmtsp = nullptr;
     AstNodeFTask* m_ftaskp = nullptr;  // Subprogram being built, if any
+    VhdlType* m_retCarrierp = nullptr;  // Its result, where that is a carrier
     std::map<const VhdlSymbol*, AstNodeFTask*> m_funcs;  // Subprogram -> what it became
     std::set<const VhdlSymbol*> m_emitting;  // Subprograms being emitted, to stop recursion
     // A signal driven from more than one place is resolved (6.5.2). Each
@@ -1263,6 +1264,28 @@ private:
     // all synthesizable code takes. A bound that names a variable, a signal
     // or a subprogram parameter is not settled until the declaration is
     // reached, and an object declared with one has to carry its own length.
+    // Whether an expression is worked out from what a call supplied, and so
+    // gives a different answer at each call
+    static bool mentionsParameter(const AstNode* nodep, int depth = 0) {
+        if (!nodep || depth > 32) return false;
+        for (const AstNode* p = nodep; p; p = p->nextp()) {
+            const VhdlSymbol* symp = nullptr;
+            if (const AstVhdlAttrName* const attrp = VN_CAST(p, VhdlAttrName)) {
+                symp = attrp->prefixp() && attrp->prefixp()->vhdlSymp()
+                           ? attrp->prefixp()->vhdlSymp()->resolved()
+                           : nullptr;
+            } else if (const AstNodeVhdlExpr* const exprp = VN_CAST(p, NodeVhdlExpr)) {
+                symp = exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+            }
+            if (symp && symp->kind() == VhdlSymKind::PARAMETER) return true;
+            if (mentionsParameter(p->op1p(), depth + 1)) return true;
+            if (mentionsParameter(p->op2p(), depth + 1)) return true;
+            if (mentionsParameter(p->op3p(), depth + 1)) return true;
+            if (mentionsParameter(p->op4p(), depth + 1)) return true;
+        }
+        return false;
+    }
+
     bool boundsOnlyRunningDecides(const AstNode* nodep, int depth = 0) const {
         if (!nodep || depth > 32) return false;
         for (const AstNode* p = nodep; p; p = p->nextp()) {
@@ -1318,6 +1341,16 @@ private:
                             = VN_CAST(symp->resolved()->declp(), VhdlObjectDecl);
                         if (declp && declp->defaultp()
                             && boundsOnlyRunningDecides(declp->defaultp(), depth + 1)) {
+                            return true;
+                        }
+                        // Nor is a value worked out by calling something with
+                        // what the call supplied -- "constant n : integer :=
+                        // maximum(l'high, r'high)". The emitted declaration
+                        // holds a call's result, which is not a number any
+                        // elaboration can read, and it differs per call
+                        if (declp && declp->defaultp()
+                            && !V3VhdlEval::eval(declp->defaultp()).isInt()
+                            && mentionsParameter(declp->defaultp())) {
                             return true;
                         }
                         break;
@@ -1685,7 +1718,34 @@ private:
     // Put a value into a carrier. Another carrier is copied whole; a value
     // whose length is known is copied element by element, since it is stored
     // from zero here and from its own left bound there.
-    AstNode* dynCarrierAssign(AstNodeExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
+    // A value whose bounds are written as expressions, put into a carrier.
+    // Nothing here can count its elements, so the copy is a loop over the
+    // bounds as written, which the back end folds per instance.
+    AstNode* dynFromEmittable(AstNodeExpr* targetp, AstNodeVhdlExpr* valuep,
+                              VhdlType* carrierTypep, FileLine* flp) {
+        if (!carrierTypep) return nullptr;
+        VhdlType* vtypep = valuep->vhdlTypep();
+        if (vtypep && !vtypep->lengthEmittable()) {
+            if (VhdlType* const convp = convertedReturnType(valuep)) vtypep = convp;
+        }
+        if (!vtypep || !vtypep->lengthEmittable() || vtypep->indexTypes().size() != 1) {
+            return nullptr;
+        }
+        // Only where the bounds are settled by elaboration. A bound naming a
+        // variable is not one the emitted declaration can hold
+        if (lengthOnlyRunningDecides(vtypep)) return nullptr;
+        AstNodeFTask* const funcp = dynOfFixedExprFunc(carrierTypep, vtypep, flp);
+        if (!funcp) return nullptr;
+        AstNodeExpr* const srcp = lowerExpr(valuep);
+        if (!srcp) return nullptr;
+        AstFuncRef* const refp
+            = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", srcp}};
+        refp->taskp(VN_AS(funcp, Func));
+        return new AstAssign{flp, targetp, refp};
+    }
+
+    AstNode* dynCarrierAssign(AstNodeExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp,
+                              VhdlType* carrierTypep = nullptr) {
         if (isDynValue(valuep)) {
             AstNodeExpr* const srcp = lowerExpr(valuep);
             if (!srcp) {
@@ -1717,9 +1777,21 @@ private:
             VL_DO_DANGLING(targetp->deleteTree(), targetp);
             return outp;
         }
-        const VhdlType* const vtypep = valuep->vhdlTypep();
+        // "std_ulogic_vector(v)" is as long as v is, though the conversion's
+        // own type says no length (9.3.6)
+        const VhdlType* vtypep = valuep->vhdlTypep();
+        if (vtypep && !vtypep->isConstrainedArray()) {
+            if (VhdlType* const convp = convertedReturnType(valuep)) vtypep = convp;
+        }
         if (!vtypep || !vtypep->isConstrainedArray() || vtypep->indexTypes().empty()
             || !vtypep->indexTypes()[0] || !vtypep->indexTypes()[0]->bounded()) {
+            // Where the value's length is an expression the elaborated
+            // design settles rather than a number here -- an object of a
+            // generic package instance, sized by its generics -- the copy is
+            // made by a helper whose bounds go in as they were written
+            if (AstNode* const outp = dynFromEmittable(targetp, valuep, carrierTypep, flp)) {
+                return outp;
+            }
             VL_DO_DANGLING(targetp->deleteTree(), targetp);
             unsup(flp, "value of a length only running decides copied from this expression");
             return nullptr;
@@ -2216,6 +2288,66 @@ private:
         return funcp;
     }
 
+    std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynOfLitFuncs;
+
+    // A string literal put into a carrier. Nothing gave the literal a length,
+    // so it has the one its own text has and the index range 1 to n (9.3.2).
+    AstNodeFTask* dynOfLiteralFunc(VhdlType* carrierTypep, int64_t count, FileLine* flp) {
+        if (count < 1 || count > 65536 || !m_modp) return nullptr;
+        const auto key = std::make_pair(
+            static_cast<const VhdlType*>(carrierTypep->base()), count);
+        const auto it = m_dynOfLitFuncs.find(key);
+        if (it != m_dynOfLitFuncs.end()) return it->second;
+        const std::string name = "__Vdynlit" + std::to_string(m_dynOfLitFuncs.size()) + "__"
+                                 + carrierTypep->base()->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
+        AstVar* const vp = new AstVar{
+            flp, VVarType::PORT, "v", VFlagChildDType{},
+            new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::UNSIGNED,
+                              static_cast<int>(count), static_cast<int>(count)}};
+        vp->direction(VDirection::INPUT);
+        vp->declDirection(VDirection::INPUT);
+        vp->funcLocal(true);
+        vp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        vp->trace(false);
+        funcp->addStmtsp(vp);
+        const auto out = [&]() {
+            return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
+        };
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp),
+                                       new AstConst{flp, AstConst::Signed32{}, 1}});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "rgt", flp),
+            new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitFalse{}}});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "q", flp),
+            new AstNewDynamic{
+                flp, new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)},
+                nullptr}});
+        for (int64_t k = 0; k < count; ++k) {
+            // A value of one element is that element: a one-bit type has no
+            // bit range to select from
+            AstNodeExpr* const srcp
+                = count == 1 ? static_cast<AstNodeExpr*>(rd(vp, flp))
+                             : new AstSelBit{flp, rd(vp, flp),
+                                             new AstConst{flp, AstConst::Signed32{},
+                                                          static_cast<int32_t>(count - 1 - k)}};
+            funcp->addStmtsp(new AstAssign{
+                flp,
+                new AstSelBit{flp, dynPart(out(), "q", flp),
+                              new AstConst{flp, AstConst::Signed32{},
+                                           static_cast<int32_t>(k)}},
+                srcp});
+        }
+        m_modp->addStmtsp(funcp);
+        m_dynOfLitFuncs.emplace(key, funcp);
+        return funcp;
+    }
+
     // Whatever an expression is worth, as a value that carries its own bounds
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
@@ -2227,7 +2359,20 @@ private:
             && asLongAsp->isConstrainedArray()) {
             typep = asLongAsp;
         }
-        if (!typep || !typep->isConstrainedArray()) return nullptr;
+        if (!typep || !typep->isConstrainedArray()) {
+            // A string literal nothing gave a length is as long as its text
+            const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
+            if (!litp || litp->kind() != VhdlLitKind::STRING) return nullptr;
+            AstNodeFTask* const litFuncp = dynOfLiteralFunc(
+                carrierTypep, static_cast<int64_t>(litp->text().size()), flp);
+            if (!litFuncp) return nullptr;
+            AstNodeExpr* const litValp = lowerExpr(nodep);
+            if (!litValp) return nullptr;
+            AstFuncRef* const litRefp
+                = new AstFuncRef{flp, litFuncp->name(), new AstArg{flp, "", litValp}};
+            litRefp->taskp(VN_AS(litFuncp, Func));
+            return litRefp;
+        }
         AstNodeFTask* const funcp = dynOfFixedFunc(carrierTypep, typep, flp);
         if (!funcp) return nullptr;
         AstNodeExpr* const valuep = lowerExpr(nodep);
@@ -2869,6 +3014,10 @@ private:
         if (name == "to_unsigned" || name == "to_signed" || name == "resize") {
             return carriedDynamically(callp->vhdlTypep());
         }
+        // The arithmetic of numeric_std is emitted rather than compiled, so
+        // its result is whatever the operation gives back here, however the
+        // package wrote the result subtype
+        if (inArithmeticPackage(symp)) return carriedDynamically(callp->vhdlTypep());
         // Otherwise what the function was emitted as, not what the
         // declaration said: a copy made for this site, or a body whose
         // return statement says how long the value is, gives the result a
@@ -3217,7 +3366,7 @@ private:
                 if (objp->defaultp()) {
                     if (AstNode* const setp
                         = dynCarrierAssign(new AstVarRef{flp, varp, VAccess::WRITE},
-                                           objp->defaultp(), flp)) {
+                                           objp->defaultp(), flp, symp->typep())) {
                         addStmt(setp);
                     }
                 }
@@ -5995,14 +6144,17 @@ private:
             AstNodeFTask* const eqp = !carrp    ? nullptr
                                       : byValue ? dynCmpFunc(carrp, flp)
                                                 : dynEqFunc(carrp, flp);
-            AstNodeExpr* const ap
-                = eqp ? asDynCarrier(nodep->lhsp(), carrp, flp, rtypep) : nullptr;
+            AstNodeExpr* ap = eqp ? asDynCarrier(nodep->lhsp(), carrp, flp, rtypep) : nullptr;
+            if (byValue && !ap && eqp) ap = dynOperand(nodep->lhsp(), carrp, flp);
             AstNodeExpr* bp = ap ? asDynCarrier(nodep->rhsp(), carrp, flp, ltypep) : nullptr;
             // The other side may be "(v'range => '0')", which is as long as
             // the value it is compared with and no longer
             if (ap && !bp && isDynValue(nodep->lhsp())) {
                 bp = dynFillOf(nodep->rhsp(), nodep->lhsp(), carrp, flp);
             }
+            // numeric_std compares a vector with an integer as well, and the
+            // integer is spread over as many places as it takes
+            if (byValue && !bp && ap) bp = dynOperand(nodep->rhsp(), carrp, flp);
             if (ap && bp) {
                 AstArg* const argsp
                     = AstNode::addNext(new AstArg{flp, "", ap}, new AstArg{flp, "", bp});
@@ -6386,6 +6538,28 @@ private:
             }
             default: break;
             }
+        }
+        // A comparison against an integer is by value (16.5), so the two are
+        // brought to a width that holds both rather than the vector's own:
+        // "u = 300" over eight bits is false, not a comparison with 44
+        const bool cmpOp = nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE
+                           || nodep->op() == VhdlBinaryOp::LT
+                           || nodep->op() == VhdlBinaryOp::LE
+                           || nodep->op() == VhdlBinaryOp::GT
+                           || nodep->op() == VhdlBinaryOp::GE;
+        if (cmpOp && lw && lw < 32 && !rw && isIntegerType(rtypep)) {
+            lhsp = sizedTo(isSignedType(ltypep) ? new AstSigned{flp, lhsp}
+                                                : static_cast<AstNodeExpr*>(
+                                                      new AstUnsigned{flp, lhsp}),
+                           32, flp);
+            return;
+        }
+        if (cmpOp && rw && rw < 32 && !lw && isIntegerType(ltypep)) {
+            rhsp = sizedTo(isSignedType(rtypep) ? new AstSigned{flp, rhsp}
+                                                : static_cast<AstNodeExpr*>(
+                                                      new AstUnsigned{flp, rhsp}),
+                           32, flp);
+            return;
         }
         if (lw && !rw && isIntegerType(rtypep)) {
             rhsp = sizedTo(rhsp, lw, flp);
@@ -10370,6 +10544,28 @@ private:
             return new AstIf{flp, lowerCondition(nextp->condp()), jumpp, nullptr};
         }
         if (AstVhdlReturn* const retp = VN_CAST(nodep, VhdlReturn)) {
+            // A guard returning a null value, where the result the copy was
+            // given has a length ("if arg'length < 1 then return NSLV"). The
+            // caller can do nothing with a value of no elements, so the
+            // result is as many zeros as it takes rather than a length error
+            const VhdlType* const vtypep
+                = retp->valuep() ? retp->valuep()->vhdlTypep() : nullptr;
+            // What the function gives back is carried, so a value that has a
+            // length of its own is put into a carrier before it is returned
+            if (m_retCarrierp && retp->valuep() && !isDynValue(retp->valuep())) {
+                if (AstNodeExpr* const carrp
+                    = asDynCarrier(retp->valuep(), m_retCarrierp, flp)) {
+                    return new AstReturn{flp, carrp};
+                }
+            }
+            const VhdlType* const velemp
+                = vtypep ? (vtypep->elementp() ? vtypep->elementp() : vtypep->base()->elementp())
+                         : nullptr;
+            if (vtypep && VN_IS(m_ftaskp, Func) && vtypep->base()->kind() == VhdlTypeKind::ARRAY
+                && vtypep->isConstrainedArray() && vtypep->dimLength(0) == 0
+                && !isStringType(vtypep) && isLogicish(velemp)) {
+                return new AstReturn{flp, new AstConst{flp, AstConst::All0{}}};
+            }
             return new AstReturn{flp, retp->valuep() ? lowerExpr(retp->valuep()) : nullptr};
         }
         if (AstVhdlWait* const waitp = VN_CAST(nodep, VhdlWait)) {
@@ -11140,7 +11336,9 @@ private:
         // value that has its own
         if (valuep && isDynObj(nodep->targetp()) && !isDynValue(valuep)) {
             AstNodeExpr* const tgtp = lowerDriveTarget(nodep->targetp());
-            if (tgtp) return dynCarrierAssign(tgtp, valuep, flp);
+            if (tgtp) {
+                return dynCarrierAssign(tgtp, valuep, flp, nodep->targetp()->vhdlTypep());
+            }
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
@@ -13871,8 +14069,14 @@ private:
         if (m_protClassp) ftaskp->classMethod(true);
         if (copyName.empty()) m_funcs.emplace(symp, ftaskp);
         VL_RESTORER(m_ftaskp);
+        VL_RESTORER(m_retCarrierp);
         VL_RESTORER_COPY(m_prefix);
         m_ftaskp = ftaskp;
+        m_retCarrierp = nullptr;
+        if (nodep->isFunction()) {
+            VhdlType* const rtp = returnType(nodep, symp);
+            if (carriedDynamically(rtp)) m_retCarrierp = rtp;
+        }
         m_prefix.clear();
         for (AstNode* p = firstParamOf(nodep); p; p = p->nextp()) {
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
@@ -14140,7 +14344,16 @@ private:
             return declaredp;
         }
         VhdlType* foundp = nullptr;
-        findReturnType(nodep->stmtsp(), foundp);
+        bool disagreep = false;
+        // A guard returning a null value says nothing about how long the
+        // result is on the paths that have one -- unless that is all there is
+        bool sawOpen = false;
+        findReturnType(nodep->stmtsp(), foundp, disagreep, true, sawOpen);
+        // Where a null value is all the body ever returns, that is the length
+        if (!foundp && !disagreep && !sawOpen) {
+            findReturnType(nodep->stmtsp(), foundp, disagreep, false, sawOpen);
+        }
+        if (disagreep) return declaredp;
         if (foundp) return foundp;
         // Where the returned expression has no length of its own -- "return v
         // and m", whose operator gives a result as long as its operands --
@@ -14180,29 +14393,100 @@ private:
         return false;
     }
 
-    static void findReturnType(AstNode* stmtsp, VhdlType*& foundp) {
-        for (AstNode* p = stmtsp; p && !foundp; p = p->nextp()) {
+    // The number of elements a constrained array type has, or -1 where the
+    // bounds do not fold
+    static int64_t arrayLength(const VhdlType* typep) {
+        if (!typep || typep->indexTypes().size() != 1 || !typep->indexTypes()[0]
+            || !typep->indexTypes()[0]->bounded()) {
+            return -1;
+        }
+        return typep->indexTypes()[0]->length();
+    }
+
+    // "return std_ulogic_vector(v)" is as long as v is, though the
+    // conversion's own type says no length (9.3.6). Give the result the index
+    // range of what was converted, which is a subtype of the declared type.
+    static VhdlType* convertedReturnType(AstNodeVhdlExpr* valuep) {
+        AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall);
+        if (!callp || !callp->prefixp() || !callp->prefixp()->vhdlSymp()) return nullptr;
+        if (callp->prefixp()->vhdlSymp()->resolved()->kind() != VhdlSymKind::TYPE) {
+            return nullptr;
+        }
+        AstVhdlAssoc* const argp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (!argp || argp->nextp() || !argp->actualp()) return nullptr;
+        const VhdlType* const fromp = argp->actualp()->vhdlTypep();
+        VhdlType* const top = valuep->vhdlTypep();
+        if (!fromp || !top || !fromp->isConstrainedArray()) return nullptr;
+        if (top->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (fromp->indexTypes().size() != 1 || !fromp->indexTypes()[0]) return nullptr;
+        if (arrayLength(fromp) < 0) return nullptr;
+        // Only where the two hold the same element, so that the length of one
+        // is the length of the other
+        const VhdlType* const felemp
+            = fromp->elementp() ? fromp->elementp() : fromp->base()->elementp();
+        VhdlType* const telemp
+            = top->elementp() ? top->elementp() : top->base()->elementp();
+        if (!felemp || !telemp || felemp->base() != telemp->base()) return nullptr;
+        VhdlType* const outp
+            = VhdlSymTab::newType(VhdlTypeKind::ARRAY, "", valuep->fileline());
+        outp->base(top->base());
+        outp->addIndexType(fromp->indexTypes()[0]);
+        outp->elementp(telemp);
+        outp->unconstrained(false);
+        return outp;
+    }
+
+    static void findReturnType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep,
+                               bool skipZero, bool& sawOpen) {
+        for (AstNode* p = stmtsp; p && !disagreep; p = p->nextp()) {
             if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+                // A return whose value has no length of its own: nothing but
+                // the value itself says how long the result is
                 if (retp->valuep() && retp->valuep()->vhdlTypep()
-                    && retp->valuep()->vhdlTypep()->isConstrainedArray()) {
-                    foundp = retp->valuep()->vhdlTypep();
+                    && retp->valuep()->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY
+                    && !retp->valuep()->vhdlTypep()->isConstrainedArray()
+                    && !convertedReturnType(retp->valuep())) {
+                    sawOpen = true;
+                }
+                VhdlType* convp = nullptr;
+                if (retp->valuep() && retp->valuep()->vhdlTypep()
+                    && !retp->valuep()->vhdlTypep()->isConstrainedArray()) {
+                    convp = convertedReturnType(retp->valuep());
+                }
+                if (retp->valuep() && (convp || (retp->valuep()->vhdlTypep()
+                                                 && retp->valuep()->vhdlTypep()->isConstrainedArray()))) {
+                    VhdlType* const typep = convp ? convp : retp->valuep()->vhdlTypep();
+                    // A guard returning a null value ("if arg'length < 1 then
+                    // return NSLV") says nothing about how long the result is
+                    // on the paths that have one
+                    if (skipZero && arrayLength(typep) == 0) continue;
+                    // Two return statements of different lengths settle
+                    // nothing: the length is whichever path ran
+                    if (foundp && arrayLength(foundp) != arrayLength(typep)) {
+                        disagreep = true;
+                        foundp = nullptr;
+                        return;
+                    }
+                    if (!foundp) foundp = typep;
                 }
                 continue;
             }
             if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
-                for (AstNode* ap = ifp->altsp(); ap && !foundp; ap = ap->nextp()) {
-                    findReturnType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp);
+                for (AstNode* ap = ifp->altsp(); ap && !disagreep; ap = ap->nextp()) {
+                    findReturnType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
+                                   sawOpen);
                 }
                 continue;
             }
             if (AstVhdlCase* const casep = VN_CAST(p, VhdlCase)) {
-                for (AstNode* ap = casep->altsp(); ap && !foundp; ap = ap->nextp()) {
-                    findReturnType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp);
+                for (AstNode* ap = casep->altsp(); ap && !disagreep; ap = ap->nextp()) {
+                    findReturnType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
+                                   sawOpen);
                 }
                 continue;
             }
             if (AstVhdlLoop* const loopp = VN_CAST(p, VhdlLoop)) {
-                findReturnType(loopp->stmtsp(), foundp);
+                findReturnType(loopp->stmtsp(), foundp, disagreep, skipZero, sawOpen);
             }
         }
     }
