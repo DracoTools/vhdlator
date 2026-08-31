@@ -3728,6 +3728,12 @@ private:
             return new AstConst{flp, AstConst::String{},
                                 attr == "simple_name" ? name : ":" + name + ":"};
         }
+        // What this process is putting on the signal, which is not what the
+        // signal is worth: several drivers are resolved into that, and this
+        // one only contributes (16.2.4)
+        if (attr == "driving" || attr == "driving_value") {
+            if (AstNodeExpr* const outp = lowerDrivingAttr(nodep, attr, flp)) return outp;
+        }
         // The signal attributes ask about what has happened to a signal, not
         // about its type (16.2.2)
         if (attr == "event" || attr == "active" || attr == "last_value"
@@ -4642,6 +4648,64 @@ private:
         m_delayeds.emplace(key, dlyp);
         return shadowPart(prefixp, dlyp, flp);
     }
+
+    // "S'DRIVING" and "S'DRIVING_VALUE" ask about the driver this process
+    // has, not about the signal: where a signal is resolved, what the
+    // process puts on it is one contribution among several, and its own
+    // value is kept apart from the signal's for exactly that reason
+    // (16.2.4).  Where the signal is not resolved there is one driver, and
+    // it is the signal itself.
+    // Whether a signal was declared "bus" or "register", whose drivers may
+    // disconnect (4.3.1.2)
+    static bool guardedSignal(const VhdlSymbol* symp) {
+        if (!symp) return false;
+        if (const AstVhdlObjectDecl* const declp
+            = VN_CAST(symp->declp(), VhdlObjectDecl)) {
+            return declp->signalKind() != VhdlSignalKind::NONE;
+        }
+        if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
+            return ifp->signalKind() != VhdlSignalKind::NONE;
+        }
+        return false;
+    }
+
+    AstNodeExpr* lowerDrivingAttr(AstVhdlAttrName* nodep, const std::string& attr,
+                                  FileLine* flp) {
+        const VhdlSymbol* const symp = rootSymOf(nodep->prefixp());
+        if (!symp) return nullptr;
+        VhdlSymbol* const rsymp = const_cast<VhdlSymbol*>(symp->resolved());
+        // A driver that only ever writes part of the signal is not driving
+        // the whole of it, and which process wrote which part is not known
+        // here, so it is refused rather than answered for the whole
+        if (s_partialDriven.count(rsymp)) return nullptr;
+        const auto it = m_drivers.find(rsymp);
+        const VhdlDriver* drvp = nullptr;
+        if (it != m_drivers.end()) {
+            // None counted yet means this is the first driver
+            const int idx = m_driverUsed.count(rsymp) ? m_driverUsed.at(rsymp) : 0;
+            if (idx < 0 || idx >= static_cast<int>(it->second.size())) return nullptr;
+            drvp = &it->second[idx];
+        }
+        if (attr == "driving") {
+            // A guarded signal's driver stops driving when it is handed a
+            // null transaction, and that disconnection is not modelled here.
+            // Saying "driving" for one of those would be a wrong answer
+            // where saying nothing is only a missing one.
+            if (guardedSignal(rsymp)) return nullptr;
+            if (drvp && drvp->enp) return new AstVarRef{flp, drvp->enp, VAccess::READ};
+            return new AstConst{flp, AstConst::BitTrue{}};
+        }
+        // What this driver holds now, which is not what it has just
+        // scheduled: an assignment is a transaction still to come
+        if (drvp && drvp->valp) {
+            VL_RESTORER_COPY(m_vars);
+            m_vars[rsymp] = drvp->valp;
+            return lowerExpr(nodep->prefixp());
+        }
+        if (it != m_drivers.end()) return nullptr;  // Resolved, but no driver here
+        return lowerExpr(nodep->prefixp());
+    }
+
 
     // The signal attributes of 16.2.4, answered from what shadowFor and
     // makeActive keep
