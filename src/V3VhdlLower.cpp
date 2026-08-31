@@ -380,11 +380,48 @@ private:
                         onep = recordAsShape(asp->actualp(), formalp, asp->fileline());
                     }
                 }
+                // The other way about: a copy made for a call that carries
+                // one of its values carries every one of them, so a value
+                // whose length is fixed is made into a carrier here
+                if (!onep && !isDynValue(asp->actualp())) {
+                    AstVar* const parp = taskParamAt(refp->taskp(),
+                                                     namep ? namep->name() : "", pos);
+                    VhdlType* const atypep = asp->actualp()->vhdlTypep();
+                    if (isCarrierVar(parp) && atypep) {
+                        onep = asDynCarrier(asp->actualp(), atypep, asp->fileline());
+                    }
+                }
                 if (!onep) onep = lowerExpr(asp->actualp());
                 refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "", onep});
             }
         }
         addCaptureArgs(refp, symp, refp->fileline());
+    }
+
+    // The parameter of the copy a call reaches, named or in order
+    static AstVar* taskParamAt(const AstNodeFTask* taskp, const std::string& name,
+                               size_t pos) {
+        if (!taskp) return nullptr;
+        size_t k = 0;
+        for (AstNode* p = taskp->stmtsp(); p; p = p->nextp()) {
+            AstVar* const varp = VN_CAST(p, Var);
+            if (!varp || !varp->isIO()) continue;
+            if (!name.empty()) {
+                if (varp->name() == name) return varp;
+            } else if (k == pos) {
+                return varp;
+            }
+            ++k;
+        }
+        return nullptr;
+    }
+    // Whether such a parameter was declared as a carrier
+    static bool isCarrierVar(const AstVar* varp) {
+        if (!varp) return false;
+        const AstNodeDType* const dtp
+            = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+        const AstRefDType* const refp = VN_CAST(dtp, RefDType);
+        return refp && refp->name().compare(0, 6, "__Vdyn") == 0;
     }
 
     // A nested subprogram is passed what it reaches out of its own region for
@@ -5690,13 +5727,19 @@ private:
             }
         }
         // Comparing values that carry their own bounds is a length and then
-        // an element at a time, which a function of the type does (9.2.3)
+        // an element at a time, which a function of the type does (9.2.3).
+        // numeric_std's own "=" is not that one: it compares what the two
+        // are worth, so an eight-bit three equals a four-bit three (16.5),
+        // and it goes the way of the other numeric operators below.
         if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
             && (isDynValue(nodep->lhsp()) || isDynValue(nodep->rhsp()))) {
             // Whichever side is carried says which carrier the two are
             // compared as; the other is made into one of the same type
             VhdlType* const carrp = isDynValue(nodep->lhsp()) ? ltypep : rtypep;
-            AstNodeFTask* const eqp = carrp ? dynEqFunc(carrp, flp) : nullptr;
+            const bool byValue = symp && inArithmeticPackage(symp);
+            AstNodeFTask* const eqp = !carrp    ? nullptr
+                                      : byValue ? dynCmpFunc(carrp, flp)
+                                                : dynEqFunc(carrp, flp);
             AstNodeExpr* const ap
                 = eqp ? asDynCarrier(nodep->lhsp(), carrp, flp, rtypep) : nullptr;
             AstNodeExpr* bp = ap ? asDynCarrier(nodep->rhsp(), carrp, flp, ltypep) : nullptr;
@@ -5706,10 +5749,23 @@ private:
                 bp = dynFillOf(nodep->rhsp(), nodep->lhsp(), carrp, flp);
             }
             if (ap && bp) {
-                AstFuncRef* const refp = new AstFuncRef{
-                    flp, eqp->name(),
-                    AstNode::addNext(new AstArg{flp, "", ap}, new AstArg{flp, "", bp})};
+                AstArg* const argsp
+                    = AstNode::addNext(new AstArg{flp, "", ap}, new AstArg{flp, "", bp});
+                // The value comparison is told how to read what lies above
+                // the shorter operand's own length
+                if (byValue) {
+                    argsp->addNext(new AstArg{
+                        flp, "",
+                        new AstConst{flp, AstConst::BitTrue{}, isSignedType(carrp)}});
+                }
+                AstFuncRef* const refp = new AstFuncRef{flp, eqp->name(), argsp};
                 refp->taskp(VN_AS(eqp, Func));
+                // What it gives back is -1, 0 or 1, not a truth value
+                if (byValue) {
+                    return nodep->op() == VhdlBinaryOp::NE
+                               ? static_cast<AstNodeExpr*>(new AstNeq{flp, refp, i32(0, flp)})
+                               : static_cast<AstNodeExpr*>(new AstEq{flp, refp, i32(0, flp)});
+                }
                 if (nodep->op() == VhdlBinaryOp::NE) return new AstLogNot{flp, refp};
                 return refp;
             }
