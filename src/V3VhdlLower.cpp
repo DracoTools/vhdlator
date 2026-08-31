@@ -1291,7 +1291,8 @@ private:
                 if (psymp
                     && (psymp->kind() == VhdlSymKind::VARIABLE
                         || psymp->kind() == VhdlSymKind::SHARED_VARIABLE
-                        || psymp->kind() == VhdlSymKind::CONSTANT)
+                        || psymp->kind() == VhdlSymKind::CONSTANT
+                        || psymp->kind() == VhdlSymKind::PARAMETER)
                     && carriedDynamically(psymp->typep())) {
                     return true;
                 }
