@@ -354,6 +354,13 @@ private:
                 if (!asp || !asp->actualp()) continue;
                 const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
                 AstNodeExpr* onep = nullptr;
+                // A written parameter given an object of a fixed length is
+                // handed the carrier made for it just before the call
+                const auto cit = m_argCarrier.find(asp);
+                if (cit != m_argCarrier.end()) {
+                    onep = new AstVarRef{asp->fileline(), cit->second, VAccess::READWRITE};
+                    m_argCarrier.erase(cit);
+                }
                 // A value that carries its own bounds, handed to a parameter
                 // whose subtype fixes them, is copied into one of those
                 if (symp && isDynValue(asp->actualp())) {
@@ -1403,10 +1410,16 @@ private:
     AstNodeDType* dynCarrierRef(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
-        const auto found = m_dynNames.find(basep);
+        // One carrier per element type, not per array type. Closely related
+        // array types have the same element and the same index range, and a
+        // conversion between them may change neither (9.3.6) -- so
+        // "std_logic_vector(u)" over a carried value is nothing at all, and
+        // giving the two their own structures would make it something.
+        VhdlType* const keyp = elemp ? elemp->base() : basep;
+        const auto found = m_dynNames.find(keyp);
         if (found != m_dynNames.end()) return new AstRefDType{flp, found->second};
-        const std::string name = "__Vdyn" + std::to_string(++m_nameNum) + "__" + basep->name();
-        m_dynNames.emplace(basep, name);
+        const std::string name = "__Vdyn" + std::to_string(++m_nameNum) + "__" + keyp->name();
+        m_dynNames.emplace(keyp, name);
         AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
         structp->name(name);
         AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
@@ -11716,10 +11729,31 @@ private:
                                + "' is written and has no length at this call");
                 return false;
             }
-            unsup(flp, "call to '" + symp->name() + "' whose parameter '"
-                           + symp->paramName(at)
-                           + "' is written and is given a value of a fixed length");
-            return false;
+            // A carrier for the call, filled from the object and copied
+            // back into it afterwards, which is what a copy-out parameter
+            // means anyway (4.2.2.3)
+            AstNodeFTask* const inp = dynOfFixedFunc(atypep, atypep, flp);
+            AstNodeFTask* const outFuncp = dynToFixedFunc(atypep, atypep, flp);
+            AstNodeExpr* const readp = inp ? lowerExpr(asp->actualp()) : nullptr;
+            AstNodeExpr* const writep = readp ? lowerDriveTarget(asp->actualp()) : nullptr;
+            if (!outFuncp || !writep) {
+                if (readp) VL_DO_DANGLING(readp->deleteTree(), readp);
+                unsup(flp, "call to '" + symp->name() + "' whose parameter '"
+                               + symp->paramName(at)
+                               + "' is written and is given a value of a fixed length");
+                return false;
+            }
+            AstVar* const tp = newTempVar("__Vdynrt", dynCarrierRef(atypep, flp), flp);
+            AstFuncRef* const fillp
+                = new AstFuncRef{flp, inp->name(), new AstArg{flp, "", readp}};
+            fillp->taskp(VN_AS(inp, Func));
+            prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(tp, flp), fillp});
+            AstFuncRef* const backp
+                = new AstFuncRef{flp, outFuncp->name(), new AstArg{flp, "", rd(tp, flp)}};
+            backp->taskp(VN_AS(outFuncp, Func));
+            postp = AstNode::addNextNull(postp, new AstAssign{flp, writep, backp});
+            m_argCarrier.emplace(asp, tp);
+            continue;
         }
         return true;
     }
@@ -13624,6 +13658,7 @@ private:
     // A signal-class formal bound to part of a signal rather than to a whole
     // one -- "drive(r.y, 3)" -- which has no variable of its own to stand
     // for it, so the actual's own name is lowered again at each reference
+    std::map<const AstNode*, AstVar*> m_argCarrier;  // Assoc -> its call's carrier
     std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_bindExprs;
     // A signal-class formal of a record type whose elements the call named
     // one at a time -- "p(iface.d => sd, iface.v => sv)" -- so the formal
