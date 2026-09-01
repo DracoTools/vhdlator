@@ -6648,6 +6648,16 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
                     if (ifp->defaultp()) markIn(ifp->defaultp(), changed);
                 }
             });
+            // And the entity's own default is the value an instance that
+            // says nothing about that generic is elaborated with, so what it
+            // names is settled by elaboration too (6.5.6.2). A verification
+            // component's configuration record arrives this way.
+            unitp->foreach([&](AstVhdlEntity* entp) {
+                for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
+                    AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+                    if (ifp->defaultp()) markIn(ifp->defaultp(), changed);
+                }
+            });
         }
         if (!changed) break;
     }
