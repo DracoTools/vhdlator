@@ -12694,6 +12694,204 @@ private:
         return AstNode::addNextNull(outp, postp);
     }
 
+    // A slice of an object whose ends only running settles, as a value that
+    // carries its own bounds. The object goes in whole and the ends go in as
+    // numbers, so nothing about the slice has to be known where the helper
+    // is written: a slice runs the way the object it is taken from runs
+    // (8.5), which is the one thing the type says.
+    std::map<std::pair<const VhdlType*, const VhdlType*>, AstNodeFTask*> m_dynOfSliceFuncs;
+    AstNodeFTask* dynOfSliceFunc(VhdlType* carrierTypep, VhdlType* objTypep,
+                                 FileLine* origFlp) {
+        const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
+                                        static_cast<const VhdlType*>(objTypep));
+        const auto it = m_dynOfSliceFuncs.find(key);
+        if (it != m_dynOfSliceFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        const VhdlType* const idxp
+            = objTypep->indexTypes().empty() ? nullptr : objTypep->indexTypes()[0];
+        if (!idxp || !idxp->bounded()) return nullptr;
+        const bool ascending = idxp->ascending();
+        FileLine* const flp = dynFl(origFlp);
+        AstFunc* const funcp
+            = newDynFunc("__Vdynofslice", carrierTypep, dynCarrierRef(carrierTypep, flp), flp);
+        AstVar* const vp = dynArg(funcp, "v", lowerType(objTypep, flp), flp);
+        AstVar* const lftp = dynArg(funcp, "lft", newIntDType(flp), flp);
+        AstVar* const rgtp = dynArg(funcp, "rgt", newIntDType(flp), flp);
+        AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        for (AstVar* const onep : {np, kp}) funcp->addStmtsp(onep);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), rd(lftp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rd(rgtp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(np, flp),
+            new AstAdd{flp,
+                       ascending
+                           ? static_cast<AstNodeExpr*>(
+                               new AstSub{flp, rd(rgtp, flp), rd(lftp, flp)})
+                           : static_cast<AstNodeExpr*>(
+                               new AstSub{flp, rd(lftp, flp), rd(rgtp, flp)}),
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(np, flp), nullptr}});
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(kp, flp), new AstConst{flp, AstConst::Signed32{}, 0}});
+        AstNodeExpr* const atp
+            = ascending
+                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lftp, flp), rd(kp, flp)})
+                  : static_cast<AstNodeExpr*>(new AstSub{flp, rd(lftp, flp), rd(kp, flp)});
+        AstNode* bodyp = new AstAssign{
+            flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)},
+            new AstSelBit{flp, rd(vp, flp), atp}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp),
+                       new AstAdd{flp, rd(kp, flp),
+                                  new AstConst{flp, AstConst::Signed32{}, 1}}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
+        m_modp->addStmtsp(funcp);
+        m_dynOfSliceFuncs.emplace(key, funcp);
+        return funcp;
+    }
+
+    // The same the other way: what the call wrote into the carrier goes back
+    // into the slice it was taken from
+    std::map<std::pair<const VhdlType*, const VhdlType*>, AstNodeFTask*> m_dynToSliceFuncs;
+    AstNodeFTask* dynToSliceFunc(VhdlType* carrierTypep, VhdlType* objTypep,
+                                 FileLine* origFlp) {
+        const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
+                                        static_cast<const VhdlType*>(objTypep));
+        const auto it = m_dynToSliceFuncs.find(key);
+        if (it != m_dynToSliceFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        const VhdlType* const idxp
+            = objTypep->indexTypes().empty() ? nullptr : objTypep->indexTypes()[0];
+        if (!idxp || !idxp->bounded()) return nullptr;
+        const bool ascending = idxp->ascending();
+        FileLine* const flp = dynFl(origFlp);
+        const std::string name = "__Vdyntoslice" + std::to_string(++m_nameNum) + "__"
+                                 + carrierTypep->base()->name();
+        AstTask* const taskp = new AstTask{flp, name, nullptr};
+        taskp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        AstVar* const vp = new AstVar{flp, VVarType::PORT, "v", VFlagChildDType{},
+                                      lowerType(objTypep, flp)};
+        vp->direction(VDirection::INOUT);
+        vp->declDirection(VDirection::INOUT);
+        vp->funcLocal(true);
+        vp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        vp->trace(false);
+        taskp->addStmtsp(vp);
+        AstVar* lftp = nullptr;
+        AstVar* rgtp = nullptr;
+        AstVar* cp = nullptr;
+        for (int i = 0; i < 3; ++i) {
+            const char* const nm = i == 0 ? "lft" : i == 1 ? "rgt" : "c";
+            AstVar* const argp
+                = new AstVar{flp, VVarType::PORT, nm, VFlagChildDType{},
+                             i < 2 ? newIntDType(flp) : dynCarrierRef(carrierTypep, flp)};
+            argp->direction(VDirection::INPUT);
+            argp->declDirection(VDirection::INPUT);
+            argp->funcLocal(true);
+            argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            argp->trace(false);
+            taskp->addStmtsp(argp);
+            if (i == 0) lftp = argp;
+            if (i == 1) rgtp = argp;
+            if (i == 2) cp = argp;
+        }
+        AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        for (AstVar* const onep : {np, kp}) taskp->addStmtsp(onep);
+        taskp->addStmtsp(new AstAssign{
+            flp, wr(np, flp),
+            new AstAdd{flp,
+                       ascending
+                           ? static_cast<AstNodeExpr*>(
+                               new AstSub{flp, rd(rgtp, flp), rd(lftp, flp)})
+                           : static_cast<AstNodeExpr*>(
+                               new AstSub{flp, rd(lftp, flp), rd(rgtp, flp)}),
+                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+        taskp->addStmtsp(
+            new AstAssign{flp, wr(kp, flp), new AstConst{flp, AstConst::Signed32{}, 0}});
+        AstNodeExpr* const atp
+            = ascending
+                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lftp, flp), rd(kp, flp)})
+                  : static_cast<AstNodeExpr*>(new AstSub{flp, rd(lftp, flp), rd(kp, flp)});
+        AstNode* bodyp = new AstAssign{
+            flp, new AstSelBit{flp, wr(vp, flp), atp},
+            new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), rd(kp, flp)}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp),
+                       new AstAdd{flp, rd(kp, flp),
+                                  new AstConst{flp, AstConst::Signed32{}, 1}}}));
+        taskp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
+        m_modp->addStmtsp(taskp);
+        m_dynToSliceFuncs.emplace(key, taskp);
+        return taskp;
+    }
+
+    // "p(v(hi downto lo))", where hi and lo are worked out while running and
+    // p writes what it is given: the slice goes in as a carrier built here
+    // and comes back into the same slice afterwards (4.2.2.3)
+    bool dynSliceRoundTrip(AstVhdlAssoc* asp, VhdlType* carrierTypep, AstNode*& prep,
+                           AstNode*& postp, AstVar*& carrierp, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(asp->actualp(), VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rangep || !callp->prefixp()) return false;
+        VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        if (!objTypep || !objTypep->isConstrainedArray()) return false;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, ascending, dirKnown) || !leftp || !rightp
+            || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return false;
+        }
+        AstNodeFTask* const inp = dynOfSliceFunc(carrierTypep, objTypep, flp);
+        AstNodeFTask* const outp = inp ? dynToSliceFunc(carrierTypep, objTypep, flp) : nullptr;
+        // The object is named twice over -- once to read it, once to write
+        // it back -- and lowering the name twice would make a second object
+        // of whatever it is that has to be made to reach it
+        AstNodeExpr* const readp = outp ? lowerExpr(callp->prefixp()) : nullptr;
+        AstNodeExpr* const writep = readp && isAssignable(readp) ? readp->cloneTree(false)
+                                                                 : nullptr;
+        if (!writep) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (readp) VL_DO_DANGLING(readp->deleteTree(), readp);
+            return false;
+        }
+        // The ends are read four times over -- twice each way -- so they are
+        // worked out once into names of their own
+        AstVar* const lop = newTempVar("__Vrtlo", newIntDType(flp), flp);
+        AstVar* const hip = newTempVar("__Vrthi", newIntDType(flp), flp);
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(lop, flp), leftp});
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(hip, flp), rightp});
+        AstVar* const tp = newTempVar("__Vrtcarr", dynCarrierRef(carrierTypep, flp), flp);
+        AstArg* inArgsp = new AstArg{flp, "", readp};
+        inArgsp->addNext(new AstArg{flp, "", rd(lop, flp)});
+        inArgsp->addNext(new AstArg{flp, "", rd(hip, flp)});
+        AstFuncRef* const fillp = new AstFuncRef{flp, inp->name(), inArgsp};
+        fillp->taskp(VN_AS(inp, Func));
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(tp, flp), fillp});
+        AstArg* outArgsp = new AstArg{flp, "", writep};
+        outArgsp->addNext(new AstArg{flp, "", rd(lop, flp)});
+        outArgsp->addNext(new AstArg{flp, "", rd(hip, flp)});
+        outArgsp->addNext(new AstArg{flp, "", rd(tp, flp)});
+        AstTaskRef* const backp = new AstTaskRef{flp, outp->name(), outArgsp};
+        backp->taskp(VN_AS(outp, Task));
+        postp = AstNode::addNextNull(postp, new AstStmtExpr{flp, backp});
+        carrierp = tp;
+        return true;
+    }
+
     // Where a carried parameter the body writes is given an object whose
     // subtype fixes its length, a carrier is made for the call, filled from
     // that object, and copied back into it when the call returns. The call
@@ -12719,6 +12917,14 @@ private:
                                    && atypep->indexTypes().size() == 1
                                    && !lengthOnlyRunningDecides(atypep);
             if (!fixed && !emittable) {
+                // A slice whose ends only running settles: the object it is
+                // taken from has a length, and the ends go in as numbers
+                VhdlType* const carrp = symp->paramTypes()[at];
+                AstVar* carrierp = nullptr;
+                if (carrp && dynSliceRoundTrip(asp, carrp, prep, postp, carrierp, flp)) {
+                    m_argCarrier.emplace(asp, carrierp);
+                    continue;
+                }
                 unsup(flp, "call to '" + symp->name() + "' whose parameter '"
                                + symp->paramName(at)
                                + "' is written and has no length at this call");
