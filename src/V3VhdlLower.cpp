@@ -1743,6 +1743,14 @@ private:
         if (vtypep && !vtypep->lengthEmittable()) {
             if (VhdlType* const convp = convertedReturnType(valuep)) vtypep = convp;
         }
+        // A signal parameter says no length of its own: the signal the call
+        // passed is what has one, and the bounds it was written with are
+        // ones this module can emit (4.2.2.3)
+        if (!vtypep || !vtypep->lengthEmittable()) {
+            if (VhdlType* const boundp = boundTypeOf(valuep)) {
+                if (boundp->lengthEmittable()) vtypep = boundp;
+            }
+        }
         if (!vtypep || !vtypep->lengthEmittable() || vtypep->indexTypes().size() != 1) {
             return nullptr;
         }
@@ -1797,6 +1805,14 @@ private:
         const VhdlType* vtypep = valuep->vhdlTypep();
         if (vtypep && !vtypep->isConstrainedArray()) {
             if (VhdlType* const convp = convertedReturnType(valuep)) vtypep = convp;
+        }
+        // A signal parameter says no length of its own: the signal the call
+        // passed is what has one, and inside the copy made for that call it
+        // is known (4.2.2.3)
+        if (arrayStillOpen(vtypep)) {
+            if (const VhdlType* const boundp = boundTypeOf(valuep)) {
+                if (!arrayStillOpen(boundp)) vtypep = boundp;
+            }
         }
         if (!vtypep || !vtypep->isConstrainedArray() || vtypep->indexTypes().empty()
             || !vtypep->indexTypes()[0] || !vtypep->indexTypes()[0]->bounded()) {
@@ -4687,16 +4703,15 @@ private:
     // and it may name an element of a record whose constraint the object
     // carries rather than the type -- which is how a verification component
     // hands a bus interface on, one element at a time (4.2.2.3, 5.3.3).
-    const VhdlType* boundTypeOf(AstNodeVhdlExpr* exprp, int depth = 0) {
+    VhdlType* boundTypeOf(AstNodeVhdlExpr* exprp, int depth = 0) {
         if (!exprp || depth > 16) return nullptr;
         if (AstVhdlSelected* const selp = VN_CAST(exprp, VhdlSelected)) {
             const AstVhdlName* const namep = VN_CAST(selp->suffixp(), VhdlName);
-            const VhdlType* const fromp
-                = namep ? boundTypeOf(selp->prefixp(), depth + 1) : nullptr;
+            VhdlType* const fromp = namep ? boundTypeOf(selp->prefixp(), depth + 1) : nullptr;
             if (!fromp || fromp->base()->kind() != VhdlTypeKind::RECORD) return nullptr;
             const std::vector<VhdlSymbol*>& elems
                 = fromp->elements().empty() ? fromp->base()->elements() : fromp->elements();
-            for (const VhdlSymbol* const elemp : elems) {
+            for (VhdlSymbol* const elemp : elems) {
                 if (elemp->name() == namep->name()) return elemp->typep();
             }
             return nullptr;
@@ -4710,7 +4725,7 @@ private:
         if (tIt2 != m_bindTypes.end() && tIt2->second) return tIt2->second;
         const auto eIt = m_bindExprs.find(symp);
         if (eIt != m_bindExprs.end() && eIt->second && eIt->second != exprp) {
-            if (const VhdlType* const outp = boundTypeOf(eIt->second, depth + 1)) return outp;
+            if (VhdlType* const outp = boundTypeOf(eIt->second, depth + 1)) return outp;
         }
         return symp->typep() ? symp->typep() : exprp->vhdlTypep();
     }
@@ -12771,7 +12786,7 @@ private:
         std::map<const VhdlSymbol*, VhdlSymbol*> symBind;
         std::map<const VhdlSymbol*, std::map<std::string, AstNodeVhdlExpr*>> elemBind;
         std::map<const VhdlSymbol*, DynSigBind> dynBind;
-        std::map<const VhdlSymbol*, const VhdlType*> typeBind;
+        std::map<const VhdlSymbol*, VhdlType*> typeBind;
         std::map<const VhdlSymbol*, DrvBind> drvBind;
         std::string key = symp->name();
         for (size_t i = 0; i < formals.size(); ++i) {
@@ -12881,7 +12896,7 @@ private:
             // the bindings that lead to the object are still the ones in
             // reach: inside the copy they are this call's own
             if (actualp) {
-                if (const VhdlType* const atp = boundTypeOf(actualp)) {
+                if (VhdlType* const atp = boundTypeOf(actualp)) {
                     typeBind.emplace(formals[i]->vhdlSymp(), atp);
                 }
             }
@@ -14761,7 +14776,7 @@ private:
     // bindings that lead to the object are still in reach. A copy that calls
     // another passes it on, so a formal several calls deep still knows how
     // long the object it names is.
-    std::map<const VhdlSymbol*, const VhdlType*> m_bindTypes;
+    std::map<const VhdlSymbol*, VhdlType*> m_bindTypes;
     // A signal-class formal of a record type whose elements the call named
     // one at a time -- "p(iface.d => sd, iface.v => sv)" -- so the formal
     // stands for no one object and each element is a signal of its own
