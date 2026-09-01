@@ -3555,7 +3555,19 @@ private:
             if (!boundsp) return false;
             boundsp->foreach([&](AstNodeVhdlExpr* refp) {
                 const VhdlSymbol* const refSymp = refp->vhdlSymp();
-                if (refSymp && refSymp->kind() == VhdlSymKind::PARAMETER) ok = false;
+                if (!refSymp) return;
+                // A bound naming something the calling subprogram declared --
+                // its own parameter, or a constant of its own worked out from
+                // one -- says nothing where the copy is analyzed: the copy
+                // cannot see the caller's declarations
+                switch (refSymp->resolved()->kind()) {
+                case VhdlSymKind::PARAMETER:
+                case VhdlSymKind::VARIABLE: ok = false; break;
+                case VhdlSymKind::CONSTANT:
+                    if (!refSymp->resolved()->hasValue()) ok = false;
+                    break;
+                default: break;
+                }
             });
         }
         const VhdlType* const elemp
