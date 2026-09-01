@@ -5531,7 +5531,28 @@ private:
             // whichever module happened to read it first
             if (declaredInPackage(symp)) m_emitForUnit = true;
             m_stmtsp = nullptr;
-            if (declp->defaultp()) {
+            // "file f : text is <name>" is open from the moment the
+            // declaration is elaborated (6.4.2.5). A package's is elaborated
+            // once for the design, before anything runs, so the open is the
+            // object's own initial value rather than a statement in whichever
+            // module happened to read the package first.
+            AstNodeExpr* openp = nullptr;
+            if (declp->kind() == VhdlObjKind::FILE && declp->fileNamep()) {
+                if (AstNodeExpr* const namep = lowerExpr(declp->fileNamep())) {
+                    std::string mode = "r";
+                    if (declp->fileOpenp()) {
+                        const VhdlValue kind = V3VhdlEval::eval(declp->fileOpenp());
+                        if (kind.isInt()) {
+                            mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
+                        }
+                    }
+                    openp = new AstFOpen{flp, namep,
+                                         new AstConst{flp, AstConst::String{}, mode}};
+                }
+            }
+            if (openp) {
+                varp->valuep(openp);
+            } else if (declp->defaultp()) {
                 varp->valuep(lowerExpr(declp->defaultp()));
             } else {
                 varp->valuep(defaultValueFor(symp->typep(), flp));
