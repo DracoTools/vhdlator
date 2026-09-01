@@ -4201,6 +4201,14 @@ private:
                     }
                 }
             }
+            // Where that left the length open, the actual may be an element
+            // of a record the call passed on: the object it ends at is the
+            // one whose subtype says how long the element is
+            if (arrayStillOpen(typep)) {
+                if (const VhdlType* const boundp = boundTypeOf(nodep->prefixp())) {
+                    if (!arrayStillOpen(boundp)) typep = boundp;
+                }
+            }
             // An access value is dereferenced without saying so (8.1)
             if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS
                 && typep->base()->designatedp()) {
@@ -4655,6 +4663,47 @@ private:
     // the last event was, and a bit that flips on each one. The writes are
     // non-blocking, so a process reading them in the same delta sees what was
     // true before the event, which is what the attributes are defined against.
+    // The subtype an actual has, where a call bound a signal parameter to
+    // it. The actual may itself be a formal of the copy that made the call,
+    // and it may name an element of a record whose constraint the object
+    // carries rather than the type -- which is how a verification component
+    // hands a bus interface on, one element at a time (4.2.2.3, 5.3.3).
+    const VhdlType* boundTypeOf(AstNodeVhdlExpr* exprp, int depth = 0) {
+        if (!exprp || depth > 16) return nullptr;
+        if (AstVhdlSelected* const selp = VN_CAST(exprp, VhdlSelected)) {
+            const AstVhdlName* const namep = VN_CAST(selp->suffixp(), VhdlName);
+            const VhdlType* const fromp
+                = namep ? boundTypeOf(selp->prefixp(), depth + 1) : nullptr;
+            if (!fromp || fromp->base()->kind() != VhdlTypeKind::RECORD) return nullptr;
+            const std::vector<VhdlSymbol*>& elems
+                = fromp->elements().empty() ? fromp->base()->elements() : fromp->elements();
+            for (const VhdlSymbol* const elemp : elems) {
+                if (elemp->name() == namep->name()) return elemp->typep();
+            }
+            return nullptr;
+        }
+        VhdlSymbol* symp = exprp->vhdlSymp();
+        if (!symp) return exprp->vhdlTypep();
+        const auto tIt = m_bindTypes.find(symp);
+        if (tIt != m_bindTypes.end() && tIt->second) return tIt->second;
+        symp = boundSignal(symp);
+        const auto tIt2 = m_bindTypes.find(symp);
+        if (tIt2 != m_bindTypes.end() && tIt2->second) return tIt2->second;
+        const auto eIt = m_bindExprs.find(symp);
+        if (eIt != m_bindExprs.end() && eIt->second && eIt->second != exprp) {
+            if (const VhdlType* const outp = boundTypeOf(eIt->second, depth + 1)) return outp;
+        }
+        return symp->typep() ? symp->typep() : exprp->vhdlTypep();
+    }
+
+    // Whether such a type still says nothing about how long it is
+    static bool arrayStillOpen(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (typep->isConstrainedArray()) return false;
+        const std::vector<VhdlType*>& idx = typep->indexTypes();
+        return idx.empty() || !idx[0] || !idx[0]->boundsp();
+    }
+
     // A signal-class formal names whatever signal the call passed. Inside a
     // copy of the body made for one call site, that signal is known, and its
     // history is the one the formal's attributes ask about (4.2.2.3).
@@ -12573,6 +12622,7 @@ private:
         std::map<const VhdlSymbol*, VhdlSymbol*> symBind;
         std::map<const VhdlSymbol*, std::map<std::string, AstNodeVhdlExpr*>> elemBind;
         std::map<const VhdlSymbol*, DynSigBind> dynBind;
+        std::map<const VhdlSymbol*, const VhdlType*> typeBind;
         std::string key = symp->name();
         for (size_t i = 0; i < formals.size(); ++i) {
             AstNodeVhdlExpr* actualp = nullptr;
@@ -12640,6 +12690,14 @@ private:
                         key += "|" + pair.first + "=" + path;
                     }
                     continue;
+                }
+            }
+            // What the actual's subtype is has to be worked out here, where
+            // the bindings that lead to the object are still the ones in
+            // reach: inside the copy they are this call's own
+            if (actualp) {
+                if (const VhdlType* const atp = boundTypeOf(actualp)) {
+                    typeBind.emplace(formals[i]->vhdlSymp(), atp);
                 }
             }
             // A signal actual is a signal of the design, either named plainly
@@ -12723,11 +12781,13 @@ private:
                 VL_RESTORER_COPY(m_bindSymbols);
                 VL_RESTORER_COPY(m_bindElems);
                 VL_RESTORER_COPY(m_bindDynSigs);
+                VL_RESTORER_COPY(m_bindTypes);
                 m_bindSignals = bind;
                 m_bindExprs = exprBind;
                 m_bindSymbols = symBind;
                 m_bindElems = elemBind;
                 m_bindDynSigs = dynBind;
+                for (const auto& pair : typeBind) m_bindTypes[pair.first] = pair.second;
                 m_ftaskp = nullptr;
                 m_prefix.clear();
                 for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
@@ -14489,6 +14549,11 @@ private:
     // for it, so the actual's own name is lowered again at each reference
     std::map<const AstNode*, AstVar*> m_argCarrier;  // Assoc -> its call's carrier
     std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_bindExprs;
+    // The subtype the actual has, worked out at the call site where the
+    // bindings that lead to the object are still in reach. A copy that calls
+    // another passes it on, so a formal several calls deep still knows how
+    // long the object it names is.
+    std::map<const VhdlSymbol*, const VhdlType*> m_bindTypes;
     // A signal-class formal of a record type whose elements the call named
     // one at a time -- "p(iface.d => sd, iface.v => sv)" -- so the formal
     // stands for no one object and each element is a signal of its own
@@ -15166,6 +15231,7 @@ private:
         m_emitting.clear();
         m_drivers.clear();
         m_subDrivers.clear();
+        m_bindTypes.clear();
         m_driverCount.clear();
         m_driverUsed.clear();
         s_partialDriven.clear();
