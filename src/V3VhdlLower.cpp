@@ -5396,6 +5396,7 @@ private:
             m_protClassp->addStmtsp(varp);
         } else if (isPkgShared(symp)) {
             // One object for the whole design, in the unit every module sees
+            varp->name(pkgObjectName(symp));
             varp->lifetime(VLifetime::STATIC_EXPLICIT);
             m_netlistp->dollarUnitPkgAddp()->addStmtsp(varp);
             m_pkgShared.emplace(symp, varp);
@@ -5549,6 +5550,24 @@ private:
         return declaredInPackage(symp);
     }
 
+    // What an object a package declares is called in the emitted code. The
+    // whole path the unit is reached by goes in the name, library included:
+    // two libraries may each declare a package of the same name -- which is
+    // how a verification framework gives every component its own command
+    // package -- and those are different objects (13.5).
+    static std::string pkgObjectName(const VhdlSymbol* symp) {
+        std::string name = symp->name();
+        if (const VhdlScope* const scopep = symp->declScopep()) {
+            std::string path
+                = scopep->pathPrefix().empty() ? scopep->name() : scopep->pathPrefix();
+            for (char& c : path) {
+                if (c == ':' || c == '.' || c == '(' || c == ')') c = '_';
+            }
+            name = path + "__" + name;
+        }
+        return "__Vpkg__" + name;
+    }
+
     AstVar* pkgSignalVar(VhdlSymbol* symp, FileLine* flp) {
         if (!declaredInPackage(symp)) return nullptr;
         const auto found = m_pkgSigs.find(symp);
@@ -5558,11 +5577,7 @@ private:
         }
         AstPackage* const unitp = m_netlistp ? m_netlistp->dollarUnitPkgAddp() : nullptr;
         if (!unitp) return nullptr;
-        std::string name = symp->name();
-        if (const VhdlScope* const scopep = symp->declScopep()) {
-            name = scopep->name() + "__" + name;
-        }
-        AstVar* const varp = new AstVar{flp, VVarType::VAR, "__Vpkg__" + name,
+        AstVar* const varp = new AstVar{flp, VVarType::VAR, pkgObjectName(symp),
                                         VFlagChildDType{}, lowerType(symp->typep(), flp)};
         varp->lifetime(VLifetime::STATIC_EXPLICIT);
         varp->trace(false);
