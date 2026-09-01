@@ -131,6 +131,13 @@ class VhdlLowerVisitor final {
     // A protected type becomes a class, and a shared variable of it an
     // instance of that class (5.6). The class is built once, on first use.
     std::map<const VhdlType*, AstClass*> m_protClasses;
+    // What a protected type's class already holds. The class is made once
+    // and every module that reaches the type shares it, so its methods and
+    // its variables outlive the per-module maps: emitting them again would
+    // declare the object's state a second time, and the two copies would
+    // count separately (5.6.2).
+    std::map<const VhdlSymbol*, AstNodeFTask*> m_protMethods;
+    std::map<const VhdlSymbol*, AstVar*> m_protVars;
     // The names those classes have been given. A generic package instantiated
     // twice has two protected types of the one name, and each needs a class
     // of its own in the emitted code (4.9).
@@ -801,6 +808,26 @@ private:
         return emittedFunc(symp);
     }
 
+    // A method of a protected type, emitted into its class when the type
+    // was first reached. A call may name the declaration or the body (5.6.2),
+    // so both find the one method.
+    AstNodeFTask* protMethodOf(VhdlSymbol* symp) {
+        if (m_protMethods.empty() || !symp) return nullptr;
+        std::vector<const VhdlSymbol*> tries{symp};
+        if (symp->bodyp() && symp->bodyp()->vhdlSymp()) tries.push_back(symp->bodyp()->vhdlSymp());
+        if (const AstVhdlSubprogDecl* const declp = VN_CAST(symp->declp(), VhdlSubprogDecl)) {
+            if (declp->vhdlSymp()) tries.push_back(declp->vhdlSymp());
+        }
+        for (const VhdlSymbol* const onep : tries) {
+            const auto it = m_protMethods.find(onep);
+            if (it != m_protMethods.end()) {
+                m_funcs[symp] = it->second;
+                return it->second;
+            }
+        }
+        return nullptr;
+    }
+
     // What a subprogram became. A method is declared in the protected type
     // and again in its body (5.6.2), and a call may name either symbol, so
     // both find the one function that was emitted.
@@ -808,6 +835,7 @@ private:
         if (!symp) return nullptr;
         auto it = m_funcs.find(symp);
         if (it != m_funcs.end()) return it->second;
+        if (AstNodeFTask* const protp = protMethodOf(symp)) return protp;
         if (symp->bodyp() && symp->bodyp()->vhdlSymp()) {
             it = m_funcs.find(symp->bodyp()->vhdlSymp());
             if (it != m_funcs.end()) return it->second;
@@ -3484,6 +3512,7 @@ private:
         // elsewhere.
         varp->trace(true);
         m_vars.emplace(symp, varp);
+        if (m_protClassp && inProtectedBody(symp)) m_protVars.emplace(symp, varp);
         return varp;
     }
     std::set<std::string> m_names;  // Names already used in this module
@@ -5324,6 +5353,18 @@ private:
         if (!symp) return nullptr;
         const auto it = m_vars.find(symp);
         if (it != m_vars.end()) return it->second;
+        // A protected type's own variable is the class's, and the class is
+        // shared: a second one would be a second copy of the object's state
+        const auto protIt = m_protVars.find(symp);
+        if (protIt != m_protVars.end()) {
+            m_vars[symp] = protIt->second;
+            return protIt->second;
+        }
+        const auto sharedIt = m_pkgShared.find(symp);
+        if (sharedIt != m_pkgShared.end()) {
+            m_vars[symp] = sharedIt->second;
+            return sharedIt->second;
+        }
         if (!symp->isObject() || symp->predefined()) return nullptr;
         // A deferred constant is declared in the package and given its value
         // in the package body, and it is that second declaration which says
@@ -5353,6 +5394,11 @@ private:
         }
         if (m_protClassp && inProtectedBody(symp)) {
             m_protClassp->addStmtsp(varp);
+        } else if (isPkgShared(symp)) {
+            // One object for the whole design, in the unit every module sees
+            varp->lifetime(VLifetime::STATIC_EXPLICIT);
+            m_netlistp->dollarUnitPkgAddp()->addStmtsp(varp);
+            m_pkgShared.emplace(symp, varp);
         } else if (m_protClassp && m_modp) {
             // Declared outside the protected type, so it belongs to the
             // module however it was reached
@@ -5479,6 +5525,10 @@ private:
     // every module can see and every reference finds the same object. VUnit's
     // message passing is built on one of these.
     std::map<const VhdlSymbol*, AstVar*> m_pkgSigs;
+    // A shared variable a package declares is likewise one object for the
+    // whole design (6.4.2.4): every module that names it works on the same
+    // state, which for a protected type is the whole point of it.
+    std::map<const VhdlSymbol*, AstVar*> m_pkgShared;
 
     // Whether a package is where the declaration stands. A signal of a module
     // that this has simply not reached yet is not one of these, and giving it
@@ -5490,6 +5540,13 @@ private:
             if (VN_IS(p, VhdlArchitecture) || VN_IS(p, VhdlEntity)) return false;
         }
         return false;
+    }
+
+    // Whether this object is a shared variable a package declares, which is
+    // one object for the whole design however many modules name it (6.4.2.4)
+    bool isPkgShared(const VhdlSymbol* symp) const {
+        if (!symp || symp->kind() != VhdlSymKind::SHARED_VARIABLE) return false;
+        return declaredInPackage(symp);
     }
 
     AstVar* pkgSignalVar(VhdlSymbol* symp, FileLine* flp) {
@@ -15073,6 +15130,9 @@ private:
         m_ftaskp = nullptr;  // The task itself belongs to the module
         redirectPortDrives(ftaskp);
         addStmt(ftaskp);
+        if (m_protClassp && copyName.empty() && inProtectedBody(symp)) {
+            m_protMethods.emplace(symp, ftaskp);
+        }
         return ftaskp;
     }
 
@@ -15764,9 +15824,12 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
 // A reference to a signal a package declares has to say which package it is
 // in, or V3Scope cannot find the one object all the modules share.
 void VhdlLowerVisitor::markPackageSignalRefs() {
-    if (m_pkgSigs.empty() || !m_netlistp) return;
+    if ((m_pkgSigs.empty() && m_pkgShared.empty()) || !m_netlistp) return;
     std::set<const AstVar*> varps;
     for (const auto& pair : m_pkgSigs) varps.insert(pair.second);
+    // A shared variable a package declares is one object too, and is reached
+    // the same way
+    for (const auto& pair : m_pkgShared) varps.insert(pair.second);
     AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
     m_netlistp->foreach([&](AstVarRef* refp) {
         if (varps.count(refp->varp())) refp->classOrPackagep(unitp);
