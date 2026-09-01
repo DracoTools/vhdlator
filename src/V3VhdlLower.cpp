@@ -1846,13 +1846,25 @@ private:
 
     // The value an aggregate that is nothing but "others => v" gives every
     // element, or null if the aggregate says anything else
+    // Whether a choice is an object's own range -- "(v'range => '0')" --
+    // which names every index there is, as "others" does (9.3.3.3)
+    static bool wholeRangeChoice(const AstVhdlChoice* choicep) {
+        const AstVhdlRange* const rp = choicep ? choicep->rangep() : nullptr;
+        const AstVhdlAttrName* const attrp = rp ? VN_CAST(rp->attrp(), VhdlAttrName) : nullptr;
+        if (!attrp) return false;
+        return attrp->name() == "range" || attrp->name() == "reverse_range";
+    }
+
     AstNodeExpr* othersFillValue(AstNodeVhdlExpr* nodep) {
         AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
         if (!aggp) return nullptr;
         AstVhdlElemAssoc* const elemp = aggp->elemsp();
         if (!elemp || elemp->nextp() || !elemp->valuep()) return nullptr;
         AstVhdlChoice* const choicep = elemp->choicesp();
-        if (!choicep || choicep->nextp() || !choicep->isOthers()) return nullptr;
+        if (!choicep || choicep->nextp()) return nullptr;
+        // "(v'range => 'X')" covers the whole of it, which is what "others"
+        // says another way (9.3.3.3)
+        if (!choicep->isOthers() && !wholeRangeChoice(choicep)) return nullptr;
         return lowerExpr(elemp->valuep());
     }
 
@@ -12628,7 +12640,13 @@ private:
             if (paramModeOf(symp, at) == VhdlMode::IN) continue;
             if (isDynObj(asp->actualp())) continue;
             VhdlType* const atypep = asp->actualp()->vhdlTypep();
-            if (!atypep || !atypep->isConstrainedArray()) {
+            // A length an instance settles counts as one: it is written in
+            // terms this module can emit, and folds with the instance
+            const bool fixed = atypep && atypep->isConstrainedArray();
+            const bool emittable = atypep && !fixed && atypep->lengthEmittable()
+                                   && atypep->indexTypes().size() == 1
+                                   && !lengthOnlyRunningDecides(atypep);
+            if (!fixed && !emittable) {
                 unsup(flp, "call to '" + symp->name() + "' whose parameter '"
                                + symp->paramName(at)
                                + "' is written and has no length at this call");
@@ -12637,8 +12655,10 @@ private:
             // A carrier for the call, filled from the object and copied
             // back into it afterwards, which is what a copy-out parameter
             // means anyway (4.2.2.3)
-            AstNodeFTask* const inp = dynOfFixedFunc(atypep, atypep, flp);
-            AstNodeFTask* const outFuncp = dynToFixedFunc(atypep, atypep, flp);
+            AstNodeFTask* const inp = fixed ? dynOfFixedFunc(atypep, atypep, flp)
+                                            : dynOfFixedExprFunc(atypep, atypep, flp);
+            AstNodeFTask* const outFuncp = fixed ? dynToFixedFunc(atypep, atypep, flp)
+                                                 : dynToFixedExprFunc(atypep, atypep, flp);
             AstNodeExpr* const readp = inp ? lowerExpr(asp->actualp()) : nullptr;
             AstNodeExpr* const writep = readp ? lowerDriveTarget(asp->actualp()) : nullptr;
             if (!outFuncp || !writep) {

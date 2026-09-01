@@ -6192,9 +6192,34 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
     } else if (sliceIndexp) {
         sliceIndexp = cloneSubtype(sliceIndexp, nodep->fileline());
         sliceIndexp->unbound();
+        // A slice whose bounds did not fold is still that long: a bound
+        // naming a generic is fixed once the instance is elaborated, so the
+        // range is kept as written for the back end to fold then (8.5).
+        // Only where every name in them is a generic: that value arrives
+        // with the instance, where a variable's or a loop parameter's
+        // arrives only while running.
+        if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
+            bool onlyGenerics = true;
+            bool anyName = false;
+            rp->foreach([&](AstVhdlName* namep) {
+                const VhdlSymbol* const nsymp
+                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                anyName = true;
+                if (!nsymp || nsymp->kind() != VhdlSymKind::GENERIC) onlyGenerics = false;
+            });
+            if (info.valid && !info.unbounded && rp->leftp() && rp->rightp() && anyName
+                && onlyGenerics) {
+                sliceIndexp->boundsp(rp);
+            }
+        }
     }
     outp->addIndexType(sliceIndexp ? sliceIndexp : V3VhdlStd::integerType());
     outp->unconstrained(!sliceIndexp || !sliceIndexp->bounded());
+    // A dimension whose range is there but did not fold is not an open one:
+    // it says how long the slice is, in terms an instance settles (8.5)
+    if (sliceIndexp && !sliceIndexp->bounded() && sliceIndexp->boundsp()) {
+        outp->openDimsKnown();
+    }
     return outp;
 }
 
