@@ -4041,8 +4041,15 @@ private:
             // "every element" without writing them out. A dimension of its
             // own needs one such initializer per level, each carrying the
             // type of that level.
+            // One level per dimension this type has, and no further: an
+            // array of an array type is one-dimensional, and its element's
+            // own dimensions belong to the element, which gives its own
+            // default. Counting those as well made the two disagree, and
+            // then the array had no default at all and nothing said so.
             std::vector<AstNodeDType*> levels;
-            for (AstNodeDType* d = dtypep; VN_IS(d, UnpackArrayDType);
+            AstNodeDType* d = dtypep;
+            for (size_t left = typep->indexTypes().size();
+                 left-- > 0 && VN_IS(d, UnpackArrayDType);
                  d = VN_AS(d, UnpackArrayDType)->childDTypep()) {
                 levels.push_back(d);
             }
