@@ -7761,8 +7761,24 @@ private:
                 // resolves from the context of the assignment. That works
                 // only where the value is given to something whose subtype
                 // says the width; a result that carries its own bounds is
-                // built below with the length the call names.
-                sized = firstp;
+                // built below with the length the call names. Where the
+                // result's own subtype says how long it is -- a length an
+                // instance settles counts, since it is a number by the time
+                // widths are worked out -- the value is cast to it outright,
+                // so the conversion happens where the call asks for it
+                // rather than wherever the value ends up.
+                // A SIGNED value keeps its sign as it widens, so the cast
+                // is told what it is casting before it is asked to make it
+                // longer (9.3.6)
+                AstNodeDType* const wantp
+                    = resultp && resultp->lengthEmittable() ? lowerType(resultp, flp) : nullptr;
+                if (wantp) {
+                    AstNodeExpr* const srcp
+                        = isSignedType(resultp)
+                              ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
+                              : firstp;
+                    sized = new AstCast{flp, srcp, VFlagChildDType{}, wantp};
+                }
             } else if (resultp && resultp->lengthEmittable()) {
                 // A width that names a generic or a port's bounds is not a
                 // number here. The result's own subtype says it, and what the
