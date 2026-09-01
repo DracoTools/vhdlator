@@ -146,6 +146,7 @@ class VhdlLowerVisitor final {
     // in each of them is neither what the language says nor what fits.
     std::map<const VhdlSymbol*, AstNodeFTask*> m_pkgFuncs;
     bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
+    bool m_asTarget = false;  // Lowering what an assignment writes, not what it reads
     bool m_emitForUnit = false;  // Building something the unit will hold
     // The names those classes have been given. A generic package instantiated
     // twice has two protected types of the one name, and each needs a class
@@ -2110,6 +2111,9 @@ private:
         }
         // A slice of one is another, with the bounds it was written with
         if (isDynSlice(nodep)) return true;
+        // And so is a slice of an object whose own length the text fixes, if
+        // its two ends do not keep a fixed distance apart
+        if (isRunningSlice(nodep)) return true;
         // An operator over such a value gives back another: nothing along
         // the way decided a length the operand did not have
         if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
@@ -2943,6 +2947,80 @@ private:
         return funcp;
     }
 
+    // "a & b" over values that carry their own bounds: as long as the two
+    // together, their elements one lot after the other. Neither operand's
+    // own bounds carry over -- the result runs the way the index subtype of
+    // its type runs and starts at that subtype's left bound (9.2.5), which
+    // is what makes "a & b" assignable to anything of the same length.
+    std::map<const VhdlType*, AstNodeFTask*> m_dynCatFuncs;
+    AstNodeFTask* dynCatFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynCatFuncs.find(basep);
+        if (it != m_dynCatFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        VhdlType* const idxp
+            = basep->indexTypes().empty() ? nullptr : basep->indexTypes()[0];
+        const bool ascending = !idxp || idxp->ascending();
+        AstNodeExpr* leftp = nullptr;
+        if (idxp) {
+            if (AstRange* const rangep = boundsRange(idxp, flp)) {
+                leftp = rangep->leftp()->unlinkFrBack();
+                VL_DO_DANGLING(rangep->deleteTree(), rangep);
+            }
+        }
+        if (!leftp) leftp = i32(0, flp);
+        AstFunc* const funcp = newDynFunc("__Vdyncat", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
+        AstVar* const bp = dynArg(funcp, "b", dynCarrierRef(typep, flp), flp);
+        AstVar* const nap = newFuncLocal("na", newIntDType(flp), flp);
+        AstVar* const nbp = newFuncLocal("nb", newIntDType(flp), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        for (AstVar* const vp : {nap, nbp, ip}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(nap, flp), dynCarrierLength(rd(ap, flp), flp)});
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(nbp, flp), dynCarrierLength(rd(bp, flp), flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), leftp});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+        AstNodeExpr* const spanp
+            = new AstSub{flp, new AstAdd{flp, rd(nap, flp), rd(nbp, flp)}, i32(1, flp)};
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "rgt", flp),
+            ascending
+                ? static_cast<AstNodeExpr*>(
+                    new AstAdd{flp, dynPart(out(), "lft", flp)->cloneTree(false), spanp})
+                : static_cast<AstNodeExpr*>(
+                    new AstSub{flp, dynPart(out(), "lft", flp)->cloneTree(false), spanp})});
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "q", flp),
+                          new AstNewDynamic{
+                              flp, new AstAdd{flp, rd(nap, flp), rd(nbp, flp)}, nullptr}});
+        for (int half = 0; half < 2; ++half) {
+            AstVar* const srcp = half == 0 ? ap : bp;
+            AstVar* const lenp = half == 0 ? nap : nbp;
+            AstNodeExpr* const atp
+                = half == 0 ? rd(ip, flp)
+                            : static_cast<AstNodeExpr*>(
+                                new AstAdd{flp, rd(nap, flp), rd(ip, flp)});
+            funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+            AstNode* bodyp = new AstAssign{
+                flp, new AstSelBit{flp, dynPart(out(), "q", flp), atp},
+                new AstSelBit{flp, dynPart(rd(srcp, flp), "q", flp), rd(ip, flp)}};
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+            funcp->addStmtsp(
+                whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
+        }
+        addHelperFunc(funcp);
+        m_dynCatFuncs.insert_or_assign(basep, funcp);
+        return funcp;
+    }
+
     // "not v" over a carrier: as long as the operand, with its own bounds,
     // and each element inverted (9.2.2)
     AstNodeFTask* dynNotFunc(VhdlType* typep, FileLine* origFlp) {
@@ -3072,6 +3150,7 @@ private:
         if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
             return dynValueType(qp->valuep());
         }
+        if (isRunningSlice(nodep)) return nodep->vhdlTypep();
         return nullptr;
     }
 
@@ -5064,6 +5143,10 @@ private:
     // The left-hand side of an ordinary driver. For a signal something else
     // forces, that is the variable the drivers keep rather than the signal.
     AstNodeExpr* lowerDriveTarget(AstNodeVhdlExpr* targetp) {
+        // A slice being written names the object's own places; only a slice
+        // being read is a value with bounds of its own
+        VL_RESTORER(m_asTarget);
+        m_asTarget = true;
         VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(targetp));
         const auto it = rootp ? m_forceDrv.find(rootp->resolved()) : m_forceDrv.end();
         if (it == m_forceDrv.end()) return lowerExpr(targetp);
@@ -6690,6 +6773,19 @@ private:
 
     // Whether an expression is a slice of a value that carries its own
     // bounds, and if it is, the range it was written with
+    // A slice of an object whose own length the text fixes, but whose ends
+    // only running settles: what that is, is a value whose length only
+    // running decides, and it carries its own bounds like any other (8.5)
+    bool isRunningSlice(const AstNodeVhdlExpr* nodep) const {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->prefixp()) return false;
+        AstVhdlRange* const rangep = VN_CAST(callp->argsp(), VhdlRange);
+        if (!rangep || sliceSpanKnown(rangep)) return false;
+        const VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        if (!objTypep || !objTypep->isConstrainedArray()) return false;
+        return carriedDynamically(callp->vhdlTypep());
+    }
+
     bool isDynSlice(const AstNodeVhdlExpr* nodep) const {
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->prefixp()) return false;
@@ -6701,6 +6797,48 @@ private:
     AstVhdlRange* dynSliceRange(AstNodeVhdlExpr* nodep) {
         if (!isDynSlice(nodep)) return nullptr;
         return VN_CAST(VN_AS(nodep, VhdlCall)->argsp(), VhdlRange);
+    }
+
+    // Writing into a slice of an object whose own length the text fixes, but
+    // whose ends only running settles. The value goes in as a carrier and
+    // the ends as numbers, and the helper puts the elements back where the
+    // object keeps them.
+    AstNode* runningSliceAssign(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
+                                FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rangep || !callp->prefixp()) return nullptr;
+        VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        VhdlType* const carrp = callp->vhdlTypep();
+        if (!objTypep || !carrp) return nullptr;
+        AstNodeFTask* const outFuncp = dynToSliceFunc(carrp, objTypep, flp);
+        if (!outFuncp) return nullptr;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, ascending, dirKnown) || !leftp || !rightp
+            || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstNodeExpr* const writep = lowerDriveTarget(callp->prefixp());
+        AstNodeExpr* const carrierp
+            = writep ? asDynCarrier(valuep, carrp, flp, carrp) : nullptr;
+        if (!carrierp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (writep) VL_DO_DANGLING(writep->deleteTree(), writep);
+            return nullptr;
+        }
+        AstArg* argsp = new AstArg{flp, "", writep};
+        argsp->addNext(new AstArg{flp, "", leftp});
+        argsp->addNext(new AstArg{flp, "", rightp});
+        argsp->addNext(new AstArg{flp, "", carrierp});
+        AstTaskRef* const refp = new AstTaskRef{flp, outFuncp->name(), argsp};
+        refp->taskp(VN_AS(outFuncp, Task));
+        return new AstStmtExpr{flp, refp};
     }
 
     // Writing into such a slice: the elements are put back where the whole
@@ -6818,7 +6956,8 @@ private:
         case VhdlBinaryOp::SUB:
         case VhdlBinaryOp::DIV:
         case VhdlBinaryOp::MOD:
-        case VhdlBinaryOp::REM: break;
+        case VhdlBinaryOp::REM:
+        case VhdlBinaryOp::CONCAT: break;
         default: return false;
         }
         VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
@@ -6884,6 +7023,19 @@ private:
             return call(funcp,
                         {cp, placesp, new AstConst{flp, AstConst::BitFalse{}}, bit(rot),
                          bit(norm)});
+        }
+        case VhdlBinaryOp::CONCAT: {
+            AstNodeFTask* const funcp = dynCatFunc(carrp, flp);
+            AstNodeExpr* const catap
+                = funcp ? asDynCarrier(nodep->lhsp(), carrp, flp, rtypep) : nullptr;
+            AstNodeExpr* const catbp
+                = catap ? asDynCarrier(nodep->rhsp(), carrp, flp, ltypep) : nullptr;
+            if (!catbp) {
+                if (catap) VL_DO_DANGLING(catap->deleteTree(), catap);
+                unsup(flp, "concatenation of a value whose length only running decides");
+                return nullptr;
+            }
+            return call(funcp, {catap, catbp});
         }
         case VhdlBinaryOp::ADD:
         case VhdlBinaryOp::SUB: {
@@ -7571,9 +7723,32 @@ private:
                 // writes both ends, so the width has to be recovered from
                 // them before Verilator's fixed-width form can be used.
                 if (!VN_IS(leftp, Const) || !VN_IS(rightp, Const)) {
-                    if (AstNodeExpr* const selp
-                        = indexedSlice(rp, fromp, leftp, rightp, flp)) {
-                        return selp;
+                    if (sliceSpanKnown(rp)) {
+                        if (AstNodeExpr* const selp
+                            = indexedSlice(rp, fromp, leftp, rightp, flp)) {
+                            return selp;
+                        }
+                    }
+                    // The two ends do not keep a fixed distance apart, so how
+                    // long the slice is only running decides -- even though
+                    // the object it is taken from has a length the text
+                    // fixes. From here it is a value that carries its own
+                    // bounds (8.5).
+                    VhdlType* const objTypep
+                        = prefixExprp ? prefixExprp->vhdlTypep() : nullptr;
+                    VhdlType* const sliceTypep = nodep->vhdlTypep();
+                    if (!m_asTarget && !sliceSpanKnown(rp) && sliceTypep && objTypep
+                        && objTypep->isConstrainedArray() && sliceDirKnown) {
+                        if (AstNodeFTask* const cfuncp
+                            = dynOfSliceFunc(sliceTypep, objTypep, flp)) {
+                            AstArg* argsp = new AstArg{flp, "", fromp};
+                            argsp->addNext(new AstArg{flp, "", leftp});
+                            argsp->addNext(new AstArg{flp, "", rightp});
+                            AstFuncRef* const refp
+                                = new AstFuncRef{flp, cfuncp->name(), argsp};
+                            refp->taskp(VN_AS(cfuncp, Func));
+                            return refp;
+                        }
                     }
                 }
                 return new AstSelExtract{flp, fromp, leftp, rightp};
@@ -7678,8 +7853,14 @@ private:
             AstNodeExpr* exprp = nullptr;
             int64_t coeff = 0;
             bool generic = false;
+            // What it was written as, for the pass that only measures and
+            // therefore builds nothing to match on
+            const AstNodeVhdlExpr* vhdlp = nullptr;
         };
         std::vector<Term> terms;
+        // What the measuring pass wrote out for itself, kept until the form
+        // is done with, since its terms are matched by shape against it
+        std::vector<AstNodeVhdlExpr*> writtenp;
         int64_t konst = 0;
         bool ok = true;
         void clear() {
@@ -7687,10 +7868,13 @@ private:
                 if (term.exprp) VL_DO_DANGLING(term.exprp->deleteTree(), term.exprp);
             }
             terms.clear();
+            for (AstNodeVhdlExpr* const nodep : writtenp) nodep->deleteTree();
+            writtenp.clear();
         }
     };
 
-    void linearAdd(LinearForm& form, AstNodeVhdlExpr* nodep, int64_t scale, int depth) {
+    void linearAdd(LinearForm& form, AstNodeVhdlExpr* nodep, int64_t scale, int depth,
+                   bool measure = false) {
         if (!form.ok || !nodep || depth > 16) {
             form.ok = false;
             return;
@@ -7703,19 +7887,19 @@ private:
         if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
             if (binp->op() == VhdlBinaryOp::ADD || binp->op() == VhdlBinaryOp::SUB) {
                 const int64_t rscale = binp->op() == VhdlBinaryOp::ADD ? scale : -scale;
-                linearAdd(form, binp->lhsp(), scale, depth + 1);
-                linearAdd(form, binp->rhsp(), rscale, depth + 1);
+                linearAdd(form, binp->lhsp(), scale, depth + 1, measure);
+                linearAdd(form, binp->rhsp(), rscale, depth + 1, measure);
                 return;
             }
             if (binp->op() == VhdlBinaryOp::MUL) {
                 const VhdlValue lhs = V3VhdlEval::eval(binp->lhsp());
                 const VhdlValue rhs = V3VhdlEval::eval(binp->rhsp());
                 if (rhs.isInt()) {
-                    linearAdd(form, binp->lhsp(), scale * rhs.toInt(), depth + 1);
+                    linearAdd(form, binp->lhsp(), scale * rhs.toInt(), depth + 1, measure);
                     return;
                 }
                 if (lhs.isInt()) {
-                    linearAdd(form, binp->rhsp(), scale * lhs.toInt(), depth + 1);
+                    linearAdd(form, binp->rhsp(), scale * lhs.toInt(), depth + 1, measure);
                     return;
                 }
                 // Neither side is a number -- "(i+1)*WORD_BITS", where the
@@ -7730,28 +7914,40 @@ private:
                     if (rsump
                         && (rsump->op() == VhdlBinaryOp::ADD
                             || rsump->op() == VhdlBinaryOp::SUB)) {
-                        spreadProduct(form, rsump, binp->lhsp(), scale, depth);
+                        spreadProduct(form, rsump, binp->lhsp(), scale, depth, measure);
                         return;
                     }
                 } else {
-                    spreadProduct(form, sump, otherp, scale, depth);
+                    spreadProduct(form, sump, otherp, scale, depth, measure);
                     return;
                 }
             }
         }
         if (AstVhdlUnary* const unp = VN_CAST(nodep, VhdlUnary)) {
             if (unp->op() == VhdlUnaryOp::NEGATE) {
-                linearAdd(form, unp->lhsp(), -scale, depth + 1);
+                linearAdd(form, unp->lhsp(), -scale, depth + 1, measure);
                 return;
             }
             if (unp->op() == VhdlUnaryOp::IDENTITY) {
-                linearAdd(form, unp->lhsp(), scale, depth + 1);
+                linearAdd(form, unp->lhsp(), scale, depth + 1, measure);
                 return;
             }
         }
         // Anything else is a term of its own, matched by what it lowers to
         const VhdlSymbol* const termSymp = rootSymOf(nodep);
         const bool isGeneric = termSymp && termSymp->kind() == VhdlSymKind::GENERIC;
+        // Measuring asks only whether the two ends cancel, so it matches
+        // terms as they were written rather than building them
+        if (measure) {
+            for (auto& term : form.terms) {
+                if (term.vhdlp && term.vhdlp->sameTree(nodep)) {
+                    term.coeff += scale;
+                    return;
+                }
+            }
+            form.terms.push_back(LinearForm::Term{nullptr, scale, isGeneric, nodep});
+            return;
+        }
         AstNodeExpr* const exprp = lowerExpr(nodep);
         if (!exprp) {
             form.ok = false;
@@ -7770,7 +7966,7 @@ private:
     // "(a +/- b) * c" spread as "a*c +/- b*c", so that a width written with
     // a generic still cancels between the two ends of a slice
     void spreadProduct(LinearForm& form, AstVhdlBinary* sump, AstNodeVhdlExpr* otherp,
-                       int64_t scale, int depth) {
+                       int64_t scale, int depth, bool measure) {
         FileLine* const flp = sump->fileline();
         AstVhdlBinary* const leftp
             = new AstVhdlBinary{flp, VhdlBinaryOp::MUL,
@@ -7780,14 +7976,42 @@ private:
             = new AstVhdlBinary{flp, VhdlBinaryOp::MUL,
                                 sump->rhsp()->cloneTree(false),
                                 otherp->cloneTree(false)};
-        linearAdd(form, leftp, scale, depth + 1);
-        linearAdd(form, rightp, sump->op() == VhdlBinaryOp::ADD ? scale : -scale, depth + 1);
-        VL_DO_DANGLING(leftp->deleteTree(), leftp);
-        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        linearAdd(form, leftp, scale, depth + 1, measure);
+        linearAdd(form, rightp, sump->op() == VhdlBinaryOp::ADD ? scale : -scale, depth + 1,
+                  measure);
+        if (measure) {
+            form.writtenp.push_back(leftp);
+            form.writtenp.push_back(rightp);
+        } else {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        }
     }
 
     // The indexed part select a moving slice becomes, or null if its bounds
     // do not move together
+    // Whether the two ends of a slice are a fixed distance apart -- which is
+    // what says the slice has a width, and so whether it is a part select or
+    // a value that carries its own bounds. "v(i + 7 downto i)" is seven
+    // apart however i moves; "v(n - 1 downto 0)" is however far n says.
+    // A generic counts as fixed: it folds when the instance is elaborated.
+    //
+    // Nothing is built here, which is why a const method may ask it: the
+    // measuring pass matches terms as they were written.
+    bool sliceSpanKnown(AstVhdlRange* rp) const {
+        if (!rp || !rp->leftp() || !rp->rightp()) return true;
+        VhdlLowerVisitor* const selfp = const_cast<VhdlLowerVisitor*>(this);
+        LinearForm span;
+        selfp->linearAdd(span, rp->leftp(), 1, 0, true);
+        selfp->linearAdd(span, rp->rightp(), -1, 0, true);
+        bool known = span.ok;
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0 && !term.generic) known = false;
+        }
+        span.clear();
+        return known;
+    }
+
     AstNodeExpr* indexedSlice(AstVhdlRange* rp, AstNodeExpr* fromp, AstNodeExpr* leftp,
                               AstNodeExpr* rightp, FileLine* flp) {
         LinearForm span;
@@ -11862,6 +12086,21 @@ private:
 
     // The assignment one waveform stands for, which is what each branch of a
     // conditional or selected signal assignment reduces to
+    // A signal given a value that carries its own bounds, where the signal's
+    // own subtype fixes them: the elements are copied across and the two
+    // lengths have to match, which is a check only running can make
+    // (10.5.2.1). Anything else is lowered as it stands.
+    AstNodeExpr* lowerDriveValue(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
+                                 FileLine* flp) {
+        if (valuep && targetp && isDynValue(valuep) && !isDynObj(targetp)) {
+            VhdlType* const ttypep = targetp->vhdlTypep();
+            if (ttypep && ttypep->isConstrainedArray()) {
+                if (AstNodeExpr* const outp = dynAsFixed(valuep, ttypep, flp)) return outp;
+            }
+        }
+        return lowerExpr(valuep);
+    }
+
     AstNode* lowerSeqWaveform(AstVhdlSigAssign* nodep, AstVhdlWaveform* wfp, bool sequential) {
         FileLine* const flp = nodep->fileline();
         if (!wfp || !wfp->valuep()) return nullptr;
@@ -11877,7 +12116,8 @@ private:
             AstNode* outp = nullptr;
             for (AstVhdlWaveform* p = wfp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
                 AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
-                AstNodeExpr* const rhsp = lowerExpr(p->valuep());
+                AstNodeExpr* const rhsp
+                    = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
                 if (!lhsp || !rhsp) return outp;
                 AstNode* const delayp
                     = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
@@ -11905,7 +12145,8 @@ private:
             return lowerAggregateTarget(aggp, wfp->valuep(), true, sequential, flp);
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
-            AstNodeExpr* const valuep = lowerExpr(wfp->valuep());
+            AstNodeExpr* const valuep
+                = lowerDriveValue(nodep->targetp(), wfp->valuep(), flp);
             if (!valuep) return nullptr;
             AstNode* const markp
                 = transactionMark(nodep->targetp(), delayp, sequential, valuep, flp);
@@ -11913,7 +12154,7 @@ private:
                 driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp), markp);
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
-        AstNodeExpr* const rhsp = lowerExpr(wfp->valuep());
+        AstNodeExpr* const rhsp = lowerDriveValue(nodep->targetp(), wfp->valuep(), flp);
         if (!lhsp || !rhsp) return nullptr;
         AstNode* const markp = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
         AstNode* const outp
@@ -12487,6 +12728,15 @@ private:
         }
         if (valuep && isDynTarget(nodep->targetp())) {
             return lowerDynCopy(nodep->targetp(), valuep, flp);
+        }
+        // A slice of an object of a fixed length, whose ends only running
+        // settles, written into: the value's elements go back into the
+        // object's own places, one at a time, since which places those are
+        // is only known when it runs
+        if (valuep && isRunningSlice(nodep->targetp())) {
+            if (AstNode* const outp = runningSliceAssign(nodep->targetp(), valuep, flp)) {
+                return outp;
+            }
         }
         // A slice of a value that carries its own bounds, written into
         if (valuep && dynSliceRange(nodep->targetp())) {
@@ -13383,8 +13633,11 @@ private:
             if (isDynObj(asp->actualp())) continue;
             VhdlType* const atypep = asp->actualp()->vhdlTypep();
             // A length an instance settles counts as one: it is written in
-            // terms this module can emit, and folds with the instance
-            const bool fixed = atypep && atypep->isConstrainedArray();
+            // terms this module can emit, and folds with the instance. A
+            // slice whose ends only running settles does not, however it was
+            // written: there is no object of that length to copy back into.
+            const bool fixed = atypep && atypep->isConstrainedArray()
+                               && !isRunningSlice(asp->actualp());
             const bool emittable = atypep && !fixed && atypep->lengthEmittable()
                                    && atypep->indexTypes().size() == 1
                                    && !lengthOnlyRunningDecides(atypep);
