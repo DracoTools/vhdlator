@@ -11625,6 +11625,42 @@ private:
         return strTypep && isStringType(strTypep);
     }
 
+    // "(others => c)" written into a slice of a STRING whose length only
+    // running decides: as many of that character as the slice holds. The
+    // aggregate itself says no length -- the target does (9.3.3.3).
+    AstNodeExpr* stringPartFill(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
+                                FileLine* flp) {
+        if (!isStringPart(targetp)) return nullptr;
+        AstNodeVhdlExpr* const onep = uniformAggregateValue(valuep);
+        if (!onep) return nullptr;
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rp = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rp) return nullptr;
+        const VhdlType* const strTypep = callp->prefixp()->vhdlTypep();
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        bool dirKnown = true;
+        if (!rangeParts(rp, leftp, rightp, ascending, dirKnown) || !leftp || !rightp
+            || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstNodeExpr* const lop = stringIndex(strTypep, leftp, flp);
+        AstNodeExpr* const hip = stringIndex(strTypep, rightp, flp);
+        AstNodeExpr* const spanp = ascending ? new AstSub{flp, hip, lop}
+                                             : new AstSub{flp, lop, hip};
+        AstNodeExpr* const lenp
+            = new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        AstNodeExpr* const charp = lowerExpr(onep);
+        if (!charp) {
+            VL_DO_DANGLING(lenp->deleteTree(), lenp);
+            return nullptr;
+        }
+        return new AstReplicateN{flp, stringElem(onep, charp, flp), lenp};
+    }
+
     AstNode* lowerStringPartAssign(AstNodeVhdlExpr* targetp, AstNodeExpr* valuep,
                                    bool signalAssign, bool sequential, FileLine* flp) {
         if (!isStringPart(targetp)) return nullptr;
@@ -11862,7 +11898,8 @@ private:
             return lowerAggregateTarget(aggp, valuep, false, false, flp);
         }
         if (valuep && isStringPart(nodep->targetp())) {
-            AstNodeExpr* const strValp = lowerExpr(valuep);
+            AstNodeExpr* const fillp = stringPartFill(nodep->targetp(), valuep, flp);
+            AstNodeExpr* const strValp = fillp ? fillp : lowerExpr(valuep);
             if (strValp) {
                 if (AstNode* const outp = lowerStringPartAssign(nodep->targetp(), strValp,
                                                                 false, false, flp)) {
