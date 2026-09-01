@@ -8402,11 +8402,29 @@ private:
     // Null where it has none, and the ordinary rule decides instead.
     AstSenTree* signalCallSensitivity(AstVhdlProcCall* nodep, FileLine* flp) {
         AstVhdlCall* const callp = VN_CAST(nodep->callp(), VhdlCall);
+        std::vector<AstVar*> varps;
+        collectSignalArgs(callp, varps);
+        AstSenItem* itemsp = nullptr;
+        for (AstVar* const varp : varps) {
+            itemsp = AstNode::addNext(
+                itemsp,
+                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
+        }
+        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
+    }
+
+    // The signals a call passes to signal parameters. A subprogram with one
+    // is given the caller's own signal, not a value (4.2.2.3), so what it
+    // asks of that signal -- its value, or whether it has just changed --
+    // changes when the signal does, and a process waiting on the call has to
+    // wait on those signals.
+    void collectSignalArgs(AstVhdlCall* callp, std::vector<AstVar*>& varps) {
         VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nullptr;
         VhdlSymbol* const symp = namedp ? namedp->resolved() : nullptr;
-        if (!symp || !callp) return nullptr;
+
+        if (!symp || !callp) return;
         AstVhdlSubprogDecl* const declp = declOf(symp);
-        if (!declp) return nullptr;
+        if (!declp) return;
         std::vector<AstVhdlIfaceDecl*> formals;
         for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
             formals.push_back(VN_AS(p, VhdlIfaceDecl));
@@ -8415,7 +8433,6 @@ private:
         for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
             if (AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc)) assocs.push_back(asp);
         }
-        std::vector<AstVar*> varps;
         for (size_t i = 0; i < formals.size(); ++i) {
             if (formals[i]->kind() == VhdlIfaceKind::FILE) continue;
             if (formals[i]->mode() == VhdlMode::OUT) continue;
@@ -8439,13 +8456,6 @@ private:
             collectVars(onep, varps);
             VL_DO_DANGLING(onep->deleteTree(), onep);
         }
-        AstSenItem* itemsp = nullptr;
-        for (AstVar* const varp : varps) {
-            itemsp = AstNode::addNext(
-                itemsp,
-                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
-        }
-        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
     // The process a concurrent statement is. A postponed one runs only once
@@ -12866,6 +12876,21 @@ private:
 
     // The sensitivity a condition implies: every signal it reads, which is
     // what "wait until" waits on when no list is written (10.2)
+    // The signals a condition waits on because it calls something with a
+    // signal parameter: the call reads the caller's own signal, which no
+    // reference in the lowered expression names
+    AstSenItem* signalArgItems(AstNodeVhdl* nodep, FileLine* flp) {
+        std::vector<AstVar*> varps;
+        nodep->foreachAndNext([&](AstVhdlCall* callp) { collectSignalArgs(callp, varps); });
+        AstSenItem* itemsp = nullptr;
+        for (AstVar* const varp : varps) {
+            itemsp = AstNode::addNext(
+                itemsp,
+                senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
+        }
+        return itemsp;
+    }
+
     AstSenTree* sensitivityOfExpr(AstNodeExpr* condp, FileLine* flp) {
         // What a concurrent statement reads is what it waits on, down to the
         // element where a fixed index says which one (11.6) -- the same rule
@@ -13033,7 +13058,38 @@ private:
         if (!condp) return nullptr;
         AstSenTree* sensp = sensitivityOf(nodep->sensp(), flp);
         if (!sensp) sensp = sensitivityOfExpr(condp, flp);
+        // "wait until falling(clk)" reads clk inside the call, and nothing in
+        // the lowered condition says so
+        if (!nodep->sensp()) {
+            if (AstSenItem* const argsp = signalArgItems(nodep->condp(), flp)) {
+                if (sensp) {
+                    sensp->addSensesp(argsp);
+                } else {
+                    sensp = new AstSenTree{flp, argsp};
+                }
+            }
+        }
         if (!sensp) return new AstWait{flp, condp, nullptr};
+        // "wait until C" suspends, and wakes to look at C again every time
+        // one of the signals C reads changes (10.2). Where C is a call, its
+        // value is not an expression the back end can watch -- a call is
+        // worked out once and does not change by itself -- so the wait is
+        // written as the loop the LRM describes: suspend, then look.
+        if (condp->exists([](const AstNodeFTaskRef*) { return true; })) {
+            AstVar* const donep
+                = newTempVar("__Vwaitc", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+            AstNode* const bodyp = AstNode::addNext(
+                static_cast<AstNode*>(new AstEventControl{flp, sensp, nullptr}),
+                static_cast<AstNode*>(new AstAssign{
+                    flp, new AstVarRef{flp, donep, VAccess::WRITE}, condp}));
+            AstNode* const outp = new AstAssign{
+                flp, new AstVarRef{flp, donep, VAccess::WRITE},
+                new AstConst{flp, AstConst::BitFalse{}}};
+            return AstNode::addNext(
+                outp, whileLoop(flp,
+                                new AstLogNot{flp, new AstVarRef{flp, donep, VAccess::READ}},
+                                bodyp));
+        }
         AstNode* const outp = new AstEventControl{flp, sensp, nullptr};
         return AstNode::addNext(outp, static_cast<AstNode*>(new AstWait{flp, condp, nullptr}));
     }
