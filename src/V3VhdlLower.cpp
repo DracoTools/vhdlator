@@ -5259,9 +5259,13 @@ private:
         if (bit != m_bindExprs.end()) return lowerExpr(bit->second);
         // One element of an array signal, at the index this call passed
         const auto dit = m_bindDynSigs.find(symp);
-        if (dit != m_bindDynSigs.end() && dit->second.arrayp && dit->second.idxp) {
-            return new AstSelBit{flp, new AstVarRef{flp, dit->second.arrayp, VAccess::READ},
-                                 new AstVarRef{flp, dit->second.idxp, VAccess::READ}};
+        if (dit != m_bindDynSigs.end() && dit->second.arrayp && !dit->second.idxps.empty()) {
+            AstNodeExpr* outp = new AstVarRef{flp, dit->second.arrayp, VAccess::READ};
+            for (AstVar* const idxp : dit->second.idxps) {
+                if (!idxp) return nullptr;
+                outp = new AstSelBit{flp, outp, new AstVarRef{flp, idxp, VAccess::READ}};
+            }
+            return outp;
         }
         const auto it = m_vars.find(symp);
         if (it != m_vars.end()) {
@@ -9102,18 +9106,23 @@ private:
     // index is an expression the caller can work out. True where the actual
     // is exactly that -- one index of a plain signal name, nothing further.
     static bool dynamicElementOf(AstNodeVhdlExpr* actualp, const VhdlSymbol* rootp,
-                                 AstNodeVhdlExpr*& idxp) {
+                                 std::vector<AstNodeVhdlExpr*>& idxps) {
         AstVhdlCall* const callp = VN_CAST(actualp, VhdlCall);
         if (!callp || !callp->prefixp() || !VN_IS(callp->prefixp(), VhdlName)) return false;
         if (callp->prefixp()->vhdlSymp() != rootp) return false;
-        AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
-        if (!asp || asp->nextp() || asp->formalp() || !asp->actualp()) return false;
         // An array of arrays indexed once still names an array, which is not
         // what this is for
         const VhdlType* const typep = actualp->vhdlTypep();
         if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY) return false;
-        idxp = asp->actualp();
-        return true;
+        // One index, or one per dimension: "g(ch, idx)" names one element of
+        // a two-dimensional signal as much as "g(i)" does of a vector
+        idxps.clear();
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || asp->formalp() || !asp->actualp()) return false;
+            idxps.push_back(asp->actualp());
+        }
+        return !idxps.empty();
     }
 
     // "p(iface.d => sd)" names one element of one formal (6.5.7.1): which
@@ -9146,11 +9155,19 @@ private:
                 out += "(" + std::to_string(lv.toInt()) + ":" + std::to_string(rv.toInt()) + ")";
                 return true;
             }
-            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
-            if (!asp || asp->nextp() || !asp->actualp()) return false;
-            const VhdlValue iv = V3VhdlEval::eval(asp->actualp());
-            if (!iv.isInt()) return false;
-            out += "(" + std::to_string(iv.toInt()) + ")";
+            // One index, or several: "arr(i, j)" names one element of a
+            // two-dimensional signal as much as "arr(i)" does of a vector
+            if (!VN_IS(callp->argsp(), VhdlAssoc)) return false;
+            out += "(";
+            for (const AstNode* p = callp->argsp(); p; p = p->nextp()) {
+                const AstVhdlAssoc* const ap = VN_CAST(p, VhdlAssoc);
+                if (!ap || !ap->actualp()) return false;
+                const VhdlValue iv = V3VhdlEval::eval(ap->actualp());
+                if (!iv.isInt()) return false;
+                if (p != callp->argsp()) out += ",";
+                out += std::to_string(iv.toInt());
+            }
+            out += ")";
             return true;
         }
         if (nodep->vhdlSymp()) {
@@ -12575,18 +12592,30 @@ private:
                 // the body refers to it
                 std::string path;
                 const VhdlSymbol* const rootp = actualp ? baseSymOf(actualp) : nullptr;
+                // A signal a package declares has no variable of this
+                // module's own until something reads it; naming one element
+                // of it is that something
+                if (rootp && rootp->kind() == VhdlSymKind::SIGNAL && !m_vars.count(rootp)) {
+                    pkgSignalVar(const_cast<VhdlSymbol*>(rootp), actualp->fileline());
+                }
                 if (!rootp || !m_vars.count(rootp) || m_drivers.count(rootp)) return nullptr;
                 if (!staticSelectKey(actualp, path)) {
                     // One element of an array signal, at an index the call
                     // works out: the copy takes the index as a parameter
-                    AstNodeVhdlExpr* idxExprp = nullptr;
-                    if (!dynamicElementOf(actualp, rootp, idxExprp)) return nullptr;
+                    std::vector<AstNodeVhdlExpr*> idxExprps;
+                    if (!dynamicElementOf(actualp, rootp, idxExprps)) return nullptr;
                     DynSigBind dyn;
                     dyn.arrayp = m_vars[rootp];
-                    dyn.argName = "__Vsigidx__" + formals[i]->name();
+                    for (size_t d = 0; d < idxExprps.size(); ++d) {
+                        dyn.argNames.push_back("__Vsigidx" + std::to_string(d) + "__"
+                                               + formals[i]->name());
+                    }
+                    for (size_t d = 0; d < idxExprps.size(); ++d) {
+                        passed.push_back(AstVhdlExprPair{dyn.argNames[d], idxExprps[d]});
+                    }
                     dynBind.emplace(formals[i]->vhdlSymp(), dyn);
-                    passed.push_back(AstVhdlExprPair{dyn.argName, idxExprp});
-                    key += "|dyn" + std::to_string(reinterpret_cast<uintptr_t>(dyn.arrayp));
+                    key += "|dyn" + std::to_string(reinterpret_cast<uintptr_t>(dyn.arrayp))
+                           + "x" + std::to_string(idxExprps.size());
                     continue;
                 }
                 exprBind.emplace(formals[i]->vhdlSymp(), actualp);
@@ -14403,8 +14432,9 @@ private:
     // it, since neither the element nor the index can be named in the copy.
     struct DynSigBind final {
         AstVar* arrayp = nullptr;  // The signal the element is part of
-        AstVar* idxp = nullptr;  // The copy's own parameter holding the index
-        std::string argName;  // What the caller passes it as
+        // The copy's own parameters holding the indices, one per dimension
+        std::vector<AstVar*> idxps;
+        std::vector<std::string> argNames;  // What the caller passes them as
     };
     std::map<const VhdlSymbol*, DynSigBind> m_bindDynSigs;
     std::map<std::string, AstNodeFTask*> m_signalCopies;
@@ -14565,14 +14595,17 @@ private:
             // indexes the array with it wherever it names the formal
             const auto dynIt = m_bindDynSigs.find(psymp);
             if (dynIt != m_bindDynSigs.end()) {
-                AstVar* const idxp
-                    = new AstVar{flp, VVarType::PORT, dynIt->second.argName, VFlagChildDType{},
-                                 newIntDType(flp)};
-                idxp->direction(VDirection::INPUT);
-                idxp->declDirection(VDirection::INPUT);
-                idxp->funcLocal(true);
-                dynIt->second.idxp = idxp;
-                ftaskp->addStmtsp(idxp);
+                dynIt->second.idxps.clear();
+                for (const std::string& argName : dynIt->second.argNames) {
+                    AstVar* const idxp
+                        = new AstVar{flp, VVarType::PORT, argName, VFlagChildDType{},
+                                     newIntDType(flp)};
+                    idxp->direction(VDirection::INPUT);
+                    idxp->declDirection(VDirection::INPUT);
+                    idxp->funcLocal(true);
+                    dynIt->second.idxps.push_back(idxp);
+                    ftaskp->addStmtsp(idxp);
+                }
                 continue;
             }
             // A signal parameter is bound to the caller's own signal, not
