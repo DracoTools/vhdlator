@@ -91,6 +91,10 @@ int bitsFor(size_t n) {
 struct AstVhdlExprPair final {
     std::string name;
     AstNodeVhdlExpr* exprp;
+    // Where what is passed is not a name of the design but something this
+    // copy already holds -- an index another copy was given -- the value is
+    // handed over as it stands
+    AstNodeExpr* loweredp = nullptr;
 };
 
 class VhdlLowerVisitor final {
@@ -5202,22 +5206,41 @@ private:
 
     // The signal attributes of 16.2.4, answered from what shadowFor and
     // makeActive keep
+    // The name a signal-class formal stands for, where a call bound it to
+    // part of a signal rather than to a whole one -- "drive(r.y)" -- so that
+    // what is asked of the formal is asked of the actual instead
+    AstNodeVhdlExpr* boundNameOf(AstNodeVhdlExpr* prefixp) {
+        VhdlSymbol* const symp = prefixp ? prefixp->vhdlSymp() : nullptr;
+        if (!symp) return prefixp;
+        for (int depth = 0; depth < 16; ++depth) {
+            const auto it = m_bindExprs.find(prefixp->vhdlSymp());
+            if (it == m_bindExprs.end() || !it->second || it->second == prefixp) break;
+            prefixp = it->second;
+            if (!prefixp->vhdlSymp()) break;
+        }
+        return prefixp;
+    }
+
     AstNodeExpr* lowerSignalAttr(AstVhdlAttrName* nodep, const std::string& attr,
                                  AstNodeExpr* argp, FileLine* flp) {
+        // A signal parameter's history is the history of the signal the call
+        // passed, whether that is a signal of its own or part of one: what
+        // the formal names has none (4.2.2.3)
+        AstNodeVhdlExpr* const prefixp = boundNameOf(nodep->prefixp());
         if (attr == "transaction" || attr == "active" || attr == "last_active"
             || attr == "quiet") {
-            const VhdlActive* const acp = activeFor(nodep->prefixp());
+            const VhdlActive* const acp = activeFor(prefixp);
             if (!acp) {
                 // Nothing marks this signal's transactions -- it is a signal
                 // no assignment here writes, such as a port driven from
                 // outside. Its events are all this side can see, and every
                 // event is a transaction, so answer from those.
-                const VhdlShadow* const evp = shadowFor(nodep->prefixp(), flp);
+                const VhdlShadow* const evp = shadowFor(prefixp, flp);
                 if (!evp) return nullptr;
                 if (attr == "transaction") {
                     return new AstVarRef{flp, evp->transp, VAccess::READ};
                 }
-                AstNodeExpr* const happeningp = eventOf(nodep->prefixp(), evp, flp);
+                AstNodeExpr* const happeningp = eventOf(prefixp, evp, flp);
                 if (!happeningp) return nullptr;
                 if (attr == "active") return happeningp;
                 if (attr == "last_active") {
@@ -5234,25 +5257,25 @@ private:
             }
             return steadyForOf(activeOf(acp, flp), acp->timep, acp->everp, argp, flp);
         }
-        const VhdlShadow* const shp = shadowFor(nodep->prefixp(), flp);
+        const VhdlShadow* const shp = shadowFor(prefixp, flp);
         if (!shp) return nullptr;
-        if (attr == "delayed") return delayedOf(nodep->prefixp(), shp, argp, flp);
+        if (attr == "delayed") return delayedOf(prefixp, shp, argp, flp);
         if (attr == "last_value") {
             // During the delta in which it changed, the value before the
             // change is what prev still holds
-            AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
+            AstNodeExpr* const evp = eventOf(prefixp, shp, flp);
             if (!evp) return nullptr;
-            return new AstCond{flp, evp, shadowPart(nodep->prefixp(), shp->prevp, flp),
-                               shadowPart(nodep->prefixp(), shp->lastp, flp)};
+            return new AstCond{flp, evp, shadowPart(prefixp, shp->prevp, flp),
+                               shadowPart(prefixp, shp->lastp, flp)};
         }
-        if (attr == "event") return eventOf(nodep->prefixp(), shp, flp);
+        if (attr == "event") return eventOf(prefixp, shp, flp);
         if (attr == "last_event") {
-            AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
+            AstNodeExpr* const evp = eventOf(prefixp, shp, flp);
             if (!evp) return nullptr;
             return sinceOf(evp, shp->timep, shp->everp, flp);
         }
         if (attr == "stable") {
-            AstNodeExpr* const evp = eventOf(nodep->prefixp(), shp, flp);
+            AstNodeExpr* const evp = eventOf(prefixp, shp, flp);
             if (!evp) return nullptr;
             return steadyForOf(evp, shp->timep, shp->everp, argp, flp);
         }
@@ -12784,6 +12807,41 @@ private:
                 if (!adeclp || !adeclp->targetp()) break;
                 actualp = adeclp->targetp();
             }
+            // An actual that is itself a formal bound to part of a signal
+            // names that part: this call is passing on what it was given,
+            // and the part is a name the copy can lower again (4.2.2.3)
+            for (int depth = 0; actualp && depth < 16; ++depth) {
+                const VhdlSymbol* const asymp = actualp->vhdlSymp();
+                const auto eIt = asymp ? m_bindExprs.find(asymp) : m_bindExprs.end();
+                if (eIt == m_bindExprs.end() || !eIt->second || eIt->second == actualp) break;
+                actualp = eIt->second;
+            }
+            // An actual that is itself a formal bound to one element of an
+            // array signal, at an index only the call knew, carries that
+            // binding on: this copy takes the same indices and hands over
+            // the ones it was given
+            if (actualp && actualp->vhdlSymp()) {
+                const auto dynIt = m_bindDynSigs.find(actualp->vhdlSymp());
+                if (dynIt != m_bindDynSigs.end() && !dynIt->second.idxps.empty()) {
+                    DynSigBind dyn;
+                    dyn.arrayp = dynIt->second.arrayp;
+                    key += "|dynon"
+                           + std::to_string(reinterpret_cast<uintptr_t>(dyn.arrayp));
+                    for (size_t d = 0; d < dynIt->second.idxps.size(); ++d) {
+                        dyn.argNames.push_back("__Vsigidx" + std::to_string(d) + "__"
+                                               + formals[i]->name());
+                        passed.push_back(AstVhdlExprPair{
+                            dyn.argNames[d], nullptr,
+                            new AstVarRef{actualp->fileline(), dynIt->second.idxps[d],
+                                          VAccess::READ}});
+                        key += "#"
+                               + std::to_string(
+                                   reinterpret_cast<uintptr_t>(dynIt->second.idxps[d]));
+                    }
+                    dynBind.emplace(formals[i]->vhdlSymp(), dyn);
+                    continue;
+                }
+            }
             // An actual that is itself a formal whose elements were named one
             // at a time carries those elements on into this copy
             if (actualp) {
@@ -12941,7 +12999,8 @@ private:
     bool addPassedArgs(AstNodeFTaskRef* refp, const std::vector<AstVhdlExprPair>& passed,
                        FileLine* flp) {
         for (const AstVhdlExprPair& pair : passed) {
-            AstNodeExpr* const onep = lowerExpr(pair.exprp);
+            AstNodeExpr* const onep
+                = pair.loweredp ? pair.loweredp->cloneTree(false) : lowerExpr(pair.exprp);
             if (!onep) return false;
             refp->addArgsp(new AstArg{flp, pair.name, onep});
         }
