@@ -2742,6 +2742,40 @@ private:
     std::map<const VhdlType*, AstNodeFTask*> m_dynNotFuncs;
     std::map<std::pair<const VhdlType*, int>, AstNodeFTask*> m_dynRedFuncs;
 
+    // "justify" to a width nothing static settles: as many spaces as the
+    // value falls short, on the side the call asks for (16.4)
+    std::map<bool, AstNodeFTask*> m_justifyFuncs;
+    AstNodeFTask* justifyFunc(bool right, FileLine* origFlp) {
+        const auto it = m_justifyFuncs.find(right);
+        if (it != m_justifyFuncs.end()) return it->second;
+        if (!m_modp) return nullptr;
+        FileLine* const flp = dynFl(origFlp);
+        const std::string name = std::string{"__Vjustify"} + (right ? "r" : "l");
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp));
+        AstVar* const vp
+            = dynArg(funcp, "v", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+        AstVar* const fieldp = dynArg(funcp, "field", newIntDType(flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        funcp->addStmtsp(lenp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, wr(lenp, flp), new AstLenN{flp, rd(vp, flp)}});
+        funcp->addStmtsp(new AstAssign{flp, out(), rd(vp, flp)});
+        AstNodeExpr* const padp
+            = new AstReplicateN{flp, new AstConst{flp, AstConst::String{}, " "},
+                                new AstSub{flp, rd(fieldp, flp), rd(lenp, flp)}};
+        AstNodeExpr* const joinp
+            = right ? static_cast<AstNodeExpr*>(new AstConcatN{flp, padp, rd(vp, flp)})
+                    : static_cast<AstNodeExpr*>(new AstConcatN{flp, rd(vp, flp), padp});
+        funcp->addStmtsp(new AstIf{flp, new AstGtS{flp, rd(fieldp, flp), rd(lenp, flp)},
+                                   new AstAssign{flp, out(), joinp}});
+        m_modp->addStmtsp(funcp);
+        m_justifyFuncs.emplace(right, funcp);
+        return funcp;
+    }
+
     // "not v" over a carrier: as long as the operand, with its own bounds,
     // and each element inverted (9.2.2)
     AstNodeFTask* dynNotFunc(VhdlType* typep, FileLine* origFlp) {
@@ -7464,22 +7498,15 @@ private:
         // "to_string(v)" is the text of the value: for a scalar the same as
         // T'IMAGE, except that a CHARACTER or a STRING is its own characters
         // with no quotation marks around them (16.3)
+        // A field width that only running settles cannot be written into a
+        // format, so the padding is built at that width instead, in a helper
+        // of its own so the value is named once
         // "justify(v, side, field)" pads a string out to a width, on the
         // left where it is justified RIGHT and on the right where LEFT
         // (16.4). SIDE is declared as (RIGHT, LEFT), so RIGHT is position 0.
         if (name == "justify" && symp->predefined() && !args.empty() && args.size() <= 3) {
             AstNodeExpr* const valuep = lowerExpr(args[0]);
             if (!valuep) return nullptr;
-            int64_t field = 0;
-            if (args.size() >= 3) {
-                const VhdlValue fv = V3VhdlEval::eval(args[2]);
-                if (!fv.isInt()) {
-                    unsup(flp, "justify to a width that is not static");
-                    VL_DO_DANGLING(valuep->deleteTree(), valuep);
-                    return nullptr;
-                }
-                field = fv.toInt();
-            }
             bool right = true;
             if (args.size() >= 2) {
                 const VhdlValue sv = V3VhdlEval::eval(args[1]);
@@ -7490,11 +7517,28 @@ private:
                 }
                 right = sv.toInt() == 0;
             }
-            if (field <= 0) return valuep;
-            return new AstSFormatF{flp,
-                                   "%" + std::string{right ? "" : "-"} + std::to_string(field)
-                                       + "s",
-                                   false, valuep};
+            if (args.size() < 3) return valuep;
+            const VhdlValue fv = V3VhdlEval::eval(args[2]);
+            if (fv.isInt()) {
+                const int64_t field = fv.toInt();
+                if (field <= 0) return valuep;
+                return new AstSFormatF{flp,
+                                       "%" + std::string{right ? "" : "-"}
+                                           + std::to_string(field) + "s",
+                                       false, valuep};
+            }
+            AstNodeFTask* const funcp = justifyFunc(right, flp);
+            AstNodeExpr* const fieldp = funcp ? lowerExpr(args[2]) : nullptr;
+            if (!fieldp) {
+                if (!funcp) unsup(flp, "justify to a width that is not static");
+                VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                return nullptr;
+            }
+            AstArg* argsp = new AstArg{flp, "", valuep};
+            argsp->addNext(new AstArg{flp, "", fieldp});
+            AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+            refp->taskp(VN_AS(funcp, Func));
+            return refp;
         }
         // "to_string(t, unit)" writes a time in that unit (16.3). The unit
         // is a time of its own, so the value is scaled by it and the unit's
