@@ -3547,6 +3547,9 @@ private:
         case VhdlMode::LINKAGE: varp->direction(VDirection::INOUT); break;
         }
         varp->declDirection(varp->direction());
+        if (varp->direction() == VDirection::INOUT && allLogic(symp->typep())) {
+            m_triPorts.insert(varp);
+        }
         varp->ansi(true);
         // A port's default value is what an input takes when the instance
         // leaves it open, and what an output's driver starts at (6.5.6.3).
@@ -14872,6 +14875,28 @@ private:
         m_subDrivers.emplace(portp, pair);
         return pair;
     }
+    // Whether every bit of such a type is a logic value. Only those ports
+    // are resolved as nets, so only those lose a drive written inside a
+    // subprogram; one made of integers keeps it, and turning it off with a
+    // 'Z' it cannot hold would lose what the other elements are worth.
+    static bool allLogic(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8) return false;
+        if (isLogicish(typep)) return true;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            if (basep->elements().empty()) return false;
+            for (const VhdlSymbol* const elemp : basep->elements()) {
+                if (!allLogic(elemp->typep(), depth + 1)) return false;
+            }
+            return true;
+        }
+        if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
+            return allLogic(basep->elementp(), depth + 1);
+        }
+        return false;
+    }
+    std::set<const AstVar*> m_triPorts;  // Ports a net's resolution decides
+
     void redirectPortDrives(AstNodeFTask* ftaskp) {
         if (!m_modp) return;
         std::vector<AstNodeAssign*> asgps;
@@ -14883,6 +14908,7 @@ private:
             const AstVar* const varp = refp->varp();
             if (varp->isFuncLocal() || !varp->isIO()) return;
             if (varp->direction() != VDirection::INOUT) return;
+            if (!m_triPorts.count(varp)) return;
             asgps.push_back(asgp);
         });
         for (AstNodeAssign* const asgp : asgps) {
@@ -15231,6 +15257,7 @@ private:
         m_emitting.clear();
         m_drivers.clear();
         m_subDrivers.clear();
+        m_triPorts.clear();
         m_bindTypes.clear();
         m_driverCount.clear();
         m_driverUsed.clear();
