@@ -4917,8 +4917,9 @@ private:
         // process runs: once at time zero, and again on every event on a
         // signal it reads
         AstNode* const outp = new AstInitial{mflp, flipp->cloneTree(false)};
-        AstSenTree* const senp = readsp ? sensitivityOfExpr(VN_CAST(readsp, NodeExpr), mflp)
-                                        : nullptr;
+        AstSenTree* const senp
+            = readsp ? sensitivityOfExpr(VN_CAST(const_cast<AstNode*>(readsp), NodeExpr), mflp)
+                     : nullptr;
         if (!senp) {
             VL_DO_DANGLING(flipp->deleteTree(), flipp);
             return outp;  // Nothing to wake it: it runs at time zero only
@@ -8494,6 +8495,39 @@ private:
             reads = true;
         });
         if (!reads) return new AstInitial{flp, bodyp};
+        // A statement that reads only one element of a signal waits on that
+        // element and on nothing else (11.6). Only where every signal it
+        // reads is one this knows: anything else takes the whole of what the
+        // statement reads, which wakes it no less often than it should.
+        bool allKnown = true;
+        std::set<const AstVar*> knownp;
+        for (const auto& pair : m_vars) {
+            if (pair.first
+                && (pair.first->kind() == VhdlSymKind::SIGNAL
+                    || pair.first->kind() == VhdlSymKind::PORT)) {
+                knownp.insert(pair.second);
+            }
+        }
+        bodyp->foreach([&allKnown, &knownp, &writtenp](const AstVarRef* refp) {
+            if (!refp->access().isReadOrRW()) return;
+            if (writtenp.count(refp)) return;
+            const AstVar* const varp = refp->varp();
+            if (!varp || varp->isParam() || varp->varType() == VVarType::GENVAR) return;
+            if (!knownp.count(varp)) allKnown = false;
+            // Only over signals whose emitted type is one value: a record or
+            // an array of them is read through a selection this cannot shadow
+            const AstNodeDType* const dtp
+                = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+            if (!VN_IS(dtp, BasicDType) && !VN_IS(dtp, PackArrayDType)) allKnown = false;
+        });
+        // Only where a part of a signal is what it reads: otherwise the
+        // ordinary combinational process says the same thing, and says it
+        // in the shape the rest of the compiler expects
+        if (allKnown && readsAPart(bodyp, knownp, writtenp)) {
+            if (AstSenTree* const senp = sensitivityOfBody(bodyp, flp)) {
+                return new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp};
+            }
+        }
         return new AstAlways{flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
                              bodyp};
     }
@@ -12686,7 +12720,38 @@ private:
     // Every signal a lowered body reads. A signal it only writes is not one
     // of them: a process that woke on what it had just assigned would run
     // again for every assignment it makes.
-    AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp) {
+    // Whether a body reads one part of a signal and nothing else of it, so
+    // that waiting on that part says something the whole of it does not.
+    // Asked before anything is built, since building a shadow of a part
+    // leaves a block behind whether the answer is used or not.
+    static bool readsAPart(AstNode* bodyp, const std::set<const AstVar*>& knownp,
+                           const std::set<const AstNode*>& writtenp) {
+        std::map<const AstVar*, AstNodeExpr*> partOf;
+        std::set<const AstVar*> seen;
+        bool any = false;
+        bodyp->foreachAndNext([&](AstVarRef* refp) {
+            if (!refp->access().isReadOrRW()) return;
+            if (writtenp.count(refp)) return;
+            AstVar* const varp = refp->varp();
+            if (!varp || !knownp.count(varp)) return;
+            const AstNodeDType* const dtp
+                = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+            if (!VN_IS(dtp, BasicDType) && !VN_IS(dtp, PackArrayDType)) return;
+            AstNodeExpr* const partp = staticPartRead(refp);
+            const auto it = partOf.find(varp);
+            if (it == partOf.end()) {
+                partOf.emplace(varp, partp);
+            } else if (it->second && (!partp || !it->second->sameTree(partp))) {
+                it->second = nullptr;
+            }
+        });
+        for (const auto& pair : partOf) {
+            if (pair.second) any = true;
+        }
+        return any;
+    }
+
+    AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp, bool* anyPartp = nullptr) {
         if (!bodyp) return nullptr;
         std::set<const AstVar*> signals;
         for (const auto& pair : m_vars) {
@@ -12711,7 +12776,15 @@ private:
             }
             AstVar* const varp = refp->varp();
             if (!varp || !signals.count(varp)) return;
-            AstNodeExpr* const partp = staticPartRead(refp);
+            // Only a signal held as one value can be shadowed a part at a
+            // time: a record, or an array of them, is read through a
+            // selection that has no shadow of its own
+            const AstNodeDType* const dtp
+                = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+            AstNodeExpr* const partp
+                = (VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType))
+                      ? staticPartRead(refp)
+                      : nullptr;
             const auto it = partOf.find(varp);
             if (it == partOf.end()) {
                 partOf.emplace(varp, partp);
@@ -12730,6 +12803,7 @@ private:
             if (partp) {
                 sensp = shadowOfPart(partp->cloneTree(false), flp);
                 oneBit = VN_IS(partp, SelBit) ? isOneBitVar(varp) : false;
+                if (sensp && anyPartp) *anyPartp = true;
             }
             if (!sensp) sensp = new AstVarRef{flp, varp, VAccess::READ};
             itemsp = AstNode::addNext(itemsp, senItemFor(sensp, oneBit, flp));
@@ -12792,7 +12866,11 @@ private:
 
     // The sensitivity a condition implies: every signal it reads, which is
     // what "wait until" waits on when no list is written (10.2)
-    static AstSenTree* sensitivityOfExpr(const AstNodeExpr* condp, FileLine* flp) {
+    AstSenTree* sensitivityOfExpr(AstNodeExpr* condp, FileLine* flp) {
+        // What a concurrent statement reads is what it waits on, down to the
+        // element where a fixed index says which one (11.6) -- the same rule
+        // a process with no sensitivity list follows
+        if (AstSenTree* const senp = sensitivityOfBody(condp, flp)) return senp;
         std::vector<AstVar*> varps;
         collectVars(condp, varps);
         AstSenItem* itemsp = nullptr;
