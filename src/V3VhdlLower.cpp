@@ -1946,11 +1946,13 @@ private:
         // An operator over such a value gives back another: nothing along
         // the way decided a length the operand did not have
         if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
-            return dynBinaryCarries(bp);
+            if (dynBinaryCarries(bp)) return true;
+            if (carriedOperatorResult(bp->vhdlSymp())) return true;
         }
         // "not v" gives back a value as long as the operand, and the
         // reductions give back one element, which is not one of these
         if (AstVhdlUnary* const up = VN_CAST(const_cast<AstNodeVhdlExpr*>(nodep), VhdlUnary)) {
+            if (carriedOperatorResult(up->vhdlSymp())) return true;
             return up->op() == VhdlUnaryOp::NOT && isDynValue(up->lhsp(), depth + 1)
                    && dynValueType(up->lhsp());
         }
@@ -2845,6 +2847,17 @@ private:
                 = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
             if (symp && carriedDynamically(symp->typep())) return symp->typep();
         }
+        // An operator a design wrote gives back what its own body settles
+        if (const AstVhdlBinary* const obp = VN_CAST(nodep, VhdlBinary)) {
+            if (carriedOperatorResult(obp->vhdlSymp())) {
+                return emittedReturnType(obp->vhdlSymp()->resolved());
+            }
+        }
+        if (const AstVhdlUnary* const oup = VN_CAST(nodep, VhdlUnary)) {
+            if (carriedOperatorResult(oup->vhdlSymp())) {
+                return emittedReturnType(oup->vhdlSymp()->resolved());
+            }
+        }
         // An operator gives back what its operand carries
         if (AstVhdlUnary* const up = VN_CAST(nodep, VhdlUnary)) {
             if (up->op() == VhdlUnaryOp::NOT) return dynValueType(up->lhsp());
@@ -3235,6 +3248,16 @@ private:
     }
 
     // Whether an expression is a call whose result is carried
+    // An operator a design wrote for itself is an ordinary function, and
+    // what it gives back may carry its own bounds like any other result
+    bool carriedOperatorResult(const VhdlSymbol* symp) const {
+        if (!symp) return false;
+        symp = symp->resolved();
+        if (symp->kind() != VhdlSymKind::FUNCTION) return false;
+        if (symp->predefined() || inArithmeticPackage(symp)) return false;
+        return carriedDynamically(emittedReturnType(symp));
+    }
+
     bool dynResultCall(const AstNodeVhdlExpr* nodep) const {
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->vhdlSymp()) return false;
@@ -5900,13 +5923,37 @@ private:
         if (it == m_funcs.end() || !VN_IS(it->second, Func)) return nullptr;
         AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
         refp->taskp(it->second);
+        size_t pos = 0;
         for (AstNodeVhdlExpr* const argp : args) {
-            AstNodeExpr* const onep = lowerExpr(argp);
+            // An operand and the parameter it is bound to need not be held
+            // the same way: an operator is an ordinary subprogram, and the
+            // copy made for this call may hold what a value of a fixed
+            // length gives it in a carrier, or the other way about
+            VhdlType* const formalp = pos < symp->paramTypes().size()
+                                          ? symp->paramTypes()[pos]
+                                          : nullptr;
+            AstNodeExpr* onep = nullptr;
+            // Not a record: an operand of one is handed over as it stands,
+            // and its elements are converted where the shapes differ
+            const VhdlType* const atypep = argp->vhdlTypep();
+            const bool arrayArg
+                = !atypep
+                  || (atypep->base()->kind() == VhdlTypeKind::ARRAY
+                      && atypep->base() == formalp->base());
+            if (formalp && formalp->base()->kind() == VhdlTypeKind::ARRAY && arrayArg) {
+                if (isDynValue(argp) && !carriedDynamically(formalp)) {
+                    onep = dynAsFixed(argp, formalp, flp);
+                } else if (!isDynValue(argp) && carriedDynamically(formalp)) {
+                    onep = asDynCarrier(argp, formalp, flp);
+                }
+            }
+            if (!onep) onep = lowerExpr(argp);
             if (!onep) {
                 VL_DO_DANGLING(refp->deleteTree(), refp);
                 return nullptr;
             }
             refp->addArgsp(new AstArg{flp, "", onep});
+            ++pos;
         }
         return refp;
     }

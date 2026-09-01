@@ -3771,8 +3771,15 @@ private:
     static void takeResultType(AstNodeVhdlExpr* nodep, const VhdlSymbol* symp) {
         if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return;
         VhdlType* const retp = symp->returnTypep();
-        if (!retp || !retp->lengthEmittable()) return;
+        if (!retp) return;
         const VhdlType* const hadp = nodep->vhdlTypep();
+        // The copy's own body settles no length -- two returns of different
+        // lengths, say -- so what the call gives back carries its bounds,
+        // whatever the declaration had suggested
+        if (!retp->lengthEmittable()) {
+            if (hadp && hadp->base() == retp->base()) nodep->vhdlTypep(retp);
+            return;
+        }
         if (hadp && hadp->lengthEmittable()) return;
         nodep->vhdlTypep(retp);
     }
