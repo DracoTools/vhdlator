@@ -100,6 +100,7 @@ class VhdlSymbol final {
     std::vector<VhdlType*> m_paramTypes;
     std::vector<std::string> m_paramNames;
     std::vector<bool> m_paramDefaults;
+    std::vector<bool> m_paramGenerics;  // Written with a generic type's name
     VhdlType* m_returnTypep = nullptr;
     int m_position = 0;  // Enumeration literal position, or record element index
     bool m_predefined = false;  // Comes from std.standard rather than source
@@ -210,10 +211,20 @@ public:
         m_paramNames.emplace_back();
         m_paramDefaults.push_back(false);
     }
-    void addParam(const std::string& name, VhdlType* typep, bool hasDefault) {
+    void addParam(const std::string& name, VhdlType* typep, bool hasDefault,
+                  bool fromGeneric = false) {
         m_paramTypes.push_back(typep);
         m_paramNames.push_back(name);
         m_paramDefaults.push_back(hasDefault);
+        m_paramGenerics.push_back(fromGeneric);
+    }
+    // Whether the parameter was written with the name of a generic type. In
+    // the uninstantiated unit such a parameter matches nothing else; two
+    // subprograms that differ only in one are told apart there, and an
+    // instantiation that makes their profiles alike must not make the call
+    // ambiguous (4.7)
+    bool paramFromGeneric(size_t i) const {
+        return i < m_paramGenerics.size() && m_paramGenerics[i];
     }
     const std::string& paramName(size_t i) const {
         static const std::string empty;

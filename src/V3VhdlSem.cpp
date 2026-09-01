@@ -104,6 +104,7 @@ class VhdlSemVisitor final : public VNVisitor {
     std::vector<VhdlEntitySpec> m_entitySpecs;
     // The types a copy's generic types stand for, while the copy is analyzed
     std::map<std::string, VhdlType*> m_boundGenTypes;
+    std::set<std::string> m_pkgGenTypeNames;  // Generic types of the package copy in hand
     // And the regions its generic packages stand for
     std::map<std::string, VhdlScope*> m_boundGenPackages;
     // And the subprograms its generic subprograms stand for
@@ -1203,6 +1204,7 @@ public:
     void findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep, bool skipZero,
                           bool& sawOpen) VL_MT_DISABLED;
     static bool returnsACall(AstNode* stmtsp) VL_MT_DISABLED;
+    bool writtenWithGenericType(AstNode* subtypep) const VL_MT_DISABLED;
     VhdlType* intrinsicResultType(VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
                                   VhdlType* resultp) VL_MT_DISABLED;
     VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
@@ -1774,7 +1776,8 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             psymp->value(specValues[paramNum]);
         }
         ifp->vhdlSymp(psymp);
-        symp->addParam(ifp->name(), typep, ifp->defaultp() != nullptr);
+        symp->addParam(ifp->name(), typep, ifp->defaultp() != nullptr,
+                       writtenWithGenericType(ifp->subtypep()));
         declare(psymp, ifp->fileline());
         // A parameter's default value is an expression like any other, and
         // names what the subprogram's own region sees -- a constant of the
@@ -2831,7 +2834,9 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     }
     intop->addUse(savedp);
     VL_RESTORER(m_inPkgInst);
+    VL_RESTORER_COPY(m_pkgGenTypeNames);
     m_inPkgInst = true;
+    m_pkgGenTypeNames.clear();
     size_t position = 0;
     for (AstNode* p = pkgp->genericsp(); p; p = p->nextp(), ++position) {
         AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
@@ -2918,6 +2923,10 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         VL_RESTORER(m_inPackageInstance);
         m_inPackageBody = m_inPackageBody || inBody;
         m_inPackageInstance = true;
+        // A copy made later for one call site is analyzed away from here, and
+        // it is still the instantiated package's own source
+        p->foreachAndNext(
+            [](AstVhdlSubprogDecl* subp) { subp->inPkgInstance(true); });
         iterate(p);
     }
     m_scopep = savedp;
@@ -3042,6 +3051,8 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
             = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, formalp->name(), formalp);
         symp->typep(typep);
         declare(symp, flp);
+        // What the copy's own declarations name when they say this name
+        m_pkgGenTypeNames.insert(formalp->name());
         // The actual type's own operators are already visible wherever the
         // type is; declaring them again here would make every use of them
         // ambiguous inside the copy
@@ -3209,6 +3220,13 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     m_scopep = regionp;
     m_returnTypep = nullptr;
     m_specValues = actualValues;
+    // A copy of a subprogram of an instantiated package is that package's own
+    // source, wherever it is analyzed (4.7)
+    VL_RESTORER(m_inPackageInstance);
+    if (originalp->inPkgInstance()) {
+        copyp->inPkgInstance(true);
+        m_inPackageInstance = true;
+    }
     {
         // What the call supplies makes the body's bounds fold, but they are
         // not static where the design wrote them: a slice or an index out of
@@ -4054,6 +4072,25 @@ void V3VhdlSem::clear() {
 
 //######################################################################
 // Expressions (clauses 8, 9, 12.5)
+
+// Whether a subtype indication was written with the name of a generic type
+// this copy has bound. In the uninstantiated unit that name matches nothing
+// else, so a parameter of it cannot be what a call means unless the argument
+// is of the type the instantiation supplied for it (4.7).
+bool VhdlSemVisitor::writtenWithGenericType(AstNode* subtypep) const {
+    if ((m_boundGenTypes.empty() && m_pkgGenTypeNames.empty()) || !subtypep) return false;
+    bool found = false;
+    subtypep->foreachAndNext([&](AstNodeVhdlExpr* refp) {
+        if (found) return;
+        if (const AstVhdlName* const namep = VN_CAST(refp, VhdlName)) {
+            if (m_boundGenTypes.count(namep->name())
+                || m_pkgGenTypeNames.count(namep->name())) {
+                found = true;
+            }
+        }
+    });
+    return found;
+}
 
 bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
     if (!fromp || !top) return true;
@@ -5622,6 +5659,8 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
 
     // Otherwise a subprogram call, resolved by its arguments and its context
     std::vector<VhdlSymbol*> cands;
+    std::vector<int> genOf;  // How many of each candidate's matched parameters
+                             // were written with a generic type's name
     std::vector<int> formalOf;
     std::vector<std::string> elemOf;
     int best = -1;
@@ -5632,18 +5671,43 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
         bool ok = true;
         int score = 0;
+        int viaGeneric = 0;
         for (size_t i = 0; i < argCands.size() && ok; ++i) {
             if (formalOf[i] < 0) continue;
             VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
             if (!anyMatches(argCands[i], paramp)) ok = false;
             if (exactMatch(argCands[i], paramp)) ++score;
+            // A parameter written with the name of a generic type matched
+            // nothing else where the unit was analyzed, so where a call could
+            // mean either, it means the one that does not need it (4.7).
+            // Counted apart from the score: such a parameter is a good match,
+            // and where it is the only candidate it is the answer.
+            if (symp->resolved()->paramFromGeneric(formalOf[i])) ++viaGeneric;
         }
         if (!ok) continue;
         if (score > best) {
             best = score;
             cands.clear();
+            genOf.clear();
         }
-        if (score == best) cands.push_back(symp);
+        if (score == best) {
+            cands.push_back(symp);
+            genOf.push_back(viaGeneric);
+        }
+    }
+    // Among equals, the one that needs no parameter written with a generic
+    // type's name -- but only for a call written *inside* the instantiated
+    // unit, which the LRM analyzes against the formal generic type (4.7). A
+    // call written where the package was instantiated sees the profiles the
+    // instantiation made, and two of them alike is an ambiguous call there.
+    if (m_inPackageInstance && cands.size() > 1 && cands.size() == genOf.size()) {
+        int least = genOf[0];
+        for (const int g : genOf) least = std::min(least, g);
+        std::vector<VhdlSymbol*> keep;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (genOf[i] == least) keep.push_back(cands[i]);
+        }
+        cands.swap(keep);
     }
     if (cands.empty()) {
         // A function whose parameters all have defaults may be called by

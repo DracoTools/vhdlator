@@ -778,6 +778,9 @@ class AstVhdlSubprogDecl final : public AstNodeVhdlDecl {
     // defaults to whatever is visible where it is instantiated (6.5.5)
     bool m_defaultsToVisible = false;
     bool m_isInstance = false;  // A copy made by "is new", which is callable
+    // Declared inside a package an instantiation copied: a call written in
+    // here is resolved as it was where the package was written (4.7)
+    bool m_inPkgInstance = false;
     // A copy was made of this one for a call site, so it is a template: the
     // calls name the copies, and it has nothing left to emit
     bool m_specialized = false;
@@ -789,6 +792,8 @@ public:
         , m_isFunction{isFunction} {}
     ASTGEN_MEMBERS_AstVhdlSubprogDecl;
     bool isFunction() const { return m_isFunction; }
+    bool inPkgInstance() const { return m_inPkgInstance; }
+    void inPkgInstance(bool flag) { m_inPkgInstance = flag; }
     // Named to avoid hiding AstNode::isPure(), which means something else:
     // this is VHDL's pure/impure function qualifier (4.2.1)
     bool vhdlPure() const { return m_isPure; }
