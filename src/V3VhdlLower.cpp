@@ -138,6 +138,15 @@ class VhdlLowerVisitor final {
     // count separately (5.6.2).
     std::map<const VhdlSymbol*, AstNodeFTask*> m_protMethods;
     std::map<const VhdlSymbol*, AstVar*> m_protVars;
+    // A subprogram a package declares is one subprogram for the whole design
+    // (4.3), not one per module that calls it. It is emitted into the unit
+    // every module sees, and every call from anywhere finds that one, which
+    // is what lets a protected type's class reach it: UVVM's methods_pkg is
+    // hundreds of subprograms called from a dozen modules, and a copy of it
+    // in each of them is neither what the language says nor what fits.
+    std::map<const VhdlSymbol*, AstNodeFTask*> m_pkgFuncs;
+    bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
+    bool m_emitForUnit = false;  // Building something the unit will hold
     // The names those classes have been given. A generic package instantiated
     // twice has two protected types of the one name, and each needs a class
     // of its own in the emitted code (4.9).
@@ -184,6 +193,8 @@ class VhdlLowerVisitor final {
     std::string m_prefix;  // Name prefix for declarations inside a process
     std::string m_blockPrefix;  // Labels of the blocks being lowered, outermost first
     std::map<const VhdlType*, AstNodeFTask*> m_valueFuncs;  // "T'VALUE" readers, per type
+    // A helper that had to stay in a module, and which module that was
+    std::map<const AstNodeFTask*, AstNodeModule*> m_helperMod;
     std::set<std::string> m_instNames;  // Instance labels the module has used
     int m_processNum = 0;  // For naming unlabelled processes
     // Set by a statement that advanced the driver index itself
@@ -211,6 +222,66 @@ public:
         } else {
             m_stmtsp = AstNode::addNextNull(m_stmtsp, nodep);
         }
+    }
+
+    // A helper built for a type -- how a value of it is compared, copied,
+    // shifted, printed -- belongs to the type and not to whichever module
+    // first needed one. It goes into the one unit, so that a package's
+    // subprograms, which are there too, can call it, and so that a design
+    // gets one of each however many modules use the type.
+    // A type whose bounds an instantiation settles is that instance's type,
+    // though, and the helper built for it names the generic that settled
+    // them. That one stays in the module, where elaboration reaches it and
+    // makes one per set of generics -- and so does a helper that calls it.
+    void addHelperFunc(AstNodeFTask* funcp) {
+        bool ofModule = namesGeneric(funcp);
+        if (!ofModule) {
+            funcp->foreach([&](AstNodeFTaskRef* refp) {
+                if (refp->taskp() && m_helperMod.count(refp->taskp())) ofModule = true;
+            });
+        }
+        if (ofModule && m_modp) {
+            m_modp->addStmtsp(funcp);
+            m_helperMod.emplace(funcp, m_modp);
+            return;
+        }
+        m_netlistp->dollarUnitPkgAddp()->addStmtsp(funcp);
+    }
+
+    // Whether a helper already built can be used here: one that had to stay
+    // in a module is that module's, and another module asking for one of the
+    // same shape gets its own.
+    bool usableHelper(const AstNodeFTask* funcp) const {
+        const auto it = m_helperMod.find(funcp);
+        return it == m_helperMod.end() || it->second == m_modp;
+    }
+
+    // Whether what was made before can be called from what is being built
+    // now. While the lowering is filling the unit -- the body of a package's
+    // protected type, whose class the design shares -- a copy some module
+    // already made is that module's, and a call to it from the unit would
+    // name what the unit cannot reach. Answering no makes a fresh one, which
+    // lands beside the caller.
+    bool emittingIntoUnit() const {
+        if (m_emitForUnit) return true;
+        // A method of a protected type the design shares is being built into
+        // that class wherever the lowering happens to be at the time
+        for (const AstNode* p = m_protClassp; p; p = p->backp()) {
+            if (VN_IS(p, Package)) return true;
+            if (p != m_protClassp && VN_IS(p, NodeModule)) return false;
+        }
+        return false;
+    }
+
+    bool callableHere(const AstNodeFTask* ftaskp) const {
+        if (!ftaskp) return false;
+        if (!emittingIntoUnit()) return true;
+        for (const AstNode* p = ftaskp; p; p = p->backp()) {
+            if (VN_IS(p, Class)) return true;  // Reached through the object
+            if (VN_IS(p, Package)) return true;  // The one unit
+            if (VN_IS(p, NodeModule)) return false;
+        }
+        return true;  // Not anywhere yet, so it goes where this goes
     }
 
     void lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
@@ -319,11 +390,14 @@ private:
             = new AstClass{flp, name, m_modp ? m_modp->libname() : ""};
         m_protClasses.emplace(basep, classp);
         v3Global.setHasClasses();
-        // The class goes where the object of it does. A protected type's
-        // methods call what is visible where the type was declared -- the
-        // subprograms of the package it is in, which are emitted into the
-        // module that uses them -- so the class has to be able to see them.
-        if (m_modp) {
+        // A protected type a package declares is one type for the design,
+        // and a shared variable of it in two modules is two objects of the
+        // one class (5.6.2), so that class goes in the unit every module
+        // sees -- beside the package's own subprograms, which its methods
+        // call. One an architecture declares is that architecture's, and its
+        // methods may read what an instance settled, so it stays there.
+        const bool ofModule = m_modp && basep->bodyp() && !nodeInPackage(basep->bodyp());
+        if (ofModule) {
             m_modp->addStmtsp(classp);
         } else {
             m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
@@ -345,7 +419,11 @@ private:
         VL_RESTORER(m_protTypep);
         VL_RESTORER(m_ftaskp);
         VL_RESTORER(m_stmtsp);
+        VL_RESTORER(m_emitForUnit);
         VL_RESTORER_COPY(m_prefix);
+        // The class is in the unit, so what its methods call has to be there
+        // too: a copy this module already made is the module's
+        if (!ofModule) m_emitForUnit = true;
         m_protClassp = classp;
         m_protBodyp = bodyp;
         m_protTypep = basep;
@@ -353,6 +431,19 @@ private:
         m_stmtsp = nullptr;
         m_prefix.clear();
         for (AstNode* p = bodyp->declsp(); p; p = p->nextp()) lowerDecl(p);
+        // What lowering the body needed beside the class itself -- a copy of
+        // a subprogram made for one call, a helper for a type -- goes into
+        // the unit the class is in. Left here it would belong to nothing,
+        // and the calls the methods make would name what is not in the
+        // design at all.
+        if (m_stmtsp) {
+            if (!ofModule && batchSelfContained(m_stmtsp)) {
+                m_netlistp->dollarUnitPkgAddp()->addStmtsp(m_stmtsp);
+            } else if (m_modp) {
+                m_modp->addStmtsp(m_stmtsp);
+            }
+            m_stmtsp = nullptr;
+        }
         return classp;
     }
 
@@ -833,17 +924,19 @@ private:
     // both find the one function that was emitted.
     AstNodeFTask* emittedFunc(VhdlSymbol* symp) {
         if (!symp) return nullptr;
+        const auto pkgIt = m_pkgFuncs.find(symp);
+        if (pkgIt != m_pkgFuncs.end()) return pkgIt->second;
         auto it = m_funcs.find(symp);
-        if (it != m_funcs.end()) return it->second;
+        if (it != m_funcs.end() && callableHere(it->second)) return it->second;
         if (AstNodeFTask* const protp = protMethodOf(symp)) return protp;
         if (symp->bodyp() && symp->bodyp()->vhdlSymp()) {
             it = m_funcs.find(symp->bodyp()->vhdlSymp());
-            if (it != m_funcs.end()) return it->second;
+            if (it != m_funcs.end() && callableHere(it->second)) return it->second;
         }
         if (AstVhdlSubprogDecl* const declp = VN_CAST(symp->declp(), VhdlSubprogDecl)) {
             if (declp->vhdlSymp() && declp->vhdlSymp() != symp) {
                 it = m_funcs.find(declp->vhdlSymp());
-                if (it != m_funcs.end()) return it->second;
+                if (it != m_funcs.end() && callableHere(it->second)) return it->second;
             }
         }
         return nullptr;
@@ -2047,7 +2140,7 @@ private:
     AstNodeFTask* dynFillFunc(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
         const auto it = m_dynFillFuncs.find(basep);
-        if (it != m_dynFillFuncs.end()) return it->second;
+        if (it != m_dynFillFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
         AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
@@ -2107,8 +2200,8 @@ private:
             flp, wr(kp, flp),
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
-        m_modp->addStmtsp(funcp);
-        m_dynFillFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynFillFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -2160,7 +2253,7 @@ private:
     AstNodeFTask* dynEqFunc(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
         const auto it = m_dynEqFuncs.find(basep);
-        if (it != m_dynEqFuncs.end()) return it->second;
+        if (it != m_dynEqFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name
             = "__Vdyneq" + std::to_string(m_dynEqFuncs.size()) + "__" + basep->name();
@@ -2209,8 +2302,8 @@ private:
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
         funcp->addStmtsp(ret(true));
-        m_modp->addStmtsp(funcp);
-        m_dynEqFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynEqFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -2226,7 +2319,7 @@ private:
         if (count < 0 || count > 65536) return nullptr;
         const auto key = std::make_pair(carrierTypep->base(), count);
         const auto it = m_dynOfFuncs.find(key);
-        if (it != m_dynOfFuncs.end()) return it->second;
+        if (it != m_dynOfFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vdynof" + std::to_string(m_dynOfFuncs.size()) + "__"
                                  + carrierTypep->base()->name();
@@ -2288,8 +2381,8 @@ private:
             flp, wr(kp, flp),
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
-        m_modp->addStmtsp(funcp);
-        m_dynOfFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynOfFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2308,7 +2401,7 @@ private:
         const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
                                         static_cast<const VhdlType*>(fixedTypep));
         const auto it = m_dynOfExprFuncs.find(key);
-        if (it != m_dynOfExprFuncs.end()) return it->second;
+        if (it != m_dynOfExprFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstRange* const rangep = boundsRange(idxp, flp);
         if (!rangep) return nullptr;
@@ -2376,8 +2469,8 @@ private:
             flp, wr(kp, flp),
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
-        m_modp->addStmtsp(funcp);
-        m_dynOfExprFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynOfExprFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2390,7 +2483,7 @@ private:
         const auto key = std::make_pair(
             static_cast<const VhdlType*>(carrierTypep->base()), count);
         const auto it = m_dynOfLitFuncs.find(key);
-        if (it != m_dynOfLitFuncs.end()) return it->second;
+        if (it != m_dynOfLitFuncs.end() && usableHelper(it->second)) return it->second;
         const std::string name = "__Vdynlit" + std::to_string(m_dynOfLitFuncs.size()) + "__"
                                  + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
@@ -2436,8 +2529,8 @@ private:
                                            static_cast<int32_t>(k)}},
                 srcp});
         }
-        m_modp->addStmtsp(funcp);
-        m_dynOfLitFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynOfLitFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2495,7 +2588,7 @@ private:
         if (count < 0 || count > 65536) return nullptr;
         const auto key = std::make_pair(carrierTypep->base(), count);
         const auto it = m_dynToFuncs.find(key);
-        if (it != m_dynToFuncs.end()) return it->second;
+        if (it != m_dynToFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vdynto" + std::to_string(m_dynToFuncs.size()) + "__"
                                  + carrierTypep->base()->name();
@@ -2548,8 +2641,8 @@ private:
             flp, wr(kp, flp),
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
-        m_modp->addStmtsp(funcp);
-        m_dynToFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynToFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2566,7 +2659,7 @@ private:
         const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
                                         static_cast<const VhdlType*>(fixedTypep));
         const auto it = m_dynToExprFuncs.find(key);
-        if (it != m_dynToExprFuncs.end()) return it->second;
+        if (it != m_dynToExprFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstRange* const rangep = boundsRange(idxp, flp);
         if (!rangep) return nullptr;
@@ -2611,8 +2704,8 @@ private:
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynToExprFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynToExprFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2645,7 +2738,7 @@ private:
         VhdlType* const basep = typep->base();
         const auto key = std::make_pair(static_cast<const VhdlType*>(basep), signd);
         const auto it = m_dynBitsFuncs.find(key);
-        if (it != m_dynBitsFuncs.end()) return it->second;
+        if (it != m_dynBitsFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vdynbits" + std::to_string(m_dynBitsFuncs.size()) + "__"
                                  + basep->name();
@@ -2700,8 +2793,8 @@ private:
             flp, wr(kp, flp),
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
-        m_modp->addStmtsp(funcp);
-        m_dynBitsFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynBitsFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2717,7 +2810,7 @@ private:
         VhdlType* const basep = typep->base();
         const auto key = std::make_pair(static_cast<const VhdlType*>(basep), signd);
         const auto it = m_dynIntFuncs.find(key);
-        if (it != m_dynIntFuncs.end()) return it->second;
+        if (it != m_dynIntFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vdynint" + std::to_string(m_dynIntFuncs.size()) + "__"
                                  + basep->name();
@@ -2766,8 +2859,8 @@ private:
             flp, wr(kp, flp),
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
-        m_modp->addStmtsp(funcp);
-        m_dynIntFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynIntFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -2821,7 +2914,7 @@ private:
     std::map<bool, AstNodeFTask*> m_justifyFuncs;
     AstNodeFTask* justifyFunc(bool right, FileLine* origFlp) {
         const auto it = m_justifyFuncs.find(right);
-        if (it != m_justifyFuncs.end()) return it->second;
+        if (it != m_justifyFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         FileLine* const flp = dynFl(origFlp);
         const std::string name = std::string{"__Vjustify"} + (right ? "r" : "l");
@@ -2845,8 +2938,8 @@ private:
                     : static_cast<AstNodeExpr*>(new AstConcatN{flp, rd(vp, flp), padp});
         funcp->addStmtsp(new AstIf{flp, new AstGtS{flp, rd(fieldp, flp), rd(lenp, flp)},
                                    new AstAssign{flp, out(), joinp}});
-        m_modp->addStmtsp(funcp);
-        m_justifyFuncs.emplace(right, funcp);
+        addHelperFunc(funcp);
+        m_justifyFuncs.insert_or_assign(right, funcp);
         return funcp;
     }
 
@@ -2856,7 +2949,7 @@ private:
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
         const auto it = m_dynNotFuncs.find(basep);
-        if (it != m_dynNotFuncs.end()) return it->second;
+        if (it != m_dynNotFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdynnot", typep, dynCarrierRef(typep, flp), flp);
         AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
@@ -2881,8 +2974,8 @@ private:
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynNotFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynNotFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -2895,7 +2988,7 @@ private:
         const auto key = std::make_pair(static_cast<const VhdlType*>(basep),
                                         static_cast<int>(op));
         const auto it = m_dynRedFuncs.find(key);
-        if (it != m_dynRedFuncs.end()) return it->second;
+        if (it != m_dynRedFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdynred", typep, bitDType(flp), flp);
         AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
@@ -2929,8 +3022,8 @@ private:
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
         if (negate) funcp->addStmtsp(new AstAssign{flp, out(), new AstNot{flp, acc()}});
-        m_modp->addStmtsp(funcp);
-        m_dynRedFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynRedFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -3018,7 +3111,7 @@ private:
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
         const auto it = m_dynShiftFuncs.find(basep);
-        if (it != m_dynShiftFuncs.end()) return it->second;
+        if (it != m_dynShiftFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
         AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
@@ -3084,8 +3177,8 @@ private:
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynShiftFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynShiftFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -3117,7 +3210,7 @@ private:
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
         const auto it = m_dynAddFuncs.find(basep);
-        if (it != m_dynAddFuncs.end()) return it->second;
+        if (it != m_dynAddFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdynadd", typep, dynCarrierRef(typep, flp), flp);
         AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
@@ -3181,8 +3274,8 @@ private:
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(pp, flp), new AstAdd{flp, rd(pp, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(pp, flp), rd(wp, flp)}, bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynAddFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynAddFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -3197,7 +3290,7 @@ private:
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
         const auto it = m_dynCmpFuncs.find(basep);
-        if (it != m_dynCmpFuncs.end()) return it->second;
+        if (it != m_dynCmpFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp
             = newDynFunc("__Vdyncmp", typep, new AstBasicDType{flp, VBasicDTypeKwd::INTEGER},
@@ -3264,8 +3357,8 @@ private:
             new AstLogAnd{flp, new AstGteS{flp, rd(pp, flp), i32(0, flp)},
                           new AstEq{flp, outr(), i32(0, flp)}},
             bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynCmpFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynCmpFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -3279,7 +3372,7 @@ private:
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
         const auto it = m_dynDivFuncs.find(basep);
-        if (it != m_dynDivFuncs.end()) return it->second;
+        if (it != m_dynDivFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdyndiv", typep, dynCarrierRef(typep, flp), flp);
         AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
@@ -3350,8 +3443,8 @@ private:
             loopsp, static_cast<AstNode*>(new AstIf{flp, rd(remp, flp), remsp, nullptr}));
         funcp->addStmtsp(new AstIf{
             flp, new AstLteS{flp, rd(vp, flp), i32(0, flp)}, zerop, loopsp});
-        m_modp->addStmtsp(funcp);
-        m_dynDivFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynDivFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -3525,7 +3618,12 @@ private:
         // temporaries the lowering makes for itself are not, and are made
         // elsewhere.
         varp->trace(true);
-        m_vars.emplace(symp, varp);
+        // The newest stands for the name: a subprogram may be emitted a
+        // second time -- once for a module, once for the unit -- and the
+        // body being built now must read the variables it just declared,
+        // not the ones the earlier copy declared.
+        m_vars[symp] = varp;
+        m_varSym.emplace(varp, symp);
         if (m_protClassp && inProtectedBody(symp)) m_protVars.emplace(symp, varp);
         return varp;
     }
@@ -4525,7 +4623,7 @@ private:
             return nullptr;
         }
         const auto it = m_valueFuncs.find(basep);
-        if (it != m_valueFuncs.end()) return it->second;
+        if (it != m_valueFuncs.end() && usableHelper(it->second)) return it->second;
 
         const std::string name = "__Vvalue" + std::to_string(m_valueFuncs.size()) + "__"
                                  + VString::downcase(basep->prettyName());
@@ -4610,8 +4708,8 @@ private:
                 bodyp, static_cast<AstNode*>(new AstAssign{
                            flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, outp}));
             funcp->addStmtsp(bodyp);
-            m_modp->addStmtsp(funcp);
-            m_valueFuncs.emplace(basep, funcp);
+            addHelperFunc(funcp);
+            m_valueFuncs.insert_or_assign(basep, funcp);
             return funcp;
         }
         if (isReal) {
@@ -4623,8 +4721,8 @@ private:
                                 new AstSubstrN{flp, rd(sp, flp), rd(lop, flp), rd(hip, flp)},
                                 AstAtoN::ATOREAL}}));
             funcp->addStmtsp(bodyp);
-            m_modp->addStmtsp(funcp);
-            m_valueFuncs.emplace(basep, funcp);
+            addHelperFunc(funcp);
+            m_valueFuncs.insert_or_assign(basep, funcp);
             return funcp;
         }
         // An integer, or the abstract part of a physical literal. An
@@ -4726,8 +4824,8 @@ private:
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, valuep}));
         funcp->addStmtsp(bodyp);
-        m_modp->addStmtsp(funcp);
-        m_valueFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_valueFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -5390,6 +5488,13 @@ private:
             m_vars[symp] = sharedIt->second;
             return sharedIt->second;
         }
+        // A constant a package declares is likewise one object, and the
+        // subprograms emitted into the unit beside it name that one
+        const auto objIt = m_pkgObjs.find(symp);
+        if (objIt != m_pkgObjs.end()) {
+            m_vars[symp] = objIt->second;
+            return objIt->second;
+        }
         if (!symp->isObject() || symp->predefined()) return nullptr;
         // A deferred constant is declared in the package and given its value
         // in the package body, and it is that second declaration which says
@@ -5412,25 +5517,59 @@ private:
         const VVarType varType
             = declp->isElabConstant() ? VVarType::LPARAM : VVarType::VAR;
         AstVar* const varp = newVarOfType(symp, varType, dtypep, flp);
-        if (declp->defaultp()) {
-            varp->valuep(lowerExpr(declp->defaultp()));
-        } else {
-            varp->valuep(defaultValueFor(symp->typep(), flp));
+        // What working out its value needed -- a copy of a subprogram made
+        // for that one call -- belongs wherever the object ends up, so it is
+        // collected here rather than left in whichever list happened to be
+        // open. An object in the unit whose value calls something left in a
+        // module names what it cannot reach.
+        AstNode* valuep = nullptr;
+        {
+            AstNode* const outerStmtsp = m_stmtsp;
+            VL_RESTORER(m_emitForUnit);
+            // A package declares one object for the design, so what working
+            // out its value calls travels with it and is not left behind in
+            // whichever module happened to read it first
+            if (declaredInPackage(symp)) m_emitForUnit = true;
+            m_stmtsp = nullptr;
+            if (declp->defaultp()) {
+                varp->valuep(lowerExpr(declp->defaultp()));
+            } else {
+                varp->valuep(defaultValueFor(symp->typep(), flp));
+            }
+            valuep = m_stmtsp;
+            m_stmtsp = outerStmtsp;
         }
+        const auto keepValueWith = [&](AstNodeModule* wherep) {
+            if (!valuep) return;
+            if (wherep) {
+                wherep->addStmtsp(valuep);
+            } else {
+                m_stmtsp = AstNode::addNextNull(m_stmtsp, valuep);
+            }
+            valuep = nullptr;
+        };
         if (m_protClassp && inProtectedBody(symp)) {
             m_protClassp->addStmtsp(varp);
+            keepValueWith(m_protClassp);
         } else if (isPkgShared(symp)) {
             // One object for the whole design, in the unit every module sees
             varp->name(pkgObjectName(symp));
             varp->lifetime(VLifetime::STATIC_EXPLICIT);
             m_netlistp->dollarUnitPkgAddp()->addStmtsp(varp);
+            keepValueWith(m_netlistp->dollarUnitPkgAddp());
             m_pkgShared.emplace(symp, varp);
+        } else if (shareObjectIntoUnit(symp, varp, valuep)) {
+            keepValueWith(m_netlistp->dollarUnitPkgAddp());
+            // One constant for the whole design, in the unit that holds the
+            // package's subprograms, since those are what name it
         } else if (m_protClassp && m_modp) {
             // Declared outside the protected type, so it belongs to the
             // module however it was reached
             m_modp->addStmtsp(varp);
+            keepValueWith(m_modp);
         } else {
             m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+            keepValueWith(nullptr);
         }
         return varp;
     }
@@ -5512,7 +5651,9 @@ private:
                 return new AstConst{flp, AstConst::Unsized64{}, 1};
             }
             auto funcIt = m_funcs.find(symp);
-            if (funcIt == m_funcs.end() && emitOnDemand(symp)) funcIt = m_funcs.find(symp);
+            if ((funcIt == m_funcs.end() || !callableHere(funcIt->second)) && emitOnDemand(symp)) {
+                funcIt = m_funcs.find(symp);
+            }
             if (funcIt != m_funcs.end() && VN_IS(funcIt->second, Func)) {
                 AstFuncRef* const refp = new AstFuncRef{flp, funcIt->second->name(), nullptr};
                 refp->taskp(funcIt->second);
@@ -5560,13 +5701,73 @@ private:
     // that this has simply not reached yet is not one of these, and giving it
     // an object of its own would leave the module's drives going somewhere
     // nothing reads.
-    static bool declaredInPackage(const VhdlSymbol* symp) {
-        for (const AstNode* p = symp->declp(); p; p = p->backp()) {
-            if (VN_IS(p, VhdlPackage) || VN_IS(p, VhdlPackageBody)) return true;
+    // Whether a declaration stands in a package rather than in a design entity
+    static bool nodeInPackage(const AstNode* nodep) {
+        for (const AstNode* p = nodep; p; p = p->backp()) {
+            // A generic package instantiated is a package of its own (4.9),
+            // and what it declares is that package's, not a module's
+            if (VN_IS(p, VhdlPackage) || VN_IS(p, VhdlPackageBody)
+                || VN_IS(p, VhdlPackageInst)) {
+                return true;
+            }
             if (VN_IS(p, VhdlArchitecture) || VN_IS(p, VhdlEntity)) return false;
         }
         return false;
     }
+
+    // Where a subprogram is a copy the analysis made for one set of argument
+    // types, its declaration is a copy too and is not linked under the
+    // package the original was written in -- so the walk below finds
+    // nothing. The region it was declared in is the original's, though, and
+    // that is the honest answer: what is asked is where the *name* stands.
+    mutable std::map<const VhdlScope*, bool> m_scopeInPkg;
+
+    // What the written declaration says, where it is linked into the design
+    // it was read from. A copy's is not, and answers nothing.
+    static bool declaredInPackageAst(const VhdlSymbol* symp, bool& decidedr) {
+        decidedr = false;
+        const AstNode* const selfp = symp ? symp->declp() : nullptr;
+        for (const AstNode* p = selfp; p; p = p->backp()) {
+            if (p != selfp && (VN_IS(p, VhdlSubprogDecl) || VN_IS(p, VhdlProtectedType))) {
+                decidedr = true;
+                return false;
+            }
+            if (VN_IS(p, VhdlPackage) || VN_IS(p, VhdlPackageBody)
+                || VN_IS(p, VhdlPackageInst)) {
+                decidedr = true;
+                return true;
+            }
+            if (VN_IS(p, VhdlArchitecture) || VN_IS(p, VhdlEntity)) {
+                decidedr = true;
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // What is asked is where the *name* stands, so the answer belongs to the
+    // region and not to any one declaration in it: a copy the analysis made
+    // is written nowhere in the design, and its own declaration answers
+    // whatever it happens to be attached to. A region a package declares has
+    // at least one declaration that says so, and one of an architecture has
+    // none, so that is the question asked of the region.
+    bool declaredInPackage(const VhdlSymbol* symp) const {
+        const VhdlScope* const scopep = symp ? symp->declScopep() : nullptr;
+        if (!scopep) return false;
+        const auto it = m_scopeInPkg.find(scopep);
+        if (it != m_scopeInPkg.end()) return it->second;
+        bool answer = false;
+        for (const auto& pair : scopep->direct()) {
+            bool decided = false;
+            if (declaredInPackageAst(pair.second, decided) && decided) {
+                answer = true;
+                break;
+            }
+        }
+        m_scopeInPkg[scopep] = answer;
+        return answer;
+    }
+
 
     // Whether this object is a shared variable a package declares, which is
     // one object for the whole design however many modules name it (6.4.2.4)
@@ -5593,6 +5794,85 @@ private:
         return "__Vpkg__" + name;
     }
 
+    // A constant a package declares is one constant for the whole design
+    // (4.3), read by every module that uses the package. It is emitted into
+    // the unit beside the package's subprograms, since a subprogram there can
+    // only name what is there -- and because two modules each declaring their
+    // own would be two objects where the language has one.
+    std::map<const VhdlSymbol*, AstVar*> m_pkgObjs;
+    // What each variable was declared for, so that an object a package
+    // declares can be recognised again wherever it was first made
+    std::map<const AstNode*, VhdlSymbol*> m_varSym;
+    std::map<const AstNode*, VhdlSymbol*> m_taskSym;
+    // Whether anything here reads a generic, which differs between one
+    // instantiation and the next. A constant is written the same way once
+    // lowered, so it is not enough to see a parameter and stop: a constant
+    // worked out from other constants is still the design's one object,
+    // and only a generic underneath it makes the value an instance's own.
+    static bool namesGeneric(AstNode* nodep) {
+        std::set<const AstVar*> asked;
+        std::vector<AstNode*> pending{nodep};
+        while (!pending.empty()) {
+            AstNode* const itemp = pending.back();
+            pending.pop_back();
+            bool found = false;
+            itemp->foreach([&](AstVarRef* refp) {
+                AstVar* const varp = refp->varp();
+                if (!varp) return;
+                if (varp->varType() == VVarType::GPARAM) {
+                    found = true;
+                } else if (varp->varType() == VVarType::LPARAM && asked.insert(varp).second) {
+                    // What this one was worked out from has to be asked too
+                    pending.push_back(varp);
+                }
+            });
+            if (found) return true;
+        }
+        return false;
+    }
+
+    bool shareObjectIntoUnit(VhdlSymbol* symp, AstVar* varp, AstNode* valuep = nullptr) {
+        if (!m_netlistp || !symp || !varp) return false;
+        // A file a package declares is one file too: two modules writing a
+        // log through it are writing to the one open file (4.3)
+        if (symp->kind() != VhdlSymKind::CONSTANT && symp->kind() != VhdlSymKind::FILE) {
+            return false;
+        }
+        if (!declaredInPackage(symp)) return false;
+        // A constant standing for a generic an instantiation supplied is that
+        // instance's, not the design's
+        if (varp->varType() != VVarType::VAR) return false;
+        // Its value may name a generic, which an instantiation supplies and
+        // which is therefore that module's: a constant worked out from one
+        // is that module's too, and stays with it
+        if (namesGeneric(varp)) return false;
+        // Its value may call a copy of a subprogram made for that one call,
+        // and such a copy belongs where the call is. The constant goes with
+        // it rather than being left naming something out of its reach.
+        std::set<const AstNode*> travels;
+        for (AstNode* q = valuep; q; q = q->nextp()) {
+            travels.insert(q);
+            q->foreach([&](AstNodeFTask* tp) { travels.insert(tp); });
+        }
+        bool namesLocalCall = false;
+        varp->foreach([&](AstNodeFTaskRef* refp) {
+            if (!refp->taskp() || travels.count(refp->taskp())) return;
+            for (const AstNode* up = refp->taskp(); up; up = up->backp()) {
+                if (VN_IS(up, Class) || VN_IS(up, Package)) return;
+                if (VN_IS(up, NodeModule) || !up->backp()) {
+                    namesLocalCall = true;
+                    return;
+                }
+            }
+        });
+        if (namesLocalCall) return false;
+        varp->name(pkgObjectName(symp));
+        varp->lifetime(VLifetime::STATIC_EXPLICIT);
+        m_netlistp->dollarUnitPkgAddp()->addStmtsp(varp);
+        m_pkgObjs.emplace(symp, varp);
+        return true;
+    }
+
     AstVar* pkgSignalVar(VhdlSymbol* symp, FileLine* flp) {
         if (!declaredInPackage(symp)) return nullptr;
         const auto found = m_pkgSigs.find(symp);
@@ -5607,12 +5887,25 @@ private:
         varp->lifetime(VLifetime::STATIC_EXPLICIT);
         varp->trace(false);
         AstVhdlObjectDecl* const declp = VN_CAST(symp->declp(), VhdlObjectDecl);
-        if (declp && declp->defaultp()) {
-            varp->valuep(lowerExpr(declp->defaultp()));
-        } else {
-            varp->valuep(defaultValueFor(symp->typep(), flp));
+        // The signal is the design's one object, so what working out its
+        // initial value calls comes here with it rather than being left in
+        // whichever module happened to read the package first
+        AstNode* valuep = nullptr;
+        {
+            AstNode* const outerStmtsp = m_stmtsp;
+            VL_RESTORER(m_emitForUnit);
+            m_emitForUnit = true;
+            m_stmtsp = nullptr;
+            if (declp && declp->defaultp()) {
+                varp->valuep(lowerExpr(declp->defaultp()));
+            } else {
+                varp->valuep(defaultValueFor(symp->typep(), flp));
+            }
+            valuep = m_stmtsp;
+            m_stmtsp = outerStmtsp;
         }
         unitp->addStmtsp(varp);
+        if (valuep) unitp->addStmtsp(valuep);
         m_pkgSigs.emplace(symp, varp);
         m_vars[symp] = varp;
         return varp;
@@ -6157,7 +6450,9 @@ private:
                                    const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
         if (!symp) return nullptr;
         auto it = m_funcs.find(symp);
-        if (it == m_funcs.end() && emitOnDemand(symp)) it = m_funcs.find(symp);
+        if ((it == m_funcs.end() || !callableHere(it->second)) && emitOnDemand(symp)) {
+            it = m_funcs.find(symp);
+        }
         if (it == m_funcs.end() || !VN_IS(it->second, Func)) return nullptr;
         AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
         refp->taskp(it->second);
@@ -6324,7 +6619,7 @@ private:
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
         const auto it = m_dynSliceFuncs.find(basep);
-        if (it != m_dynSliceFuncs.end()) return it->second;
+        if (it != m_dynSliceFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp
             = newDynFunc("__Vdynslice", typep, dynCarrierRef(typep, flp), flp);
@@ -6360,8 +6655,8 @@ private:
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynSliceFuncs.emplace(basep, funcp);
+        addHelperFunc(funcp);
+        m_dynSliceFuncs.insert_or_assign(basep, funcp);
         return funcp;
     }
 
@@ -7587,11 +7882,25 @@ private:
 
     AstNodeFTask* emitOnDemand(VhdlSymbol* symp) {
         if (!symp) return nullptr;
+        // Already in the unit, put there by this module or by another
+        const auto pkgIt = m_pkgFuncs.find(symp);
+        if (pkgIt != m_pkgFuncs.end()) {
+            m_funcs.emplace(symp, pkgIt->second);
+            return pkgIt->second;
+        }
         AstVhdlSubprogDecl* declp = symp->bodyp();
         if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
         if (!declp) return nullptr;
         if (m_emitting.count(symp)) return nullptr;  // A recursive call, mid-emission
         m_emitting.insert(symp);
+        // A package's subprograms call one another, and two that call each
+        // other cannot be settled one at a time: whichever is looked at first
+        // names one that is not anywhere yet. So the first of them collects
+        // the rest, and where they go is decided for the group.
+        const bool insideGroup = m_inPkgEmit;
+        VL_RESTORER(m_inPkgEmit);
+        if (declaredInPackage(symp)) m_inPkgEmit = true;
+        AstNode* batchp = nullptr;
         {
             VL_RESTORER(m_ftaskp);
             VL_RESTORER(m_protClassp);
@@ -7606,33 +7915,130 @@ private:
             // its methods, however it was first reached, so it and whatever
             // it declares belong to the module too (5.6.2)
             const bool method = m_protClassp && inProtectedBody(symp);
+            // What a class the design shares asks for goes where the class
+            // goes. Collected apart it would be decided on its own, and a
+            // copy that names one of its neighbours -- still held, not yet
+            // put anywhere -- looks unreachable and is left in the module,
+            // where the class then cannot call it. So it stays with the rest
+            // and the whole of it is placed once.
+            const bool intoUnit = emittingIntoUnit();
+            const bool collect = !method && !insideGroup && !intoUnit;
             AstNode* const outerStmtsp = m_stmtsp;
+            VL_RESTORER(m_emitForUnit);
             if (!method) {
                 m_protClassp = nullptr;
-                m_stmtsp = nullptr;
+                if (intoUnit) m_emitForUnit = true;
+                if (collect) m_stmtsp = nullptr;
             }
             m_ftaskp = nullptr;
             m_prefix.clear();
             lowerSubprogram(declp);
-            if (!method) {
-                if (m_stmtsp && m_modp) m_modp->addStmtsp(m_stmtsp);
+            if (collect) {
+                batchp = m_stmtsp;
                 m_stmtsp = outerStmtsp;
             }
         }
         m_emitting.erase(symp);
+        AstNodeFTask* madep = nullptr;
         auto it = m_funcs.find(symp);
-        if (it != m_funcs.end()) return it->second;
+        if (it != m_funcs.end()) madep = it->second;
         // The body may carry a symbol of its own; the call's symbol is what
         // later lookups use, so record it under that too
         VhdlSymbol* const bodySymp = declp->vhdlSymp();
-        if (bodySymp && bodySymp != symp) {
+        if (!madep && bodySymp && bodySymp != symp) {
             it = m_funcs.find(bodySymp);
             if (it != m_funcs.end()) {
                 m_funcs.emplace(symp, it->second);
-                return it->second;
+                madep = it->second;
             }
         }
-        return nullptr;
+        if (batchp && !shareIntoUnit(symp, bodySymp, madep, batchp) && m_modp) {
+            m_modp->addStmtsp(batchp);
+        }
+        return madep;
+    }
+
+    // Whether everything this batch names can be reached from the one unit:
+    // what the batch itself declares, what is in the unit already, and a
+    // class's own, which is reached through the object. Anything else is a
+    // module's, and a subprogram moved away from it would name what is no
+    // longer in scope.
+    static bool nodeSelfContained(AstNode* nodep) {
+        AstNode* const savedNext = nodep->nextp();
+        // Only this node, not what follows it in the list it is in
+        const bool out = selfContainedImpl(nodep, savedNext);
+        return out;
+    }
+    static bool batchSelfContained(AstNode* batchp) { return selfContainedImpl(batchp, nullptr); }
+    static bool selfContainedImpl(AstNode* batchp, AstNode* stopp) {
+        std::set<const AstNode*> owned;
+        for (AstNode* p = batchp; p && p != stopp; p = p->nextp()) {
+            owned.insert(p);
+            p->foreach([&](AstVar* varp) { owned.insert(varp); });
+            p->foreach([&](AstNodeFTask* ftaskp) { owned.insert(ftaskp); });
+        }
+        const auto reachable = [&](const AstNode* targetp) {
+            // A call on a protected object names its method rather than
+            // binding it here, and is answered by the class the object is of
+            if (!targetp) return true;
+            if (owned.count(targetp)) return true;
+            for (const AstNode* p = targetp; p; p = p->backp()) {
+                if (VN_IS(p, Class)) return true;  // Reached through the object
+                if (VN_IS(p, Package)) return true;  // The one unit
+                if (VN_IS(p, NodeModule)) return false;
+            }
+            return false;  // Not linked yet, so a module being built owns it
+        };
+        bool ok = true;
+        for (AstNode* p = batchp; p && p != stopp && ok; p = p->nextp()) {
+            p->foreach([&](AstVarRef* refp) {
+                if (!reachable(refp->varp())) ok = false;
+            });
+            p->foreach([&](AstNodeFTaskRef* refp) {
+                if (!reachable(refp->taskp())) ok = false;
+            });
+            p->foreach([&](AstMemberSel* selp) {
+                if (selp->varp() && !reachable(selp->varp())) ok = false;
+            });
+        }
+        return ok;
+    }
+
+    // Take a package's subprogram into the unit every module sees, so that
+    // the one the language declares is the one the design gets. Answers
+    // whether it was taken; where it was not, the module keeps it as before.
+    bool shareIntoUnit(VhdlSymbol* symp, VhdlSymbol* bodySymp, AstNodeFTask* ftaskp,
+                       AstNode* batchp) {
+        if (!ftaskp || !m_netlistp || !batchp) return false;
+        if (!declaredInPackage(symp)) return false;
+        if (ftaskp->classMethod()) return false;
+        // Only what this batch built, so that a second module reusing it is
+        // reusing a whole subprogram and not half of one
+        bool made = false;
+        for (AstNode* p = batchp; p; p = p->nextp()) {
+            if (p == ftaskp) made = true;
+        }
+        if (!made) return false;
+        if (!batchSelfContained(batchp)) return false;
+        // One object for the whole design, so it outlives any one call
+        for (AstNode* p = batchp; p; p = p->nextp()) {
+            if (AstVar* const varp = VN_CAST(p, Var)) {
+                varp->lifetime(VLifetime::STATIC_EXPLICIT);
+            }
+        }
+        // Everything the group brought with it is in the unit now, so the
+        // next module that calls any of them finds the one there is
+        std::set<const AstNode*> taken;
+        for (AstNode* p = batchp; p; p = p->nextp()) taken.insert(p);
+        m_netlistp->dollarUnitPkgAddp()->addStmtsp(batchp);
+        m_pkgFuncs.emplace(symp, ftaskp);
+        if (bodySymp && bodySymp != symp) m_pkgFuncs.emplace(bodySymp, ftaskp);
+        for (const auto& pair : m_funcs) {
+            if (taken.count(pair.second) && declaredInPackage(pair.first)) {
+                m_pkgFuncs.emplace(pair.first, pair.second);
+            }
+        }
+        return true;
     }
 
     AstNodeExpr* lowerFuncCall(AstVhdlCall* nodep, FileLine* flp) {
@@ -7667,7 +8073,9 @@ private:
             if (AstNodeExpr* const outp = lowerSignalFuncCall(symp, nodep, flp)) return outp;
         }
         auto it = m_funcs.find(symp);
-        if (it == m_funcs.end() && emitOnDemand(symp)) it = m_funcs.find(symp);
+        if ((it == m_funcs.end() || !callableHere(it->second)) && emitOnDemand(symp)) {
+            it = m_funcs.find(symp);
+        }
         if (it != m_funcs.end() && VN_IS(it->second, Func)) {
             AstFuncRef* const refp = new AstFuncRef{flp, it->second->name(), nullptr};
             refp->taskp(it->second);
@@ -9652,7 +10060,8 @@ private:
         AstNodeFTask* ftaskp = nullptr;
         {
             const auto it = m_funcs.find(resolvep);
-            ftaskp = it != m_funcs.end() ? it->second : emitOnDemand(resolvep);
+            ftaskp = it != m_funcs.end() && callableHere(it->second) ? it->second
+                                                                     : emitOnDemand(resolvep);
         }
         if (!ftaskp || !VN_IS(ftaskp, Func)) {
             unsup(flp, what);
@@ -11952,7 +12361,7 @@ private:
         const auto key = std::make_pair(static_cast<const VhdlType*>(fromp),
                                         static_cast<const VhdlType*>(top));
         const auto it = m_recShapeFuncs.find(key);
-        if (it != m_recShapeFuncs.end()) return it->second;
+        if (it != m_recShapeFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name = "__Vrecshape" + std::to_string(m_recShapeFuncs.size()) + "__"
                                  + top->base()->name();
@@ -11975,8 +12384,8 @@ private:
             return nullptr;
         }
         funcp->addStmtsp(bodyp);
-        m_modp->addStmtsp(funcp);
-        m_recShapeFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_recShapeFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -12706,7 +13115,9 @@ private:
             }
         }
         auto it = symp ? m_funcs.find(symp) : m_funcs.end();
-        if (it == m_funcs.end() && symp && emitOnDemand(symp)) it = m_funcs.find(symp);
+        if ((it == m_funcs.end() || !callableHere(it->second)) && symp && emitOnDemand(symp)) {
+            it = m_funcs.find(symp);
+        }
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
             unsup(flp, "procedure call to '"
                            + (symp ? symp->name() : std::string{"<name>"}) + "'"
@@ -12745,7 +13156,7 @@ private:
         const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
                                         static_cast<const VhdlType*>(objTypep));
         const auto it = m_dynOfSliceFuncs.find(key);
-        if (it != m_dynOfSliceFuncs.end()) return it->second;
+        if (it != m_dynOfSliceFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const VhdlType* const idxp
             = objTypep->indexTypes().empty() ? nullptr : objTypep->indexTypes()[0];
@@ -12792,8 +13203,8 @@ private:
                        new AstAdd{flp, rd(kp, flp),
                                   new AstConst{flp, AstConst::Signed32{}, 1}}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
-        m_modp->addStmtsp(funcp);
-        m_dynOfSliceFuncs.emplace(key, funcp);
+        addHelperFunc(funcp);
+        m_dynOfSliceFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -12805,7 +13216,7 @@ private:
         const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
                                         static_cast<const VhdlType*>(objTypep));
         const auto it = m_dynToSliceFuncs.find(key);
-        if (it != m_dynToSliceFuncs.end()) return it->second;
+        if (it != m_dynToSliceFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const VhdlType* const idxp
             = objTypep->indexTypes().empty() ? nullptr : objTypep->indexTypes()[0];
@@ -12869,8 +13280,8 @@ private:
                        new AstAdd{flp, rd(kp, flp),
                                   new AstConst{flp, AstConst::Signed32{}, 1}}}));
         taskp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
-        m_modp->addStmtsp(taskp);
-        m_dynToSliceFuncs.emplace(key, taskp);
+        addHelperFunc(taskp);
+        m_dynToSliceFuncs.insert_or_assign(key, taskp);
         return taskp;
     }
 
@@ -13641,7 +14052,13 @@ private:
             m_deltaVarp = new AstVar{flp, VVarType::VAR, "__Vdelta", VFlagChildDType{},
                                      newLogicDType(flp, 1)};
             m_deltaVarp->valuep(new AstConst{flp, AstConst::BitFalse{}});
-            m_stmtsp = AstNode::addNextNull(m_stmtsp, m_deltaVarp);
+            // One bit for the design, in the unit every module sees. What a
+            // wait for 0 ns needs is to be woken a delta later, and any
+            // process that toggles this gives every waiting one that much;
+            // a bit per module would be a second of the same thing, and a
+            // subprogram a package shares could name only one of them.
+            m_deltaVarp->lifetime(VLifetime::STATIC_EXPLICIT);
+            m_netlistp->dollarUnitPkgAddp()->addStmtsp(m_deltaVarp);
         }
         AstNode* const outp = new AstAssignDly{
             flp, new AstVarRef{flp, m_deltaVarp, VAccess::WRITE},
@@ -15146,8 +15563,16 @@ private:
         FileLine* const flp = nodep->fileline();
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (!symp) return nullptr;
-        if (copyName.empty() && m_funcs.count(symp)) {
-            return nullptr;  // Its declaration already made one
+        if (copyName.empty()) {
+            const auto pkgIt = m_pkgFuncs.find(symp);
+            if (pkgIt != m_pkgFuncs.end()) {
+                m_funcs.emplace(symp, pkgIt->second);
+                return nullptr;  // The unit already holds the one there is
+            }
+            const auto madeIt = m_funcs.find(symp);
+            // Its declaration already made one -- unless that one is a
+            // module's and this is going into the unit
+            if (madeIt != m_funcs.end() && callableHere(madeIt->second)) return nullptr;
         }
         if (symp->isForeign()) {
             lowerForeignSubprogram(nodep, symp);
@@ -15224,7 +15649,10 @@ private:
         // A subprogram declared in a protected type body is one of its
         // methods, and reaches the object's own variables (5.6.2)
         if (m_protClassp) ftaskp->classMethod(true);
-        if (copyName.empty()) m_funcs.emplace(symp, ftaskp);
+        if (copyName.empty()) {
+            m_funcs.insert_or_assign(symp, ftaskp);
+            m_taskSym.emplace(ftaskp, symp);
+        }
         VL_RESTORER(m_ftaskp);
         VL_RESTORER(m_retCarrierp);
         VL_RESTORER_COPY(m_prefix);
@@ -15575,10 +16003,10 @@ private:
             }
             varp->declDirection(varp->direction());
             varp->funcLocal(true);
-            m_vars.emplace(psymp, varp);
+            m_vars[psymp] = varp;
             ftaskp->addStmtsp(varp);
         }
-        m_funcs.emplace(symp, ftaskp);
+        m_funcs.insert_or_assign(symp, ftaskp);
         addStmt(ftaskp);
     }
 
@@ -15775,20 +16203,11 @@ private:
         m_names.clear();
         m_instNames.clear();
         m_blockPrefix.clear();
-        m_valueFuncs.clear();
-        // The helpers a carrier needs belong to the module they were emitted
-        // into, so the next one starts without them
-        m_dynEqFuncs.clear();
-        m_dynFillFuncs.clear();
-        m_dynOfFuncs.clear();
-        m_dynToFuncs.clear();
-        m_dynBitsFuncs.clear();
-        m_dynIntFuncs.clear();
-        m_dynShiftFuncs.clear();
-        m_dynAddFuncs.clear();
-        m_dynCmpFuncs.clear();
-        m_dynDivFuncs.clear();
         m_funcs.clear();
+        // A copy made for one call, bound to the signal that call passed,
+        // belongs to the module the call is in: reused from another module
+        // it would name a subprogram that is not in scope there
+        m_signalCopies.clear();
         m_emitting.clear();
         m_drivers.clear();
         m_subDrivers.clear();
@@ -15858,7 +16277,6 @@ private:
         m_stmtsp = nullptr;
         m_modp->addStmtsp(m_shadowsp);
         m_shadowsp = nullptr;
-        m_deltaVarp = nullptr;
         m_shadows.clear();
         m_netlistp->addModulesp(m_modp);
         m_modp = nullptr;
@@ -16070,15 +16488,165 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
 // A reference to a signal a package declares has to say which package it is
 // in, or V3Scope cannot find the one object all the modules share.
 void VhdlLowerVisitor::markPackageSignalRefs() {
-    if ((m_pkgSigs.empty() && m_pkgShared.empty()) || !m_netlistp) return;
-    std::set<const AstVar*> varps;
-    for (const auto& pair : m_pkgSigs) varps.insert(pair.second);
-    // A shared variable a package declares is one object too, and is reached
-    // the same way
-    for (const auto& pair : m_pkgShared) varps.insert(pair.second);
+    if (!m_netlistp) return;
     AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
+    if (!unitp) return;
+    // Everything the unit names has to be reachable from it. An object a
+    // package declares that a module happened to make its own -- because
+    // that module was the first to read it -- is moved here, and every
+    // reference to it, from the unit and from the modules, answered by the
+    // one object the language says there is (4.3).
+    {
+        const auto placeOf = [](const AstNode* tp) -> char {
+            for (const AstNode* up = tp; up; up = up->backp()) {
+                if (VN_IS(up, Class)) return 'c';
+                if (VN_IS(up, Package)) return 'u';
+                if (VN_IS(up, NodeModule)) return 'm';
+            }
+            return '?';
+        };
+        // Homing one thing may show up another that named it, so this is
+        // run until nothing more moves
+        for (int pass = 0; pass < 4; ++pass) {
+            std::map<const AstVar*, AstVar*> redirect;
+            // Anywhere in the design, not only in the unit: a variable that was
+            // never put anywhere is named by whoever made it, and is nobody's
+            // until it is adopted here
+            m_netlistp->foreach([&](AstVarRef* refp) {
+                AstVar* const varp = refp->varp();
+                // 'm': a module made it its own. '?': it was never put anywhere,
+                // which happens where the lowering built it for a subprogram it
+                // then emitted somewhere else. Both are the design's object.
+                if (!varp) return;
+                const char place = placeOf(varp);
+                if (place != 'm' && place != '?') return;
+                if (redirect.count(varp)) return;
+                const auto symIt = m_varSym.find(varp);
+                const bool ofPackage
+                    = symIt != m_varSym.end() && declaredInPackage(symIt->second);
+                if (!ofPackage) {
+                    // Left nowhere, so nothing else can claim it either
+                    if (place == '?') {
+                        unitp->addStmtsp(varp);
+                        redirect.emplace(varp, varp);
+                    }
+                    return;
+                }
+                VhdlSymbol* const symp = symIt->second;
+                const auto haveIt = m_pkgObjs.find(symp);
+                if (haveIt != m_pkgObjs.end()) {
+                    redirect.emplace(varp, haveIt->second);
+                    return;
+                }
+                // Anything that cannot come here still has to be somewhere: if
+                // it was left nowhere, it goes where the reference to it is
+                const auto homeItNearby = [&]() {
+                    if (place != '?') return;
+                    for (AstNode* up = refp->backp(); up; up = up->backp()) {
+                        if (AstNodeModule* const modp = VN_CAST(up, NodeModule)) {
+                            modp->addStmtsp(varp);
+                            return;
+                        }
+                    }
+                };
+                // Its value may be this module's -- worked out from a generic --
+                // in which case it is not the design's and cannot be moved
+                if (namesGeneric(varp)) {
+                    homeItNearby();
+                    return;
+                }
+                // Nor if working it out calls something that stayed in a module:
+                // moved here, the object would name what it cannot reach
+                bool callsLocal = false;
+                varp->foreach([&](AstNodeFTaskRef* callp) {
+                    if (!callp->taskp()) return;
+                    const char at = placeOf(callp->taskp());
+                    if (at != 'c' && at != 'u') callsLocal = true;
+                });
+                if (callsLocal) {
+                    homeItNearby();
+                    return;
+                }
+                if (varp->backp()) varp->unlinkFrBack();
+                varp->name(pkgObjectName(symp));
+                varp->lifetime(VLifetime::STATIC_EXPLICIT);
+                unitp->addStmtsp(varp);
+                m_pkgObjs.emplace(symp, varp);
+                redirect.emplace(varp, varp);
+            });
+            if (!redirect.empty()) {
+                m_netlistp->foreach([&](AstVarRef* refp) {
+                    const auto it = redirect.find(refp->varp());
+                    if (it == redirect.end() || refp->varp() == it->second) return;
+                    refp->varp(it->second);
+                    refp->name(it->second->name());
+                });
+            }
+            // The same for the subprograms the unit calls. One a package
+            // declares is the design's, so it is brought here -- unless what it
+            // names is a module's own, and then it has to stay where it is.
+            std::map<const AstNodeFTask*, AstNodeFTask*> taskRedirect;
+            std::vector<AstNodeFTask*> movable;
+            unitp->foreach([&](AstNodeFTaskRef* refp) {
+                AstNodeFTask* const taskp = refp->taskp();
+                if (!taskp) return;
+                const char place = placeOf(taskp);
+                if (place != 'm' && place != '?') return;
+                if (taskRedirect.count(taskp)) return;
+                const auto symIt = m_taskSym.find(taskp);
+                const bool ofPackage
+                    = symIt != m_taskSym.end() && declaredInPackage(symIt->second);
+                // A copy made for one call, or a helper built for a type, is
+                // named here but was left nowhere. It belongs to no module, so
+                // the unit is where it goes.
+                if (!ofPackage && place != '?') return;
+                if (!ofPackage) {
+                    if (nodeSelfContained(taskp)) {
+                        taskRedirect.emplace(taskp, taskp);
+                        movable.push_back(taskp);
+                    }
+                    return;
+                }
+                const auto haveIt = m_pkgFuncs.find(symIt->second);
+                if (haveIt != m_pkgFuncs.end() && haveIt->second != taskp) {
+                    taskRedirect.emplace(taskp, haveIt->second);
+                    return;
+                }
+                if (!nodeSelfContained(taskp)) return;
+                taskRedirect.emplace(taskp, taskp);
+                movable.push_back(taskp);
+            });
+            for (AstNodeFTask* const taskp : movable) {
+                const auto symIt = m_taskSym.find(taskp);
+                if (taskp->backp()) taskp->unlinkFrBack();
+                unitp->addStmtsp(taskp);
+                if (symIt != m_taskSym.end()) m_pkgFuncs.emplace(symIt->second, taskp);
+            }
+            if (!taskRedirect.empty()) {
+                m_netlistp->foreach([&](AstNodeFTaskRef* refp) {
+                    const auto it = taskRedirect.find(refp->taskp());
+                    if (it == taskRedirect.end() || refp->taskp() == it->second) return;
+                    refp->taskp(it->second);
+                    refp->name(it->second->name());
+                });
+            }
+            if (redirect.empty() && taskRedirect.empty() && movable.empty()) break;
+        }
+    }
+    // Whatever ended up in the unit is reached the same way, whether it is a
+    // signal a package declares, a shared variable, or one of its subprograms
+    std::set<const AstNode*> varps;
+    std::set<const AstNode*> taskps;
+    for (AstNode* p = unitp->stmtsp(); p; p = p->nextp()) {
+        if (VN_IS(p, Var)) varps.insert(p);
+        if (VN_IS(p, NodeFTask)) taskps.insert(p);
+    }
+    if (varps.empty() && taskps.empty()) return;
     m_netlistp->foreach([&](AstVarRef* refp) {
         if (varps.count(refp->varp())) refp->classOrPackagep(unitp);
+    });
+    m_netlistp->foreach([&](AstNodeFTaskRef* refp) {
+        if (taskps.count(refp->taskp())) refp->classOrPackagep(unitp);
     });
 }
 

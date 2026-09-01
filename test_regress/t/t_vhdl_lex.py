@@ -15,7 +15,7 @@ test.scenarios('linter')
 # so a change in how any construct is scanned shows up as a diff.
 test.top_filename = "t/t_vhdl_lex.vhd"
 
-test.lint(fails=True,
+test.lint(fails=False,
           verilator_flags2=["--dump-vhdl-tokens"],
           expect_filename=test.golden_filename)
 
