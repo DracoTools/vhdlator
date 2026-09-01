@@ -1205,6 +1205,7 @@ public:
                           bool& sawOpen) VL_MT_DISABLED;
     static bool returnsACall(AstNode* stmtsp) VL_MT_DISABLED;
     bool writtenWithGenericType(AstNode* subtypep) const VL_MT_DISABLED;
+    static bool sameButForUniversal(const std::vector<VhdlSymbol*>& cands) VL_MT_DISABLED;
     VhdlType* intrinsicResultType(VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
                                   VhdlType* resultp) VL_MT_DISABLED;
     VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
@@ -4092,6 +4093,37 @@ bool VhdlSemVisitor::writtenWithGenericType(AstNode* subtypep) const {
     return found;
 }
 
+// Whether every candidate says the same thing, differing only in whether a
+// parameter is written as a universal type or as the INTEGER or REAL it
+// converts to. STANDARD declares both for every physical type.
+bool VhdlSemVisitor::sameButForUniversal(const std::vector<VhdlSymbol*>& cands) {
+    if (cands.size() < 2) return false;
+    const VhdlSymbol* const firstp = cands[0];
+    const VhdlType* const retp = firstp->returnTypep();
+    if (!retp) return false;
+    const auto alike = [](const VhdlType* ap, const VhdlType* bp) {
+        if (!ap || !bp) return false;
+        if (ap->base() == bp->base()) return true;
+        const VhdlTypeKind ak = ap->kind();
+        const VhdlTypeKind bk = bp->kind();
+        const auto intish = [](VhdlTypeKind k) {
+            return k == VhdlTypeKind::INTEGER || k == VhdlTypeKind::UNIVERSAL_INTEGER;
+        };
+        const auto realish = [](VhdlTypeKind k) {
+            return k == VhdlTypeKind::FLOATING || k == VhdlTypeKind::UNIVERSAL_REAL;
+        };
+        return (intish(ak) && intish(bk)) || (realish(ak) && realish(bk));
+    };
+    for (const VhdlSymbol* const symp : cands) {
+        if (!symp->returnTypep() || symp->returnTypep()->base() != retp->base()) return false;
+        if (symp->paramTypes().size() != firstp->paramTypes().size()) return false;
+        for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
+            if (!alike(symp->paramTypes()[i], firstp->paramTypes()[i])) return false;
+        }
+    }
+    return true;
+}
+
 bool VhdlSemVisitor::typesMatch(const VhdlType* fromp, const VhdlType* top) {
     if (!fromp || !top) return true;
     // A generic type nothing has bound yet is a type of its own: it matches
@@ -4562,6 +4594,26 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
             if (wantp ? resultp->base() == wantp->base() : resultp->isUniversal()) {
                 preferred.push_back(symp);
             }
+        }
+        // Two implicit declarations of a physical operator differ only in
+        // whether the count is universal or INTEGER -- "*"(universal_integer,
+        // TIME) and "*"(INTEGER, TIME) -- and mean the same thing, so an
+        // operand that reads as either is not an ambiguity to report (16.3).
+        // The universal one is what a literal means on its own (9.3.2).
+        if (preferred.size() != 1 && sameButForUniversal(cands)) {
+            VhdlSymbol* bestp = cands[0];
+            int most = -1;
+            for (VhdlSymbol* const symp : cands) {
+                int universal = 0;
+                for (const VhdlType* const typep : symp->paramTypes()) {
+                    if (typep && typep->isUniversal()) ++universal;
+                }
+                if (universal > most) {
+                    most = universal;
+                    bestp = symp;
+                }
+            }
+            preferred.assign(1, bestp);
         }
         if (preferred.size() == 1) {
             cands.swap(preferred);
