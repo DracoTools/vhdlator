@@ -14774,8 +14774,65 @@ private:
             }
         }
         m_ftaskp = nullptr;  // The task itself belongs to the module
+        redirectPortDrives(ftaskp);
         addStmt(ftaskp);
         return ftaskp;
+    }
+
+    // A port of mode inout is a net, and what its drivers add up to is
+    // worked out from the processes that drive it: a signal assignment
+    // written inside a subprogram is not one of those, and would be lost.
+    // Such a port is given a driver of its own here instead -- a value and
+    // an enable, with the port assigned from them -- which is the driver
+    // the call creates for the process that made it (14.7.2).
+    std::map<const AstVar*, std::pair<AstVar*, AstVar*>> m_subDrivers;
+    std::pair<AstVar*, AstVar*> subDriverFor(AstVar* portp, FileLine* flp) {
+        const auto it = m_subDrivers.find(portp);
+        if (it != m_subDrivers.end()) return it->second;
+        const std::string base = "__Vsubdrv__" + portp->name();
+        AstVar* const valp = new AstVar{flp, VVarType::VAR, base + "__val", portp};
+        AstVar* const enp = new AstVar{flp, VVarType::VAR, base + "__en", VFlagChildDType{},
+                                       new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
+        // Nothing is driven until the subprogram has run, which is what a
+        // driver contributes before its first transaction
+        enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
+        addStmt(valp);
+        addStmt(enp);
+        addStmt(new AstAlways{new AstAssignW{
+            flp, new AstVarRef{flp, portp, VAccess::WRITE},
+            new AstCond{flp, new AstVarRef{flp, enp, VAccess::READ},
+                        new AstVarRef{flp, valp, VAccess::READ},
+                        new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
+        const auto pair = std::make_pair(valp, enp);
+        m_subDrivers.emplace(portp, pair);
+        return pair;
+    }
+    void redirectPortDrives(AstNodeFTask* ftaskp) {
+        if (!m_modp) return;
+        std::vector<AstNodeAssign*> asgps;
+        ftaskp->foreach([&](AstNodeAssign* asgp) {
+            if (!VN_IS(asgp, AssignDly) && !VN_IS(asgp, AssignW)) return;
+            AstVarRef* const refp
+                = VN_CAST(AstNodeVarRef::varRefLValueRecurse(asgp->lhsp()), VarRef);
+            if (!refp || !refp->varp()) return;
+            const AstVar* const varp = refp->varp();
+            if (varp->isFuncLocal() || !varp->isIO()) return;
+            if (varp->direction() != VDirection::INOUT) return;
+            asgps.push_back(asgp);
+        });
+        for (AstNodeAssign* const asgp : asgps) {
+            FileLine* const flp = asgp->fileline();
+            AstVarRef* const refp
+                = VN_AS(AstNodeVarRef::varRefLValueRecurse(asgp->lhsp()), VarRef);
+            const auto drv = subDriverFor(refp->varp(), flp);
+            refp->varp(drv.first);
+            AstNode* const delayp = asgp->timingControlp();
+            AstNode* const enp = new AstAssignDly{
+                flp, new AstVarRef{flp, drv.second, VAccess::WRITE},
+                new AstConst{flp, AstConst::BitTrue{}},
+                delayp ? delayp->cloneTree(false) : nullptr};
+            asgp->addNextHere(enp);
+        }
     }
 
     // What a nested subprogram reaches out of its own region for, in the
@@ -15108,6 +15165,7 @@ private:
         m_funcs.clear();
         m_emitting.clear();
         m_drivers.clear();
+        m_subDrivers.clear();
         m_driverCount.clear();
         m_driverUsed.clear();
         s_partialDriven.clear();
