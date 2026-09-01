@@ -10869,10 +10869,34 @@ private:
 
     // METHODS - sequential statements (clause 10)
 
+    // "s <= unaffected" says to leave the driver as it is (10.5.2.1), so a
+    // statement that gives nothing back is what it asked for
+    static bool assignsNothing(const AstNode* nodep) {
+        const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign);
+        if (!asgp) return false;
+        bool anyValue = false;
+        bool anyWave = false;
+        nodep->foreach([&](const AstVhdlWaveform* wavep) {
+            anyWave = true;
+            if (wavep->valuep()) anyValue = true;
+        });
+        return anyWave && !anyValue;
+    }
+
     AstNode* lowerStmts(AstNode* stmtsp) {
         AstNode* outp = nullptr;
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
-            outp = AstNode::addNextNull(outp, lowerStmt(VN_AS(p, NodeVhdlStmt)));
+            const int before = V3Error::errorCount();
+            AstNode* const onep = lowerStmt(VN_AS(p, NodeVhdlStmt));
+            // A statement that lowers to nothing has to have said why: "null"
+            // is the one that means nothing, and everything else that gives
+            // nothing back has reported it. Saying nothing and emitting
+            // nothing would leave the design quietly missing what it wrote.
+            if (!onep && !VN_IS(p, VhdlNull) && !assignsNothing(p)
+                && V3Error::errorCount() == before) {
+                unsup(p->fileline(), std::string{"statement "} + p->typeName());
+            }
+            outp = AstNode::addNextNull(outp, onep);
         }
         return outp;
     }
