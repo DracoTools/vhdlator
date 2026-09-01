@@ -1236,10 +1236,10 @@ private:
         const bool local = m_modp && dependsOnGeneric(keyp);
         if (local) {
             const auto foundl = m_recLocalNames.find({m_modp, keyp});
-            if (foundl != m_recLocalNames.end()) return new AstRefDType{flp, foundl->second};
+            if (foundl != m_recLocalNames.end()) return refToDType(foundl->second, flp);
         } else {
             const auto found = m_recNames.find(keyp);
-            if (found != m_recNames.end()) return new AstRefDType{flp, found->second};
+            if (found != m_recNames.end()) return refToDType(found->second, flp);
         }
         const std::string name
             = "__Vrec" + std::to_string(++m_nameNum) + "__" + keyp->name();
@@ -1266,7 +1266,20 @@ private:
         } else {
             unitp->addStmtsp(tdp);
         }
-        return new AstRefDType{flp, name};
+        m_dtypeDecls.emplace(name, tdp);
+        return refToDType(name, flp);
+    }
+
+    // A reference to a structure the lowering declared, bound to that
+    // declaration rather than left to be answered by name. The declaration
+    // is in the unit every module shares, and a name is answered where it
+    // was written -- so a reference from anywhere else could not find it.
+    std::map<std::string, AstTypedef*> m_dtypeDecls;
+    AstRefDType* refToDType(const std::string& name, FileLine* flp) {
+        AstRefDType* const refp = new AstRefDType{flp, name};
+        const auto it = m_dtypeDecls.find(name);
+        if (it != m_dtypeDecls.end()) refp->typedefp(it->second);
+        return refp;
     }
 
     // Whether any bound inside this type is an expression rather than a
@@ -1505,7 +1518,7 @@ private:
         // giving the two their own structures would make it something.
         VhdlType* const keyp = elemp ? elemp->base() : basep;
         const auto found = m_dynNames.find(keyp);
-        if (found != m_dynNames.end()) return new AstRefDType{flp, found->second};
+        if (found != m_dynNames.end()) return refToDType(found->second, flp);
         const std::string name = "__Vdyn" + std::to_string(++m_nameNum) + "__" + keyp->name();
         m_dynNames.emplace(keyp, name);
         AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
@@ -1523,7 +1536,8 @@ private:
             flp, "dsc", VFlagChildDType{}, new AstBasicDType{flp, VBasicDTypeKwd::BIT}, nullptr});
         AstTypedef* const tdp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
         if (unitp) unitp->addStmtsp(tdp);
-        return new AstRefDType{flp, name};
+        m_dtypeDecls.emplace(name, tdp);
+        return refToDType(name, flp);
     }
 
     // The parts of a carrier
@@ -4062,6 +4076,10 @@ private:
             for (size_t i = levels.size(); i-- > 0;) {
                 AstNodeDType* const lvlp
                     = (i == 0) ? dtypep : levels[i]->cloneTree(false);
+                // An initializer names its type rather than holding it, so
+                // the tree has to own it: left loose it belongs to nothing,
+                // and a check of the tree says so.
+                m_netlistp->typeTablep()->addTypesp(lvlp);
                 outp = new AstInitArray{flp, lvlp, outp};
             }
             return outp;

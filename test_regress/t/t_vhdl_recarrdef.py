@@ -17,7 +17,7 @@ test.scenarios('vlt')
 test.top_filename = "t/t_vhdl_recarrdef.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_recarrdef"],
+             verilator_flags2=["--timing", "--debug-check", "--top-module t_vhdl_recarrdef"],
              make_top_shell=False,
              make_main=False)
 
