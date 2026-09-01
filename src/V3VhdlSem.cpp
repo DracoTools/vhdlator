@@ -1348,6 +1348,9 @@ private:
                              bool generics = false) VL_MT_DISABLED;
     void analyzeDrivers(AstVhdlArchitecture* archp) VL_MT_DISABLED;
     static bool isLogicValued(const VhdlType* typep) VL_MT_DISABLED;
+    static bool driversCombined(const VhdlType* typep, int depth = 0) VL_MT_DISABLED;
+    void collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbol*>& whole,
+                            std::set<const VhdlSymbol*>& partial) VL_MT_DISABLED;
     struct NeedResolve final {
         VhdlSymbol* symp;
         VhdlSymbol* resolvep;
@@ -3904,6 +3907,80 @@ bool VhdlSemVisitor::isLogicValued(const VhdlType* typep) {
     return true;
 }
 
+// Whether the drivers of such a signal are combined into one value without
+// a resolution function of the design's own being run: the nine logic
+// values resolve natively, and a composite of them resolves element by
+// element, which for a value made of bits is the same thing (6.5.2)
+bool VhdlSemVisitor::driversCombined(const VhdlType* typep, int depth) {
+    if (!typep || depth > 8) return false;
+    const VhdlType* const basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::RECORD) {
+        if (basep->elements().empty()) return false;
+        for (const VhdlSymbol* const elemp : basep->elements()) {
+            if (!driversCombined(elemp->typep(), depth + 1)) return false;
+        }
+        return true;
+    }
+    if (!isLogicValued(typep)) return false;
+    // An unresolved logic type -- STD_ULOGIC -- combines nothing
+    if (typep->resolutionp()) return true;
+    const VhdlType* const elemp
+        = typep->elementp() ? typep->elementp() : basep->elementp();
+    return elemp && elemp->resolutionp();
+}
+
+// A procedure with a signal parameter of mode out or inout drives the
+// signal the call passes, and the driver belongs to the process that made
+// the call (4.2.2.3, 14.7.2): two processes calling the same procedure
+// with the same signal are two drivers of it.
+void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbol*>& whole,
+                                        std::set<const VhdlSymbol*>& partial) {
+    stmtp->foreach([&](AstVhdlProcCall* pcallp) {
+        const AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+        VhdlSymbol* const namedp
+            = callp ? callp->vhdlSymp()
+                    : (pcallp->callp() ? pcallp->callp()->vhdlSymp() : nullptr);
+        VhdlSymbol* const csymp = namedp ? namedp->resolved() : nullptr;
+        AstVhdlSubprogDecl* const declp
+            = csymp ? (csymp->bodyp() ? csymp->bodyp()
+                                      : VN_CAST(csymp->declp(), VhdlSubprogDecl))
+                    : nullptr;
+        if (!declp || !callp) return;
+        // The formals, past the generics a generic subprogram keeps ahead
+        // of them (4.2.1)
+        std::vector<const AstVhdlIfaceDecl*> formals;
+        AstNode* fp = declp->paramsp();
+        for (int i = 0; i < declp->genericCount() && fp; ++i) fp = fp->nextp();
+        for (; fp; fp = fp->nextp()) formals.push_back(VN_CAST(fp, VhdlIfaceDecl));
+        size_t pos = 0;
+        for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+            const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+            if (!asp || !asp->actualp()) continue;
+            const AstVhdlIfaceDecl* formalp = nullptr;
+            if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                for (const AstVhdlIfaceDecl* const one : formals) {
+                    if (one && one->name() == fnamep->name()) formalp = one;
+                }
+            } else if (!asp->formalp() && pos < formals.size()) {
+                formalp = formals[pos];
+            }
+            if (!formalp || formalp->kind() != VhdlIfaceKind::SIGNAL) continue;
+            if (formalp->mode() == VhdlMode::IN) continue;
+            const VhdlSymbol* const symp = driverRootSym(asp->actualp());
+            if (!symp) continue;
+            // Only where the drivers are combined at all: a signal whose
+            // resolution is a function of the design's own is left as it
+            // was, since one driver per call site is not what it expects
+            if (!driversCombined(symp->typep())) continue;
+            if (VN_IS(asp->actualp(), VhdlName)) {
+                whole.insert(symp);
+            } else {
+                partial.insert(symp);
+            }
+        }
+    });
+}
+
 void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::map<const VhdlSymbol*, int> counts;
     std::map<const VhdlSymbol*, FileLine*> where;
@@ -3922,6 +3999,7 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             }
             std::set<const VhdlSymbol*> whole;
             collectDrivenSyms(p, whole, partial, false);
+            collectCallDrivers(p, whole, partial);
             const AstVhdlGenerate* const genp = VN_CAST(p, VhdlGenerate);
             const bool inGenerate = genp;
             // Every iteration of a for generate elaborates the statements of
@@ -3961,6 +4039,13 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             // as ordinary assignments; if two really do elaborate, the back
             // end says so where it can see it.
             symp->driverCount(1);
+            continue;
+        }
+        if (!resolvep && driversCombined(typep)) {
+            // A composite of logic values: each element resolves as the
+            // logic values do, and the drivers of a composite are resolved
+            // element by element (6.5.2), so the signal needs no resolution
+            // function of its own
             continue;
         }
         if (!resolvep) {

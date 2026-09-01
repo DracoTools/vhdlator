@@ -9325,6 +9325,45 @@ private:
                 }
             }
         }
+        // A procedure with a signal parameter of mode out or inout drives
+        // the signal the call passes, and the driver belongs to the process
+        // that made the call (4.2.2.3, 14.7.2)
+        if (const AstVhdlProcCall* const pcallp = VN_CAST(nodep, VhdlProcCall)) {
+            const AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+            VhdlSymbol* const namedp
+                = callp ? callp->vhdlSymp()
+                        : (pcallp->callp() ? pcallp->callp()->vhdlSymp() : nullptr);
+            VhdlSymbol* const csymp = namedp ? namedp->resolved() : nullptr;
+            AstVhdlSubprogDecl* const declp = csymp ? declOf(csymp) : nullptr;
+            if (declp && callp) {
+                std::vector<const AstVhdlIfaceDecl*> formals;
+                for (AstNode* fp = firstParamOf(declp); fp; fp = fp->nextp()) {
+                    formals.push_back(VN_CAST(fp, VhdlIfaceDecl));
+                }
+                size_t pos = 0;
+                for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+                    const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                    if (!asp || !asp->actualp()) continue;
+                    const AstVhdlIfaceDecl* formalp = nullptr;
+                    if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                        for (const AstVhdlIfaceDecl* const one : formals) {
+                            if (one && one->name() == fnamep->name()) formalp = one;
+                        }
+                    } else if (!asp->formalp() && pos < formals.size()) {
+                        formalp = formals[pos];
+                    }
+                    if (!formalp || formalp->kind() != VhdlIfaceKind::SIGNAL) continue;
+                    if (formalp->mode() == VhdlMode::IN) continue;
+                    if (const VhdlSymbol* const symp = rootSymOf(asp->actualp())) {
+                        if (VN_IS(asp->actualp(), VhdlName)) {
+                            out.insert(symp);
+                        } else {
+                            s_partialDriven.insert(symp);
+                        }
+                    }
+                }
+            }
+        }
         if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
             if (const VhdlSymbol* const symp = rootSymOf(asgp->targetp())) {
                 // A driver belongs to the longest static prefix of the name
@@ -9360,6 +9399,12 @@ private:
             }
             for (const VhdlSymbol* const symp : driven) ++m_driverCount[symp];
         }
+    }
+
+    // Whether an assignment to this name goes through a driver of its own:
+    // a resolved signal, or a formal a call bound to one driver of one
+    bool drivenThroughDriver(const VhdlSymbol* symp) const {
+        return symp && (m_drivers.count(symp) || m_bindDrivers.count(symp));
     }
 
     // Whether this signal needs resolving, and can be
@@ -9720,8 +9765,13 @@ private:
                            AstNodeExpr* valuep, AstNode* delayp, bool sequential,
                            FileLine* flp) {
         const VhdlSymbol* const symp = rootSymOf(targetp);
-        const auto it = m_drivers.find(symp);
-        const int idx = m_driverUsed[symp];
+        // Inside a copy made for a call, the name is the formal's and the
+        // driver is the one the caller owns
+        const auto bIt = m_bindDrivers.find(symp);
+        const VhdlSymbol* const signalp
+            = bIt != m_bindDrivers.end() ? bIt->second.signalp : symp;
+        const auto it = m_drivers.find(signalp);
+        const int idx = bIt != m_bindDrivers.end() ? bIt->second.idx : m_driverUsed[signalp];
         if (it == m_drivers.end() || idx >= static_cast<int>(it->second.size())) {
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
             unsup(flp, "assignment to a resolved signal from here");
@@ -9861,7 +9911,7 @@ private:
         // -- which is what "rst <= '0' after 22 ns" means.
         if (nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
             && (nodep->wavesp()->nextp() || nodep->wavesp()->afterp())
-            && !m_drivers.count(rootSymOf(nodep->targetp()))) {
+            && !drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             if (!v3Global.opt.timing().isTrue()) {
                 unsup(flp, "waveform with more than one element without --timing");
                 return;
@@ -9876,7 +9926,7 @@ private:
         }
         // The same, where which waveform is scheduled depends on a condition
         if (nodep->kind() == VhdlAssignKind::CONDITIONAL
-            && !m_drivers.count(rootSymOf(nodep->targetp())) && anyWaveformDelay(nodep)) {
+            && !drivenThroughDriver(rootSymOf(nodep->targetp())) && anyWaveformDelay(nodep)) {
             if (!v3Global.opt.timing().isTrue()) {
                 unsup(flp, "waveform with more than one element without --timing");
                 return;
@@ -9921,7 +9971,7 @@ private:
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
             return;
         }
-        if (m_drivers.count(rootSymOf(nodep->targetp()))) {
+        if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
             if (AstNode* const outp
                 = driveResolved(nodep, nodep->targetp(), rhsp, delayp, false, flp)) {
@@ -11277,7 +11327,7 @@ private:
             if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
             return lowerAggregateTarget(aggp, wfp->valuep(), true, sequential, flp);
         }
-        if (m_drivers.count(rootSymOf(nodep->targetp()))) {
+        if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             AstNodeExpr* const valuep = lowerExpr(wfp->valuep());
             if (!valuep) return nullptr;
             AstNode* const markp
@@ -12642,6 +12692,7 @@ private:
         std::map<const VhdlSymbol*, std::map<std::string, AstNodeVhdlExpr*>> elemBind;
         std::map<const VhdlSymbol*, DynSigBind> dynBind;
         std::map<const VhdlSymbol*, const VhdlType*> typeBind;
+        std::map<const VhdlSymbol*, DrvBind> drvBind;
         std::string key = symp->name();
         for (size_t i = 0; i < formals.size(); ++i) {
             AstNodeVhdlExpr* actualp = nullptr;
@@ -12767,7 +12818,27 @@ private:
                 key += "|" + path;
                 continue;
             }
-            if (m_drivers.count(actualSymp)) return nullptr;  // Resolved: needs its drivers
+            // A signal several processes drive is not refused: the copy is
+            // made for this call, so the driver the caller owns is known
+            // here and is the one an assignment inside it writes
+            const auto drvIt = m_drivers.find(actualSymp->resolved());
+            if (drvIt != m_drivers.end()) {
+                const VhdlSymbol* const signalp = actualSymp->resolved();
+                const int idx = m_driverUsed[signalp];
+                if (idx >= static_cast<int>(drvIt->second.size())) return nullptr;
+                // Only where the drivers resolve as the logic values do. One
+                // combined by a function of the design's own holds a value
+                // and nothing to say whether it drives at all, and a copy
+                // that wrote to it would drive from the moment it was
+                // elaborated rather than when the call was made.
+                if (!drvIt->second[idx].enp) return nullptr;
+                DrvBind db;
+                db.signalp = signalp;
+                db.idx = idx;
+                drvBind.emplace(formals[i]->vhdlSymp(), db);
+                key += "|drv" + std::to_string(reinterpret_cast<uintptr_t>(signalp)) + "#"
+                       + std::to_string(idx);
+            }
             bind.emplace(formals[i]->vhdlSymp(), varIt->second);
             // Which signal the formal names, so that inside the copy its
             // history attributes -- 'EVENT, 'LAST_VALUE and the rest -- are
@@ -12801,12 +12872,14 @@ private:
                 VL_RESTORER_COPY(m_bindElems);
                 VL_RESTORER_COPY(m_bindDynSigs);
                 VL_RESTORER_COPY(m_bindTypes);
+                VL_RESTORER_COPY(m_bindDrivers);
                 m_bindSignals = bind;
                 m_bindExprs = exprBind;
                 m_bindSymbols = symBind;
                 m_bindElems = elemBind;
                 m_bindDynSigs = dynBind;
                 for (const auto& pair : typeBind) m_bindTypes[pair.first] = pair.second;
+                m_bindDrivers = drvBind;
                 m_ftaskp = nullptr;
                 m_prefix.clear();
                 for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
@@ -14589,6 +14662,15 @@ private:
         std::vector<std::string> argNames;  // What the caller passes them as
     };
     std::map<const VhdlSymbol*, DynSigBind> m_bindDynSigs;
+    // A signal-class formal bound to a signal several processes drive. An
+    // assignment inside the subprogram is made by the driver of the process
+    // that called it (4.2.2.3, 14.7.2), so the copy is told which driver
+    // that is; a read still reads what the drivers add up to.
+    struct DrvBind final {
+        const VhdlSymbol* signalp = nullptr;  // The signal it names
+        int idx = 0;  // Which of that signal's drivers the caller owns
+    };
+    std::map<const VhdlSymbol*, DrvBind> m_bindDrivers;
     std::map<std::string, AstNodeFTask*> m_signalCopies;
 
     // Whether every element of a record has a length the back end can fold
@@ -15275,6 +15357,7 @@ private:
         m_subDrivers.clear();
         m_triPorts.clear();
         m_bindTypes.clear();
+        m_bindDrivers.clear();
         m_driverCount.clear();
         m_driverUsed.clear();
         s_partialDriven.clear();
