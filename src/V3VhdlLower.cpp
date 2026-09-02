@@ -6844,8 +6844,22 @@ private:
         if (!callp || !callp->prefixp()) return false;
         AstVhdlRange* const rangep = VN_CAST(callp->argsp(), VhdlRange);
         if (!rangep || sliceSpanKnown(rangep)) return false;
+        // It is running that has to decide how long it is. Ends the
+        // elaboration settles -- a generic, or an attribute of an object a
+        // generic sized -- fold per instance, and that is an ordinary part
+        // select, which costs nothing.
+        if (!boundsOnlyRunningDecides(rangep->leftp())
+            && !boundsOnlyRunningDecides(rangep->rightp())) {
+            return false;
+        }
         const VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
-        if (!objTypep || !objTypep->isConstrainedArray()) return false;
+        // The object has places to take the slice from -- a length the text
+        // or the elaboration fixes, not one that arrives with the value
+        if (!objTypep || objTypep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (objTypep->indexTypes().empty()) return false;
+        // Not one whose own length arrives with its value: that is a carrier
+        // already, and a slice of one is taken a different way (8.5)
+        if (carriedDynamically(objTypep)) return false;
         return carriedDynamically(callp->vhdlTypep());
     }
 
@@ -6874,8 +6888,6 @@ private:
         VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
         VhdlType* const carrp = callp->vhdlTypep();
         if (!objTypep || !carrp) return nullptr;
-        AstNodeFTask* const outFuncp = dynToSliceFunc(carrp, objTypep, flp);
-        if (!outFuncp) return nullptr;
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool ascending = true;
@@ -6884,6 +6896,12 @@ private:
             || !dirKnown) {
             if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstNodeFTask* const outFuncp = dynToSliceFunc(carrp, objTypep, ascending, flp);
+        if (!outFuncp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return nullptr;
         }
         AstNodeExpr* const writep = lowerDriveTarget(callp->prefixp());
@@ -7794,16 +7812,16 @@ private:
                     }
                     // The two ends do not keep a fixed distance apart, so how
                     // long the slice is only running decides -- even though
-                    // the object it is taken from has a length the text
-                    // fixes. From here it is a value that carries its own
-                    // bounds (8.5).
+                    // the object it is taken from has a length the text or
+                    // the elaboration fixes. From here it is a value that
+                    // carries its own bounds (8.5).
                     VhdlType* const objTypep
                         = prefixExprp ? prefixExprp->vhdlTypep() : nullptr;
                     VhdlType* const sliceTypep = nodep->vhdlTypep();
-                    if (!m_asTarget && !sliceSpanKnown(rp) && sliceTypep && objTypep
-                        && objTypep->isConstrainedArray() && sliceDirKnown) {
+                    if (!m_asTarget && sliceTypep && objTypep && sliceDirKnown
+                        && isRunningSlice(nodep)) {
                         if (AstNodeFTask* const cfuncp
-                            = dynOfSliceFunc(sliceTypep, objTypep, flp)) {
+                            = dynOfSliceFunc(sliceTypep, objTypep, sliceAsc, flp)) {
                             AstArg* argsp = new AstArg{flp, "", fromp};
                             argsp->addNext(new AstArg{flp, "", leftp});
                             argsp->addNext(new AstArg{flp, "", rightp});
@@ -7936,6 +7954,17 @@ private:
         }
     };
 
+    // Whether a generic is named anywhere in this expression, which is what
+    // says the elaboration settles it
+    static bool namesAGeneric(const AstNode* nodep) {
+        bool found = false;
+        const_cast<AstNode*>(nodep)->foreach([&](AstNodeVhdlExpr* exprp) {
+            const VhdlSymbol* const symp = exprp->vhdlSymp();
+            if (symp && symp->resolved()->kind() == VhdlSymKind::GENERIC) found = true;
+        });
+        return found;
+    }
+
     void linearAdd(LinearForm& form, AstNodeVhdlExpr* nodep, int64_t scale, int depth,
                    bool measure = false) {
         if (!form.ok || !nodep || depth > 16) {
@@ -7997,8 +8026,15 @@ private:
             }
         }
         // Anything else is a term of its own, matched by what it lowers to
+        // Whether elaboration settles this term. A generic does, and so does
+        // anything written from generics -- "WIDE/2" is not a generic itself
+        // but folds the moment the instance is made, which is soon enough
+        // for a part select. Anything a variable or a signal reaches into
+        // never does, and neither does a value the analyzer could not fold
+        // and no generic stands behind.
         const VhdlSymbol* const termSymp = rootSymOf(nodep);
-        const bool isGeneric = termSymp && termSymp->kind() == VhdlSymKind::GENERIC;
+        const bool isGeneric = (termSymp && termSymp->kind() == VhdlSymKind::GENERIC)
+                               || (namesAGeneric(nodep) && !boundsOnlyRunningDecides(nodep));
         // Measuring asks only whether the two ends cancel, so it matches
         // terms as they were written rather than building them
         if (measure) {
@@ -13485,18 +13521,23 @@ private:
     // numbers, so nothing about the slice has to be known where the helper
     // is written: a slice runs the way the object it is taken from runs
     // (8.5), which is the one thing the type says.
-    std::map<std::pair<const VhdlType*, const VhdlType*>, AstNodeFTask*> m_dynOfSliceFuncs;
-    AstNodeFTask* dynOfSliceFunc(VhdlType* carrierTypep, VhdlType* objTypep,
+    std::map<std::tuple<const VhdlType*, const VhdlType*, bool>, AstNodeFTask*>
+        m_dynOfSliceFuncs;
+    AstNodeFTask* dynOfSliceFunc(VhdlType* carrierTypep, VhdlType* objTypep, bool ascending,
                                  FileLine* origFlp) {
-        const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
-                                        static_cast<const VhdlType*>(objTypep));
+        const auto key = std::make_tuple(static_cast<const VhdlType*>(carrierTypep->base()),
+                                         static_cast<const VhdlType*>(objTypep), ascending);
         const auto it = m_dynOfSliceFuncs.find(key);
         if (it != m_dynOfSliceFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const VhdlType* const idxp
             = objTypep->indexTypes().empty() ? nullptr : objTypep->indexTypes()[0];
-        if (!idxp || !idxp->bounded()) return nullptr;
-        const bool ascending = idxp->ascending();
+        // The object has places of its own to slice -- a length the text or
+        // the elaboration fixes, not one that arrives with the value. Which
+        // way it runs comes from the slice, which must run the object's own
+        // way (8.5): an index subtype whose bounds are not numbers yet does
+        // not answer that reliably.
+        if (!idxp || (!idxp->bounded() && carriedDynamically(objTypep))) return nullptr;
         FileLine* const flp = dynFl(origFlp);
         AstFunc* const funcp
             = newDynFunc("__Vdynofslice", carrierTypep, dynCarrierRef(carrierTypep, flp), flp);
@@ -13545,18 +13586,23 @@ private:
 
     // The same the other way: what the call wrote into the carrier goes back
     // into the slice it was taken from
-    std::map<std::pair<const VhdlType*, const VhdlType*>, AstNodeFTask*> m_dynToSliceFuncs;
-    AstNodeFTask* dynToSliceFunc(VhdlType* carrierTypep, VhdlType* objTypep,
+    std::map<std::tuple<const VhdlType*, const VhdlType*, bool>, AstNodeFTask*>
+        m_dynToSliceFuncs;
+    AstNodeFTask* dynToSliceFunc(VhdlType* carrierTypep, VhdlType* objTypep, bool ascending,
                                  FileLine* origFlp) {
-        const auto key = std::make_pair(static_cast<const VhdlType*>(carrierTypep->base()),
-                                        static_cast<const VhdlType*>(objTypep));
+        const auto key = std::make_tuple(static_cast<const VhdlType*>(carrierTypep->base()),
+                                         static_cast<const VhdlType*>(objTypep), ascending);
         const auto it = m_dynToSliceFuncs.find(key);
         if (it != m_dynToSliceFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const VhdlType* const idxp
             = objTypep->indexTypes().empty() ? nullptr : objTypep->indexTypes()[0];
-        if (!idxp || !idxp->bounded()) return nullptr;
-        const bool ascending = idxp->ascending();
+        // The object has places of its own to slice -- a length the text or
+        // the elaboration fixes, not one that arrives with the value. Which
+        // way it runs comes from the slice, which must run the object's own
+        // way (8.5): an index subtype whose bounds are not numbers yet does
+        // not answer that reliably.
+        if (!idxp || (!idxp->bounded() && carriedDynamically(objTypep))) return nullptr;
         FileLine* const flp = dynFl(origFlp);
         const std::string name = "__Vdyntoslice" + std::to_string(++m_nameNum) + "__"
                                  + carrierTypep->base()->name();
@@ -13640,8 +13686,9 @@ private:
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return false;
         }
-        AstNodeFTask* const inp = dynOfSliceFunc(carrierTypep, objTypep, flp);
-        AstNodeFTask* const outp = inp ? dynToSliceFunc(carrierTypep, objTypep, flp) : nullptr;
+        AstNodeFTask* const inp = dynOfSliceFunc(carrierTypep, objTypep, ascending, flp);
+        AstNodeFTask* const outp
+            = inp ? dynToSliceFunc(carrierTypep, objTypep, ascending, flp) : nullptr;
         // The object is named twice over -- once to read it, once to write
         // it back -- and lowering the name twice would make a second object
         // of whatever it is that has to be made to reach it
@@ -16061,10 +16108,18 @@ private:
             const bool dyn = !symp->isForeign() && ifp->kind() != VhdlIfaceKind::SIGNAL
                              && carriedDynamically(psymp->typep());
             if (dyn) m_dynSyms.insert(psymp);
+            AstNodeDType* paramDTypep
+                = dyn ? dynCarrierRef(psymp->typep(), flp) : lowerType(psymp->typep(), flp);
+            // A parameter of a type that could not be emitted has to be said
+            // so, and given something to stand in: a variable with no type
+            // at all is a tree that faults later rather than a message now
+            if (!paramDTypep) {
+                unsup(flp, "parameter '" + ifp->name() + "' of a type that has no length here");
+                paramDTypep = newLogicDType(flp, 1);
+            }
             AstVar* const varp
                 = new AstVar{flp, VVarType::PORT, ifp->name(), VFlagChildDType{},
-                             dyn ? dynCarrierRef(psymp->typep(), flp)
-                                 : lowerType(psymp->typep(), flp)};
+                             paramDTypep};
             // A carrier the body writes goes by reference: its bounds are the
             // actual's, and the caller has to see the elements written
             if (dyn && ifp->mode() != VhdlMode::IN) {

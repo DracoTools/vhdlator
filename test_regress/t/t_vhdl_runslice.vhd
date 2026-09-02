@@ -8,6 +8,31 @@
 library ieee;
 use ieee.std_logic_1164.all;
 
+entity t_vhdl_runslice_gen is
+    generic (GC_W : natural);
+end entity;
+
+architecture test of t_vhdl_runslice_gen is
+begin
+    -- The object's own length is one the instantiation settles, which is
+    -- still a length: the slice is taken from places the object has
+    main : process is
+        variable v : std_logic_vector(GC_W - 1 downto 0) := "10110";
+        variable m : integer                             := 2;
+        variable r : std_logic_vector(2 downto 0);
+    begin
+        r := v(m downto 0);
+        assert r = "110" report "generic-bounded read" severity failure;
+
+        v(m downto 0) := "001";
+        assert v = "10001" report "generic-bounded write" severity failure;
+        wait;
+    end process;
+end architecture;
+
+library ieee;
+use ieee.std_logic_1164.all;
+
 entity t_vhdl_runslice is
 end entity;
 
@@ -16,6 +41,8 @@ architecture test of t_vhdl_runslice is
     signal buf  : std_logic_vector(7 downto 0) := "10101010";
     signal out8 : std_logic_vector(7 downto 0);
 begin
+
+    u_gen : entity work.t_vhdl_runslice_gen generic map (GC_W => 5);
 
     main : process is
         variable m  : integer                      := 5;
