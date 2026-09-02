@@ -9592,6 +9592,20 @@ private:
         return namep ? namep->name() : "";
     }
 
+    // The signal an actual names, through whatever conversions are written
+    // on it: "f(s)" is an association with s itself (6.5.7.1), so it is s
+    // that a conversion on the formal drives.
+    static AstNodeVhdlExpr* actualSignal(AstNodeVhdlExpr* nodep) {
+        for (int depth = 0; nodep && depth < 8; ++depth) {
+            if (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected)) return nodep;
+            AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+            if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
+            AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            nodep = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+        }
+        return nullptr;
+    }
+
     // Whether an actual names a signal, possibly through a conversion.
     // 6.5.7.1 keeps that an association with the signal itself; anything
     // else is an expression, and a port associated with one has a driver of
@@ -9647,13 +9661,21 @@ private:
             // drives on its way out to the actual (6.5.7.1): the port is a
             // signal of its own, and the actual follows the conversion of it
             if (outConvp) {
-                AstNodeExpr* const targetp = lowerExpr(actualp);
-                // The actual has to be something that can be assigned. Where
-                // it is itself a conversion -- a conversion written on both
-                // sides -- there is nothing to drive, and the association is
-                // left to be bound the ordinary way.
+                AstNodeExpr* targetp = lowerExpr(actualp);
+                // The actual has to be something that can be assigned. A
+                // conversion written on it as well -- one on each side --
+                // is still an association with the signal inside it, and
+                // that is what the port drives on its way out (6.5.7.1).
                 if (targetp && !isAssignable(targetp)) {
                     VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                    AstNodeVhdlExpr* const innerp = actualSignal(actualp);
+                    targetp = innerp ? lowerExpr(innerp) : nullptr;
+                    if (targetp && !isAssignable(targetp)) {
+                        VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                        targetp = nullptr;
+                    }
+                }
+                if (!targetp) {
                     outConvp = nullptr;
                 } else {
                     AstVar* const varp = newVar(symp, VVarType::VAR, flp);
