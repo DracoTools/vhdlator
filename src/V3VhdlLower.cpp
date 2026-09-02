@@ -5248,51 +5248,55 @@ private:
     // variable exists, and before any statement is, so that every assignment
     // can mark itself.
     void makeActives(FileLine* flp) {
-        for (const VhdlSymbol* const symp : m_needActive) {
-            if (m_actives.count(symp)) continue;
-            const auto varIt = m_vars.find(symp);
-            if (varIt == m_vars.end()) continue;
-            VL_RESTORER(m_ftaskp);
-            m_ftaskp = nullptr;
-            VhdlActive ac;
-            const std::string base = "__Vact" + std::to_string(++m_nameNum) + "__" + symp->name();
-            // Every driver of the signal marks the same bit, and a concurrent
-            // assignment marks it from two blocks -- once to start and once
-            // to react -- so it is written from more than one place by
-            // construction, which is not a finding about the design
-            FileLine* const mflp = new FileLine{flp};
-            mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
-            ac.togglep = newTempVar(base + "__trans", newLogicDType(mflp, 1), mflp);
-            ac.prevp = newTempVar(base + "__prev", newLogicDType(flp, 1), flp);
-            ac.timep = newTempVar(base + "__time",
-                                  new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
-                                                    VNumRange{63, 0}, -1},
-                                  flp);
-            ac.everp = newTempVar(base + "__ever", newLogicDType(flp, 1), flp);
-            // 16.2.4 leaves the initial value of S'TRANSACTION undefined and
-            // calls a description that depends on it erroneous, but nvc
-            // 1.22.1 and GHDL 7.0.0-dev agree on '1', and a testbench that
-            // reads it before the first transaction should see what they see
-            ac.togglep->valuep(new AstConst{flp, AstConst::BitTrue{}});
-            ac.prevp->valuep(new AstConst{flp, AstConst::BitTrue{}});
-            ac.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
-            AstNode* stmtsp = new AstAssignDly{flp,
-                                               new AstVarRef{flp, ac.prevp, VAccess::WRITE},
-                                               new AstVarRef{flp, ac.togglep, VAccess::READ}};
-            stmtsp = AstNode::addNext(
-                stmtsp, static_cast<AstNode*>(new AstAssignDly{
-                            flp, new AstVarRef{flp, ac.timep, VAccess::WRITE}, nowOf(flp)}));
-            stmtsp = AstNode::addNext(
-                stmtsp, static_cast<AstNode*>(new AstAssignDly{
-                            flp, new AstVarRef{flp, ac.everp, VAccess::WRITE},
-                            new AstConst{flp, AstConst::BitTrue{}}}));
-            AstSenTree* const senp = new AstSenTree{
-                flp, senItemFor(new AstVarRef{flp, ac.togglep, VAccess::READ}, true, flp)};
-            m_shadowsp = AstNode::addNextNull(
-                m_shadowsp,
-                static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp}));
-            m_actives.emplace(symp, ac);
-        }
+        for (const VhdlSymbol* const symp : m_needActive) makeActiveFor(symp, flp);
+    }
+
+    // The same for one signal, for a port whose transactions have to reach
+    // the signal a conversion on its association drives (6.5.7.1)
+    void makeActiveFor(const VhdlSymbol* symp, FileLine* flp) {
+        if (m_actives.count(symp)) return;
+        const auto varIt = m_vars.find(symp);
+        if (varIt == m_vars.end()) return;
+        VL_RESTORER(m_ftaskp);
+        m_ftaskp = nullptr;
+        VhdlActive ac;
+        const std::string base = "__Vact" + std::to_string(++m_nameNum) + "__" + symp->name();
+        // Every driver of the signal marks the same bit, and a concurrent
+        // assignment marks it from two blocks -- once to start and once
+        // to react -- so it is written from more than one place by
+        // construction, which is not a finding about the design
+        FileLine* const mflp = new FileLine{flp};
+        mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        ac.togglep = newTempVar(base + "__trans", newLogicDType(mflp, 1), mflp);
+        ac.prevp = newTempVar(base + "__prev", newLogicDType(flp, 1), flp);
+        ac.timep = newTempVar(base + "__time",
+                              new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
+                                                VNumRange{63, 0}, -1},
+                              flp);
+        ac.everp = newTempVar(base + "__ever", newLogicDType(flp, 1), flp);
+        // 16.2.4 leaves the initial value of S'TRANSACTION undefined and
+        // calls a description that depends on it erroneous, but nvc
+        // 1.22.1 and GHDL 7.0.0-dev agree on '1', and a testbench that
+        // reads it before the first transaction should see what they see
+        ac.togglep->valuep(new AstConst{flp, AstConst::BitTrue{}});
+        ac.prevp->valuep(new AstConst{flp, AstConst::BitTrue{}});
+        ac.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+        AstNode* stmtsp = new AstAssignDly{flp,
+                                           new AstVarRef{flp, ac.prevp, VAccess::WRITE},
+                                           new AstVarRef{flp, ac.togglep, VAccess::READ}};
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, ac.timep, VAccess::WRITE}, nowOf(flp)}));
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, ac.everp, VAccess::WRITE},
+                        new AstConst{flp, AstConst::BitTrue{}}}));
+        AstSenTree* const senp = new AstSenTree{
+            flp, senItemFor(new AstVarRef{flp, ac.togglep, VAccess::READ}, true, flp)};
+        m_shadowsp = AstNode::addNextNull(
+            m_shadowsp,
+            static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp}));
+        m_actives.emplace(symp, ac);
     }
 
     const VhdlActive* activeFor(AstNodeVhdlExpr* prefixp) {
@@ -9600,6 +9604,17 @@ private:
             if (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected)) return nodep;
             AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
             if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
+            // A call whose prefix names a type or a function is a conversion;
+            // one whose prefix names an object is an index or a slice (8.1),
+            // and an index names part of the actual rather than all of it
+            const VhdlSymbol* const prefixp
+                = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            const VhdlSymbol* const namedp = prefixp ? prefixp->resolved() : nullptr;
+            if (!namedp
+                || (namedp->kind() != VhdlSymKind::TYPE
+                    && namedp->kind() != VhdlSymKind::FUNCTION)) {
+                return nullptr;
+            }
             AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
             nodep = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
         }
@@ -9627,6 +9642,105 @@ private:
         const AstNodeVhdlExpr* const argp
             = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
         return isSignalActual(argp);
+    }
+
+    // A port with a conversion written on its formal: the port is a signal of
+    // its own, what it drives reaches the actual through the conversion, and
+    // -- where a conversion is written on the actual as well -- what the port
+    // itself holds is what that conversion makes of the actual (6.5.7.1).
+    void lowerConvertedPort(VhdlSymbol* symp, AstVhdlIfaceDecl* ifp, AstNodeVhdlExpr* outConvp,
+                            AstNodeVhdlExpr* inConvp, AstNodeVhdlExpr* innerp,
+                            AstNodeExpr* targetp, FileLine* flp) {
+        AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+        addStmt(varp);
+        // Written by the association and by the block's own statements,
+        // which is what a port with a conversion on each side is
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        // With a conversion on the actual as well, what the port holds and
+        // what it drives are two different things: the first is what the
+        // conversion makes of the actual, the second is what the block's own
+        // statements assign to it. They need a variable each.
+        AstVar* drvp = nullptr;
+        if (inConvp) {
+            drvp = new AstVar{cflp, VVarType::VAR, varp->name() + "__Vdrv", VFlagChildDType{},
+                              lowerType(symp->typep(), flp)};
+            addStmt(drvp);
+            if (ifp->defaultp()) {
+                drvp->valuep(lowerExpr(ifp->defaultp()));
+            } else if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp, true)) {
+                drvp->valuep(defp);
+            }
+            m_drivers.emplace(symp, std::vector<VhdlDriver>{VhdlDriver{drvp, nullptr, nullptr}});
+        } else if (ifp->defaultp()) {
+            varp->valuep(lowerExpr(ifp->defaultp()));
+        }
+        // The conversion is applied to what the port drives, which where the
+        // port holds something else is the driver's own value
+        if (drvp) m_vars[symp] = drvp;
+        AstNodeExpr* const convValuep = lowerExpr(outConvp);
+        if (drvp) m_vars[symp] = varp;
+        if (!convValuep) {
+            VL_DO_DANGLING(targetp->deleteTree(), targetp);
+            return;
+        }
+        // The conversion is applied to the value as it leaves the port
+        // (6.5.7.1); the delta belongs to the port's own driver, not to the
+        // conversion of what it drives
+        //
+        // Where the actual has drivers of its own -- two blocks driving one
+        // signal through conversions of their own, say -- what the
+        // conversion makes of the port is one of them and is resolved with
+        // the rest, rather than written straight onto the signal (6.5.6.3)
+        VhdlSymbol* const sigp
+            = innerp ? const_cast<VhdlSymbol*>(rootSymOf(innerp)) : nullptr;
+        const auto drvIt = sigp ? m_drivers.find(sigp) : m_drivers.end();
+        const int slot = sigp ? m_driverUsed[sigp] : 0;
+        if (drvIt != m_drivers.end() && slot < static_cast<int>(drvIt->second.size())) {
+            const VhdlDriver& sdrv = drvIt->second[slot];
+            AstVar* const savedp = m_vars[sigp];
+            m_vars[sigp] = sdrv.valp;
+            AstNodeExpr* const valLhsp = lowerDriveTarget(innerp);
+            m_vars[sigp] = savedp;
+            VL_DO_DANGLING(targetp->deleteTree(), targetp);
+            if (!valLhsp) {
+                VL_DO_DANGLING(convValuep->deleteTree(), convValuep);
+                return;
+            }
+            addStmt(new AstAlways{new AstAssignW{cflp, valLhsp, convValuep}});
+            if (sdrv.enp) {
+                // An association drives from the moment the design is
+                // elaborated, and how strongly is not something the result
+                // of a conversion can be asked
+                addStmt(new AstAlways{
+                    new AstAssignW{cflp, new AstVarRef{cflp, sdrv.enp, VAccess::WRITE},
+                                   new AstConst{cflp, AstConst::WidthedValue{}, 1, 1}}});
+            }
+            ++m_driverUsed[sigp];
+        } else {
+            addStmt(new AstAlways{new AstAssignW{cflp, targetp, convValuep}});
+        }
+        if (inConvp) {
+            if (AstNodeExpr* const inValuep = lowerExpr(inConvp)) {
+                addStmt(new AstAlways{new AstAssignW{
+                    cflp, new AstVarRef{cflp, varp, VAccess::WRITE}, inValuep}});
+            }
+        }
+        // A transaction on the port is a transaction on what it drives: the
+        // conversion runs whenever the port's driver delivers, whether or not
+        // the value it makes of it is a new one (14.7.3.4). Only where the
+        // association is the signal's one driver, since two of them mark the
+        // same bit and one cannot then be wired to the other.
+        const VhdlSymbol* const drivenp = innerp ? rootSymOf(innerp) : nullptr;
+        const auto actIt
+            = drivenp ? m_actives.find(drivenp->resolved()) : m_actives.end();
+        if (actIt == m_actives.end() || drivenp->driverCount() > 1) return;
+        makeActiveFor(symp, flp);
+        const auto portIt = m_actives.find(symp);
+        if (portIt == m_actives.end()) return;
+        addStmt(new AstAlways{
+            new AstAssignW{cflp, new AstVarRef{cflp, actIt->second.togglep, VAccess::WRITE},
+                           new AstVarRef{cflp, portIt->second.togglep, VAccess::READ}}});
     }
 
     void lowerBlockInterface(AstNode* formalsp, AstNode* mapp, bool isGeneric) {
@@ -9661,14 +9775,20 @@ private:
             // drives on its way out to the actual (6.5.7.1): the port is a
             // signal of its own, and the actual follows the conversion of it
             if (outConvp) {
-                AstNodeExpr* targetp = lowerExpr(actualp);
                 // The actual has to be something that can be assigned. A
                 // conversion written on it as well -- one on each side --
                 // is still an association with the signal inside it, and
                 // that is what the port drives on its way out (6.5.7.1).
+                AstNodeVhdlExpr* const innerp = actualSignal(actualp);
+                // That other conversion converts the other way: what the
+                // port itself holds is what it makes of the actual, and the
+                // port's own driver is a separate thing (6.5.7.1)
+                AstNodeVhdlExpr* const inConvp
+                    = innerp && innerp != actualp && ifp->mode() != VhdlMode::OUT ? actualp
+                                                                                  : nullptr;
+                AstNodeExpr* targetp = lowerExpr(actualp);
                 if (targetp && !isAssignable(targetp)) {
                     VL_DO_DANGLING(targetp->deleteTree(), targetp);
-                    AstNodeVhdlExpr* const innerp = actualSignal(actualp);
                     targetp = innerp ? lowerExpr(innerp) : nullptr;
                     if (targetp && !isAssignable(targetp)) {
                         VL_DO_DANGLING(targetp->deleteTree(), targetp);
@@ -9678,18 +9798,7 @@ private:
                 if (!targetp) {
                     outConvp = nullptr;
                 } else {
-                    AstVar* const varp = newVar(symp, VVarType::VAR, flp);
-                    addStmt(varp);
-                    AstNodeExpr* const convValuep = lowerExpr(outConvp);
-                    if (!targetp || !convValuep) {
-                        if (targetp) VL_DO_DANGLING(targetp->deleteTree(), targetp);
-                        if (convValuep) VL_DO_DANGLING(convValuep->deleteTree(), convValuep);
-                        continue;
-                    }
-                    // The conversion is applied to the value as it leaves
-                    // the port (6.5.7.1); the delta belongs to the port's own
-                    // driver, not to the conversion of what it drives
-                    addStmt(new AstAlways{new AstAssignW{flp, targetp, convValuep}});
+                    lowerConvertedPort(symp, ifp, outConvp, inConvp, innerp, targetp, flp);
                     continue;
                 }
             }
@@ -10238,8 +10347,12 @@ private:
             // An instance's out port is a driver of the signal associated
             // with it, as much as an assignment to that signal is (6.5.6.3)
             if (asp->drives() && asp->actualp()) {
-                if (const VhdlSymbol* const symp = rootSymOf(asp->actualp())) {
-                    if (VN_IS(asp->actualp(), VhdlName)) {
+                // An actual written through a conversion is still an
+                // association with the signal inside it (6.5.7.1)
+                AstNodeVhdlExpr* const innerp = actualSignal(asp->actualp());
+                AstNodeVhdlExpr* const namedp = innerp ? innerp : asp->actualp();
+                if (const VhdlSymbol* const symp = rootSymOf(namedp)) {
+                    if (VN_IS(namedp, VhdlName)) {
                         out.insert(symp);
                     } else {
                         s_partialDriven.insert(symp);
@@ -10690,23 +10803,35 @@ private:
 
     // An assignment to a signal that has several drivers writes this driver's
     // value and enable rather than the signal
-    AstNode* driveResolved(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* targetp,
-                           AstNodeExpr* valuep, AstNode* delayp, bool sequential,
-                           FileLine* flp) {
+    // The driver an assignment to this name writes, where the signal has one
+    // of its own. Null where it has none, which is the ordinary case of a
+    // signal one place drives.
+    const VhdlDriver* driverFor(AstNodeVhdlExpr* targetp) {
         const VhdlSymbol* const symp = rootSymOf(targetp);
+        if (!symp) return nullptr;
         // Inside a copy made for a call, the name is the formal's and the
         // driver is the one the caller owns
         const auto bIt = m_bindDrivers.find(symp);
         const VhdlSymbol* const signalp
             = bIt != m_bindDrivers.end() ? bIt->second.signalp : symp;
         const auto it = m_drivers.find(signalp);
+        if (it == m_drivers.end()) return nullptr;
         const int idx = bIt != m_bindDrivers.end() ? bIt->second.idx : m_driverUsed[signalp];
-        if (it == m_drivers.end() || idx >= static_cast<int>(it->second.size())) {
+        if (idx >= static_cast<int>(it->second.size())) return nullptr;
+        return &it->second[idx];
+    }
+
+    AstNode* driveResolved(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* targetp,
+                           AstNodeExpr* valuep, AstNode* delayp, bool sequential,
+                           FileLine* flp) {
+        const VhdlSymbol* const symp = rootSymOf(targetp);
+        const VhdlDriver* const drvp = driverFor(targetp);
+        if (!drvp) {
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
             unsup(flp, "assignment to a resolved signal from here");
             return nullptr;
         }
-        const VhdlDriver& drv = it->second[idx];
+        const VhdlDriver& drv = *drvp;
         // Lowering the target against each of the two says how a slice or an
         // index of the signal maps onto them, without repeating the work here
         VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
@@ -10767,6 +10892,12 @@ private:
     AstNode* waveformStmts(AstNodeVhdlExpr* targetp, AstVhdlWaveform* wavesp,
                            AstNodeExpr*& readsp, FileLine* flp) {
         AstNode* stmtsp = nullptr;
+        // Where the signal has a driver of its own, each element of the
+        // waveform is delivered into that driver rather than into the signal
+        // itself, and says with it whether the driver drives at all (14.7.2)
+        const VhdlDriver* const drvp = driverFor(targetp);
+        VhdlSymbol* const keyp = drvp ? const_cast<VhdlSymbol*>(rootSymOf(targetp)) : nullptr;
+        AstVar* const savedp = keyp ? m_vars[keyp] : nullptr;
         // A transaction happens when each element is delivered, and the bit
         // that records it flips *then* rather than now: a delayed assignment
         // of "not t" reads t as it stands when the assignment is made, so
@@ -10776,7 +10907,9 @@ private:
         AstNodeExpr* prevDelayp = nullptr;
         AstNode* marksp = nullptr;
         for (AstVhdlWaveform* p = wavesp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
+            if (keyp) m_vars[keyp] = drvp->valp;
             AstNodeExpr* const onep = lowerDriveTarget(targetp);
+            if (keyp) m_vars[keyp] = savedp;
             AstNodeExpr* const valuep = lowerExpr(p->valuep());
             if (!onep || !valuep) return nullptr;
             readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
@@ -10785,6 +10918,26 @@ private:
             AstNode* const delayp = afterp ? new AstDelay{flp, afterp, false} : nullptr;
             stmtsp = AstNode::addNextNull(
                 stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
+            if (drvp && drvp->enp) {
+                // Whether this element drives at all, and how strongly,
+                // arrives with it: a waveform may hand the signal over to
+                // its other drivers part way through (16.8.2)
+                const VhdlDrive drive = driveOfLiteral(p->valuep());
+                stmtsp = AstNode::addNextNull(
+                    stmtsp,
+                    static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, drvp->enp, VAccess::WRITE},
+                        new AstConst{flp, AstConst::WidthedValue{}, 1,
+                                     drive == VhdlDrive::OFF ? 0U : 1U},
+                        delayp ? delayp->cloneTree(false) : nullptr}));
+                stmtsp = AstNode::addNextNull(
+                    stmtsp,
+                    static_cast<AstNode*>(new AstAssignDly{
+                        flp, new AstVarRef{flp, drvp->weakp, VAccess::WRITE},
+                        new AstConst{flp, AstConst::WidthedValue{}, 1,
+                                     drive == VhdlDrive::WEAK ? 1U : 0U},
+                        delayp ? delayp->cloneTree(false) : nullptr}));
+            }
             if (AstNode* const flipp = transactionMark(targetp, nullptr, true, nullptr, flp)) {
                 // The wait before it is how much later than the last element
                 // this one is delivered, since the waveform's times increase
@@ -10839,8 +10992,7 @@ private:
         // delay, where a VHDL driver holds its old value until the time comes
         // -- which is what "rst <= '0' after 22 ns" means.
         if (nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
-            && (nodep->wavesp()->nextp() || nodep->wavesp()->afterp())
-            && !drivenThroughDriver(rootSymOf(nodep->targetp()))) {
+            && (nodep->wavesp()->nextp() || nodep->wavesp()->afterp())) {
             if (!v3Global.opt.timing().isTrue()) {
                 unsup(flp, "waveform with more than one element without --timing");
                 return;
@@ -10854,8 +11006,7 @@ private:
             return;
         }
         // The same, where which waveform is scheduled depends on a condition
-        if (nodep->kind() == VhdlAssignKind::CONDITIONAL
-            && !drivenThroughDriver(rootSymOf(nodep->targetp())) && anyWaveformDelay(nodep)) {
+        if (nodep->kind() == VhdlAssignKind::CONDITIONAL && anyWaveformDelay(nodep)) {
             if (!v3Global.opt.timing().isTrue()) {
                 unsup(flp, "waveform with more than one element without --timing");
                 return;

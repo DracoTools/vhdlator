@@ -3846,14 +3846,62 @@ const VhdlSymbol* driverRootSym(const AstNode* nodep) {
     }
     return nullptr;
 }
+// The signal an actual names, through whatever conversions are written on it.
+// "f(s)" as an actual is an association with s itself (6.5.7.1), so a
+// conversion written on the formal drives s and not a signal of its own.
+const AstNodeVhdlExpr* actualThroughConversions(const AstNodeVhdlExpr* nodep) {
+    for (int depth = 0; nodep && depth < 8; ++depth) {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nodep;
+        // A call whose prefix names a type or a function is a conversion; one
+        // whose prefix names an object is an index or a slice (8.1)
+        const VhdlSymbol* const prefixp
+            = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+        const VhdlSymbol* const namedp = prefixp ? prefixp->resolved() : nullptr;
+        if (!namedp
+            || (namedp->kind() != VhdlSymKind::TYPE
+                && namedp->kind() != VhdlSymKind::FUNCTION)) {
+            return nodep;
+        }
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        nodep = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+    }
+    return nodep;
+}
+
+// The port a conversion on a formal is applied to, as in "f(p) => a" (6.5.7.1)
+const VhdlSymbol* convertedFormalPort(const AstNodeVhdlExpr* formalp) {
+    const AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+    if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
+    const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+    const AstNodeVhdlExpr* const argp
+        = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+    const AstVhdlName* const namep = VN_CAST(argp, VhdlName);
+    const VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
+    return symp && symp->kind() == VhdlSymKind::PORT ? symp : nullptr;
+}
+
+// Whether a conversion written on this formal makes the association a driver
+// of the actual: the port's driving value goes out through the conversion,
+// which is a source of the actual like any other (6.5.7.1, 14.7.2)
+bool convertedFormalDrives(const AstNodeVhdlExpr* formalp) {
+    const VhdlSymbol* const portp = convertedFormalPort(formalp);
+    const AstVhdlIfaceDecl* const declp
+        = portp ? VN_CAST(portp->declp(), VhdlIfaceDecl) : nullptr;
+    if (!declp) return false;
+    return declp->mode() == VhdlMode::OUT || declp->mode() == VhdlMode::INOUT
+           || declp->mode() == VhdlMode::BUFFER;
+}
+
 void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                        std::set<const VhdlSymbol*>& partial, bool follow) {
     if (!nodep) return;
     if (const AstVhdlAssoc* const asp = VN_CAST(nodep, VhdlAssoc)) {
         // An instance's out port drives the signal it is associated with
         if (asp->drives() && asp->actualp()) {
-            if (const VhdlSymbol* const symp = driverRootSym(asp->actualp())) {
-                if (VN_IS(asp->actualp(), VhdlName)) {
+            const AstNodeVhdlExpr* const namedp = actualThroughConversions(asp->actualp());
+            if (const VhdlSymbol* const symp = driverRootSym(namedp)) {
+                if (VN_IS(namedp, VhdlName)) {
                     whole.insert(symp);
                 } else {
                     partial.insert(symp);
@@ -3993,7 +4041,31 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     // are, and so are those of a block inside that one (11.2)
     std::function<void(AstNode*)> walk = [&](AstNode* stmtsp) {
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
-            if (const AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+            if (AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+                // A block is not a driver of its own, but a conversion
+                // written on one of its ports is: what the port drives
+                // leaves through the conversion and arrives at the actual as
+                // a source of it, which a plain association -- where the
+                // port and the actual are one signal -- never is (6.5.7.1)
+                AstVhdlBlockHeader* const headerp = blockp->headerp();
+                for (AstNode* mp = headerp ? headerp->portMapp() : nullptr; mp;
+                     mp = mp->nextp()) {
+                    AstVhdlAssoc* const asp = VN_CAST(mp, VhdlAssoc);
+                    if (!asp || !asp->actualp() || !asp->formalp()) continue;
+                    if (!convertedFormalDrives(asp->formalp())) continue;
+                    asp->drives(true);
+                    const AstNodeVhdlExpr* const namedp
+                        = actualThroughConversions(asp->actualp());
+                    const VhdlSymbol* const symp = driverRootSym(namedp);
+                    if (!symp) continue;
+                    if (!VN_IS(namedp, VhdlName)) {
+                        partial.insert(symp);
+                        continue;
+                    }
+                    ++counts[symp];
+                    outsideGenerate.insert(symp);
+                    if (!where.count(symp)) where[symp] = asp->fileline();
+                }
                 walk(blockp->stmtsp());
                 continue;
             }
@@ -7256,10 +7328,14 @@ void VhdlSemVisitor::markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitSco
             const VhdlSymbol* const symp = namep->vhdlSymp();
             if (symp && symp->kind() == VhdlSymKind::PORT) portp = symp;
         }
-        // An individual association -- "d(3) => x" -- or one through a
-        // conversion drives part of the actual rather than the whole of it,
-        // which the driver count treats as it treats a partial assignment
-        if (!portp) continue;
+        // A conversion written on the formal is a source of the actual in
+        // its own right: the port's driving value goes out through it, and
+        // the actual is not the port itself but a signal the conversion
+        // drives (6.5.7.1) -- so an "inout" formal counts here as well
+        if (!portp) {
+            if (convertedFormalDrives(asp->formalp())) asp->drives(true);
+            continue;
+        }
         const AstVhdlIfaceDecl* const declp = VN_CAST(portp->declp(), VhdlIfaceDecl);
         if (!declp || declp->mode() != VhdlMode::OUT) continue;
         asp->drives(true);
