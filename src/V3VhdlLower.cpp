@@ -10349,23 +10349,29 @@ private:
             VL_DO_DANGLING(oldp->deleteTree(), oldp);
         }
         std::vector<VhdlDriver> drivers;
+        // What a driver holds is written from two blocks by construction --
+        // once to start, once to react, which is what a concurrent statement
+        // is (11.6) -- so the finding is about how this is emitted rather
+        // than about the design
+        FileLine* const dflp = new FileLine{flp};
+        dflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
         for (int i = 0; i < count; ++i) {
             VhdlDriver drv;
             const std::string base
                 = "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name();
-            drv.valp = new AstVar{flp, VVarType::VAR, base + "__val", VFlagChildDType{},
+            drv.valp = new AstVar{dflp, VVarType::VAR, base + "__val", VFlagChildDType{},
                                   lowerType(symp->typep(), flp)};
             // One bit, whatever the signal's width: a driver of a resolved
             // signal is on or off as a whole in every form real code uses,
             // and a per-bit enable cannot be the condition of a select
-            drv.enp = new AstVar{flp, VVarType::VAR, base + "__en", VFlagChildDType{},
+            drv.enp = new AstVar{dflp, VVarType::VAR, base + "__en", VFlagChildDType{},
                                  new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
             addStmt(drv.valp);
             addStmt(drv.enp);
             // Off until the driver says otherwise, which is what a driver of
             // a resolved signal contributes before it has run
             drv.enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
-            drv.weakp = new AstVar{flp, VVarType::VAR, base + "__weak", VFlagChildDType{},
+            drv.weakp = new AstVar{dflp, VVarType::VAR, base + "__weak", VFlagChildDType{},
                                    new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
             addStmt(drv.weakp);
             drv.weakp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
@@ -10896,18 +10902,20 @@ private:
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            // A driver holds what it was given until the delta ends, so a
+            // concurrent assignment to a resolved signal is the process it
+            // is defined to be (11.6) and not a continuous assignment. Read
+            // before that delta -- which is what a testbench does at time
+            // zero -- the signal is still what its own default says, and a
+            // continuous assignment had already made it the driven value.
+            AstNodeExpr* const readsp = rhsp->cloneTree(false);
             if (AstNode* const outp
-                = driveResolved(nodep, nodep->targetp(), rhsp, delayp, false, flp)) {
-                // Each continuous assignment becomes its own always, so
-                // the list has to be taken apart from the front: the head has
-                // no back to unlink from
-                for (AstNode* p = outp; p;) {
-                    AstNode* nextp = p->nextp();
-                    if (nextp) nextp->unlinkFrBackWithNext();
-                    addStmt(new AstAlways{VN_AS(p, AssignW)});
-                    p = nextp;
-                }
-                addStmt(transactionMark(nodep->targetp(), delayp, false, rhsp, flp));
+                = driveResolved(nodep, nodep->targetp(), rhsp, delayp, true, flp)) {
+                AstNode* const markp
+                    = transactionMark(nodep->targetp(), delayp, true, rhsp, flp);
+                emitWaveformProcess(AstNode::addNextNull(outp, markp), readsp, flp);
+            } else {
+                VL_DO_DANGLING(readsp->deleteTree(), readsp);
             }
             return;
         }
