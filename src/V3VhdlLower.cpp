@@ -12985,6 +12985,17 @@ private:
     // points at, at the offset the loop has reached. Takes ownership of the
     // offset expression.
     AstNodeExpr* dynSourceElem(AstNodeVhdlExpr* valuep, AstNodeExpr* offsetp, FileLine* flp) {
+        // An aggregate that gives every place the same value has that value
+        // at every offset, whichever offset it is; how many places there
+        // are is what the object being written knows (9.3.3.3)
+        if (AstNodeVhdlExpr* const uniformp = uniformAggregateValue(valuep)) {
+            if (AstNodeExpr* const elemp = lowerExpr(uniformp)) {
+                VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                return elemp;
+            }
+            VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+            return nullptr;
+        }
         const DynAccess* dynp = nullptr;
         AstVhdlRange* rangep = nullptr;
         AstNodeVhdlExpr* objNodep = nullptr;
