@@ -3021,6 +3021,68 @@ private:
         return funcp;
     }
 
+    // The text of a value that carries its own bounds: one character per
+    // element, since how many there are is only known while it runs (16.3).
+    // A logic element is written as the character its literal is, which is
+    // what "%b" gives for a single one of them.
+    std::map<const VhdlType*, AstNodeFTask*> m_dynTextFuncs;
+    AstNodeFTask* dynTextFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynTextFuncs.find(basep);
+        if (it != m_dynTextFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        const VhdlType* const elemp = basep->elementp();
+        // Only a vector of logic reads as text one element at a time; an
+        // array of anything else has no such image in the language either
+        if (!elemp || !enumIsLogic(elemp->base())) return nullptr;
+        AstFunc* const funcp = newDynFunc("__Vdyntext", typep,
+                                          new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        for (AstVar* const vp : {lenp, ip}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const auto acc
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::READ}; };
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lenp, flp), dynCarrierLength(rd(cp, flp), flp)});
+        funcp->addStmtsp(
+            new AstAssign{flp, out(), new AstConst{flp, AstConst::String{}, ""}});
+        funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+        AstNode* bodyp = new AstAssign{
+            flp, out(),
+            new AstConcatN{flp, acc(),
+                           new AstSFormatF{flp, "%b", false,
+                                           new AstSelBit{flp,
+                                                         dynPart(rd(cp, flp), "q", flp),
+                                                         rd(ip, flp)}}}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
+        addHelperFunc(funcp);
+        m_dynTextFuncs.insert_or_assign(basep, funcp);
+        return funcp;
+    }
+
+    // The text of an expression whose length only running decides. Null
+    // where it is not one of those, and the caller writes it as before.
+    AstNodeExpr* dynTextOf(AstNodeVhdlExpr* nodep, FileLine* flp) {
+        if (!nodep || !isDynValue(nodep)) return nullptr;
+        VhdlType* const carrp = dynValueType(nodep);
+        if (!carrp) return nullptr;
+        AstNodeFTask* const funcp = dynTextFunc(carrp, flp);
+        if (!funcp) return nullptr;
+        AstNodeExpr* const valuep = lowerExpr(nodep);
+        if (!valuep) return nullptr;
+        AstFuncRef* const refp
+            = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", valuep}};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
     // "not v" over a carrier: as long as the operand, with its own bounds,
     // and each element inverted (9.2.2)
     AstNodeFTask* dynNotFunc(VhdlType* typep, FileLine* origFlp) {
@@ -4622,6 +4684,7 @@ private:
         // built from -- but it is an ordinary expression too, and a function
         // may return it (16.2.3)
         if (attr == "image" && nodep->argp()) {
+            if (AstNodeExpr* const textp = dynTextOf(nodep->argp(), flp)) return textp;
             AstNodeExpr* const valuep = lowerExpr(nodep->argp());
             if (!valuep) return nullptr;
             const VhdlType* const vtypep = nodep->argp()->vhdlTypep();
@@ -8455,6 +8518,7 @@ private:
         }
         if (name == "to_string" && args.size() == 1 && symp->predefined()) {
             const VhdlType* const vtypep = args[0]->vhdlTypep();
+            if (AstNodeExpr* const textp = dynTextOf(args[0], flp)) return textp;
             AstNodeExpr* const valuep = lowerExpr(args[0]);
             if (!valuep) return nullptr;
             if (vtypep && isStringType(vtypep)) return valuep;
@@ -14595,8 +14659,17 @@ private:
         }
         if (args.size() < 2) return nullptr;
         AstNodeExpr* const linep = lowerExpr(args[0]);
+        if (!linep) return nullptr;
+        // A value whose length only running decides is written one element
+        // at a time, which no format can do
+        if (radix.empty() || radix == "%b") {
+            if (AstNodeExpr* const dtextp = dynTextOf(args[1], flp)) {
+                return new AstAssign{flp, linep,
+                                     new AstConcatN{flp, linep->cloneTree(false), dtextp}};
+            }
+        }
         AstNodeExpr* const valuep = lowerExpr(args[1]);
-        if (!linep || !valuep) return nullptr;
+        if (!valuep) return nullptr;
         const std::string format
             = radix.empty() ? formatFor(args[1]->vhdlTypep()) : radix;
         AstNodeExpr* textp = new AstSFormatF{flp, format, false, valuep};
@@ -15657,6 +15730,10 @@ private:
                     if (asp->actualp() && !asp->nextp()) valuep = asp->actualp();
                 }
             }
+        }
+        if (AstNodeExpr* const textp = dynTextOf(valuep, flOf(valuep))) {
+            format += "%s";
+            return textp;
         }
         AstNodeExpr* const exprp = lowerExpr(valuep);
         if (!exprp) {
