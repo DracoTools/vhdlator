@@ -4493,11 +4493,7 @@ private:
         // design unit, which denotes no value (16.2.7)
         if (attr == "simple_name" || attr == "instance_name" || attr == "path_name") {
             if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
-            std::vector<std::string> parts;
-            flattenName(nodep->prefixp(), parts);
-            const std::string name = parts.empty() ? std::string{"?"} : parts.back();
-            return new AstConst{flp, AstConst::String{},
-                                attr == "simple_name" ? name : ":" + name + ":"};
+            return lowerNameAttr(nodep, attr, flp);
         }
         // What this process is putting on the signal, which is not what the
         // signal is worth: several drivers are resolved into that, and this
@@ -9647,6 +9643,232 @@ private:
         return isSignalActual(argp);
     }
 
+
+    // METHODS - the name attributes (16.2.7)
+
+    // Whether what a name denotes is a declarative region of its own, which
+    // is what decides whether its path ends with a colon
+    static bool isRegionName(const VhdlSymbol* symp) {
+        if (!symp) return false;
+        switch (symp->kind()) {
+        case VhdlSymKind::FUNCTION:
+        case VhdlSymKind::PROCEDURE:
+        case VhdlSymKind::PACKAGE:
+        case VhdlSymKind::ENTITY:
+        case VhdlSymKind::ARCHITECTURE:
+        case VhdlSymKind::CONFIGURATION:
+        case VhdlSymKind::LABEL: return true;
+        default: return false;
+        }
+    }
+
+    // "[bit,bit return integer]", the parameter and result profile a name is
+    // written with where the name alone need not pick out one declaration
+    static std::string signatureOf(const VhdlSymbol* symp) {
+        std::string out = "[";
+        bool first = true;
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (!first) out += ",";
+            first = false;
+            out += typep ? typep->prettyName() : "";
+        }
+        if (symp->returnTypep()) out += " return " + symp->returnTypep()->prettyName();
+        return out + "]";
+    }
+
+    // A name as a path writes it: overloadable ones carry their profile
+    static std::string pathNameOf(const VhdlSymbol* symp) {
+        if (!symp) return "";
+        if (symp->kind() == VhdlSymKind::FUNCTION || symp->kind() == VhdlSymKind::PROCEDURE) {
+            return symp->name() + signatureOf(symp);
+        }
+        return symp->name();
+    }
+
+    // What a node is a child of. The back pointer runs through the siblings
+    // before it in a list, and those are not what a name sits inside.
+    static const AstNode* parentOf(const AstNode* nodep) {
+        for (const AstNode* p = nodep; p;) {
+            const AstNode* const backp = p->backp();
+            if (!backp) return nullptr;
+            if (backp->nextp() == p) {
+                p = backp;
+                continue;
+            }
+            return backp;
+        }
+        return nullptr;
+    }
+
+    // The regions a declaration sits in, from its design unit down, and which
+    // unit that is. Generate statements are left out: they are blocks of the
+    // elaborated design, which the hierarchy names rather than the text.
+    bool vhdlPathWalk(const AstNode* declp, std::vector<std::string>& parts, std::string& lib,
+                      std::string& unit, bool& inPkg) {
+        inPkg = false;
+        const AstNode* nodep = declp;
+        for (int depth = 0; nodep && depth < 128; ++depth, nodep = parentOf(nodep)) {
+            if (const AstNodeVhdlUnit* const unitp = VN_CAST(nodep, NodeVhdlUnit)) {
+                lib = unitp->libname().empty() ? "work" : unitp->libname();
+                unit = unitp->name();
+                // A package body continues its package's own region (12.1)
+                inPkg = VN_IS(nodep, VhdlPackage) || VN_IS(nodep, VhdlPackageBody)
+                        || VN_IS(nodep, VhdlPackageInst);
+                if (const AstVhdlArchitecture* const archp = VN_CAST(nodep, VhdlArchitecture)) {
+                    std::vector<std::string> ent;
+                    if (flattenName(archp->entityNamep(), ent) && !ent.empty()) {
+                        unit = ent.back();
+                    }
+                }
+                std::reverse(parts.begin(), parts.end());
+                std::reverse(m_pathIdxp.begin(), m_pathIdxp.end());
+                return true;
+            }
+            if (nodep == declp) continue;  // The name itself, if it is one
+            if (VN_IS(nodep, VhdlGenerateBody)) continue;  // Its statement is the region
+            if (const AstVhdlGenerate* const genp = VN_CAST(nodep, VhdlGenerate)) {
+                parts.push_back(generateRegionName(genp));
+            } else if (const AstVhdlSubprogDecl* const subp = VN_CAST(nodep, VhdlSubprogDecl)) {
+                const VhdlSymbol* const ssymp = subp->vhdlSymp();
+                parts.push_back(ssymp ? pathNameOf(ssymp) : subp->name());
+            } else if (const AstVhdlProcess* const procp = VN_CAST(nodep, VhdlProcess)) {
+                // An unlabelled process has an empty name of its own, which
+                // the path shows as two colons together (16.2.7)
+                parts.push_back(procp->label());
+            } else if (const AstVhdlBlock* const blockp = VN_CAST(nodep, VhdlBlock)) {
+                parts.push_back(blockp->label());
+            }
+        }
+        return false;
+    }
+
+    // The same for what a name denotes
+    bool vhdlPathOf(const VhdlSymbol* symp, std::vector<std::string>& parts, std::string& lib,
+                    std::string& unit, bool& inPkg) {
+        if (!symp || !symp->declp()) return false;
+        parts.clear();
+        const AstNode* const declp = symp->declp();
+        // A design unit is the root of its own path and does not appear
+        // inside it; a generate statement is named by the hierarchy
+        const bool ofUnit = VN_IS(declp, NodeVhdlUnit);
+        // An overloadable name is written with its signature, so that two of
+        // the same name are told apart; nvc 1.22.1 writes it the same way
+        if (!ofUnit) parts.push_back(pathNameOf(symp));
+        return vhdlPathWalk(declp, parts, lib, unit, inPkg);
+    }
+
+    // The tail of a path: the regions inside the design unit, then the name
+    static std::string pathTail(const std::vector<std::string>& parts, bool region) {
+        std::string out;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i) out += ":";
+            out += parts[i];
+        }
+        if (region && !parts.empty()) out += ":";
+        return out;
+    }
+
+    // "x'SIMPLE_NAME", "x'PATH_NAME" and "x'INSTANCE_NAME" (16.2.7)
+    AstNodeExpr* lowerNameAttr(AstVhdlAttrName* nodep, const std::string& attr, FileLine* flp) {
+        const VhdlSymbol* symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
+        if (symp) symp = symp->resolved();
+        std::string written;
+        {
+            std::vector<std::string> flat;
+            flattenName(nodep->prefixp(), flat);
+            written = flat.empty() ? std::string{"?"} : flat.back();
+        }
+        if (attr == "simple_name") {
+            return new AstConst{flp, AstConst::String{},
+                                symp && !symp->name().empty() ? symp->name() : written};
+        }
+        std::vector<std::string> parts;
+        std::string lib;
+        std::string unit;
+        bool inPkg = false;
+        bool region = isRegionName(symp);
+        m_pathIdxp.clear();
+        bool known = vhdlPathOf(symp, parts, lib, unit, inPkg);
+        if (!known) {
+            // A statement label denotes the statement it labels, and the
+            // analyzer keeps no symbol for one: the statement is the region,
+            // and it is the one this is written inside (12.1)
+            for (const AstNode* upp = nodep; upp; upp = parentOf(upp)) {
+                const AstNodeVhdlStmt* const stmtp = VN_CAST(upp, NodeVhdlStmt);
+                if (!stmtp || stmtp->label() != written) continue;
+                parts.clear();
+                m_pathIdxp.clear();
+                if (const AstVhdlGenerate* const genp = VN_CAST(upp, VhdlGenerate)) {
+                    parts.push_back(generateRegionName(genp));
+                } else {
+                    parts.push_back(stmtp->label());
+                }
+                known = vhdlPathWalk(upp, parts, lib, unit, inPkg);
+                region = true;
+                break;
+            }
+        }
+        if (!known) return new AstConst{flp, AstConst::String{}, ":" + written + ":"};
+        const std::string tail = pathTail(parts, region);
+        // A name a package declares is not part of the design hierarchy at
+        // all, so its path starts at the library the package was analyzed
+        // into rather than at the design's own top (16.2.7)
+        if (inPkg) return pathString(":" + lib + ":" + unit + ":" + tail, flp);
+        // 'INSTANCE_NAME names the design entity the region was built from,
+        // which its path does not (16.2.7)
+        std::string root = unit;
+        if (attr == "instance_name") {
+            const auto archIt = m_archOf.find(lib + "." + unit);
+            if (archIt != m_archOf.end()) root += "(" + archIt->second + ")";
+        }
+        return pathString(":" + root + ":" + tail, flp);
+    }
+
+    // What a generate statement is called in a path (16.2.7). An iteration
+    // written out on its own says which one it is; where the loop is left for
+    // the back end, which iteration this is is a value the design carries, so
+    // the path leaves a place for it and reads it where it runs.
+    std::string generateRegionName(const AstVhdlGenerate* genp) {
+        std::string name = genp->label();
+        const auto it = m_genIndex.find(genp);
+        if (it != m_genIndex.end()) return name + "(" + it->second + ")";
+        if (genp->kind() != VhdlLoopKind::FOR) return name;
+        VhdlSymbol* const symp = genp->vhdlSymp();
+        const auto varIt = symp ? m_vars.find(symp) : m_vars.end();
+        if (varIt == m_vars.end()) return name;
+        m_pathIdxp.push_back(varIt->second);
+        return name + "(\001)";
+    }
+    std::map<const AstNode*, std::string> m_genIndex;  // Generate -> iteration being written
+    std::vector<AstVar*> m_pathIdxp;  // The iteration each place in a path waits for
+
+    // A path with places left in it for the iterations a generate loop is on
+    AstNodeExpr* pathString(const std::string& text, FileLine* flp) {
+        if (m_pathIdxp.empty()) return new AstConst{flp, AstConst::String{}, text};
+        AstNodeExpr* outp = nullptr;
+        size_t at = 0;
+        size_t which = 0;
+        for (;;) {
+            const size_t mark = text.find('\001', at);
+            const std::string chunk
+                = text.substr(at, mark == std::string::npos ? std::string::npos : mark - at);
+            if (!chunk.empty()) {
+                AstNodeExpr* const litp = new AstConst{flp, AstConst::String{}, chunk};
+                outp = outp ? new AstConcatN{flp, outp, litp} : litp;
+            }
+            if (mark == std::string::npos) break;
+            AstNodeExpr* idxp = new AstConst{flp, AstConst::String{}, "?"};
+            if (which < m_pathIdxp.size()) {
+                idxp = new AstSFormatF{flp, "%0d", false,
+                                       new AstVarRef{flp, m_pathIdxp[which], VAccess::READ}};
+            }
+            ++which;
+            outp = outp ? new AstConcatN{flp, outp, idxp} : idxp;
+            at = mark + 1;
+        }
+        return outp ? outp : new AstConst{flp, AstConst::String{}, text};
+    }
+
     // A port with a conversion written on its formal: the port is a signal of
     // its own, what it drives reaches the actual through the conversion, and
     // -- where a conversion is written on the actual as well -- what the port
@@ -11970,7 +12192,9 @@ private:
             const bool had = prevIt != m_vars.end();
             AstVar* const savedp = had ? prevIt->second : nullptr;
             m_vars[symp] = paramp;
+            m_genIndex[nodep] = std::to_string(value);
             AstNode* const itemsp = lowerGenerateBody(nodep->altsp());
+            m_genIndex.erase(nodep);
             if (had) {
                 m_vars[symp] = savedp;
             } else {
