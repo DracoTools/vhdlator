@@ -2102,6 +2102,22 @@ Summary:
 
    Displays program version and exits.
 
+.. option:: --vhdl-inline-limit <statements>
+
+   Emits a VHDL subprogram whose body has more than this many statements as a
+   function of its own, rather than letting its body be written out at every
+   place it is called. Zero, the default, leaves every subprogram to the
+   ordinary inlining.
+
+   Verilator writes the body of a task or function out at each call site with
+   no limit on the total, so a design whose subprograms call one another
+   several deep -- which is what a VHDL verification framework such as UVVM,
+   VUnit or OSVVM is -- emits code that grows with the number of paths through
+   its call graph rather than with the size of its source. Setting this to
+   ``1``, which keeps only the subprograms of no statements inlined, is what
+   such a design usually needs; a design of ordinary size does not need it at
+   all and compiles faster without it.
+
 .. option:: --vhdl-std <std>
 
    Selects which revision of the VHDL standard (IEEE 1076) applies to VHDL

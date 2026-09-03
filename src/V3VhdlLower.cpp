@@ -17132,6 +17132,24 @@ private:
             }
         }
         m_ftaskp = nullptr;  // The task itself belongs to the module
+        // A subprogram big enough to be worth a call of its own says so.
+        // Verilator writes out the body of every task at every call site,
+        // and a verification library is a deep call graph -- a check calls a
+        // formatter calls a string helper -- so the copies multiply down it.
+        if (const int limit = v3Global.opt.vhdlInlineLimit()) {
+            int count = 0;
+            ftaskp->foreach([&count](const AstNodeStmt*) { ++count; });
+            if (count > limit) {
+                ftaskp->addStmtsp(new AstPragma{flp, VPragmaType::NO_INLINE_TASK});
+                // A subprogram reaches the objects a package declares, and
+                // there is one of each for the design however many modules
+                // name it. Verilator reports a reference out of a function's
+                // own scope because it cannot generally say a non-inlined
+                // one is scheduled where it should be; here the call is a
+                // statement of the caller, which is exactly where it is.
+                ftaskp->fileline()->warnOff(V3ErrorCode::IMPURE, true);
+            }
+        }
         redirectPortDrives(ftaskp);
         addStmt(ftaskp);
         if (m_protClassp && copyName.empty() && inProtectedBody(symp)) {
