@@ -5113,6 +5113,7 @@ private:
             flp, senItemFor(new AstVarRef{flp, sigp, VAccess::READ}, isOneBitVar(sigp), flp)};
         AstAlways* const alwaysp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp};
         m_shadowsp = AstNode::addNextNull(m_shadowsp, static_cast<AstNode*>(alwaysp));
+        m_historied.insert(sigp);
         return &m_shadows.emplace(symp, sh).first->second;
     }
 
@@ -5295,6 +5296,7 @@ private:
         m_shadowsp = AstNode::addNextNull(
             m_shadowsp,
             static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp}));
+        m_historied.insert(varIt->second);
         m_actives.emplace(symp, ac);
     }
 
@@ -9524,10 +9526,8 @@ private:
             reads = true;
         });
         if (!reads) return new AstInitial{flp, bodyp};
-        // A statement that reads only one element of a signal waits on that
-        // element and on nothing else (11.6). Only where every signal it
-        // reads is one this knows: anything else takes the whole of what the
-        // statement reads, which wakes it no less often than it should.
+        // A statement waits on what it names, and on nothing else (11.6) --
+        // where it reads one element of a signal, on that element alone.
         bool allKnown = true;
         std::set<const AstVar*> knownp;
         for (const auto& pair : m_vars) {
@@ -9537,24 +9537,59 @@ private:
                 knownp.insert(pair.second);
             }
         }
-        bodyp->foreach([&allKnown, &knownp, &writtenp](const AstVarRef* refp) {
+        bodyp->foreach([&allKnown, &writtenp](const AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             if (writtenp.count(refp)) return;
-            const AstVar* const varp = refp->varp();
-            if (!varp || varp->isParam() || varp->varType() == VVarType::GENVAR) return;
-            if (!knownp.count(varp)) allKnown = false;
-            // Only over signals whose emitted type is one value: a record or
-            // an array of them is read through a selection this cannot shadow
-            const AstNodeDType* const dtp
-                = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
-            if (!VN_IS(dtp, BasicDType) && !VN_IS(dtp, PackArrayDType)) allKnown = false;
+            if (!nameableRead(refp->varp())) allKnown = false;
         });
-        // Only where a part of a signal is what it reads: otherwise the
-        // ordinary combinational process says the same thing, and says it
-        // in the shape the rest of the compiler expects
-        if (allKnown && readsAPart(bodyp, knownp, writtenp)) {
+        // A statement that assigns a signal has to be written so that
+        // Verilator schedules it as an event-driven block. In a
+        // combinational one, "<=" is turned into a blocking assignment, and
+        // the value would land in the delta it was computed in rather than
+        // the next -- so a process reading the target in that delta would see
+        // the new value where VHDL gives it the old one (11.6, 10.5.2.2).
+        // Nothing else needs it, and the combinational form is the shape the
+        // rest of the compiler works with best, so that is what everything
+        // else keeps.
+        bool schedules = false;
+        bodyp->foreachAndNext([&schedules](const AstAssignDly*) { schedules = true; });
+        // Reading one element by a fixed index is a rule about when the
+        // statement runs, not about the delta, and it holds however the rest
+        // of the architecture is written -- so such a statement keeps its
+        // sensitivity whatever the delta turns out to be worth.
+        const bool part = readsAPart(bodyp, knownp, writtenp);
+        if (allKnown && (schedules || part)) {
             if (AstSenTree* const senp = sensitivityOfBody(bodyp, flp)) {
-                return new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp};
+                if (part) {
+                    AstAlways* const partp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp};
+                    m_concSenp.insert(partp);
+                    return partp;
+                }
+                // Verilog's "always" with an event control does not run at
+                // time zero, and a concurrent statement runs once at the
+                // start whether or not anything has changed (11.6) -- so the
+                // statements are emitted twice, once to start and once to
+                // react. The combinational form needs no such thing: it is
+                // evaluated once as the design settles.
+                //
+                // Both of them drive what the statement assigns, which
+                // Verilator would otherwise report as two drivers. They
+                // cannot conflict: they are the same statements, and the one
+                // that starts runs before anything could have changed.
+                for (const AstNode* const np : writtenp) {
+                    const AstVarRef* const refp = VN_CAST(np, VarRef);
+                    if (refp && refp->varp()) {
+                        refp->varp()->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    }
+                }
+                AstAlways* const alwaysp
+                    = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp->cloneTree(true)};
+                AstInitial* const initp = new AstInitial{flp, bodyp};
+                m_concSenp.insert(alwaysp);
+                m_concSenp.insert(initp);
+                m_concDeltas.push_back(ConcDelta{alwaysp, initp});
+                return AstNode::addNext(static_cast<AstNode*>(alwaysp),
+                                        static_cast<AstNode*>(initp));
             }
         }
         return new AstAlways{flp, VAlwaysKwd::ALWAYS, new AstSenTree{flp, comboSenItem(flp)},
@@ -14865,6 +14900,267 @@ private:
         return any;
     }
 
+    // A concurrent assignment written as an event-driven block, and the
+    // time-zero run beside it. Whether the delta it keeps between its
+    // sources and its target can be seen at all is a question about the
+    // whole architecture, so it is asked once the architecture is lowered.
+    struct ConcDelta final {
+        AstAlways* alwaysp = nullptr;
+        AstInitial* initp = nullptr;
+    };
+    std::vector<ConcDelta> m_concDeltas;
+    // Every concurrent statement given a sensitivity of its own. None of
+    // them is watching another: they are the machinery, not the design's
+    // view of itself.
+    std::set<const AstNode*> m_concSenp;
+    // Signals something asks a question about time of: what an attribute
+    // keeps about one is a record of which delta each of its values fell in,
+    // so the deltas of such a signal are all observable by construction.
+    std::set<const AstVar*> m_historied;
+
+    // Give a block back its combinational form: what it assigns lands in the
+    // delta it was computed in, which is what a continuous assignment does
+    // and what the rest of the compiler optimizes best.
+    void relaxToCombo(const ConcDelta& cd, FileLine* flp) {
+        AstSenTree* const oldp = cd.alwaysp->sentreep();
+        AstSenTree* const combop = new AstSenTree{flp, comboSenItem(flp)};
+        if (oldp) {
+            oldp->replaceWith(combop);
+            VL_DO_DANGLING(oldp->deleteTree(), oldp);
+        } else {
+            cd.alwaysp->sentreep(combop);
+        }
+        if (cd.initp) {
+            cd.initp->unlinkFrBack();
+            VL_DO_DANGLING(cd.initp->deleteTree(), cd.initp);
+        }
+    }
+
+    // Whether a block can be resumed at a moment of its own choosing, rather
+    // than only when a signal it waits on changes. One that can may run in
+    // any delta at all, so anything it reads is read at a moment this cannot
+    // name -- including the delta in which a concurrent assignment's target
+    // is still holding its old value.
+    static bool resumesAnywhen(const AstNode* nodep) {
+        return nodep->exists([](const AstNode* np) {
+            return VN_IS(np, Delay) || VN_IS(np, EventControl) || VN_IS(np, Wait)
+                   || VN_IS(np, Fork);
+        });
+    }
+
+    // The delta a concurrent assignment puts between its sources and its
+    // target is only there to be seen where something can look at the target
+    // in the delta one of those sources changed. In synchronous logic
+    // nothing can: the assignments feed a clocked process, which runs on an
+    // edge, by which time every delta has passed. Keeping the delta there
+    // costs a great deal -- the value can no longer be folded into its
+    // readers -- so it is kept only where it can be seen.
+    void relaxConcurrentDeltas(FileLine* flp) {
+        if (m_concDeltas.empty()) return;
+        // Everything the architecture became, and what each of them touches.
+        // Whatever is not one of these assignments is something that may be
+        // looking at one -- a process, an instance, a subprogram of the
+        // module -- and is treated as such.
+        std::map<const AstNode*, std::set<const AstVar*>> reads;
+        std::map<const AstNode*, std::set<const AstVar*>> writes;
+        std::map<const AstVar*, std::vector<const AstNode*>> writtenBy;
+        std::vector<AstNode*> othersp;
+        std::set<const AstVar*> outsidep;
+        for (AstNode* p = m_modp->stmtsp(); p; p = p->nextp()) {
+            if (VN_IS(p, Var) || VN_IS(p, Typedef)) continue;
+            refsOfBlock(p, reads[p], writes[p]);
+            // What leaves the architecture: a port of its own, or a signal
+            // an instance inside it is wired to. Whatever reads such a
+            // signal is somewhere this cannot see, and so is whatever
+            // changes at the same moment as one.
+            if (VN_IS(p, Cell)) {
+                outsidep.insert(reads[p].begin(), reads[p].end());
+                outsidep.insert(writes[p].begin(), writes[p].end());
+            }
+            if (!m_concSenp.count(p)) othersp.push_back(p);
+        }
+        for (const auto& pair : writes) {
+            for (const AstVar* const varp : pair.second) writtenBy[varp].push_back(pair.first);
+        }
+        std::set<const AstNode*> concp;
+        for (const ConcDelta& cd : m_concDeltas) concp.insert(cd.alwaysp);
+        // In which deltas the target would answer differently with the delta
+        // and without it: those in which anything it is computed from
+        // changes. A source read straight from a driver is one such signal,
+        // and so is everything that driver writes beside it, since those
+        // change together. Where the source is itself one of these
+        // assignments the question passes on to its own sources, because
+        // that whole chain is what collapses into a single delta; where it
+        // comes from a process it does not, since what a process assigns is
+        // scheduled and does not collapse.
+        const auto sourcesOf = [&](const AstNode* startp) {
+            std::set<const AstVar*> out;
+            std::set<const AstNode*> seen{startp};
+            std::vector<const AstNode*> workp{startp};
+            while (!workp.empty()) {
+                const AstNode* const bp = workp.back();
+                workp.pop_back();
+                const auto rIt = reads.find(bp);
+                if (rIt == reads.end()) continue;
+                for (const AstVar* const varp : rIt->second) {
+                    if (!out.insert(varp).second) continue;
+                    const auto byIt = writtenBy.find(varp);
+                    if (byIt == writtenBy.end()) continue;
+                    for (const AstNode* const wp : byIt->second) {
+                        const auto wIt = writes.find(wp);
+                        if (wIt != writes.end()) {
+                            out.insert(wIt->second.begin(), wIt->second.end());
+                        }
+                        if (concp.count(wp) && seen.insert(wp).second) workp.push_back(wp);
+                    }
+                }
+            }
+            return out;
+        };
+        // When each of the others could be looking. One that waits on a
+        // list of signals looks in the deltas those change in; one that can
+        // suspend and take itself up again -- or that has no list at all --
+        // could be looking in any delta there is.
+        struct Watcher final {
+            const AstNode* nodep = nullptr;
+            std::set<const AstVar*> wake;
+            bool anywhen = false;
+        };
+        std::vector<Watcher> watchers;
+        for (AstNode* const bp : othersp) {
+            const auto rIt = reads.find(bp);
+            if (rIt == reads.end() || rIt->second.empty()) continue;
+            Watcher w;
+            w.nodep = bp;
+            w.anywhen = true;
+            const AstAlways* const alwp = VN_CAST(bp, Always);
+            if (alwp && alwp->sentreep() && !resumesAnywhen(bp)) {
+                w.anywhen = false;
+                alwp->sentreep()->foreach([&w](const AstSenItem* itemp) {
+                    const VEdgeType et = itemp->edgeType();
+                    if (et != VEdgeType::ET_CHANGED && et != VEdgeType::ET_BOTHEDGE
+                        && et != VEdgeType::ET_POSEDGE && et != VEdgeType::ET_NEGEDGE) {
+                        w.anywhen = true;
+                    }
+                });
+                alwp->sentreep()->foreach([&w](const AstVarRef* refp) {
+                    if (refp->varp()) w.wake.insert(refp->varp());
+                });
+            }
+            watchers.push_back(std::move(w));
+        }
+        const auto reachesOutside
+            = [&outsidep](const AstVar* varp) { return varp->isIO() || outsidep.count(varp); };
+        const auto anyOutside = [&](const std::set<const AstVar*>& vars) {
+            for (const AstVar* const varp : vars) {
+                if (reachesOutside(varp)) return true;
+            }
+            return false;
+        };
+        const auto meets
+            = [](const std::set<const AstVar*>& a, const std::set<const AstVar*>& b) {
+                  return a.size() > b.size() ? meetsImpl(b, a) : meetsImpl(a, b);
+              };
+        int relaxed = 0;
+        for (const ConcDelta& cd : m_concDeltas) {
+            const auto wIt = writes.find(cd.alwaysp);
+            if (wIt == writes.end() || wIt->second.empty()) continue;
+            if (anyOutside(wIt->second)) continue;  // Read where this cannot look
+            if (meetsImpl(wIt->second, m_historied)) continue;  // Asked about by time
+            bool seen = false;
+            std::set<const AstVar*> srcs;
+            bool haveSrcs = false;
+            bool srcsOutside = false;
+            for (const Watcher& w : watchers) {
+                const auto rIt = reads.find(w.nodep);
+                if (rIt == reads.end() || !meets(rIt->second, wIt->second)) continue;
+                if (w.anywhen) {
+                    seen = true;
+                    break;
+                }
+                if (!haveSrcs) {
+                    srcs = sourcesOf(cd.alwaysp);
+                    srcsOutside = anyOutside(srcs);
+                    haveSrcs = true;
+                }
+                // A source from outside may change together with something
+                // else from outside, which is written down nowhere here
+                if (srcsOutside && anyOutside(w.wake)) {
+                    seen = true;
+                    break;
+                }
+                if (meets(w.wake, srcs)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                relaxToCombo(cd, flp);
+                ++relaxed;
+            }
+        }
+        UINFO(4, "Concurrent assignments left as combinational: " << relaxed << " of "
+                                                                  << m_concDeltas.size());
+    }
+
+    // What a block reads and what it writes. Which of the two a reference is
+    // cannot be asked of the reference here -- V3LinkLValue decides that,
+    // long after this -- so what an assignment writes is found by walking
+    // down its left side, and everything else is a read.
+    static void refsOfBlock(AstNode* blockp, std::set<const AstVar*>& reads,
+                            std::set<const AstVar*>& writes) {
+        std::set<const AstNode*> writtenp;
+        blockp->foreach([&writtenp, &writes](const AstNodeAssign* asgp) {
+            for (const AstNode* np = asgp->lhsp(); np;) {
+                if (const AstVarRef* const refp = VN_CAST(np, VarRef)) {
+                    writtenp.insert(np);
+                    if (refp->varp()) writes.insert(refp->varp());
+                    break;
+                }
+                if (const AstMemberSel* const memp = VN_CAST(np, MemberSel)) {
+                    np = memp->fromp();
+                } else if (const AstStructSel* const strp = VN_CAST(np, StructSel)) {
+                    np = strp->fromp();
+                } else if (const AstSelBit* const bitp = VN_CAST(np, SelBit)) {
+                    np = bitp->fromp();
+                } else if (const AstSelExtract* const extp = VN_CAST(np, SelExtract)) {
+                    np = extp->fromp();
+                } else if (const AstSel* const selp = VN_CAST(np, Sel)) {
+                    np = selp->fromp();
+                } else if (const AstArraySel* const arrp = VN_CAST(np, ArraySel)) {
+                    np = arrp->fromp();
+                } else {
+                    break;
+                }
+            }
+        });
+        blockp->foreach([&writtenp, &reads](const AstVarRef* refp) {
+            if (writtenp.count(refp) || !refp->varp()) return;
+            const AstVar* const varp = refp->varp();
+            if (varp->isParam() || varp->varType() == VVarType::GENVAR) return;
+            reads.insert(varp);
+        });
+    }
+
+    static bool meetsImpl(const std::set<const AstVar*>& small,
+                          const std::set<const AstVar*>& big) {
+        for (const AstVar* const varp : small) {
+            if (big.count(varp)) return true;
+        }
+        return false;
+    }
+
+    // Whether a variable a statement reads is one the module can wait on. A
+    // generic or a generate parameter never changes, so nothing waits on it;
+    // what a subprogram keeps for itself is gone before the statement could
+    // be woken.
+    static bool nameableRead(const AstVar* varp) {
+        if (!varp) return false;
+        if (varp->isParam() || varp->varType() == VVarType::GENVAR) return false;
+        if (varp->isFuncLocal()) return false;
+        return true;
+    }
+
     AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp, bool* anyPartp = nullptr) {
         if (!bodyp) return nullptr;
         std::set<const AstVar*> signals;
@@ -14889,14 +15185,17 @@ private:
                 if (asgp->lhsp() == refp) return;
             }
             AstVar* const varp = refp->varp();
-            if (!varp || !signals.count(varp)) return;
+            if (!nameableRead(varp)) return;
             // Only a signal held as one value can be shadowed a part at a
             // time: a record, or an array of them, is read through a
-            // selection that has no shadow of its own
+            // selection that has no shadow of its own. What an attribute
+            // keeps about a signal is a variable of the module too, and the
+            // statement waits on it as it waits on the signal itself.
             const AstNodeDType* const dtp
                 = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
             AstNodeExpr* const partp
-                = (VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType))
+                = (signals.count(varp)
+                   && (VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType)))
                       ? staticPartRead(refp)
                       : nullptr;
             const auto it = partOf.find(varp);
@@ -17309,6 +17608,10 @@ private:
         m_modp->addStmtsp(m_shadowsp);
         m_shadowsp = nullptr;
         m_shadows.clear();
+        relaxConcurrentDeltas(flp);
+        m_concDeltas.clear();
+        m_concSenp.clear();
+        m_historied.clear();
         m_netlistp->addModulesp(m_modp);
         m_modp = nullptr;
     }

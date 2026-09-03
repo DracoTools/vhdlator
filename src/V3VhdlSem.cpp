@@ -6571,6 +6571,13 @@ VhdlType* VhdlSemVisitor::constrainRecordFromParts(VhdlType* typep,
         if (elemTypep->base()->kind() != VhdlTypeKind::ARRAY || !elemTypep->unconstrained()) {
             continue;
         }
+        // An element the record's own declaration constrained is not open,
+        // even where the bound it was given names a generic and so does not
+        // fold until the instance does (5.3.3). Taking its bounds from the
+        // value instead would make an object of the type a different
+        // structure from the type itself, and the two would no longer be
+        // assignable to one another.
+        if (elemTypep->lengthEmittable()) continue;
         VhdlType* const newTypep = constrainFromValue(elemTypep, byPos[i], flp);
         if (newTypep == elemTypep) continue;
         if (!outp) outp = cloneSubtype(typep, flp);
