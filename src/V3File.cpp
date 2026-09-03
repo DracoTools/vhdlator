@@ -783,6 +783,15 @@ void V3OutFormatter::putns(const AstNode* nodep, const char* strg) {
             break;
         case ' ': wordstart = true; break;
         case '\t': wordstart = true; break;
+        case '\\':
+            // Inside a string literal a backslash escapes what follows, so an
+            // escaped quote does not end the string. Without this, emitted
+            // code that contains one leaves the rest of the file tracked as
+            // though it were inside a string, and the braces and parentheses
+            // that decide the indentation are counted wrongly.
+            wordstart = false;
+            if (m_inStringLiteral && cp[1]) putcNoTracking(*++cp);
+            break;
         case '"':
             wordstart = false;
             m_inStringLiteral = !m_inStringLiteral;
