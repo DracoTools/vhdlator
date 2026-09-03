@@ -95,6 +95,9 @@ struct AstVhdlExprPair final {
     // copy already holds -- an index another copy was given -- the value is
     // handed over as it stands
     AstNodeExpr* loweredp = nullptr;
+    // The formal it is handed to, whose mode says which way a value that
+    // needs converting on the way in has to travel
+    const AstVhdlIfaceDecl* formalp = nullptr;
 };
 
 class VhdlLowerVisitor final {
@@ -13861,9 +13864,9 @@ private:
     // "p(v(hi downto lo))", where hi and lo are worked out while running and
     // p writes what it is given: the slice goes in as a carrier built here
     // and comes back into the same slice afterwards (4.2.2.3)
-    bool dynSliceRoundTrip(AstVhdlAssoc* asp, VhdlType* carrierTypep, AstNode*& prep,
+    bool dynSliceRoundTrip(AstNodeVhdlExpr* actualp, VhdlType* carrierTypep, AstNode*& prep,
                            AstNode*& postp, AstVar*& carrierp, FileLine* flp) {
-        AstVhdlCall* const callp = VN_CAST(asp->actualp(), VhdlCall);
+        AstVhdlCall* const callp = VN_CAST(actualp, VhdlCall);
         AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
         if (!rangep || !callp->prefixp()) return false;
         VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
@@ -13949,7 +13952,8 @@ private:
                 // taken from has a length, and the ends go in as numbers
                 VhdlType* const carrp = symp->paramTypes()[at];
                 AstVar* carrierp = nullptr;
-                if (carrp && dynSliceRoundTrip(asp, carrp, prep, postp, carrierp, flp)) {
+                if (carrp
+                    && dynSliceRoundTrip(asp->actualp(), carrp, prep, postp, carrierp, flp)) {
                     m_argCarrier.emplace(asp, carrierp);
                     continue;
                 }
@@ -14121,7 +14125,10 @@ private:
                 continue;
             }
             if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) {
-                if (actualp) passed.push_back(AstVhdlExprPair{formals[i]->name(), actualp});
+                if (actualp) {
+                    passed.push_back(
+                        AstVhdlExprPair{formals[i]->name(), actualp, nullptr, formals[i]});
+                }
                 continue;
             }
             // An alias is another name for what it denotes (6.6), so a
@@ -14321,13 +14328,209 @@ private:
         return copyIt->second;
     }
 
+    // Whether an emitted type is one of the carrier structures
+    static bool isCarrierDType(const AstNodeDType* dtypep) {
+        const AstRefDType* const refp = VN_CAST(dtypep, RefDType);
+        return refp && refp->name().compare(0, 6, "__Vdyn") == 0;
+    }
+
+    // The range an emitted object was declared with, where it has one
+    static const AstRange* emittedRangeOf(const AstVar* varp) {
+        if (!varp) return nullptr;
+        if (const AstPackArrayDType* const pp = VN_CAST(varp->childDTypep(), PackArrayDType)) {
+            return pp->rangep();
+        }
+        if (const AstUnpackArrayDType* const up
+            = VN_CAST(varp->childDTypep(), UnpackArrayDType)) {
+            return up->rangep();
+        }
+        return nullptr;
+    }
+
+    // A carrier filled from an object of a fixed width, and the copy back
+    // into it. The bounds are taken from the object *as it was emitted*
+    // rather than from its VHDL subtype: inside a copy made for one call the
+    // length of a signal parameter is settled, so "v : std_logic_vector
+    // (rdata'length - 1 downto 0)" has a real width there, while the subtype
+    // it was written with reports as unconstrained wherever it is asked.
+    AstNode* carrierRoundTrip(AstVar* tmpp, AstVar* objp, AstNodeExpr* leftp,
+                              AstNodeExpr* rightp, bool ascending, bool fill, FileLine* flp) {
+        AstVar* const np = newTempVar("__Vdynn", newIntDType(flp), flp);
+        AstVar* const kp = newTempVar("__Vdynk", newIntDType(flp), flp);
+        const auto wrc = [&]() { return new AstVarRef{flp, tmpp, VAccess::WRITE}; };
+        const auto rdc = [&]() { return new AstVarRef{flp, tmpp, VAccess::READ}; };
+        AstNode* stmtsp = new AstAssign{
+            flp, wr(np, flp),
+            new AstAdd{flp,
+                       ascending ? new AstSub{flp, rightp, leftp->cloneTree(false)}
+                                 : new AstSub{flp, leftp->cloneTree(false), rightp},
+                       i32(1, flp)}};
+        if (fill) {
+            stmtsp = AstNode::addNext(
+                stmtsp, static_cast<AstNode*>(new AstAssign{
+                            flp, dynPart(wrc(), "lft", flp), leftp->cloneTree(false)}));
+            stmtsp = AstNode::addNext(
+                stmtsp, static_cast<AstNode*>(new AstAssign{
+                            flp, dynPart(wrc(), "rgt", flp), rightp->cloneTree(false)}));
+            stmtsp = AstNode::addNext(
+                stmtsp,
+                static_cast<AstNode*>(new AstAssign{
+                    flp, dynPart(wrc(), "dsc", flp),
+                    new AstConst{flp, AstConst::BitTrue{}, !ascending}}));
+            stmtsp = AstNode::addNext(
+                stmtsp, static_cast<AstNode*>(new AstAssign{
+                            flp, dynPart(wrc(), "q", flp),
+                            new AstNewDynamic{flp, rd(np, flp), nullptr}}));
+        }
+        stmtsp = AstNode::addNext(
+            stmtsp, static_cast<AstNode*>(new AstAssign{flp, wr(kp, flp), i32(0, flp)}));
+        AstNodeExpr* const atp
+            = ascending ? static_cast<AstNodeExpr*>(
+                  new AstAdd{flp, leftp->cloneTree(false), rd(kp, flp)})
+                        : static_cast<AstNodeExpr*>(
+                            new AstSub{flp, leftp->cloneTree(false), rd(kp, flp)});
+        AstNodeExpr* const objElemp
+            = new AstSelBit{flp, new AstVarRef{flp, objp, fill ? VAccess::READ : VAccess::WRITE},
+                            atp};
+        AstNodeExpr* const carElemp = new AstSelBit{
+            flp, dynPart(fill ? wrc() : rdc(), "q", flp), rd(kp, flp)};
+        AstNode* bodyp = fill ? new AstAssign{flp, carElemp, objElemp}
+                              : new AstAssign{flp, objElemp, carElemp};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp),
+                       new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+        stmtsp = AstNode::addNext(
+            stmtsp, whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
+        return stmtsp;
+    }
+
+    // Whether a name is a slice of an object: "v(a downto b)" (8.5)
+    static bool isSlice(const AstNodeVhdlExpr* nodep) {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        return callp && callp->prefixp() && VN_IS(callp->argsp(), VhdlRange);
+    }
+
+    // The ends of the slice a call passes, worked out once into names of
+    // their own: they are read four times over, twice each way
+    bool sliceEndsOf(AstNodeVhdlExpr* actualp, AstVar*& objp, AstVar*& lop, AstVar*& hip,
+                     bool& ascending, AstNode** prepp, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(actualp, VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rangep || !callp->prefixp()) return false;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, ascending, dirKnown) || !leftp || !rightp
+            || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return false;
+        }
+        AstNodeExpr* const basep = lowerExpr(callp->prefixp());
+        AstVarRef* refp = VN_CAST(basep, VarRef);
+        // A slice of something that carries its own bounds is a value of its
+        // own already, and its places are not the object's
+        if (refp && isCarrierDType(refp->varp()->childDTypep())) refp = nullptr;
+        if (!refp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (basep) VL_DO_DANGLING(basep->deleteTree(), basep);
+            return false;
+        }
+        objp = refp->varp();
+        VL_DO_DANGLING(basep->deleteTree(), basep);
+        lop = newTempVar("__Vdynlf", newIntDType(flp), flp);
+        hip = newTempVar("__Vdynrg", newIntDType(flp), flp);
+        *prepp = AstNode::addNextNull(*prepp, new AstAssign{flp, wr(lop, flp), leftp});
+        *prepp = AstNode::addNextNull(*prepp, new AstAssign{flp, wr(hip, flp), rightp});
+        return true;
+    }
+
     // The arguments a call to such a copy still has to hand over
     bool addPassedArgs(AstNodeFTaskRef* refp, const std::vector<AstVhdlExprPair>& passed,
-                       FileLine* flp) {
+                       FileLine* flp, AstNodeFTask* taskp = nullptr, AstNode** prepp = nullptr,
+                       AstNode** postpp = nullptr) {
+        // The formals of the copy, by name. Gathered once: they are its own
+        // top-level declarations, and walking the body for each argument
+        // would be the size of the body times the number of arguments.
+        std::map<std::string, AstVar*> ios;
+        if (taskp && prepp) {
+            for (AstNode* p = taskp->stmtsp(); p; p = p->nextp()) {
+                AstVar* const vp = VN_CAST(p, Var);
+                if (vp && vp->isIO()) ios.emplace(vp->name(), vp);
+            }
+        }
         for (const AstVhdlExprPair& pair : passed) {
-            AstNodeExpr* const onep
+            // A parameter that carries its own bounds goes by reference, so
+            // an object whose emitted width is fixed cannot be handed over as
+            // it stands: a carrier is filled from it for the call and copied
+            // back into it afterwards, which is what a copy-out parameter
+            // means anyway (4.2.2.3). Whether one is needed is asked of the
+            // *emitted* formal, since a subtype written against the length of
+            // a signal parameter has no length until a copy is made for one
+            // call and that parameter is bound.
+            AstVar* fvarp = nullptr;
+            if (taskp && prepp && pair.exprp && !pair.loweredp) {
+                const auto ioIt = ios.find(pair.name);
+                if (ioIt != ios.end()) fvarp = ioIt->second;
+                if (fvarp && !isCarrierDType(fvarp->childDTypep())) fvarp = nullptr;
+                // A slice reads as a value of its own and writes as the
+                // object's own places, so it is not one of those that
+                // arrives carried already
+                if (fvarp && !isSlice(pair.exprp) && isDynValue(pair.exprp)) fvarp = nullptr;
+            }
+            // A slice: the object it is taken from has places of its own,
+            // and the ends are worked out here into names
+            if (fvarp && isSlice(pair.exprp)) {
+                AstVar* objp = nullptr;
+                AstVar* lop = nullptr;
+                AstVar* hip = nullptr;
+                bool ascending = true;
+                if (sliceEndsOf(pair.exprp, objp, lop, hip, ascending, prepp, flp)) {
+                    const VhdlMode mode
+                        = pair.formalp ? pair.formalp->mode() : VhdlMode::INOUT;
+                    AstVar* const tmpp = newTempVar(
+                        "__Vdynsig", fvarp->childDTypep()->cloneTree(false), flp);
+                    *prepp = AstNode::addNextNull(
+                        *prepp, carrierRoundTrip(tmpp, objp, rd(lop, flp), rd(hip, flp),
+                                                 ascending, true, flp));
+                    if (postpp && mode != VhdlMode::IN) {
+                        *postpp = AstNode::addNextNull(
+                            *postpp, carrierRoundTrip(tmpp, objp, rd(lop, flp),
+                                                      rd(hip, flp), ascending, false, flp));
+                    }
+                    refp->addArgsp(new AstArg{
+                        flp, pair.name, new AstVarRef{flp, tmpp, VAccess::READWRITE}});
+                    continue;
+                }
+            }
+            AstNodeExpr* onep
                 = pair.loweredp ? pair.loweredp->cloneTree(false) : lowerExpr(pair.exprp);
             if (!onep) return false;
+            AstVar* const objp = VN_IS(onep, VarRef) ? VN_AS(onep, VarRef)->varp() : nullptr;
+            const AstRange* const rangep = emittedRangeOf(objp);
+            if (fvarp && rangep && !isCarrierDType(objp->childDTypep())) {
+                const VhdlMode mode = pair.formalp ? pair.formalp->mode() : VhdlMode::INOUT;
+                AstVar* const tmpp = newTempVar(
+                    "__Vdynsig", fvarp->childDTypep()->cloneTree(false), flp);
+                // Filled either way: with nothing flowing in the carrier
+                // still has to be as long as the object it is copied back
+                // into, since that is what says how long the value is
+                *prepp = AstNode::addNextNull(
+                    *prepp, carrierRoundTrip(tmpp, objp, rangep->leftp()->cloneTree(false),
+                                             rangep->rightp()->cloneTree(false),
+                                             rangep->ascending(), true, flp));
+                if (postpp && mode != VhdlMode::IN) {
+                    *postpp = AstNode::addNextNull(
+                        *postpp,
+                        carrierRoundTrip(tmpp, objp, rangep->leftp()->cloneTree(false),
+                                         rangep->rightp()->cloneTree(false),
+                                         rangep->ascending(), false, flp));
+                }
+                VL_DO_DANGLING(onep->deleteTree(), onep);
+                onep = new AstVarRef{flp, tmpp, VAccess::READWRITE};
+            }
             refp->addArgsp(new AstArg{flp, pair.name, onep});
         }
         return true;
@@ -14340,11 +14543,17 @@ private:
         if (!taskp) return nullptr;
         AstTaskRef* const refp = new AstTaskRef{flp, taskp->name(), nullptr};
         refp->taskp(taskp);
-        if (!addPassedArgs(refp, passed, flp)) {
+        AstNode* prep = nullptr;
+        AstNode* postp = nullptr;
+        if (!addPassedArgs(refp, passed, flp, taskp, &prep, &postp)) {
             VL_DO_DANGLING(refp->deleteTree(), refp);
+            if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
+            if (postp) VL_DO_DANGLING(postp->deleteTree(), postp);
             return nullptr;
         }
-        return new AstStmtExpr{flp, refp};
+        AstNode* const outp
+            = AstNode::addNextNull(prep, new AstStmtExpr{flp, refp});
+        return AstNode::addNextNull(outp, postp);
     }
 
     // The same for a function: "rising_edge(s)" written out rather than
