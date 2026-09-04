@@ -11,12 +11,15 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A signal-class parameter names the caller's own signal, so an assignment
-# inside the subprogram drives that signal.
+# A signal-class parameter names the caller's own signal, so its range and
+# its length come from there; and JUSTIFY to a side the call only settles
+# while running.
 test.top_filename = "t/t_vhdl_sigparam.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_sigparam"],
+             verilator_flags2=[
+                 "--timing", "--debug-check", "--top-module t_vhdl_sigparam"
+             ],
              make_top_shell=False,
              make_main=False)
 

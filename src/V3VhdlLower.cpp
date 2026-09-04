@@ -2558,6 +2558,13 @@ private:
             const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
             if (litp && litp->kind() == VhdlLitKind::STRING) typep = nullptr;
         }
+        // A signal-class formal names the caller's own signal (4.2.2.3), so
+        // how long it is is the signal's business, not the open subtype the
+        // formal is written with
+        if (!typep || !typep->isConstrainedArray()) {
+            VhdlType* const boundp = boundTypeOf(nodep);
+            if (boundp && boundp->isConstrainedArray()) typep = boundp;
+        }
         if (!typep || !typep->isConstrainedArray()) {
             const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
             if (!litp || litp->kind() != VhdlLitKind::STRING) return nullptr;
@@ -8555,16 +8562,53 @@ private:
             AstNodeExpr* const valuep = lowerExpr(args[0]);
             if (!valuep) return nullptr;
             bool right = true;
+            // The side may be a parameter of the subprogram the call is
+            // written in -- UVVM's own TO_STRING is written that way -- and
+            // then which side to pad is a question for running (16.4)
+            AstNodeExpr* sidep = nullptr;
             if (args.size() >= 2) {
                 const VhdlValue sv = V3VhdlEval::eval(args[1]);
-                if (!sv.isInt()) {
+                if (sv.isInt()) {
+                    right = sv.toInt() == 0;
+                } else {
+                    sidep = lowerExpr(args[1]);
+                    if (!sidep) {
+                        unsup(flp, "justify to a side that is not static");
+                        VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                        return nullptr;
+                    }
+                }
+            }
+            if (args.size() < 3) {
+                if (sidep) VL_DO_DANGLING(sidep->deleteTree(), sidep);
+                return valuep;
+            }
+            if (sidep) {
+                AstNodeFTask* const rightFuncp = justifyFunc(true, flp);
+                AstNodeFTask* const leftFuncp = justifyFunc(false, flp);
+                AstNodeExpr* const widthp
+                    = rightFuncp && leftFuncp ? lowerExpr(args[2]) : nullptr;
+                if (!widthp) {
                     unsup(flp, "justify to a side that is not static");
+                    VL_DO_DANGLING(sidep->deleteTree(), sidep);
                     VL_DO_DANGLING(valuep->deleteTree(), valuep);
                     return nullptr;
                 }
-                right = sv.toInt() == 0;
+                const auto call = [&](AstNodeFTask* funcp, AstNodeExpr* vp,
+                                      AstNodeExpr* wp) -> AstNodeExpr* {
+                    AstArg* callArgsp = new AstArg{flp, "", vp};
+                    callArgsp->addNext(new AstArg{flp, "", wp});
+                    AstFuncRef* const callp
+                        = new AstFuncRef{flp, funcp->name(), callArgsp};
+                    callp->taskp(VN_AS(funcp, Func));
+                    return callp;
+                };
+                // SIDE is (RIGHT, LEFT), so RIGHT is the first position
+                return new AstCond{
+                    flp, new AstEq{flp, sidep, new AstConst{flp, AstConst::Unsized32{}, 0}},
+                    call(rightFuncp, valuep->cloneTree(false), widthp->cloneTree(false)),
+                    call(leftFuncp, valuep, widthp)};
             }
-            if (args.size() < 3) return valuep;
             const VhdlValue fv = V3VhdlEval::eval(args[2]);
             if (fv.isInt()) {
                 const int64_t field = fv.toInt();
@@ -13835,13 +13879,35 @@ private:
                     }
                     bool asc = true;
                     bool dirKnown = true;
-                    if (dynamicBounds(attrp->prefixp()->vhdlTypep(), dim, flp, initp, limitp,
+                    // A signal-class formal names the caller's own signal
+                    // (4.2.2.3), so "data'range" is that signal's range and
+                    // not the open subtype the formal is written with
+                    VhdlType* prefixTypep = attrp->prefixp()->vhdlTypep();
+                    if (!prefixTypep || !prefixTypep->isConstrainedArray()) {
+                        VhdlType* const boundp = boundTypeOf(attrp->prefixp());
+                        if (boundp && boundp->isConstrainedArray()) prefixTypep = boundp;
+                    }
+                    if (dynamicBounds(prefixTypep, dim, flp, initp, limitp,
                                       asc, &dirKnown)) {
                         if (!dirKnown) ascp = ascendingOf(initp, limitp, flp);
                         ascending = (name == "range") ? asc : !asc;
                         if (name == "reverse_range") {
                             std::swap(initp, limitp);
                             if (ascp) ascp = new AstLogNot{flp, ascp};
+                        }
+                    } else if (VhdlType* const boundIdxp = const_cast<VhdlType*>(
+                                   indexSubtype(prefixTypep, dim))) {
+                        // A subtype the call settled has bounds that folded
+                        // rather than bounds written as a range, and those
+                        // are the numbers the loop runs between
+                        if (boundIdxp->bounded()) {
+                            initp = lowerValue(VhdlValue::mkInt(boundIdxp->left(), boundIdxp),
+                                               boundIdxp, flp);
+                            limitp = lowerValue(VhdlValue::mkInt(boundIdxp->right(), boundIdxp),
+                                                boundIdxp, flp);
+                            ascending = (name == "range") ? boundIdxp->ascending()
+                                                          : !boundIdxp->ascending();
+                            if (name == "reverse_range") std::swap(initp, limitp);
                         }
                     }
                 }
