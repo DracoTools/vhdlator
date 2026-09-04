@@ -3631,10 +3631,24 @@ private:
     // verification framework is thousands of copies of the same code.
     // Anything else keeps its own identity: two scalar subtypes of one type
     // differ in their bounds, and a body may read those.
-    static std::string specKeyOf(const VhdlType* typep) {
+    static std::string specKeyOf(const VhdlType* typep, int depth = 0) {
         if (!typep) return "0";
         const std::string ownKey = std::to_string(reinterpret_cast<uintptr_t>(typep));
         const VhdlType* const basep = typep->base();
+        // A record subtype constrains its elements, and one written inside a
+        // subprogram is a fresh object every time that subprogram is copied.
+        // Keyed on the object, a recursive call inside a copy never finds the
+        // copy it is already in and asks for another, for ever -- so what a
+        // record subtype is worth here is its base and what it constrains.
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            if (depth > 4) return ownKey;
+            std::string out = "R" + std::to_string(reinterpret_cast<uintptr_t>(basep));
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                if (!elemp) return ownKey;
+                out += ":" + specKeyOf(elemp->typep(), depth + 1);
+            }
+            return out;
+        }
         if (basep->kind() != VhdlTypeKind::ARRAY) return ownKey;
         const std::vector<VhdlType*>& indexes = typep->indexTypes();
         if (indexes.empty()) return ownKey;
@@ -3646,6 +3660,12 @@ private:
             if (!idxp || !idxp->bounded()) return ownKey;
             out += "[" + std::to_string(idxp->left()) + (idxp->ascending() ? "to" : "dt")
                    + std::to_string(idxp->right()) + "]";
+        }
+        // An array of records is constrained by its element as well as by its
+        // own bounds, and that element is a fresh object per copy too
+        if (typep->elementp() && typep->elementp()->base()
+            && typep->elementp()->base()->kind() == VhdlTypeKind::RECORD && depth <= 4) {
+            out += "{" + specKeyOf(typep->elementp(), depth + 1) + "}";
         }
         return out;
     }
