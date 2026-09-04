@@ -378,15 +378,6 @@ public:
 };
 
 //=============================================================================
-// VlForever is a helper awaitable type for suspending coroutines forever. Used for constant
-// wait statements.
-
-struct VlForever final {
-    bool await_ready() const { return false; }  // Always suspend
-    void await_suspend(std::coroutine_handle<> coro) const { coro.destroy(); }
-    void await_resume() const {}
-};
-
 //=============================================================================
 // VlForkSync is used to manage fork..join and fork..join_any constructs.
 
@@ -451,7 +442,7 @@ public:
 // Return value of a coroutine. Used for chaining coroutine suspension/resumption.
 
 class VlCoroutine final {
-private:
+public:
     // TYPES
     struct VlPromise final {
         std::coroutine_handle<> m_continuation;  // Coroutine to resume after this one finishes
@@ -472,8 +463,12 @@ private:
         void return_void() const {}
     };
 
+private:
     // MEMBERS
     VlPromise* m_promisep;  // The promise created for this coroutine
+    // Whether the coroutine suspended forever rather than finishing. Its frame is gone, so the
+    // promise is too, but anything awaiting it must never run again either.
+    bool m_forever = false;
 
 public:
     // TYPES
@@ -489,7 +484,8 @@ public:
     // Move. Update the pointers each time the return object is moved
     // cppcheck-suppress noExplicitConstructor
     VlCoroutine(VlCoroutine&& other)
-        : m_promisep{std::exchange(other.m_promisep, nullptr)} {
+        : m_promisep{std::exchange(other.m_promisep, nullptr)}
+        , m_forever{other.m_forever} {
         if (m_promisep) m_promisep->m_corop = this;
     }
     ~VlCoroutine() {
@@ -498,11 +494,42 @@ public:
     }
 
     // METHODS
-    // Suspend the awaiter if the coroutine is suspended (the promise exists)
-    bool await_ready() const noexcept { return !m_promisep; }
-    // Set the awaiting coroutine as the continuation of the current coroutine
-    void await_suspend(std::coroutine_handle<> coro) { m_promisep->m_continuation = coro; }
+    // Mark the coroutine as one that suspended forever
+    void forever() noexcept { m_forever = true; }
+    // Suspend the awaiter if the coroutine is suspended (the promise exists), or if it suspended
+    // forever, in which case there is no promise left to hang the continuation on
+    bool await_ready() const noexcept { return !m_promisep && !m_forever; }
+    // Set the awaiting coroutine as the continuation of the current coroutine. Where the
+    // coroutine suspended forever the awaiting one never runs again either, so it goes the same
+    // way its continuation would have gone had it been registered in time.
+    void await_suspend(std::coroutine_handle<VlPromise> coro) {
+        if (VL_UNLIKELY(m_forever)) {
+            // Whoever is awaiting the awaiting coroutine must stop as well, and it has not
+            // registered itself yet either, so the word is passed along the chain
+            if (VlCoroutine* const corop = coro.promise().m_corop) corop->forever();
+            coro.destroy();
+            return;
+        }
+        m_promisep->m_continuation = coro;
+    }
     void await_resume() const noexcept {}
+};
+
+//=============================================================================
+// VlForever is a helper awaitable type for suspending coroutines forever. Used for constant
+// wait statements.
+
+struct VlForever final {
+    bool await_ready() const { return false; }  // Always suspend
+    void await_suspend(std::coroutine_handle<VlCoroutine::VlPromise> coro) const {
+        // The frame goes now, but whoever is awaiting this coroutine has not had the chance to
+        // register itself as the continuation yet -- that happens after this returns. Say so on
+        // the return object, which outlives the frame, so the awaiting coroutine is stopped too
+        // rather than carrying on past a wait that never ends.
+        if (VlCoroutine* const corop = coro.promise().m_corop) corop->forever();
+        coro.destroy();
+    }
+    void await_resume() const {}
 };
 
 #endif  // Guard
