@@ -772,8 +772,28 @@ private:
         if (isStringType(designatedp)) return false;  // A LINE is text
         const VhdlType* const dbasep = designatedp->base();
         if (dbasep->kind() != VhdlTypeKind::ARRAY) return false;
-        return !designatedp->isConstrainedArray() && dbasep->indexTypes().size() == 1;
+        if (dbasep->indexTypes().size() != 1) return false;
+        if (!designatedp->isConstrainedArray()) return true;
+        // A constraint of "0 to integer'high" is how VHDL spells "as long as
+        // whatever is on the other side made it": the object is on the heap,
+        // nothing ever allocates the whole of it, and emitting it as a member
+        // would ask for gigabytes. Such an access carries its bounds like an
+        // unconstrained one.
+        return arrayTooLargeToEmit(designatedp);
     }
+
+    // Whether an array's own bounds ask for more elements than may sensibly
+    // be emitted. The same limit lowerArrayType refuses at.
+    static bool arrayTooLargeToEmit(const VhdlType* typep) {
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            const VhdlType* const idxp = indexes[i];
+            if (!idxp || !idxp->bounded() || typep->dimOpen(i)) continue;
+            if (idxp->length() > EMIT_ELEMENT_LIMIT) return true;
+        }
+        return false;
+    }
+    static constexpr int64_t EMIT_ELEMENT_LIMIT = 1 << 24;
 
     AstClass* accessClass(VhdlType* basep, FileLine* flp) {
         const auto it = m_accClasses.find(basep);
@@ -1055,7 +1075,7 @@ private:
                 // has constrained, would be four billion elements long. That
                 // is not a design, it is an unconstrained type that reached
                 // here by mistake, and emitting it hangs the back end.
-                if (idxp->length() > (1 << 24)) {
+                if (idxp->length() > EMIT_ELEMENT_LIMIT) {
                     unsup(flp, "array '" + typep->prettyName() + "' of "
                                    + std::to_string(idxp->length()) + " elements");
                     return dtypep;
