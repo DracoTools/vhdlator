@@ -17746,6 +17746,11 @@ private:
             findReturnType(nodep->stmtsp(), foundp, disagreep, false, sawOpen);
         }
         if (disagreep) return declaredp;
+        // What another call gives back is as long as that call makes it, and
+        // nothing here says that is the length the other returns agree on --
+        // "if id = root_id then return (1 => root_id); end if; return walk(id);"
+        // does not return one element
+        if (foundp && returnsAnotherCall(nodep->stmtsp())) return declaredp;
         if (foundp) return foundp;
         // Where the returned expression has no length of its own -- "return v
         // and m", whose operator gives a result as long as its operands --
@@ -17760,6 +17765,23 @@ private:
         }
         return declaredp;
     }
+    // Whether any return statement returns what a call gives back
+    static bool returnsAnotherCall(AstNode* stmtsp) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+                AstVhdlCall* const callp = VN_CAST(retp->valuep(), VhdlCall);
+                const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
+                if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
+                if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
+            }
+            if (p->op1p() && returnsAnotherCall(p->op1p())) return true;
+            if (p->op2p() && returnsAnotherCall(p->op2p())) return true;
+            if (p->op3p() && returnsAnotherCall(p->op3p())) return true;
+            if (p->op4p() && returnsAnotherCall(p->op4p())) return true;
+        }
+        return false;
+    }
+
     // Whether any return statement returns what a call gives back, or an
     // object whose own subtype says a length that does not fold
     static bool returnsACallResult(AstNode* stmtsp) {
