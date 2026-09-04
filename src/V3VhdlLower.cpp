@@ -8592,7 +8592,11 @@ private:
             if (AstNodeExpr* const instp = protectedInstance(selp->prefixp(), &protTypep)) {
                 AstMethodCall* const callp
                     = new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
-                addCallArgs(callp, nodep);
+                // Named, so that an operand and the parameter it is bound to
+                // are converted where one carries its own bounds and the
+                // other does not -- a method of a protected type is an
+                // ordinary subprogram in that respect (5.6.2)
+                addCallArgs(callp, nodep, symp);
                 return callp;
             }
         }
@@ -14149,7 +14153,7 @@ private:
                 = selp ? protectedInstance(selp->prefixp(), &protTypep) : nullptr) {
                 AstMethodCall* const mcallp
                     = new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
-                addCallArgs(mcallp, callp);
+                addCallArgs(mcallp, callp, symp);
                 return new AstStmtExpr{flp, mcallp};
             }
         }
