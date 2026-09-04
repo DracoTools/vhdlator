@@ -13746,8 +13746,25 @@ private:
 
     AstNode* lowerIf(AstVhdlIf* nodep) {
         std::vector<AstVhdlAlternative*> alts;
+        // A condition the copy made for one call site settles is a branch the
+        // design either always takes or never reaches. "value'length =
+        // target'length" inside a copy where the two differ is the second,
+        // and what such a branch assigns is checked for length when it runs
+        // (10.5.2.1) -- so it is legal however it is written, and emitting it
+        // would ask the back end to width-check code nothing can execute.
         for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
-            alts.push_back(VN_AS(p, VhdlAlternative));
+            AstVhdlAlternative* const altp = VN_AS(p, VhdlAlternative);
+            if (!altp->condp()) {
+                alts.push_back(altp);
+                break;  // The else, and nothing follows it
+            }
+            const VhdlValue cond = V3VhdlEval::eval(altp->condp());
+            if (cond.isInt()) {
+                if (cond.toInt() == 0) continue;  // Never taken
+                alts.push_back(altp);
+                break;  // Always taken, so nothing after it is reached
+            }
+            alts.push_back(altp);
         }
         AstNode* outp = nullptr;
         for (size_t i = alts.size(); i-- > 0;) {
@@ -13758,6 +13775,11 @@ private:
             }
             outp = new AstIf{altp->fileline(), lowerCondition(altp->condp()),
                              lowerStmts(altp->stmtsp()), outp};
+        }
+        // Every branch settled to false and there was no else, so the whole
+        // statement does nothing -- which is not the same as failing to lower
+        if (!outp) {
+            return new AstComment{nodep->fileline(), "no branch of this if is reached"};
         }
         return outp;
     }

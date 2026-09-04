@@ -1274,6 +1274,8 @@ private:
     void visit(AstVhdlSigAssign* nodep) override;
     void visit(AstVhdlVarAssign* nodep) override;
     void visit(AstVhdlIf* nodep) override;
+    // A branch whose condition a copy settled to false: nothing reaches it
+    bool m_unreached = false;
     void visit(AstVhdlCase* nodep) override;
     void visit(AstVhdlAssert* nodep) override;
     void visit(AstVhdlWait* nodep) override;
@@ -6258,6 +6260,7 @@ void VhdlSemVisitor::checkWaveform(AstNode* wavesp) {
 // What is assigned must belong to the target's subtype: in range for a
 // scalar, and of the right length for a constrained array (10.5.2.2)
 void VhdlSemVisitor::checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) {
+    if (m_unreached) return;  // A branch a settled condition closed off
     checkValueInRange(nodep, targetp, "the assignment target");
     checkArrayValue(nodep, targetp, "the assignment target");
 }
@@ -7152,6 +7155,18 @@ void VhdlSemVisitor::visit(AstVhdlIf* nodep) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         // A condition is of type BOOLEAN, or is converted to one by "??" (9.2.9)
         if (altp->condp()) analyzeExpr(altp->condp(), V3VhdlStd::booleanType());
+        // A copy made for one call site settles conditions the source left
+        // open -- "value'length = target'length" where the two lengths now
+        // differ -- and the branch behind such a condition is one nothing
+        // reaches. What it assigns is checked for length when it runs
+        // (10.5.2.1), so a branch that never runs is legal however it is
+        // written, and reporting it would refuse code the design cannot
+        // execute. It is still analyzed; only the run-time checks are held.
+        VL_RESTORER(m_unreached);
+        if (altp->condp()) {
+            const VhdlValue cond = V3VhdlEval::eval(altp->condp());
+            if (cond.isInt() && cond.toInt() == 0) m_unreached = true;
+        }
         iterateAndNextNull(altp->stmtsp());
     }
 }
