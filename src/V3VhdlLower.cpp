@@ -3086,6 +3086,97 @@ private:
         return refp;
     }
 
+    // The text of a value that carries its own bounds, written in a base
+    // (16.3). TO_HSTRING and TO_OSTRING extend the value on the left to a
+    // whole number of digits, so the padding is worked out while running
+    // just as the length is.
+    std::map<std::pair<const VhdlType*, int>, AstNodeFTask*> m_dynRadixFuncs;
+    AstNodeFTask* dynRadixTextFunc(VhdlType* typep, int bits, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto key = std::make_pair(static_cast<const VhdlType*>(basep), bits);
+        const auto it = m_dynRadixFuncs.find(key);
+        if (it != m_dynRadixFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        const VhdlType* const elemp = basep->elementp();
+        if (!elemp || !enumIsLogic(elemp->base())) return nullptr;
+        AstFunc* const funcp = newDynFunc("__Vdynradix", typep,
+                                          new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        AstVar* const padp = newFuncLocal("pad", newIntDType(flp), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        // As wide as one digit, so that the conversion writes one character
+        AstVar* const vp = newFuncLocal("v", newLogicDType(flp, bits), flp);
+        for (AstVar* const varp : {lenp, padp, ip, vp}) funcp->addStmtsp(varp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const auto acc
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::READ}; };
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lenp, flp), dynCarrierLength(rd(cp, flp), flp)});
+        // "(bits - len mod bits) mod bits" -- nothing to add when it already fits
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(padp, flp),
+            new AstModDivS{flp,
+                           new AstSub{flp, i32(bits, flp),
+                                      new AstModDivS{flp, rd(lenp, flp), i32(bits, flp)}},
+                           i32(bits, flp)}});
+        funcp->addStmtsp(
+            new AstAssign{flp, out(), new AstConst{flp, AstConst::String{}, ""}});
+        funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+        AstNode* bodyp = new AstAssign{flp, wr(vp, flp), i32(0, flp)};
+        for (int k = 0; k < bits; ++k) {
+            // The index into the elements, counting from the left, once the
+            // padding the value is extended by is taken off
+            AstNodeExpr* const idxp
+                = new AstSub{flp, new AstAdd{flp, rd(ip, flp), i32(k, flp)}, rd(padp, flp)};
+            AstNodeExpr* const safep
+                = new AstCond{flp, new AstLtS{flp, idxp->cloneTree(false), i32(0, flp)},
+                              i32(0, flp), idxp->cloneTree(false)};
+            AstNodeExpr* const bitp = new AstCond{
+                flp, new AstLtS{flp, idxp, i32(0, flp)}, i32(0, flp),
+                new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), safep}};
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, wr(vp, flp),
+                           new AstOr{flp, new AstShiftL{flp, rd(vp, flp), i32(1, flp)},
+                                     bitp}}));
+        }
+        bodyp = AstNode::addNext(
+            bodyp,
+            static_cast<AstNode*>(new AstAssign{
+                flp, out(),
+                new AstConcatN{flp, acc(),
+                               new AstSFormatF{flp, bits == 4 ? "%h" : "%o", false,
+                                               rd(vp, flp)}}}));
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(bits, flp)}}));
+        funcp->addStmtsp(whileLoop(
+            flp, new AstLtS{flp, rd(ip, flp), new AstAdd{flp, rd(lenp, flp), rd(padp, flp)}},
+            bodyp));
+        addHelperFunc(funcp);
+        m_dynRadixFuncs.insert_or_assign(key, funcp);
+        return funcp;
+    }
+
+    // The text of an expression in a base, where its length is only known
+    // while running. Null where it is not one of those.
+    AstNodeExpr* dynRadixTextOf(AstNodeVhdlExpr* nodep, int bits, FileLine* flp) {
+        if (!nodep || !isDynValue(nodep)) return nullptr;
+        VhdlType* const carrp = dynValueType(nodep);
+        if (!carrp) return nullptr;
+        AstNodeFTask* const funcp = dynRadixTextFunc(carrp, bits, flp);
+        if (!funcp) return nullptr;
+        AstNodeExpr* const valuep = lowerExpr(nodep);
+        if (!valuep) return nullptr;
+        AstFuncRef* const refp
+            = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", valuep}};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
     // "not v" over a carrier: as long as the operand, with its own bounds,
     // and each element inverted (9.2.2)
     AstNodeFTask* dynNotFunc(VhdlType* typep, FileLine* origFlp) {
@@ -4687,7 +4778,7 @@ private:
             AstNodeExpr* const valuep = lowerExpr(nodep->argp());
             if (!valuep) return nullptr;
             const VhdlType* const vtypep = nodep->argp()->vhdlTypep();
-            if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp)) return namep;
+            if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp, true)) return namep;
             return new AstSFormatF{flp, formatFor(vtypep, true), false, valuep};
         }
         // "t'value(s)" is the value whose image is s (16.2.3)
@@ -8518,44 +8609,7 @@ private:
         if (name == "to_string" && args.size() == 2 && symp->predefined()
             && args[0]->vhdlTypep()
             && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::PHYSICAL) {
-            AstNodeExpr* const valuep = lowerExpr(args[0]);
-            const VhdlValue unitv = V3VhdlEval::eval(args[1]);
-            if (!valuep) return nullptr;
-            if (unitv.isInt() && unitv.toInt() > 0) {
-                const std::string suffix = unitNameOf(args[0]->vhdlTypep(), unitv.toInt());
-                AstNodeExpr* const scaledp
-                    = new AstDivS{flp, valuep,
-                                  new AstConst{flp, AstConst::Unsized64{},
-                                               static_cast<uint64_t>(unitv.toInt())}};
-                return new AstSFormatF{flp, "%0d " + suffix, false, scaledp};
-            }
-            // The unit is only known while running -- OSVVM reads it from a
-            // setting -- so both the scaling and the unit's name are worked
-            // out then, the name by asking which unit the value is
-            AstNodeExpr* const unitp = lowerExpr(args[1]);
-            if (!unitp) {
-                VL_DO_DANGLING(valuep->deleteTree(), valuep);
-                return nullptr;
-            }
-            AstNodeExpr* namep = nullptr;
-            for (const auto& unit : args[0]->vhdlTypep()->base()->units()) {
-                AstNodeExpr* const litp
-                    = new AstConst{flp, AstConst::String{}, " " + unit.first};
-                if (!namep) {
-                    namep = litp;
-                    continue;
-                }
-                namep = new AstCond{
-                    flp,
-                    new AstEq{flp, unitp->cloneTree(false),
-                              new AstConst{flp, AstConst::Unsized64{},
-                                           static_cast<uint64_t>(unit.second)}},
-                    litp, namep};
-            }
-            AstNodeExpr* const scaledp = new AstDivS{flp, valuep, unitp};
-            AstSFormatF* const outp = new AstSFormatF{flp, "%0d%s", false, scaledp};
-            if (namep) outp->addExprsp(namep);
-            return outp;
+            return physicalText(args[0], args[1], flp);
         }
         if (name == "to_string" && args.size() == 1 && symp->predefined()) {
             const VhdlType* const vtypep = args[0]->vhdlTypep();
@@ -8566,7 +8620,7 @@ private:
             if (vtypep && vtypep->base() == V3VhdlStd::characterType()->base()) {
                 return new AstSFormatF{flp, "%c", false, valuep};
             }
-            if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp)) return namep;
+            if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp, false)) return namep;
             return new AstSFormatF{flp, formatFor(vtypep, false), false, valuep};
         }
         // An edge test is the shape a clocked process is recognised by, but
@@ -8788,6 +8842,17 @@ private:
                 = (name == "to_hstring" || name == "to_hex_string")
                       ? "%h"
                       : ((name == "to_ostring" || name == "to_octal_string") ? "%o" : "%b");
+            // A value whose length only running decides has no width for a
+            // conversion to work from, so its digits are built one at a time
+            if (isDynValue(args[0])) {
+                VL_DO_DANGLING(firstp->deleteTree(), firstp);
+                AstNodeExpr* dynp = fmt == "%b"
+                                        ? dynTextOf(args[0], flp)
+                                        : dynRadixTextOf(args[0], fmt == "%h" ? 4 : 3, flp);
+                if (!dynp) return nullptr;
+                if (fmt == "%h") dynp = new AstToUpperN{flp, dynp};
+                return dynp;
+            }
             AstNodeExpr* outp = new AstSFormatF{flp, fmt, false, firstp};
             // VHDL writes hexadecimal in upper case
             if (fmt == "%h") outp = new AstToUpperN{flp, outp};
@@ -15639,6 +15704,15 @@ private:
                                      new AstConcatN{flp, linep->cloneTree(false), dtextp}};
             }
         }
+        // A physical value is written in a unit, NS unless the call names one
+        if (radix.empty() && args[1]->vhdlTypep()
+            && args[1]->vhdlTypep()->base()->kind() == VhdlTypeKind::PHYSICAL) {
+            AstNodeExpr* const unitTextp
+                = physicalText(args[1], args.size() >= 5 ? args[4] : nullptr, flp);
+            if (!unitTextp) return nullptr;
+            return new AstAssign{flp, linep,
+                                 new AstConcatN{flp, linep->cloneTree(false), unitTextp}};
+        }
         AstNodeExpr* const valuep = lowerExpr(args[1]);
         if (!valuep) return nullptr;
         const std::string format
@@ -16711,7 +16785,8 @@ private:
             appendLiteral(format, "<?>");
             return nullptr;
         }
-        if (AstNodeExpr* const namep = enumImage(exprp, valuep->vhdlTypep(), flOf(valuep))) {
+        if (AstNodeExpr* const namep
+            = enumImage(exprp, valuep->vhdlTypep(), flOf(valuep), isImage)) {
             format += "%s";
             return namep;
         }
@@ -16721,14 +16796,29 @@ private:
 
     static FileLine* flOf(AstNode* nodep) { return nodep->fileline(); }
 
+    // How an enumeration literal reads. 'IMAGE writes the literal the way it
+    // is written in the source, so a character literal keeps its apostrophes;
+    // TO_STRING gives the character alone (5.7).
+    static std::string literalText(const std::string& name, bool isImage) {
+        if (isImage) return name;
+        if (name.size() >= 3 && name.front() == '\'' && name.back() == '\'') {
+            return name.substr(1, name.size() - 2);
+        }
+        return name;
+    }
+
     // 'IMAGE of an enumeration value is the literal's own name (16.2), not
     // its position. The literals are known here, so the choice between them
     // is made without a table at run time; nothing else in the design needs
     // the names, so nothing else pays for them.
-    static AstNodeExpr* enumImage(AstNodeExpr* exprp, const VhdlType* typep, FileLine* flp) {
+    static AstNodeExpr* enumImage(AstNodeExpr* exprp, const VhdlType* typep, FileLine* flp,
+                                  bool isImage) {
         if (!typep) return nullptr;
         const VhdlType* const basep = typep->base();
         if (basep->kind() != VhdlTypeKind::ENUM || enumIsLogic(basep)) return nullptr;
+        // CHARACTER is the one enumeration whose position is the value itself,
+        // so it needs no table at all -- see formatFor
+        if (basep == V3VhdlStd::characterType()) return nullptr;
         const std::vector<VhdlSymbol*>& literals = basep->literals();
         if (literals.empty() || literals.size() > 256) return nullptr;
         AstNodeExpr* outp = new AstConst{flp, AstConst::String{}, "?"};
@@ -16739,7 +16829,8 @@ private:
                 new AstEq{flp, exprp->cloneTree(false),
                           new AstConst{flp, AstConst::Unsized32{},
                                        static_cast<uint32_t>(literals[i]->position())}},
-                new AstConst{flp, AstConst::String{}, literals[i]->name()}, outp};
+                new AstConst{flp, AstConst::String{}, literalText(literals[i]->name(), isImage)},
+                outp};
         }
         VL_DO_DANGLING(exprp->deleteTree(), exprp);
         return outp;
@@ -16774,6 +16865,65 @@ private:
         return best;
     }
 
+    // The scale of the unit of that name, or 0 if the type has no such unit
+    static int64_t scaleOfUnit(const VhdlType* typep, const std::string& name) {
+        if (!typep) return 0;
+        for (const auto& unit : typep->base()->units()) {
+            if (unit.first == name) return unit.second;
+        }
+        return 0;
+    }
+
+    // The text of a physical value written in a unit -- "2 ns" -- which is
+    // what both TO_STRING (5.7) and TEXTIO's WRITE (16.4) give. A null unit
+    // is WRITE's own default of NS, which is why "write(l, now)" reads in
+    // nanoseconds rather than in the resolution limit.
+    AstNodeExpr* physicalText(AstNodeVhdlExpr* valArgp, AstNodeVhdlExpr* unitArgp,
+                              FileLine* flp) {
+        const VhdlType* const vtypep = valArgp->vhdlTypep();
+        AstNodeExpr* const valuep = lowerExpr(valArgp);
+        if (!valuep) return nullptr;
+        VhdlValue unitv = unitArgp ? V3VhdlEval::eval(unitArgp) : VhdlValue{};
+        int64_t scale = unitv.isInt() ? unitv.toInt() : 0;
+        if (!unitArgp) {
+            scale = scaleOfUnit(vtypep, "ns");
+            if (scale <= 0) scale = 1;
+        }
+        if (scale > 0) {
+            const std::string suffix = unitNameOf(vtypep, scale);
+            AstNodeExpr* const scaledp
+                = new AstDivS{flp, valuep,
+                              new AstConst{flp, AstConst::Unsized64{},
+                                           static_cast<uint64_t>(scale)}};
+            return new AstSFormatF{flp, "%0d " + suffix, false, scaledp};
+        }
+        // The unit is only known while running -- OSVVM reads it from a
+        // setting -- so both the scaling and the unit's name are worked
+        // out then, the name by asking which unit the value is
+        AstNodeExpr* const unitp = lowerExpr(unitArgp);
+        if (!unitp) {
+            VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            return nullptr;
+        }
+        AstNodeExpr* namep = nullptr;
+        for (const auto& unit : vtypep->base()->units()) {
+            AstNodeExpr* const litp = new AstConst{flp, AstConst::String{}, " " + unit.first};
+            if (!namep) {
+                namep = litp;
+                continue;
+            }
+            namep = new AstCond{flp,
+                                new AstEq{flp, unitp->cloneTree(false),
+                                          new AstConst{flp, AstConst::Unsized64{},
+                                                       static_cast<uint64_t>(unit.second)}},
+                                litp, namep};
+        }
+        AstNodeExpr* const scaledp = new AstDivS{flp, valuep, unitp};
+        AstSFormatF* const outp = new AstSFormatF{flp, "%0d%s", false, scaledp};
+        if (namep) outp->addExprsp(namep);
+        return outp;
+    }
+
     static std::string formatFor(const VhdlType* typep, bool isImage = false) {
         if (!typep) return "%0d";
         const VhdlType* const basep = typep->base();
@@ -16782,12 +16932,17 @@ private:
         case VhdlTypeKind::UNIVERSAL_REAL: return "%g";
         case VhdlTypeKind::PHYSICAL:
             // A physical value is written with its unit, and TIME in terms of
-            // the resolution limit, which here is the femtosecond (16.2.3)
-            return isImage ? "%0t fs" : "%0t";
+            // the resolution limit, which here is the femtosecond (16.2.3).
+            // TO_STRING of a physical value is its image (5.7), so the unit is
+            // written either way -- unlike an enumeration, where only the
+            // image keeps the apostrophes a character literal is written with.
+            return "%0t fs";
         case VhdlTypeKind::ARRAY:
             // A vector of logic reads in binary, as VHDL prints it
             return basep->elementp() && enumIsLogic(basep->elementp()->base()) ? "%b" : "%0d";
         case VhdlTypeKind::ENUM:
+            // A CHARACTER value is its own code point, so it prints directly
+            if (basep == V3VhdlStd::characterType()) return isImage ? "'%c'" : "%c";
             if (!enumIsLogic(basep)) return "%0d";
             // A logic value is a character literal, and its image keeps the
             // apostrophes the literal is written with
