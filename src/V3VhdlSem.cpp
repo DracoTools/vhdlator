@@ -3296,6 +3296,12 @@ bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
             // A type conversion keeps the length of what it converts, and is
             // dealt with where the returned type is read
             if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
+            // "return v & v" is as long as its operands *together*, which is
+            // no parameter's length (9.2.5) -- so the result carries its own
+            // bounds rather than borrowing one of them
+            if (AstVhdlBinary* const binp = VN_CAST(retp->valuep(), VhdlBinary)) {
+                if (binp->op() == VhdlBinaryOp::CONCAT) return true;
+            }
             // An object the body returns whose own subtype says a length that
             // does not fold -- numeric_std's RESIZE returns a
             // "(NEW_SIZE-1 downto 0)" -- is as long as that says, whatever
@@ -3617,6 +3623,33 @@ private:
         return nullptr;
     }
 
+    // What a copy of a subprogram actually depends on about an actual's
+    // subtype. For an array that is its element type and its bounds and
+    // nothing else: two subtypes that agree on those are interchangeable
+    // inside the body, and keying on the subtype object instead would make a
+    // separate copy for every place a length is written -- which for a
+    // verification framework is thousands of copies of the same code.
+    // Anything else keeps its own identity: two scalar subtypes of one type
+    // differ in their bounds, and a body may read those.
+    static std::string specKeyOf(const VhdlType* typep) {
+        if (!typep) return "0";
+        const std::string ownKey = std::to_string(reinterpret_cast<uintptr_t>(typep));
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ARRAY) return ownKey;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (indexes.empty()) return ownKey;
+        std::string out = "A" + std::to_string(reinterpret_cast<uintptr_t>(basep)) + ":"
+                          + std::to_string(reinterpret_cast<uintptr_t>(typep->elementp()));
+        for (const VhdlType* const idxp : indexes) {
+            // A bound that does not fold here -- one that names a generic --
+            // is carried as it is written, so it keeps the subtype's identity
+            if (!idxp || !idxp->bounded()) return ownKey;
+            out += "[" + std::to_string(idxp->left()) + (idxp->ascending() ? "to" : "dt")
+                   + std::to_string(idxp->right()) + "]";
+        }
+        return out;
+    }
+
     void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
         if (!needsSpecializing(symp)) return;
         // A copy is never itself specialized: it was made for one call site
@@ -3769,9 +3802,7 @@ private:
         // type may each declare one of the same name and profile, and they
         // are different subprograms with different bodies (5.6.2)
         std::string key = std::to_string(reinterpret_cast<uintptr_t>(symp));
-        for (const VhdlType* const typep : actualTypes) {
-            key += "|" + std::to_string(reinterpret_cast<uintptr_t>(typep));
-        }
+        for (const VhdlType* const typep : actualTypes) key += "|" + specKeyOf(typep);
         for (const VhdlValue& val : actualValues) {
             key += val.isInt() ? ("=" + std::to_string(val.toInt())) : "=?";
         }
@@ -3796,6 +3827,17 @@ private:
             nodep->vhdlSymp(newp);
             takeResultType(nodep, newp);
             m_madeOne = true;
+            // The copy's formals have lengths the original's had none of, so
+            // a call written inside it can be specialized where it could not
+            // be before. Its own declarations and statements, not what
+            // follows it: the copy was put beside the original, so its
+            // siblings are the rest of the package. The cache entry is in
+            // place first, so a subprogram that calls itself finds the copy
+            // it is already in rather than making another (4.2.1).
+            if (AstVhdlSubprogDecl* const copyDeclp = newp->bodyp()) {
+                passOver(copyDeclp->declsp());
+                passOver(copyDeclp->stmtsp());
+            }
         }
     }
 

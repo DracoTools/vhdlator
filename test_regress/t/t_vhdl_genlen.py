@@ -11,12 +11,15 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A subprogram parameter whose length names a generic: a length the instance
-# settles, not a parameter left open.
+# A length that elaboration settles but that is written against a generic,
+# or against how long a signal-class parameter's signal is, converting both
+# ways between a fixed value and one carrying its own bounds.
 test.top_filename = "t/t_vhdl_genlen.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_genlen"],
+             verilator_flags2=[
+                 "--timing", "--debug-check", "--top-module t_vhdl_genlen"
+             ],
              make_top_shell=False,
              make_main=False)
 

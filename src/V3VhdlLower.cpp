@@ -2565,6 +2565,53 @@ private:
             VhdlType* const boundp = boundTypeOf(nodep);
             if (boundp && boundp->isConstrainedArray()) typep = boundp;
         }
+        // A bound that names a generic settles at elaboration but is not a
+        // number here, so the conversion takes the bounds as expressions
+        // rather than as folded values -- an RTL signal declared
+        // "std_logic_vector(GC_WIDTH - 1 downto 0)" is the common case
+        if ((!typep || !typep->isConstrainedArray()) && carrierTypep) {
+            VhdlType* candp = typep && typep->lengthEmittable() ? typep : nullptr;
+            if (!candp) {
+                VhdlType* const boundp = boundTypeOf(nodep);
+                if (boundp && boundp->lengthEmittable()) candp = boundp;
+            }
+            if (candp && candp->indexTypes().size() == 1
+                && !lengthOnlyRunningDecides(candp)) {
+                if (AstNodeFTask* const exprFuncp
+                    = dynOfFixedExprFunc(carrierTypep, candp, flp)) {
+                    if (AstNodeExpr* const srcp = lowerExpr(nodep)) {
+                        AstFuncRef* const exprRefp
+                            = new AstFuncRef{flp, exprFuncp->name(), new AstArg{flp, "", srcp}};
+                        exprRefp->taskp(VN_AS(exprFuncp, Func));
+                        return exprRefp;
+                    }
+                }
+            }
+        }
+        // "v & w" has no subtype of its own written anywhere -- it is as long
+        // as its operands together (9.2.5) -- but each operand does, so the
+        // carrier is built by joining theirs
+        if ((!typep || !typep->isConstrainedArray()) && carrierTypep) {
+            if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
+                if (binp->op() == VhdlBinaryOp::CONCAT) {
+                    AstNodeExpr* const leftp = asDynCarrier(binp->lhsp(), carrierTypep, flp);
+                    AstNodeExpr* const rightp
+                        = leftp ? asDynCarrier(binp->rhsp(), carrierTypep, flp) : nullptr;
+                    AstNodeFTask* const catp
+                        = rightp ? dynCatFunc(carrierTypep, flp) : nullptr;
+                    if (catp) {
+                        AstArg* catArgsp = new AstArg{flp, "", leftp};
+                        catArgsp->addNext(new AstArg{flp, "", rightp});
+                        AstFuncRef* const catRefp
+                            = new AstFuncRef{flp, catp->name(), catArgsp};
+                        catRefp->taskp(VN_AS(catp, Func));
+                        return catRefp;
+                    }
+                    if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                    if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                }
+            }
+        }
         if (!typep || !typep->isConstrainedArray()) {
             const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
             if (!litp || litp->kind() != VhdlLitKind::STRING) return nullptr;
@@ -2727,7 +2774,10 @@ private:
     AstNodeExpr* dynAsFixed(AstNodeVhdlExpr* nodep, VhdlType* fixedTypep, FileLine* flp) {
         VhdlType* const carrierp = nodep->vhdlTypep();
         if (!carrierp) return nullptr;
-        AstNodeFTask* const funcp = dynToFixedFunc(carrierp, fixedTypep, flp);
+        AstNodeFTask* funcp = dynToFixedFunc(carrierp, fixedTypep, flp);
+        // A bound that names a generic is a length even though it is not a
+        // number here, so the copy takes its bounds as expressions
+        if (!funcp) funcp = dynToFixedExprFunc(carrierp, fixedTypep, flp);
         if (!funcp) return nullptr;
         AstNodeExpr* const valuep = lowerExpr(nodep);
         if (!valuep) return nullptr;
@@ -4101,7 +4151,17 @@ private:
                 return;
             }
             if (objp->defaultp()) {
-                varp->valuep(lowerExpr(objp->defaultp()));
+                // A value that carries its own bounds, given to an object
+                // whose subtype fixes them, is copied into one of those --
+                // the same conversion an assignment to it would make (6.4.2)
+                AstNodeExpr* initp = nullptr;
+                if (isDynValue(objp->defaultp()) && !isCarrierDType(varp->childDTypep())
+                    && symp->typep() && symp->typep()->lengthEmittable()
+                    && !lengthOnlyRunningDecides(symp->typep())) {
+                    initp = dynAsFixed(objp->defaultp(), symp->typep(), flp);
+                }
+                if (!initp) initp = lowerExpr(objp->defaultp());
+                varp->valuep(initp);
             } else if (AstNodeExpr* const spacesp = dynamicStringInit(symp->typep(), flp)) {
                 // A STRING as long as something only known while running --
                 // "variable r : string(s'range)" over an unconstrained
@@ -5096,6 +5156,19 @@ private:
     // hands a bus interface on, one element at a time (4.2.2.3, 5.3.3).
     VhdlType* boundTypeOf(AstNodeVhdlExpr* exprp, int depth = 0) {
         if (!exprp || depth > 16) return nullptr;
+        // An attribute that gives back a value of the prefix's own subtype is
+        // as long as the prefix is (16.2), which for a signal-class formal is
+        // the caller's signal rather than the open subtype it is written with
+        if (AstVhdlAttrName* const attrp = VN_CAST(exprp, VhdlAttrName)) {
+            const std::string& attr = attrp->name();
+            if (attrp->prefixp()
+                && (attr == "last_value" || attr == "delayed"
+                    || attr == "driving_value")) {
+                if (VhdlType* const fromp = boundTypeOf(attrp->prefixp(), depth + 1)) {
+                    if (fromp->isConstrainedArray() || fromp->lengthEmittable()) return fromp;
+                }
+            }
+        }
         if (AstVhdlSelected* const selp = VN_CAST(exprp, VhdlSelected)) {
             const AstVhdlName* const namep = VN_CAST(selp->suffixp(), VhdlName);
             VhdlType* const fromp = namep ? boundTypeOf(selp->prefixp(), depth + 1) : nullptr;
@@ -5802,7 +5875,17 @@ private:
             if (openp) {
                 varp->valuep(openp);
             } else if (declp->defaultp()) {
-                varp->valuep(lowerExpr(declp->defaultp()));
+                // A value that carries its own bounds, given to an object
+                // whose subtype fixes them, is copied into one of those --
+                // the same conversion an assignment to it would make (6.4.2)
+                AstNodeExpr* initp = nullptr;
+                if (isDynValue(declp->defaultp()) && !isCarrierDType(varp->childDTypep())
+                    && symp->typep() && symp->typep()->lengthEmittable()
+                    && !lengthOnlyRunningDecides(symp->typep())) {
+                    initp = dynAsFixed(declp->defaultp(), symp->typep(), flp);
+                }
+                if (!initp) initp = lowerExpr(declp->defaultp());
+                varp->valuep(initp);
             } else {
                 varp->valuep(defaultValueFor(symp->typep(), flp));
             }
@@ -13418,6 +13501,18 @@ private:
             if (AstNode* const outp = dynCarrierToFixed(nodep->targetp(), valuep, flp)) {
                 return outp;
             }
+            // A length that elaboration settles but that is not a number
+            // here -- one written against a generic or against how long a
+            // signal-class parameter's signal is -- has no count to copy
+            // element by element, so the conversion takes its bounds as
+            // expressions instead
+            VhdlType* const ttypep = nodep->targetp()->vhdlTypep();
+            if (ttypep && ttypep->lengthEmittable() && !lengthOnlyRunningDecides(ttypep)) {
+                AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
+                AstNodeExpr* const rhsp = lhsp ? dynAsFixed(valuep, ttypep, flp) : nullptr;
+                if (rhsp) return new AstAssign{flp, lhsp, rhsp};
+                if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            }
         }
         // The other way about: an object that carries its bounds given a
         // value that has its own
@@ -14473,7 +14568,11 @@ private:
         std::map<const VhdlSymbol*, DynSigBind> dynBind;
         std::map<const VhdlSymbol*, VhdlType*> typeBind;
         std::map<const VhdlSymbol*, DrvBind> drvBind;
-        std::string key = symp->name();
+        // Which subprogram, not merely which name: a name may have several
+        // overloads, and two of them taking the same signal would otherwise
+        // share one copy -- so a call would run the other one's body (4.5.2)
+        std::string key
+            = symp->name() + "@" + std::to_string(reinterpret_cast<uintptr_t>(declp));
         for (size_t i = 0; i < formals.size(); ++i) {
             AstNodeVhdlExpr* actualp = nullptr;
             // The elements of this formal that the call named one at a time
@@ -14892,6 +14991,21 @@ private:
                     }
                     refp->addArgsp(new AstArg{
                         flp, pair.name, new AstVarRef{flp, tmpp, VAccess::READWRITE}});
+                    continue;
+                }
+            }
+            // A value of a fixed length handed to a parameter the copy holds
+            // as a carrier is copied into one. Only a parameter of mode IN:
+            // one the body writes has to come back out again, which is what
+            // the round trip above is for.
+            if (fvarp && !isSlice(pair.exprp) && !pair.loweredp
+                && (!pair.formalp || pair.formalp->mode() == VhdlMode::IN)) {
+                if (AstNodeExpr* const carrp
+                    = asDynCarrier(pair.exprp, pair.exprp->vhdlTypep(), flp,
+                                   pair.formalp && pair.formalp->vhdlSymp()
+                                       ? pair.formalp->vhdlSymp()->typep()
+                                       : nullptr)) {
+                    refp->addArgsp(new AstArg{flp, pair.name, carrp});
                     continue;
                 }
             }
