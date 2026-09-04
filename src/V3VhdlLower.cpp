@@ -9627,6 +9627,15 @@ private:
                 return;
             }
             if (senp) VL_DO_DANGLING(senp->deleteTree(), senp);
+            // With no signal parameter the equivalent process ends with a
+            // wait statement that has no sensitivity clause (11.4): the call
+            // is made once and the process never runs again. What the
+            // procedure reads along the way does not put it back -- only a
+            // signal handed to a signal parameter does, and there is none.
+            if (bodyp && !callp->postponed()) {
+                addStmt(new AstInitial{flp, bodyp});
+                return;
+            }
             addStmt(concurrentProcess(bodyp, callp->postponed(), flp));
             return;
         }
