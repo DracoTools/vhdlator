@@ -8520,6 +8520,62 @@ private:
         return out;
     }
     static bool batchSelfContained(AstNode* batchp) { return selfContainedImpl(batchp, nullptr); }
+
+    // The variables a subprogram works with that were left standing outside
+    // it, and that nothing else in the design names
+    static std::vector<AstVar*> ownVarsOutside(AstNodeFTask* taskp,
+                                               const std::map<const AstVar*, const AstNode*>& sole) {
+        std::vector<AstVar*> out;
+        std::set<const AstVar*> seen;
+        taskp->foreach([&](AstVarRef* refp) {
+            AstVar* const varp = refp->varp();
+            if (!varp || seen.count(varp)) return;
+            for (AstNode* up = varp->backp(); up; up = up->backp()) {
+                if (up == taskp) return;  // Already inside it
+                if (VN_IS(up, NodeModule) || VN_IS(up, NodeFTask)) break;
+            }
+            const auto it = sole.find(varp);
+            if (it == sole.end() || it->second != taskp) return;
+            seen.insert(varp);
+            out.push_back(varp);
+        });
+        return out;
+    }
+
+    // Whether the unit could hold this subprogram, counting as reachable the
+    // working variables that would travel with it and the other subprograms
+    // moving with it in the same group
+    static bool movableWith(AstNodeFTask* taskp, const std::set<AstNodeFTask*>& group,
+                            const std::map<const AstVar*, const AstNode*>& sole) {
+        std::set<const AstNode*> owned;
+        for (AstNodeFTask* const otherp : group) {
+            owned.insert(otherp);
+            otherp->foreach([&](AstVar* varp) { owned.insert(varp); });
+            for (const AstVar* const varp : ownVarsOutside(otherp, sole)) owned.insert(varp);
+        }
+        const auto reachable = [&](const AstNode* targetp) {
+            if (!targetp) return true;
+            if (owned.count(targetp)) return true;
+            for (const AstNode* p = targetp; p; p = p->backp()) {
+                if (VN_IS(p, Class)) return true;  // Reached through the object
+                if (VN_IS(p, Package)) return true;  // The one unit
+                if (VN_IS(p, NodeModule)) return false;
+            }
+            return false;
+        };
+        bool ok = true;
+        taskp->foreach([&](AstVarRef* refp) {
+            if (!reachable(refp->varp())) ok = false;
+        });
+        taskp->foreach([&](AstNodeFTaskRef* refp) {
+            if (!reachable(refp->taskp())) ok = false;
+        });
+        taskp->foreach([&](AstMemberSel* selp) {
+            if (selp->varp() && !reachable(selp->varp())) ok = false;
+        });
+        return ok;
+    }
+
     static bool selfContainedImpl(AstNode* batchp, AstNode* stopp) {
         std::set<const AstNode*> owned;
         for (AstNode* p = batchp; p && p != stopp; p = p->nextp()) {
@@ -18351,36 +18407,86 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
             // names is a module's own, and then it has to stay where it is.
             std::map<const AstNodeFTask*, AstNodeFTask*> taskRedirect;
             std::vector<AstNodeFTask*> movable;
+            // A subprogram's own working variables are sometimes left standing
+            // in the module rather than inside the subprogram, and then the
+            // subprogram cannot leave without them. Where nothing else in the
+            // design names one, it travels with the subprogram it belongs to.
+            std::map<const AstVar*, const AstNode*> soleTaskOf;
+            m_netlistp->foreach([&](AstVarRef* refp) {
+                AstVar* const varp = refp->varp();
+                if (!varp) return;
+                const AstNode* ownerp = nullptr;
+                for (AstNode* up = refp->backp(); up; up = up->backp()) {
+                    if (VN_IS(up, NodeFTask)) {
+                        ownerp = up;
+                        break;
+                    }
+                    if (VN_IS(up, NodeModule)) break;
+                }
+                const auto it = soleTaskOf.find(varp);
+                if (it == soleTaskOf.end()) {
+                    soleTaskOf.emplace(varp, ownerp);
+                } else if (it->second != ownerp) {
+                    it->second = nullptr;
+                }
+            });
+            // What the unit names has to come here, and so does whatever
+            // that names in turn: a helper called only from a subprogram the
+            // unit wants is reached from nowhere else, so it would be left
+            // behind and the subprogram could never leave without it.
+            std::set<AstNodeFTask*> wanted;
+            std::vector<AstNodeFTask*> queue;
+            const auto want = [&](AstNodeFTask* taskp) {
+                if (!taskp) return;
+                const char at = placeOf(taskp);
+                if (at != 'm' && at != '?') return;
+                if (!wanted.insert(taskp).second) return;
+                queue.push_back(taskp);
+            };
             unitp->foreach([&](AstNodeFTaskRef* refp) {
                 AstNodeFTask* const taskp = refp->taskp();
                 if (!taskp) return;
-                const char place = placeOf(taskp);
-                if (place != 'm' && place != '?') return;
-                if (taskRedirect.count(taskp)) return;
+                // One the unit already holds under another name is used
+                // instead of bringing a second copy of it here
                 const auto symIt = m_taskSym.find(taskp);
-                const bool ofPackage
-                    = symIt != m_taskSym.end() && declaredInPackage(symIt->second);
-                // A copy made for one call, or a helper built for a type, is
-                // named here but was left nowhere. It belongs to no module, so
-                // the unit is where it goes.
-                if (!ofPackage && place != '?') return;
-                if (!ofPackage) {
-                    if (nodeSelfContained(taskp)) {
-                        taskRedirect.emplace(taskp, taskp);
-                        movable.push_back(taskp);
+                if (symIt != m_taskSym.end() && declaredInPackage(symIt->second)) {
+                    const auto haveIt = m_pkgFuncs.find(symIt->second);
+                    if (haveIt != m_pkgFuncs.end() && haveIt->second != taskp) {
+                        taskRedirect.emplace(taskp, haveIt->second);
+                        return;
                     }
-                    return;
                 }
-                const auto haveIt = m_pkgFuncs.find(symIt->second);
-                if (haveIt != m_pkgFuncs.end() && haveIt->second != taskp) {
-                    taskRedirect.emplace(taskp, haveIt->second);
-                    return;
+                want(taskp);
+            });
+            while (!queue.empty()) {
+                AstNodeFTask* const taskp = queue.back();
+                queue.pop_back();
+                taskp->foreach([&](AstNodeFTaskRef* refp) { want(refp->taskp()); });
+            }
+            // One of them that names something no module may give up takes
+            // everything that calls it out of the group as well
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (auto it = wanted.begin(); it != wanted.end();) {
+                    if (movableWith(*it, wanted, soleTaskOf)) {
+                        ++it;
+                    } else {
+                        it = wanted.erase(it);
+                        changed = true;
+                    }
                 }
-                if (!nodeSelfContained(taskp)) return;
+            }
+            for (AstNodeFTask* const taskp : wanted) {
                 taskRedirect.emplace(taskp, taskp);
                 movable.push_back(taskp);
-            });
+            }
             for (AstNodeFTask* const taskp : movable) {
+                for (AstVar* const varp : ownVarsOutside(taskp, soleTaskOf)) {
+                    if (!varp->backp()) continue;
+                    varp->unlinkFrBack();
+                    varp->lifetime(VLifetime::STATIC_EXPLICIT);
+                    unitp->addStmtsp(varp);
+                }
                 const auto symIt = m_taskSym.find(taskp);
                 if (taskp->backp()) taskp->unlinkFrBack();
                 unitp->addStmtsp(taskp);
