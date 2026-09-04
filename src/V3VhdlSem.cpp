@@ -1859,6 +1859,9 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         if (nodep->hasBody()) symp->bodyp(nodep);
         declare(symp, nodep->fileline());
     }
+    // A path writes a subprogram with its profile, and the region's name
+    // alone does not carry one (16.2.7)
+    innerp->ownerp(reusep ? reusep : symp);
 
     if (nodep->hasBody()) {
         m_scopep = innerp;

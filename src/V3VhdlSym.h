@@ -280,6 +280,7 @@ class VhdlScope final {
     // MEMBERS
     VhdlScope* const m_parentp;  // Enclosing region, or null at the root
     const std::string m_name;  // For diagnostics
+    VhdlSymbol* m_ownerp = nullptr;  // The subprogram this is the region of
     // Where a design unit's own path starts, which is not just its name: a
     // package is reached through its library and an architecture is written
     // with the entity it belongs to (16.2.7)
@@ -309,6 +310,11 @@ public:
     // METHODS
     VhdlScope* parentp() const { return m_parentp; }
     const std::string& name() const { return m_name; }
+    // The subprogram whose declarative region this is, where it is one. A
+    // path names a subprogram with its profile, which the region's name
+    // alone does not carry (16.2.7)
+    VhdlSymbol* ownerp() const { return m_ownerp; }
+    void ownerp(VhdlSymbol* symp) { m_ownerp = symp; }
     const std::multimap<std::string, VhdlSymbol*>& direct() const { return m_direct; }
     const std::string& instPrefix() const { return m_instPrefix; }
     const std::string& pathPrefix() const { return m_pathPrefix; }

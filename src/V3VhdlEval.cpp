@@ -542,11 +542,26 @@ private:
 
     // Every region from the design unit down to this one, each followed by a
     // colon. An unnamed process contributes an empty name, as VHDL writes it.
+    // The name a copy the analysis made goes by in the source. A copy is one
+    // call site's, and its made-up suffix is no part of what the design was
+    // written as -- and cannot be part of an identifier either, since VHDL
+    // does not let two underlines stand together (15.4.2)
+    static std::string sourceName(const std::string& name) {
+        const size_t at = name.find("__V");
+        return at == std::string::npos ? name : name.substr(0, at);
+    }
+
     static std::string scopePath(const VhdlScope* scopep, bool inst) {
         if (!scopep) return "";
         const std::string& prefix = inst ? scopep->instPrefix() : scopep->pathPrefix();
         if (!prefix.empty()) return prefix + ":";
         std::string name = scopep->name();
+        // A subprogram's region is written with the subprogram's profile, so
+        // that two of the same name are told apart (16.2.7)
+        if (const VhdlSymbol* const ownerp = scopep->ownerp()) {
+            return scopePath(scopep->parentp(), inst) + sourceName(ownerp->name())
+                   + signatureOf(ownerp) + ":";
+        }
         // The body of a generate is not a named region of its own: the
         // generate statement's own label is what the path holds (16.2.7), so
         // an unlabelled body contributes nothing rather than an empty name
@@ -599,7 +614,8 @@ private:
             VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
             if (!symp) return VhdlValue{};
             const bool inst = attr == "instance_name";
-            std::string out = ":" + scopePath(symp->declScopep(), inst) + symp->name();
+            std::string out
+                = ":" + scopePath(symp->declScopep(), inst) + sourceName(symp->name());
             switch (symp->kind()) {
             case VhdlSymKind::FUNCTION:
             case VhdlSymKind::PROCEDURE:
