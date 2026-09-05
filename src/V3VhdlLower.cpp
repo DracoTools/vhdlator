@@ -4005,7 +4005,7 @@ private:
         return carriedDynamically(emittedReturnType(symp));
     }
 
-    bool dynResultCall(const AstNodeVhdlExpr* nodep) const {
+    bool dynResultCall(const AstNodeVhdlExpr* nodep, int depth = 0) const {
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->vhdlSymp()) return false;
         const VhdlSymbol* const symp = callp->vhdlSymp()->resolved();
@@ -4017,6 +4017,22 @@ private:
         if ((name == "to_unsigned" || name == "to_signed" || name == "resize")
             && inArithmeticPackage(symp)) {
             return carriedDynamically(callp->vhdlTypep());
+        }
+        // MAXIMUM and MINIMUM over two arrays give one of the two back, so
+        // the result is as long as an operand and no longer: two fixed
+        // operands give a fixed result, whatever unconstrained subtype the
+        // package wrote the result with (5.3.2.4)
+        if ((name == "maximum" || name == "minimum") && inArithmeticPackage(symp)
+            && depth < 8) {
+            bool operandCarries = false;
+            int args = 0;
+            for (AstNode* argp = callp->argsp(); argp; argp = argp->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
+                if (!asp || !asp->actualp()) continue;
+                ++args;
+                if (isDynValue(asp->actualp(), depth + 1)) operandCarries = true;
+            }
+            if (args >= 2) return operandCarries;
         }
         // The arithmetic of numeric_std is emitted rather than compiled, so
         // its result is whatever the operation gives back here, however the
@@ -9516,13 +9532,53 @@ private:
             AstNodeExpr* const secondp = lowerExpr(args[1]);
             if (!secondp) return nullptr;
             const bool signd = isSignedType(args[0]->vhdlTypep());
-            AstNodeExpr* const testp
-                = signd ? static_cast<AstNodeExpr*>(
-                      new AstGtS{flp, firstp->cloneTree(false), secondp->cloneTree(false)})
-                        : static_cast<AstNodeExpr*>(
-                            new AstGt{flp, firstp->cloneTree(false), secondp->cloneTree(false)});
-            return name == "maximum" ? new AstCond{flp, testp, firstp, secondp}
-                                     : new AstCond{flp, testp, secondp, firstp};
+            // Each operand is read once and then chosen between: either may
+            // be a call, and one made twice is not what the expression says
+            AstVar* const lp = extremeTemp(args[0], flp);
+            AstVar* const rp = extremeTemp(args[1], flp);
+            if (!lp || !rp) {
+                VL_DO_DANGLING(secondp->deleteTree(), secondp);
+                unsup(flp, "'" + name + "' of a value of no length known here");
+                return nullptr;
+            }
+            AstNode* setp = new AstAssign{flp, wr(lp, flp), firstp};
+            setp = AstNode::addNext(
+                setp, static_cast<AstNode*>(new AstAssign{flp, wr(rp, flp), secondp}));
+            const auto operand = [&](AstVar* varp, int at) {
+                return asSignedNumber(rd(varp, flp), args[at]->vhdlTypep(), flp);
+            };
+            // An operand that carries its own bounds is compared element by
+            // element, in the same helper the relational operators use
+            AstNodeExpr* testp = nullptr;
+            if (isDynValue(args[0]) || isDynValue(args[1])) {
+                VhdlType* const carrp
+                    = dynValueType(args[0]) ? dynValueType(args[0]) : dynValueType(args[1]);
+                AstNodeFTask* const cmpp = carrp ? dynCmpFunc(carrp, flp) : nullptr;
+                if (!cmpp) {
+                    unsup(flp, "'" + name + "' of a value of no length known here");
+                    return nullptr;
+                }
+                AstFuncRef* const refp = new AstFuncRef{
+                    flp, cmpp->name(),
+                    AstNode::addNext(
+                        new AstArg{flp, "", rd(lp, flp)},
+                        AstNode::addNext(new AstArg{flp, "", rd(rp, flp)},
+                                         new AstArg{flp, "",
+                                                    new AstConst{flp, AstConst::BitTrue{},
+                                                                 signd}}))};
+                refp->taskp(VN_AS(cmpp, Func));
+                testp = new AstGtS{flp, refp, i32(0, flp)};
+            } else {
+                testp = signd ? static_cast<AstNodeExpr*>(
+                            new AstGtS{flp, operand(lp, 0), operand(rp, 1)})
+                              : static_cast<AstNodeExpr*>(
+                                  new AstGt{flp, rd(lp, flp), rd(rp, flp)});
+            }
+            AstNodeExpr* const pickp
+                = name == "maximum"
+                      ? new AstCond{flp, testp, rd(lp, flp), rd(rp, flp)}
+                      : new AstCond{flp, testp, rd(rp, flp), rd(lp, flp)};
+            return new AstExprStmt{flp, setp, pickp};
         }
         // "to_hstring(v)" and its relatives write the value in that base
         // (16.3). Compiled from the IEEE body they would be a loop over a
@@ -16506,6 +16562,22 @@ private:
 
     // A variable of the lowerer's own, for holding a value across the
     // statements one VHDL construct expands into
+    // A place to hold one operand of MAXIMUM or MINIMUM while the other is
+    // read, shaped like whatever that operand turns out to be: a value that
+    // carries its own bounds is held in a carrier, and one whose length the
+    // text fixes in a vector of that length
+    AstVar* extremeTemp(AstNodeVhdlExpr* argp, FileLine* flp) {
+        if (!argp) return nullptr;
+        AstNodeDType* dtypep = nullptr;
+        if (isDynValue(argp)) {
+            VhdlType* const carrp = dynValueType(argp);
+            if (carrp) dtypep = dynCarrierRef(carrp, flp);
+        } else if (argp->vhdlTypep()) {
+            dtypep = lowerType(argp->vhdlTypep(), flp);
+        }
+        return dtypep ? newTempVar("__Vext", dtypep, flp) : nullptr;
+    }
+
     AstVar* newTempVar(const std::string& name, AstNodeDType* dtypep, FileLine* flp) {
         AstVar* const varp = new AstVar{flp, VVarType::VAR, name + std::to_string(++m_tempNum),
                                         VFlagChildDType{}, dtypep};
