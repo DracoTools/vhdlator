@@ -48,11 +48,20 @@ architecture a of t_vhdl_rtlen is
     begin
         return n * 2;
     end function;
+
+    -- Nor is this one, whatever it was declared: "impure" is a promise the
+    -- language needs, not a description of the body, and a body that reads
+    -- only what it was handed answers the same way every time
+    impure function thrice (n : natural) return natural is
+    begin
+        return n * 3;
+    end function;
 begin
     process
         variable c : int_vec(1 to 4);
         variable d : int_vec(0 to 3);
         variable e : int_vec(1 to twice(3));
+        variable f : int_vec(1 to thrice(3));
     begin
         c := counted;
         assert c'length = 4 report "counted length" severity failure;
@@ -67,6 +76,13 @@ begin
             e(i) := i;
         end loop;
         assert e(1) = 1 and e(6) = 6 report "pure bound values" severity failure;
+
+        assert f'length = 9 report "nominally impure bound length" severity failure;
+        for i in f'range loop
+            f(i) := i * 2;
+        end loop;
+        assert f(1) = 2 and f(9) = 18 report "nominally impure bound values"
+            severity failure;
 
         -- The same call, a different length, because the signal moved
         howmany <= 2;

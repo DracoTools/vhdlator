@@ -1476,6 +1476,71 @@ private:
         return false;
     }
 
+    // Whether a node stands somewhere inside another's tree
+    static bool nodeInside(const AstNode* nodep, const AstNode* rootp) {
+        for (const AstNode* p = nodep; p; p = p->backp()) {
+            if (p == rootp) return true;
+        }
+        return false;
+    }
+
+    mutable std::map<const VhdlSymbol*, bool> m_readsRunning;
+    mutable std::set<const VhdlSymbol*> m_readsRunningOpen;
+
+    // What a subprogram reads outside its own parameters is what says
+    // whether elaboration can work its result out. "Impure" is a promise the
+    // language needs and not a description of what the body does: VUnit
+    // writes "impure function data_length(source) return natural is begin
+    // return source.p_data_length; end", which reads only what it was
+    // handed, and an elaborated design asking it over a generic gets the
+    // same answer every time. One that reads a signal, a shared variable, a
+    // file, or a protected type's own state reads what the run has settled,
+    // and a bound written as a call to it is a length only running decides.
+    bool readsRunningState(const VhdlSymbol* symp, int depth = 0) const {
+        if (!symp || depth > 8) return true;
+        const auto found = m_readsRunning.find(symp);
+        if (found != m_readsRunning.end()) return found->second;
+        // A call that leads back to the one being asked about says nothing
+        // on its own: whatever the recursion reads, it reads somewhere else
+        if (!m_readsRunningOpen.insert(symp).second) return false;
+        const AstVhdlSubprogDecl* bodyp = symp->bodyp();
+        if (!bodyp) bodyp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        bool reads = true;  // A body this design never saw is taken at its word
+        if (bodyp && bodyp->hasBody()) {
+            reads = false;
+            bodyp->foreach([&](const AstNodeVhdlExpr* exprp) {
+                if (reads || !exprp->vhdlSymp()) return;
+                const VhdlSymbol* const readp = exprp->vhdlSymp()->resolved();
+                switch (readp->kind()) {
+                case VhdlSymKind::SIGNAL:
+                case VhdlSymKind::PORT:
+                case VhdlSymKind::SHARED_VARIABLE:
+                case VhdlSymKind::FILE: reads = true; return;
+                case VhdlSymKind::VARIABLE:
+                    // A variable the body declared itself is its own working
+                    // space; one declared outside it -- a protected type's
+                    // own, a process's -- is state the run has settled
+                    if (!nodeInside(readp->declp(), bodyp)) reads = true;
+                    return;
+                case VhdlSymKind::FUNCTION:
+                case VhdlSymKind::PROCEDURE: {
+                    const AstVhdlSubprogDecl* const calledp
+                        = VN_CAST(readp->declp(), VhdlSubprogDecl);
+                    if (calledp && !calledp->vhdlPure()
+                        && readsRunningState(readp, depth + 1)) {
+                        reads = true;
+                    }
+                    return;
+                }
+                default: return;
+                }
+            });
+        }
+        m_readsRunningOpen.erase(symp);
+        m_readsRunning.insert_or_assign(symp, reads);
+        return reads;
+    }
+
     bool boundsOnlyRunningDecides(const AstNode* nodep, int depth = 0) const {
         if (!nodep || depth > 32) return false;
         for (const AstNode* p = nodep; p; p = p->nextp()) {
@@ -1524,14 +1589,18 @@ private:
                         // A pure function asked the same thing twice answers
                         // the same way, so elaboration may work its result
                         // out and a bound written as a call to one is a
-                        // number. An impure one reads what only the run has
-                        // settled (4.2.1) -- how many entries a list holds --
-                        // so a bound written as a call to one is a length
-                        // only running decides. A predefined operator has no
-                        // declaration of its own and is pure by definition.
+                        // number. An impure one may read what only the run
+                        // has settled (4.2.1) -- how many entries a list
+                        // holds -- and then a bound written as a call to it
+                        // is a length only running decides. A predefined
+                        // operator has no declaration of its own and is pure
+                        // by definition.
                         const AstVhdlSubprogDecl* const fdeclp
                             = VN_CAST(symp->resolved()->declp(), VhdlSubprogDecl);
-                        if (fdeclp && fdeclp->isFunction() && !fdeclp->vhdlPure()) return true;
+                        if (fdeclp && fdeclp->isFunction() && !fdeclp->vhdlPure()
+                            && readsRunningState(symp->resolved())) {
+                            return true;
+                        }
                         break;
                     }
                     case VhdlSymKind::CONSTANT: {
