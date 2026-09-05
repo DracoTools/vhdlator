@@ -4173,26 +4173,33 @@ private:
             }
             if (dynDecl) {
                 addStmt(varp);
+                // A declaration of a subprogram is elaborated on every call.
+                // A declaration of a process, or of anywhere else, is
+                // elaborated once before the design runs, and a statement
+                // cannot stand loose among a module's own.
+                AstNode* setupp = nullptr;
+                const auto later = [&](AstNode* nodep) {
+                    setupp = AstNode::addNextNull(setupp, nodep);
+                };
                 // An object declared with a value that carries its own bounds
                 // takes them from it -- which is the only thing that says how
                 // long "constant c : t := f(x)" is (6.4.2.2)
                 if (objp->defaultp() && isDynValue(objp->defaultp())) {
                     if (AstNodeExpr* const srcp = lowerExpr(objp->defaultp())) {
-                        addStmt(new AstAssign{
+                        later(new AstAssign{
                             flp, new AstVarRef{flp, varp, VAccess::WRITE}, srcp});
                     }
-                    return;
-                }
-                // Otherwise a carrier is given its bounds and its room where
-                // it is declared, since nothing else knows how long it is
-                addStmt(dynCarrierInit(varp, symp->typep(), flp));
-                if (objp->defaultp()) {
-                    if (AstNode* const setp
-                        = dynCarrierAssign(new AstVarRef{flp, varp, VAccess::WRITE},
-                                           objp->defaultp(), flp, symp->typep())) {
-                        addStmt(setp);
+                } else {
+                    // Otherwise a carrier is given its bounds and its room
+                    // where it is declared, since nothing else knows how long
+                    // it is
+                    later(dynCarrierInit(varp, symp->typep(), flp));
+                    if (objp->defaultp()) {
+                        later(dynCarrierAssign(new AstVarRef{flp, varp, VAccess::WRITE},
+                                               objp->defaultp(), flp, symp->typep()));
                     }
                 }
+                if (setupp) addStmt(m_ftaskp ? setupp : new AstInitial{flp, setupp});
                 return;
             }
             // A record with an element that carries its own bounds is given
