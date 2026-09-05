@@ -5912,6 +5912,13 @@ private:
             valuep = m_stmtsp;
             m_stmtsp = outerStmtsp;
         }
+        // A parameter's value has to fold. Where it cannot, the constant is
+        // an object given its value once rather than a parameter -- and a
+        // constant that names such an object cannot fold either, which is why
+        // this asks about the value rather than about the declaration.
+        if (varp->varType() == VVarType::LPARAM && !valueFolds(varp->valuep())) {
+            varp->varType(VVarType::VAR);
+        }
         const auto keepValueWith = [&](AstNodeModule* wherep) {
             if (!valuep) return;
             if (wherep) {
@@ -5945,6 +5952,42 @@ private:
             keepValueWith(nullptr);
         }
         return varp;
+    }
+
+    // Whether what an object was given is a value that can be worked out
+    // before the design runs. A pure function is one the back end may run at
+    // elaboration, so a constant whose value calls one is still a constant; an
+    // impure one reads what only running settles (4.2.1), and a constant whose
+    // value calls one is an object given its value once, not a parameter.
+    bool valueFolds(const AstNode* nodep) const {
+        if (!nodep) return true;
+        bool folds = true;
+        nodep->foreach([&](const AstNode* itemp) {
+            if (!folds) return;
+            if (VN_IS(itemp, New) || VN_IS(itemp, FOpen) || VN_IS(itemp, MethodCall)
+                || VN_IS(itemp, Time)) {
+                folds = false;
+                return;
+            }
+            if (const AstNodeFTaskRef* const callp = VN_CAST(itemp, NodeFTaskRef)) {
+                const auto it = m_taskSym.find(callp->taskp());
+                const AstVhdlSubprogDecl* const declp
+                    = it == m_taskSym.end()
+                          ? nullptr
+                          : VN_CAST(it->second->declp(), VhdlSubprogDecl);
+                if (!declp || !declp->isFunction() || !declp->vhdlPure()) folds = false;
+                return;
+            }
+            if (const AstVarRef* const refp = VN_CAST(itemp, VarRef)) {
+                const AstVar* const varp = refp->varp();
+                if (!varp
+                    || (varp->varType() != VVarType::GPARAM
+                        && varp->varType() != VVarType::LPARAM)) {
+                    folds = false;
+                }
+            }
+        });
+        return folds;
     }
 
     // Whether a subprogram may be called with no arguments at all
