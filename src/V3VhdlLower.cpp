@@ -557,8 +557,11 @@ private:
         for (VhdlSymbol* const capp : it->second) {
             const auto varIt = m_vars.find(capp);
             if (varIt == m_vars.end() || !varIt->second) continue;
-            refp->addArgsp(
-                new AstArg{flp, "", new AstVarRef{flp, varIt->second, VAccess::READWRITE}});
+            // By name: a parameter the call leaves out because it has a
+            // default (4.2.2.1) is still a parameter, and an argument put
+            // after it in order would be read as that one's
+            refp->addArgsp(new AstArg{flp, "__Vcap__" + capp->name(),
+                                      new AstVarRef{flp, varIt->second, VAccess::READWRITE}});
         }
     }
 
