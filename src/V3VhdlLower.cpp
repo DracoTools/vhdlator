@@ -1127,6 +1127,20 @@ private:
         return dtypep;
     }
 
+    // Which way a range runs is how it was written, not what its two ends
+    // happen to be (5.2.1). AstRange reads its own direction off its bounds,
+    // which answers "descending" for every range whose ends are not numbers
+    // here -- and a bound worked out by calling something is not one. A range
+    // the text leaves open, "v'range", keeps what the index subtype says.
+    bool boundsAscending(const VhdlType* idxp) const {
+        if (!idxp) return true;
+        if (idxp->bounded()) return idxp->ascending();
+        if (const AstVhdlRange* const vrp = VN_CAST(idxp->boundsp(), VhdlRange)) {
+            if (!vrp->dirUnknown()) return vrp->dir() == VhdlDir::TO;
+        }
+        return idxp->ascending();
+    }
+
     // The range an index subtype was written with, where its bounds did not
     // fold. Null if there is none to emit.
     AstRange* boundsRange(const VhdlType* idxp, FileLine* flp) {
@@ -2479,7 +2493,7 @@ private:
         funcp->addStmtsp(vp);
         AstNodeExpr* const leftp = rangep->leftp()->unlinkFrBack();
         AstNodeExpr* const rightp = rangep->rightp()->unlinkFrBack();
-        const bool ascending = rangep->ascending();
+        const bool ascending = boundsAscending(idxp);
         VL_DO_DANGLING(rangep->deleteTree(), rangep);
         const auto out = [&]() {
             return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
@@ -2780,7 +2794,7 @@ private:
         AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(carrierTypep, flp), flp);
         AstNodeExpr* const leftp = rangep->leftp()->unlinkFrBack();
         AstNodeExpr* const rightp = rangep->rightp()->unlinkFrBack();
-        const bool ascending = rangep->ascending();
+        const bool ascending = boundsAscending(idxp);
         VL_DO_DANGLING(rangep->deleteTree(), rangep);
         AstVar* const lp = newFuncLocal("l", newIntDType(flp), flp);
         AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
@@ -3068,7 +3082,7 @@ private:
         if (!m_modp) return nullptr;
         VhdlType* const idxp
             = basep->indexTypes().empty() ? nullptr : basep->indexTypes()[0];
-        const bool ascending = !idxp || idxp->ascending();
+        const bool ascending = boundsAscending(idxp);
         AstNodeExpr* leftp = nullptr;
         if (idxp) {
             if (AstRange* const rangep = boundsRange(idxp, flp)) {
