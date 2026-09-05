@@ -9294,10 +9294,42 @@ private:
             const VhdlValue widthVal = V3VhdlEval::eval(args[1]);
             AstNodeExpr* sized = firstp;
             if (widthVal.isInt()) {
-                sized = new AstCastSize{
-                    flp, firstp,
-                    new AstConst{flp, AstConst::Unsized32{},
-                                 static_cast<uint32_t>(widthVal.toInt())}};
+                const int want = static_cast<int>(widthVal.toInt());
+                // RESIZE fills what the result is short with the operand's
+                // leftmost element -- its sign -- and then writes the low
+                // elements over that, so the sign stands leftmost whichever
+                // of the two lengths is the greater (9.3.6).  Verilog's own
+                // widening and narrowing do neither: they pad with zeros and
+                // drop everything above the width.
+                const bool signd
+                    = name == "resize" && isSignedType(args[0]->vhdlTypep());
+                const int have = signd ? exprVectorWidth(args[0]) : 0;
+                if (signd && want >= 1 && have > want) {
+                    // Read once: what is resized may be a call
+                    AstVar* const tmpp
+                        = newTempVar("__Vresz", newLogicDType(flp, have), flp);
+                    const auto val = [&]() {
+                        return new AstVarRef{flp, tmpp, VAccess::READ};
+                    };
+                    AstNodeExpr* const signp = new AstSel{flp, val(), have - 1, 1};
+                    sized = new AstExprStmt{
+                        flp,
+                        new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE},
+                                      firstp},
+                        want == 1 ? signp
+                                  : static_cast<AstNodeExpr*>(new AstConcat{
+                                      flp, signp, new AstSel{flp, val(), 0, want - 1}})};
+                } else {
+                    // A SIGNED value keeps its sign as it widens, so the cast
+                    // is told what it is casting before it is asked to make it
+                    // longer
+                    sized = new AstCastSize{
+                        flp,
+                        signd ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
+                              : firstp,
+                        new AstConst{flp, AstConst::Unsized32{},
+                                     static_cast<uint32_t>(want)}};
+                }
             } else if (name == "resize" && !(resultp && carriedDynamically(resultp))) {
                 // The width comes from another object's range, which V3Width
                 // resolves from the context of the assignment. That works
