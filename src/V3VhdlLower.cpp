@@ -4818,6 +4818,35 @@ private:
     static bool isSignedName(const std::string& name) {
         return name == "signed" || name == "unresolved_signed";
     }
+    // One of numeric_std's SIGNED vectors, as against an integer, which
+    // Verilator's own INTEGER already carries a sign on
+    // One of numeric_std's own vectors, whose operators are declared over
+    // any two lengths and compare by value -- as against an array type,
+    // whose "=" is the predefined one and false between lengths that differ
+    static bool isNumericVector(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ARRAY) return false;
+        const auto numeric = [](const std::string& n) {
+            return n == "signed" || n == "unresolved_signed" || n == "unsigned"
+                   || n == "unresolved_unsigned";
+        };
+        return numeric(typep->name()) || numeric(basep->name());
+    }
+    static bool isSignedVector(const VhdlType* typep) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        return basep->kind() == VhdlTypeKind::ARRAY
+               && (isSignedName(typep->name()) || isSignedName(basep->name()));
+    }
+    // A SIGNED vector read as the number it stands for.  Nothing about an
+    // array of logic says its leftmost element is a sign, so every operator
+    // that reads one as a number has to be told, or it reads the positive
+    // number the same elements spell (9.3.6).
+    static AstNodeExpr* asSignedNumber(AstNodeExpr* nodep, const VhdlType* typep,
+                                       FileLine* flp) {
+        return isSignedVector(typep) ? new AstSigned{flp, nodep} : nodep;
+    }
     static bool isSignedType(const VhdlType* typep) {
         if (!typep) return false;
         const VhdlType* const basep = typep->base();
@@ -7269,10 +7298,12 @@ private:
                                new AstConst{flp, AstConst::RealDouble{}, 0.0}},
                     new AstNegateD{flp, lhsp->cloneTree(false)}, lhsp};
             }
-            return new AstCond{flp,
-                               new AstLtS{flp, lhsp->cloneTree(false),
-                                          new AstConst{flp, AstConst::Signed32{}, 0}},
-                               new AstNegate{flp, lhsp->cloneTree(false)}, lhsp};
+            return new AstCond{
+                flp,
+                new AstLtS{dynFl(flp),
+                           asSignedNumber(lhsp->cloneTree(false), otypep, flp),
+                           new AstConst{dynFl(flp), AstConst::Signed32{}, 0}},
+                new AstNegate{flp, lhsp->cloneTree(false)}, lhsp};
         case VhdlUnaryOp::NOT: return new AstNot{flp, lhsp};
         case VhdlUnaryOp::AND: return new AstRedAnd{flp, lhsp};
         case VhdlUnaryOp::OR: return new AstRedOr{flp, lhsp};
@@ -7841,6 +7872,10 @@ private:
         if (!lhsp || !rhsp) return nullptr;
         matchVectorWidth(nodep, ltypep, rtypep, lhsp, rhsp, flp);
         const bool signd = isSignedType(ltypep) || isSignedType(rtypep);
+        if (signd) {
+            lhsp = asSignedNumber(lhsp, ltypep, flp);
+            rhsp = asSignedNumber(rhsp, rtypep, flp);
+        }
         // A real literal that no context has converted is still a real. "**"
         // is the operator that shows it, being the only predefined one whose
         // two operands have different types: "2.0 ** n" would otherwise be
@@ -8178,7 +8213,24 @@ private:
             case VhdlBinaryOp::MUL:
             case VhdlBinaryOp::DIV:
             case VhdlBinaryOp::MOD:
-            case VhdlBinaryOp::REM: {
+            case VhdlBinaryOp::REM:
+            // numeric_std declares its own comparisons over operands of any
+            // two lengths, and they compare by value (16.5).  Only an array
+            // type's predefined "=" is false between lengths that differ,
+            // and neither SIGNED nor UNSIGNED is reached through that one.
+            case VhdlBinaryOp::EQ:
+            case VhdlBinaryOp::NE:
+            case VhdlBinaryOp::LT:
+            case VhdlBinaryOp::LE:
+            case VhdlBinaryOp::GT:
+            case VhdlBinaryOp::GE: {
+                const bool cmp = nodep->op() != VhdlBinaryOp::ADD
+                                 && nodep->op() != VhdlBinaryOp::SUB
+                                 && nodep->op() != VhdlBinaryOp::MUL
+                                 && nodep->op() != VhdlBinaryOp::DIV
+                                 && nodep->op() != VhdlBinaryOp::MOD
+                                 && nodep->op() != VhdlBinaryOp::REM;
+                if (cmp && !(isNumericVector(ltypep) && isNumericVector(rtypep))) break;
                 const bool signd = isSignedType(ltypep) || isSignedType(rtypep);
                 if (lw < rw) {
                     lhsp = sizedTo(signd ? new AstSigned{flp, lhsp} : lhsp, rw, flp);
@@ -9428,7 +9480,9 @@ private:
         if (name == "shift_right") {
             if (args.size() < 2) return nullptr;
             if (isSignedType(args[0]->vhdlTypep())) {
-                return new AstShiftRS{flp, firstp, lowerExpr(args[1])};
+                return new AstShiftRS{
+                    flp, asSignedNumber(firstp, args[0]->vhdlTypep(), flp),
+                    lowerExpr(args[1])};
             }
             return new AstShiftR{flp, firstp, lowerExpr(args[1])};
         }
