@@ -3904,7 +3904,14 @@ private:
         m_specializations.emplace(key, nullptr);
         VhdlSymbol* const newp
             = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, actualValues, name);
-        m_specializations[key] = newp;
+        if (newp) {
+            m_specializations[key] = newp;
+        } else {
+            // Nothing was made, so nothing is claimed: another call with the
+            // same key may still succeed, and one that found the claim would
+            // have been told to wait for a copy that never arrives
+            m_specializations.erase(key);
+        }
         if (newp) {
             m_copyOf.emplace(newp, m_within.back());
             m_madeSyms.insert(newp);
