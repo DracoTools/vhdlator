@@ -3751,6 +3751,42 @@ private:
     // the copy's own means there is a last copy, and a longer one means
     // there is not -- "p(prefix & \"  \")" asks for a copy per depth, and
     // the depth is a value, which no copy can settle.
+    // Whether a declaration stands inside a protected type's own region
+    static bool inProtectedType(const AstNode* nodep) {
+        for (const AstNode* p = nodep; p; p = p->backp()) {
+            if (VN_IS(p, VhdlProtectedType)) return true;
+        }
+        return false;
+    }
+
+    // Whether an expression names a generic of the module it is written in
+    static bool namesGeneric(const AstNode* nodep, int depth = 0) {
+        if (!nodep || depth > 32) return false;
+        for (const AstNode* p = nodep; p; p = p->nextp()) {
+            if (const AstNodeVhdlExpr* const exprp = VN_CAST(p, NodeVhdlExpr)) {
+                if (const VhdlSymbol* const symp = exprp->vhdlSymp()) {
+                    if (symp->resolved()->kind() == VhdlSymKind::GENERIC) return true;
+                }
+            }
+            if (namesGeneric(p->op1p(), depth + 1)) return true;
+            if (namesGeneric(p->op2p(), depth + 1)) return true;
+            if (namesGeneric(p->op3p(), depth + 1)) return true;
+            if (namesGeneric(p->op4p(), depth + 1)) return true;
+        }
+        return false;
+    }
+
+    // Whether any of these types says how long it is by naming a generic
+    static bool boundsNameGeneric(const std::vector<VhdlType*>& types) {
+        for (const VhdlType* const typep : types) {
+            if (!typep) continue;
+            for (const VhdlType* const idxp : typep->indexTypes()) {
+                if (idxp && !idxp->bounded() && namesGeneric(idxp->boundsp())) return true;
+            }
+        }
+        return false;
+    }
+
     bool descends(const VhdlSymbol* symp,
                   const std::vector<VhdlType*>& actualTypes) const {
         for (const VhdlSpecFrame& frame : m_within) {
@@ -3890,6 +3926,14 @@ private:
         // copy, since each copy asks for one longer still. Such a call keeps
         // the original, whose parameter carries its bounds with the value.
         if (!descends(symp, actualTypes)) return;
+        // A method of a protected type belongs to one class, and the class
+        // is shared however many instances a design elaborates. A copy made
+        // for an actual whose bounds name an instance's generics -- which is
+        // what an unconstrained port's bounds are -- would name them from
+        // outside the module they belong to, and outlive them. Such a call
+        // keeps the original, whose parameter carries its bounds along with
+        // the value.
+        if (inProtectedType(bodyp) && boundsNameGeneric(actualTypes)) return;
         // A copy per call site is bounded by the source; a copy per *value*
         // could not be, if a recursive call kept folding to a new one
         if (m_count > 4096) return;

@@ -503,7 +503,21 @@ private:
                     AstVar* const parp = taskParamAt(refp->taskp(),
                                                      namep ? namep->name() : "", pos);
                     VhdlType* const atypep = asp->actualp()->vhdlTypep();
-                    if (isCarrierVar(parp) && atypep) {
+                    bool wantsCarrier = isCarrierVar(parp);
+                    // A method of a protected type is named here rather than
+                    // bound, since which class holds it is settled later, so
+                    // what its parameter is has to be read from the
+                    // subprogram instead of from the parameter itself
+                    if (!parp && symp) {
+                        const int at = namep ? symp->paramIndex(namep->name())
+                                             : static_cast<int>(pos);
+                        const VhdlType* const formalp
+                            = at >= 0 && at < static_cast<int>(symp->paramTypes().size())
+                                  ? symp->paramTypes()[at]
+                                  : nullptr;
+                        wantsCarrier = formalp && carriedDynamically(formalp);
+                    }
+                    if (wantsCarrier && atypep) {
                         onep = asDynCarrier(asp->actualp(), atypep, asp->fileline());
                     }
                 }
@@ -1137,6 +1151,13 @@ private:
         if (idxp->bounded()) return idxp->ascending();
         if (const AstVhdlRange* const vrp = VN_CAST(idxp->boundsp(), VhdlRange)) {
             if (!vrp->dirUnknown()) return vrp->dir() == VhdlDir::TO;
+            // An open port's bounds are two generics an instance binds, and
+            // which way its range runs is the instance's to say -- while the
+            // helper built from the type is shared by every instance. A
+            // vector is written "downto" far more often than "to", so that
+            // is the answer here, and it is the one the emitted range node
+            // gave before the direction was asked for properly.
+            return false;
         }
         return idxp->ascending();
     }
