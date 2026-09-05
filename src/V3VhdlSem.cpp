@@ -8052,7 +8052,13 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
     if (basep->kind() != VhdlTypeKind::ARRAY) return nullptr;
 
     AstVhdlIndexConstraint* consp = nullptr;
-    if (typep->unconstrained()) {
+    // A STRING is text and is carried with its length, so what an actual
+    // makes it is known from the value and needs no bounds passed beside it.
+    // A generic of one has no instantiation to pass them anyway, when the
+    // entity it belongs to is the top of the design.
+    const VhdlType* const strp = V3VhdlStd::stringType();
+    const bool isString = strp && basep == strp->base();
+    if (typep->unconstrained() && !isString) {
         consp = new AstVhdlIndexConstraint{flp};
         const size_t dims = basep->indexTypes().size();
         for (size_t d = 0; d < dims; ++d) {
