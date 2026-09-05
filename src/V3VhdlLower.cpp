@@ -8651,7 +8651,11 @@ private:
         const VhdlTypeKind toKind = top->base()->kind();
         const VhdlTypeKind fromKind = fromp ? fromp->base()->kind() : toKind;
         if (toKind == VhdlTypeKind::FLOATING && fromKind != VhdlTypeKind::FLOATING) {
-            return new AstIToRD{flp, valuep};
+            // Written as a cast rather than as the conversion itself: the
+            // back end settles what an operand is worth before it decides
+            // which conversion to make, and one made here would be handed an
+            // operand nothing had settled yet
+            return new AstCast{flp, valuep, VFlagChildDType{}, lowerType(top, flp)};
         }
         if (toKind != VhdlTypeKind::FLOATING && fromKind == VhdlTypeKind::FLOATING) {
             return new AstRToIRoundS{flp, valuep};
