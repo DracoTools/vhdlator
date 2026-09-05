@@ -4072,6 +4072,9 @@ private:
             case VhdlObjKind::SHARED_VARIABLE: varType = VVarType::VAR; break;
             case VhdlObjKind::FILE: varType = VVarType::VAR; break;
             }
+            // A fill the region runs, for an object whose length only
+            // running decides; see below
+            AstNodeExpr* fillp = nullptr;
             const bool dynDecl = objp->kind() != VhdlObjKind::FILE
                                  && carriedDynamically(symp->typep());
             if (dynDecl) m_dynSyms.insert(symp);
@@ -4186,12 +4189,37 @@ private:
                 // A STRING as long as something only known while running --
                 // "variable r : string(s'range)" over an unconstrained
                 // parameter -- has to start out that long, or writing to an
-                // element of it writes nothing at all
-                varp->valuep(spacesp);
+                // element of it writes nothing at all. An initial value is
+                // asked to fold, so where the length is one that running
+                // decides the fill is a statement of the region instead.
+                if (valueFolds(spacesp)) {
+                    varp->valuep(spacesp);
+                } else {
+                    VL_DO_DANGLING(spacesp->deleteTree(), spacesp);
+                    fillp = dynamicLength(symp->typep(), flp);
+                }
             } else {
                 varp->valuep(defaultValueFor(symp->typep(), flp));
             }
             addStmt(varp);
+            if (fillp) {
+                // How many characters, worked out into an object of its own:
+                // asked for inside the fill, a call is a value the back end
+                // tries to settle before the design runs and cannot
+                AstVar* const lenp = newTempVar("__Vstrlen", newIntDType(flp), flp);
+                AstNode* setp
+                    = new AstAssign{flp, new AstVarRef{flp, lenp, VAccess::WRITE}, fillp};
+                setp = AstNode::addNext(
+                    setp, static_cast<AstNode*>(new AstAssign{
+                              flp, new AstVarRef{flp, varp, VAccess::WRITE},
+                              new AstReplicateN{
+                                  flp, new AstConst{flp, AstConst::String{}, " "},
+                                  new AstVarRef{flp, lenp, VAccess::READ}}}));
+                // A declaration of a subprogram is elaborated on every call;
+                // anywhere else it happens once, before the design runs, and
+                // a statement cannot stand loose among a module's own
+                addStmt(m_ftaskp ? setp : new AstInitial{flp, setp});
+            }
             if (objp->kind() == VhdlObjKind::SIGNAL) {
                 if (isLogicish(symp->typep())) {
                     // One driver of a logic signal resolves to itself, so the
