@@ -17973,6 +17973,25 @@ private:
             if (!seen.insert(rootp).second) return;
             captures.push_back(rootp);
         });
+        // A nested subprogram that calls one of its siblings has to hand on
+        // what that one reaches out for as well. The sibling's extra
+        // parameters are filled from whatever the caller can name, and a
+        // caller that never mentions the object itself can name nothing --
+        // so it takes the object as a parameter of its own and passes it
+        // straight through. Siblings are planned in the order they are
+        // declared, and a call names one already declared, so the plan being
+        // read here is complete.
+        nodep->foreach([&](AstNodeVhdlExpr* exprp) {
+            VhdlSymbol* const usedp = exprp->vhdlSymp();
+            if (!usedp) return;
+            const auto plan = m_captureOf.find(usedp->resolved());
+            if (plan == m_captureOf.end()) return;
+            for (VhdlSymbol* const capp : plan->second) {
+                if (ownp.count(capp)) continue;
+                if (!seen.insert(capp).second) continue;
+                captures.push_back(capp);
+            }
+        });
         m_captureOf.emplace(symp, captures);
     }
 
