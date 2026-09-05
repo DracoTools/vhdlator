@@ -1506,6 +1506,20 @@ private:
                     case VhdlSymKind::SIGNAL:
                     case VhdlSymKind::PORT:
                     case VhdlSymKind::PARAMETER: return true;
+                    case VhdlSymKind::FUNCTION: {
+                        // A pure function asked the same thing twice answers
+                        // the same way, so elaboration may work its result
+                        // out and a bound written as a call to one is a
+                        // number. An impure one reads what only the run has
+                        // settled (4.2.1) -- how many entries a list holds --
+                        // so a bound written as a call to one is a length
+                        // only running decides. A predefined operator has no
+                        // declaration of its own and is pure by definition.
+                        const AstVhdlSubprogDecl* const fdeclp
+                            = VN_CAST(symp->resolved()->declp(), VhdlSubprogDecl);
+                        if (fdeclp && fdeclp->isFunction() && !fdeclp->vhdlPure()) return true;
+                        break;
+                    }
                     case VhdlSymKind::CONSTANT: {
                         // A constant declared from what the call supplies --
                         // "constant len : positive := n + 1" inside a
@@ -2124,6 +2138,16 @@ private:
         if (!nodep || depth > 8) return false;
         if (isDynObj(nodep)) return true;
         if (dynResultCall(nodep)) return true;
+        // A function that may be called with no arguments at all is written
+        // as a name and not as a call (4.2.2.1), so what it gives back is
+        // asked of the name
+        if (!VN_IS(nodep, VhdlCall) && nodep->vhdlSymp()) {
+            const VhdlSymbol* const namedp = nodep->vhdlSymp()->resolved();
+            if (namedp->kind() == VhdlSymKind::FUNCTION && allParamsDefaulted(namedp)
+                && carriedDynamically(emittedReturnType(namedp))) {
+                return true;
+            }
+        }
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
             const VhdlSymbol* const prefixp
                 = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
