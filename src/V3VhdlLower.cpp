@@ -9244,12 +9244,16 @@ private:
                               : firstp;
                     sized = new AstCast{flp, srcp, VFlagChildDType{}, wantp};
                 }
-            } else if (resultp && resultp->lengthEmittable()) {
+            } else if (resultp && resultp->lengthEmittable()
+                       && !carriedDynamically(resultp)) {
                 // A width that names a generic or a port's bounds is not a
                 // number here. The result's own subtype says it, and what the
                 // value is given to has that subtype, so the width comes from
                 // the assignment exactly as it does for RESIZE. Narrowing the
-                // integer to it is what the conversion is for.
+                // integer to it is what the conversion is for. A result that
+                // carries its own bounds is not one of these: nothing it is
+                // given to has a width to take, so the bits are built below
+                // with the length the call names.
                 FileLine* const cflp = new FileLine{flp};
                 cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
                 cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
