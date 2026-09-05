@@ -1555,6 +1555,18 @@ private:
                           ? attrp->prefixp()->vhdlSymp()->resolved()
                           : nullptr;
                 if (psymp && m_dynSyms.count(psymp)) return true;
+                // An access value points at an array as long as allocating
+                // it made it, and an attribute over one dereferences the
+                // pointer where it stands (8.6) -- so "p'length" answers
+                // only once p has a value, and that is not until it runs
+                if (psymp && psymp->isObject() && psymp->typep()
+                    && psymp->typep()->base()->kind() == VhdlTypeKind::ACCESS) {
+                    const VhdlType* const atp = psymp->typep()->base()->designatedp();
+                    if (atp && atp->base()->kind() == VhdlTypeKind::ARRAY
+                        && !atp->isConstrainedArray()) {
+                        return true;
+                    }
+                }
                 // Text is carried dynamically wherever it goes, so a string
                 // whose own subtype fixes no length answers 'LENGTH only
                 // when it has a value, and that is not until it runs
