@@ -1033,9 +1033,23 @@ private:
         if (!indexes.empty() && indexes[0] && indexes[0]->bounded()) return indexes[0]->left();
         return 1;
     }
+    // The text behind a type: a STRING itself, or an access to one, which is
+    // emitted as a string of its own rather than as an object to dereference
+    // (5.4). Asking the pointer's own type where text starts answers nothing,
+    // and an index left uncorrected reads and writes the wrong character.
+    static const VhdlType* stringBehind(const VhdlType* typep) {
+        if (!typep) return nullptr;
+        if (typep->base()->kind() == VhdlTypeKind::ACCESS) {
+            const VhdlType* const designatedp = typep->base()->designatedp();
+            return designatedp && isStringType(designatedp->base()) ? designatedp : nullptr;
+        }
+        return isStringType(typep) ? typep : nullptr;
+    }
+
     // An index into a STRING, brought back to where Verilator counts from
     static AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
-        if (!typep || !isStringType(typep)) return indexp;
+        typep = stringBehind(typep);
+        if (!typep) return indexp;
         const int64_t low = stringLow(typep);
         if (low == 0) return indexp;
         return new AstSub{flp, indexp,
@@ -8277,7 +8291,7 @@ private:
                     refp->taskp(VN_AS(funcp, Func));
                     return refp;
                 }
-                if (prefixTypep && isStringType(prefixTypep)) {
+                if (stringBehind(prefixTypep)) {
                     // A slice of a STRING is a substring: Verilator's string
                     // is characters, not bits, so a part select of it means
                     // nothing
@@ -13548,8 +13562,7 @@ private:
     static bool isStringPart(const AstNodeVhdlExpr* targetp) {
         const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
         if (!callp || !callp->prefixp()) return false;
-        const VhdlType* const strTypep = callp->prefixp()->vhdlTypep();
-        return strTypep && isStringType(strTypep);
+        return stringBehind(callp->prefixp()->vhdlTypep()) != nullptr;
     }
 
     // "(others => c)" written into a slice of a STRING whose length only
