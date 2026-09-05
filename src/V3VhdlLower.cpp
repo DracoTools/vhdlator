@@ -6095,12 +6095,26 @@ private:
     // that is the honest answer: what is asked is where the *name* stands.
     mutable std::map<const VhdlScope*, bool> m_scopeInPkg;
 
+    // What a node is written inside. Not what backp() gives on its own: a
+    // node in the middle of a list is backed by the one before it, and the
+    // one before it is a neighbour, not a parent -- so a declaration standing
+    // between two subprograms of a package body would answer that it is
+    // inside one of them.
+    static const AstNode* writtenInside(const AstNode* nodep) {
+        const AstNode* backp = nodep->backp();
+        while (backp && backp->nextp() == nodep) {
+            nodep = backp;
+            backp = nodep->backp();
+        }
+        return backp;
+    }
+
     // What the written declaration says, where it is linked into the design
     // it was read from. A copy's is not, and answers nothing.
     static bool declaredInPackageAst(const VhdlSymbol* symp, bool& decidedr) {
         decidedr = false;
         const AstNode* const selfp = symp ? symp->declp() : nullptr;
-        for (const AstNode* p = selfp; p; p = p->backp()) {
+        for (const AstNode* p = selfp; p; p = writtenInside(p)) {
             if (p != selfp && (VN_IS(p, VhdlSubprogDecl) || VN_IS(p, VhdlProtectedType))) {
                 decidedr = true;
                 return false;
