@@ -5945,13 +5945,29 @@ private:
         } else if (m_protClassp && m_modp) {
             // Declared outside the protected type, so it belongs to the
             // module however it was reached
+            nameForPackage(varp, symp);
             m_modp->addStmtsp(varp);
             keepValueWith(m_modp);
         } else {
+            // Two packages may each declare a constant of the same name, and
+            // one that cannot come to the unit is left wherever the reading
+            // subprogram ends up -- which may be where the other one is. The
+            // package it was declared in is what tells the two apart.
+            nameForPackage(varp, symp);
             m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
             keepValueWith(nullptr);
         }
         return varp;
+    }
+
+    // An object a package declares keeps the package's name on it wherever
+    // it goes, since the simple name alone is not its own (4.3, 12.4)
+    void nameForPackage(AstVar* varp, const VhdlSymbol* symp) {
+        if (!declaredInPackage(symp)) return;
+        const std::string name = pkgObjectName(symp);
+        if (varp->name() == name) return;
+        m_names.insert(name);
+        varp->name(name);
     }
 
     // Whether what an object was given is a value that can be worked out
@@ -6270,8 +6286,13 @@ private:
         }
         if (!declaredInPackage(symp)) return false;
         // A constant standing for a generic an instantiation supplied is that
-        // instance's, not the design's
-        if (varp->varType() != VVarType::VAR) return false;
+        // instance's, not the design's -- which is what naming a generic says,
+        // and not what being emitted as a parameter says: a constant whose
+        // value is settled before the design runs is emitted that way whether
+        // an instantiation had anything to do with it or not
+        if (varp->varType() != VVarType::VAR && varp->varType() != VVarType::LPARAM) {
+            return false;
+        }
         // Its value may name a generic, which an instantiation supplies and
         // which is therefore that module's: a constant worked out from one
         // is that module's too, and stays with it
@@ -6342,11 +6363,20 @@ private:
     }
 
     AstVar* constVarFor(VhdlSymbol* symp, FileLine* flp) {
+        const auto found = m_pkgObjs.find(symp);
+        if (found != m_pkgObjs.end()) {
+            m_vars[symp] = found->second;
+            return found->second;
+        }
         AstVar* const varp = newVar(symp, VVarType::VAR, flp);
         varp->valuep(lowerValue(symp->value(), symp->typep(), flp));
         if (m_protClassp) {
             m_protClassp->addStmtsp(varp);
-        } else {
+        } else if (!shareObjectIntoUnit(symp, varp)) {
+            // A constant a package declares is one object for the design
+            // (4.3), and every subprogram that reads it reads that one --
+            // otherwise each gets a copy of its own and the copies collide
+            // wherever two of those subprograms end up together
             m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
         }
         return varp;
@@ -18540,6 +18570,26 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
             for (AstNodeFTask* const taskp : movable) {
                 for (AstVar* const varp : ownVarsOutside(taskp, soleTaskOf)) {
                     if (!varp->backp()) continue;
+                    // An object a package declares is one object for the
+                    // design (4.3). A module that read it first made its own,
+                    // and every module that did is bringing one here now, so
+                    // the first to arrive is the one and the rest answer to it
+                    const auto symIt = m_varSym.find(varp);
+                    VhdlSymbol* const symp
+                        = symIt == m_varSym.end() ? nullptr : symIt->second;
+                    if (symp && declaredInPackage(symp) && !namesGeneric(varp)) {
+                        const auto haveIt = m_pkgObjs.find(symp);
+                        if (haveIt != m_pkgObjs.end()) {
+                            if (haveIt->second != varp) redirect.emplace(varp, haveIt->second);
+                            continue;
+                        }
+                        varp->unlinkFrBack();
+                        varp->name(pkgObjectName(symp));
+                        varp->lifetime(VLifetime::STATIC_EXPLICIT);
+                        unitp->addStmtsp(varp);
+                        m_pkgObjs.emplace(symp, varp);
+                        continue;
+                    }
                     varp->unlinkFrBack();
                     varp->lifetime(VLifetime::STATIC_EXPLICIT);
                     unitp->addStmtsp(varp);
@@ -18554,6 +18604,17 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
                     const auto it = taskRedirect.find(refp->taskp());
                     if (it == taskRedirect.end() || refp->taskp() == it->second) return;
                     refp->taskp(it->second);
+                    refp->name(it->second->name());
+                });
+            }
+            // What the subprograms brought with them may have answered to an
+            // object already here, and the references to it are still the ones
+            // the module made
+            if (!redirect.empty()) {
+                m_netlistp->foreach([&](AstVarRef* refp) {
+                    const auto it = redirect.find(refp->varp());
+                    if (it == redirect.end() || refp->varp() == it->second) return;
+                    refp->varp(it->second);
                     refp->name(it->second->name());
                 });
             }
