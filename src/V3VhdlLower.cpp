@@ -6869,6 +6869,20 @@ private:
         return callp->prefixp();
     }
 
+    // Where an alias renumbers, an index that aliasShift has put onto what
+    // the alias denotes is counted the way that object is counted, not the
+    // way the alias is -- a STRING starts where its own range starts, and
+    // "alias revS : string(3 downto 1) is S" would otherwise take three off
+    // an index already brought back to S's own numbering (6.6.2)
+    const VhdlType* aliasIndexType(VhdlSymbol* symp, const VhdlType* typep) const {
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return typep;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!declp || !declp->targetp()) return typep;
+        if (aliasKeepsRange(symp, declp)) return typep;
+        const VhdlType* const ttp = declp->targetp()->vhdlTypep();
+        return ttp ? ttp : typep;
+    }
+
     // An index into an alias, put onto the range of what it denotes
     static AstNodeExpr* aliasShift(VhdlSymbol* symp, AstNodeExpr* idxp, FileLine* flp) {
         if (!symp || symp->kind() != VhdlSymKind::ALIAS || !idxp) return idxp;
@@ -8267,8 +8281,9 @@ private:
                     // A slice of a STRING is a substring: Verilator's string
                     // is characters, not bits, so a part select of it means
                     // nothing
-                    return new AstSubstrN{flp, fromp, stringIndex(prefixTypep, leftp, flp),
-                                          stringIndex(prefixTypep, rightp, flp)};
+                    const VhdlType* const idxTypep = aliasIndexType(objSymp, prefixTypep);
+                    return new AstSubstrN{flp, fromp, stringIndex(idxTypep, leftp, flp),
+                                          stringIndex(idxTypep, rightp, flp)};
                 }
                 // A slice whose bounds move together but keep their width --
                 // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
@@ -8316,8 +8331,9 @@ private:
                     return nullptr;
                 }
                 indexp = aliasShift(objSymp, indexp, flp);
-                indexp = stringIndex(prefixTypep, indexp, flp);
-                indexp = logicIndex(prefixTypep, dim, indexp, flp);
+                const VhdlType* const idxTypep = aliasIndexType(objSymp, prefixTypep);
+                indexp = stringIndex(idxTypep, indexp, flp);
+                indexp = logicIndex(idxTypep, dim, indexp, flp);
                 // A value that carries its own bounds is stored from zero,
                 // whatever range it was made with
                 if (dim == 0 && isDynObj(nodep->prefixp())) {
