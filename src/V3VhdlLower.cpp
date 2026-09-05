@@ -3105,6 +3105,83 @@ private:
         return funcp;
     }
 
+    std::map<std::pair<const VhdlType*, bool>, AstNodeFTask*> m_dynResizeFuncs;
+
+    // RESIZE to a length only running settles.  Numeric_std defines it by
+    // the two right-hand ends lining up: whatever falls off the left is
+    // lost, and whatever the result is short is filled -- with zeros for an
+    // UNSIGNED, and with the sign for a SIGNED, whose leftmost element is
+    // the operand's sign however the two lengths compare (9.3.6).  It reads
+    // the operand's own elements rather than the number it stands for, so
+    // an operand wider than a machine word, or a negative one, resizes the
+    // way the package says it does.
+    AstNodeFTask* dynResizeFunc(VhdlType* typep, bool signd, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto key = std::make_pair(static_cast<const VhdlType*>(basep), signd);
+        const auto it = m_dynResizeFuncs.find(key);
+        if (it != m_dynResizeFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp
+            = newDynFunc("__Vdynresize", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+        AstVar* const np = dynArg(funcp, "n", newIntDType(flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        AstVar* const offp = newFuncLocal("off", newIntDType(flp), flp);
+        AstVar* const sgnp = newFuncLocal("sgn", bitDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        for (AstVar* const vp : {lenp, offp, sgnp, kp}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lenp, flp), dynCarrierLength(rd(cp, flp), flp)});
+        // The right-hand ends line up, so the element of the operand an
+        // element of the result stands for is this far along it
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(offp, flp), new AstSub{flp, rd(lenp, flp), rd(np, flp)}});
+        // What is short is filled with the sign, which the operand keeps
+        // leftmost.  An operand of no length has no sign, and numeric_std
+        // gives all zeros for one.
+        funcp->addStmtsp(new AstAssign{flp, wr(sgnp, flp), i32(0, flp)});
+        if (signd) {
+            funcp->addStmtsp(new AstIf{
+                flp, new AstGtS{flp, rd(lenp, flp), i32(0, flp)},
+                new AstAssign{flp, wr(sgnp, flp),
+                              new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp),
+                                            i32(0, flp)}}});
+        }
+        // "n-1 downto 0" is the subtype numeric_std gives the result
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp),
+                                       new AstSub{flp, rd(np, flp), i32(1, flp)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), i32(0, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(np, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
+        // An element the operand reaches is copied; one it falls short of
+        // takes the fill.  A SIGNED result keeps the sign leftmost even
+        // where the length it is cut to would have dropped it.
+        AstNodeExpr* takep = new AstGteS{flp, new AstAdd{flp, rd(kp, flp), rd(offp, flp)},
+                                         i32(0, flp)};
+        if (signd) {
+            takep = new AstLogAnd{flp, new AstGtS{flp, rd(kp, flp), i32(0, flp)}, takep};
+        }
+        AstNode* bodyp = new AstAssign{
+            flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)},
+            new AstCond{flp, takep,
+                        new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp),
+                                      new AstAdd{flp, rd(kp, flp), rd(offp, flp)}},
+                        rd(sgnp, flp)}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
+        addHelperFunc(funcp);
+        m_dynResizeFuncs.insert_or_assign(key, funcp);
+        return funcp;
+    }
+
     // ---- Arithmetic over values that carry their own bounds ---------------
     // The operators of numeric_std are declared over unconstrained operands,
     // so any of them can be reached by a value whose length only running
@@ -9259,6 +9336,30 @@ private:
                 cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
                 flp = cflp;
                 sized = firstp;
+            } else if (name == "resize" && resultp && carriedDynamically(resultp)) {
+                // What RESIZE is handed is a vector, not a number, so the
+                // result is built out of its elements.  Reading it as a
+                // number would drop whatever stands above a machine word,
+                // and would widen a negative value with zeros where the
+                // package widens it with its sign (9.3.6).
+                AstNodeExpr* const widthp = lowerExpr(args[1]);
+                AstNodeFTask* const rszp
+                    = widthp ? dynResizeFunc(resultp, isSignedType(resultp), flp) : nullptr;
+                AstNodeExpr* const srcp = rszp ? asDynCarrier(args[0], resultp, flp) : nullptr;
+                if (srcp) {
+                    AstNodeExpr* deadp = firstp;
+                    VL_DO_DANGLING(deadp->deleteTree(), deadp);
+                    FileLine* const wflp = dynFl(flp);
+                    AstFuncRef* const refp
+                        = new AstFuncRef{wflp, rszp->name(),
+                                         AstNode::addNext(new AstArg{wflp, "", srcp},
+                                                          new AstArg{wflp, "", widthp})};
+                    refp->taskp(VN_AS(rszp, Func));
+                    return refp;
+                }
+                if (widthp) VL_DO_DANGLING(widthp->deleteTree(), widthp);
+                unsup(flp, "conversion to a width that is not locally static");
+                return nullptr;
             } else if (resultp && carriedDynamically(resultp)) {
                 // What the value is given to carries its own bounds, so the
                 // width the call names is the length it is made with
