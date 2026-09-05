@@ -3833,6 +3833,11 @@ private:
         }
         const auto it = m_specializations.find(key);
         if (it != m_specializations.end()) {
+            // The copy for this key is the one whose body is being analyzed
+            // right now, so this is the call it makes to itself. It names the
+            // original until the copy is finished, and the round that follows
+            // binds it to the copy (4.2.1).
+            if (!it->second) return;
             nodep->vhdlSymp(it->second);
             takeResultType(nodep, it->second);
             return;
@@ -3844,9 +3849,13 @@ private:
         // could not be, if a recursive call kept folding to a new one
         if (m_count > 4096) return;
         const std::string name = symp->name() + "__V" + std::to_string(++m_count);
+        // Claimed before the copy's body is analyzed, since analyzing it
+        // reaches the calls the body makes -- and one of those may be to the
+        // subprogram being copied, which is this same copy and not another
+        m_specializations.emplace(key, nullptr);
         VhdlSymbol* const newp
             = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, actualValues, name);
-        m_specializations.emplace(key, newp);
+        m_specializations[key] = newp;
         if (newp) {
             m_madeSyms.insert(newp);
             nodep->vhdlSymp(newp);
@@ -3856,9 +3865,7 @@ private:
             // a call written inside it can be specialized where it could not
             // be before. Its own declarations and statements, not what
             // follows it: the copy was put beside the original, so its
-            // siblings are the rest of the package. The cache entry is in
-            // place first, so a subprogram that calls itself finds the copy
-            // it is already in rather than making another (4.2.1).
+            // siblings are the rest of the package.
             if (AstVhdlSubprogDecl* const copyDeclp = newp->bodyp()) {
                 passOver(copyDeclp->declsp());
                 passOver(copyDeclp->stmtsp());
