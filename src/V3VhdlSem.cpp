@@ -3438,6 +3438,10 @@ class VhdlSpecVisitor final : public VNVisitor {
     // Subprogram and actual types -> the copy made for them
     std::map<std::string, VhdlSymbol*> m_specializations;
     std::set<const VhdlSymbol*> m_madeSyms;  // Copies, which are never copied again
+    // A subprogram a copy was made from, and the actuals it was made for
+    using VhdlSpecFrame = std::pair<const VhdlSymbol*, std::vector<VhdlType*>>;
+    std::map<const VhdlSymbol*, VhdlSpecFrame> m_copyOf;  // What each copy was made for
+    std::vector<VhdlSpecFrame> m_within;  // The copies being made or walked
     int m_count = 0;
     bool m_madeOne = false;
 
@@ -3461,6 +3465,19 @@ public:
 
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
+    // A copy's body is walked again on every later round, so what a call is
+    // written inside is read from the body rather than from how it was reached
+    void visit(AstVhdlSubprogDecl* nodep) override {
+        const VhdlSymbol* const symp = nodep->vhdlSymp();
+        const auto it = symp ? m_copyOf.find(symp->resolved()) : m_copyOf.end();
+        if (it == m_copyOf.end()) {
+            iterateChildren(nodep);
+            return;
+        }
+        m_within.push_back(it->second);
+        iterateChildren(nodep);
+        m_within.pop_back();
+    }
     void visit(AstVhdlCall* nodep) override {
         iterateChildren(nodep);
         trySpecialize(nodep, nodep->vhdlSymp(), nodep->argsp());
@@ -3727,6 +3744,30 @@ private:
         specializeWithActuals(nodep, symp, byFormalExpr, individual);
     }
 
+    // Whether a copy for these actuals would be one of a terminating series.
+    // A call a copy makes to the subprogram it is a copy of is written in
+    // terms of the copy's own formals, so the actuals it passes on say
+    // whether the recursion is getting anywhere: every length no longer than
+    // the copy's own means there is a last copy, and a longer one means
+    // there is not -- "p(prefix & \"  \")" asks for a copy per depth, and
+    // the depth is a value, which no copy can settle.
+    bool descends(const VhdlSymbol* symp,
+                  const std::vector<VhdlType*>& actualTypes) const {
+        for (const VhdlSpecFrame& frame : m_within) {
+            if (frame.first != symp) continue;
+            if (frame.second.size() != actualTypes.size()) continue;
+            for (size_t i = 0; i < actualTypes.size(); ++i) {
+                const VhdlType* const newp = actualTypes[i];
+                const VhdlType* const oldp = frame.second[i];
+                if (!newp || !oldp) continue;
+                if (newp->base()->kind() != VhdlTypeKind::ARRAY) continue;
+                if (oldp->base()->kind() != VhdlTypeKind::ARRAY) continue;
+                if (newp->dimLength(0) > oldp->dimLength(0)) return false;
+            }
+        }
+        return true;
+    }
+
     // The copy itself, given what each formal is associated with. An operator
     // the design declared is a subprogram like any other (4.5.2), and its
     // operands are its actuals, so it comes here too.
@@ -3845,10 +3886,18 @@ private:
         AstVhdlSubprogDecl* const bodyp = symp->bodyp();
         VhdlScope* const regionp = symp->innerp() ? symp->innerp()->parentp() : nullptr;
         if (!bodyp || !regionp) return;
+        // A subprogram that calls itself with a longer argument has no last
+        // copy, since each copy asks for one longer still. Such a call keeps
+        // the original, whose parameter carries its bounds with the value.
+        if (!descends(symp, actualTypes)) return;
         // A copy per call site is bounded by the source; a copy per *value*
         // could not be, if a recursive call kept folding to a new one
         if (m_count > 4096) return;
         const std::string name = symp->name() + "__V" + std::to_string(++m_count);
+        // The copy's own body is analyzed before it is made, so the frame is
+        // in place from here: a call it makes to what it is a copy of is the
+        // recursive one, and it is that call the descent test has to see
+        m_within.emplace_back(symp, actualTypes);
         // Claimed before the copy's body is analyzed, since analyzing it
         // reaches the calls the body makes -- and one of those may be to the
         // subprogram being copied, which is this same copy and not another
@@ -3857,6 +3906,7 @@ private:
             = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, actualValues, name);
         m_specializations[key] = newp;
         if (newp) {
+            m_copyOf.emplace(newp, m_within.back());
             m_madeSyms.insert(newp);
             nodep->vhdlSymp(newp);
             takeResultType(nodep, newp);
@@ -3871,6 +3921,7 @@ private:
                 passOver(copyDeclp->stmtsp());
             }
         }
+        m_within.pop_back();
     }
 
     // The copy's result has a length where the original's had none, so the
