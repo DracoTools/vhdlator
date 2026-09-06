@@ -3755,6 +3755,7 @@ void AstCFunc::dump(std::ostream& str) const {
     if (needProcess()) str << " [NPRC]";
     if (entryPoint()) str << " [ENTRY]";
     if (noLife()) str << " [NOLIFE]";
+    if (ordersWithCaller()) str << " [ORDCALLER]";
 }
 void AstCFunc::dumpJson(std::ostream& str) const {
     dumpJsonBoolFuncIf(str, slow);

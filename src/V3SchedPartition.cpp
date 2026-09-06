@@ -39,6 +39,7 @@
 #include "V3EmitV.h"
 #include "V3Graph.h"
 #include "V3Sched.h"
+#include "V3Task.h"
 
 #include <tuple>
 #include <unordered_map>
@@ -199,16 +200,17 @@ class SchedGraphBuilder final : public VNVisitor {
         // Add edges based on references
         V3Sched::util::VarScopeSet forceReadEdgeIgnores;
         V3Sched::util::collectForceReadEdgeIgnores(nodep, forceReadEdgeIgnores);
-        nodep->foreach([this, logicVtxp, &forceReadEdgeIgnores](const AstVarRef* vrefp) {
-            AstVarScope* const vscp = vrefp->varScopep();
-            if (vrefp->access().isReadOrRW() && m_readTriggersThisLogic(vscp)
-                && !forceReadEdgeIgnores.count(vscp)) {
-                new V3GraphEdge{m_graphp, getVarVertex(vscp), logicVtxp, 10};
-            }
-            if (vrefp->access().isWriteOrRW() && !vrefp->varp()->ignoreSchedWrite()) {
-                new V3GraphEdge{m_graphp, logicVtxp, getVarVertex(vscp), 10};
-            }
-        });
+        V3Task::foreachVarRefThroughCalls(
+            nodep, [this, logicVtxp, &forceReadEdgeIgnores](const AstVarRef* vrefp) {
+                AstVarScope* const vscp = vrefp->varScopep();
+                if (vrefp->access().isReadOrRW() && m_readTriggersThisLogic(vscp)
+                    && !forceReadEdgeIgnores.count(vscp)) {
+                    new V3GraphEdge{m_graphp, getVarVertex(vscp), logicVtxp, 10};
+                }
+                if (vrefp->access().isWriteOrRW() && !vrefp->varp()->ignoreSchedWrite()) {
+                    new V3GraphEdge{m_graphp, logicVtxp, getVarVertex(vscp), 10};
+                }
+            });
 
         // If the logic calls a 'context' DPI import, it might fire the DPI Export trigger
         if (m_dpiExportTriggerp) {
@@ -377,7 +379,7 @@ LogicRegions partition(LogicByScope& clockedLogic, LogicByScope& combinationalLo
         const VNUser2InUse user2InUse;  // AstVarScope::user2() -> bool: written in Active region
 
         const auto markVars = [](AstNode* nodep) {
-            nodep->foreach([](const AstNodeVarRef* vrefp) {
+            V3Task::foreachVarRefThroughCalls(nodep, [](const AstVarRef* vrefp) {
                 AstVarScope* const vscp = vrefp->varScopep();
                 if (vrefp->access().isReadOrRW()) vscp->user1(true);
                 if (vrefp->access().isWriteOrRW() && !vrefp->varp()->ignoreSchedWrite())
@@ -400,7 +402,7 @@ LogicRegions partition(LogicByScope& clockedLogic, LogicByScope& combinationalLo
                 nextp = nodep->nextp();
                 if (AstAlwaysPre* const logicp = VN_CAST(nodep, AlwaysPre)) {
                     bool toActiveRegion = false;
-                    logicp->foreach([&](const AstNodeVarRef* vrefp) {
+                    V3Task::foreachVarRefThroughCalls(logicp, [&](const AstVarRef* vrefp) {
                         AstVarScope* const vscp = vrefp->varScopep();
                         if (vrefp->access().isReadOnly()) {
                             // Variable only read in Pre, and is written in active region

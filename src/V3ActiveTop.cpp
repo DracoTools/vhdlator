@@ -29,6 +29,7 @@
 
 #include "V3Const.h"
 #include "V3SenTree.h"
+#include "V3Task.h"
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -45,18 +46,22 @@ class ActiveTopVisitor final : public VNVisitor {
     // METHODS
     static bool isInitial(AstNode* nodep) {
         const VNUser1InUse user1InUse;
-        // Return true if no variables that read.
-        return nodep->forall([&](const AstVarRef* refp) -> bool {
+        // Return true if no variables that read. A call to a task V3Task left
+        // out of line reads whatever that task reads, so look through it.
+        bool reads = false;
+        V3Task::foreachVarRefThroughCalls(nodep, [&](const AstVarRef* refp) {
+            if (reads) return;
             AstVarScope* const vscp = refp->varScopep();
             // Note: Use same heuristic as ordering does to ignore written variables
             // TODO: Use live variable analysis.
             if (refp->access().isWriteOnly()) {
                 vscp->user1(true);
-                return true;
+                return;
             }
             // Read or ReadWrite: OK if written before
-            return vscp->user1();
+            if (!vscp->user1()) reads = true;
         });
+        return !reads;
     }
 
     // VISITORS

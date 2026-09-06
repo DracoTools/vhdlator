@@ -117,6 +117,9 @@ class TaskStateVisitor final : public VNVisitor {
     AstNodeFTask* m_ctorp = nullptr;  // Class constructor
     AstClass* m_classp = nullptr;  // Current class
     V3Graph m_callGraph;  // Task call graph
+    // Emitted size of one inlined copy of each task, 1 if it is not inlined
+    std::unordered_map<const TaskFTaskVertex*, uint64_t> m_inlinedSizes;
+    VDouble0 m_statCostNoInline;  // Statistic tracking
     TaskBaseVertex* m_curVxp;  // Current vertex we're adding to
     std::vector<AstInitialAutomatic*> m_initialps;  // Initial blocks to move
     bool m_underPortVar = false;  // Visiting under a port AstVar; any expression there
@@ -193,6 +196,71 @@ private:
         }
     }
 
+    // Whether a task or function may be left as a C function of its own. Some
+    // must be inlined at their call sites whatever they cost.
+    static bool canDeclineInline(const AstNodeFTask* ftaskp) {
+        // A public task keeps an inlined copy at its internal call sites and a
+        // separate public one, so declining buys nothing
+        if (ftaskp->taskPublic()) return false;
+        if (ftaskp->dpiImport() || ftaskp->dpiExport()) return false;
+        if (ftaskp->classMethod() || ftaskp->isConstructor()) return false;
+        if (ftaskp->recursive()) return false;
+        return true;
+    }
+
+    // Sizes are multiplied together down the call graph, so they saturate
+    static uint64_t satMul(uint64_t a, uint64_t b) {
+        constexpr uint64_t MAX_SIZE = 1ULL << 40;
+        if (b != 0 && a > MAX_SIZE / b) return MAX_SIZE;
+        return std::min(MAX_SIZE, a * b);
+    }
+    static uint64_t satAdd(uint64_t a, uint64_t b) {
+        constexpr uint64_t MAX_SIZE = 1ULL << 40;
+        return std::min(MAX_SIZE, a + b);
+    }
+
+    // Emitted size of one inlined copy of the given task, counting the tasks it
+    // will itself inline, deciding bottom up whether that is affordable.
+    //
+    // A task inlined into a task that is itself inlined is written out once per
+    // call path, so with no bound the emitted code grows with the number of
+    // paths through the call graph rather than with the size of the source. A
+    // verification library is a deep call graph by construction -- a check
+    // calls a formatter calls a string helper -- and multiplies out to
+    // hundreds of megabytes. This is the same cost model module inlining has
+    // in --inline-mult.
+    uint64_t inlinedSize(TaskFTaskVertex* vtxp, uint64_t limit,
+                         std::vector<const TaskFTaskVertex*>& stack) {
+        const auto pair = m_inlinedSizes.find(vtxp);
+        if (pair != m_inlinedSizes.end()) return pair->second;
+        // A cycle in the call graph is recursion, which is never inlined
+        for (const TaskFTaskVertex* const onStackp : stack) {
+            if (onStackp == vtxp) return 1;
+        }
+        stack.push_back(vtxp);
+        uint64_t size = vtxp->nodep()->nodeCount();
+        for (V3GraphEdge& edge : vtxp->outEdges()) {
+            TaskFTaskVertex* const calleep = edge.top()->cast<TaskFTaskVertex>();
+            if (!calleep) continue;
+            const uint64_t each = inlinedSize(calleep, limit, stack);
+            size = satAdd(size, satMul(static_cast<uint64_t>(edge.weight()), each));
+        }
+        stack.pop_back();
+        uint64_t callSites = 0;
+        for (V3GraphEdge& edge : vtxp->inEdges()) callSites += edge.weight();
+        // One call site never duplicates anything, so it is always worth inlining
+        if (!vtxp->noInline() && callSites > 1 && canDeclineInline(vtxp->nodep())
+            && size > limit / callSites) {
+            UINFO(5, "No task inline, " << size << " nodes at " << callSites
+                                        << " call sites: " << vtxp->nodep());
+            vtxp->noInline(true);
+            ++m_statCostNoInline;
+        }
+        const uint64_t result = vtxp->noInline() ? 1 : size;
+        m_inlinedSizes.emplace(vtxp, result);
+        return result;
+    }
+
     void decideInlining() {
         for (V3GraphVertex& vtx : m_callGraph.vertices()) {
             TaskFTaskVertex* const ftVtxp = vtx.cast<TaskFTaskVertex>();
@@ -218,6 +286,17 @@ private:
             if (ftaskp->taskPublic()) continue;
             // If the function is pure, it's OK not to inline, so don't do it
             if (ftVtxp->pure()) ftVtxp->noInline(true);
+        }
+
+        // Then decline whatever costs too much to write out at every call site
+        const int mult = v3Global.opt.inlineTaskMult();
+        if (mult < 1) return;  // Unbounded inlining
+        const uint64_t limit = static_cast<uint64_t>(mult);
+        std::vector<const TaskFTaskVertex*> stack;
+        for (V3GraphVertex& vtx : m_callGraph.vertices()) {
+            if (TaskFTaskVertex* const ftVtxp = vtx.cast<TaskFTaskVertex>()) {
+                inlinedSize(ftVtxp, limit, stack);
+            }
         }
     }
 
@@ -352,7 +431,9 @@ public:
         decideInlining();
         if (dumpGraphLevel()) m_callGraph.dumpDotFilePrefixed("task_call");
     }
-    ~TaskStateVisitor() override = default;
+    ~TaskStateVisitor() override {
+        V3Stats::addStat("Optimizations, Functions not inlined by cost", m_statCostNoInline);
+    }
     VL_UNCOPYABLE(TaskStateVisitor);
 };
 
@@ -1750,11 +1831,19 @@ class TaskVisitor final : public VNVisitor {
 
             const bool noInline = m_statep->ftaskNoInline(nodep);
             const bool needsNonInlineCFunc = m_statep->ftaskNeedsNonInlineCFunc(nodep);
-            // Warn if not inlining an impure ftask (unless method, recursive,
-            // or interface-local member access, which is not truly external).
+            // A task left out of line is still a statement of whoever calls it:
+            // scheduling and ordering read its body at each call site, so a
+            // reference out of its own scope is fine. That only works where the
+            // call is a plain AstCCall naming the body, which a class method or
+            // a virtual interface method dispatched through a handle is not.
+            const bool ordersWithCaller = noInline && !needsNonInlineCFunc && !nodep->classMethod()
+                                          && !nodep->dpiImport() && !nodep->dpiExport();
+            // Warn if not inlining an impure ftask we cannot order with its
+            // caller (unless method, recursive, or interface-local member
+            // access, which is not truly external).
             // Will likely not schedule correctly.
             // TODO: Why not if recursive? It will not work ...
-            if (noInline && !nodep->classMethod() && !nodep->recursive()) {
+            if (noInline && !ordersWithCaller && !nodep->classMethod() && !nodep->recursive()) {
                 if (AstNode* const impurep = m_statep->checkImpure(nodep)) {
                     if (!isIfaceLocalImpure(nodep, impurep)) {
                         nodep->v3warn(IMPURE, "Unsupported: External variable referenced by "
@@ -1777,6 +1866,7 @@ class TaskVisitor final : public VNVisitor {
                 if (nodep->isConstructor()) m_statep->remapFuncClassp(nodep, clonedFuncp);
                 const bool makeNonInlineFunc = noInline || needsNonInlineCFunc;
                 if (AstCFunc* const cfuncp = makeUserFunc(clonedFuncp, makeNonInlineFunc)) {
+                    if (ordersWithCaller) cfuncp->ordersWithCaller(true);
                     nodep->addNextHere(cfuncp);
                     if (nodep->dpiImport() || makeNonInlineFunc) {
                         m_statep->ftaskCFuncp(nodep, cfuncp);

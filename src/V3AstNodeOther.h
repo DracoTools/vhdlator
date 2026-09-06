@@ -545,6 +545,8 @@ class AstCFunc final : public AstNode {
     bool m_noLife : 1;  // Disable V3Life on this function - has multiple calls, and reads Syms
                         // state
     bool m_isCovergroupSample : 1;  // Automatic covergroup sample() function
+    bool m_ordersWithCaller : 1;  // Body was left out of line by V3Task, so scheduling and
+                                  // ordering must analyze it as part of each caller
     int m_cost;  // Function call cost
 public:
     AstCFunc(FileLine* fl, const string& name, AstScope* scopep, const string& rtnType = "")
@@ -576,6 +578,7 @@ public:
         m_recursive = false;
         m_noLife = false;
         m_isCovergroupSample = false;
+        m_ordersWithCaller = false;
         m_cost = v3Global.opt.instrCountDpi();  // As proxy for unknown general DPI cost
     }
     ASTGEN_MEMBERS_AstCFunc;
@@ -654,6 +657,8 @@ public:
     bool recursive() const { return m_recursive; }
     void noLife(bool flag) { m_noLife = flag; }
     bool noLife() const { return m_noLife; }
+    void ordersWithCaller(bool flag) { m_ordersWithCaller = flag; }
+    bool ordersWithCaller() const { return m_ordersWithCaller; }
     bool isCovergroupSample() const { return m_isCovergroupSample; }
     void isCovergroupSample(bool flag) { m_isCovergroupSample = flag; }
     void cost(int cost) { m_cost = cost; }

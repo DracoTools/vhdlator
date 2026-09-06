@@ -1592,6 +1592,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
     DECL_OPTION("-inline-cfuncs", Set, &m_inlineCFuncs);
     DECL_OPTION("-inline-cfuncs-product", Set, &m_inlineCFuncsProduct);
     DECL_OPTION("-inline-mult", Set, &m_inlineMult);
+    DECL_OPTION("-inline-task-mult", Set, &m_inlineTaskMult);
     DECL_OPTION("-instr-count-dpi", CbVal, [this, fl](int val) {
         m_instrCountDpi = val;
         if (m_instrCountDpi < 0) fl->v3fatal("--instr-count-dpi must be non-negative: " << val);
@@ -2459,5 +2460,6 @@ void V3Options::optimize(int level) {
     // And set specific optimization levels
     if (level >= 3) {
         m_inlineMult = -1;  // Maximum inlining
+        m_inlineTaskMult = -1;  // Maximum inlining
     }
 }

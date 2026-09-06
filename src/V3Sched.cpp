@@ -45,6 +45,7 @@
 #include "V3Order.h"
 #include "V3SenExprBuilder.h"
 #include "V3Stats.h"
+#include "V3Task.h"
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -505,7 +506,7 @@ AstNode* createInputCombLoop(AstNetlist* netlistp, AstCFunc* const initFuncp,
     // so we can make them sc_sensitive
     if (v3Global.opt.systemC()) {
         logic.foreachLogic([](AstNode* logicp) {
-            logicp->foreach([](AstVarRef* refp) {
+            V3Task::foreachVarRefThroughCalls(logicp, [](AstVarRef* refp) {
                 if (refp->access().isWriteOnly()) return;
                 AstVarScope* const vscp = refp->varScopep();
                 if (vscp->scopep()->isTop() && vscp->varp()->isNonOutput()) {

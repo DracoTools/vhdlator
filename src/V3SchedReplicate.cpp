@@ -38,6 +38,7 @@
 
 #include "V3Graph.h"
 #include "V3Sched.h"
+#include "V3Task.h"
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -220,7 +221,7 @@ std::unique_ptr<Graph> buildGraph(const LogicRegions& logicRegions) {
             V3Sched::util::VarScopeSet forceReadEdgeIgnores;
             V3Sched::util::collectForceReadEdgeIgnores(nodep, forceReadEdgeIgnores);
 
-            nodep->foreach([&](AstVarRef* refp) {
+            V3Task::foreachVarRefThroughCalls(nodep, [&](AstVarRef* refp) {
                 AstVarScope* const vscp = refp->varScopep();
                 SchedReplicateVarVertex* const vvtxp = getVarVertex(vscp);
                 if (refp->access().isReadOrRW() && !vscp->user3SetOnce()

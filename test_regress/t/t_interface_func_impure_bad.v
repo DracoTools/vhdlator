@@ -26,9 +26,13 @@ endinterface
 
 module t;
   iface i ();
+  virtual iface vi;
 
   initial begin
-    i.local_write();
-    i.external_write();
+    // A call through a virtual interface handle is dispatched at run time, so
+    // scheduling cannot read the body of the task it reaches
+    vi = i;
+    vi.local_write();
+    vi.external_write();
   end
 endmodule

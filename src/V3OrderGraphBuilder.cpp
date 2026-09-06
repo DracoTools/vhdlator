@@ -108,6 +108,8 @@ class OrderGraphBuilder final : public VNVisitor {
     bool m_inClocked = false;  // Underneath clocked AstActive
     bool m_inPre = false;  // Underneath AlwaysPre
     bool m_inPost = false;  // Underneath AstAlwaysPost
+    // Bodies of out of line tasks being read as part of the caller, innermost last
+    std::vector<const AstCFunc*> m_following;
     std::function<bool(const AstVarScope*)> m_readTriggersCombLogic;
     V3Sched::util::VarScopeSet m_forceReadEdgeIgnores;
     const bool m_parallel;  // Ordering for multi-threaded execution (record variable accesses)
@@ -196,6 +198,9 @@ class OrderGraphBuilder final : public VNVisitor {
         // for ordering, we should be able to assert this:
         UASSERT_OBJ(m_scopep, nodep, "AstVarRef not under scope");
         UASSERT_OBJ(m_logicVxp, nodep, "AstVarRef not under logic");
+        // A variable local to an out of line task is one object shared by all
+        // its call sites, so it says nothing about how they depend on each other
+        if (!m_following.empty() && nodep->varp()->isFuncLocal()) return;
         AstVarScope* const varscp = nodep->varScopep();
         UASSERT_OBJ(varscp, nodep, "Var didn't get varscoped in V3Scope.cpp");
 
@@ -323,7 +328,20 @@ class OrderGraphBuilder final : public VNVisitor {
             }
         }
     }
-    void visit(AstCCall* nodep) override { iterateChildren(nodep); }
+    void visit(AstCCall* nodep) override {
+        iterateChildren(nodep);  // The arguments, which are evaluated here
+        // A task V3Task left out of line is still a statement of this block, so
+        // read its body here: what it touches is touched by whoever calls it.
+        AstCFunc* const funcp = nodep->funcp();
+        if (!funcp->ordersWithCaller()) return;
+        // Recursion, which is never left out of line, but be safe
+        for (const AstCFunc* const onStackp : m_following) {
+            if (onStackp == funcp) return;
+        }
+        m_following.push_back(funcp);
+        iterateChildren(funcp);
+        m_following.pop_back();
+    }
 
     //--- Logic akin to SystemVerilog Processes (AstNodeProcedure)
     void visit(AstInitial* nodep) override {  // LCOV_EXCL_START

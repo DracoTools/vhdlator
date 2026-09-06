@@ -42,6 +42,7 @@
 #include "V3SenTree.h"
 #include "V3SplitVar.h"
 #include "V3Stats.h"
+#include "V3Task.h"
 
 #include <map>
 #include <unordered_map>
@@ -155,7 +156,7 @@ std::unique_ptr<Graph> buildGraph(const LogicByScope& lbs) {
             V3Sched::util::VarScopeSet forceReadEdgeIgnores;
             V3Sched::util::collectForceReadEdgeIgnores(nodep, forceReadEdgeIgnores);
 
-            nodep->foreach([&](AstVarRef* refp) {
+            V3Task::foreachVarRefThroughCalls(nodep, [&](AstVarRef* refp) {
                 AstVarScope* const vscp = refp->varScopep();
                 SchedAcyclicVarVertex* const vvtxp = getVarVertex(vscp);
                 // We want to cut the narrowest signals

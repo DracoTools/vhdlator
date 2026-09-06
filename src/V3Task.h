@@ -24,6 +24,7 @@
 #include "V3Container.h"
 #include "V3Error.h"
 
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -68,6 +69,37 @@ public:
                                       const string& frPrefix = "") VL_MT_DISABLED;
     static string assignDpiToInternal(const string& lhsName, AstVar* rhsp) VL_MT_DISABLED;
     static const char* dpiTemporaryVarSuffix() VL_MT_SAFE { return s_dpiTemporaryVarSuffix; }
+
+    // Call 'f' on every AstVarRef under 'nodep', descending into the bodies of
+    // the tasks this pass left out of line (AstCFunc::ordersWithCaller): a call
+    // is a statement of whoever wrote it, so what the task reads and writes is
+    // read and written there. Variables local to such a task are skipped --
+    // there is one of each per task rather than per call site, so they say
+    // nothing about how the callers depend on one another.
+    template <typename T_Callable>
+    static void foreachVarRefThroughCalls(AstNode* nodep, T_Callable&& f) {
+        std::vector<const AstCFunc*> following;
+        const std::function<void(AstNode*)> recurse = [&](AstNode* rootp) {
+            const bool inCall = !following.empty();
+            rootp->foreach([&](AstNode* np) {
+                if (AstVarRef* const refp = VN_CAST(np, VarRef)) {
+                    if (inCall && refp->varp()->isFuncLocal()) return;
+                    f(refp);
+                } else if (const AstCCall* const callp = VN_CAST(np, CCall)) {
+                    AstCFunc* const funcp = callp->funcp();
+                    if (!funcp->ordersWithCaller()) return;
+                    // Recursion, which is never left out of line, but be safe
+                    for (const AstCFunc* const onStackp : following) {
+                        if (onStackp == funcp) return;
+                    }
+                    following.push_back(funcp);
+                    recurse(funcp);
+                    following.pop_back();
+                }
+            });
+        };
+        recurse(nodep);
+    }
 };
 
 #endif  // Guard

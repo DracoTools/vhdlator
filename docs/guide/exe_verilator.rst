@@ -1028,6 +1028,24 @@ Summary:
    setting is ignored for very small modules; they will always be inlined,
    if allowed.
 
+.. option:: --inline-task-mult <value>
+
+   Tune the inlining of tasks and functions. Verilator writes out the body
+   of a task at every place it is called; a task inlined into a task that is
+   itself inlined is written out once per call path, so the emitted code
+   grows with the number of paths through the call graph rather than with
+   the size of the source. The default value of 20000 specifies that a task
+   whose inlined body, counted over all of its call sites, would come to
+   more than 20000 operations is left as a function of its own and called.
+   A task with a single call site is always inlined, as that duplicates
+   nothing. Larger values, or a value < 1 which will inline everything, lead
+   to longer compile times and larger models, but potentially faster
+   simulation speed.
+
+   Raise this if a design is dominated by small hot tasks. Lower it if a
+   verification framework -- a deep call graph of small helpers, which UVVM,
+   VUnit and OSVVM all are -- makes the model too large to compile.
+
 .. option:: --instr-count-dpi <value>
 
    Tune the assumed dynamic instruction count of the average DPI
@@ -1278,7 +1296,8 @@ Summary:
    opposed to :vlopt:`-CFLAGS -O3 <-CFLAGS>` which affects the C compiler's
    optimization. :vlopt:`-O3` may improve simulation performance at the
    cost of compile time. This currently sets :vlopt:`--inline-mult -1
-   <--inline-mult>`.
+   <--inline-mult>` and :vlopt:`--inline-task-mult -1
+   <--inline-task-mult>`.
 
 .. option:: -O<optimization-letter>
 
