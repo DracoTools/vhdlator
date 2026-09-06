@@ -8020,6 +8020,23 @@ private:
                 return equal ? static_cast<AstNodeExpr*>(new AstEqD{flp, lhsp, rhsp})
                              : static_cast<AstNodeExpr*>(new AstNeqD{flp, lhsp, rhsp});
             }
+            // An array type's own "=" is false between operands of two
+            // lengths, whatever their elements hold (9.2.3), and so it can
+            // be answered here. Only numeric_std's own comparisons are by
+            // value across lengths, and those were brought to one width
+            // above; nothing else may be, since leaving the two widths to
+            // differ lets the back end pad the shorter operand and find
+            // them equal.
+            {
+                const int lw = staticArrayLength(nodep->lhsp(), ltypep);
+                const int rw = staticArrayLength(nodep->rhsp(), rtypep);
+                if (lw && rw && lw != rw
+                    && !(isNumericVector(ltypep) && isNumericVector(rtypep))) {
+                    VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                    VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                    return new AstConst{flp, AstConst::BitTrue{}, !equal};
+                }
+            }
             // A matching operator lets one side say which places it does not
             // care about, and "-" is how it says so (9.2.3)
             if (nodep->op() == VhdlBinaryOp::MATCH_EQ
@@ -8231,6 +8248,23 @@ private:
     }
 
     // The length of a constrained one-dimensional vector, or 0
+    // How many elements a one-dimensional array operand has, where that is
+    // settled before the design runs: from its own subtype, or -- for a
+    // literal, whose length is its own text and for a bit string the count
+    // written in front of it -- from the characters it stands for
+    static int staticArrayLength(AstNodeVhdlExpr* nodep, const VhdlType* typep) {
+        if (const int w = vectorWidth(typep)) return w;
+        const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
+        if (!litp
+            || (litp->kind() != VhdlLitKind::STRING
+                && litp->kind() != VhdlLitKind::BITSTRING)) {
+            return 0;
+        }
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return 0;
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        return val.isStr() ? static_cast<int>(val.toStr().size()) : 0;
+    }
+
     static int vectorWidth(const VhdlType* typep) {
         if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return 0;
         if (!typep->isConstrainedArray() || typep->dimensions() != 1) return 0;
