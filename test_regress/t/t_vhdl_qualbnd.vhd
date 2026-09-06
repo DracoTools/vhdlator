@@ -43,11 +43,25 @@ architecture a of t_vhdl_qualbnd is
 
     constant K : integer_vector := (7, 8, 9);
 
+    -- A result that is sometimes no elements at all
+    function decode_maybe (n : integer) return std_logic_vector is
+        constant C_NONE : std_logic_vector(0 downto 1) := (others => '0');
+    begin
+        if n = 0 then
+            return C_NONE;
+        elsif n = 1 then
+            return "1010";
+        else
+            return "11001100";
+        end if;
+    end function;
+
 begin
 
     p: process is
         variable o : integer := 1;
         variable t : integer := 2;
+        variable z : integer := 0;
         variable v : integer_vector(0 to 2) := (7, 8, 9);
     begin
         -- A qualified aggregate says how long it is
@@ -62,6 +76,14 @@ begin
 
         assert decode_slv(o) = std_logic_vector'("1010") report "qual slv eq" severity failure;
         assert decode_slv(t) /= std_logic_vector'("1010") report "qual slv ne" severity failure;
+
+        -- A literal of no elements, qualified and bare.  Two arrays are equal
+        -- only where they are the same length, so an empty one equals only
+        -- another empty one.
+        assert decode_maybe(z) = std_logic_vector'("") report "qual null" severity failure;
+        assert decode_maybe(o) /= std_logic_vector'("") report "qual null ne" severity failure;
+        assert decode_maybe(z) = "" report "bare null" severity failure;
+        assert decode_maybe(o) /= "" report "bare null ne" severity failure;
 
         -- What already worked, so a fix cannot be a coincidence
         assert decode(o) = K report "against a constant" severity failure;

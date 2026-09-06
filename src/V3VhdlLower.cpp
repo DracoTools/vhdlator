@@ -2782,6 +2782,45 @@ private:
         return funcp;
     }
 
+    std::map<const VhdlType*, AstNodeFTask*> m_dynNullFuncs;
+
+    // A null literal -- "" -- is a value of no elements at all, so there is
+    // nothing to copy across: the carrier holds nothing and says a range that
+    // runs backwards, which is what a null range is (5.2.1).
+    AstNodeFTask* dynNullFunc(VhdlType* carrierTypep, FileLine* flp) {
+        if (!carrierTypep || !m_modp) return nullptr;
+        const VhdlType* const key = carrierTypep->base();
+        const auto it = m_dynNullFuncs.find(key);
+        if (it != m_dynNullFuncs.end() && usableHelper(it->second)) return it->second;
+        const std::string name = "__Vdynnull" + std::to_string(m_dynNullFuncs.size()) + "__"
+                                 + carrierTypep->base()->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const VhdlType* const idxp = carrierTypep->base()->indexTypes().empty()
+                                         ? nullptr
+                                         : carrierTypep->base()->indexTypes()[0];
+        const bool ascending = idxp ? boundsAscending(idxp) : true;
+        const int64_t left = (idxp && idxp->bounded()) ? idxp->left() : (ascending ? 1 : 0);
+        const int64_t right = ascending ? left - 1 : left + 1;
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "lft", flp),
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left)}});
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "rgt", flp),
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(right)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "q", flp),
+            new AstNewDynamic{flp, new AstConst{flp, AstConst::Signed32{}, 0}, nullptr}});
+        addHelperFunc(funcp);
+        m_dynNullFuncs.insert_or_assign(key, funcp);
+        return funcp;
+    }
+
     // Whatever an expression is worth, as a value that carries its own bounds
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
@@ -2856,6 +2895,14 @@ private:
         if (!typep || !typep->isConstrainedArray()) {
             const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
             if (!litp || litp->kind() != VhdlLitKind::STRING) return nullptr;
+            // A literal of no elements has nothing to copy across
+            if (litp->text().empty()) {
+                AstNodeFTask* const nullFuncp = dynNullFunc(carrierTypep, flp);
+                if (!nullFuncp) return nullptr;
+                AstFuncRef* const nullRefp = new AstFuncRef{flp, nullFuncp->name(), nullptr};
+                nullRefp->taskp(VN_AS(nullFuncp, Func));
+                return nullRefp;
+            }
             AstNodeFTask* const litFuncp = dynOfLiteralFunc(
                 carrierTypep, static_cast<int64_t>(litp->text().size()), flp);
             if (!litFuncp) return nullptr;
