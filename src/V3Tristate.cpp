@@ -1606,8 +1606,15 @@ class TristateVisitor final : public TristateBaseVisitor {
             associateLogic(nodep->rhsp(), nodep);
             // A variable's initial value is what it holds before anything
             // drives it, not a driver of it: a 'z' there leaves the variable
-            // an ordinary variable, so a procedural write to it stands
-            if (!m_inStaticInit) associateLogic(nodep, nodep->lhsp());
+            // an ordinary variable, so a procedural write to it stands.
+            // Neither is a procedural assignment to a variable a driver of
+            // a net. Resolution is a continuous assignment, and a
+            // continuous assignment cannot run between two statements of a
+            // process, so a variable turned into a resolved net reads back
+            // inside its own process as a value the writes never reached.
+            if (!m_inStaticInit && !proceduralVarAssign(nodep)) {
+                associateLogic(nodep, nodep->lhsp());
+            }
         } else {
             if (nodep->user2() & U2_NONGRAPH) {
                 return;  // Iterated here, or created assignment to ignore
@@ -1669,6 +1676,33 @@ class TristateVisitor final : public TristateBaseVisitor {
             iterateAndNextNull(nodep->lhsp());
         }
     }
+    // Whether this is a blocking procedural assignment to a variable rather
+    // than to a net or a port. What such an assignment writes has to be
+    // there for the statement that follows it to read, and resolution
+    // cannot give it that: resolution is a continuous assignment, which
+    // runs after the process rather than between two of its statements. A
+    // non-blocking assignment makes no such promise -- its value is not
+    // there until the time step ends -- so several of those may drive one
+    // variable between them and be resolved, which is what a bus modelled
+    // that way relies on.
+    static bool proceduralVarAssign(const AstNodeAssign* nodep) {
+        if (!VN_IS(nodep, Assign)) return false;
+        const AstNode* lhsp = nodep->lhsp();
+        while (lhsp) {
+            if (const AstSel* const selp = VN_CAST(lhsp, Sel)) {
+                lhsp = selp->fromp();
+            } else if (const AstArraySel* const asp = VN_CAST(lhsp, ArraySel)) {
+                lhsp = asp->fromp();
+            } else {
+                break;
+            }
+        }
+        const AstNodeVarRef* const refp = VN_CAST(lhsp, NodeVarRef);
+        if (!refp || !refp->varp()) return false;
+        const AstVar* const varp = refp->varp();
+        return !varp->isNet() && !varp->isIO();
+    }
+
     void visit(AstAssignW* nodep) override { visitAssign(nodep); }
     void visit(AstAssign* nodep) override { visitAssign(nodep); }
     void visit(AstAssignDly* nodep) override { visitAssign(nodep); }
