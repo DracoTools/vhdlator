@@ -14382,6 +14382,32 @@ private:
         return nullptr;
     }
 
+    enum class VhdlTri : uint8_t { FALSE, TRUE, UNKNOWN };
+
+    // What a condition settled before the design runs is worth, read the way
+    // its own type says (9.2.9). A condition that is not a BOOLEAN is read
+    // through the condition operator, so what decides the branch is whether
+    // the value is '1' -- not whether its position in the type is other than
+    // zero. A STD_LOGIC '0' sits at position two, and reading that as a
+    // truth value takes the branch and throws the else away.
+    static VhdlTri staticTruth(const VhdlValue& val, AstNodeVhdlExpr* condp) {
+        if (!val.isInt()) return VhdlTri::UNKNOWN;
+        const VhdlType* const typep = condp ? condp->vhdlTypep() : nullptr;
+        const VhdlType* const basep = typep ? typep->base() : nullptr;
+        if (!basep || basep == V3VhdlStd::booleanType()) {
+            return val.toInt() == 0 ? VhdlTri::FALSE : VhdlTri::TRUE;
+        }
+        if (basep->kind() == VhdlTypeKind::ENUM && enumIsLogic(basep)) {
+            const std::vector<VhdlSymbol*>& lits = basep->literals();
+            const int64_t pos = val.toInt();
+            if (pos < 0 || pos >= static_cast<int64_t>(lits.size())) return VhdlTri::UNKNOWN;
+            return logicValueOf(lits[static_cast<size_t>(pos)]->name()) == LogicVal::ONE
+                       ? VhdlTri::TRUE
+                       : VhdlTri::FALSE;
+        }
+        return VhdlTri::UNKNOWN;
+    }
+
     AstNode* lowerIf(AstVhdlIf* nodep) {
         std::vector<AstVhdlAlternative*> alts;
         // A condition the copy made for one call site settles is a branch the
@@ -14397,8 +14423,9 @@ private:
                 break;  // The else, and nothing follows it
             }
             const VhdlValue cond = V3VhdlEval::eval(altp->condp());
-            if (cond.isInt()) {
-                if (cond.toInt() == 0) continue;  // Never taken
+            const VhdlTri taken = staticTruth(cond, altp->condp());
+            if (taken != VhdlTri::UNKNOWN) {
+                if (taken == VhdlTri::FALSE) continue;  // Never taken
                 alts.push_back(altp);
                 break;  // Always taken, so nothing after it is reached
             }
