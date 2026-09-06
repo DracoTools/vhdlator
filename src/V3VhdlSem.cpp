@@ -3298,6 +3298,16 @@ bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
             AstVhdlCall* const callp = VN_CAST(retp->valuep(), VhdlCall);
             const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
             if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
+            // A function that may be called with no arguments at all is
+            // called by writing its name and nothing else (4.2.2.1), so
+            // "return put_msg" is a call however little it looks like one
+            if (!namedp && retp->valuep() && !VN_IS(retp->valuep(), VhdlCall)
+                && retp->valuep()->vhdlSymp()) {
+                const VhdlSymbol* const barep = retp->valuep()->vhdlSymp()->resolved();
+                if (barep->kind() == VhdlSymKind::FUNCTION && allParamsDefaulted(barep)) {
+                    namedp = barep;
+                }
+            }
             // A type conversion keeps the length of what it converts, and is
             // dealt with where the returned type is read
             if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
