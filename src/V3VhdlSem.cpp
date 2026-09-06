@@ -1230,6 +1230,8 @@ public:
     void specializeWithin(AstNode* nodep) VL_MT_DISABLED;
     // Whether every element of a record has a length of its own (5.3.3)
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
+    // Whether a subprogram may be called with no arguments at all (4.2.2.1)
+    static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     // A record subtype whose open elements take their bounds from the values
     // written for them one at a time (5.3.3, 6.5.7.1)
     VhdlType* constrainRecordFromParts(VhdlType* typep,
@@ -1342,7 +1344,6 @@ private:
                                       FileLine* flp) VL_MT_DISABLED;
     VhdlType* constrainElementFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                         FileLine* flp) VL_MT_DISABLED;
-    static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
@@ -3538,6 +3539,23 @@ private:
         iterateChildren(nodep);
         trySpecialize(nodep, nodep->vhdlSymp(), nodep->argsp());
     }
+    // A function that may be called with no arguments at all is called by
+    // writing its name and nothing else (4.2.2.1). Such a call has no
+    // argument list to specialize on, but its result may still be something
+    // only a copy of the body can settle the bounds of.
+    void visit(AstVhdlName* nodep) override {
+        iterateChildren(nodep);
+        VhdlSymbol* const symp = nodep->vhdlSymp();
+        if (!symp) return;
+        const VhdlSymbol* const barep = symp->resolved();
+        if (barep->kind() != VhdlSymKind::FUNCTION) return;
+        if (!VhdlSemVisitor::allParamsDefaulted(barep)) return;
+        // The name of the function a call is written on is not itself a call
+        if (const AstVhdlCall* const callp = VN_CAST(nodep->backp(), VhdlCall)) {
+            if (callp->prefixp() == nodep) return;
+        }
+        trySpecialize(nodep, symp, nullptr);
+    }
     // An operator a design declares is an ordinary subprogram whose name
     // happens to be an operator symbol (4.5.2), so it is copied per use in
     // the same way. std_logic_unsigned's "*" is one: its result is as long
@@ -3748,7 +3766,7 @@ private:
         return out;
     }
 
-    void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
+    void trySpecialize(AstNodeVhdlExpr* nodep, VhdlSymbol* symp, AstNode* argsp) {
         if (!needsSpecializing(symp)) return;
         // A copy is never itself specialized: it was made for one call site
         // and has nothing left to fix
@@ -3943,7 +3961,12 @@ private:
         // Nothing to specialize on: no parameter has a length to fix, and no
         // value the call passes is known, so the copy would be the original
         if (byValue) {
-            bool worthIt = false;
+            // A result whose subtype only the body settles is itself something
+            // to specialize on, and the only thing a function with no
+            // parameters has: the copy is what reads the result's bounds off
+            // what the body returns, so without it "return s" out of a
+            // "string(50 to 55)" arrives at the caller renumbered from 1
+            bool worthIt = resultIsUnconstrained(symp);
             for (const VhdlValue& val : actualValues) {
                 if (val.known()) worthIt = true;
             }
