@@ -18601,6 +18601,24 @@ private:
         }
         return declaredp;
     }
+    // What a type conversion is written on, since the conversion is as long
+    // as that is and says no length of its own (9.3.6)
+    static AstNodeVhdlExpr* throughTypeConversions(AstNodeVhdlExpr* nodep) {
+        for (int depth = 0; nodep && depth < 8; ++depth) {
+            AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+            if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nodep;
+            const VhdlSymbol* const prefixp
+                = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            if (!prefixp || prefixp->resolved()->kind() != VhdlSymKind::TYPE) return nodep;
+            AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            AstNodeVhdlExpr* const nextp
+                = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+            if (!nextp) return nodep;
+            nodep = nextp;
+        }
+        return nodep;
+    }
+
     // Whether any return statement returns what a call gives back
     static bool returnsAnotherCall(AstNode* stmtsp) {
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
@@ -18623,12 +18641,15 @@ private:
     static bool returnsACallResult(AstNode* stmtsp) {
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
             if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
-                AstVhdlCall* const callp = VN_CAST(retp->valuep(), VhdlCall);
+                // A type conversion is exactly as long as what it is written
+                // on (9.3.6): "return unsigned(f(x))" is as long as f makes
+                // it, which no parameter of this subprogram says
+                AstNodeVhdlExpr* const valuep = throughTypeConversions(retp->valuep());
+                AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall);
                 const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
                 if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
                 if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
-                const VhdlType* const typep
-                    = retp->valuep() ? retp->valuep()->vhdlTypep() : nullptr;
+                const VhdlType* const typep = valuep ? valuep->vhdlTypep() : nullptr;
                 if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
                     && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
                     && typep->indexTypes()[0]->boundsp()) {

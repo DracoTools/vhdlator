@@ -3290,39 +3290,61 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     return newSymp;
 }
 
+// What a type conversion is written on, since the conversion is as long as
+// that is and says no length of its own (9.3.6)
+namespace {
+AstNodeVhdlExpr* throughTypeConversions(AstNodeVhdlExpr* nodep) {
+    for (int depth = 0; nodep && depth < 8; ++depth) {
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nodep;
+        const VhdlSymbol* const prefixp
+            = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+        if (!prefixp || prefixp->resolved()->kind() != VhdlSymKind::TYPE) return nodep;
+        AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        AstNodeVhdlExpr* const nextp
+            = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+        if (!nextp) return nodep;
+        nodep = nextp;
+    }
+    return nodep;
+}
+}  // namespace
+
 // Whether any return statement returns what a call gives, whose length is
 // the call's business and not any parameter's
 bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
     for (AstNode* p = stmtsp; p; p = p->nextp()) {
         if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
-            AstVhdlCall* const callp = VN_CAST(retp->valuep(), VhdlCall);
+            // A type conversion is exactly as long as what it is written on
+            // (9.3.6), so "return unsigned(f(x))" returns what f gives back
+            AstNodeVhdlExpr* const valuep = throughTypeConversions(retp->valuep());
+            AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall);
             const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
             if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
             // A function that may be called with no arguments at all is
             // called by writing its name and nothing else (4.2.2.1), so
             // "return put_msg" is a call however little it looks like one
-            if (!namedp && retp->valuep() && !VN_IS(retp->valuep(), VhdlCall)
-                && retp->valuep()->vhdlSymp()) {
-                const VhdlSymbol* const barep = retp->valuep()->vhdlSymp()->resolved();
+            if (!namedp && valuep && !VN_IS(valuep, VhdlCall) && valuep->vhdlSymp()) {
+                const VhdlSymbol* const barep = valuep->vhdlSymp()->resolved();
                 if (barep->kind() == VhdlSymKind::FUNCTION && allParamsDefaulted(barep)) {
                     namedp = barep;
                 }
             }
-            // A type conversion keeps the length of what it converts, and is
-            // dealt with where the returned type is read
+            // An indexed name or a slice is written the same way a call is;
+            // neither is one
             if (namedp && namedp->resolved()->kind() != VhdlSymKind::TYPE) return true;
             // "return v & v" is as long as its operands *together*, which is
             // no parameter's length (9.2.5) -- so the result carries its own
             // bounds rather than borrowing one of them
-            if (AstVhdlBinary* const binp = VN_CAST(retp->valuep(), VhdlBinary)) {
+            if (AstVhdlBinary* const binp = VN_CAST(valuep, VhdlBinary)) {
                 if (binp->op() == VhdlBinaryOp::CONCAT) return true;
             }
             // An object the body returns whose own subtype says a length that
             // does not fold -- numeric_std's RESIZE returns a
             // "(NEW_SIZE-1 downto 0)" -- is as long as that says, whatever
             // any parameter is
-            if (retp->valuep() && retp->valuep()->vhdlTypep()) {
-                const VhdlType* const typep = retp->valuep()->vhdlTypep();
+            if (valuep && valuep->vhdlTypep()) {
+                const VhdlType* const typep = valuep->vhdlTypep();
                 if (typep->base()->kind() == VhdlTypeKind::ARRAY
                     && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
                     && typep->indexTypes()[0]->boundsp()) {
