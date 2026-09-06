@@ -702,10 +702,65 @@ private:
         return VhdlValue{};
     }
 
+    // MINIMUM and MAXIMUM are declared for every scalar type by the language
+    // itself (5.2.6), and a call to an implicitly defined operation whose
+    // arguments are static is static in its turn (9.4.2 e). So this runs no
+    // user code: the comparison is the type's own predefined one, which for
+    // an enumeration is by position and for a physical type is by the value
+    // scaled to its primary unit -- both of which are what the integer here
+    // already holds
+    VhdlValue evalMinMax(AstVhdlCall* nodep, const VhdlSymbol* symp) {
+        const bool wantMax = symp->name() == "maximum";
+        if (!wantMax && symp->name() != "minimum") return VhdlValue{};
+        // The one-argument form answers over the elements of an array
+        // (5.3.2.4), which is not a value held here
+        if (symp->paramTypes().size() != 2) return VhdlValue{};
+        VhdlValue args[2];
+        size_t at = 0;
+        for (AstNode* p = nodep->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            AstNodeVhdlExpr* const actualp = asp ? asp->actualp() : VN_CAST(p, NodeVhdlExpr);
+            size_t which = at;
+            if (asp && asp->formalp()) {
+                // The formals of an operation the language declares are
+                // named but have no declaration of their own to resolve to,
+                // so the name is read as it was written
+                const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                const int idx = namep ? symp->paramIndex(namep->name()) : -1;
+                if (idx < 0) return VhdlValue{};
+                which = static_cast<size_t>(idx);
+            }
+            if (which > 1 || !actualp) return VhdlValue{};
+            const VhdlValue val = eval(actualp);
+            // An array compares element by element, which is not done here
+            if (!val.known() || val.isStr()) return VhdlValue{};
+            args[which] = val;
+            ++at;
+        }
+        if (at != 2 || !args[0].known() || !args[1].known()) return VhdlValue{};
+        // "MINIMUM returns L if L < R, or R otherwise; MAXIMUM returns R if
+        // L < R, or L otherwise" (5.2.6)
+        const bool less = (args[0].isReal() || args[1].isReal())
+                              ? args[0].toReal() < args[1].toReal()
+                              : args[0].toInt() < args[1].toInt();
+        return wantMax ? (less ? args[1] : args[0]) : (less ? args[0] : args[1]);
+    }
+
     VhdlValue evalCall(AstVhdlCall* nodep) {
-        // Only a type conversion folds; a function call would mean running
-        // code, and an indexed name reading a value we do not hold (9.3.6)
+        // Only a type conversion and the operations the language itself
+        // declares fold; any other function call would mean running code,
+        // and an indexed name reading a value we do not hold (9.3.6)
         AstNodeVhdlExpr* const prefixp = nodep->prefixp();
+        // What a call resolved to is recorded on the call itself; a type
+        // conversion names its type through the prefix instead
+        const VhdlSymbol* namedp = nodep->vhdlSymp();
+        if (!namedp && prefixp) namedp = prefixp->vhdlSymp();
+        if (namedp) {
+            const VhdlSymbol* const funcp = namedp->resolved();
+            if (funcp->kind() == VhdlSymKind::FUNCTION && funcp->predefined()) {
+                return evalMinMax(nodep, funcp);
+            }
+        }
         VhdlSymbol* const symp = prefixp ? prefixp->vhdlSymp() : nullptr;
         if (!symp || symp->kind() != VhdlSymKind::TYPE || !symp->typep()) return VhdlValue{};
         AstVhdlAssoc* const asp = VN_CAST(nodep->argsp(), VhdlAssoc);
