@@ -8197,9 +8197,46 @@ private:
         return 0;
     }
 
+    // Whether a type is an array whose elements are of another type: the
+    // pair a logical operator of 9.2.2 may be written with
+    static bool arrayOfElement(const VhdlType* arrayp, const VhdlType* elemp) {
+        if (!arrayp || !elemp) return false;
+        if (arrayp->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        const VhdlType* const ep = arrayp->base()->elementp();
+        return ep && ep->base() == elemp->base();
+    }
+
     void matchVectorWidth(AstVhdlBinary* nodep, const VhdlType* ltypep,
                           const VhdlType* rtypep, AstNodeExpr*& lhsp, AstNodeExpr*& rhsp,
                           FileLine* flp) {
+        // VHDL-2008 gives the logical operators a form with one array
+        // operand and one of the element type, and the scalar stands for
+        // every element of the array (9.2.2).  It is repeated across the
+        // array's length, not widened into it, which would put it in the
+        // rightmost element and leave the rest zero.
+        switch (nodep->op()) {
+        case VhdlBinaryOp::AND:
+        case VhdlBinaryOp::OR:
+        case VhdlBinaryOp::NAND:
+        case VhdlBinaryOp::NOR:
+        case VhdlBinaryOp::XOR:
+        case VhdlBinaryOp::XNOR: {
+            const int lw = exprVectorWidth(nodep->lhsp());
+            const int rw = exprVectorWidth(nodep->rhsp());
+            const auto spread = [&](AstNodeExpr*& scalarp, int width) {
+                scalarp = new AstReplicate{flp, scalarp,
+                                           new AstConst{flp, AstConst::Unsized32{},
+                                                        static_cast<uint32_t>(width)}};
+            };
+            if (lw > 0 && !rw && arrayOfElement(ltypep, rtypep)) {
+                spread(rhsp, lw);
+            } else if (rw > 0 && !lw && arrayOfElement(rtypep, ltypep)) {
+                spread(lhsp, rw);
+            }
+            return;
+        }
+        default: break;
+        }
         switch (nodep->op()) {
         case VhdlBinaryOp::ADD:
         case VhdlBinaryOp::SUB:
