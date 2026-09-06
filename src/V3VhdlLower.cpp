@@ -18587,6 +18587,10 @@ private:
         // "if id = root_id then return (1 => root_id); end if; return walk(id);"
         // does not return one element
         if (foundp && returnsAnotherCall(nodep->stmtsp())) return declaredp;
+        // One return path whose length only running measures is enough: the
+        // result is as long as whichever path ran, and a path that happens to
+        // fold cannot be shown to agree with one that does not
+        if (foundp && sawOpen) return declaredp;
         if (foundp) return foundp;
         // Where the returned expression has no length of its own -- "return v
         // and m", whose operator gives a result as long as its operands --

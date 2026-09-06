@@ -1202,7 +1202,7 @@ public:
                                      const std::vector<VhdlValue>& actualValues,
                                      const std::string& name) VL_MT_DISABLED;
     void findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep, bool skipZero,
-                          bool& sawOpen) VL_MT_DISABLED;
+                          bool& sawOpen, bool& sawUnfolded) VL_MT_DISABLED;
     static bool returnsACall(AstNode* stmtsp) VL_MT_DISABLED;
     bool writtenWithGenericType(AstNode* subtypep) const VL_MT_DISABLED;
     static bool sameButForUniversal(const std::vector<VhdlSymbol*>& cands) VL_MT_DISABLED;
@@ -1890,9 +1890,11 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
                 VhdlType* foundp = nullptr;
                 bool disagreep = false;
                 bool sawOpen = false;
-                findReturnedType(nodep->stmtsp(), foundp, disagreep, true, sawOpen);
+                bool sawUnfolded = false;
+                findReturnedType(nodep->stmtsp(), foundp, disagreep, true, sawOpen, sawUnfolded);
                 if (!foundp && !disagreep && !sawOpen) {
-                    findReturnedType(nodep->stmtsp(), foundp, disagreep, false, sawOpen);
+                    findReturnedType(nodep->stmtsp(), foundp, disagreep, false, sawOpen,
+                                     sawUnfolded);
                 }
                 if (foundp && (foundp->base()->kind() != VhdlTypeKind::ARRAY
                                || foundp->isConstrainedArray())) {
@@ -3262,9 +3264,10 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
         VhdlType* foundp = nullptr;
         bool disagreep = false;
         bool sawOpen = false;
-        findReturnedType(copyp->stmtsp(), foundp, disagreep, true, sawOpen);
+        bool sawUnfolded = false;
+        findReturnedType(copyp->stmtsp(), foundp, disagreep, true, sawOpen, sawUnfolded);
         if (!foundp && !disagreep && !sawOpen) {
-            findReturnedType(copyp->stmtsp(), foundp, disagreep, false, sawOpen);
+            findReturnedType(copyp->stmtsp(), foundp, disagreep, false, sawOpen, sawUnfolded);
         }
         if (!foundp && !disagreep && !returnsACall(copyp->stmtsp())) {
             // "return v and m" gives a result as long as its operands, so a
@@ -3280,7 +3283,10 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
                 }
             }
         }
-        if (foundp) newSymp->returnTypep(foundp);
+        // One return path whose length only running measures is enough: the
+        // result is as long as whichever path ran, so taking the length off
+        // a path that happens to fold would be the wrong answer on the other
+        if (foundp && !sawOpen) newSymp->returnTypep(foundp);
     }
     // The copy belongs beside the original, so lowering finds it. The
     // original is a template from here on: every call names a copy, and
@@ -3362,7 +3368,7 @@ bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
 
 // The type of the first return statement that has a length of its own
 void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep,
-                                      bool skipZero, bool& sawOpen) {
+                                      bool skipZero, bool& sawOpen, bool& sawUnfolded) {
     for (AstNode* p = stmtsp; p && !disagreep; p = p->nextp()) {
         if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
             if (retp->valuep() && retp->valuep()->vhdlTypep()) {
@@ -3397,11 +3403,29 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
                 const bool folds = usable && typep->base()->kind() == VhdlTypeKind::ARRAY
                                    && typep->indexTypes().size() == 1
                                    && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded();
+                // A path whose length is not a number here cannot be shown to
+                // agree with one whose length is: "iv_t(1 to n)" for a
+                // parameter n is a length the back end can emit and nothing
+                // can compare with a constant. The result is as long as
+                // whichever path ran, so it carries its bounds.
+                if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY && !folds) {
+                    sawUnfolded = true;
+                    if (foundp) {
+                        foundp = nullptr;
+                        disagreep = true;
+                        return;
+                    }
+                }
                 if (folds) {
                     // A guard returning a null value ("if arg'length < 1 then
                     // return NSLV") says nothing about how long the result is
                     // on the paths that have one
                     if (skipZero && typep->dimLength(0) == 0) continue;
+                    if (sawUnfolded) {
+                        foundp = nullptr;
+                        disagreep = true;
+                        return;
+                    }
                     // Two returns of different lengths settle nothing: the
                     // length is whichever path ran, so the result carries it
                     if (foundp && foundp->base()->kind() == VhdlTypeKind::ARRAY
@@ -3420,19 +3444,19 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
         if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
             for (AstNode* ap = ifp->altsp(); ap && !disagreep; ap = ap->nextp()) {
                 findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
-                                 sawOpen);
+                                 sawOpen, sawUnfolded);
             }
             continue;
         }
         if (AstVhdlCase* const casep = VN_CAST(p, VhdlCase)) {
             for (AstNode* ap = casep->altsp(); ap && !disagreep; ap = ap->nextp()) {
                 findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
-                                 sawOpen);
+                                 sawOpen, sawUnfolded);
             }
             continue;
         }
         if (AstVhdlLoop* const loopp = VN_CAST(p, VhdlLoop)) {
-            findReturnedType(loopp->stmtsp(), foundp, disagreep, skipZero, sawOpen);
+            findReturnedType(loopp->stmtsp(), foundp, disagreep, skipZero, sawOpen, sawUnfolded);
         }
     }
 }
