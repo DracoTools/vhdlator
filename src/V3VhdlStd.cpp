@@ -161,6 +161,24 @@ bool isCharacterType(const VhdlType* typep) {
     return true;
 }
 
+// STD_ULOGIC, recognised by its shape rather than by its name: the nine
+// character literals 'U' 'X' '0' '1' 'Z' 'W' 'L' 'H' '-' in that order.
+// The type is declared in STD_LOGIC_1164, which STANDARD cannot name, and
+// a design may declare an equivalent of its own.
+bool isNineValueLogic(const VhdlType* typep) {
+    if (!typep) return false;
+    const VhdlType* const basep = typep->base();
+    if (basep->kind() != VhdlTypeKind::ENUM) return false;
+    const std::vector<VhdlSymbol*>& lits = basep->literals();
+    if (lits.size() != 9) return false;
+    static const char* const NINE = "UX01ZWLH-";
+    for (size_t i = 0; i < lits.size(); ++i) {
+        const std::string& name = lits[i]->name();
+        if (name.size() != 3 || name[1] != NINE[i]) return false;
+    }
+    return true;
+}
+
 void addFunc(VhdlScope* scopep, const std::string& name, VhdlType* returnp,
              const std::vector<VhdlType*>& params) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::FUNCTION, name, nullptr);
@@ -383,16 +401,31 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         addFunc(scopep, "&", typep, {elemp, elemp});
     }
 
-    // The matching relational operators are predefined for every type, and
-    // for BIT they give a BIT so that "?=" chains (9.2.3). STD_LOGIC_1164
-    // leaves its STD_ULOGIC versions commented out and relies on this.
+    // The matching relational operators are predefined for BIT and for
+    // STD_ULOGIC and for nothing else, and each gives back that same type
+    // rather than a BOOLEAN -- which is what lets "?=" chain, and what
+    // STD_LOGIC_1164 relies on where it leaves its own versions commented
+    // out. The two equality ones are defined for a one-dimensional array of
+    // either as well, and give back the element type (9.2.3).
     {
-        VhdlType* const matchp = (typep == s_bitp) ? typep : boolp;
-        addFunc(scopep, "?=", matchp, {typep, typep});
-        addFunc(scopep, "?/=", matchp, {typep, typep});
-        if (typep->isScalar()) {
-            for (const char* const op : {"?<", "?<=", "?>", "?>="}) {
-                addFunc(scopep, op, matchp, {typep, typep});
+        VhdlType* matchp = nullptr;
+        bool ordering = false;
+        if (typep == s_bitp || isNineValueLogic(typep)) {
+            matchp = typep;
+            ordering = true;
+        } else if (typep->kind() == VhdlTypeKind::ARRAY && typep->dimensions() == 1
+                   && typep->elementp()
+                   && (typep->elementp()->base() == (s_bitp ? s_bitp->base() : nullptr)
+                       || isNineValueLogic(typep->elementp()))) {
+            matchp = typep->elementp();
+        }
+        if (matchp) {
+            addFunc(scopep, "?=", matchp, {typep, typep});
+            addFunc(scopep, "?/=", matchp, {typep, typep});
+            if (ordering) {
+                for (const char* const op : {"?<", "?<=", "?>", "?>="}) {
+                    addFunc(scopep, op, matchp, {typep, typep});
+                }
             }
         }
     }
