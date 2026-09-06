@@ -7223,6 +7223,13 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
         // A qualified expression states its own type (9.3.5)
         resultp = resolveTypeMark(p->typeMarkp());
         analyzeExpr(p->valuep(), resultp);
+        // Where the type mark names an unconstrained array, what is qualified
+        // is what says how long the value is (5.3.2.2), just as it does for a
+        // conversion: "integer_vector'(7, 8, 9)" is three elements even though
+        // INTEGER_VECTOR itself says no length
+        if (resultp && p->valuep()) {
+            resultp = constrainFromValue(resultp, p->valuep(), p->fileline());
+        }
     } else if (AstVhdlAllocator* const p = VN_CAST(nodep, VhdlAllocator)) {
         if (p->subtypep()) {
             resultp = resolveSubtype(p->subtypep());
