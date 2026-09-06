@@ -1060,6 +1060,60 @@ private:
     // this runtime keeps, so a comparison against it has to be the exact one;
     // 'U', 'X', 'W' and '-' all collapse to Verilog's X on both sides of an
     // ordinary comparison, which is what the accepted divergence says.
+    // The places a value settled before the design runs does not care about.
+    // A '-' stands for a place that matches whatever it is compared with
+    // (9.2.3, 16.8.3), and nothing carries a don't-care once the metavalues
+    // have collapsed -- so those places are taken out of the comparison
+    // here, while the pattern is still a value of its own type. Returns the
+    // characters of the pattern, or "" if it holds no don't-care.
+    static std::string dontCareOf(AstNodeVhdlExpr* nodep) {
+        if (!nodep) return "";
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        if (val.isStr()) {
+            const std::string& text = val.toStr();
+            return text.find('-') == std::string::npos ? "" : text;
+        }
+        // One element of a logic type, whose value is its position
+        const VhdlType* const typep = nodep->vhdlTypep();
+        const VhdlType* const basep = typep ? typep->base() : nullptr;
+        if (!val.isInt() || !basep || basep->kind() != VhdlTypeKind::ENUM
+            || !enumIsLogic(basep)) {
+            return "";
+        }
+        const std::vector<VhdlSymbol*>& lits = basep->literals();
+        const int64_t pos = val.toInt();
+        if (pos < 0 || pos >= static_cast<int64_t>(lits.size())) return "";
+        const std::string& name = lits[static_cast<size_t>(pos)]->name();
+        return (name.size() == 3 && name[1] == '-') ? "-" : "";
+    }
+
+    // "(v and mask) = (pattern and mask)", with the places the pattern does
+    // not care about masked out of both sides
+    AstNodeExpr* maskedMatch(AstNodeExpr* lhsp, AstNodeExpr* rhsp,
+                             const std::string& pattern, bool equal, FileLine* flp) {
+        const int width = static_cast<int>(pattern.size());
+        V3Number mask{flp, width, 0};
+        mask.setAllBits0();
+        bool any = false;
+        for (int i = 0; i < width; ++i) {
+            // The leftmost character is the most significant bit
+            if (pattern[static_cast<size_t>(i)] != '-') {
+                mask.setBit(width - 1 - i, '1');
+                any = true;
+            }
+        }
+        // Every place is a don't-care, so the two always match
+        if (!any) {
+            VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+            return new AstConst{flp, AstConst::BitTrue{}, equal};
+        }
+        AstNodeExpr* const lp = new AstAnd{flp, lhsp, new AstConst{flp, mask}};
+        AstNodeExpr* const rp = new AstAnd{flp, rhsp, new AstConst{flp, mask}};
+        return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, lp, rp})
+                     : static_cast<AstNodeExpr*>(new AstNeq{flp, lp, rp});
+    }
+
     static bool hasMetaConst(const AstNodeExpr* nodep) {
         const AstConst* const constp = VN_CAST(nodep, Const);
         return constp && constp->num().isAnyZ();
@@ -7958,20 +8012,32 @@ private:
         case VhdlBinaryOp::XNOR: return new AstNot{flp, new AstXor{flp, lhsp, rhsp}};
         case VhdlBinaryOp::EQ:
         case VhdlBinaryOp::MATCH_EQ:
-            if (real) return new AstEqD{flp, lhsp, rhsp};
+        case VhdlBinaryOp::NE:
+        case VhdlBinaryOp::MATCH_NE: {
+            const bool equal = nodep->op() == VhdlBinaryOp::EQ
+                               || nodep->op() == VhdlBinaryOp::MATCH_EQ;
+            if (real) {
+                return equal ? static_cast<AstNodeExpr*>(new AstEqD{flp, lhsp, rhsp})
+                             : static_cast<AstNodeExpr*>(new AstNeqD{flp, lhsp, rhsp});
+            }
+            // A matching operator lets one side say which places it does not
+            // care about, and "-" is how it says so (9.2.3)
+            if (nodep->op() == VhdlBinaryOp::MATCH_EQ
+                || nodep->op() == VhdlBinaryOp::MATCH_NE) {
+                const std::string lpat = dontCareOf(nodep->lhsp());
+                const std::string rpat = dontCareOf(nodep->rhsp());
+                const std::string& pat = !rpat.empty() ? rpat : lpat;
+                if (!pat.empty()) return maskedMatch(lhsp, rhsp, pat, equal, flp);
+            }
             // A logic literal with a Z in it is compared exactly: "s = 'Z'"
             // is true when s is 'Z' (9.2.3), where Verilog's "==" answers X.
             if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
-                return new AstEqCase{flp, lhsp, rhsp};
+                return equal ? static_cast<AstNodeExpr*>(new AstEqCase{flp, lhsp, rhsp})
+                             : static_cast<AstNodeExpr*>(new AstNeqCase{flp, lhsp, rhsp});
             }
-            return new AstEq{flp, lhsp, rhsp};
-        case VhdlBinaryOp::NE:
-        case VhdlBinaryOp::MATCH_NE:
-            if (real) return new AstNeqD{flp, lhsp, rhsp};
-            if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
-                return new AstNeqCase{flp, lhsp, rhsp};
-            }
-            return new AstNeq{flp, lhsp, rhsp};
+            return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, lhsp, rhsp})
+                         : static_cast<AstNodeExpr*>(new AstNeq{flp, lhsp, rhsp});
+        }
         case VhdlBinaryOp::LT:
         case VhdlBinaryOp::MATCH_LT:
             if (real) return new AstLtD{flp, lhsp, rhsp};
@@ -9182,10 +9248,23 @@ private:
 
     // The functions of the IEEE packages that every design uses, emitted as
     // native operations (16.5, 16.8)
+    // The name a subprogram was declared with, with the mark a copy made
+    // for one call site carries stripped off it. A subprogram declared over
+    // unconstrained operands -- which is every one of numeric_std's -- is
+    // copied per call site, and the copy is what the call names.
+    static std::string declaredName(const std::string& name) {
+        const size_t at = name.rfind("__V");
+        if (at == std::string::npos || at + 3 >= name.size()) return name;
+        for (size_t i = at + 3; i < name.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(name[i]))) return name;
+        }
+        return name.substr(0, at);
+    }
+
     AstNodeExpr* lowerIntrinsic(const VhdlSymbol* symp,
                                 const std::vector<AstNodeVhdlExpr*>& args,
                                 AstVhdlCall* nodep, FileLine* flp) {
-        const std::string& name = symp->name();
+        const std::string name = declaredName(symp->name());
         VhdlType* const resultp = nodep->vhdlTypep();
         // NOW is the current simulation time, which VHDL counts in the
         // primary unit of TIME (16.3) and Verilator in the design's precision
@@ -9551,6 +9630,25 @@ private:
                 return nullptr;
             }
             return rotateOf(firstp, placesp, width, name == "rotate_left", flp);
+        }
+        // STD_MATCH is the same comparison the matching operators make, and
+        // its whole purpose is the don't-care: it is what a design writes to
+        // decode an address against a pattern (16.8.3). Compiled from the
+        // package body it never sees one, since the metavalues have
+        // collapsed by then, so a pattern settled before the design runs is
+        // read here while it is still a value of its own type.
+        if (name == "std_match" && args.size() == 2 && inArithmeticPackage(symp)) {
+            const std::string lpat = dontCareOf(args[0]);
+            const std::string rpat = dontCareOf(args[1]);
+            const std::string& pat = !rpat.empty() ? rpat : lpat;
+            const int other = exprVectorWidth(rpat.empty() ? args[1] : args[0]);
+            // A one-element operand is a scalar, whose pattern is one place
+            const bool scalar = pat.size() == 1 && !other;
+            if (!pat.empty() && (scalar || other == static_cast<int>(pat.size()))) {
+                if (AstNodeExpr* const secondp = lowerExpr(args[1])) {
+                    return maskedMatch(firstp, secondp, pat, true, flp);
+                }
+            }
         }
         if (name == "and_reduce") return new AstRedAnd{flp, firstp};
         if (name == "or_reduce") return new AstRedOr{flp, firstp};
