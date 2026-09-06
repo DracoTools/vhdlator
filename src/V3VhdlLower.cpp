@@ -2715,7 +2715,10 @@ private:
     std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynOfLitFuncs;
 
     // A string literal put into a carrier. Nothing gave the literal a length,
-    // so it has the one its own text has and the index range 1 to n (9.3.2).
+    // so it has the one its own text has, and its index range starts where the
+    // array type's own index subtype starts (5.3.2.2, 9.3.2) -- 0 for a
+    // STD_LOGIC_VECTOR, whose index is NATURAL, and 1 for a STRING, whose
+    // index is POSITIVE.
     AstNodeFTask* dynOfLiteralFunc(VhdlType* carrierTypep, int64_t count, FileLine* flp) {
         if (count < 1 || count > 65536 || !m_modp) return nullptr;
         const auto key = std::make_pair(
@@ -2740,13 +2743,20 @@ private:
         const auto out = [&]() {
             return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
         };
-        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp),
-                                       new AstConst{flp, AstConst::Signed32{}, 1}});
-        funcp->addStmtsp(new AstAssign{
-            flp, dynPart(out(), "rgt", flp),
-            new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)}});
+        const VhdlType* const idxp = carrierTypep->base()->indexTypes().empty()
+                                         ? nullptr
+                                         : carrierTypep->base()->indexTypes()[0];
+        const bool ascending = idxp ? boundsAscending(idxp) : true;
+        const int64_t left = (idxp && idxp->bounded()) ? idxp->left() : (ascending ? 1 : count);
+        const int64_t right = ascending ? left + count - 1 : left - count + 1;
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "lft", flp),
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left)}});
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "rgt", flp),
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(right)}});
         funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
-                                       new AstConst{flp, AstConst::BitFalse{}}});
+                                       new AstConst{flp, AstConst::BitTrue{}, !ascending}});
         funcp->addStmtsp(new AstAssign{
             flp, dynPart(out(), "q", flp),
             new AstNewDynamic{
