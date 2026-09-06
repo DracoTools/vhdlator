@@ -5290,9 +5290,17 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
         && !resultp->lengthEmittable() && sameLengthAsOperands(nodep->op())) {
         VhdlType* bestp = nullptr;
         for (AstNodeVhdlExpr* const opp : {nodep->lhsp(), nodep->rhsp()}) {
-            VhdlType* const typep = opp ? opp->vhdlTypep() : nullptr;
-            if (!typep || typep->base() != resultp->base() || !typep->lengthEmittable()) {
-                continue;
+            VhdlType* typep = opp ? opp->vhdlTypep() : nullptr;
+            if (!typep || typep->base() != resultp->base()) continue;
+            // An operand whose own subtype says no length may still be one
+            // that can be measured: a concatenation is as long as its parts
+            // together (9.2.5), and an aggregate as long as it was written.
+            // Passing over such an operand leaves the result with the other
+            // one's length, short by exactly the part that went uncounted.
+            if (!typep->lengthEmittable()) {
+                VhdlType* const measuredp = constrainFromValue(resultp, opp, nodep->fileline());
+                if (!measuredp || !measuredp->lengthEmittable()) continue;
+                typep = measuredp;
             }
             // Of two lengths, the result is the longer (16.5)
             if (!bestp || (typep->isConstrainedArray() && bestp->isConstrainedArray()
