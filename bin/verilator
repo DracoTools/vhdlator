@@ -610,7 +610,6 @@ detailed descriptions of these arguments.
      +verilog1995ext+<ext>      Synonym for +1364-1995ext+<ext>
      +verilog2001ext+<ext>      Synonym for +1364-2001ext+<ext>
     --version                   Show program version and exits
-    --vhdl-inline-limit <stmts> Emit a VHDL subprogram this big as a function
     --vhdl-std <std>            Select the VHDL standard revision
     --vpi                       Enable VPI compiles
     --waiver-multiline          Create multiline --match for waivers

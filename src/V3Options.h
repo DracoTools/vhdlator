@@ -328,7 +328,6 @@ private:
     int         m_inlineCFuncsProduct = 200;   // main switch: --inline-cfuncs-product
     int         m_inlineMult = 2000;   // main switch: --inline-mult
     int         m_inlineTaskMult = 20000;   // main switch: --inline-task-mult
-    int         m_vhdlInlineLimit = 0;  // main switch: --vhdl-inline-limit
     int         m_instrCountDpi = 200;   // main switch: --instr-count-dpi
     bool        m_jsonEditNums = true; // main switch: --no-json-edit-nums
     bool        m_jsonIds = true; // main switch: --no-json-ids
@@ -636,7 +635,6 @@ public:
     int inlineCFuncsProduct() const { return m_inlineCFuncsProduct; }
     int inlineMult() const { return m_inlineMult; }
     int inlineTaskMult() const { return m_inlineTaskMult; }
-    int vhdlInlineLimit() const VL_MT_SAFE { return m_vhdlInlineLimit; }
     int instrCountDpi() const { return m_instrCountDpi; }
     int localizeMaxSize() const { return m_localizeMaxSize; }
     bool jsonEditNums() const { return m_jsonEditNums; }

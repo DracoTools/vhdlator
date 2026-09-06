@@ -1923,7 +1923,6 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
         showVersion(false);
         v3Global.vlExit(0);
     });
-    DECL_OPTION("-vhdl-inline-limit", Set, &m_vhdlInlineLimit);
     DECL_OPTION("-vhdl-std", CbVal, [this, fl](const char* valp) {
         // Accept both the bare year ("2008", "08") and the IEEE form ("1076-2008")
         static const std::map<const std::string, V3LangCode> stds{

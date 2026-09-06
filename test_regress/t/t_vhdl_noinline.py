@@ -17,7 +17,7 @@ test.top_filename = "t/t_vhdl_noinline.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
              verilator_flags2=[
-                 "--timing", "--debug-check", "--vhdl-inline-limit 1",
+                 "--timing", "--debug-check", "--inline-task-mult 1",
                  "--top-module t_vhdl_noinline"
              ],
              make_top_shell=False,
