@@ -1230,8 +1230,6 @@ public:
     void specializeWithin(AstNode* nodep) VL_MT_DISABLED;
     // Whether every element of a record has a length of its own (5.3.3)
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
-    // Whether a subprogram may be called with no arguments at all (4.2.2.1)
-    static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     // A record subtype whose open elements take their bounds from the values
     // written for them one at a time (5.3.3, 6.5.7.1)
     VhdlType* constrainRecordFromParts(VhdlType* typep,
@@ -1344,6 +1342,7 @@ private:
                                       FileLine* flp) VL_MT_DISABLED;
     VhdlType* constrainElementFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                         FileLine* flp) VL_MT_DISABLED;
+    static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     static std::string dimensionText(size_t dim, size_t dims) VL_MT_DISABLED;
     void setupUnitContext(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void applyContextItem(AstVhdlContextItem* ctxp) VL_MT_DISABLED;
@@ -3281,10 +3280,7 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
                 }
             }
         }
-        // One return path whose length only running knows is enough: the
-        // result is as long as whichever path ran, so taking the length off
-        // a path that happens to fold would be the wrong answer on the other
-        if (foundp && !sawOpen) newSymp->returnTypep(foundp);
+        if (foundp) newSymp->returnTypep(foundp);
     }
     // The copy belongs beside the original, so lowering finds it. The
     // original is a template from here on: every call names a copy, and
@@ -3345,7 +3341,6 @@ bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
 // The type of the first return statement that has a length of its own
 void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep,
                                       bool skipZero, bool& sawOpen) {
-    bool sawUnfolded = false;
     for (AstNode* p = stmtsp; p && !disagreep; p = p->nextp()) {
         if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
             if (retp->valuep() && retp->valuep()->vhdlTypep()) {
@@ -3380,29 +3375,11 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
                 const bool folds = usable && typep->base()->kind() == VhdlTypeKind::ARRAY
                                    && typep->indexTypes().size() == 1
                                    && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded();
-                // A path whose length is not a number here cannot be shown to
-                // agree with one whose length is: "iv_t(1 to n)" for a
-                // parameter n is a length the back end can emit and nothing
-                // can compare with a constant. The result is as long as
-                // whichever path ran, so it carries its bounds.
-                if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY && !folds) {
-                    sawUnfolded = true;
-                    if (foundp) {
-                        foundp = nullptr;
-                        disagreep = true;
-                        return;
-                    }
-                }
                 if (folds) {
                     // A guard returning a null value ("if arg'length < 1 then
                     // return NSLV") says nothing about how long the result is
                     // on the paths that have one
                     if (skipZero && typep->dimLength(0) == 0) continue;
-                    if (sawUnfolded) {
-                        foundp = nullptr;
-                        disagreep = true;
-                        return;
-                    }
                     // Two returns of different lengths settle nothing: the
                     // length is whichever path ran, so the result carries it
                     if (foundp && foundp->base()->kind() == VhdlTypeKind::ARRAY
@@ -3514,23 +3491,6 @@ private:
     void visit(AstVhdlCall* nodep) override {
         iterateChildren(nodep);
         trySpecialize(nodep, nodep->vhdlSymp(), nodep->argsp());
-    }
-    // A function that may be called with no arguments at all is called by
-    // writing its name and nothing else (4.2.2.1). Such a call has no
-    // argument list to specialize on, but its result may still be something
-    // only a copy of the body can settle the bounds of.
-    void visit(AstVhdlName* nodep) override {
-        iterateChildren(nodep);
-        VhdlSymbol* const symp = nodep->vhdlSymp();
-        if (!symp) return;
-        const VhdlSymbol* const barep = symp->resolved();
-        if (barep->kind() != VhdlSymKind::FUNCTION) return;
-        if (!VhdlSemVisitor::allParamsDefaulted(barep)) return;
-        // The name of the function a call is written on is not itself a call
-        if (const AstVhdlCall* const callp = VN_CAST(nodep->backp(), VhdlCall)) {
-            if (callp->prefixp() == nodep) return;
-        }
-        trySpecialize(nodep, symp, nullptr);
     }
     // An operator a design declares is an ordinary subprogram whose name
     // happens to be an operator symbol (4.5.2), so it is copied per use in
@@ -3742,7 +3702,7 @@ private:
         return out;
     }
 
-    void trySpecialize(AstNodeVhdlExpr* nodep, VhdlSymbol* symp, AstNode* argsp) {
+    void trySpecialize(AstVhdlCall* nodep, VhdlSymbol* symp, AstNode* argsp) {
         if (!needsSpecializing(symp)) return;
         // A copy is never itself specialized: it was made for one call site
         // and has nothing left to fix
@@ -3937,12 +3897,7 @@ private:
         // Nothing to specialize on: no parameter has a length to fix, and no
         // value the call passes is known, so the copy would be the original
         if (byValue) {
-            // A result whose subtype only the body settles is itself something
-            // to specialize on, and the only thing a function with no
-            // parameters has: the copy is what reads the result's bounds off
-            // what the body returns, so without it "return s" out of a
-            // "string(50 to 55)" arrives at the caller renumbered from 1
-            bool worthIt = resultIsUnconstrained(symp);
+            bool worthIt = false;
             for (const VhdlValue& val : actualValues) {
                 if (val.known()) worthIt = true;
             }
