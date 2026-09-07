@@ -4338,6 +4338,19 @@ private:
     // whose timeout expires find a signal being updated in the same cycle,
     // and only then does a timed wait have to stand aside for the update.
     bool m_anyAfter = false;
+    // Generics no instance can hand a value the back end folds. A generic is
+    // ordinarily a parameter, which is what makes V3Param copy a module per
+    // set of values and so what makes the ordinary case fast. But a constant
+    // built by an impure function is still a globally static primary, even
+    // though the expression that made it is not (9.4.3, note 2), so passing
+    // one is legal and there is nothing to fold. Such a generic is not a
+    // parameter at all: it is data arriving from outside, which is a port.
+    std::set<const VhdlSymbol*> m_dataGenerics;
+    // The variables such generics were lowered to, so their port entries can
+    // be written after the ports proper: a generic clause stands ahead of a
+    // port clause, and giving one of these an early port position would move
+    // every port association written positionally
+    std::vector<AstVar*> m_dataGenericVarps;
 
     // An interface element of a generic or port clause (6.5)
     // Whether a value of this type is one the back end can carry as a
@@ -4367,18 +4380,36 @@ private:
             return;
         }
         if (isGeneric) {
-            // A generic is a parameter, and a parameter carries a value the
-            // back end can fold. A composite that does not pack has no such
-            // value: elaboration would have to hand over a structure.
-            if (!parameterizable(symp->typep())) {
-                unsup(flp, "generic '" + symp->name() + "' of a type that is not one value");
+            // A generic whose value no instance can fold is data handed over
+            // at elaboration, not a value the back end can carry, so it
+            // arrives the way data does: as an input. It keeps the generic's
+            // own default, which is what an unassociated generic takes, and
+            // it is joined by name -- no AstPort, since a generic stands
+            // ahead of the ports and giving it one of their positions would
+            // move every port association written positionally
+            const bool asData = m_dataGenerics.count(symp->resolved());
+            if (!asData) {
+                // A generic is a parameter, and a parameter carries a value the
+                // back end can fold. A composite that does not pack has no such
+                // value: elaboration would have to hand over a structure.
+                if (!parameterizable(symp->typep())) {
+                    unsup(flp, "generic '" + symp->name() + "' of a type that is not one value");
+                    return;
+                }
+                // A generic is a parameter, so V3Param clones a module per set
+                // of values exactly as VHDL elaboration would
+                AstVar* const varp = newVar(symp, VVarType::GPARAM, flp);
+                if (nodep->defaultp()) varp->valuep(lowerExpr(nodep->defaultp()));
+                addStmt(varp);
                 return;
             }
-            // A generic is a parameter, so V3Param clones a module per set of
-            // values exactly as VHDL elaboration would
-            AstVar* const varp = newVar(symp, VVarType::GPARAM, flp);
+            AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+            varp->direction(VDirection::INPUT);
+            varp->declDirection(VDirection::INPUT);
+            varp->ansi(true);
             if (nodep->defaultp()) varp->valuep(lowerExpr(nodep->defaultp()));
             addStmt(varp);
+            m_dataGenericVarps.push_back(varp);
             return;
         }
         // A VHDL port is a signal, which a process may assign as readily as a
@@ -13029,6 +13060,16 @@ private:
                 }
                 ++genPosition;
             }
+            // A generic nothing can fold was lowered as an input, so what is
+            // written for it is a port association and not a parameter one
+            const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+            const VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+            if (gsymp && m_dataGenerics.count(gsymp->resolved())) {
+                // Joined by the name written for it, which is what a named
+                // association gives -- and only a named one is ever marked
+                pinsp = AstNode::addNext(pinsp, pinp);
+                continue;
+            }
             paramsp = AstNode::addNext(paramsp, pinp);
         }
         // A binding indication may give the generics and the ports itself,
@@ -18898,6 +18939,7 @@ private:
         m_stmtsp = nullptr;
         m_processNum = 0;
         int pinNum = 0;
+        m_dataGenericVarps.clear();
         for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
             lowerInterface(VN_AS(p, VhdlIfaceDecl), true, pinNum);
         }
@@ -18905,6 +18947,13 @@ private:
         for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
             lowerInterface(VN_AS(p, VhdlIfaceDecl), false, pinNum);
         }
+        // A generic that became an input takes its place after the ports, so
+        // that a port association written by position still reaches the port
+        // it was written for
+        for (AstVar* const dgp : m_dataGenericVarps) {
+            addStmt(new AstPort{dgp->fileline(), ++pinNum, dgp->name()});
+        }
+        m_dataGenericVarps.clear();
         // An entity may have a statement part of its own, whose statements
         // are passive: an assertion that holds for every instance of it,
         // whatever architecture is bound (3.2.4)
@@ -18973,6 +19022,34 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             const VhdlSymbol* const symp = ifp->vhdlSymp();
             const VhdlType* const typep = symp ? symp->typep() : nullptr;
             markPortRecord(typep);
+        });
+    }
+    // Which generics no instance hands a value the back end can fold. The
+    // entity's declaration is lowered once and the actuals are in the
+    // parents, so every instantiation is read before any of them is lowered.
+    // Only a named association is answered here: a positional one would have
+    // to be matched against the entity this instance has not yet been bound
+    // to, and leaving it a parameter is what the compiler did before.
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([this](AstVhdlInstance* instp) {
+            for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+                const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+                VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+                if (!gsymp) continue;
+                if (V3VhdlEval::eval(asp->actualp()).known()) continue;
+                // Only where the actual is a constant that has no value of
+                // its own. A generic reaching down from an enclosing
+                // instance has none here either, but elaboration gives it
+                // one and V3Param folds it; an expression may still fold in
+                // the back end where nothing here could fold it.
+                const VhdlSymbol* const asymp = asp->actualp()->vhdlSymp();
+                if (!asymp) continue;
+                const VhdlSymbol* const constp = asymp->resolved();
+                if (constp->kind() != VhdlSymKind::CONSTANT || constp->hasValue()) continue;
+                m_dataGenerics.insert(gsymp->resolved());
+            }
         });
     }
     // Whether any signal transaction in the design is delivered at a time of
