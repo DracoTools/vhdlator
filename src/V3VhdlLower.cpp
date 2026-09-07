@@ -4171,6 +4171,24 @@ private:
             }
             if (args >= 2) return operandCarries;
         }
+        // A conversion between the logic families keeps the same bits and is
+        // emitted as nothing at all, so what it gives back is worth exactly
+        // what it was handed. Recognised the same way the lowering of it is,
+        // by what it operates on and not by name alone, so that a design's
+        // own function of the name is still a call. The type side of this
+        // rule gives such a result the length of its argument, but only
+        // where the argument already has one, and a call specialized for
+        // this site does not have one until it is made.
+        if ((name == "to_stdlogicvector" || name == "to_stdulogicvector"
+             || name == "to_bitvector" || name == "to_x01" || name == "to_01"
+             || name == "to_ux01")
+            && V3VhdlStd::isIntrinsic(symp) && depth < 8) {
+            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            AstNodeVhdlExpr* const valp = asp ? asp->actualp() : nullptr;
+            if (valp && (isLogicish(valp->vhdlTypep()) || isBitish(valp->vhdlTypep()))) {
+                return isDynValue(valp, depth + 1);
+            }
+        }
         // The arithmetic of numeric_std is emitted rather than compiled, so
         // its result is whatever the operation gives back here, however the
         // package wrote the result subtype
