@@ -2295,7 +2295,16 @@ private:
             outp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, srcp};
             keepp = new AstVarRef{flp, tmpp, VAccess::READ};
         }
-        AstNodeExpr* const lhsp = lowerDriveTarget(targetp);
+        // A slice is written through the object it is a slice of. Lowering
+        // a slice gives a value of its own, numbered from nothing -- so a
+        // slice of one element has no bit range to select from at all, and a
+        // slice of more is numbered differently from the places it names.
+        // The indices below are the object's own either way (8.5).
+        AstNodeVhdlExpr* placesp = targetp;
+        if (AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+            if (VN_IS(callp->argsp(), VhdlRange) && callp->prefixp()) placesp = callp->prefixp();
+        }
+        AstNodeExpr* const lhsp = lowerDriveTarget(placesp);
         if (!lhsp) {
             if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
             VL_DO_DANGLING(keepp->deleteTree(), keepp);
@@ -2315,13 +2324,14 @@ private:
         const bool asc = idxp->ascending();
         for (int64_t i = 0; i < count; ++i) {
             const int64_t at = asc ? idxp->left() + i : idxp->left() - i;
+            AstNodeExpr* const placep
+                = new AstSelBit{flp, lhsp->cloneTree(false),
+                                new AstConst{flp, AstConst::Signed32{},
+                                             static_cast<int32_t>(at)}};
             outp = AstNode::addNextNull(
                 outp,
                 static_cast<AstNode*>(new AstAssign{
-                    flp,
-                    new AstSelBit{flp, lhsp->cloneTree(false),
-                                  new AstConst{flp, AstConst::Signed32{},
-                                               static_cast<int32_t>(at)}},
+                    flp, placep,
                     new AstSelBit{flp, dynPart(keepp->cloneTree(false), "q", flp),
                                   new AstConst{flp, AstConst::Signed32{},
                                                static_cast<int32_t>(i)}}}));
