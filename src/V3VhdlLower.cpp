@@ -522,7 +522,23 @@ private:
                     }
                 }
                 if (!onep) onep = lowerExpr(asp->actualp());
-                refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "", onep});
+                // Whether an actual matches a constrained formal is a
+                // condition to be met while running (4.2.2.1), and analysis
+                // has already either reported a mismatch or let it stand as
+                // one a guard rules out -- "if v'length = 5 then f(v)" in a
+                // copy made for a call that passed thirty-four. So the width
+                // the two disagree on is not a finding about the source, and
+                // the check that would report it is turned off here.
+                FileLine* aflp = asp->fileline();
+                if (guardedLengthMismatch(symp, namep, pos, asp->actualp())) {
+                    // The width check is made against the call rather than
+                    // against the argument, so that is where it is turned off
+                    FileLine* const rflp = new FileLine{refp->fileline()};
+                    rflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                    rflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                    refp->fileline(rflp);
+                }
+                refp->addArgsp(new AstArg{aflp, namep ? namep->name() : "", onep});
             }
         }
         addCaptureArgs(refp, symp, refp->fileline());
@@ -7372,6 +7388,30 @@ private:
         if (it == m_bindElems.end()) return nullptr;
         const auto eit = it->second.find(nodep->vhdlSymp()->name());
         return eit == it->second.end() ? nullptr : eit->second;
+    }
+
+    // Whether a call hands a formal whose subtype fixes its length a value
+    // of another length. Legal to write: a subprogram written against an
+    // unconstrained array is compiled once per call site, and inside such a
+    // copy the parameter's length is what that call supplied -- so a call the
+    // copy's own length rules out may still stand where a test on that length
+    // guards it, and whether the two agree is a condition to be met while
+    // running (4.2.2.1). Analysis lets such a call through for that reason;
+    // the width check that would report it is a finding about the source, and
+    // there is nothing here the source got wrong.
+    static bool guardedLengthMismatch(const VhdlSymbol* symp, const AstVhdlName* namep,
+                                      size_t pos, const AstNodeVhdlExpr* actualp) {
+        if (!symp || !actualp) return false;
+        const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
+        if (at < 0 || at >= static_cast<int>(symp->paramTypes().size())) return false;
+        const VhdlType* const formalp = symp->paramTypes()[at];
+        const VhdlType* const atypep = actualp->vhdlTypep();
+        if (!formalp || !atypep) return false;
+        if (!formalp->isConstrainedArray() || !atypep->isConstrainedArray()) return false;
+        if (formalp->dimensions() != 1 || atypep->dimensions() != 1) return false;
+        const int64_t want = formalp->dimLength(0);
+        const int64_t got = atypep->dimLength(0);
+        return want >= 0 && got >= 0 && want != got;
     }
 
     // An operator a design declares itself is an ordinary function whose name

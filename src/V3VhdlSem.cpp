@@ -7083,6 +7083,11 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
                                      const std::string& what) {
     if (!nodep || !typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return;
     if (!typep->isConstrainedArray()) return;
+    // In a copy made for one call site the parameter's length is what that
+    // call supplied, not something the design wrote, so a call the length
+    // rules out is written anyway and guarded: "if v'length = 5 then f(v)"
+    // is legal, and the match is a condition to be met while running (4.2.2.1)
+    if (m_inSpecialized) return;
     if (AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate)) {
         checkAggregate(aggp, typep, what);
         return;
