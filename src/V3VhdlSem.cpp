@@ -6385,6 +6385,7 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
     if (resultp->base()->indexTypes().size() != 1) return nullptr;
     const std::string& name = symp->name();
     int64_t length = -1;
+    bool fromOne = false;  // The result is numbered "1 to length", not down from it
     AstNodeVhdlExpr* sizeExprp = nullptr;  // Where the length is not a number here
     if (name == "to_signed" || name == "to_unsigned" || name == "resize") {
         if (assocs.size() != 2 || !assocs[1] || !assocs[1]->actualp()) return nullptr;
@@ -6408,6 +6409,24 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
         const VhdlType* const argp = assocs[0]->actualp()->vhdlTypep();
         if (!argp || !argp->isConstrainedArray()) return nullptr;
         length = argp->dimLength(0);
+    } else if (name == "to_01" || name == "to_bitvector" || name == "to_stdlogicvector"
+               || name == "to_stdulogicvector" || name == "to_x01" || name == "to_ux01") {
+        // These give back what they were handed, element for element, so the
+        // result is as long as the argument. The frontend carries them out
+        // itself, so nothing else measures the result -- and a value of no
+        // length cannot be passed on to a subprogram written against an
+        // unconstrained array, since the copy made for that call site is what
+        // gives the parameter a width.
+        //
+        // How the result is numbered is each declaration's own business, and
+        // the two families in the IEEE bodies do not agree: TO_01 and the
+        // conversions between vector types count down from the length less
+        // one, while TO_X01 and TO_UX01 count up from one.
+        if (assocs.empty() || !assocs[0] || !assocs[0]->actualp()) return nullptr;
+        const VhdlType* const argp = assocs[0]->actualp()->vhdlTypep();
+        if (!argp || !argp->isConstrainedArray()) return nullptr;
+        length = argp->dimLength(0);
+        fromOne = name == "to_x01" || name == "to_ux01";
     } else {
         return nullptr;
     }
@@ -6429,6 +6448,8 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
         // The range is what the expression says, not the index subtype's own
         newIndexp->unbound();
         newIndexp->boundsp(new AstVhdlRange{flp, leftp, VhdlDir::DOWNTO, zerop});
+    } else if (fromOne) {
+        newIndexp->setBounds(1, length, true);
     } else {
         // numeric_std counts a vector down from its length less one (16.5)
         newIndexp->setBounds(length - 1, 0, false);
