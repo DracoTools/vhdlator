@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <map>
 #include <string>
@@ -227,7 +228,11 @@ class VhdlEvaluator final {
     // One activation of a subprogram body being run for a static call: the
     // value of every parameter, local object and loop parameter it holds
     using Frame = std::map<const VhdlSymbol*, VhdlValue>;
-    std::vector<Frame> m_frames;
+    // A deque and not a vector: runBody holds a reference to the activation
+    // it is filling in while evaluating an initial value, and that may be a
+    // call, which pushes an activation of its own. A vector would move the
+    // one being filled out from under the reference.
+    std::deque<Frame> m_frames;
     int m_calls = 0;  // Activations nested, against a recursion that has no end
     int m_steps = 0;  // Statements run, against a loop that has none either
     bool m_bail = false;  // The activation being run cannot be folded

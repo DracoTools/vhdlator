@@ -27,6 +27,7 @@ package t_vhdl_funcfold_pkg is
     function weigh (kind : character; n : natural) return natural;
     function scaled (n : natural; by : natural := 3) return natural;
     function fact (n : natural) return natural;
+    function two_step (n : natural) return natural;
     function widen (arg : signed) return std_ulogic;
 end package;
 
@@ -90,11 +91,21 @@ package body t_vhdl_funcfold_pkg is
         return n * fact (n - 1);
     end function;
 
+    -- A local constant whose value is itself a call, so one activation is
+    -- started while the one that names it is still being filled in
+    function two_step (n : natural) return natural is
+        constant half : natural := bits_for (n);
+        variable acc  : natural;
+    begin
+        acc := half * 2;
+        return acc;
+    end function;
+
     -- The shape that needs the fold to compile at all: a working value whose
     -- length comes from a call to a helper, then written into a
     -- concatenation, which has to know how many elements it is joining (9.2.5)
     function widen (arg : signed) return std_ulogic is
-        constant w    : natural := mine (arg'length, 6);
+        constant w    : natural := mine (arg'length, two_step (2));
         constant base : signed (w-1 downto 0) := to_signed (3, w);
     begin
         return or (std_ulogic_vector (base) & '0');
@@ -119,6 +130,7 @@ architecture a of t_vhdl_funcfold is
     constant W4 : natural := scaled (5);              -- 15
     constant W5 : natural := scaled (5, by => 20);    -- 64
     constant W6 : natural := fact (5);                -- 120
+    constant W7 : natural := two_step (100);          -- 14
 
     signal s1 : std_logic_vector (W1 - 1 downto 0) := (others => '0');
     signal s2 : std_logic_vector (W2 - 1 downto 0) := (others => '0');
@@ -126,6 +138,7 @@ architecture a of t_vhdl_funcfold is
     signal s4 : signed (W4 - 1 downto 0)           := (others => '0');
     signal s5 : std_logic_vector (W5 - 1 downto 0) := (others => '0');
     signal s6 : std_logic_vector (W6 - 1 downto 0) := (others => '0');
+    signal s7 : std_logic_vector (W7 - 1 downto 0) := (others => '0');
 
 begin
 
@@ -138,6 +151,7 @@ begin
         assert s4'length = 15 report "bad W4" severity failure;
         assert s5'length = 64 report "bad W5" severity failure;
         assert s6'length = 120 report "bad W6" severity failure;
+        assert s7'length = 14 report "bad W7" severity failure;
 
         -- The same functions still run, and give the same answers
         assert mine (-8, -3) = -8 report "bad mine" severity failure;
@@ -146,6 +160,7 @@ begin
         assert weigh ('b', 4) = 8 report "bad weigh b" severity failure;
         assert scaled (5) = 15 report "bad scaled" severity failure;
         assert fact (5) = 120 report "bad fact" severity failure;
+        assert two_step (100) = 14 report "bad two_step" severity failure;
 
         assert widen (v) = '1' report "bad widen" severity failure;
 
