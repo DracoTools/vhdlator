@@ -273,7 +273,30 @@ void V3VhdlStd::clear() {
 //######################################################################
 // Implicit operators (5.2.6, 9.2)
 
-bool V3VhdlStd::isIntrinsicName(const std::string& name) {
+bool V3VhdlStd::isIntrinsic(const VhdlSymbol* symp) {
+    if (!symp) return false;
+    if (!intrinsicName(symp->name())) return false;
+    // One the language itself declares has no body that could be compiled
+    if (symp->predefined()) return true;
+    // The packages the frontend stands in for. A subprogram declared anywhere
+    // else is the design's own however it is named: IEEE's float_generic_pkg
+    // declares a RESIZE that converts between floating point formats, which
+    // has nothing to do with numeric_std's.
+    static const std::vector<std::string> PKGS{
+        "numeric_std",          "numeric_bit",      "numeric_std_unsigned",
+        "numeric_bit_unsigned", "std_logic_1164",   "std_logic_arith",
+        "std_logic_unsigned",   "std_logic_signed", "std_logic_misc",
+        "std_logic_textio",     "textio",           "env",
+        "standard"};
+    for (const VhdlScope* scopep = symp->declScopep(); scopep; scopep = scopep->parentp()) {
+        for (const std::string& candidate : PKGS) {
+            if (candidate == scopep->name()) return true;
+        }
+    }
+    return false;
+}
+
+bool V3VhdlStd::intrinsicName(const std::string& name) {
     static const std::vector<std::string> NAMES{
         "to_integer",     "to_unsigned",   "to_signed",       "resize",
         "shift_left",     "shift_right",   "rotate_left",     "rotate_right",

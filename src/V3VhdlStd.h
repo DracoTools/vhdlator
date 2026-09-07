@@ -62,12 +62,17 @@ public:
     static VhdlType* universalRealType() VL_MT_DISABLED;
     static VhdlType* errorType() VL_MT_DISABLED;
 
-    // Whether a subprogram of that name is emitted as a native operation
-    // rather than compiled. The frontend recognises the arithmetic of the
-    // IEEE packages instead of running it, so those bodies are never used --
-    // and specializing them per call site would be wasted work that also
+    // Whether this subprogram is emitted as a native operation rather than
+    // compiled. The frontend recognises the arithmetic and the text of the
+    // IEEE packages instead of running them, so those bodies are never used
+    // -- and specializing them per call site would be wasted work that also
     // renames them out of recognition.
-    static bool isIntrinsicName(const std::string& name) VL_MT_DISABLED;
+    //
+    // The name alone does not say which: RESIZE, MINIMUM and WRITE are
+    // ordinary declarations in IEEE's fixed-point and floating-point
+    // packages, and in any design that writes its own. Only a declaration
+    // that came from one of the packages the frontend stands in for is one.
+    static bool isIntrinsic(const VhdlSymbol* symp) VL_MT_DISABLED;
 
     // Declare the operators a type declaration implicitly brings with it
     // (5.2.6, 9.2). Called for every user-defined type as well.
@@ -76,6 +81,8 @@ public:
     static void clear() VL_MT_DISABLED;
 
 private:
+    // Whether the name is one of those the frontend stands in for
+    static bool intrinsicName(const std::string& name) VL_MT_DISABLED;
     static void buildTextio() VL_MT_DISABLED;
     static void buildEnv() VL_MT_DISABLED;
 

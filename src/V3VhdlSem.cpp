@@ -3599,7 +3599,7 @@ private:
         if (symp->predefined() || !symp->bodyp()) return false;
         // A subprogram the frontend emits as a native operation is never
         // compiled, so making copies of it is wasted work
-        if (V3VhdlStd::isIntrinsicName(symp->name())) return false;
+        if (V3VhdlStd::isIntrinsic(symp)) return false;
         for (const VhdlType* const typep : symp->paramTypes()) {
             // A bound that names a generic is a length: the back end folds it
             // per instance, so one copy of the subprogram serves every call
@@ -6375,6 +6375,10 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
                                               const std::vector<AstVhdlAssoc*>& assocs,
                                               VhdlType* resultp) {
     if (!symp || !resultp) return nullptr;
+    // Only where the frontend really is what carries the operation out. A
+    // package that declares a RESIZE of its own means its own thing by it,
+    // and its result is whatever its body returns (see V3VhdlStd)
+    if (!V3VhdlStd::isIntrinsic(symp)) return nullptr;
     if (resultp->base()->kind() != VhdlTypeKind::ARRAY || resultp->isConstrainedArray()) {
         return nullptr;
     }
