@@ -4914,6 +4914,19 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         err(nodep->fileline(), "No visible " + what + " matches this use");
         return V3VhdlStd::errorType();
     }
+    // A procedure call statement can only name a procedure and an expression
+    // can only name a function, so the two never compete (4.3, 10.7). A call
+    // written with parentheses settles that where its arguments are read; a
+    // procedure taking none at all is written as a bare name (4.2.2.1), and
+    // there is nowhere else for it to be settled but here.
+    if (cands.size() > 1 && m_procCall) {
+        std::vector<VhdlSymbol*> kept;
+        for (VhdlSymbol* const symp : cands) {
+            if (symp->resolved()->kind() == VhdlSymKind::FUNCTION) continue;
+            kept.push_back(symp);
+        }
+        if (!kept.empty()) cands.swap(kept);
+    }
     if (cands.size() > 1) {
         // Inside a copy of an instantiated package, a call means what it
         // meant in the template: substituting the generics may have left two
