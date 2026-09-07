@@ -23,8 +23,9 @@
 // between a packed array and a dynamic one in V3VhdlLower -- depends on it.
 //
 // Only already-analyzed expressions can be folded: names must carry the
-// declaration they denote and operators the overload that was chosen, since
-// only a *predefined* operator has a meaning known without executing code.
+// declaration they denote and operators the overload that was chosen. A call
+// to a pure function whose actuals are static is static in its turn (9.4.3 i),
+// and folds by running the body over those values.
 //
 //*************************************************************************
 

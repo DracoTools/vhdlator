@@ -17,11 +17,17 @@
 // Folds the static expressions of clause 9.4 to values.
 //
 // Two rules shape the code. Only a *predefined* operator can be folded, since
-// a user-defined one means running code the frontend has not compiled yet; a
-// user-defined "+" therefore stops the fold, which is correct rather than a
-// limitation. And every fold is guarded against overflow, because a VHDL
-// source may legally contain integer_type'high + 1 in a context where the
-// expression is never evaluated, and folding must not trap on it.
+// a user-defined one is a function call and is folded by running its body
+// rather than by knowing what its symbol means. And every fold is guarded
+// against overflow, because a VHDL source may legally contain
+// integer_type'high + 1 in a context where the expression is never evaluated,
+// and folding must not trap on it.
+//
+// A call to a pure function whose actuals are static is itself static
+// (9.4.3 i), so the body is interpreted here over the values the call passed.
+// That is not an optimisation: an array bound may be written as a call to a
+// helper declared beside it, and until the call folds the bound is not a
+// number and the object cannot be given a width.
 //
 //*************************************************************************
 
@@ -36,7 +42,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <string>
+#include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -216,9 +224,22 @@ class VhdlEvaluator final {
     std::string* const m_errp;  // Where to leave the reason a fold failed
     int m_depth = 0;  // Guards against a cyclic declaration
 
+    // One activation of a subprogram body being run for a static call: the
+    // value of every parameter, local object and loop parameter it holds
+    using Frame = std::map<const VhdlSymbol*, VhdlValue>;
+    std::vector<Frame> m_frames;
+    int m_calls = 0;  // Activations nested, against a recursion that has no end
+    int m_steps = 0;  // Statements run, against a loop that has none either
+    bool m_bail = false;  // The activation being run cannot be folded
+
     // A constant folded from a self-referential declaration would recurse
     // forever; analysis reports the cycle separately, so just stop
     static constexpr int MAX_DEPTH = 64;
+    // A body may name a function that names a body, and a loop may be written
+    // so that it never ends. Neither is a reason to hang: a fold that runs out
+    // of either budget is simply not one that happened.
+    static constexpr int MAX_CALLS = 16;
+    static constexpr int MAX_STEPS = 20000;
 
 public:
     // CONSTRUCTORS
@@ -261,6 +282,13 @@ private:
             if (!symp->aliasp()) return VhdlValue{};
             symp = symp->aliasp();
         }
+        // Inside a body being run for a static call, an object belongs to that
+        // activation and has whatever value it has been given there
+        if (!m_frames.empty()) {
+            const Frame& frame = m_frames.back();
+            const auto it = frame.find(symp);
+            if (it != frame.end()) return it->second;
+        }
         switch (symp->kind()) {
         case VhdlSymKind::ENUM_LITERAL:
             return VhdlValue::mkInt(symp->position(), symp->typep());
@@ -276,6 +304,10 @@ private:
             // A parameter has a value only in a copy of a subprogram made for
             // one call site, which is where the call's own values were fixed
             return symp->value();
+        case VhdlSymKind::FUNCTION:
+            // A function taking no parameters is called by writing its name
+            // with no argument list at all (4.2.2.1)
+            return evalUserCall(nullptr, symp);
         default: return VhdlValue{};
         }
     }
@@ -746,6 +778,354 @@ private:
         return wantMax ? (less ? args[1] : args[0]) : (less ? args[0] : args[1]);
     }
 
+    // Running a subprogram body
+    //
+    // A function call is a static expression when the function is pure and
+    // each of its actuals is static (9.4.3 i), and its value is whatever the
+    // body computes. So the body is run here, statement by statement, over
+    // the values the call passed. This is not a shortcut for any particular
+    // function: an array bound written as a call to a helper declared beside
+    // it is ordinary VHDL, and IEEE's own floating-point package sizes its
+    // fraction that way.
+    //
+    // Only the scalar values this evaluator holds can be computed, so a body
+    // that needs an array or a record stops -- which is the ordinary "not
+    // static" answer rather than an error. Two budgets bound the work: how
+    // many activations may be nested, and how many statements may run in all.
+
+    enum class Flow : uint8_t {
+        NORMAL,  // Ran to the end of the statement list
+        RETURNED,  // A return statement, or the fold gave up
+        EXITED,  // An exit statement
+        NEXTED  // A next statement
+    };
+
+    // Give up on the fold from inside a body. The value is unknown however
+    // far the walk had got, so the flow only has to unwind.
+    Flow bail() {
+        m_bail = true;
+        return Flow::RETURNED;
+    }
+
+    // Whether a condition holds. BOOLEAN is an enumeration, so TRUE is the
+    // literal at position one (5.2.2). Clears okr where it does not fold.
+    bool condTrue(AstNodeVhdlExpr* nodep, bool& okr) {
+        const VhdlValue val = eval(nodep);
+        if (!val.known() || !val.isInt()) {
+            okr = false;
+            return false;
+        }
+        return val.toInt() == VAL_TRUE;
+    }
+
+    // The object a variable assignment writes, or null where the target is
+    // not a plain name of something this activation holds. A pure function
+    // may not write anything outside itself (4.4), so anything else stops
+    const VhdlSymbol* targetSym(AstNodeVhdlExpr* nodep) {
+        if (m_frames.empty()) return nullptr;
+        AstVhdlName* const namep = VN_CAST(nodep, VhdlName);
+        VhdlSymbol* symp = namep ? namep->vhdlSymp() : nullptr;
+        if (!symp) return nullptr;
+        symp = symp->resolved();
+        return m_frames.back().count(symp) ? symp : nullptr;
+    }
+
+    Flow execStmts(AstNode* stmtsp, VhdlValue& retr) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            const Flow f = execStmt(p, retr);
+            if (f != Flow::NORMAL) return f;
+        }
+        return Flow::NORMAL;
+    }
+
+    Flow execStmt(AstNode* nodep, VhdlValue& retr) {
+        if (++m_steps > MAX_STEPS) return bail();
+        if (VN_IS(nodep, VhdlNull)) return Flow::NORMAL;
+        if (AstVhdlReturn* const p = VN_CAST(nodep, VhdlReturn)) {
+            if (p->valuep()) {
+                retr = eval(p->valuep());
+                if (!retr.known()) return bail();
+            }
+            return Flow::RETURNED;
+        }
+        if (VN_IS(nodep, VhdlAssert)) {
+            // An assertion produces no value. Raising it here would put the
+            // message out once for every expression that folds a call to
+            // this function rather than once for every execution, so the
+            // check is left to the code the back end emits.
+            return Flow::NORMAL;
+        }
+        if (AstVhdlVarAssign* const p = VN_CAST(nodep, VhdlVarAssign)) {
+            if (p->kind() != VhdlAssignKind::SIMPLE) return bail();
+            const VhdlSymbol* const symp = targetSym(p->targetp());
+            if (!symp) return bail();
+            const VhdlValue val = eval(p->valuep());
+            if (!val.known()) return bail();
+            m_frames.back()[symp] = val;
+            return Flow::NORMAL;
+        }
+        if (AstVhdlIf* const p = VN_CAST(nodep, VhdlIf)) {
+            for (AstNode* ap = p->altsp(); ap; ap = ap->nextp()) {
+                AstVhdlAlternative* const altp = VN_CAST(ap, VhdlAlternative);
+                if (!altp) return bail();
+                // The last alternative may have no condition, meaning "else"
+                if (altp->condp()) {
+                    bool ok = true;
+                    const bool taken = condTrue(altp->condp(), ok);
+                    if (!ok) return bail();
+                    if (!taken) continue;
+                }
+                return execStmts(altp->stmtsp(), retr);
+            }
+            return Flow::NORMAL;
+        }
+        if (AstVhdlCase* const p = VN_CAST(nodep, VhdlCase)) return execCase(p, retr);
+        if (AstVhdlLoop* const p = VN_CAST(nodep, VhdlLoop)) return execLoop(p, retr);
+        if (AstVhdlNext* const p = VN_CAST(nodep, VhdlNext)) {
+            // A labelled exit leaves a loop further out than the one this
+            // walk is in, which it does not keep track of (10.12)
+            if (!p->loopLabel().empty()) return bail();
+            if (p->condp()) {
+                bool ok = true;
+                const bool taken = condTrue(p->condp(), ok);
+                if (!ok) return bail();
+                if (!taken) return Flow::NORMAL;
+            }
+            return p->isExit() ? Flow::EXITED : Flow::NEXTED;
+        }
+        // A wait or a signal assignment cannot appear in a function at all,
+        // and a procedure call would have to carry values back out
+        return bail();
+    }
+
+    // Whether a case choice covers the selector. Clears okr where the choice
+    // is one this walk cannot decide, such as a discrete range given by a
+    // type mark.
+    bool choiceMatches(AstVhdlChoice* nodep, const VhdlValue& sel, bool& okr) {
+        if (nodep->isOthers()) return true;
+        if (AstVhdlRange* const rp = nodep->rangep()) {
+            const VhdlValue lo = rp->leftp() ? eval(rp->leftp()) : VhdlValue{};
+            const VhdlValue hi = rp->rightp() ? eval(rp->rightp()) : VhdlValue{};
+            if (!sel.isInt() || !lo.isInt() || !hi.isInt()) {
+                okr = false;
+                return false;
+            }
+            return rp->dir() == VhdlDir::TO
+                       ? (sel.toInt() >= lo.toInt() && sel.toInt() <= hi.toInt())
+                       : (sel.toInt() <= lo.toInt() && sel.toInt() >= hi.toInt());
+        }
+        AstNodeVhdlExpr* const valuep = nodep->valuep();
+        const VhdlValue val = valuep ? eval(valuep) : VhdlValue{};
+        if (!val.known() || val.kind() != sel.kind()) {
+            okr = false;
+            return false;
+        }
+        return val.isStr() ? val.toStr() == sel.toStr() : val.toInt() == sel.toInt();
+    }
+
+    Flow execCase(AstVhdlCase* nodep, VhdlValue& retr) {
+        // "case?" matches with "?=", where a '-' in a choice stands for any
+        // value (10.9). That is a comparison over the elements of an array,
+        // and no array is held here
+        if (nodep->matching()) return bail();
+        const VhdlValue sel = eval(nodep->exprp());
+        if (!sel.known()) return bail();
+        for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
+            AstVhdlAlternative* const altp = VN_CAST(ap, VhdlAlternative);
+            if (!altp) return bail();
+            for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
+                AstVhdlChoice* const chp = VN_CAST(cp, VhdlChoice);
+                if (!chp) return bail();
+                bool ok = true;
+                const bool hit = choiceMatches(chp, sel, ok);
+                if (!ok) return bail();
+                if (hit) return execStmts(altp->stmtsp(), retr);
+            }
+        }
+        // The choices of a case statement are exhaustive (10.9), so this is
+        // only reached where analysis has already reported that they are not
+        return Flow::NORMAL;
+    }
+
+    Flow execLoop(AstVhdlLoop* nodep, VhdlValue& retr) {
+        const bool isFor = nodep->kind() == VhdlLoopKind::FOR;
+        int64_t from = 0;
+        int64_t to = 0;
+        int64_t step = 1;
+        const VhdlSymbol* parmp = nullptr;
+        VhdlType* parmTypep = nullptr;
+        if (isFor) {
+            // The discrete range decides both the values and how many there
+            // are, so it has to fold before the first iteration (10.10)
+            AstVhdlRange* const rp = VN_CAST(nodep->rangep(), VhdlRange);
+            const VhdlValue lo = rp && rp->leftp() ? eval(rp->leftp()) : VhdlValue{};
+            const VhdlValue hi = rp && rp->rightp() ? eval(rp->rightp()) : VhdlValue{};
+            if (!lo.isInt() || !hi.isInt()) return bail();
+            from = lo.toInt();
+            to = hi.toInt();
+            step = rp->dir() == VhdlDir::TO ? 1 : -1;
+            parmp = nodep->vhdlSymp();
+            if (!parmp) return bail();
+            parmTypep = nodep->vhdlSymp()->typep();
+        }
+        for (int64_t i = from;; i += step) {
+            if (isFor) {
+                if (step > 0 ? i > to : i < to) break;
+                m_frames.back()[parmp] = VhdlValue::mkInt(i, parmTypep);
+            } else if (nodep->kind() == VhdlLoopKind::WHILE) {
+                bool ok = nodep->condp() != nullptr;
+                const bool go = ok && condTrue(nodep->condp(), ok);
+                if (!ok) return bail();
+                if (!go) break;
+            }
+            if (++m_steps > MAX_STEPS) return bail();
+            const Flow f = execStmts(nodep->stmtsp(), retr);
+            if (f == Flow::RETURNED) return f;
+            if (f == Flow::EXITED) break;
+        }
+        // The loop parameter is not visible outside the loop (10.10)
+        if (parmp) m_frames.back().erase(parmp);
+        return Flow::NORMAL;
+    }
+
+    // One activation: bind the parameters, elaborate the declarations, run
+    // the statements. The frame is already pushed.
+    VhdlValue runBody(AstVhdlSubprogDecl* declp, const std::vector<AstVhdlIfaceDecl*>& parms,
+                      const std::vector<VhdlValue>& args, const std::vector<bool>& given) {
+        Frame& frame = m_frames.back();
+        for (size_t i = 0; i < parms.size(); ++i) {
+            VhdlSymbol* const symp = parms[i]->vhdlSymp();
+            if (!symp) return VhdlValue{};
+            if (given[i]) {
+                frame[symp->resolved()] = args[i];
+                continue;
+            }
+            // A formal the call left out takes the default written in its
+            // declaration, read in the subprogram's own region (6.5.7.1)
+            if (!parms[i]->defaultp()) return VhdlValue{};
+            const VhdlValue val = eval(parms[i]->defaultp());
+            if (!val.known()) return VhdlValue{};
+            frame[symp->resolved()] = val;
+        }
+        for (AstNode* p = declp->declsp(); p; p = p->nextp()) {
+            // Anything that is not an object declares no value to hold -- a
+            // type, a nested subprogram, a use clause -- and a name that
+            // denotes one of those folds by its own rules or not at all
+            AstVhdlObjectDecl* const op = VN_CAST(p, VhdlObjectDecl);
+            if (!op) continue;
+            if (op->kind() != VhdlObjKind::CONSTANT && op->kind() != VhdlObjKind::VARIABLE) {
+                continue;
+            }
+            VhdlSymbol* const symp = op->vhdlSymp();
+            if (!symp || !scalarValued(symp->typep())) continue;
+            // A variable with no initial value starts at the leftmost value
+            // of its subtype, which is not a value held here. Left unknown,
+            // so that reading it before it is written stops the fold rather
+            // than inventing a number.
+            frame[symp->resolved()] = op->defaultp() ? eval(op->defaultp()) : VhdlValue{};
+        }
+        VhdlValue ret;
+        const Flow f = execStmts(declp->stmtsp(), ret);
+        // Reaching the end of a function without a return statement is an
+        // error the running model reports; there is no value to give here
+        if (f != Flow::RETURNED) return VhdlValue{};
+        return ret;
+    }
+
+    // Whether a value of this type is one this evaluator holds faithfully:
+    // a number, a position or a physical value, and nothing composite
+    static bool scalarValued(const VhdlType* typep) {
+        if (!typep) return false;
+        switch (typep->base()->kind()) {
+        case VhdlTypeKind::ENUM:
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::FLOATING:
+        case VhdlTypeKind::PHYSICAL:
+        case VhdlTypeKind::UNIVERSAL_INTEGER:
+        case VhdlTypeKind::UNIVERSAL_REAL: return true;
+        default: return false;
+        }
+    }
+
+    // A call to a user-defined function, folded by running it. Null argsp is
+    // a call written as a bare name, which is how a function taking no
+    // parameters is called (4.2.2.1).
+    VhdlValue evalUserCall(AstNode* argsp, const VhdlSymbol* funcp) {
+        // A function bound to a C symbol has no body to run, and an impure
+        // one may read a signal or a shared variable, so neither is static
+        if (funcp->predefined() || funcp->isForeign()) return VhdlValue{};
+        AstVhdlSubprogDecl* const declp = funcp->bodyp();
+        if (!declp || !declp->isFunction() || !declp->vhdlPure()) return VhdlValue{};
+        if (m_calls >= MAX_CALLS || m_steps >= MAX_STEPS) return VhdlValue{};
+        // Only where every value that goes in and the one that comes out is
+        // a scalar. A value here is a number, not an array with bounds of its
+        // own, so a body that builds one would be run over values that had
+        // lost how they were indexed -- and a bound is exactly what such a
+        // call is usually asked for.
+        if (!scalarValued(funcp->returnTypep())) return VhdlValue{};
+
+        // The parameters, in order. A generic subprogram keeps its generics
+        // ahead of them, and a call associates only the parameters (4.2.1).
+        std::vector<AstVhdlIfaceDecl*> parms;
+        int skip = declp->genericCount();
+        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+            AstVhdlIfaceDecl* const ip = VN_CAST(p, VhdlIfaceDecl);
+            if (!ip) return VhdlValue{};
+            if (skip > 0) {
+                --skip;
+                continue;
+            }
+            // A signal, file or subprogram parameter is not a value passed
+            if (ip->kind() != VhdlIfaceKind::CONSTANT && ip->kind() != VhdlIfaceKind::VARIABLE) {
+                return VhdlValue{};
+            }
+            if (ip->mode() != VhdlMode::IN) return VhdlValue{};
+            if (!scalarValued(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr)) {
+                return VhdlValue{};
+            }
+            parms.push_back(ip);
+        }
+
+        // The actuals, evaluated where the call was written, before this
+        // call's own names come into view
+        std::vector<VhdlValue> args(parms.size());
+        std::vector<bool> given(parms.size(), false);
+        size_t at = 0;
+        for (AstNode* p = argsp; p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            AstNodeVhdlExpr* const actualp = asp ? asp->actualp() : VN_CAST(p, NodeVhdlExpr);
+            if (!actualp) return VhdlValue{};  // Written OPEN
+            size_t which = at++;
+            if (asp && asp->formalp()) {
+                const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                if (!namep) return VhdlValue{};
+                which = parms.size();
+                for (size_t i = 0; i < parms.size(); ++i) {
+                    if (parms[i]->name() == namep->name()) {
+                        which = i;
+                        break;
+                    }
+                }
+            }
+            if (which >= parms.size() || given[which]) return VhdlValue{};
+            const VhdlValue val = eval(actualp);
+            if (!val.known()) return VhdlValue{};
+            args[which] = val;
+            given[which] = true;
+        }
+
+        // Giving up inside one activation says nothing about the expression
+        // that contains the call, so the flag is this call's own
+        VL_RESTORER(m_bail);
+        m_bail = false;
+        ++m_calls;
+        m_frames.emplace_back();
+        const VhdlValue out = runBody(declp, parms, args, given);
+        m_frames.pop_back();
+        --m_calls;
+        return m_bail ? VhdlValue{} : out;
+    }
+
     VhdlValue evalCall(AstVhdlCall* nodep) {
         // Only a type conversion and the operations the language itself
         // declares fold; any other function call would mean running code,
@@ -757,8 +1137,11 @@ private:
         if (!namedp && prefixp) namedp = prefixp->vhdlSymp();
         if (namedp) {
             const VhdlSymbol* const funcp = namedp->resolved();
-            if (funcp->kind() == VhdlSymKind::FUNCTION && funcp->predefined()) {
-                return evalMinMax(nodep, funcp);
+            if (funcp->kind() == VhdlSymKind::FUNCTION) {
+                // A call to a pure function whose actuals are static is static
+                // in its turn (9.4.3 i), whoever declared it
+                return funcp->predefined() ? evalMinMax(nodep, funcp)
+                                           : evalUserCall(nodep->argsp(), funcp);
             }
         }
         VhdlSymbol* const symp = prefixp ? prefixp->vhdlSymp() : nullptr;
