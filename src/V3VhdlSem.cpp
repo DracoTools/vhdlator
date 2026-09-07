@@ -6127,8 +6127,11 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     if (namedPrefix && VN_IS(nodep->prefixp(), VhdlSelected)) {
         bool callable = false;
         for (const VhdlSymbol* const symp : found) {
-            if (symp->kind() == VhdlSymKind::FUNCTION
-                || symp->kind() == VhdlSymKind::PROCEDURE) {
+            // An alias of a subprogram is called like the subprogram (6.6.3),
+            // so what it denotes is what says whether this is a call -- the
+            // search above the loop asks the same question the same way
+            const VhdlSymKind kind = symp->resolved()->kind();
+            if (kind == VhdlSymKind::FUNCTION || kind == VhdlSymKind::PROCEDURE) {
                 callable = true;
             }
         }
