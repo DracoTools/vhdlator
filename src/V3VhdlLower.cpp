@@ -9944,6 +9944,7 @@ private:
              || name == "to_bitvector" || name == "to_bit" || name == "to_stdulogic"
              || name == "to_stdlogic" || name == "to_x01" || name == "to_01"
              || name == "to_ux01")
+            && V3VhdlStd::isIntrinsic(symp)
             && (isLogicish(args[0]->vhdlTypep()) || isBitish(args[0]->vhdlTypep()))) {
             return firstp;
         }
