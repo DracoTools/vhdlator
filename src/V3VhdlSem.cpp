@@ -4914,15 +4914,16 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         err(nodep->fileline(), "No visible " + what + " matches this use");
         return V3VhdlStd::errorType();
     }
-    // A procedure call statement can only name a procedure and an expression
-    // can only name a function, so the two never compete (4.3, 10.7). A call
-    // written with parentheses settles that where its arguments are read; a
-    // procedure taking none at all is written as a bare name (4.2.2.1), and
-    // there is nowhere else for it to be settled but here.
+    // A procedure call statement names a procedure and nothing else (4.3,
+    // 10.7), so nothing else competes with one -- not a function of the same
+    // name, and not an enumeration literal of it either. A call written with
+    // parentheses settles that where its arguments are read; a procedure
+    // taking none at all is written as a bare name (4.2.2.1), and there is
+    // nowhere else for it to be settled but here.
     if (cands.size() > 1 && m_procCall) {
         std::vector<VhdlSymbol*> kept;
         for (VhdlSymbol* const symp : cands) {
-            if (symp->resolved()->kind() == VhdlSymKind::FUNCTION) continue;
+            if (symp->resolved()->kind() != VhdlSymKind::PROCEDURE) continue;
             kept.push_back(symp);
         }
         if (!kept.empty()) cands.swap(kept);
