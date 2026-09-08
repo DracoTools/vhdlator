@@ -4228,12 +4228,17 @@ private:
             && inArithmeticPackage(symp)) {
             return carriedDynamically(callp->vhdlTypep());
         }
-        // MAXIMUM and MINIMUM over two arrays give one of the two back, so
-        // the result is as long as an operand and no longer: two fixed
-        // operands give a fixed result, whatever unconstrained subtype the
-        // package wrote the result with (5.3.2.4)
-        if ((name == "maximum" || name == "minimum") && inArithmeticPackage(symp)
-            && depth < 8) {
+        // MAXIMUM and MINIMUM over two arrays give one of the two back
+        // (5.3.2.4), so the result is as long as whichever operand won --
+        // which the two operands settle between them only where they are the
+        // same length. Where they are not, which one it is is a question for
+        // running, and the result has to carry its own bounds: "maximum((4,
+        // 9, 2), (1, 2, 3, 4, 5))" is three elements long, not five, because
+        // the comparison is lexicographic and the first operand is greater.
+        // Predefined for every array type in STANDARD as well as declared in
+        // the arithmetic packages, and the rule is the same either way.
+        if ((name == "maximum" || name == "minimum")
+            && (inArithmeticPackage(symp) || V3VhdlStd::isIntrinsic(symp)) && depth < 8) {
             bool operandCarries = false;
             int args = 0;
             for (AstNode* argp = callp->argsp(); argp; argp = argp->nextp()) {
@@ -7331,6 +7336,17 @@ private:
                               elemp, flp);
         }
         const bool signd = typep->elementp() && isSignedType(typep->elementp());
+        // Every element is read out of the value, so a value that cannot be
+        // read twice -- an aggregate, or what a call gives back -- is worked
+        // out once and kept. "maximum(integer_vector'(4, 9, 2))" is the
+        // shape: an aggregate has no places to select from until it is one.
+        AstNode* prep = nullptr;
+        if (!repeatable(arrp)) {
+            AstVar* const tmpp
+                = newTempVar("__Vextreme", lowerType(const_cast<VhdlType*>(typep), flp), flp);
+            prep = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, arrp};
+            arrp = new AstVarRef{flp, tmpp, VAccess::READ};
+        }
         AstNodeExpr* bestp = nullptr;
         for (int64_t i = 0; i < count; ++i) {
             AstNodeExpr* const elemp = new AstSelBit{
@@ -7349,6 +7365,10 @@ private:
                             : new AstCond{flp, testp, bestp, elemp};
         }
         VL_DO_DANGLING(arrp->deleteTree(), arrp);
+        // The statement that works the value out travels with the expression,
+        // since a call may appear anywhere an expression may
+        if (prep && bestp) return new AstExprStmt{flp, prep, bestp};
+        if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
         return bestp;
     }
 
@@ -10044,6 +10064,24 @@ private:
                 return lowerArrayExtreme(firstp, args[0]->vhdlTypep(), name == "maximum", flp);
             }
             if (args.size() < 2) return nullptr;
+            // The answer is one of the two operands (5.3.2.4), so where they
+            // are not the same length which one it is is a question for
+            // running, and the answer would have to carry its own bounds.
+            // The comparison that would decide it is the lexicographic one
+            // STANDARD declares over any array, which is not the numeric one
+            // the carrier helper makes -- so this is refused rather than
+            // answered with the wrong comparison.
+            const VhdlType* const ltypep = args[0]->vhdlTypep();
+            const VhdlType* const rtypep = args[1]->vhdlTypep();
+            if (!isDynValue(args[0]) && !isDynValue(args[1]) && ltypep && rtypep
+                && ltypep->isConstrainedArray() && rtypep->isConstrainedArray()
+                && ltypep->dimensions() == 1 && rtypep->dimensions() == 1
+                && ltypep->dimLength(0) != rtypep->dimLength(0)) {
+                VL_DO_DANGLING(firstp->deleteTree(), firstp);
+                unsup(flp, "'" + name + "' of two arrays of different lengths");
+                return nullptr;
+            }
+            AstNodeExpr* const leftValp = firstp;
             AstNodeExpr* const secondp = lowerExpr(args[1]);
             if (!secondp) return nullptr;
             const bool signd = isSignedType(args[0]->vhdlTypep());
@@ -10056,7 +10094,7 @@ private:
                 unsup(flp, "'" + name + "' of a value of no length known here");
                 return nullptr;
             }
-            AstNode* setp = new AstAssign{flp, wr(lp, flp), firstp};
+            AstNode* setp = new AstAssign{flp, wr(lp, flp), leftValp};
             setp = AstNode::addNext(
                 setp, static_cast<AstNode*>(new AstAssign{flp, wr(rp, flp), secondp}));
             const auto operand = [&](AstVar* varp, int at) {
@@ -17144,10 +17182,12 @@ private:
     // read, shaped like whatever that operand turns out to be: a value that
     // carries its own bounds is held in a carrier, and one whose length the
     // text fixes in a vector of that length
-    AstVar* extremeTemp(AstNodeVhdlExpr* argp, FileLine* flp) {
+    AstVar* extremeTemp(AstNodeVhdlExpr* argp, FileLine* flp, VhdlType* asCarrierp = nullptr) {
         if (!argp) return nullptr;
         AstNodeDType* dtypep = nullptr;
-        if (isDynValue(argp)) {
+        if (asCarrierp) {
+            dtypep = dynCarrierRef(asCarrierp, flp);
+        } else if (isDynValue(argp)) {
             VhdlType* const carrp = dynValueType(argp);
             if (carrp) dtypep = dynCarrierRef(carrp, flp);
         } else if (argp->vhdlTypep()) {
