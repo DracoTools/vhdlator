@@ -30,6 +30,7 @@ begin
         variable d : integer_vector (1 to 5) := (4, 9, 2, 1, 1);
         variable f : integer_vector (1 to 2) := (4, 9);
         variable g : integer_vector (3 downto 1) := (4, 9, 2);
+        variable m : integer_vector (1 to 3);
     begin
         -- The first difference decides, not the last
         assert not (a > c) report "a > c" severity failure;
@@ -49,6 +50,15 @@ begin
         -- The comparison walks the values from their leftmost element,
         -- whichever way the index range runs
         assert not (a < g) and not (a > g) report "a vs g" severity failure;
+
+        -- MAXIMUM and MINIMUM of two such arrays choose between them, and
+        -- ask the same question the operators do (5.3.2.4)
+        m := maximum (a, c);
+        assert m = c report "maximum picked the wrong one" severity failure;
+        m := minimum (a, c);
+        assert m = a report "minimum picked the wrong one" severity failure;
+        m := maximum (a, e);
+        assert m = a report "maximum of two equal" severity failure;
 
         report "*-* All Finished *-*";
         std.env.stop;

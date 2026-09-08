@@ -10243,6 +10243,20 @@ private:
                                                                  signd}}))};
                 refp->taskp(VN_AS(cmpp, Func));
                 testp = new AstGtS{flp, refp, i32(0, flp)};
+            } else if (ltypep && rtypep && ltypep->base()->kind() == VhdlTypeKind::ARRAY
+                       && ltypep->isConstrainedArray() && rtypep->isConstrainedArray()
+                       && VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp),
+                                UnpackArrayDType)) {
+                // An array of a discrete element that does not lower to a
+                // packed vector is compared the way the language compares one
+                // -- lexicographically (5.2.6) -- which is what the operators
+                // do a few hundred lines away
+                testp = lexCompareOf(rd(lp, flp), ltypep, rd(rp, flp), rtypep, false, false,
+                                     flp);
+                if (!testp) {
+                    unsup(flp, "'" + name + "' of two arrays compared element by element");
+                    return nullptr;
+                }
             } else {
                 testp = signd ? static_cast<AstNodeExpr*>(
                             new AstGtS{flp, operand(lp, 0), operand(rp, 1)})
