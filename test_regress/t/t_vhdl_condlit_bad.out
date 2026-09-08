@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_condlit_bad.vhd:38:33: Ambiguous character literal 'H': 2 visible declarations match, and the context does not decide between them
+... candidate: 'H'() return tri at t/t_vhdl_condlit_bad.vhd:27:28
+... candidate: 'H'() return character
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_condlit_bad.vhd:38:33: Value 'H' is outside the range of variable 'b', which is false to true
+%Error: t/t_vhdl_condlit_bad.vhd:40:12: Ambiguous character literal '1': 3 visible declarations match, and the context does not decide between them
+... candidate: '1'() return tri at t/t_vhdl_condlit_bad.vhd:27:23
+... candidate: '1'() return bit
+... candidate: '1'() return character
+%Error: Exiting due to

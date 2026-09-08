@@ -328,6 +328,16 @@ class VhdlSemVisitor final : public VNVisitor {
     // A discrete range in any of its spellings: "left to right", a type mark
     // standing for its own range, a subtype indication, "t range <>", or a
     // range attribute name.
+    // The condition of an if, a loop, an exit, a next, an assertion or a
+    // conditional assignment: BOOLEAN, or converted to one by "??" (9.2.9).
+    // Only the expression itself is a condition -- the operands of "a = b"
+    // are not -- so the node is remembered rather than a flag set.
+    VhdlType* analyzeCondition(AstNodeVhdlExpr* condp) {
+        VL_RESTORER(m_condExprp);
+        m_condExprp = condp;
+        return analyzeExpr(condp, V3VhdlStd::booleanType());
+    }
+
     RangeInfo analyzeRange(AstNode* rangep, VhdlType* wantp) {
         RangeInfo info;
         if (!rangep) return info;
@@ -1318,6 +1328,7 @@ private:
                                               AstVhdlEntity* entp, AstVhdlComponentDecl* compp,
                                               VhdlScope* scopep,
                                               std::vector<std::string>& path) VL_MT_DISABLED;
+    bool hasConditionOperator(const VhdlType* typep) VL_MT_DISABLED;
     void bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void bindAscending(AstVhdlInstance* nodep, const OpenBound& bound,
                        AstNodeVhdlExpr* prefixp, bool ascending,
@@ -1431,6 +1442,9 @@ private:
     static bool scopeEncloses(const VhdlScope* outerp, const VhdlScope* innerp) VL_MT_DISABLED;
     // Set while the call that is a statement of its own is resolved
     bool m_procCall = false;
+    // The expression that is a condition, if any: only that one has the
+    // condition operator applied to it (9.2.9)
+    const AstNodeVhdlExpr* m_condExprp = nullptr;
     // Set while a copy made for one call site is analyzed: the bounds inside
     // it fold because the call supplied them, not because the design wrote
     // them, so a range that does not fit is a run-time condition
@@ -2256,7 +2270,7 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
     }
     // The guard expression names what is visible where the block appears; the
     // GUARD signal it declares is visible only inside (11.2)
-    if (nodep->guardp()) analyzeExpr(nodep->guardp(), V3VhdlStd::booleanType());
+    if (nodep->guardp()) analyzeCondition(nodep->guardp());
     pushScope(nodep->name().empty() ? "block" : nodep->name());
     if (nodep->guardp()) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::SIGNAL, "guard", nodep);
@@ -2363,7 +2377,7 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
 void VhdlSemVisitor::visit(AstVhdlGenerateBody* nodep) {
     // The condition is an expression, not a statement, so it needs analyzing
     // rather than iterating: iterating would leave its names unresolved
-    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    if (nodep->condp()) analyzeCondition(nodep->condp());
     for (AstNode* p = nodep->choicesp(); p; p = p->nextp()) {
         analyzeChoice(VN_AS(p, VhdlChoice), m_genSelTypep);
     }
@@ -2389,7 +2403,7 @@ void VhdlSemVisitor::visit(AstVhdlLoop* nodep) {
         return;
     }
     // A while loop tests a condition of type BOOLEAN before each pass (10.10)
-    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    if (nodep->condp()) analyzeCondition(nodep->condp());
     iterateAndNextNull(nodep->stmtsp());
 }
 
@@ -4962,6 +4976,19 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
     // parentheses settles that where its arguments are read; a procedure
     // taking none at all is written as a bare name (4.2.2.1), and there is
     // nowhere else for it to be settled but here.
+    // A condition that is not already a BOOLEAN has the condition operator
+    // applied to it, and the expression is legal where exactly one reading of
+    // it is a BOOLEAN once it is (9.2.9, and note 1 of 12.5). So a bare 'H' as
+    // a condition is the STD_ULOGIC one, since CHARACTER has no "??" -- while
+    // a bare '1' stays ambiguous, because BIT has one as well as STD_ULOGIC.
+    // Only in a condition: "variable b : boolean := 'H';" is still an error.
+    if (cands.size() > 1 && nodep == m_condExprp) {
+        std::vector<VhdlSymbol*> kept;
+        for (VhdlSymbol* const symp : cands) {
+            if (hasConditionOperator(symp->typep())) kept.push_back(symp);
+        }
+        if (kept.size() == 1) cands.swap(kept);
+    }
     if (cands.size() > 1 && m_procCall) {
         std::vector<VhdlSymbol*> kept;
         for (VhdlSymbol* const symp : cands) {
@@ -5966,6 +5993,21 @@ bool vhdlIsIndexPart(const std::string& part) {
 
 int64_t vhdlIndexPartAt(const std::string& part) {
     return std::stoll(part.substr(1, part.size() - 2));
+}
+
+// Whether a visible "??" takes this type, which is what lets a value of it
+// stand as a condition (9.2.9)
+bool VhdlSemVisitor::hasConditionOperator(const VhdlType* typep) {
+    if (!typep) return false;
+    std::vector<VhdlSymbol*> found;
+    lookup("??", found);
+    for (const VhdlSymbol* const symp : found) {
+        const VhdlSymbol* const fp = symp->resolved();
+        if (fp->kind() != VhdlSymKind::FUNCTION) continue;
+        if (fp->paramTypes().size() != 1 || !fp->paramTypes()[0]) continue;
+        if (fp->paramTypes()[0]->base() == typep->base()) return true;
+    }
+    return false;
 }
 
 VhdlType* vhdlFormalTypeAt(const VhdlSymbol* symp, int idx, const std::string& elem) {
@@ -7481,7 +7523,7 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
-        if (altp->condp()) analyzeExpr(altp->condp(), V3VhdlStd::booleanType());
+        if (altp->condp()) analyzeCondition(altp->condp());
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
             AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
             analyzeChoice(chp, nodep->selectorp() ? nodep->selectorp()->vhdlTypep() : nullptr);
@@ -7512,7 +7554,7 @@ void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
-        if (altp->condp()) analyzeExpr(altp->condp(), V3VhdlStd::booleanType());
+        if (altp->condp()) analyzeCondition(altp->condp());
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
             analyzeChoice(VN_AS(cp, VhdlChoice),
                           nodep->selectorp() ? nodep->selectorp()->vhdlTypep() : nullptr);
@@ -7531,7 +7573,7 @@ void VhdlSemVisitor::visit(AstVhdlIf* nodep) {
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         // A condition is of type BOOLEAN, or is converted to one by "??" (9.2.9)
-        if (altp->condp()) analyzeExpr(altp->condp(), V3VhdlStd::booleanType());
+        if (altp->condp()) analyzeCondition(altp->condp());
         // A copy made for one call site settles conditions the source left
         // open -- "value'length = target'length" where the two lengths now
         // differ -- and the branch behind such a condition is one nothing
@@ -7647,7 +7689,7 @@ void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlAssert* nodep) {
-    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    if (nodep->condp()) analyzeCondition(nodep->condp());
     if (nodep->reportp()) analyzeExpr(nodep->reportp(), V3VhdlStd::stringType());
     if (nodep->severityp()) analyzeExpr(nodep->severityp(), V3VhdlStd::severityType());
 }
@@ -7656,7 +7698,7 @@ void VhdlSemVisitor::visit(AstVhdlWait* nodep) {
     for (AstNode* sp = nodep->sensp(); sp; sp = sp->nextp()) {
         analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
     }
-    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    if (nodep->condp()) analyzeCondition(nodep->condp());
     if (nodep->timeoutp()) {
         analyzeExpr(nodep->timeoutp(), V3VhdlStd::timeType());
         checkDelay(nodep->timeoutp(), "timeout");
@@ -8841,5 +8883,5 @@ void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlNext* nodep) {
-    if (nodep->condp()) analyzeExpr(nodep->condp(), V3VhdlStd::booleanType());
+    if (nodep->condp()) analyzeCondition(nodep->condp());
 }
