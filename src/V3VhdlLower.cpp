@@ -2199,6 +2199,11 @@ private:
                 if (!arrayStillOpen(boundp)) vtypep = boundp;
             }
         }
+        // And what a call gives back is as long as the copy made for this
+        // call site makes it, which the call's own type does not say
+        if (arrayStillOpen(vtypep)) {
+            if (const VhdlType* const emp = emittedArrayType(valuep)) vtypep = emp;
+        }
         if (!vtypep || !vtypep->isConstrainedArray() || vtypep->indexTypes().empty()
             || !vtypep->indexTypes()[0] || !vtypep->indexTypes()[0]->bounded()) {
             // Where the value's length is an expression the elaborated
@@ -2219,13 +2224,23 @@ private:
         }
         const VhdlType* const idxp = vtypep->indexTypes()[0];
         const int64_t count = idxp->length();
-        if (count < 0 || count > 65536 || !repeatable(srcp)) {
+        if (count < 0 || count > 65536) {
             VL_DO_DANGLING(targetp->deleteTree(), targetp);
             VL_DO_DANGLING(srcp->deleteTree(), srcp);
             unsup(flp, "value of a length only running decides copied from this expression");
             return nullptr;
         }
         AstNode* outp = nullptr;
+        AstNodeExpr* readp = srcp;
+        if (!repeatable(srcp)) {
+            // A call gives its value once, so it is worked out and kept --
+            // the same thing the copy into a fixed target does a few hundred
+            // lines away
+            AstVar* const tmpp
+                = newTempVar("__Vdynsrc", lowerType(const_cast<VhdlType*>(vtypep), flp), flp);
+            outp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, srcp};
+            readp = new AstVarRef{flp, tmpp, VAccess::READ};
+        }
         const bool asc = idxp->ascending();
         for (int64_t i = 0; i < count; ++i) {
             const int64_t at = asc ? idxp->left() + i : idxp->left() - i;
@@ -2236,12 +2251,12 @@ private:
                     new AstSelBit{flp, dynPart(targetp->cloneTree(false), "q", flp),
                                   new AstConst{flp, AstConst::Signed32{},
                                                static_cast<int32_t>(i)}},
-                    new AstSelBit{flp, srcp->cloneTree(false),
+                    new AstSelBit{flp, readp->cloneTree(false),
                                   new AstConst{flp, AstConst::Signed32{},
                                                static_cast<int32_t>(at)}}}));
         }
         VL_DO_DANGLING(targetp->deleteTree(), targetp);
-        VL_DO_DANGLING(srcp->deleteTree(), srcp);
+        VL_DO_DANGLING(readp->deleteTree(), readp);
         return outp;
     }
 
