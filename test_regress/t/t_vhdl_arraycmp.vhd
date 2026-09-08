@@ -60,6 +60,30 @@ begin
         m := maximum (a, e);
         assert m = a report "maximum of two equal" severity failure;
 
+        -- Two of different lengths: the answer is whichever operand won, so
+        -- its length is not either operand's until the comparison is made,
+        -- and the value carries its own bounds until then.
+        -- a is (4, 9, 2) and f is (4, 9): equal as far as f goes, so a is the
+        -- greater for being longer
+        assert maximum (a, f)'length = 3
+            report "unequal: max length " & integer'image (maximum (a, f)'length)
+            severity failure;
+        assert minimum (a, f)'length = 2
+            report "unequal: min length " & integer'image (minimum (a, f)'length)
+            severity failure;
+        assert maximum (a, f) = a report "unequal: max value" severity failure;
+        assert minimum (a, f) = f report "unequal: min value" severity failure;
+
+        -- d is (4, 9, 2, 1, 1), so this time the longer one wins the other way
+        assert maximum (a, d)'length = 5
+            report "unequal longer: max length" severity failure;
+        assert maximum (a, d) = d report "unequal longer: max value" severity failure;
+
+        -- And where the first difference decides before either runs out, the
+        -- winner may be the shorter: c is (5, 0, 0), greater than a at once
+        assert maximum (a, c)'length = 3 report "first difference" severity failure;
+        assert maximum (a, c) = c report "first difference value" severity failure;
+
         report "*-* All Finished *-*";
         std.env.stop;
         wait;

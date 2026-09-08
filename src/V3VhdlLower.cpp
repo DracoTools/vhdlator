@@ -4154,6 +4154,78 @@ private:
         return funcp;
     }
 
+    std::map<const VhdlType*, AstNodeFTask*> m_dynLexFuncs;
+
+    // The lexicographic order over two values that carry their own bounds:
+    // the first pair of elements that differ decides, and where one runs out
+    // first the shorter of the two is the lesser (5.2.6). This is the order
+    // the relational operators of STANDARD give any array, and it is not the
+    // numeric one numeric_std wants -- __Vdyncmp beside it -- which aligns
+    // two vectors by bit position and reads them as numbers.
+    AstNodeFTask* dynLexCmpFunc(VhdlType* typep, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        VhdlType* const basep = typep->base();
+        const auto it = m_dynLexFuncs.find(basep);
+        if (it != m_dynLexFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp
+            = newDynFunc("__Vdynlexcmp", typep,
+                         new AstBasicDType{flp, VBasicDTypeKwd::INTEGER}, flp);
+        AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
+        AstVar* const bp = dynArg(funcp, "b", dynCarrierRef(typep, flp), flp);
+        AstVar* const lap = newFuncLocal("la", newIntDType(flp), flp);
+        AstVar* const lbp = newFuncLocal("lb", newIntDType(flp), flp);
+        AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        for (AstVar* const vp : {lap, lbp, np, kp}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const auto outr
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::READ}; };
+        funcp->addStmtsp(new AstAssign{flp, wr(lap, flp),
+                                       dynCarrierLength(rd(ap, flp), flp)});
+        funcp->addStmtsp(new AstAssign{flp, wr(lbp, flp),
+                                       dynCarrierLength(rd(bp, flp), flp)});
+        funcp->addStmtsp(new AstAssign{
+            flp, wr(np, flp),
+            new AstCond{flp, new AstLtS{flp, rd(lap, flp), rd(lbp, flp)}, rd(lap, flp),
+                        rd(lbp, flp)}});
+        funcp->addStmtsp(new AstAssign{flp, out(), i32(0, flp)});
+        funcp->addStmtsp(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
+        // Walk from the leftmost element, which is where a carrier keeps the
+        // one its left bound names, and stop at the first difference
+        const auto elemA
+            = [&]() { return new AstSelBit{flp, dynPart(rd(ap, flp), "q", flp), rd(kp, flp)}; };
+        const auto elemB
+            = [&]() { return new AstSelBit{flp, dynPart(rd(bp, flp), "q", flp), rd(kp, flp)}; };
+        AstNode* bodyp = new AstIf{
+            flp, new AstGtS{flp, elemA(), elemB()},
+            new AstAssign{flp, out(), i32(1, flp)},
+            new AstIf{flp, new AstLtS{flp, elemA(), elemB()},
+                      new AstAssign{flp, out(), i32(-1, flp)}, nullptr}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLogAnd{flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)},
+                          new AstEq{flp, outr(), i32(0, flp)}}});
+        loopp->addStmtsp(bodyp);
+        funcp->addStmtsp(loopp);
+        // Equal as far as the shorter goes, so the shorter is the lesser
+        funcp->addStmtsp(new AstIf{
+            flp, new AstEq{flp, outr(), i32(0, flp)},
+            new AstIf{flp, new AstGtS{flp, rd(lap, flp), rd(lbp, flp)},
+                      new AstAssign{flp, out(), i32(1, flp)},
+                      new AstIf{flp, new AstLtS{flp, rd(lap, flp), rd(lbp, flp)},
+                                new AstAssign{flp, out(), i32(-1, flp)}, nullptr}},
+            nullptr});
+        addHelperFunc(funcp);
+        m_dynLexFuncs.insert_or_assign(basep, funcp);
+        return funcp;
+    }
+
     std::map<const VhdlType*, AstNodeFTask*> m_dynDivFuncs;
 
     // "/", "mod" and "rem" over a carrier by an integer, which numeric_std
@@ -4277,11 +4349,31 @@ private:
             && (inArithmeticPackage(symp) || V3VhdlStd::isIntrinsic(symp)) && depth < 8) {
             bool operandCarries = false;
             int args = 0;
+            int64_t oneLength = -1;
+            bool lengthsAgree = true;
             for (AstNode* argp = callp->argsp(); argp; argp = argp->nextp()) {
                 const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
                 if (!asp || !asp->actualp()) continue;
                 ++args;
                 if (isDynValue(asp->actualp(), depth + 1)) operandCarries = true;
+                const VhdlType* const atypep = asp->actualp()->vhdlTypep();
+                const int64_t len
+                    = atypep && atypep->isConstrainedArray() && atypep->dimensions() == 1
+                          ? atypep->dimLength(0)
+                          : -1;
+                if (len < 0) {
+                    lengthsAgree = false;
+                } else if (oneLength < 0) {
+                    oneLength = len;
+                } else if (oneLength != len) {
+                    lengthsAgree = false;
+                }
+            }
+            // Two operands of the same length settle the answer's length
+            // between them; two of different lengths do not, and then the
+            // answer carries its own bounds
+            if (args >= 2 && carriedDynamically(callp->vhdlTypep())) {
+                return operandCarries || !lengthsAgree;
             }
             if (args >= 2) return operandCarries;
         }
@@ -10224,29 +10316,37 @@ private:
             if (args.size() < 2) return nullptr;
             // The answer is one of the two operands (5.3.2.4), so where they
             // are not the same length which one it is is a question for
-            // running, and the answer would have to carry its own bounds.
-            // The comparison that would decide it is the lexicographic one
-            // STANDARD declares over any array, which is not the numeric one
-            // the carrier helper makes -- so this is refused rather than
-            // answered with the wrong comparison.
+            // running -- and then the answer carries its own bounds, since
+            // neither length is the answer's until the comparison is made.
             const VhdlType* const ltypep = args[0]->vhdlTypep();
             const VhdlType* const rtypep = args[1]->vhdlTypep();
+            VhdlType* carrierTypep = nullptr;
             if (!isDynValue(args[0]) && !isDynValue(args[1]) && ltypep && rtypep
                 && ltypep->isConstrainedArray() && rtypep->isConstrainedArray()
                 && ltypep->dimensions() == 1 && rtypep->dimensions() == 1
                 && ltypep->dimLength(0) != rtypep->dimLength(0)) {
-                VL_DO_DANGLING(firstp->deleteTree(), firstp);
-                unsup(flp, "'" + name + "' of two arrays of different lengths");
-                return nullptr;
+                carrierTypep = nodep->vhdlTypep();
+                if (!carriedDynamically(carrierTypep)) carrierTypep = nullptr;
+                if (!carrierTypep) {
+                    VL_DO_DANGLING(firstp->deleteTree(), firstp);
+                    unsup(flp, "'" + name + "' of two arrays of different lengths");
+                    return nullptr;
+                }
             }
-            AstNodeExpr* const leftValp = firstp;
-            AstNodeExpr* const secondp = lowerExpr(args[1]);
+            AstNodeExpr* leftValp = firstp;
+            if (carrierTypep) {
+                VL_DO_DANGLING(firstp->deleteTree(), leftValp);
+                leftValp = asDynCarrier(args[0], carrierTypep, flp);
+                if (!leftValp) return nullptr;
+            }
+            AstNodeExpr* const secondp
+                = carrierTypep ? asDynCarrier(args[1], carrierTypep, flp) : lowerExpr(args[1]);
             if (!secondp) return nullptr;
             const bool signd = isSignedType(args[0]->vhdlTypep());
             // Each operand is read once and then chosen between: either may
             // be a call, and one made twice is not what the expression says
-            AstVar* const lp = extremeTemp(args[0], flp);
-            AstVar* const rp = extremeTemp(args[1], flp);
+            AstVar* const lp = extremeTemp(args[0], flp, carrierTypep);
+            AstVar* const rp = extremeTemp(args[1], flp, carrierTypep);
             if (!lp || !rp) {
                 VL_DO_DANGLING(secondp->deleteTree(), secondp);
                 unsup(flp, "'" + name + "' of a value of no length known here");
@@ -10261,7 +10361,22 @@ private:
             // An operand that carries its own bounds is compared element by
             // element, in the same helper the relational operators use
             AstNodeExpr* testp = nullptr;
-            if (isDynValue(args[0]) || isDynValue(args[1])) {
+            if (carrierTypep) {
+                // Two arrays of different lengths, held as carriers so that
+                // either may be the answer, and ordered the way the language
+                // orders any array
+                AstNodeFTask* const cmpp = dynLexCmpFunc(carrierTypep, flp);
+                if (!cmpp) {
+                    unsup(flp, "'" + name + "' of two arrays of different lengths");
+                    return nullptr;
+                }
+                AstFuncRef* const refp = new AstFuncRef{
+                    flp, cmpp->name(),
+                    AstNode::addNext(new AstArg{flp, "", rd(lp, flp)},
+                                     new AstArg{flp, "", rd(rp, flp)})};
+                refp->taskp(VN_AS(cmpp, Func));
+                testp = new AstGtS{flp, refp, i32(0, flp)};
+            } else if (isDynValue(args[0]) || isDynValue(args[1])) {
                 VhdlType* const carrp
                     = dynValueType(args[0]) ? dynValueType(args[0]) : dynValueType(args[1]);
                 AstNodeFTask* const cmpp = carrp ? dynCmpFunc(carrp, flp) : nullptr;
@@ -10298,6 +10413,30 @@ private:
                             new AstGtS{flp, operand(lp, 0), operand(rp, 1)})
                               : static_cast<AstNodeExpr*>(
                                   new AstGt{flp, rd(lp, flp), rd(rp, flp)});
+            }
+            // An unpacked array has no conditional of its own, so the
+            // choice is made by a statement and the answer read from where
+            // it was put
+            // Asked only of a type that has a length: lowering one that has
+            // none reports that it cannot be lowered, which is not a question
+            // being asked here
+            const bool unpacked
+                = !carrierTypep && ltypep && ltypep->isConstrainedArray()
+                  && VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp), UnpackArrayDType);
+            if (unpacked) {
+                AstVar* const outVarp = extremeTemp(args[0], flp);
+                if (!outVarp) {
+                    unsup(flp, "'" + name + "' of two arrays compared element by element");
+                    return nullptr;
+                }
+                AstNode* const pickStmtp = new AstIf{
+                    flp, testp,
+                    new AstAssign{flp, wr(outVarp, flp),
+                                  name == "maximum" ? rd(lp, flp) : rd(rp, flp)},
+                    new AstAssign{flp, wr(outVarp, flp),
+                                  name == "maximum" ? rd(rp, flp) : rd(lp, flp)}};
+                setp = AstNode::addNext(setp, pickStmtp);
+                return new AstExprStmt{flp, setp, rd(outVarp, flp)};
             }
             AstNodeExpr* const pickp
                 = name == "maximum"

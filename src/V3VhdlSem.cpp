@@ -6555,7 +6555,9 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
     if (resultp->base()->indexTypes().size() != 1) return nullptr;
     const std::string& name = symp->name();
     int64_t length = -1;
-    bool fromOne = false;  // The result is numbered "1 to length", not down from it
+    bool fromOne = false;
+    // An operand's own index range, where the result is numbered as it is
+    const VhdlType* keepIndexp = nullptr;  // The result is numbered "1 to length", not down from it
     AstNodeVhdlExpr* sizeExprp = nullptr;  // Where the length is not a number here
     if (name == "to_signed" || name == "to_unsigned" || name == "resize") {
         if (assocs.size() != 2 || !assocs[1] || !assocs[1]->actualp()) return nullptr;
@@ -6573,6 +6575,29 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
             if (!sizep || !sizep->isConstrainedArray()) return nullptr;
             length = sizep->dimLength(0);
         }
+    } else if (name == "maximum" || name == "minimum") {
+        // Of two arrays the answer is one of the two (5.3.2.4), so where they
+        // are the same length that is the answer's length -- and where they
+        // are not, which operand won is a question for running and the value
+        // carries its own bounds instead
+        if (assocs.size() != 2) return nullptr;
+        int64_t agreed = -1;
+        for (const AstVhdlAssoc* const asp : assocs) {
+            if (!asp || !asp->actualp()) return nullptr;
+            const VhdlType* const argp = asp->actualp()->vhdlTypep();
+            if (!argp || !argp->isConstrainedArray() || argp->dimensions() != 1) return nullptr;
+            const int64_t len = argp->dimLength(0);
+            if (len < 0) return nullptr;
+            if (agreed < 0) {
+                agreed = len;
+            } else if (agreed != len) {
+                return nullptr;
+            }
+        }
+        length = agreed;
+        // The answer is one of the two operands, so it is numbered the way
+        // an operand is and not the way numeric_std numbers a result
+        keepIndexp = assocs[0]->actualp()->vhdlTypep()->indexTypes()[0];
     } else if (name == "shift_left" || name == "shift_right" || name == "rotate_left"
                || name == "rotate_right") {
         if (assocs.empty() || !assocs[0] || !assocs[0]->actualp()) return nullptr;
@@ -6601,11 +6626,18 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
         return nullptr;
     }
     if (!sizeExprp && (length < 0 || length > (1 << 20))) return nullptr;
-    const VhdlType* const idxp = resultp->base()->indexTypes()[0];
+    const VhdlType* const idxp
+        = keepIndexp ? keepIndexp : resultp->base()->indexTypes()[0];
     if (!idxp) return nullptr;
     FileLine* const flp = resultp->fileline();
     VhdlType* const outp = cloneSubtype(resultp, flp);
     VhdlType* const newIndexp = cloneSubtype(const_cast<VhdlType*>(idxp), flp);
+    if (keepIndexp) {
+        outp->clearIndexTypes();
+        outp->addIndexType(newIndexp);
+        outp->unconstrained(false);
+        return outp;
+    }
     if (sizeExprp) {
         // numeric_std counts a vector down from its length less one (16.5),
         // written out so that elaboration works it out
