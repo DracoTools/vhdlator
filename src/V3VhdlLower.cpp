@@ -5421,6 +5421,7 @@ private:
             if (!valuep) return nullptr;
             const VhdlType* const vtypep = nodep->argp()->vhdlTypep();
             if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp, true)) return namep;
+            if (AstNodeExpr* const realp = realImage(valuep, vtypep, flp)) return realp;
             return new AstSFormatF{flp, formatFor(vtypep, true), false, valuep};
         }
         // "t'value(s)" is the value whose image is s (16.2.3)
@@ -9667,6 +9668,7 @@ private:
                 return new AstSFormatF{flp, "%c", false, valuep};
             }
             if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp, false)) return namep;
+            if (AstNodeExpr* const realp = realImage(valuep, vtypep, flp)) return realp;
             return new AstSFormatF{flp, formatFor(vtypep, false), false, valuep};
         }
         // An edge test is the shape a clocked process is recognised by, but
@@ -18094,6 +18096,10 @@ private:
             format += "%s";
             return namep;
         }
+        if (AstNodeExpr* const realp = realImage(exprp, valuep->vhdlTypep(), flOf(valuep))) {
+            format += "%s";
+            return realp;
+        }
         format += formatFor(valuep->vhdlTypep(), isImage);
         return exprp;
     }
@@ -18225,6 +18231,24 @@ private:
         AstNodeExpr* const scaledp = new AstDivS{flp, valuep, unitp};
         AstSFormatF* const outp = new AstSFormatF{flp, "%0d%s", false, scaledp};
         if (namep) outp->addExprsp(namep);
+        return outp;
+    }
+
+    // IMAGE of a floating point value, and TO_STRING of one: 16.4 asks for the
+    // smallest number of digits that represents the value accurately, which is
+    // the shortest decimal that reads back as the same value. Verilog's %g is
+    // six significant digits -- right for Verilog, and a different number for
+    // VHDL, so 225.5625 would print as 225.562.
+    AstNodeExpr* realImage(AstNodeExpr* valuep, const VhdlType* typep, FileLine* flp) {
+        if (!valuep || !typep) return nullptr;
+        const VhdlTypeKind kind = typep->base()->kind();
+        if (kind != VhdlTypeKind::FLOATING && kind != VhdlTypeKind::UNIVERSAL_REAL) {
+            return nullptr;
+        }
+        AstCExpr* const outp = new AstCExpr{flp, AstCExpr::Pure{}, "VL_VHDL_REAL_IMAGE("};
+        outp->add(valuep);
+        outp->add(")");
+        outp->dtypeSetString();
         return outp;
     }
 

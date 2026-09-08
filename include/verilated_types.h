@@ -231,6 +231,11 @@ extern std::string VL_TO_STRING(SData lhs);
 extern std::string VL_TO_STRING(IData lhs);
 extern std::string VL_TO_STRING(QData lhs);
 extern std::string VL_TO_STRING(double lhs);
+// VHDL's IMAGE of a floating point value, and TO_STRING of one, which IEEE
+// 1076-2008 16.4 says uses the smallest number of digits that represents the
+// value accurately -- so the shortest decimal that reads back as the same
+// value. Verilog's %g is six significant digits and is right for Verilog.
+extern std::string VL_VHDL_REAL_IMAGE(double lhs) VL_PURE;
 inline std::string VL_TO_STRING(const std::string& obj) { return "\"" + obj + "\""; }
 template <std::size_t N_Words>
 inline std::string VL_TO_STRING(const VlWide<N_Words>& obj) {

@@ -2488,6 +2488,25 @@ std::string VL_TO_STRING(QData lhs) {
 std::string VL_TO_STRING(double lhs) {
     return VL_SFORMATF_N_NX("%g", 1, VL_VFORMATATTR_DOUBLE, lhs);
 }
+std::string VL_VHDL_REAL_IMAGE(double lhs) VL_PURE {
+    char buf[64];
+    // The shortest decimal that reads back as the same value: try each
+    // precision in turn and stop at the first that round-trips. Seventeen
+    // significant digits always suffice for a 64 bit double.
+    for (int prec = 1; prec < 17; ++prec) {
+        VL_SNPRINTF(buf, sizeof(buf), "%.*g", prec, lhs);
+        if (std::strtod(buf, nullptr) == lhs) break;
+        if (prec == 16) VL_SNPRINTF(buf, sizeof(buf), "%.17g", lhs);
+    }
+    std::string out{buf};
+    // An image always shows a decimal point, so that it reads back through
+    // 'VALUE (16.2.6)
+    if (out.find('.') == std::string::npos && out.find('e') == std::string::npos
+        && out.find("inf") == std::string::npos && out.find("nan") == std::string::npos) {
+        out += ".0";
+    }
+    return out;
+}
 std::string VL_TO_STRING_W(int words, const WDataInP obj) {
     return VL_SFORMATF_N_NX("'h%0x", 1, VL_VFORMATATTR_UNSIGNED, words * VL_EDATASIZE, obj);
 }

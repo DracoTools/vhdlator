@@ -1189,8 +1189,17 @@ std::string V3VhdlEval::image(const VhdlValue& val) {
     case VhdlValKind::REAL: {
         // 'IMAGE of a real always shows a decimal point, so that the result
         // reads back through 'VALUE (16.2.6)
+        // 16.4 asks for the smallest number of digits that represents the
+        // value accurately, which is the shortest decimal that reads back as
+        // the same value -- the rule the emitted code follows too, so a value
+        // that folds and one that does not print alike
         char buf[64];
-        VL_SNPRINTF(buf, sizeof(buf), "%.17g", val.toReal());
+        const double v = val.toReal();
+        for (int prec = 1; prec < 17; ++prec) {
+            VL_SNPRINTF(buf, sizeof(buf), "%.*g", prec, v);
+            if (std::strtod(buf, nullptr) == v) break;
+            if (prec == 16) VL_SNPRINTF(buf, sizeof(buf), "%.17g", v);
+        }
         std::string out{buf};
         if (out.find('.') == std::string::npos && out.find('e') == std::string::npos
             && out.find("inf") == std::string::npos && out.find("nan") == std::string::npos) {
