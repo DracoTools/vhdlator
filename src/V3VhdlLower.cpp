@@ -219,6 +219,15 @@ public:
     // built, or the enclosing module or generate body
     void addStmt(AstNode* nodep) {
         if (!nodep) return;
+        // What keeps a signal's history belongs to the module, wherever the
+        // expression that first asked for it happens to be. A generate body
+        // is collected rather than added to the module and is then unrolled
+        // per iteration, so a variable left in one is cloned away from the
+        // block that maintains it, which is emitted for the module once.
+        if (m_toShadows) {
+            m_shadowsp = AstNode::addNextNull(m_shadowsp, nodep);
+            return;
+        }
         if (m_ftaskp) {
             m_ftaskp->addStmtsp(nodep);
         } else if (m_protClassp) {
@@ -4405,6 +4414,7 @@ private:
     };
     std::map<const VhdlSymbol*, VhdlShadow> m_shadows;
     AstNode* m_shadowsp = nullptr;  // The blocks that keep them, for the module
+    bool m_toShadows = false;  // Making one, so what is added belongs to the module
 
     // What 'ACTIVE, 'LAST_ACTIVE, 'TRANSACTION and 'QUIET need. They ask
     // whether a driver assigned, not whether the value changed, and nothing
@@ -5805,7 +5815,9 @@ private:
         // These belong to the module: a block assigns them, and a
         // non-blocking assignment may not target an automatic variable
         VL_RESTORER(m_ftaskp);
+        VL_RESTORER(m_toShadows);
         m_ftaskp = nullptr;
+        m_toShadows = true;
         AstNodeDType* const valDTypep = lowerType(symp->typep(), flp);
         sh.prevp = newTempVar(base + "__prev", valDTypep, flp);
         sh.lastp = newTempVar(base + "__last", lowerType(symp->typep(), flp), flp);
