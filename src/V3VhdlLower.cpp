@@ -6651,6 +6651,13 @@ private:
                 return refp;
             }
         }
+        // A formal bound part by part, referred to as a whole
+        const auto ebIt = m_bindElems.find(symp);
+        if (ebIt != m_bindElems.end()) {
+            if (AstNodeExpr* const wholep = wholeOfBoundParts(symp, ebIt->second, flp)) {
+                return wholep;
+            }
+        }
         if (AstVar* const varp = objectVar(symp, flp)) {
             return new AstVarRef{flp, varp, VAccess::READ};
         }
@@ -7464,6 +7471,60 @@ private:
         return nullptr;
     }
 
+    // A formal whose parts the call named one at a time has no object of its
+    // own: each part is a signal of the design in its own right, and a
+    // reference to a part lowers to that signal (6.5.7.1). A reference to the
+    // whole of it is every part at once, in the order the type keeps them,
+    // which is a concatenation -- legal to read from and legal to write into,
+    // so the body may say "d <= ones" as well as "d.x <= v".
+    AstNodeExpr* wholeOfBoundParts(const VhdlSymbol* symp,
+                                   const std::map<std::string, AstNodeVhdlExpr*>& parts,
+                                   FileLine* flp) {
+        const VhdlType* const typep = symp ? symp->typep() : nullptr;
+        if (!typep) return nullptr;
+        // The order to put them in: a record keeps its elements in the order
+        // they were declared, an array in index order, and the first is the
+        // most significant either way -- which is how a packed value is laid
+        // out and how a concatenation reads
+        std::vector<std::string> order;
+        if (typep->base()->kind() == VhdlTypeKind::RECORD) {
+            const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
+            if (elems.empty() || elems.size() != parts.size()) return nullptr;
+            for (const VhdlSymbol* const elemp : elems) order.push_back(elemp->name());
+        } else if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            std::vector<int64_t> at;
+            for (const auto& pair : parts) {
+                if (!isIndexPart(pair.first)) return nullptr;
+                at.push_back(indexPartAt(pair.first));
+            }
+            if (at.empty()) return nullptr;
+            // Descending unless the formal's own subtype says otherwise: the
+            // indices the call named are the bounds it has
+            std::sort(at.begin(), at.end());
+            const VhdlType* const idxp
+                = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
+            if (!idxp || !idxp->ascending()) std::reverse(at.begin(), at.end());
+            for (const int64_t one : at) order.push_back(indexPartName(one));
+        } else {
+            return nullptr;
+        }
+        AstNodeExpr* outp = nullptr;
+        for (const std::string& name : order) {
+            const auto it = parts.find(name);
+            if (it == parts.end() || !it->second) {
+                if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                return nullptr;
+            }
+            AstNodeExpr* const onep = lowerExpr(it->second);
+            if (!onep) {
+                if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                return nullptr;
+            }
+            outp = outp ? new AstConcat{flp, outp, onep} : onep;
+        }
+        return outp;
+    }
+
     // Where a selected name reads an element of a formal whose elements were
     // associated one at a time, the actual that element was given (6.5.7.1)
     AstNodeVhdlExpr* elementBindOf(const AstVhdlSelected* nodep) {
@@ -7473,6 +7534,26 @@ private:
         const auto it = m_bindElems.find(prefixp->vhdlSymp());
         if (it == m_bindElems.end()) return nullptr;
         const auto eit = it->second.find(nodep->vhdlSymp()->name());
+        return eit == it->second.end() ? nullptr : eit->second;
+    }
+
+    // The same for an indexed name of such a formal -- "d(0)" inside a body
+    // whose caller wrote "d(0) => tlast". The index must be one the call
+    // named, which is what makes it a place the copy can lower.
+    AstNodeVhdlExpr* indexBindOf(const AstVhdlCall* nodep) {
+        if (m_bindElems.empty() || !nodep->prefixp()) return nullptr;
+        const AstVhdlName* const prefixp = VN_CAST(nodep->prefixp(), VhdlName);
+        if (!prefixp || !prefixp->vhdlSymp()) return nullptr;
+        const auto it = m_bindElems.find(prefixp->vhdlSymp());
+        if (it == m_bindElems.end()) return nullptr;
+        if (!nodep->argsp() || nodep->argsp()->nextp()) return nullptr;
+        const AstVhdlAssoc* const idxp = VN_CAST(nodep->argsp(), VhdlAssoc);
+        AstNodeVhdlExpr* const valp
+            = idxp ? idxp->actualp() : VN_CAST(nodep->argsp(), NodeVhdlExpr);
+        if (!valp) return nullptr;
+        const VhdlValue val = V3VhdlEval::eval(valp);
+        if (!val.isInt()) return nullptr;
+        const auto eit = it->second.find(indexPartName(val.toInt()));
         return eit == it->second.end() ? nullptr : eit->second;
     }
 
@@ -8722,6 +8803,9 @@ private:
     // conversion or a call (8.1)
     AstNodeExpr* lowerCall(AstVhdlCall* nodep) {
         FileLine* const flp = nodep->fileline();
+        // An indexed name of a formal whose elements the call named one at a
+        // time is the actual that element was given (6.5.7.1)
+        if (AstNodeVhdlExpr* const boundp = indexBindOf(nodep)) return lowerExpr(boundp);
         VhdlSymbol* const prefixSymp
             = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
         // A type mark makes it a conversion (9.3.6)
@@ -11774,15 +11858,40 @@ private:
 
     // "p(iface.d => sd)" names one element of one formal (6.5.7.1): which
     // formal, and which element of it
+    // The part of a formal an association element names. One string serves
+    // both shapes -- a record element by its name, an array element as its
+    // index in parentheses, which no identifier is -- and the spelling is the
+    // one V3VhdlSem binds with, so the two agree on what a part is called.
+    static std::string indexPartName(int64_t at) { return "(" + std::to_string(at) + ")"; }
+    static bool isIndexPart(const std::string& part) {
+        return part.size() > 2 && part.front() == '(' && part.back() == ')';
+    }
+    static int64_t indexPartAt(const std::string& part) {
+        return std::stoll(part.substr(1, part.size() - 2));
+    }
+
     static bool individualFormal(const AstNodeVhdlExpr* formalp, std::string& root,
                                  std::string& elem) {
-        const AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected);
-        if (!selp) return false;
-        const AstVhdlName* const prefixp = VN_CAST(selp->prefixp(), VhdlName);
-        const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
-        if (!prefixp || !suffixp) return false;
+        if (const AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected)) {
+            const AstVhdlName* const prefixp = VN_CAST(selp->prefixp(), VhdlName);
+            const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
+            if (!prefixp || !suffixp) return false;
+            root = prefixp->name();
+            elem = suffixp->name();
+            return true;
+        }
+        const AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) return false;
+        const AstVhdlName* const prefixp = VN_CAST(callp->prefixp(), VhdlName);
+        if (!prefixp) return false;
+        const AstVhdlAssoc* const idxp = VN_CAST(callp->argsp(), VhdlAssoc);
+        AstNodeVhdlExpr* const valp
+            = idxp ? idxp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+        if (!valp) return false;
+        const VhdlValue val = V3VhdlEval::eval(valp);
+        if (!val.isInt()) return false;
         root = prefixp->name();
-        elem = suffixp->name();
+        elem = indexPartName(val.toInt());
         return true;
     }
 

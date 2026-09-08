@@ -70,6 +70,13 @@ std::string lower(const std::string& in) {
 
 class VhdlSpecVisitor;
 
+// The part of a formal an association element names -- a record element by
+// its name, an array element as its index in parentheses. Defined below,
+// beside the binding that produces them.
+std::string vhdlIndexPartName(int64_t at);
+bool vhdlIsIndexPart(const std::string& part);
+int64_t vhdlIndexPartAt(const std::string& part);
+
 class VhdlSemVisitor final : public VNVisitor {
     // STATE
     VhdlScope* m_scopep = nullptr;  // Region being filled
@@ -1237,6 +1244,8 @@ public:
     VhdlType* constrainRecordFromParts(VhdlType* typep,
                                        const std::vector<AstNodeVhdlExpr*>& byPos,
                                        FileLine* flp) VL_MT_DISABLED;
+    VhdlType* constrainArrayFromIndices(VhdlType* typep, const std::vector<int64_t>& indices,
+                                        FileLine* flp) VL_MT_DISABLED;
 
 private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
@@ -3789,12 +3798,20 @@ private:
         // A formal whose elements the call names one at a time has no actual
         // of its own; its subtype is the one its elements' actuals make up
         std::map<size_t, std::vector<AstNodeVhdlExpr*>> individual;
+        std::map<size_t, std::vector<int64_t>> individualIdx;
         for (size_t k = 0; k < assocs.size(); ++k) {
             const int f = formalOf[k];
             if (f < 0 || static_cast<size_t>(f) >= nparams) return;
             if (!elemOf[k].empty()) {
                 VhdlType* const recTypep = symp->paramTypes()[f];
                 if (!recTypep) return;
+                // An array formal takes its bounds from the indices the call
+                // names, so it is those that are collected rather than the
+                // actuals in element order
+                if (vhdlIsIndexPart(elemOf[k])) {
+                    individualIdx[f].push_back(vhdlIndexPartAt(elemOf[k]));
+                    continue;
+                }
                 auto it = individual.find(f);
                 if (it == individual.end()) {
                     it = individual
@@ -3815,7 +3832,7 @@ private:
         for (size_t i = 0; i < nparams; ++i) {
             if (byFormal[i]) byFormalExpr[i] = byFormal[i]->actualp();
         }
-        specializeWithActuals(nodep, symp, byFormalExpr, individual);
+        specializeWithActuals(nodep, symp, byFormalExpr, individual, individualIdx);
     }
 
     // Whether a copy for these actuals would be one of a terminating series.
@@ -3881,14 +3898,27 @@ private:
     // The copy itself, given what each formal is associated with. An operator
     // the design declared is a subprogram like any other (4.5.2), and its
     // operands are its actuals, so it comes here too.
-    void specializeWithActuals(AstNodeVhdlExpr* nodep, VhdlSymbol* symp,
-                               const std::vector<AstNodeVhdlExpr*>& byFormalExpr,
-                               const std::map<size_t, std::vector<AstNodeVhdlExpr*>>& individual) {
+    void specializeWithActuals(
+        AstNodeVhdlExpr* nodep, VhdlSymbol* symp,
+        const std::vector<AstNodeVhdlExpr*>& byFormalExpr,
+        const std::map<size_t, std::vector<AstNodeVhdlExpr*>>& individual,
+        const std::map<size_t, std::vector<int64_t>>& individualIdx = {}) {
         const size_t nparams = symp->paramTypes().size();
         const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
         for (size_t i = 0; i < nparams; ++i) {
+            const auto idxIt = individualIdx.find(i);
+            if (idxIt != individualIdx.end()) {
+                // The indices the call named are the bounds the formal has:
+                // "p(v(0) => s)" hands a parameter of exactly one element
+                VhdlType* const madep = m_sem.constrainArrayFromIndices(
+                    symp->paramTypes()[i], idxIt->second, nodep->fileline());
+                if (!madep) return;
+                if (byValue) actualValues.push_back(VhdlValue{});
+                actualTypes.push_back(madep);
+                continue;
+            }
             const auto indIt = individual.find(i);
             if (indIt != individual.end()) {
                 VhdlType* const madep = m_sem.constrainRecordFromParts(
@@ -5884,25 +5914,92 @@ static const VhdlSymbol* vhdlElementNamed(const VhdlType* typep, const std::stri
     return nullptr;
 }
 
+// A formal whose elements a call names one at a time takes its bounds from
+// those elements: "p(v(0) => s)" hands over a parameter of exactly one, and
+// "p(v(1) => a, v(0) => b)" one of two. The indices must run consecutively --
+// an association that names some but not all of a range leaves the rest with
+// no actual, and no default can supply an element (6.5.7.1).
+VhdlType* VhdlSemVisitor::constrainArrayFromIndices(VhdlType* typep,
+                                                    const std::vector<int64_t>& indices,
+                                                    FileLine* flp) {
+    if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+    if (indices.empty() || typep->base()->indexTypes().empty()) return nullptr;
+    std::vector<int64_t> at = indices;
+    std::sort(at.begin(), at.end());
+    for (size_t i = 1; i < at.size(); ++i) {
+        if (at[i] == at[i - 1]) return nullptr;  // The same element twice over
+        if (at[i] != at[i - 1] + 1) return nullptr;  // A gap has no actual
+    }
+    const VhdlType* const declIdxp
+        = typep->indexTypes().empty() ? typep->base()->indexTypes()[0] : typep->indexTypes()[0];
+    // Which way round the formal's own range runs, where its subtype says
+    const bool ascending = declIdxp && declIdxp->boundsp() ? declIdxp->ascending() : false;
+    VhdlType* const outp = cloneSubtype(typep, flp);
+    VhdlType* const newIndexp
+        = cloneSubtype(const_cast<VhdlType*>(typep->base()->indexTypes()[0]), flp);
+    if (ascending) {
+        newIndexp->setBounds(at.front(), at.back(), true);
+    } else {
+        newIndexp->setBounds(at.back(), at.front(), false);
+    }
+    outp->clearIndexTypes();
+    outp->addIndexType(newIndexp);
+    outp->unconstrained(false);
+    return outp;
+}
+
+// The part of a formal an association element names, written so that one
+// string serves both shapes: an element of a record by its name, and an
+// element of an array as its index in parentheses, which no identifier is.
+std::string vhdlIndexPartName(int64_t at) { return "(" + std::to_string(at) + ")"; }
+
+bool vhdlIsIndexPart(const std::string& part) {
+    return part.size() > 2 && part.front() == '(' && part.back() == ')';
+}
+
+int64_t vhdlIndexPartAt(const std::string& part) {
+    return std::stoll(part.substr(1, part.size() - 2));
+}
+
 VhdlType* vhdlFormalTypeAt(const VhdlSymbol* symp, int idx, const std::string& elem) {
     if (!symp || idx < 0 || static_cast<size_t>(idx) >= symp->paramTypes().size()) return nullptr;
     VhdlType* const typep = symp->paramTypes()[idx];
     if (elem.empty()) return typep;
+    if (vhdlIsIndexPart(elem)) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        return typep->elementp() ? typep->elementp() : typep->base()->elementp();
+    }
     const VhdlSymbol* const elemp = vhdlElementNamed(typep, elem);
     return elemp ? elemp->typep() : nullptr;
 }
 
-// "p(r.x => a, r.y => b)" names the parts of one parameter one at a time: the
-// parameter and the element of it this association element names (6.5.7.1)
+// "p(r.x => a, r.y => b)" and "p(v(0) => a, v(1) => b)" each name the parts of
+// one parameter one at a time: the parameter, and the element of it this
+// association element names (6.5.7.1)
 static bool vhdlIndividualFormal(const AstNodeVhdlExpr* formalp, std::string& root,
                                  std::string& elem) {
-    const AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected);
-    if (!selp) return false;
-    const AstVhdlName* const prefixp = VN_CAST(selp->prefixp(), VhdlName);
-    const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
-    if (!prefixp || !suffixp) return false;
+    if (const AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected)) {
+        const AstVhdlName* const prefixp = VN_CAST(selp->prefixp(), VhdlName);
+        const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
+        if (!prefixp || !suffixp) return false;
+        root = prefixp->name();
+        elem = suffixp->name();
+        return true;
+    }
+    // An indexed name of the formal, whose index must be static: which
+    // element it is has to be known where the call is written
+    const AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+    if (!callp || !callp->argsp() || callp->argsp()->nextp()) return false;
+    const AstVhdlName* const prefixp = VN_CAST(callp->prefixp(), VhdlName);
+    if (!prefixp) return false;
+    const AstVhdlAssoc* const idxp = VN_CAST(callp->argsp(), VhdlAssoc);
+    AstNodeVhdlExpr* const valp
+        = idxp ? idxp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+    if (!valp) return false;
+    const VhdlValue val = V3VhdlEval::eval(valp);
+    if (!val.isInt()) return false;
     root = prefixp->name();
-    elem = suffixp->name();
+    elem = vhdlIndexPartName(val.toInt());
     return true;
 }
 
@@ -5940,7 +6037,15 @@ bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& a
             }
             const int idx = symp->paramIndex(root);
             if (idx < 0) return false;
-            if (!vhdlElementNamed(symp->paramTypes()[idx], elem)) return false;
+            // A record element must be one the type has; an array element is
+            // named by an index, and which indices there are is what the call
+            // is deciding, so there is nothing yet to check it against
+            if (vhdlIsIndexPart(elem)) {
+                const VhdlType* const ftypep = symp->paramTypes()[idx];
+                if (!ftypep || ftypep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+            } else if (!vhdlElementNamed(symp->paramTypes()[idx], elem)) {
+                return false;
+            }
             if (filled[idx] && !individual.count(idx)) return false;
             if (!individual[idx].insert(elem).second) return false;  // Twice over
             formalOf[i] = idx;
@@ -5957,7 +6062,14 @@ bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& a
     // is left out has no actual at all, and no default can supply it
     for (const auto& pair : individual) {
         const VhdlType* const typep = symp->paramTypes()[pair.first];
-        if (!typep || typep->base()->elements().size() != pair.second.size()) return false;
+        if (!typep) return false;
+        // An array formal takes its own bounds from the indices the call
+        // names, so there is no element list for them to be measured against
+        if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            if (pair.second.empty()) return false;
+            continue;
+        }
+        if (typep->base()->elements().size() != pair.second.size()) return false;
     }
     for (size_t i = 0; i < formals; ++i) {
         if (!filled[i] && !symp->paramHasDefault(i)) return false;
