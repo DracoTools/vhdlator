@@ -4069,7 +4069,12 @@ private:
             if (hadp && hadp->base() == retp->base()) nodep->vhdlTypep(retp);
             return;
         }
-        if (hadp && hadp->lengthEmittable()) return;
+        // The copy's body settled a length, and that is what the call gives
+        // back. Where the call already carried one it was inferred before
+        // this copy existed -- an operator whose declared result is
+        // unconstrained is given an operand's length to be going on with --
+        // and an inference does not outrank the body it was standing in for.
+        if (hadp && hadp->lengthEmittable() && !retp->isConstrainedArray()) return;
         nodep->vhdlTypep(retp);
     }
 };

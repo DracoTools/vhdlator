@@ -20,10 +20,10 @@
 -- The package also asks for a null slice: "invec (right_index - 1 downto
 -- arglow)" where the two are adjacent names no elements at all (5.2.1).
 --
--- Arithmetic is not covered here. "p + q" is held back by a separate defect:
--- the length of a user-defined operator's result is settled before the copy
--- made for the call site folds its own bounds, so it comes out as long as an
--- operand instead of one element longer.
+-- The arithmetic below reaches the same shape a second way: "+" on sfixed
+-- declares its result one element longer than either operand, and that length
+-- is settled by the copy made for the call rather than by anything written
+-- down, so RESIZE of it is a call whose actual only its own copy measures.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -36,8 +36,8 @@ architecture a of t_vhdl_fixedpkg is
 begin
 
     main: process is
-        variable p : sfixed (8 downto -8);
-        variable u : ufixed (8 downto -8);
+        variable p, q, r : sfixed (8 downto -8);
+        variable u, v, w : ufixed (8 downto -8);
         variable n : sfixed (3 downto -4);
 
         -- Every value here is exact in eight fractional bits, so these are
@@ -75,6 +75,31 @@ begin
         u := to_ufixed (7.5, 8, -8);
         p := resize (to_sfixed (u), p);
         check_real (to_real (p), 7.5, "ufixed to sfixed");
+
+        -- Arithmetic, written the way a design writes it: the operator's
+        -- result handed straight to RESIZE
+        p := to_sfixed (1.5, 8, -8);
+        q := to_sfixed (2.25, 8, -8);
+        r := resize (p + q, r);
+        check_real (to_real (r), 3.75, "sfixed add");
+        r := resize (p - q, r);
+        check_real (to_real (r), -0.75, "sfixed subtract");
+        r := resize (p * q, r);
+        check_real (to_real (r), 3.375, "sfixed multiply");
+
+        p := to_sfixed (-3.125, 8, -8);
+        q := to_sfixed (0.0625, 8, -8);
+        r := resize (p * q, r);
+        check_real (to_real (r), -0.1953125, "sfixed multiply negative");
+        r := resize (p + q, r);
+        check_real (to_real (r), -3.0625, "sfixed add negative");
+
+        u := to_ufixed (100.25, 8, -8);
+        v := to_ufixed (2.25, 8, -8);
+        w := resize (u + v, w);
+        check_real (to_real (w), 102.5, "ufixed add");
+        w := resize (u * v, w);
+        check_real (to_real (w), 225.5625, "ufixed multiply");
 
         report "*-* All Finished *-*";
         std.env.stop;
