@@ -2269,6 +2269,50 @@ private:
         return returnType(declp, symp);
     }
 
+    // Whether a call is one of the conversions between the logic families,
+    // which keep the same bits and are emitted as nothing at all -- so what
+    // one gives back is worth exactly what it was handed, and is exactly as
+    // long. Asked of the subprogram and not of the name alone, so a design's
+    // own function of that name is still a call.
+    static bool passesItsArgumentThrough(const VhdlSymbol* symp) {
+        if (!symp) return false;
+        const std::string& name = symp->name();
+        if (name != "to_stdlogicvector" && name != "to_stdulogicvector"
+            && name != "to_bitvector" && name != "to_x01" && name != "to_01"
+            && name != "to_ux01") {
+            return false;
+        }
+        return V3VhdlStd::isIntrinsic(symp);
+    }
+
+    // The one argument such a conversion was handed
+    static AstNodeVhdlExpr* conversionArgOf(const AstVhdlCall* callp) {
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        return asp ? asp->actualp() : nullptr;
+    }
+
+    // How long a value really is once emitted, where the type analysis gave
+    // it says nothing. A subprogram written against an unconstrained array is
+    // compiled once per call site, and the copy's result has a length the
+    // declaration had none of -- but the copies are made in a round after the
+    // analysis that settles types, so at that point the call still says
+    // nothing, and every reader of its type is told nothing.
+    static VhdlType* emittedArrayType(AstNodeVhdlExpr* nodep, int depth = 0) {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || depth > 8) return nullptr;
+        const VhdlSymbol* const symp
+            = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return nullptr;
+        if (passesItsArgumentThrough(symp)) {
+            if (AstNodeVhdlExpr* const argp = conversionArgOf(callp)) {
+                return emittedArrayType(argp, depth + 1);
+            }
+            return nullptr;
+        }
+        VhdlType* const retp = emittedReturnType(symp);
+        return retp && retp->isConstrainedArray() ? retp : nullptr;
+    }
+
     // Copy a value that carries its own bounds into an object whose subtype
     // fixes them. The elements are copied one at a time, since the value is
     // stored from zero and the object from its own left bound, and the
@@ -2870,6 +2914,11 @@ private:
         if (!typep || !typep->isConstrainedArray()) {
             VhdlType* const boundp = boundTypeOf(nodep);
             if (boundp && boundp->isConstrainedArray()) typep = boundp;
+        }
+        // And what a call gives back is as long as the copy made for this
+        // call site makes it, which the call's own type does not say
+        if (!typep || !typep->isConstrainedArray()) {
+            if (VhdlType* const emp = emittedArrayType(nodep)) typep = emp;
         }
         // A bound that names a generic settles at elaboration but is not a
         // number here, so the conversion takes the bounds as expressions
@@ -4179,12 +4228,8 @@ private:
         // rule gives such a result the length of its argument, but only
         // where the argument already has one, and a call specialized for
         // this site does not have one until it is made.
-        if ((name == "to_stdlogicvector" || name == "to_stdulogicvector"
-             || name == "to_bitvector" || name == "to_x01" || name == "to_01"
-             || name == "to_ux01")
-            && V3VhdlStd::isIntrinsic(symp) && depth < 8) {
-            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
-            AstNodeVhdlExpr* const valp = asp ? asp->actualp() : nullptr;
+        if (passesItsArgumentThrough(symp) && depth < 8) {
+            AstNodeVhdlExpr* const valp = conversionArgOf(callp);
             if (valp && (isLogicish(valp->vhdlTypep()) || isBitish(valp->vhdlTypep()))) {
                 return isDynValue(valp, depth + 1);
             }
