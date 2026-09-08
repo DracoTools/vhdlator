@@ -8192,6 +8192,125 @@ private:
         }
     }
 
+    // The relational operators over an array are lexicographic: the first pair
+    // of elements that differ decides, and where one operand runs out first
+    // the shorter of the two is the lesser (5.2.6). An array of bits lowers to
+    // a packed vector, whose plain unsigned comparison gives the same answer;
+    // one of integers or reals lowers to an unpacked array, which has no
+    // comparison of its own at all -- so it is written out here.
+    AstNodeExpr* lexArrayCompare(AstVhdlBinary* nodep, FileLine* flp) {
+        const VhdlBinaryOp op = nodep->op();
+        if (op != VhdlBinaryOp::LT && op != VhdlBinaryOp::LE && op != VhdlBinaryOp::GT
+            && op != VhdlBinaryOp::GE) {
+            return nullptr;
+        }
+        const VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
+        const VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
+        if (!ltypep || !rtypep) return nullptr;
+        if (ltypep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (!ltypep->isConstrainedArray() || !rtypep->isConstrainedArray()) return nullptr;
+        if (ltypep->dimensions() != 1 || rtypep->dimensions() != 1) return nullptr;
+        const VhdlType* const elemp
+            = ltypep->elementp() ? ltypep->elementp() : ltypep->base()->elementp();
+        if (!elemp) return nullptr;
+        // Only where the array does not lower to a packed vector: one that
+        // does is already compared correctly as a number
+        if (!VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp), UnpackArrayDType)) {
+            return nullptr;
+        }
+        const VhdlType* const lidxp = ltypep->indexTypes()[0];
+        const VhdlType* const ridxp = rtypep->indexTypes()[0];
+        if (!lidxp || !ridxp || !lidxp->bounded() || !ridxp->bounded()) return nullptr;
+        const int64_t la = lidxp->length();
+        const int64_t lb = ridxp->length();
+        if (la < 0 || lb < 0 || la > 4096 || lb > 4096) return nullptr;
+        AstNodeExpr* lhsp = lowerExpr(nodep->lhsp());
+        AstNodeExpr* rhsp = lhsp ? lowerExpr(nodep->rhsp()) : nullptr;
+        if (!rhsp) {
+            if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            return nullptr;
+        }
+        // Every element is read out of each operand, so one that cannot be
+        // read twice is worked out once and kept
+        AstNode* prep = nullptr;
+        const auto keep = [&](AstNodeExpr*& expp, const VhdlType* typep) {
+            if (repeatable(expp)) return;
+            AstVar* const tmpp
+                = newTempVar("__Vlex", lowerType(const_cast<VhdlType*>(typep), flp), flp);
+            prep = AstNode::addNextNull(
+                prep, static_cast<AstNode*>(
+                          new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, expp}));
+            expp = new AstVarRef{flp, tmpp, VAccess::READ};
+        };
+        keep(lhsp, ltypep);
+        keep(rhsp, rtypep);
+        const bool wantLess0 = op == VhdlBinaryOp::LT || op == VhdlBinaryOp::LE;
+        const bool orEqual0 = op == VhdlBinaryOp::LE || op == VhdlBinaryOp::GE;
+        AstNodeExpr* const outp0
+            = lexCompareOf(lhsp, ltypep, rhsp, rtypep, wantLess0, orEqual0, flp);
+        VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+        VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+        if (!outp0) {
+            if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
+            return nullptr;
+        }
+        if (prep) return new AstExprStmt{flp, prep, outp0};
+        return outp0;
+    }
+
+    // The comparison itself, over two operands that may each be read again.
+    // Split out so that MAXIMUM and MINIMUM, which choose between two arrays,
+    // ask the same question the operators do.
+    AstNodeExpr* lexCompareOf(AstNodeExpr* lhsp, const VhdlType* ltypep, AstNodeExpr* rhsp,
+                              const VhdlType* rtypep, bool wantLess, bool orEqual,
+                              FileLine* flp) {
+        const VhdlType* const elemp
+            = ltypep->elementp() ? ltypep->elementp() : ltypep->base()->elementp();
+        if (!elemp) return nullptr;
+        const VhdlType* const lidxp = ltypep->indexTypes()[0];
+        const VhdlType* const ridxp = rtypep->indexTypes()[0];
+        if (!lidxp || !ridxp || !lidxp->bounded() || !ridxp->bounded()) return nullptr;
+        const int64_t la = lidxp->length();
+        const int64_t lb = ridxp->length();
+        if (la < 0 || lb < 0 || la > 4096 || lb > 4096) return nullptr;
+        const bool real = elemp->base()->kind() == VhdlTypeKind::FLOATING;
+        const bool signd = !real && isSignedType(const_cast<VhdlType*>(elemp));
+        const auto at = [&](AstNodeExpr* fromp, const VhdlType* idxp, int64_t i) {
+            const int64_t k = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
+            return new AstSelBit{flp, fromp->cloneTree(false),
+                                 new AstConst{flp, AstConst::Signed32{},
+                                              static_cast<int32_t>(k)}};
+        };
+        const auto less = [&](AstNodeExpr* ap, AstNodeExpr* bp) -> AstNodeExpr* {
+            if (real) return new AstLtD{flp, ap, bp};
+            return signd ? static_cast<AstNodeExpr*>(new AstLtS{flp, ap, bp})
+                         : static_cast<AstNodeExpr*>(new AstLt{flp, ap, bp});
+        };
+        const auto differ = [&](AstNodeExpr* ap, AstNodeExpr* bp) -> AstNodeExpr* {
+            if (real) return new AstNeqD{flp, ap, bp};
+            return new AstNeq{flp, ap, bp};
+        };
+        // Where every element the two share is equal, the shorter operand is
+        // the lesser -- and two of the same length are equal, which "<=" and
+        // ">=" accept and "<" and ">" do not
+        bool tailAnswer = false;
+        if (la == lb) {
+            tailAnswer = orEqual;
+        } else {
+            tailAnswer = wantLess ? (la < lb) : (la > lb);
+        }
+        AstNodeExpr* outp = new AstConst{flp, AstConst::BitTrue{}, tailAnswer};
+        const int64_t common = la < lb ? la : lb;
+        for (int64_t i = common - 1; i >= 0; --i) {
+            AstNodeExpr* const decidep
+                = wantLess ? less(at(lhsp, lidxp, i), at(rhsp, ridxp, i))
+                           : less(at(rhsp, ridxp, i), at(lhsp, lidxp, i));
+            outp = new AstCond{flp, differ(at(lhsp, lidxp, i), at(rhsp, ridxp, i)), decidep,
+                               outp};
+        }
+        return outp;
+    }
+
     AstNodeExpr* lowerBinary(AstVhdlBinary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -8325,6 +8444,9 @@ private:
             return outp;
             }
         }
+        // An array of a non-packed element compares lexicographically, which
+        // no operator of the emitted language does
+        if (AstNodeExpr* const lexp = lexArrayCompare(nodep, flp)) return lexp;
         switch (nodep->op()) {
         // On BOOLEAN and BIT, and only there, these four are short-circuit
         // operations: the right operand is evaluated only if the left has not
