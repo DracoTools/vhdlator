@@ -375,6 +375,9 @@ class VhdlSemVisitor final : public VNVisitor {
         // even though NOTE alone names a literal of two types (5.2.1).
         VhdlType* hintp = wantp;
         if (!hintp || hintp->isError()) hintp = commonBoundType(rp->leftp(), rp->rightp());
+        // The generic that says which way an open dimension runs is named
+        // here like any other, so it is resolved here like any other
+        if (rp->dirp()) analyzeExpr(rp->dirp(), V3VhdlStd::booleanType());
         VhdlType* leftp = analyzeExpr(rp->leftp(), hintp);
         VhdlType* rightp
             = analyzeExpr(rp->rightp(), hintp ? hintp : (leftp && !leftp->isUniversal() ? leftp
@@ -1306,6 +1309,7 @@ private:
         int dim;  // Which of its dimensions
         std::string leftName;  // The generics carrying the bounds
         std::string rightName;
+        std::string ascName;  // And which way round they run
         bool isGeneric;  // A generic left unconstrained, rather than a port
     };
     std::map<VhdlScope*, std::vector<OpenBound>> m_openBounds;
@@ -1315,6 +1319,9 @@ private:
                                               VhdlScope* scopep,
                                               std::vector<std::string>& path) VL_MT_DISABLED;
     void bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void bindAscending(AstVhdlInstance* nodep, const OpenBound& bound,
+                       AstNodeVhdlExpr* prefixp, bool ascending,
+                       FileLine* flp) VL_MT_DISABLED;
     VhdlScope* specializeEntity(AstVhdlInstance* nodep, const std::string& entKey)
         VL_MT_DISABLED;
     void analyzeSpecializedUnit(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
@@ -8321,9 +8328,16 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
         for (const std::string& step : path) out += "__" + (step.empty() ? "e" : step);
         return out + "__" + std::to_string(d);
     };
-    const auto makeGeneric = [&](const std::string& name) {
+    const auto makeGeneric = [&](const std::string& name, const char* mark = "integer",
+                                const char* dflt = nullptr) {
         AstVhdlIfaceDecl* const genp = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::CONSTANT};
-        genp->subtypep(new AstVhdlSubtypeInd{flp, new AstVhdlName{flp, "integer"}});
+        genp->subtypep(new AstVhdlSubtypeInd{flp, new AstVhdlName{flp, mark}});
+        // The two bounds have no sensible default -- an instance must say
+        // them -- but the direction does: a vector is written "downto" far
+        // more often than "to", which is the answer this had before an
+        // instance was asked, and it keeps a binding this does not reach
+        // giving no answer at all
+        if (dflt) genp->defaultp(new AstVhdlName{flp, dflt});
         if (ifp->kind() == VhdlIfaceKind::CONSTANT) {
             // A generic constrained by these must see them declared first, so
             // they go in ahead of it
@@ -8373,16 +8387,21 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
         for (size_t d = 0; d < dims; ++d) {
             const std::string leftName = "__vl" + mangled(d);
             const std::string rightName = "__vr" + mangled(d);
+            const std::string ascName = "__va" + mangled(d);
             makeGeneric(leftName);
             makeGeneric(rightName);
+            makeGeneric(ascName, "boolean", "false");
             AstVhdlRange* const rangep
                 = new AstVhdlRange{flp, new AstVhdlName{flp, leftName}, VhdlDir::TO,
                                    new AstVhdlName{flp, rightName}};
-            // Which way round the actual's range runs is not known here
+            // Which way round the actual's range runs is not known here, so a
+            // third generic carries it and the instance binds it. It folds
+            // per instance like the other two, so it costs nothing to run.
             rangep->dirUnknown(true);
+            rangep->dirp(new AstVhdlName{flp, ascName});
             consp->addRangesp(rangep);
             m_openBounds[scopep].push_back(OpenBound{ifp->name(), path, static_cast<int>(d),
-                                                     leftName, rightName,
+                                                     leftName, rightName, ascName,
                                                      ifp->kind() == VhdlIfaceKind::CONSTANT});
         }
     }
@@ -8502,6 +8521,7 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                         new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
                         litp});
                 }
+                bindAscending(nodep, bound, nullptr, true, flp);
                 continue;
             }
         }
@@ -8525,6 +8545,14 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                 nodep->addGenericMapp(new AstVhdlAssoc{
                     flp, new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
                     endp});
+            }
+            if (formalRangep->leftp() && formalRangep->rightp()) {
+                bindAscending(nodep, bound, nullptr, formalRangep->dir() == VhdlDir::TO, flp);
+            } else if (AstVhdlAttrName* const rattrp
+                       = VN_CAST(formalRangep->attrp(), VhdlAttrName)) {
+                if (rattrp->prefixp()) {
+                    bindAscending(nodep, bound, rattrp->prefixp(), true, flp);
+                }
             }
             continue;
         }
@@ -8552,7 +8580,45 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                 flp, new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
                 attrp});
         }
+        // The same place inside the actual says which way its range runs
+        {
+            AstNodeVhdlExpr* prefixp = actualp->cloneTree(false);
+            for (size_t si = skipSteps; si < bound.path.size(); ++si) {
+                const std::string& step = bound.path[si];
+                prefixp = step.empty()
+                              ? static_cast<AstNodeVhdlExpr*>(
+                                    new AstVhdlAttrName{flp, prefixp, "element"})
+                              : static_cast<AstNodeVhdlExpr*>(new AstVhdlSelected{
+                                    flp, prefixp, new AstVhdlName{flp, step}});
+            }
+            bindAscending(nodep, bound, prefixp, true, flp);
+            VL_DO_DANGLING(prefixp->deleteTree(), prefixp);
+        }
     }
+}
+
+// The generic that says which way an open dimension's range runs. Given a
+// prefix, it is that object's 'ASCENDING; given none, the answer is already
+// known here and goes in as TRUE or FALSE.
+void VhdlSemVisitor::bindAscending(AstVhdlInstance* nodep, const OpenBound& bound,
+                                   AstNodeVhdlExpr* prefixp, bool ascending, FileLine* flp) {
+    if (bound.ascName.empty()) return;
+    AstNodeVhdlExpr* valuep = nullptr;
+    if (prefixp) {
+        AstVhdlAttrName* const attrp
+            = new AstVhdlAttrName{flp, prefixp->cloneTree(false), "ascending"};
+        if (bound.dim > 0) {
+            AstVhdlLiteral* const dimp = new AstVhdlLiteral{
+                flp, VhdlLitKind::INTEGER, std::to_string(bound.dim + 1)};
+            dimp->intVal(bound.dim + 1);
+            attrp->argp(dimp);
+        }
+        valuep = attrp;
+    } else {
+        valuep = new AstVhdlName{flp, ascending ? "true" : "false"};
+    }
+    nodep->addGenericMapp(
+        new AstVhdlAssoc{flp, new AstVhdlName{flp, bound.ascName}, valuep});
 }
 
 // Each actual takes the type of the formal it is associated with, by position

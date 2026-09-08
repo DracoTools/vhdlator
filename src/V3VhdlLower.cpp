@@ -1239,6 +1239,16 @@ private:
     // which answers "descending" for every range whose ends are not numbers
     // here -- and a bound worked out by calling something is not one. A range
     // the text leaves open, "v'range", keeps what the index subtype says.
+    // Which way an open dimension's range runs, as an expression: the third
+    // generic the instance binds to the actual's 'ASCENDING. Null where the
+    // answer is known here, which is every ordinary range.
+    AstNodeExpr* boundsAscendingExpr(const VhdlType* idxp, FileLine* flp) {
+        if (!idxp || idxp->bounded()) return nullptr;
+        AstVhdlRange* const vrp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!vrp || !vrp->dirUnknown() || !vrp->dirp()) return nullptr;
+        return lowerExpr(vrp->dirp());
+    }
+
     bool boundsAscending(const VhdlType* idxp) const {
         if (!idxp) return true;
         if (idxp->bounded()) return idxp->ascending();
@@ -2757,6 +2767,10 @@ private:
         funcp->addStmtsp(vp);
         AstNodeExpr* const leftp = rangep->leftp()->unlinkFrBack();
         AstNodeExpr* const rightp = rangep->rightp()->unlinkFrBack();
+        // Which way the range runs may be the instance's to say, and the
+        // helper is shared by every instance -- so where a generic carries it
+        // the answer goes in as that expression rather than as a guess
+        AstNodeExpr* const ascExprp = boundsAscendingExpr(idxp, flp);
         const bool ascending = boundsAscending(idxp);
         VL_DO_DANGLING(rangep->deleteTree(), rangep);
         const auto out = [&]() {
@@ -2766,7 +2780,9 @@ private:
         funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rightp});
         funcp->addStmtsp(new AstAssign{
             flp, dynPart(out(), "dsc", flp),
-            new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+            ascExprp ? static_cast<AstNodeExpr*>(new AstLogNot{flp, ascExprp})
+                     : static_cast<AstNodeExpr*>(
+                         new AstConst{flp, AstConst::BitTrue{}, !ascending})});
         AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
         AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
         funcp->addStmtsp(np);
@@ -2777,10 +2793,24 @@ private:
         AstNodeExpr* const rp = dynPart(new AstVarRef{flp, VN_AS(funcp->fvarp(), Var),
                                                       VAccess::READ},
                                         "rgt", flp);
+        // The carrier already holds which way it runs, so the length and the
+        // walk below read it there rather than from a guess made here
+        const auto dsc = [&]() {
+            return dynPart(new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::READ},
+                           "dsc", flp);
+        };
+        AstNodeExpr* spanp = nullptr;
+        if (ascExprp) {
+            spanp = new AstCond{flp, dsc(), new AstSub{flp, lp->cloneTree(false),
+                                                       rp->cloneTree(false)},
+                                new AstSub{flp, rp, lp}};
+        } else {
+            spanp = ascending ? static_cast<AstNodeExpr*>(new AstSub{flp, rp, lp})
+                              : static_cast<AstNodeExpr*>(new AstSub{flp, lp, rp});
+        }
         funcp->addStmtsp(new AstAssign{
             flp, wr(np, flp),
-            new AstAdd{flp, ascending ? new AstSub{flp, rp, lp} : new AstSub{flp, lp, rp},
-                       new AstConst{flp, AstConst::Signed32{}, 1}}});
+            new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
                                        new AstNewDynamic{flp, rd(np, flp), nullptr}});
         funcp->addStmtsp(new AstAssign{flp, wr(kp, flp),
@@ -2791,9 +2821,15 @@ private:
         AstNodeExpr* const lft = dynPart(new AstVarRef{flp, VN_AS(funcp->fvarp(), Var),
                                                        VAccess::READ},
                                          "lft", flp);
-        AstNodeExpr* const atp
-            = ascending ? static_cast<AstNodeExpr*>(new AstAdd{flp, lft, rd(kp, flp)})
-                        : static_cast<AstNodeExpr*>(new AstSub{flp, lft, rd(kp, flp)});
+        AstNodeExpr* atp = nullptr;
+        if (ascExprp) {
+            atp = new AstCond{flp, dsc(),
+                              new AstSub{flp, lft->cloneTree(false), rd(kp, flp)},
+                              new AstAdd{flp, lft, rd(kp, flp)}};
+        } else {
+            atp = ascending ? static_cast<AstNodeExpr*>(new AstAdd{flp, lft, rd(kp, flp)})
+                            : static_cast<AstNodeExpr*>(new AstSub{flp, lft, rd(kp, flp)});
+        }
         loopp->addStmtsp(new AstAssign{
             flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(kp, flp)},
             new AstSelBit{flp, rd(vp, flp), atp}});

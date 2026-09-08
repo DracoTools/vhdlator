@@ -475,6 +475,9 @@ class AstVhdlRange final : public AstNodeVhdl {
     // @astgen op1 := leftp : Optional[AstNodeVhdlExpr]
     // @astgen op2 := rightp : Optional[AstNodeVhdlExpr]
     // @astgen op3 := attrp : Optional[AstNodeVhdlExpr]  // e.g. t'range
+    // Which way an open dimension's range runs, where only an instance says:
+    // a generic bound to the actual's 'ASCENDING, so it folds per instance
+    // @astgen op4 := dirp : Optional[AstNodeVhdlExpr]
     const VhdlDir m_dir;
     bool m_dirUnknown = false;  // Which way the range runs is not known here
 
