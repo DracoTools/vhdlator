@@ -7435,6 +7435,15 @@ private:
         const VhdlType* const formalp = symp->paramTypes()[at];
         const VhdlType* const atypep = actualp->vhdlTypep();
         if (!formalp || !atypep) return false;
+        if (atypep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        // A null slice denotes no elements at all (5.2.1), which a statically
+        // sized model has no value for, so it is written down as the ends
+        // were and its width is whatever that comes to. Nothing the back end
+        // measures about it is a finding about the source.
+        if (atypep->isConstrainedArray() && atypep->dimensions() == 1
+            && atypep->dimLength(0) == 0) {
+            return true;
+        }
         if (!formalp->isConstrainedArray() || !atypep->isConstrainedArray()) return false;
         if (formalp->dimensions() != 1 || atypep->dimensions() != 1) return false;
         const int64_t want = formalp->dimLength(0);
@@ -8768,6 +8777,29 @@ private:
                             refp->taskp(VN_AS(cfuncp, Func));
                             return refp;
                         }
+                    }
+                }
+                // A range whose ends run the wrong way round for its
+                // direction is a null range, which is legal and denotes a
+                // slice of no elements at all (5.2.1) -- "invec (right - 1
+                // downto low)" where the two are adjacent, which is how
+                // ieee.fixed_pkg asks for the bits below the last one when
+                // there are none. A statically sized model has no zero-width
+                // value, so this lowers to a select of the ends as written,
+                // and the back end's complaints about the order and the width
+                // are not findings about the source. A design that uses the
+                // *value* of a null slice is outside what this supports; one
+                // that only writes it down, as the IEEE bodies do on a branch
+                // reached at other widths, compiles and runs.
+                if (sliceDirKnown && VN_IS(leftp, Const) && VN_IS(rightp, Const)) {
+                    const int32_t l = VN_AS(leftp, Const)->toSInt();
+                    const int32_t r = VN_AS(rightp, Const)->toSInt();
+                    if (sliceAsc ? l > r : l < r) {
+                        FileLine* const nflp = new FileLine{flp};
+                        nflp->warnOff(V3ErrorCode::SELRANGE, true);
+                        nflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                        nflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        return new AstSelExtract{nflp, fromp, leftp, rightp};
                     }
                 }
                 return new AstSelExtract{flp, fromp, leftp, rightp};
