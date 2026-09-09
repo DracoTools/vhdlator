@@ -2223,6 +2223,15 @@ private:
             if (AstNode* const outp = dynFromEmittable(targetp, valuep, carrierTypep, flp)) {
                 return outp;
             }
+            // A value with no subtype written anywhere still says how many
+            // elements it has: a literal by its own text, a joining of two
+            // values by what they hold between them
+            if (carrierTypep) {
+                if (AstNodeExpr* const asCarrierp
+                    = asDynCarrier(valuep, carrierTypep, flp, carrierTypep)) {
+                    return new AstAssign{flp, targetp, asCarrierp};
+                }
+            }
             VL_DO_DANGLING(targetp->deleteTree(), targetp);
             unsup(flp, "value of a length only running decides copied from this expression");
             return nullptr;
@@ -2458,12 +2467,18 @@ private:
             if (dynBinaryCarries(bp)) return true;
             if (carriedOperatorResult(bp->vhdlSymp())) return true;
         }
-        // "not v" gives back a value as long as the operand, and the
-        // reductions give back one element, which is not one of these
+        // "not v" gives back a value as long as the operand, as do "+", "-"
+        // and "abs" over one; the reductions give back one element, which is
+        // not one of these
         if (AstVhdlUnary* const up = VN_CAST(const_cast<AstNodeVhdlExpr*>(nodep), VhdlUnary)) {
             if (carriedOperatorResult(up->vhdlSymp())) return true;
-            return up->op() == VhdlUnaryOp::NOT && isDynValue(up->lhsp(), depth + 1)
-                   && dynValueType(up->lhsp());
+            switch (up->op()) {
+            case VhdlUnaryOp::NOT:
+            case VhdlUnaryOp::NEGATE:
+            case VhdlUnaryOp::ABS:
+                return isDynValue(up->lhsp(), depth + 1) && dynValueType(up->lhsp());
+            default: return false;
+            }
         }
         return false;
     }
@@ -2917,6 +2932,54 @@ private:
     // A null literal -- "" -- is a value of no elements at all, so there is
     // nothing to copy across: the carrier holds nothing and says a range that
     // runs backwards, which is what a null range is (5.2.1).
+    std::map<const VhdlType*, AstNodeFTask*> m_dynElemFuncs;
+
+    // One element as a value of one element. Concatenation is written over
+    // elements as freely as over arrays (9.2.5), and an element has no bounds
+    // of its own, so it takes the leftmost the index type allows.
+    AstNodeFTask* dynOfElementFunc(VhdlType* carrierTypep, FileLine* flp) {
+        if (!carrierTypep || !m_modp) return nullptr;
+        const VhdlType* const key = carrierTypep->base();
+        const auto it = m_dynElemFuncs.find(key);
+        if (it != m_dynElemFuncs.end() && usableHelper(it->second)) return it->second;
+        VhdlType* const elemp = carrierTypep->elementp() ? carrierTypep->elementp()
+                                                         : carrierTypep->base()->elementp();
+        AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
+        if (!elemDTypep) return nullptr;
+        const std::string name = "__Vdynelem" + std::to_string(m_dynElemFuncs.size()) + "__"
+                                 + carrierTypep->base()->name();
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
+        AstVar* const ep = dynArg(funcp, "e", elemDTypep, flp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const VhdlType* const idxp = carrierTypep->base()->indexTypes().empty()
+                                         ? nullptr
+                                         : carrierTypep->base()->indexTypes()[0];
+        const bool ascending = idxp ? boundsAscending(idxp) : true;
+        const int64_t left = (idxp && idxp->bounded()) ? idxp->left() : (ascending ? 1 : 0);
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "lft", flp),
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left)}});
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "rgt", flp),
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left)}});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "q", flp),
+            new AstNewDynamic{flp, new AstConst{flp, AstConst::Signed32{}, 1}, nullptr}});
+        funcp->addStmtsp(new AstAssign{
+            flp,
+            new AstSelBit{flp, dynPart(out(), "q", flp),
+                          new AstConst{flp, AstConst::Signed32{}, 0}},
+            rd(ep, flp)});
+        addHelperFunc(funcp);
+        m_dynElemFuncs.insert_or_assign(key, funcp);
+        return funcp;
+    }
+
     AstNodeFTask* dynNullFunc(VhdlType* carrierTypep, FileLine* flp) {
         if (!carrierTypep || !m_modp) return nullptr;
         const VhdlType* const key = carrierTypep->base();
@@ -2956,6 +3019,23 @@ private:
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerExpr(nodep);
         VhdlType* typep = nodep->vhdlTypep();
+        // One element of the array standing where an array is wanted, which
+        // concatenation allows (9.2.5)
+        if (carrierTypep && typep && typep->base()->kind() != VhdlTypeKind::ARRAY) {
+            const VhdlType* const elemp = carrierTypep->elementp()
+                                              ? carrierTypep->elementp()
+                                              : carrierTypep->base()->elementp();
+            if (elemp && elemp->base() == typep->base()) {
+                if (AstNodeFTask* const elemFuncp = dynOfElementFunc(carrierTypep, flp)) {
+                    if (AstNodeExpr* const elemValp = lowerExpr(nodep)) {
+                        AstFuncRef* const elemRefp = new AstFuncRef{
+                            flp, elemFuncp->name(), new AstArg{flp, "", elemValp}};
+                        elemRefp->taskp(VN_AS(elemFuncp, Func));
+                        return elemRefp;
+                    }
+                }
+            }
+        }
         // A string literal is as long as what it is written against says
         // (9.3.2), and the analyzer leaves that to the context
         if ((!typep || !typep->isConstrainedArray()) && asLongAsp
@@ -3852,7 +3932,12 @@ private:
         }
         // An operator gives back what its operand carries
         if (AstVhdlUnary* const up = VN_CAST(nodep, VhdlUnary)) {
-            if (up->op() == VhdlUnaryOp::NOT) return dynValueType(up->lhsp());
+            switch (up->op()) {
+            case VhdlUnaryOp::NOT:
+            case VhdlUnaryOp::NEGATE:
+            case VhdlUnaryOp::ABS: return dynValueType(up->lhsp());
+            default: break;
+            }
         }
         if (AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
             if (dynBinaryCarries(bp)) {
@@ -3871,6 +3956,11 @@ private:
     AstNodeExpr* lowerDynUnary(AstVhdlUnary* nodep, FileLine* flp) {
         VhdlType* const otypep = dynValueType(nodep->lhsp());
         if (!otypep) return nullptr;
+        switch (nodep->op()) {
+        case VhdlUnaryOp::NEGATE:
+        case VhdlUnaryOp::ABS: return lowerDynSign(nodep, otypep, flp);
+        default: break;
+        }
         AstNodeFTask* funcp = nullptr;
         switch (nodep->op()) {
         case VhdlUnaryOp::NOT: funcp = dynNotFunc(otypep, flp); break;
@@ -3888,6 +3978,59 @@ private:
         AstFuncRef* const refp
             = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", valuep}};
         refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
+    // "-" and "abs" over a value that carries its own bounds. numeric_std
+    // gives each of them back as long as the operand, numbered from
+    // "length-1 downto 0", and the arithmetic is the one its "-" already does
+    // against nothing, so each is written as zero minus the operand -- or
+    // zero plus it, which leaves the value alone and renumbers it (16.5).
+    // "abs" is the one or the other according to the sign, and reads the
+    // operand twice, so that one is worked out and kept.
+    AstNodeExpr* lowerDynSign(AstVhdlUnary* nodep, VhdlType* otypep, FileLine* flp) {
+        AstNodeFTask* const addp = dynAddFunc(otypep, flp);
+        AstNodeFTask* const bitsp = addp ? dynBitsFunc(otypep, false, flp) : nullptr;
+        if (!bitsp) return nullptr;
+        AstNodeExpr* valuep = lowerExpr(nodep->lhsp());
+        if (!valuep) return nullptr;
+        const VhdlUnaryOp op = nodep->op();
+        AstNode* prep = nullptr;
+        if (op == VhdlUnaryOp::ABS && !repeatable(valuep)) {
+            AstVar* const tmpp = newTempVar("__Vdynabs", dynCarrierRef(otypep, flp), flp);
+            prep = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, valuep};
+            valuep = new AstVarRef{flp, tmpp, VAccess::READ};
+        }
+        // Whether to take the operand away rather than add it: always for a
+        // negation, and for "abs" only where the operand is negative, which
+        // its leftmost element says
+        AstNodeExpr* subp = nullptr;
+        if (op == VhdlUnaryOp::NEGATE) {
+            subp = new AstConst{flp, AstConst::BitTrue{}};
+        } else {
+            subp = new AstCond{
+                flp,
+                new AstGtS{flp, dynCarrierLength(valuep->cloneTree(false), flp), i32(0, flp)},
+                new AstSelBit{flp, dynPart(valuep->cloneTree(false), "q", flp), i32(0, flp)},
+                new AstConst{flp, AstConst::BitFalse{}}};
+        }
+        // Nothing to add it to or take it from, as wide as an integer, which
+        // the sign extension in the adder carries out to whatever is needed
+        AstArg* zeroArgsp = new AstArg{flp, "", i32(0, flp)};
+        zeroArgsp->addNext(new AstArg{flp, "", i32(32, flp)});
+        AstFuncRef* const zerop = new AstFuncRef{flp, bitsp->name(), zeroArgsp};
+        zerop->taskp(VN_AS(bitsp, Func));
+        AstArg* argsp = new AstArg{flp, "", zerop};
+        argsp->addNext(new AstArg{flp, "", valuep});
+        argsp->addNext(new AstArg{flp, "", subp});
+        argsp->addNext(new AstArg{
+            flp, "",
+            new AstConst{flp, AstConst::BitTrue{}, isSignedType(otypep)}});
+        // As long as the vector alone, which is the right-hand operand here
+        argsp->addNext(new AstArg{flp, "", i32(2, flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, addp->name(), argsp};
+        refp->taskp(VN_AS(addp, Func));
+        if (prep) return new AstExprStmt{flp, prep, refp};
         return refp;
     }
 
