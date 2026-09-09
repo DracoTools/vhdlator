@@ -368,10 +368,19 @@ class VhdlSemVisitor final : public VNVisitor {
         if (m_inSpecialized) return;  // The template was checked already
         VhdlType* const boolp = V3VhdlStd::booleanType();
         if (boolp && typep->base() == boolp->base()) return;
-        if (hasConditionOperator(typep)) return;
+        // The condition operator arrived in VHDL-2008 (9.2.9). Before it, a
+        // condition is of type BOOLEAN and nothing else, however many
+        // "??" a design of its own declares
+        if (condp->fileline()->language() >= V3LangCode::L1076_2008
+            && hasConditionOperator(typep)) {
+            return;
+        }
         err(condp->fileline(),
-            "Condition must be of type BOOLEAN, or of a type the condition"
-            " operator is defined for, but is " + typep->name());
+            condp->fileline()->language() >= V3LangCode::L1076_2008
+                ? "Condition must be of type BOOLEAN, or of a type the condition"
+                  " operator is defined for, but is "
+                      + typep->name()
+                : "Condition must be of type BOOLEAN, but is " + typep->name());
     }
 
     RangeInfo analyzeRange(AstNode* rangep, VhdlType* wantp) {

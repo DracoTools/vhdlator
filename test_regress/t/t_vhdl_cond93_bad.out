@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_cond93_bad.vhd:25:8: Condition must be of type BOOLEAN, but is std_logic
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to
