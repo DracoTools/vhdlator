@@ -13,14 +13,19 @@ A corpus expectation is not by itself a rule to implement.  VESTS demands an
 analysis error for several things that nvc and GHDL both accept without a
 word -- the operands of a logical operator being arrays of different lengths,
 for one, which both leave to run time.  Enforcing those would refuse designs
-those tools compile.  What is worth working on is the subset both of them
+those tools compile.  What is worth working on is the subset the references
 refuse, and this prints exactly that, grouped by the LRM clause VESTS names
 in each case's own identifier.
+
+Two references disagree often enough to matter, so a third breaks the tie
+where one is available: pass --questa to compile each source with Questa's
+vcom as well, and a case is counted as one to act on when a majority of the
+references available refuse it.
 
 Typical use, from the Verilator repository root:
 
     nodist/vhdl_corpus.py --root ../ --json gaps.json
-    nodist/vhdl_gapcheck.py gaps.json
+    nodist/vhdl_gapcheck.py gaps.json --questa
 """
 
 import argparse
@@ -48,13 +53,24 @@ def refuses(command, cwd):
 
 
 def verdicts(args_path):
-    """Return (nvc refuses, ghdl refuses) for one source."""
+    """Return one entry per reference asked: True where it refuses the source."""
     args, path = args_path
     with tempfile.TemporaryDirectory() as work:
         std = std_of(path)
-        nvc = refuses([args.nvc, "--std=" + ("1993" if std == "93" else "2008"), "-a", path], work)
-        ghdl = refuses([args.ghdl, "-a", "--std=" + ("93" if std == "93" else "08"), path], work)
-        return nvc, ghdl
+        out = [("nvc",
+                refuses([args.nvc, "--std=" + ("1993" if std == "93" else "2008"), "-a", path],
+                        work)),
+               ("ghdl",
+                refuses([args.ghdl, "-a", "--std=" + ("93" if std == "93" else "08"), path],
+                        work))]
+        if args.questa:
+            # vcom needs a library of its own, and one per source keeps the
+            # sources from seeing each other's design units
+            subprocess.run([args.vlib, "work"], cwd=work, capture_output=True, check=False)
+            out.append(("questa",
+                        refuses([args.vcom, "-" + ("93" if std == "93" else "2008"), "-quiet",
+                                 path], work)))
+        return out
 
 
 def clause_of(path):
@@ -79,6 +95,10 @@ def main():
     parser.add_argument('--corpus', action='append', default=[], help='limit to these corpora')
     parser.add_argument('--nvc', default='nvc', help='nvc binary (default: nvc)')
     parser.add_argument('--ghdl', default='ghdl', help='ghdl binary (default: ghdl)')
+    parser.add_argument('--questa', action='store_true',
+                        help="also ask Questa's vcom, which breaks a tie between the other two")
+    parser.add_argument('--vcom', default='vcom', help='Questa vcom binary (default: vcom)')
+    parser.add_argument('--vlib', default='vlib', help='Questa vlib binary (default: vlib)')
     parser.add_argument('--jobs', type=int, default=8, help='parallel jobs (default: 8)')
     parser.add_argument('--groups', type=int, default=20, help='clauses to list (default: 20)')
     args = parser.parse_args()
@@ -95,21 +115,30 @@ def main():
     if not todo:
         print('Nothing to check: no source in this report was expected to fail and did not')
         return 0
-    print('Checking %d sources against %s and %s' % (len(todo), args.nvc, args.ghdl))
+    who = [args.nvc, args.ghdl] + ([args.vcom] if args.questa else [])
+    print('Checking %d sources against %s' % (len(todo), ', '.join(who)))
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         outcomes = list(pool.map(verdicts, [(args, path) for path in todo]))
 
     groups = collections.Counter()
     agreed = []
-    for path, (nvc, ghdl) in zip(todo, outcomes):
-        groups['nvc %s, ghdl %s' % ('refuses' if nvc else 'accepts',
-                                    'refuses' if ghdl else 'accepts')] += 1
-        if nvc and ghdl:
+    split = []
+    for path, answers in zip(todo, outcomes):
+        groups[', '.join('%s %s' % (who, 'refuses' if no else 'accepts')
+                         for who, no in answers)] += 1
+        refused = sum(1 for _, no in answers if no)
+        if refused * 2 > len(answers):
             agreed.append(path)
+        elif refused:
+            split.append(path)
     print()
     for text, count in groups.most_common():
         print('  %5d  %s' % (count, text))
-    print('\nBoth references refuse these, so they are rules worth having: %d\n' % len(agreed))
+    print('\nA majority of the references refuse these, so they are rules worth'
+          ' having: %d' % len(agreed))
+    if split:
+        print('And %d where the references are split without a majority' % len(split))
+    print()
 
     clauses = collections.Counter()
     example = {}
