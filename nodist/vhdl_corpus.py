@@ -105,8 +105,10 @@ def nvc_expectations(nvc_root, phase):
         wants_error = bool(expects and re.search(r'\{\s*\d+\s*,', expects.group(1)))
         for name in re.findall(r'input_from_file\(TESTDIR\s*"([^"]+)"', body):
             full = os.path.normpath(os.path.join(nvc_root, 'test', name.lstrip('/')))
-            if wants_error or table.get(full) == 'reject':
-                table[full] = 'reject'
+            # An entry may be a warning as readily as an error, so what NVC
+            # asks of the source is a diagnostic, not necessarily a refusal
+            if wants_error or table.get(full) == 'diagnose':
+                table[full] = 'diagnose'
             else:
                 table.setdefault(full, 'accept')
     _NVC_EXPECT[key] = table
@@ -137,19 +139,24 @@ def extra_flags(path):
 class Result:
     """Outcome of running Verilator over one source file."""
 
-    __slots__ = ('path', 'ok', 'seconds', 'message', 'expected')
+    __slots__ = ('path', 'ok', 'seconds', 'message', 'expected', 'diagnosed')
 
-    def __init__(self, path, ok, seconds, message, expected='accept'):
+    def __init__(self, path, ok, seconds, message, expected='accept', diagnosed=False):
         self.path = path
         self.ok = ok
         self.seconds = seconds
         self.message = message
         self.expected = expected
+        self.diagnosed = diagnosed
 
     @property
     def as_expected(self):
         """Whether the run came out the way the corpus says it should."""
-        return self.ok if self.expected == 'accept' else not self.ok
+        if self.expected == 'accept':
+            return self.ok
+        if self.expected == 'diagnose':
+            return self.diagnosed
+        return not self.ok
 
 
 def find_sources(root, subdirs):
@@ -181,10 +188,13 @@ def run_one(args):
                               check=False)
         output = proc.stdout.decode('utf-8', errors='replace')
         ok = proc.returncode == 0
+        diagnosed = any(
+            line.startswith('%Error') or line.startswith('%Warning')
+            for line in output.splitlines())
     except subprocess.TimeoutExpired:
-        return Result(path, False, time.time() - start, 'TIMEOUT', expected)
+        return Result(path, False, time.time() - start, 'TIMEOUT', expected, False)
     except OSError as exc:
-        return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected)
+        return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected, False)
 
     message = ''
     if not ok:
@@ -195,7 +205,7 @@ def run_one(args):
                 break
         else:
             message = (output.strip().splitlines() or ['(no output)'])[-1]
-    return Result(path, ok, time.time() - start, message, expected)
+    return Result(path, ok, time.time() - start, message, expected, diagnosed)
 
 
 def summarize_failures(results, limit):
@@ -204,9 +214,11 @@ def summarize_failures(results, limit):
     for result in results:
         if result.as_expected:
             continue
-        if result.expected == 'reject':
-            counts['(accepted, but the corpus says this must be refused)'] = (
-                counts.get('(accepted, but the corpus says this must be refused)', 0) + 1)
+        if result.expected in ('reject', 'diagnose'):
+            key = ('(accepted, but the corpus says this must be refused)'
+                   if result.expected == 'reject' else
+                   '(nothing reported, but the corpus expects a diagnostic here)')
+            counts[key] = counts.get(key, 0) + 1
             continue
         # Strip file/line so distinct files with the same cause group together
         key = re.sub(r'^%Error[^:]*: [^ ]+?:\d+:\d+: ', '%Error: ', result.message)
@@ -238,12 +250,16 @@ def score_corpus(name, root, globs, args):
 
     passed = sum(1 for r in results if r.as_expected)
     total = len(results)
-    must_reject = sum(1 for r in results if r.expected == 'reject')
-    wrongly_accepted = sum(1 for r in results if r.expected == 'reject' and r.ok)
+    must_reject = sum(1 for r in results if r.expected in ('reject', 'diagnose'))
+    wrongly_accepted = sum(1 for r in results if r.expected in ('reject', 'diagnose')
+                           and not r.as_expected)
+    # VESTS says a non-compliant case must not compile; NVC's harness lists
+    # warnings as readily as errors, so what it asks for is a diagnostic
+    demand = 'diagnosed' if any(r.expected == 'diagnose' for r in results) else 'refused'
     percent = (100.0 * passed / total) if total else 0.0
     note = ''
     if must_reject:
-        note = '   [%d must be refused, %d were not]' % (must_reject, wrongly_accepted)
+        note = '   [%d must be %s, %d were not]' % (must_reject, demand, wrongly_accepted)
     if name in NEEDS_LIBRARY:
         note += '   [a floor: each file needs its library compiled alongside]'
     print('%-16s  %5d/%-5d  %5.1f%%   (%.1fs)%s' %
