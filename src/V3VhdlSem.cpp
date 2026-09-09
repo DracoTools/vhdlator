@@ -335,7 +335,24 @@ class VhdlSemVisitor final : public VNVisitor {
     VhdlType* analyzeCondition(AstNodeVhdlExpr* condp) {
         VL_RESTORER(m_condExprp);
         m_condExprp = condp;
-        return analyzeExpr(condp, V3VhdlStd::booleanType());
+        VhdlType* const typep = analyzeExpr(condp, V3VhdlStd::booleanType());
+        checkCondition(condp, typep);
+        return typep;
+    }
+
+    // A condition is of type BOOLEAN, or of a type the condition operator is
+    // defined for, which is the conversion the language would otherwise have
+    // written out (9.2.9, and note 1 of 12.5). Anything else is not a
+    // condition, however readily it might convert to one in another language.
+    void checkCondition(AstNodeVhdlExpr* condp, VhdlType* typep) {
+        if (!condp || !typep || typep->isError()) return;
+        if (m_inSpecialized) return;  // The template was checked already
+        VhdlType* const boolp = V3VhdlStd::booleanType();
+        if (boolp && typep->base() == boolp->base()) return;
+        if (hasConditionOperator(typep)) return;
+        err(condp->fileline(),
+            "Condition must be of type BOOLEAN, or of a type the condition"
+            " operator is defined for, but is " + typep->name());
     }
 
     RangeInfo analyzeRange(AstNode* rangep, VhdlType* wantp) {

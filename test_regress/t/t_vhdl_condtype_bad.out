@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_condtype_bad.vhd:39:12: Condition must be of type BOOLEAN, or of a type the condition operator is defined for, but is integer
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_condtype_bad.vhd:45:8: Condition must be of type BOOLEAN, or of a type the condition operator is defined for, but is colour
+%Error: t/t_vhdl_condtype_bad.vhd:53:11: Condition must be of type BOOLEAN, or of a type the condition operator is defined for, but is integer
+%Error: Exiting due to
