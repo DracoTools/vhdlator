@@ -6007,7 +6007,17 @@ private:
         }
         if (!symp) return nullptr;
         AstNodeVhdlExpr* const valuep = symp->resolved()->userAttr(attr);
-        return valuep ? lowerExpr(valuep) : nullptr;
+        if (!valuep) return nullptr;
+        AstNodeExpr* const outp = lowerExpr(valuep);
+        // "obj'attr(i)" is one element of the value the attribute holds, not
+        // the whole of it (7.2, 8.4); the analyzer has already given this
+        // name the element's type
+        if (outp && nodep->argp()) {
+            if (AstNodeExpr* const indexp = lowerExpr(nodep->argp())) {
+                return new AstSelBit{nodep->fileline(), outp, indexp};
+            }
+        }
+        return outp;
     }
 
     // What a signal attribute needs kept about one signal, made on first use.

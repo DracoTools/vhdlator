@@ -5731,7 +5731,21 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() == VhdlSymKind::ATTRIBUTE) {
             nodep->vhdlSymp(symp);
-            return symp->typep();
+            VhdlType* const typep = symp->typep();
+            // A user-defined attribute holds an ordinary value, so where that
+            // value is an array "obj'attr(i)" is one element of it rather
+            // than an argument to anything (7.2, 8.4). The predefined
+            // attributes that take an argument are answered above.
+            if (nodep->argp() && typep && typep->base()->kind() == VhdlTypeKind::ARRAY) {
+                const std::vector<VhdlType*>& idx = typep->indexTypes().empty()
+                                                        ? typep->base()->indexTypes()
+                                                        : typep->indexTypes();
+                analyzeExpr(nodep->argp(), idx.empty() ? nullptr : idx[0]);
+                VhdlType* const elemp
+                    = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+                if (elemp) return elemp;
+            }
+            return typep;
         }
     }
     err(nodep->fileline(), "Unknown attribute '" + attr + "'");
@@ -6435,6 +6449,13 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     std::vector<int> formalOf;
     std::vector<std::string> elemOf;
     int best = -1;
+    // Resolution is bidirectional: a subprogram overloads on its result as
+    // well as on its arguments (12.5). So a candidate whose result is the
+    // type the context asked for outranks one whose arguments merely match
+    // more exactly -- otherwise "abs"(10) assigned to an enumeration means
+    // the predefined operator on universal_integer, whose argument fits
+    // without conversion, and the design's own is never considered.
+    int bestFits = -1;
     for (VhdlSymbol* const symp : found) {
         // An alias of a subprogram is called like the subprogram it names
         const VhdlSymKind kind = symp->resolved()->kind();
@@ -6456,12 +6477,15 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             if (symp->resolved()->paramFromGeneric(formalOf[i])) ++viaGeneric;
         }
         if (!ok) continue;
-        if (score > best) {
+        VhdlType* const resultp = symp->returnTypep() ? symp->returnTypep() : symp->typep();
+        const int fits = (wantp && !wantp->isError() && typesMatch(resultp, wantp)) ? 1 : 0;
+        if (fits > bestFits || (fits == bestFits && score > best)) {
+            bestFits = fits;
             best = score;
             cands.clear();
             genOf.clear();
         }
-        if (score == best) {
+        if (fits == bestFits && score == best) {
             cands.push_back(symp);
             genOf.push_back(viaGeneric);
         }
