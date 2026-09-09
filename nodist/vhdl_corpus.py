@@ -40,7 +40,8 @@ CORPORA = {
     'nvc-bounds': ('nvc', ['test/bounds']),
     'nvc-simp': ('nvc', ['test/simp']),
     'nvc-regress': ('nvc', ['test/regress']),
-    'ghdl': ('ghdl', ['testsuite']),
+    'ghdl': ('ghdl', ['testsuite/gna', 'testsuite/sanity', 'testsuite/synth']),
+    'vests': ('ghdl', ['testsuite/vests']),
     'compliance': ('Compliance-Tests', ['vhdl_2008', 'vhdl_2019']),
     'uvvm': ('UVVM', ['.']),
     'vunit': ('vunit', ['vunit/vhdl']),
@@ -243,9 +244,13 @@ def main():
     parser.add_argument('--verilator',
                         default=None,
                         help='verilator binary (default: ./bin/verilator relative to repo)')
+    # A warning is Verilator's opinion of a design, not a verdict on whether the
+    # source is legal, and no VHDL corpus is written to avoid them. Scoring one
+    # as a rejection would count a lint remark as a conformance failure, so
+    # warnings are not fatal here; errors still are.
     parser.add_argument('--flags',
-                        default='--lint-only',
-                        help='flags passed to verilator (default: --lint-only)')
+                        default='--lint-only -Wno-fatal',
+                        help='flags passed to verilator (default: --lint-only -Wno-fatal)')
     parser.add_argument('--jobs',
                         type=int,
                         default=multiprocessing.cpu_count(),
