@@ -49,6 +49,13 @@ CORPORA = {
 
 VHDL_SUFFIXES = ('.vhd', '.vhdl')
 
+# Corpora whose files are not self-contained: each source names a library the
+# corpus compiles alongside it -- VUnit's own, UVVM's, OSVVM's -- so running
+# one file on its own reports a missing design unit whatever the frontend
+# does with the language. The number for these is a floor and nothing more,
+# and saying so is better than printing a percentage that means nothing.
+NEEDS_LIBRARY = frozenset(('compliance', 'uvvm', 'vunit'))
+
 # A corpus that says what it expects of each file has to be scored against
 # that and not against "did it compile".  VESTS declares the expectation in
 # its own directory layout: a compliant case must be accepted, and a
@@ -194,6 +201,8 @@ def score_corpus(name, root, globs, args):
     note = ''
     if must_reject:
         note = '   [%d must be refused, %d were not]' % (must_reject, wrongly_accepted)
+    if name in NEEDS_LIBRARY:
+        note += '   [a floor: each file needs its library compiled alongside]'
     print('%-16s  %5d/%-5d  %5.1f%%   (%.1fs)%s' %
           (name, passed, total, percent, elapsed, note))
 
@@ -300,12 +309,16 @@ def main():
         root = overrides.get(name, os.path.join(args.root, subdir))
         entry = score_corpus(name, root, globs, args)
         if entry:
+            entry['needs_library'] = name in NEEDS_LIBRARY
             report[name] = entry
+            if name in NEEDS_LIBRARY:
+                continue  # A floor, so leave it out of the total rather than depress it
             grand_total += entry['total']
             grand_pass += entry['passed']
 
     percent = (100.0 * grand_pass / grand_total) if grand_total else 0.0
-    print('%-16s  %5d/%-5d  %5.1f%%' % ('TOTAL', grand_pass, grand_total, percent))
+    print('%-16s  %5d/%-5d  %5.1f%%   (corpora needing their library left out)' %
+          ('TOTAL', grand_pass, grand_total, percent))
 
     if args.json:
         with open(args.json, 'w', encoding='utf-8') as fh:
