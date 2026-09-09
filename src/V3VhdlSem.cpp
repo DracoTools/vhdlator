@@ -157,6 +157,25 @@ class VhdlSemVisitor final : public VNVisitor {
         m_errored = true;
     }
 
+    // A declarative part admits only the items its own clause lists. A
+    // process may not declare a signal or a component, and neither may a
+    // subprogram: what those regions are for is code, and an object that
+    // outlives one call or a binding that belongs to a structure has nowhere
+    // to live there (11.3, 4.3).
+    void rejectDecls(AstNode* declsp, const std::string& where) {
+        for (AstNode* dp = declsp; dp; dp = dp->nextp()) {
+            if (const AstVhdlObjectDecl* const odp = VN_CAST(dp, VhdlObjectDecl)) {
+                if (odp->kind() == VhdlObjKind::SIGNAL) {
+                    err(dp->fileline(),
+                        "A signal cannot be declared in " + where + ": '" + odp->name() + "'");
+                }
+            } else if (VN_IS(dp, VhdlComponentDecl)) {
+                err(dp->fileline(), "A component cannot be declared in " + where + ": '"
+                                        + VN_AS(dp, NodeVhdlDecl)->name() + "'");
+            }
+        }
+    }
+
     // A copy of a package made for one instantiation, while it is analyzed.
     // Substituting a generic type may make two declarations of a name the
     // same profile -- "f(e : t_element)" and "f(n : integer)" where the
@@ -1379,6 +1398,7 @@ private:
     int64_t aggregateLength(AstVhdlAggregate* nodep) VL_MT_DISABLED;
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
     VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
+    void checkCompositeElements(VhdlType* typep, FileLine* flp) VL_MT_DISABLED;
     VhdlType* convertedType(VhdlType* top, AstVhdlAssoc* argp) VL_MT_DISABLED;
     VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) VL_MT_DISABLED;
@@ -1558,12 +1578,35 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
         V3VhdlStd::addImplicitOperators(m_scopep, otherp->typep());
         return;
     }
+    checkCompositeElements(typep, nodep->fileline());
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, nodep->name(), nodep);
     symp->typep(typep);
     nodep->vhdlSymp(symp);
     declare(symp, nodep->fileline());
     // A type declaration implicitly declares its operators (5.2.6)
     V3VhdlStd::addImplicitOperators(m_scopep, typep);
+}
+
+// What a composite type is made of. A file is a handle on something outside
+// the design and a protected type is an object with an identity, so neither
+// can be copied, and an element of a composite is copied whenever the
+// composite is (5.3.1, 5.3.3).
+void VhdlSemVisitor::checkCompositeElements(VhdlType* typep, FileLine* flp) {
+    if (!typep) return;
+    const auto bad = [&](const VhdlType* elemp, const std::string& what) {
+        if (!elemp) return;
+        const VhdlTypeKind kind = elemp->base()->kind();
+        if (kind != VhdlTypeKind::FILE && kind != VhdlTypeKind::PROTECTED) return;
+        err(flp, std::string{kind == VhdlTypeKind::FILE ? "A file" : "A protected"}
+                     + " type cannot be " + what + ": '" + elemp->prettyName() + "'");
+    };
+    if (typep->kind() == VhdlTypeKind::ARRAY) {
+        bad(typep->elementp(), "the element of an array type");
+    } else if (typep->kind() == VhdlTypeKind::RECORD) {
+        for (const VhdlSymbol* const elemp : typep->elements()) {
+            bad(elemp->typep(), "the type of a record element");
+        }
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlSubtypeDecl* nodep) {
@@ -1920,6 +1963,7 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         // so it is checked in each copy rather than here (4.4)
         const bool isTemplate = nodep->genericCount() > 0 && !nodep->isInstance();
         if (!isTemplate) {
+            rejectDecls(nodep->declsp(), "a subprogram");
             iterateAndNextNull(nodep->declsp());
             iterateAndNextNull(nodep->stmtsp());
             // A function whose result type leaves something open gets it
@@ -2273,6 +2317,7 @@ void VhdlSemVisitor::visit(AstVhdlProcess* nodep) {
         analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
     }
     pushScope(nodep->name().empty() ? "process" : nodep->name());
+    rejectDecls(nodep->declsp(), "a process");
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
     popScope();
@@ -5655,6 +5700,21 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
 }
 
 VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wantp) {
+    // "others" stands for whatever is left, so nothing can be left after it:
+    // it must be the last choice of the last association (9.3.3.3)
+    {
+        bool sawOthers = false;
+        for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
+            for (AstNode* cp = VN_AS(elemp, VhdlElemAssoc)->choicesp(); cp; cp = cp->nextp()) {
+                if (sawOthers) {
+                    err(cp->fileline(), "Nothing can follow an 'others' choice in an aggregate");
+                    sawOthers = false;  // One report is enough for this aggregate
+                    break;
+                }
+                if (VN_AS(cp, VhdlChoice)->isOthers()) sawOthers = true;
+            }
+        }
+    }
     // An aggregate takes its type entirely from the context (9.3.3)
     if (!wantp || wantp->isError() || !wantp->isComposite()) {
         for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {

@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_declrules_bad.vhd:19:3: A file type cannot be the element of an array type: 'ft'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_declrules_bad.vhd:23:12: A signal cannot be declared in a subprogram: 's'
+%Error: t/t_vhdl_declrules_bad.vhd:33:5: A component cannot be declared in a process: 'c1'
+%Error: t/t_vhdl_declrules_bad.vhd:41:58: Nothing can follow an 'others' choice in an aggregate
+%Error: Exiting due to
