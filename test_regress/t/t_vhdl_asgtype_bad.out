@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_asgtype_bad.vhd:34:10: Assignment target is of type r, but the value is of type universal_integer
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_asgtype_bad.vhd:35:10: Assignment target is of type integer, but the value is of type boolean
+%Error: t/t_vhdl_asgtype_bad.vhd:36:10: Assignment target is of type integer, but the value is of type boolean
+%Error: Exiting due to

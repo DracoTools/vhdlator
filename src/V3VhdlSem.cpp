@@ -1408,6 +1408,9 @@ private:
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
     VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
     void checkCompositeElements(VhdlType* typep, FileLine* flp) VL_MT_DISABLED;
+    bool checkAssignedType(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
+    static bool indexedCallWouldFit(const AstNodeVhdlExpr* nodep, const VhdlType* valuep,
+                                    const VhdlType* targetp) VL_MT_DISABLED;
     void checkSignalAttrOfOutPort(AstVhdlAttrName* nodep,
                                   const std::string& attrName) VL_MT_DISABLED;
     VhdlType* convertedType(VhdlType* top, AstVhdlAssoc* argp) VL_MT_DISABLED;
@@ -6840,8 +6843,62 @@ void VhdlSemVisitor::checkWaveform(AstNode* wavesp) {
 // scalar, and of the right length for a constrained array (10.5.2.2)
 void VhdlSemVisitor::checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) {
     if (m_unreached) return;  // A branch a settled condition closed off
+    // Where the type is wrong, what its value or its length would be says
+    // nothing more about it
+    if (!checkAssignedType(nodep, targetp)) return;
     checkValueInRange(nodep, targetp, "the assignment target");
     checkArrayValue(nodep, targetp, "the assignment target");
+}
+
+// What is assigned must be of the target's type (10.5.2.1, 10.6.2). A literal
+// or an aggregate was handed the target's type to be analyzed with and so
+// already has it; what this catches is a value that has a type of its own and
+// a different one. The universal types are the exception the language makes:
+// they convert to any type of their own class (9.3.6).
+bool VhdlSemVisitor::checkAssignedType(AstNodeVhdlExpr* nodep, VhdlType* targetp) {
+    if (m_inSpecialized) return true;  // The template was checked already
+    if (!nodep || !targetp || targetp->isError()) return true;
+    VhdlType* const valuep = nodep->vhdlTypep();
+    if (!valuep || valuep->isError()) return true;
+    if (valuep->base() == targetp->base()) return true;
+    const VhdlTypeKind want = targetp->base()->kind();
+    switch (valuep->base()->kind()) {
+    case VhdlTypeKind::UNIVERSAL_INTEGER:
+        if (want == VhdlTypeKind::INTEGER || want == VhdlTypeKind::PHYSICAL) return true;
+        break;
+    case VhdlTypeKind::UNIVERSAL_REAL:
+        if (want == VhdlTypeKind::FLOATING || want == VhdlTypeKind::PHYSICAL) return true;
+        break;
+    // An incomplete type is one whose full declaration has not been seen, and
+    // a protected type is reached through a name that is not its own
+    case VhdlTypeKind::INCOMPLETE:
+    case VhdlTypeKind::PROTECTED: return true;
+    default: break;
+    }
+    if (want == VhdlTypeKind::INCOMPLETE || want == VhdlTypeKind::PROTECTED) return true;
+    // "f(i)" where every parameter of f has a default reads two ways: a call
+    // with one argument, or the defaulted call's result indexed by i (4.2.2.1,
+    // 8.4). This analyzer only takes the first, so where the second would fit
+    // the target it says nothing rather than reporting a type that another
+    // reading of the same text does not have. nvc 1.22.1 and GHDL 7.0.0-dev
+    // both accept such a design; Questa 2025.2 refuses it.
+    if (indexedCallWouldFit(nodep, valuep, targetp)) return true;
+    err(nodep->fileline(), "Assignment target is of type " + targetp->prettyName()
+                               + ", but the value is of type " + valuep->prettyName());
+    return false;
+}
+
+bool VhdlSemVisitor::indexedCallWouldFit(const AstNodeVhdlExpr* nodep, const VhdlType* valuep,
+                                         const VhdlType* targetp) {
+    const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+    if (!callp || !callp->argsp()) return false;
+    if (valuep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+    const VhdlSymbol* const symp = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+    if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return false;
+    if (!allParamsDefaulted(symp)) return false;
+    const VhdlType* const elemp
+        = valuep->elementp() ? valuep->elementp() : valuep->base()->elementp();
+    return elemp && elemp->base() == targetp->base();
 }
 
 void VhdlSemVisitor::analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) {
