@@ -1372,7 +1372,14 @@ class TristateVisitor final : public TristateBaseVisitor {
     void visit(AstConst* nodep) override {
         UINFO(9, dbgState() << nodep);
         if (m_graphing) {
-            if (!m_alhs && nodep->num().hasZ()) m_tgraph.setTristate(nodep);
+            // A z handed to a subprogram is a value, not a driver of a net.
+            // There is nothing inside for it to resolve against -- a
+            // parameter is a variable, and a variable a tristate net is read
+            // into already loses the z here -- so it is left as the constant
+            // it is, which is what a z written into $display is left as too.
+            if (!m_alhs && nodep->num().hasZ() && !VN_IS(nodep->backp(), Arg)) {
+                m_tgraph.setTristate(nodep);
+            }
         } else {
             // Detect any Z consts and convert them to 0's with an enable that is also 0.
             if (m_alhs && nodep->user1p()) {
