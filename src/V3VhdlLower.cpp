@@ -8156,7 +8156,19 @@ private:
         if (!VN_IS(callp->argsp(), VhdlRange)) return false;
         AstNodeVhdlExpr* const basep
             = aliasBase(callp->vhdlSymp(), const_cast<AstNodeVhdlExpr*>(callp->prefixp()));
-        return isDynObj(basep);
+        // A slice of a carrier is another, whether the carrier is a named
+        // object or what a call gave back
+        return isDynObj(basep) || dynResultCall(basep) || parameterlessDynCall(basep);
+    }
+
+    // A function that may be called with no arguments at all is written as a
+    // name, not as a call (4.2.2.1), so a slice of what it gives back reads
+    // as a slice of that name
+    bool parameterlessDynCall(const AstNodeVhdlExpr* nodep) const {
+        if (!nodep || VN_IS(nodep, VhdlCall) || !nodep->vhdlSymp()) return false;
+        const VhdlSymbol* const symp = nodep->vhdlSymp()->resolved();
+        return symp->kind() == VhdlSymKind::FUNCTION && allParamsDefaulted(symp)
+               && carriedDynamically(emittedReturnType(symp));
     }
     AstVhdlRange* dynSliceRange(AstNodeVhdlExpr* nodep) {
         if (!isDynSlice(nodep)) return nullptr;
@@ -9288,8 +9300,11 @@ private:
                 rightp = aliasShift(objSymp, rightp, flp);
                 // A slice of a value that carries its own bounds is another
                 // such value, made a place at a time (8.5)
-                if (isDynObj(nodep->prefixp())) {
-                    VhdlType* const carrp = nodep->prefixp()->vhdlTypep();
+                if (isDynObj(nodep->prefixp()) || dynResultCall(nodep->prefixp())
+                    || parameterlessDynCall(nodep->prefixp())) {
+                    VhdlType* const carrp = dynValueType(nodep->prefixp())
+                                                ? dynValueType(nodep->prefixp())
+                                                : nodep->prefixp()->vhdlTypep();
                     AstNodeFTask* const funcp
                         = carrp && sliceDirKnown ? dynSliceFunc(carrp, flp) : nullptr;
                     if (!funcp) {
