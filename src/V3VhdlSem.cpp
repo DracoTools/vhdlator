@@ -1408,6 +1408,8 @@ private:
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
     VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
     void checkCompositeElements(VhdlType* typep, FileLine* flp) VL_MT_DISABLED;
+    void checkSignalAttrOfOutPort(AstVhdlAttrName* nodep,
+                                  const std::string& attrName) VL_MT_DISABLED;
     VhdlType* convertedType(VhdlType* top, AstVhdlAssoc* argp) VL_MT_DISABLED;
     VhdlType* constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) VL_MT_DISABLED;
@@ -5590,6 +5592,33 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
     return V3VhdlStd::errorType();
 }
 
+// A port of mode OUT may not be read before VHDL-2008 (93's 4.3.2; 2008
+// lifted it in 6.5.2). Asking one of these attributes is reading it: they
+// answer about the value the signal has or had. 'DRIVING and 'DRIVING_VALUE
+// ask about what this process drives, which an output is exactly for, and
+// 'LENGTH and its kind ask about the subtype rather than the signal.
+static bool readsTheSignal(const std::string& attr) {
+    return attr == "stable" || attr == "event" || attr == "active" || attr == "quiet"
+           || attr == "last_value" || attr == "last_event" || attr == "last_active"
+           || attr == "transaction" || attr == "delayed";
+}
+
+void VhdlSemVisitor::checkSignalAttrOfOutPort(AstVhdlAttrName* nodep,
+                                              const std::string& attrName) {
+    if (nodep->fileline()->language() >= V3LangCode::L1076_2008) return;
+    if (!readsTheSignal(attrName)) return;
+    const AstNodeVhdlExpr* const prefixp = nodep->prefixp();
+    const VhdlSymbol* const symp
+        = prefixp && prefixp->vhdlSymp() ? prefixp->vhdlSymp()->resolved() : nullptr;
+    // An interface object -- a port, or a subprogram parameter -- carries its
+    // mode on the declaration rather than on the symbol
+    const AstVhdlIfaceDecl* const portp
+        = symp ? VN_CAST(symp->declp(), VhdlIfaceDecl) : nullptr;
+    if (!portp || portp->mode() != VhdlMode::OUT) return;
+    err(nodep->fileline(), "A port of mode out cannot be read before VHDL-2008, and '"
+                               + attrName + " reads it: '" + symp->name() + "'");
+}
+
 VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* wantp) {
     // Predefined attributes (16.2). The prefix may be a type mark or an
     // object; either way its type is what most attributes ask about.
@@ -5619,6 +5648,7 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         return V3VhdlStd::stringType();
     }
     if (!prefixTypep) prefixTypep = analyzeExpr(nodep->prefixp(), nullptr);
+    checkSignalAttrOfOutPort(nodep, attrName);
     // Record what the prefix denotes, so that folding an attribute later does
     // not have to work it out again
     if (nodep->prefixp() && !nodep->prefixp()->vhdlTypep()) {

@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_outread_bad.vhd:26:9: A port of mode out cannot be read before VHDL-2008, and 'event reads it: 'o'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_outread_bad.vhd:29:9: A port of mode out cannot be read before VHDL-2008, and 'stable reads it: 'o'
+%Error: Exiting due to
