@@ -894,7 +894,12 @@ private:
             consp = new AstConsPackUOrStruct{nodep->fileline(), structp};
             m_reclaimValuesp.push_back(consp);
         }
-        AstNodeExpr* const valuep = newTrackedClone(fetchValue(valueFromp));
+        AstNodeExpr* const fromValuep = fetchValueNull(valueFromp);
+        if (!fromValuep) {  // An impure call, say, which is not evaluated at all
+            clearOptimizable(valueFromp, "Struct member assigned a value not computed");
+            return;
+        }
+        AstNodeExpr* const valuep = newTrackedClone(fromValuep);
         if (AstConsPackMember* const oldp = consMemberOf(consp, selp->name())) {
             VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
         }
@@ -1034,8 +1039,10 @@ private:
             clearOptimizable(nodep, "Struct member never assigned: " + nodep->name());
         } else if (AstConst* const constp = VN_CAST(memberp->rhsp(), Const)) {
             setValue(nodep, constp);
+        } else if (AstNodeExpr* const valuep = fetchValueNull(memberp->rhsp())) {
+            setValue(nodep, valuep);
         } else {
-            setValue(nodep, fetchValue(memberp->rhsp()));
+            clearOptimizable(nodep, "Struct member holds a value not computed");
         }
     }
     void visit(AstConsPackUOrStruct* nodep) override {
@@ -1052,6 +1059,14 @@ private:
             iterateAndNextConstNull(mp->rhsp());
         }
         if (m_checkOnly || !optimizable()) return;
+        for (AstConsPackMember* mp = nodep->membersp(); mp;
+             mp = VN_AS(mp->nextp(), ConsPackMember)) {
+            // An impure call is noted and not evaluated, so it leaves no value behind
+            if (!fetchValueNull(mp->rhsp())) {
+                clearOptimizable(mp->rhsp(), "Struct member holds a value not computed");
+                return;
+            }
+        }
         AstConsPackUOrStruct* const newp = new AstConsPackUOrStruct{nodep->fileline(), structp};
         m_reclaimValuesp.push_back(newp);
         for (AstConsPackMember* mp = nodep->membersp(); mp;
@@ -1309,6 +1324,9 @@ private:
                 }
                 // Evaluate pin value
                 iterateConst(pinp);
+                // An argument that could not be worked out has no value to pass on,
+                // and the call cannot be evaluated. Say so, rather than asking for it.
+                if (!optimizable()) return;
                 // Clone in case are recursing
                 portValues.emplace_back(std::make_pair(portp, newTrackedClone(fetchValue(pinp))));
             }
