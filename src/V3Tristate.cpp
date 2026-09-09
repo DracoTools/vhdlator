@@ -189,6 +189,10 @@ public:
 private:
     // MEMBERS
     V3Graph m_graph;  // Logic graph
+    // Where a high impedance value could flow from, to: the second variable is
+    // assigned something the first takes part in
+    std::vector<std::pair<const AstVar*, const AstVar*>> m_zFlow;
+    std::set<const AstVar*> m_maybeZ;  // Variables a high impedance value can reach
 
 public:
     // CONSTRUCTORS
@@ -282,6 +286,8 @@ public:
             }
         }
         m_graph.clear();
+        m_zFlow.clear();
+        m_maybeZ.clear();
         AstNode::user4ClearTree();  // Wipe all node user4p's that point to vertexes
     }
     void graphWalk(AstNodeModule* nodep) {
@@ -292,7 +298,28 @@ public:
         for (V3GraphVertex& vtx : m_graph.vertices()) {
             graphWalkRecurseBack(static_cast<TristateVertex*>(&vtx), 0);
         }
+        markMaybeZ();
         if (dumpGraphLevel() >= 9) m_graph.dumpDotFilePrefixed("tri_pos__" + nodep->name());
+    }
+    // Which variables a high impedance value can reach. Everything a tristate
+    // drives, and then everything assigned from one of those, to a fixed point.
+    // Nothing here changes what is emitted: it only says of a variable that no
+    // z can arrive at it, so a comparison against z need not ask its enable.
+    void markMaybeZ() {
+        for (const V3GraphVertex& vtx : m_graph.vertices()) {
+            const TristateVertex& tvtx = static_cast<const TristateVertex&>(vtx);
+            if (tvtx.isTristate() && tvtx.varp()) m_maybeZ.insert(tvtx.varp());
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& pair : m_zFlow) {
+                if (m_maybeZ.count(pair.first) && !m_maybeZ.count(pair.second)) {
+                    m_maybeZ.insert(pair.second);
+                    changed = true;
+                }
+            }
+        }
     }
     void associate(AstNode* fromp, AstNode* top) {
         new V3GraphEdge{&m_graph, makeVertex(fromp), makeVertex(top), 1};
@@ -310,6 +337,12 @@ public:
         if (AstNode* const refp = nodep->op4p()) deleteVerticesFromSubtreeRecurse(refp);
     }
     void setTristate(AstNode* nodep) { makeVertex(nodep)->isTristate(true); }
+    // A high impedance value can reach this variable from somewhere this module
+    // cannot see: a port, another module's signal, or a connection to a cell
+    void setMaybeZ(const AstVar* varp) { m_maybeZ.insert(varp); }
+    bool maybeZ(const AstVar* varp) const { return m_maybeZ.count(varp) != 0; }
+    // The second variable is assigned an expression the first takes part in
+    void addZFlow(const AstVar* fromp, const AstVar* top) { m_zFlow.emplace_back(fromp, top); }
     bool isTristate(const AstNode* nodep) {
         const TristateVertex* const vertexp = reinterpret_cast<TristateVertex*>(nodep->user4p());
         return vertexp && vertexp->isTristate();
@@ -476,6 +509,18 @@ class TristateVisitor final : public TristateBaseVisitor {
             m_modp->addStmtsp(newp);
         }
     }
+    // Record that a high impedance value in anything this assignment reads could
+    // show up in what it writes. Deliberately generous: proving a variable can
+    // never be high impedance is what this is for, and a guess in the other
+    // direction only leaves the answer as it was.
+    void noteZFlow(const AstNodeAssign* nodep) {
+        nodep->lhsp()->foreach([&](const AstNodeVarRef* lrefp) {
+            if (!lrefp->varp() || !lrefp->access().isWriteOrRW()) return;
+            nodep->rhsp()->foreach([&](const AstNodeVarRef* rrefp) {
+                if (rrefp->varp()) m_tgraph.addZFlow(rrefp->varp(), lrefp->varp());
+            });
+        });
+    }
     void associateLogic(AstNode* fromp, AstNode* top) {
         if (m_logicp) m_tgraph.associate(fromp, top);
     }
@@ -567,6 +612,22 @@ class TristateVisitor final : public TristateBaseVisitor {
             invarp->user1p(newp);  // find envar given invarp
         }
         return VN_AS(invarp->user1p(), Var);
+    }
+    // Whether a high impedance value can reach here at all. A variable that no
+    // tristate drives, and that nothing outside this module can reach, is driven
+    // throughout, whatever value it holds.
+    bool canBeZ(AstVar* varp) {
+        if (!varp) return true;
+        if (m_tgraph.isTristate(varp) || m_tgraph.maybeZ(varp)) return true;
+        // A port is driven by whoever instantiated this module, and a variable of
+        // another module -- an interface signal, say -- by whoever drives it there.
+        // Either may hand us a high impedance value this module cannot see.
+        if (varp->isIO()) return true;
+        const AstNodeModule* const ownerModp = findParentModule(varp);
+        return ownerModp && ownerModp != m_modp;
+    }
+    bool anyTristateUnder(AstNode* nodep) {
+        return nodep->exists([this](AstNodeVarRef* refp) { return canBeZ(refp->varp()); });
     }
     AstConst* getNonZConstp(AstConst* const constp) {
         FileLine* const fl = constp->fileline();
@@ -1604,6 +1665,7 @@ class TristateVisitor final : public TristateBaseVisitor {
             iterateAndNextNull(nodep->lhsp());
             m_alhs = false;
             associateLogic(nodep->rhsp(), nodep);
+            noteZFlow(nodep);
             // A variable's initial value is what it holds before anything
             // drives it, not a driver of it: a 'z' there leaves the variable
             // an ordinary variable, so a procedural write to it stands.
@@ -1614,6 +1676,8 @@ class TristateVisitor final : public TristateBaseVisitor {
             // inside its own process as a value the writes never reached.
             if (!m_inStaticInit && !proceduralVarAssign(nodep)) {
                 associateLogic(nodep, nodep->lhsp());
+                // Whole value in, whole value out: whatever the right-hand side is,
+                // including a high impedance, is what the left-hand side receives
             }
         } else {
             if (nodep->user2() & U2_NONGRAPH) {
@@ -1745,8 +1809,14 @@ class TristateVisitor final : public TristateBaseVisitor {
                 if (rhsp->user1p()) {
                     enRhsp = VN_AS(rhsp->user1p(), NodeExpr);
                     rhsp->user1p(nullptr);
-                } else {
+                } else if (anyTristateUnder(rhsp)) {
                     enRhsp = getEnExprBasedOnOriginalp(rhsp);
+                } else {
+                    // Nothing here is ever high impedance, so it is driven everywhere.
+                    // Asking for an enable instead would manufacture one that nothing
+                    // assigns, and an enable of zero says "high impedance": every zero
+                    // bit of an ordinary variable would then compare identical to z.
+                    enRhsp = newAllZerosOrOnes(rhsp, true);
                 }
                 AstNodeExpr* newp
                     = new AstLogAnd{fl, new AstEq{fl, VN_AS(constp->user1p(), Const), enRhsp},
@@ -1939,6 +2009,13 @@ class TristateVisitor final : public TristateBaseVisitor {
     //     const output Unsupported; Illegal?
     void visit(AstPin* nodep) override {
         if (m_graphing) {
+            // Whatever a cell pin connects to may be driven from inside that cell,
+            // where this module cannot see whether it is ever high impedance
+            if (nodep->exprp()) {
+                nodep->exprp()->foreach([this](const AstNodeVarRef* refp) {
+                    if (refp->varp()) m_tgraph.setMaybeZ(refp->varp());
+                });
+            }
             if (nodep->user2() & U2_GRAPHING) return;  // This pin is already expanded
             nodep->user2Or(U2_GRAPHING);
             // Find child module's new variables.
