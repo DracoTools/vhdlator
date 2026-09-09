@@ -39,8 +39,9 @@ V3DupFinder::size_type V3DupFinder::erase(AstNode* nodep) {
     return 0;
 }
 
-V3DupFinder::iterator V3DupFinder::findDuplicate(AstNode* nodep, V3DupFinderUserSame* checkp) {
-    const auto& er = equal_range(m_hasher(nodep));
+V3DupFinder::iterator V3DupFinder::findDuplicateAt(V3Hash key, AstNode* nodep,
+                                                   V3DupFinderUserSame* checkp) {
+    const auto& er = equal_range(key);
     for (iterator it = er.first; it != er.second; ++it) {
         AstNode* const node2p = it->second;
         if (nodep == node2p) continue;  // Same node is not a duplicate
@@ -50,6 +51,15 @@ V3DupFinder::iterator V3DupFinder::findDuplicate(AstNode* nodep, V3DupFinderUser
         return it;
     }
     return end();
+}
+
+V3DupFinder::iterator V3DupFinder::findDuplicate(AstNode* nodep, V3DupFinderUserSame* checkp) {
+    return findDuplicateAt(m_hasher(nodep), nodep, checkp);
+}
+
+V3DupFinder::iterator V3DupFinder::findDuplicate(AstNode* nodep, V3DupFinderUserSame* checkp,
+                                                 const V3Hash& extra) {
+    return findDuplicateAt(m_hasher(nodep) + extra.value(), nodep, checkp);
 }
 
 void V3DupFinder::dumpFile(const string& filename, bool tree) {

@@ -75,11 +75,31 @@ public:
     // Insert node into data structure
     iterator insert(AstNode* nodep) { return emplace(m_hasher(nodep), nodep); }
 
+    // Insert node into data structure, under an additional key the caller also requires.
+    // Use when the caller's isSame() demands more than the node's own tree: hashing that
+    // requirement here keeps candidates it would reject out of the bucket, rather than
+    // paying for a comparison per pair. 'extra' must agree with isSame(), that is, two
+    // nodes it accepts must have been given the same 'extra'. A node inserted this way
+    // cannot be found by erase(), which knows only the node's own hash.
+    iterator insert(AstNode* nodep, const V3Hash& extra) {
+        return emplace(m_hasher(nodep) + extra.value(), nodep);
+    }
+
     // Erase node from data structure
     size_type erase(AstNode* nodep) VL_MT_DISABLED;
 
     // Return duplicate, if one was inserted, with optional user check for sameness
     iterator findDuplicate(AstNode* nodep, V3DupFinderUserSame* checkp = nullptr) VL_MT_DISABLED;
+
+    // Return duplicate inserted under the same additional key, with user check for sameness
+    iterator findDuplicate(AstNode* nodep, V3DupFinderUserSame* checkp,
+                           const V3Hash& extra) VL_MT_DISABLED;
+
+private:
+    iterator findDuplicateAt(V3Hash key, AstNode* nodep,
+                             V3DupFinderUserSame* checkp) VL_MT_DISABLED;
+
+public:
 
     // Dump for debug
     void dumpFile(const string& filename, bool tree) VL_MT_DISABLED;

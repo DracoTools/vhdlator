@@ -845,6 +845,32 @@ class GateDedupeHash final : public V3DupFinderUserSame {
 
     V3DupFinder m_dupFinder;  // Duplicate finder for rhs of assigns
 
+    // Hash of each activation block, taken before this pass rewrote anything
+    std::unordered_map<const AstActive*, uint32_t> m_activeHash;
+
+    // Key the duplicate finder on what isSame() below insists on, and not on the right-hand
+    // side alone. A design with many small assignments has many identical right-hand sides
+    // that are not duplicates of one another, and what keeps them apart is the activation
+    // they sit under, which the right-hand side's hash says nothing about. Left out of the
+    // key they all land in one bucket, and each insertion then compares two activation
+    // blocks against every entry already there -- quadratic, over a population where no
+    // pair can ever match.
+    //
+    // The hash used has to be the one taken by snapshotActives() before the pass began.
+    // Deduping rewrites the readers of a signal, so an activation hashed after that has a
+    // different hash from the same activation hashed before it, and one bucket key would
+    // no longer mean one activation.
+    V3Hash extraKey(const AuxAstNodeExpr& aux) const {
+        V3Hash hash{static_cast<uint32_t>(aux.parentp->type())};
+        // Nothing for no activation, which is legal and compares only against another none
+        if (aux.activep) {
+            const auto it = m_activeHash.find(aux.activep);
+            UASSERT_OBJ(it != m_activeHash.end(), aux.activep, "Activation not snapshotted");
+            hash += it->second;
+        }
+        return hash;
+    }
+
     static bool same(AstNode* node1p, AstNode* node2p) {
         // Regarding the complexity of this function 'same':
         // Applying this comparison function to a a set of n trees pairwise is O(n^2) in the
@@ -877,7 +903,14 @@ class GateDedupeHash final : public V3DupFinderUserSame {
     }
 
 public:
-    GateDedupeHash() = default;
+    GateDedupeHash() {
+        // Take every activation's hash while the netlist is still as this pass found it.
+        // Uncached, so that the right-hand sides underneath keep being hashed when they
+        // are reached, exactly as they were before this snapshot existed.
+        v3Global.rootp()->foreach([this](const AstActive* activep) {
+            m_activeHash.emplace(activep, V3Hasher::uncachedHash(activep).value());
+        });
+    }
     ~GateDedupeHash() = default;
 
     const AstNodeAssign* hashAndFindDupe(AstNodeAssign* assignp, AstActive* activep,
@@ -889,11 +922,12 @@ public:
         m_auxCurRhsp.parentp = assignp;
 
         // Check for a duplicate, if found return its assignment
-        const auto it = m_dupFinder.findDuplicate(m_currRhsp, this);
+        const V3Hash extra = extraKey(m_auxCurRhsp);
+        const auto it = m_dupFinder.findDuplicate(m_currRhsp, this, extra);
         if (it != m_dupFinder.end()) return m_auxNodeExpr(VN_AS(it->second, NodeExpr)).parentp;
 
         // Insert new node
-        m_dupFinder.insert(m_currRhsp);
+        m_dupFinder.insert(m_currRhsp, extra);
         m_auxNodeExpr(m_currRhsp) = m_auxCurRhsp;
         return nullptr;
     }
