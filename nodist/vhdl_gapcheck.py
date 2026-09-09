@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+# pylint: disable=C0114,C0116,C0209,R0914
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of either the GNU Lesser General Public License Version 3
+# or the Perl Artistic License Version 2.0.
+# SPDX-FileCopyrightText: 2026-2026 Wilson Snyder
+# SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
+"""Filter the corpus scoreboard's "must fail and did not" list by what the
+reference simulators actually do with each source.
+
+A corpus expectation is not by itself a rule to implement.  VESTS demands an
+analysis error for several things that nvc and GHDL both accept without a
+word -- the operands of a logical operator being arrays of different lengths,
+for one, which both leave to run time.  Enforcing those would refuse designs
+those tools compile.  What is worth working on is the subset both of them
+refuse, and this prints exactly that, grouped by the LRM clause VESTS names
+in each case's own identifier.
+
+Typical use, from the Verilator repository root:
+
+    nodist/vhdl_corpus.py --root ../ --json gaps.json
+    nodist/vhdl_gapcheck.py gaps.json
+"""
+
+import argparse
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+
+
+def std_of(path):
+    """Which revision this source is written against."""
+    return "93" if "/vhdl-93/" in path else "2008"
+
+
+def refuses(command, cwd):
+    try:
+        proc = subprocess.run(command, cwd=cwd, capture_output=True, timeout=60, check=False)
+        return proc.returncode != 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def verdicts(args_path):
+    """Return (nvc refuses, ghdl refuses) for one source."""
+    args, path = args_path
+    with tempfile.TemporaryDirectory() as work:
+        std = std_of(path)
+        nvc = refuses([args.nvc, "--std=" + ("1993" if std == "93" else "2008"), "-a", path], work)
+        ghdl = refuses([args.ghdl, "-a", "--std=" + ("93" if std == "93" else "08"), path], work)
+        return nvc, ghdl
+
+
+def clause_of(path):
+    """The LRM clause VESTS names in a case's own identifier, and its message."""
+    try:
+        with open(path, encoding="latin-1") as fh:
+            text = fh.read()
+    except OSError:
+        return "(unreadable)", ""
+    match = re.search(r"\bc(\d\d)s(\d\d)b", text)
+    if not match:
+        return "(unnamed)", os.path.basename(path)
+    said = re.search(r"FAILED TEST: \S+ - (.{10,100})", text)
+    return ("clause %d.%d" % (int(match.group(1)), int(match.group(2))),
+            said.group(1).strip() if said else os.path.basename(path))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('json', help='scoreboard JSON written by vhdl_corpus.py --json')
+    parser.add_argument('--corpus', action='append', default=[], help='limit to these corpora')
+    parser.add_argument('--nvc', default='nvc', help='nvc binary (default: nvc)')
+    parser.add_argument('--ghdl', default='ghdl', help='ghdl binary (default: ghdl)')
+    parser.add_argument('--jobs', type=int, default=8, help='parallel jobs (default: 8)')
+    parser.add_argument('--groups', type=int, default=20, help='clauses to list (default: 20)')
+    args = parser.parse_args()
+
+    with open(args.json, encoding='utf-8') as fh:
+        report = json.load(fh)['corpora']
+    todo = []
+    for name, entry in report.items():
+        if args.corpus and name not in args.corpus:
+            continue
+        for failure in entry.get('failures', []):
+            if failure.get('expected') in ('reject', 'diagnose'):
+                todo.append(os.path.join(entry['root'], failure['file']))
+    if not todo:
+        print('Nothing to check: no source in this report was expected to fail and did not')
+        return 0
+    print('Checking %d sources against %s and %s' % (len(todo), args.nvc, args.ghdl))
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        outcomes = list(pool.map(verdicts, [(args, path) for path in todo]))
+
+    groups = collections.Counter()
+    agreed = []
+    for path, (nvc, ghdl) in zip(todo, outcomes):
+        groups['nvc %s, ghdl %s' % ('refuses' if nvc else 'accepts',
+                                    'refuses' if ghdl else 'accepts')] += 1
+        if nvc and ghdl:
+            agreed.append(path)
+    print()
+    for text, count in groups.most_common():
+        print('  %5d  %s' % (count, text))
+    print('\nBoth references refuse these, so they are rules worth having: %d\n' % len(agreed))
+
+    clauses = collections.Counter()
+    example = {}
+    for path in agreed:
+        clause, said = clause_of(path)
+        clauses[clause] += 1
+        example.setdefault(clause, said)
+    for clause, count in clauses.most_common(args.groups):
+        print('  %4d  %-12s %s' % (count, clause, example.get(clause, '')[:84]))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

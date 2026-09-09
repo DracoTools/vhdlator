@@ -545,6 +545,7 @@ PY_PROGRAMS = \
   nodist/verilator_bisect \
   nodist/verilator_saif_diff \
   nodist/vhdl_corpus.py \
+  nodist/vhdl_gapcheck.py \
   src/.gdbinit.py \
   src/astgen \
   src/bisonpre \
