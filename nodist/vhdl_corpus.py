@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pylint: disable=C0114,C0116,C0209,R0902,R0903,R0912,R0914
+# pylint: disable=C0114,C0116,C0209,R0902,R0903,R0912,R0913,R0914
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms of either the GNU Lesser General Public License Version 3
@@ -48,17 +48,57 @@ CORPORA = {
 
 VHDL_SUFFIXES = ('.vhd', '.vhdl')
 
+# A corpus that says what it expects of each file has to be scored against
+# that and not against "did it compile".  VESTS declares the expectation in
+# its own directory layout: a compliant case must be accepted, and a
+# non-compliant one must be *rejected*, so counting an accepted file as a
+# success is exactly backwards for the 1,500-odd cases whose whole point is
+# to be refused.  Where a corpus does not declare an expectation, acceptance
+# is the only thing to measure, and that is what is reported.
+EXPECT_RULES = (
+    (re.compile(r'/vests/.*/disputed/'), 'skip'),
+    (re.compile(r'/vests/vhdl-ams/'), 'skip'),  # VHDL-AMS is a different language
+    (re.compile(r'/vests/.*/non_compliant/'), 'reject'),
+    (re.compile(r'/vests/.*/compliant/'), 'accept'),
+    (re.compile(r'/vests/.*/iofiles/'), 'skip'),
+)
+
+# Sources a corpus writes against an older revision than the default
+PER_PATH_FLAGS = ((re.compile(r'/vests/vhdl-93/'), ['--vhdl-std', '93']), )
+
+
+def expected_outcome(path):
+    """Return 'accept', 'reject' or 'skip' for one source."""
+    for pattern, outcome in EXPECT_RULES:
+        if pattern.search(path):
+            return outcome
+    return 'accept'
+
+
+def extra_flags(path):
+    """Return flags this source needs beyond the common ones."""
+    for pattern, flags in PER_PATH_FLAGS:
+        if pattern.search(path):
+            return flags
+    return []
+
 
 class Result:
     """Outcome of running Verilator over one source file."""
 
-    __slots__ = ('path', 'ok', 'seconds', 'message')
+    __slots__ = ('path', 'ok', 'seconds', 'message', 'expected')
 
-    def __init__(self, path, ok, seconds, message):
+    def __init__(self, path, ok, seconds, message, expected='accept'):
         self.path = path
         self.ok = ok
         self.seconds = seconds
         self.message = message
+        self.expected = expected
+
+    @property
+    def as_expected(self):
+        """Whether the run came out the way the corpus says it should."""
+        return self.ok if self.expected == 'accept' else not self.ok
 
 
 def find_sources(root, subdirs):
@@ -79,7 +119,8 @@ def find_sources(root, subdirs):
 def run_one(args):
     """Run Verilator over one source. Returns a Result."""
     verilator, flags, timeout, path = args
-    command = [verilator] + flags + [path]
+    expected = expected_outcome(path)
+    command = [verilator] + flags + extra_flags(path) + [path]
     start = time.time()
     try:
         proc = subprocess.run(command,
@@ -90,9 +131,9 @@ def run_one(args):
         output = proc.stdout.decode('utf-8', errors='replace')
         ok = proc.returncode == 0
     except subprocess.TimeoutExpired:
-        return Result(path, False, time.time() - start, 'TIMEOUT')
+        return Result(path, False, time.time() - start, 'TIMEOUT', expected)
     except OSError as exc:
-        return Result(path, False, time.time() - start, 'EXEC: %s' % exc)
+        return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected)
 
     message = ''
     if not ok:
@@ -103,14 +144,18 @@ def run_one(args):
                 break
         else:
             message = (output.strip().splitlines() or ['(no output)'])[-1]
-    return Result(path, ok, time.time() - start, message)
+    return Result(path, ok, time.time() - start, message, expected)
 
 
 def summarize_failures(results, limit):
     """Group failure messages so the common blockers surface first."""
     counts = {}
     for result in results:
-        if result.ok:
+        if result.as_expected:
+            continue
+        if result.expected == 'reject':
+            counts['(accepted, but the corpus says this must be refused)'] = (
+                counts.get('(accepted, but the corpus says this must be refused)', 0) + 1)
             continue
         # Strip file/line so distinct files with the same cause group together
         key = re.sub(r'^%Error[^:]*: [^ ]+?:\d+:\d+: ', '%Error: ', result.message)
@@ -124,7 +169,7 @@ def score_corpus(name, root, globs, args):
     if not os.path.isdir(root):
         print('%-16s  -- not found at %s' % (name, root))
         return None
-    sources = find_sources(root, globs)
+    sources = [p for p in find_sources(root, globs) if expected_outcome(p) != 'skip']
     if args.limit:
         sources = sources[:args.limit]
     if not sources:
@@ -140,16 +185,22 @@ def score_corpus(name, root, globs, args):
         results = [run_one(item) for item in work]
     elapsed = time.time() - started
 
-    passed = sum(1 for r in results if r.ok)
+    passed = sum(1 for r in results if r.as_expected)
     total = len(results)
+    must_reject = sum(1 for r in results if r.expected == 'reject')
+    wrongly_accepted = sum(1 for r in results if r.expected == 'reject' and r.ok)
     percent = (100.0 * passed / total) if total else 0.0
-    print('%-16s  %5d/%-5d  %5.1f%%   (%.1fs)' % (name, passed, total, percent, elapsed))
+    note = ''
+    if must_reject:
+        note = '   [%d must be refused, %d were not]' % (must_reject, wrongly_accepted)
+    print('%-16s  %5d/%-5d  %5.1f%%   (%.1fs)%s' %
+          (name, passed, total, percent, elapsed, note))
 
     for message, count in summarize_failures(results, args.failures):
         print('%-16s      %4dx  %s' % ('', count, message[:120]))
     if args.verbose:
         for result in results:
-            if not result.ok:
+            if not result.as_expected:
                 print('%-16s      FAIL %s' % ('', os.path.relpath(result.path, root)))
 
     return {
@@ -159,14 +210,19 @@ def score_corpus(name, root, globs, args):
         passed,
         'total':
         total,
+        'must_reject':
+        must_reject,
+        'wrongly_accepted':
+        wrongly_accepted,
         'percent':
         round(percent, 2),
         'seconds':
         round(elapsed, 2),
         'failures': [{
             'file': os.path.relpath(r.path, root),
-            'message': r.message
-        } for r in results if not r.ok],
+            'expected': r.expected,
+            'message': r.message or '(accepted, but must be refused)'
+        } for r in results if not r.as_expected],
     }
 
 
