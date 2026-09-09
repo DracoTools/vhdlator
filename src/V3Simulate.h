@@ -844,6 +844,63 @@ private:
             clearOptimizable(selp->fromp(), "Select LHS isn't simple variable");
         }
     }
+    // Find a struct's member by the name a select names it with
+    static AstMemberDType* memberOf(const AstNodeUOrStructDType* structp, const string& name) {
+        for (AstMemberDType* itemp = structp->membersp(); itemp;
+             itemp = VN_AS(itemp->nextp(), MemberDType)) {
+            if (itemp->name() == name) return itemp;
+        }
+        return nullptr;
+    }
+    static AstConsPackMember* consMemberOf(const AstConsPackUOrStruct* consp, const string& name) {
+        for (AstConsPackMember* mp = consp->membersp(); mp;
+             mp = VN_AS(mp->nextp(), ConsPackMember)) {
+            if (mp->dtypep() && mp->dtypep()->name() == name) return mp;
+        }
+        return nullptr;
+    }
+    // A member of an unpacked structure has no bit position to write through, so
+    // the value of such a variable is kept as the constructor for it, a member at a
+    // time, the way an unpacked array's is kept as its initializer.
+    void handleAssignStruct(AstNodeAssign* nodep, AstStructSel* selp, AstNodeExpr* valueFromp) {
+        checkNodeInfo(selp);
+        AstVarRef* const varrefp = VN_CAST(selp->fromp(), VarRef);
+        if (!varrefp) {
+            clearOptimizable(selp->fromp(), "Struct member assign LHS isn't simple variable");
+            return;
+        }
+        AstNodeUOrStructDType* const structp
+            = VN_CAST(varrefp->varp()->dtypeSkipRefp(), NodeUOrStructDType);
+        if (!structp || structp->packed()) {
+            // A packed one is a bit vector, and arrives as a Sel instead
+            clearOptimizable(nodep, "Struct member select of non-unpacked-struct");
+            return;
+        }
+        AstMemberDType* const memberp = memberOf(structp, selp->name());
+        if (!memberp) {
+            clearOptimizable(selp, "Struct has no member " + selp->name());  // LCOV_EXCL_LINE
+            return;  // LCOV_EXCL_LINE
+        }
+        if (m_checkOnly || !optimizable()) return;
+        AstNode* const vscp = varOrScope(varrefp);
+        AstConsPackUOrStruct* consp = nullptr;
+        if (AstConsPackUOrStruct* const p
+            = VN_CAST(fetchOutValueNull(vscp), ConsPackUOrStruct)) {
+            consp = p;
+        } else if (AstConsPackUOrStruct* const p
+                   = VN_CAST(fetchValueNull(vscp), ConsPackUOrStruct)) {
+            consp = p;
+        } else {  // Nothing assigned yet, so nothing is known of any other member
+            consp = new AstConsPackUOrStruct{nodep->fileline(), structp};
+            m_reclaimValuesp.push_back(consp);
+        }
+        AstNodeExpr* const valuep = newTrackedClone(fetchValue(valueFromp));
+        if (AstConsPackMember* const oldp = consMemberOf(consp, selp->name())) {
+            VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+        }
+        consp->addMembersp(new AstConsPackMember{nodep->fileline(), memberp, valuep});
+        assignOutValue(nodep, vscp, consp);
+    }
     void handleAssignRecurse(AstNodeAssign* nodep, AstNodeExpr* lhsp, AstNodeExpr* valueFromp) {
         if (!optimizable()) return;
         if (AstArraySel* const selp = VN_CAST(lhsp, ArraySel)) {
@@ -897,6 +954,12 @@ private:
                 return;
             }
             handleAssignSel(nodep, selp, valueFromp);
+        } else if (AstStructSel* const selp = VN_CAST(lhsp, StructSel)) {
+            if (!m_params) {
+                clearOptimizable(lhsp, "Assign LHS has select");
+                return;
+            }
+            handleAssignStruct(nodep, selp, valueFromp);
         } else if (VN_IS(lhsp, VarRef)) {
             if (m_checkOnly) {
                 iterateAndNextConstNull(lhsp);
@@ -954,6 +1017,50 @@ private:
         } else {
             clearOptimizable(nodep, "Array select of non-array");
         }
+    }
+
+    void visit(AstStructSel* nodep) override {
+        checkNodeInfo(nodep);
+        iterateChildrenConst(nodep);
+        if (m_checkOnly || !optimizable()) return;
+        const AstConsPackUOrStruct* const consp
+            = VN_CAST(fetchValueNull(nodep->fromp()), ConsPackUOrStruct);
+        if (!consp) {
+            clearOptimizable(nodep, "Struct member select of non-structure value");
+            return;
+        }
+        AstConsPackMember* const memberp = consMemberOf(consp, nodep->name());
+        if (!memberp) {
+            clearOptimizable(nodep, "Struct member never assigned: " + nodep->name());
+        } else if (AstConst* const constp = VN_CAST(memberp->rhsp(), Const)) {
+            setValue(nodep, constp);
+        } else {
+            setValue(nodep, fetchValue(memberp->rhsp()));
+        }
+    }
+    void visit(AstConsPackUOrStruct* nodep) override {
+        checkNodeInfo(nodep);
+        AstNodeUOrStructDType* const structp
+            = VN_CAST(nodep->dtypep()->skipRefp(), NodeUOrStructDType);
+        if (!structp) {
+            clearOptimizable(nodep, "Structure constructor of non-structure");  // LCOV_EXCL_LINE
+            return;  // LCOV_EXCL_LINE
+        }
+        for (AstConsPackMember* mp = nodep->membersp(); mp;
+             mp = VN_AS(mp->nextp(), ConsPackMember)) {
+            checkNodeInfo(mp);
+            iterateAndNextConstNull(mp->rhsp());
+        }
+        if (m_checkOnly || !optimizable()) return;
+        AstConsPackUOrStruct* const newp = new AstConsPackUOrStruct{nodep->fileline(), structp};
+        m_reclaimValuesp.push_back(newp);
+        for (AstConsPackMember* mp = nodep->membersp(); mp;
+             mp = VN_AS(mp->nextp(), ConsPackMember)) {
+            newp->addMembersp(new AstConsPackMember{mp->fileline(),
+                                                    VN_AS(mp->dtypep(), MemberDType),
+                                                    newTrackedClone(fetchValue(mp->rhsp()))});
+        }
+        setValue(nodep, newp);
     }
 
     // Evaluate a slice of an unpacked array.  If the base value is a constant
