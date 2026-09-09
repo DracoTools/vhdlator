@@ -1683,8 +1683,6 @@ class TristateVisitor final : public TristateBaseVisitor {
             // inside its own process as a value the writes never reached.
             if (!m_inStaticInit && !proceduralVarAssign(nodep)) {
                 associateLogic(nodep, nodep->lhsp());
-                // Whole value in, whole value out: whatever the right-hand side is,
-                // including a high impedance, is what the left-hand side receives
             }
         } else {
             if (nodep->user2() & U2_NONGRAPH) {
