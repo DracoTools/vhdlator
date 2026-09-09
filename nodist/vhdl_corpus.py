@@ -75,11 +75,54 @@ EXPECT_RULES = (
 PER_PATH_FLAGS = ((re.compile(r'/vests/vhdl-93/'), ['--vhdl-std', '93']), )
 
 
+# NVC's phase corpora are half deliberately-illegal source, and NVC declares
+# which half in its own C test harness rather than in the directory layout: a
+# test that lists expected diagnostics is a source that must be refused.  Read
+# that, so those corpora are scored the way their author scores them.
+NVC_PHASE_RE = re.compile(r'(.*/nvc)/test/(parse|sem|bounds|simp)/[^/]+$')
+_NVC_EXPECT = {}
+
+
+def nvc_expectations(nvc_root, phase):
+    """Map absolute source path -> 'accept' or 'reject' for one NVC phase."""
+    key = (nvc_root, phase)
+    if key in _NVC_EXPECT:
+        return _NVC_EXPECT[key]
+    table = {}
+    harness = os.path.join(nvc_root, 'test', 'test_%s.c' % phase)
+    try:
+        with open(harness, encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+    except OSError:
+        _NVC_EXPECT[key] = table
+        return table
+    for chunk in text.split('START_TEST(')[1:]:
+        body = chunk.split('END_TEST')[0]
+        # An entry of the form '{ 20, "..." }' is a diagnostic the source must
+        # produce; the list always ends '{ -1, NULL }', which is not one
+        expects = re.search(r'error_t\s+\w*expect\w*\s*\[\]\s*=\s*\{(.*?)\n\s*\};', body,
+                            re.S)
+        wants_error = bool(expects and re.search(r'\{\s*\d+\s*,', expects.group(1)))
+        for name in re.findall(r'input_from_file\(TESTDIR\s*"([^"]+)"', body):
+            full = os.path.normpath(os.path.join(nvc_root, 'test', name.lstrip('/')))
+            if wants_error or table.get(full) == 'reject':
+                table[full] = 'reject'
+            else:
+                table.setdefault(full, 'accept')
+    _NVC_EXPECT[key] = table
+    return table
+
+
 def expected_outcome(path):
     """Return 'accept', 'reject' or 'skip' for one source."""
     for pattern, outcome in EXPECT_RULES:
         if pattern.search(path):
             return outcome
+    match = NVC_PHASE_RE.match(path)
+    if match:
+        table = nvc_expectations(match.group(1), match.group(2))
+        # A source no test names is not part of the suite's own scoring
+        return table.get(os.path.normpath(path), 'skip')
     return 'accept'
 
 
