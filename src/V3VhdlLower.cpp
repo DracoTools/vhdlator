@@ -10884,9 +10884,22 @@ private:
         // pattern, which is the only form that can carry element values.
         const bool packed = typep->base()->elementp()
                             && elementPacks(typep->base()->elementp());
+        // In an assignment pattern, what "others" gives after the last
+        // element named otherwise is one default member rather than one
+        // member per element: a memory of thousands of words initialized
+        // "(0 => a, 1 => b, others => 0)" is three values, not thousands
+        int64_t emitted = count;
+        if (!packed && !asString && othersp) {
+            emitted = 0;
+            for (int64_t i = 0; i < count; ++i) {
+                if (byIndex[static_cast<size_t>(i)] || !spanAt[static_cast<size_t>(i)]) {
+                    emitted = i + 1;
+                }
+            }
+        }
         AstNodeExpr* outp = nullptr;
         AstNode* itemsp = nullptr;
-        for (int64_t i = 0; i < count; ++i) {
+        for (int64_t i = 0; i < emitted; ++i) {
             if (spanAt[static_cast<size_t>(i)] == 0) continue;  // Covered by a run
             AstNodeVhdlExpr* const valuep
                 = byIndex[static_cast<size_t>(i)] ? byIndex[static_cast<size_t>(i)] : othersp;
@@ -10911,6 +10924,16 @@ private:
             }
         }
         if (packed || asString) return outp;
+        if (emitted < count) {
+            AstNodeExpr* const valuep = lowerExpr(othersp);
+            if (!valuep) {
+                if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
+                return nullptr;
+            }
+            AstPatMember* const defaultp = new AstPatMember{flp, valuep, nullptr, nullptr};
+            defaultp->isDefault(true);
+            itemsp = AstNode::addNextNull(itemsp, defaultp);
+        }
         return itemsp ? new AstPattern{flp, itemsp} : nullptr;
     }
 
