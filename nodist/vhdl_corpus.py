@@ -29,6 +29,7 @@ import json
 import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -249,6 +250,25 @@ def find_sources(root, subdirs):
     return sorted(found)
 
 
+def run_group(command, timeout):
+    """Run a command in a process group of its own, and on timeout kill the
+    whole group.  bin/verilator is a wrapper that runs verilator_bin as a
+    child, so killing only the process started would leave the compiler
+    running -- for hours, and holding its memory, on a source that hangs it."""
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+        raise
+    return stdout, proc.returncode
+
+
 def run_one(args):
     """Run Verilator over one source. Returns a Result."""
     verilator, flags, timeout, path = args
@@ -257,13 +277,9 @@ def run_one(args):
                + (ghdl_companions(path) if '/ghdl/testsuite/' in path else []) + [path])
     start = time.time()
     try:
-        proc = subprocess.run(command,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT,
-                              timeout=timeout,
-                              check=False)
-        output = proc.stdout.decode('utf-8', errors='replace')
-        ok = proc.returncode == 0
+        stdout, returncode = run_group(command, timeout)
+        output = stdout.decode('utf-8', errors='replace')
+        ok = returncode == 0
         diagnosed = any(
             line.startswith('%Error') or line.startswith('%Warning')
             for line in output.splitlines())

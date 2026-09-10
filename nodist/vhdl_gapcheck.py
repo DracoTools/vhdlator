@@ -33,6 +33,7 @@ import collections
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -45,10 +46,24 @@ def std_of(path):
 
 
 def refuses(command, cwd):
+    # In a process group of its own, so a timeout takes any child with it
     try:
-        proc = subprocess.run(command, cwd=cwd, capture_output=True, timeout=60, check=False)
-        return proc.returncode != 0
-    except (subprocess.TimeoutExpired, OSError):
+        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            command,
+            cwd=cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError:
+        return False
+    try:
+        return proc.wait(timeout=60) != 0
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
         return False
 
 
