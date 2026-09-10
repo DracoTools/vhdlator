@@ -273,7 +273,14 @@ void V3Vhdl::parseFile(FileLine* fl, const string& filename, const string& libna
     for (const std::string& line : lines) text += line;
 
     FileLine* const flp = new FileLine{foundname};
-    flp->language(v3Global.opt.fileLanguage(foundname));
+    // The IEEE and STD libraries Verilator ships are the 2008 editions and
+    // are written against that revision, whatever revision the design that
+    // uses them is written against: a VHDL-93 design still gets the
+    // numeric_std it asked for, and the library's own text is not judged by
+    // rules its edition predates.
+    flp->language(libname == "ieee" || libname == "std"
+                      ? V3LangCode{V3LangCode::L1076_2008}
+                      : v3Global.opt.fileLanguage(foundname));
     flp->lineno(1);
     // An ascending range is how VHDL usually writes an index, so warning
     // about one would fire on nearly every design. Every fileline the scanner

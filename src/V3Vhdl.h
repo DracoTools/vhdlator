@@ -43,6 +43,8 @@ class VInFilter;
 class V3Vhdl final {
 public:
     // Lex and parse one VHDL file into the design unit database
+    // The libraries Verilator ships are the IEEE 2008 editions, whatever
+    // revision the design that uses them is written against
     static void parseFile(FileLine* fl, const string& filename, const string& libname,
                           VInFilter* filterp, const string& errmsg) VL_MT_DISABLED;
 
