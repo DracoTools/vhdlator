@@ -551,6 +551,37 @@ public:
         emitOpName(nodep, nodep->emitC(), nodep->fromp(), elemDTypep, nullptr);
     }
 
+    // An array initializer whose default fills more of the array than it
+    // names is emitted as a loop and then the named elements. Written out
+    // whole, a memory of millions of words is millions of initializers for
+    // the C++ compiler to read. Returns false where it did not apply.
+    bool emitFilledInitArray(AstNodeAssign* nodep, const AstUnpackArrayDType* unpackDtp) {
+        const AstInitArray* const initp = VN_CAST(nodep->rhsp(), InitArray);
+        if (!initp || !VN_IS(nodep->lhsp(), VarRef)) return false;
+        AstConst* const defaultp = VN_CAST(initp->defaultp(), Const);
+        if (!defaultp || VN_IS(unpackDtp->subDTypep()->skipRefp(), UnpackArrayDType)) return false;
+        if (initp->map().size() * 2 >= static_cast<size_t>(unpackDtp->elementsConst())) {
+            return false;
+        }
+        for (const auto& itr : initp->map()) {
+            if (!VN_IS(itr.second->valuep(), Const)) return false;
+        }
+        putns(nodep, "{\n");
+        puts("auto& __Vfill = ");
+        iterateAndNextConstNull(nodep->lhsp());
+        puts(";\n");
+        puts("for (int __Vi = 0; __Vi < " + cvtToStr(unpackDtp->elementsConst())
+             + "; ++__Vi) {\n");
+        emitSetVarConstant("__Vfill[__Vi]", defaultp);
+        puts("}\n");
+        for (const auto& itr : initp->map()) {
+            emitSetVarConstant("__Vfill[" + cvtToStr(itr.first) + "]",
+                               VN_AS(itr.second->valuep(), Const));
+        }
+        puts("}\n");
+        return true;
+    }
+
     void visit(AstNodeAssign* nodep) override {
         if (AstCReset* const resetp = VN_CAST(nodep->rhsp(), CReset)) {
             // TODO get rid of emitVarReset and instead let AstNodeAssign understand how to init
@@ -590,6 +621,7 @@ public:
         bool reverseUnpack = false;  // Set for descending CvtPackedToArray
         const AstUnpackArrayDType* const unpackDtp
             = VN_CAST(nodep->dtypep()->skipRefp(), UnpackArrayDType);
+        if (unpackDtp && emitFilledInitArray(nodep, unpackDtp)) return;
         if (AstSel* const selp = VN_CAST(nodep->lhsp(), Sel)) {
             UASSERT_OBJ(selp->widthMin() == selp->widthConst(), selp, "Width mismatch");
             if (selp->widthMin() == 1) {

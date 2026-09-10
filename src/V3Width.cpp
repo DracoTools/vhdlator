@@ -5888,12 +5888,34 @@ class WidthVisitor final : public VNVisitor {
         AstNode* newp = nullptr;
         bool allConstant = true;
         const bool isConcat = nodep->itemsp() && VN_AS(nodep->itemsp(), PatMember)->isConcat();
+        // A constant default is the same value for every element it fills,
+        // and an InitArray can hold it once as its default rather than once
+        // per element: '{default: 0} of a memory of millions of words is one
+        // value, not millions of nodes
+        if (defaultp && VN_IS(arrayDtp, UnpackArrayDType)) {
+            AstPatMember* newpatp = defaultPatp_patternArray(defaultp, arrayDtp->subDTypep());
+            if (!VN_IS(newpatp->lhssp(), Pattern)) {
+                newpatp->dtypep(arrayDtp->subDTypep());
+                // Fold it first: '{default: -1} is a negation until it is
+                userIterate(newpatp, WidthVP{newpatp->dtypep(), BOTH}.p());
+                V3Const::constifyParamsNoWarnEdit(newpatp->lhssp());  // lhssp may change
+                AstNodeExpr* const valuep = patternMemberValueIterate(newpatp);
+                if (VN_IS(valuep, Const)) {
+                    newp = new AstInitArray{nodep->fileline(), arrayDtp, valuep};
+                } else {
+                    VL_DO_DANGLING(pushDeletep(valuep), valuep);
+                }
+            }
+            VL_DO_DANGLING(pushDeletep(newpatp), newpatp);
+        }
+        const bool sharedDefault = newp != nullptr;
         for (int entn = 0, ent = range.left(); entn < range.elements();
              ++entn, ent += range.leftToRightInc()) {
             AstPatMember* newpatp = nullptr;
             AstPatMember* patp = nullptr;
             const auto it = patmap.find(ent);
             if (it == patmap.end()) {
+                if (sharedDefault) continue;
                 if (defaultp) {
                     newpatp = defaultPatp_patternArray(defaultp, arrayDtp->subDTypep());
                     patp = newpatp;
