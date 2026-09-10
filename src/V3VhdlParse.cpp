@@ -33,6 +33,8 @@
 #include "V3Global.h"
 
 #include <functional>
+#include <set>
+#include <sstream>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -45,6 +47,15 @@ static std::string lowerOperator(const std::string& text) {
     return out;
 }
 
+// Whether a string names one of the operators of 9.2, which are the only
+// strings an operator symbol may be (4.5.2): not "foo", and not " + "
+static bool isOperatorSymbol(const std::string& lowered) {
+    static const std::set<std::string> ops{
+        "and", "or",  "nand", "nor", "xor", "xnor", "=",   "/=",  "<",   "<=",  ">",   ">=",
+        "?=",  "?/=", "?<",   "?<=", "?>",  "?>=",  "sll", "srl", "sla", "sra", "rol", "ror",
+        "+",   "-",   "&",    "*",   "/",   "mod",  "rem", "**",  "abs", "not", "??"};
+    return ops.count(lowered) != 0;
+}
 
 //######################################################################
 // Construction and token access
@@ -72,9 +83,42 @@ const VhdlToken& V3VhdlParse::peek(size_t ahead) {
 
 VhdlTokType V3VhdlParse::peekType(size_t ahead) { return peek(ahead).type; }
 
+// A lexical element, spelled so that two of them are the same string exactly
+// when 4.10 counts them the same: case does not matter in a basic identifier,
+// and a numeric literal may be written differently if its value is the same
+static std::string conformanceSpelling(const VhdlToken& tok) {
+    switch (tok.type) {
+    case VhdlTokType::IDENTIFIER: return tok.extendedId ? "\\" + tok.text + "\\" : tok.text;
+    case VhdlTokType::INTEGER_LIT: return "#" + std::to_string(tok.intVal);
+    case VhdlTokType::REAL_LIT: {
+        std::ostringstream os;
+        os.precision(17);
+        os << "#" << tok.realVal;
+        return os.str();
+    }
+    case VhdlTokType::STRING_LIT: return "\"" + tok.text + "\"";
+    case VhdlTokType::CHARACTER_LIT: return "'" + tok.text + "'";
+    case VhdlTokType::BITSTRING_LIT: return std::string(1, tok.baseSpec) + "\"" + tok.text + "\"";
+    default: return "%" + std::to_string(static_cast<int>(tok.type));
+    }
+}
+
 VhdlToken V3VhdlParse::consume() {
     const VhdlToken tok = peek();
     if (tok.type != VhdlTokType::END_OF_FILE) m_ahead.pop_front();
+    if (m_specp) {
+        if (tok.type == VhdlTokType::DOT && m_specp->size() > 1) {
+            // A simple name may be written as an expanded name that ends in
+            // it (4.10), so what comes before a dot is not compared: drop
+            // the prefix already recorded
+            const size_t end = m_specp->size() - 1;  // Its trailing space
+            const size_t start = m_specp->rfind(' ', end - 1);
+            m_specp->erase(start == std::string::npos ? 0 : start + 1);
+        } else {
+            *m_specp += conformanceSpelling(tok);
+            *m_specp += ' ';
+        }
+    }
     // A semicolon ends a statement or declaration, which is far enough from
     // the last mistake to trust diagnostics again
     if (tok.type == VhdlTokType::SEMICOLON) m_panic = false;
@@ -815,11 +859,26 @@ AstNodeVhdl* V3VhdlParse::parseTypeDefinition(const std::string& typeName) {
         consume();
         expect(VhdlTokType::LPAREN, "'(' after 'array'");
         AstVhdlIndexConstraint* const indexp = new AstVhdlIndexConstraint{flp};
+        // An array type is either unbounded in every index or constrained in
+        // every index (5.3.2.1): its object is either given all its bounds
+        // or already has them all
+        bool sawBox = false;
+        bool sawRange = false;
+        bool mixed = false;
         do {
             FileLine* const iflp = here();
             // Either "type_mark range <>" (unbounded) or a discrete range
-            if (peekType() == VhdlTokType::IDENTIFIER
-                && (peekType(1) == VhdlTokType::KWD_RANGE) && peekType(2) == VhdlTokType::BOX) {
+            const bool box = peekType() == VhdlTokType::IDENTIFIER
+                             && peekType(1) == VhdlTokType::KWD_RANGE
+                             && peekType(2) == VhdlTokType::BOX;
+            if (!mixed && (box ? sawRange : sawBox)) {
+                iflp->v3error("An array type cannot have both an index left open with"
+                              " 'range <>' and one with bounds; either every index is open"
+                              " or none is");
+                mixed = true;
+            }
+            (box ? sawBox : sawRange) = true;
+            if (box) {
                 AstNodeVhdlExpr* const markp = parseName();
                 consume();  // "range"
                 consume();  // "<>"
@@ -840,6 +899,10 @@ AstNodeVhdl* V3VhdlParse::parseTypeDefinition(const std::string& typeName) {
         // record_type_definition (5.3.3)
         consume();
         AstVhdlRecordType* const nodep = new AstVhdlRecordType{flp};
+        // A record has at least one element
+        if (peekType() == VhdlTokType::KWD_END) {
+            flp->v3error("A record type must declare at least one element");
+        }
         while (peekType() == VhdlTokType::IDENTIFIER) {
             std::vector<std::pair<std::string, FileLine*>> names;
             do {
@@ -971,6 +1034,12 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
     // subprogram_declaration, subprogram_body or subprogram_instantiation
     // (4.2, 4.3, 4.4)
     FileLine* const flp = here();
+    // A subprogram of an interface list is part of the enclosing
+    // specification's spelling, so only the outermost one records its own
+    std::string spec;
+    VL_RESTORER(m_specp);
+    const bool recording = !m_specp;
+    if (recording) m_specp = &spec;
     bool isPure = true;
     bool pureGiven = false;
     if (check(VhdlTokType::KWD_PURE)) {
@@ -987,8 +1056,18 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
     std::string name;
     bool isOperator = false;
     if (peekType() == VhdlTokType::STRING_LIT) {
-        name = lowerOperator(consume().text);
+        const VhdlToken tok = consume();
+        name = lowerOperator(tok.text);
         isOperator = true;
+        // Only a function overloads an operator (4.2.1, 4.5.2)
+        if (!isFunction) {
+            tok.flp->v3error("A procedure is named by an identifier, not by an operator symbol:"
+                             " only a function can overload an operator");
+        } else if (!isOperatorSymbol(name)) {
+            tok.flp->v3error("\"" << tok.text
+                                  << "\" is not an operator of the language, so a function"
+                                     " cannot be named by it");
+        }
     } else {
         name = identifier("a subprogram name");
     }
@@ -1046,6 +1125,10 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
         expect(VhdlTokType::KWD_RETURN, "'return' in a function declaration");
         // VHDL-2019 allows a full subtype indication as the return
         nodep->returnTypep(parseName());
+    }
+    if (recording) {
+        m_specp = nullptr;
+        nodep->specText(spec);
     }
 
     // "is <>" marks a generic subprogram that defaults to the visible one (6.5.5)

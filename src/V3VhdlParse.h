@@ -52,6 +52,10 @@ class V3VhdlParse final {
     int m_printed = 0;  // Of those, how many were reported
     bool m_panic = false;  // Suppressing a cascade from an earlier error
     bool m_atEnd = false;  // Scanner is exhausted
+    // While a subprogram specification is being parsed, what it is spelled
+    // as, one lexical element at a time, to test the conformance of a body
+    // to its declaration by (4.10)
+    std::string* m_specp = nullptr;
 
     static constexpr int MAX_ERRORS = 20;  // Stop reporting after this many
 

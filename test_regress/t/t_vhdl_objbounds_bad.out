@@ -1,0 +1,8 @@
+%Error: t/t_vhdl_objbounds_bad.vhd:25:5: Element 'x' is declared twice in this record type
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_objbounds_bad.vhd:34:10: A signal must be given its bounds where it is declared, but bit_vector leaves them open; only a constant takes them from its value: 's1'
+%Error: t/t_vhdl_objbounds_bad.vhd:35:10: A signal must be given its bounds where it is declared, but std_logic_vector leaves them open; only a constant takes them from its value: 's2'
+%Error: t/t_vhdl_objbounds_bad.vhd:36:10: A signal must be given its bounds where it is declared, but rec leaves them open; only a constant takes them from its value: 's3'
+%Error: t/t_vhdl_objbounds_bad.vhd:37:10: A signal must be given its bounds where it is declared, but string leaves them open; only a constant takes them from its value: 's4'
+%Error: t/t_vhdl_objbounds_bad.vhd:41:14: A variable must be given its bounds where it is declared, but bit_vector leaves them open; only a constant takes them from its value: 'v3'
+%Error: Exiting due to

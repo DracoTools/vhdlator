@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_parammode_bad.vhd:15:16: A parameter of a function can only be of mode in, but 'a' is of mode inout
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_parammode_bad.vhd:19:25: A parameter of a function cannot be a variable: 'a'
+%Error: t/t_vhdl_parammode_bad.vhd:23:17: A parameter of a procedure can only be of mode in, out or inout, but 'c' is of mode linkage
+%Error: t/t_vhdl_parammode_bad.vhd:26:17: A parameter of a procedure can only be of mode in, out or inout, but 'c' is of mode buffer
+%Error: Exiting due to

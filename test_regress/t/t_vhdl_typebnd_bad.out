@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_typebnd_bad.vhd:19:22: The bounds of type 'bad1' must both be integers or both be reals, which is what decides the kind of type it is
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_typebnd_bad.vhd:20:22: A bound of numeric type 'bad2' must be an integer or a real, but this one is of type boolean
+%Error: t/t_vhdl_typebnd_bad.vhd:21:29: A bound of numeric type 'bad3' must be an integer or a real, but this one is of type string
+%Error: t/t_vhdl_typebnd_bad.vhd:22:22: The bounds of physical type 'bad4' must be integers
+%Error: Exiting due to

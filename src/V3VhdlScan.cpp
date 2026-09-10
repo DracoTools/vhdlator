@@ -847,6 +847,10 @@ VhdlToken V3VhdlScan::scanBitStringLiteral(FileLine* flp, const std::string& spe
     advance();  // opening quote
     std::string simplified;
     bool closed = false;
+    // An underline only ever separates two characters of the bit value
+    // (15.8), so it cannot lead, trail, or follow another underline
+    bool afterUnderline = false;
+    bool badUnderline = false;
     while (!atEnd()) {
         const unsigned char c = static_cast<unsigned char>(peek());
         if (isLineEnd(c)) break;
@@ -857,8 +861,16 @@ VhdlToken V3VhdlScan::scanBitStringLiteral(FileLine* flp, const std::string& spe
         }
         if (c == '_') {
             advance();  // underlines do not affect the value (15.8)
+            if (!badUnderline && (simplified.empty() || afterUnderline)) {
+                flp->v3error((simplified.empty()
+                                  ? "A bit string literal cannot begin with an underline"
+                                  : "A bit string literal cannot have two underlines in a row"));
+                badUnderline = true;
+            }
+            afterUnderline = true;
         } else if (isGraphic(c) || c == '\t') {
             simplified += advance();  // See the note on tabs above
+            afterUnderline = false;
         } else {
             flp->v3error("Non-graphic character in bit string literal");
             advance();
@@ -867,6 +879,9 @@ VhdlToken V3VhdlScan::scanBitStringLiteral(FileLine* flp, const std::string& spe
     if (!closed) {
         flp->v3error("Unterminated bit string literal, expected closing '" << quote << "'");
         return tok;
+    }
+    if (afterUnderline && !badUnderline) {
+        flp->v3error("A bit string literal cannot end with an underline");
     }
 
     // Expanded bit value (15.8)
@@ -885,6 +900,15 @@ VhdlToken V3VhdlScan::scanBitStringLiteral(FileLine* flp, const std::string& spe
         for (const char c : simplified) {
             const int value = extendedDigitValue(static_cast<unsigned char>(c));
             const bool isExtDigit = value >= 0 && value < (1 << bitsPer);
+            if (!isExtDigit && m_lang < V3LangCode::L1076_2008) {
+                // Passing other characters through, so B"XXXX" is four 'X'
+                // elements, is VHDL-2008's; before it a bit value held only
+                // the digits of its base (VHDL-93 13.7)
+                flp->v3error("'" << c << "' is not a digit of base " << base
+                                 << "; before VHDL-2008 a bit string literal holds only"
+                                    " digits of its base");
+                return tok;
+            }
             if (!isExtDigit) {
                 // Not an extended digit: replicate it, so B"XXXX" and X"F-"
                 // keep their metavalues (15.8)

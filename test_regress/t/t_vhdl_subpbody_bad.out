@@ -1,0 +1,8 @@
+%Error: t/t_vhdl_subpbody_bad.vhd:38:3: The body of procedure 'split' does not repeat the specification of its declaration exactly; the two may differ only in case, comments, how a number is written and whether a name is expanded
+        t/t_vhdl_subpbody_bad.vhd:18:3: ... Location of the declaration
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_subpbody_bad.vhd:41:3: The body of function 'mode' does not repeat the specification of its declaration exactly; the two may differ only in case, comments, how a number is written and whether a name is expanded
+        t/t_vhdl_subpbody_bad.vhd:19:3: ... Location of the declaration
+%Error: t/t_vhdl_subpbody_bad.vhd:17:3: Procedure 'never' is declared but never given a body in the package body
+%Error: t/t_vhdl_subpbody_bad.vhd:51:3: Procedure 'local_never' is declared but never given a body in this region
+%Error: Exiting due to

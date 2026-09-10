@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_reporttype_bad.vhd:23:25: What is reported must be of type string, but this is of type character
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_reporttype_bad.vhd:24:28: A severity must be of type severity_level, but this is of type integer
+%Error: t/t_vhdl_reporttype_bad.vhd:25:28: A severity must be of type severity_level from STD.STANDARD, but this is of another type of that name
+%Error: Exiting due to

@@ -96,6 +96,9 @@ class VhdlSemVisitor final : public VNVisitor {
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
     bool m_inPackageBody = false;
+    // Package declarations whose body this analysis has seen, and so whose
+    // subprograms are known to have been given bodies or not (4.8)
+    std::set<const AstVhdlPackage*> m_pkgsWithBody;
     int m_ifacePos = 0;  // Position of the interface element being declared
     bool m_errored = false;
     // An entity with a generic type is one entity per type the design hands
@@ -1100,6 +1103,7 @@ class VhdlSemVisitor final : public VNVisitor {
                                 || info.right.isReal();
             VhdlType* const typep = VhdlSymTab::newType(
                 isReal ? VhdlTypeKind::FLOATING : VhdlTypeKind::INTEGER, name, flp);
+            checkDefinitionBounds(nump->rangep(), name, false);
             applyRange(typep, info);
             if (!typep->bounded() && nump->rangep()) {
                 err(flp, "The bounds of type '" + name + "' must be locally static");
@@ -1111,6 +1115,7 @@ class VhdlSemVisitor final : public VNVisitor {
             // The range is in units of the primary unit, so it folds before
             // any unit name exists (5.2.4)
             applyRange(typep, analyzeRange(physp->rangep(), nullptr));
+            checkDefinitionBounds(physp->rangep(), name, true);
             bool first = true;
             for (AstNode* unitp = physp->unitsp(); unitp; unitp = unitp->nextp()) {
                 AstVhdlUnitDecl* const udp = VN_AS(unitp, VhdlUnitDecl);
@@ -1195,16 +1200,23 @@ class VhdlSemVisitor final : public VNVisitor {
             typep->openDimsKnown();
             typep->unconstrained(unconstrained);
             typep->elementp(resolveSubtype(arrp->elementp()));
+            checkElementConstrained(arrp->elementp()->fileline(), typep->elementp());
             return typep;
         }
         if (AstVhdlRecordType* const recp = VN_CAST(defp, VhdlRecordType)) {
             VhdlType* const typep = VhdlSymTab::newType(VhdlTypeKind::RECORD, name, flp);
             int pos = 0;
+            std::set<std::string> names;  // Element names are distinct (5.3.3)
             for (AstNode* elemp = recp->elemsp(); elemp; elemp = elemp->nextp()) {
                 AstVhdlElementDecl* const edp = VN_AS(elemp, VhdlElementDecl);
+                if (!names.insert(edp->name()).second) {
+                    err(edp->fileline(), "Element '" + edp->prettyName()
+                                             + "' is declared twice in this record type");
+                }
                 VhdlSymbol* const symp
                     = VhdlSymTab::newSymbol(VhdlSymKind::RECORD_ELEMENT, edp->name(), edp);
                 symp->typep(resolveSubtype(edp->subtypep()));
+                checkElementConstrained(edp->fileline(), symp->typep());
                 symp->position(pos++);
                 edp->vhdlSymp(symp);
                 typep->addElement(symp);
@@ -1234,6 +1246,42 @@ class VhdlSemVisitor final : public VNVisitor {
 
     // A numeric type definition is floating when either bound is a real
     // literal (5.2.5)
+    // The bounds of an integer or a physical type definition are each of some
+    // integer type, and those of a floating point type definition each of
+    // some floating point type; the two need not be of the same type
+    // (5.2.3.1, 5.2.4.1, 5.2.5.1). What the new type is follows from them, so
+    // "range 1 to 9.0" says two different things at once.
+    void checkDefinitionBounds(const AstVhdlRange* rangep, const std::string& name,
+                               bool physical) {
+        if (!rangep || rangep->attrp() || !rangep->leftp() || !rangep->rightp()) return;
+        int cls[2] = {0, 0};  // 1 integer, 2 floating point
+        int i = 0;
+        for (const AstNodeVhdlExpr* const boundp : {rangep->leftp(), rangep->rightp()}) {
+            const VhdlType* const typep = boundp->vhdlTypep();
+            if (!typep || typep->isError()) return;
+            switch (typep->base()->kind()) {
+            case VhdlTypeKind::INTEGER:
+            case VhdlTypeKind::UNIVERSAL_INTEGER: cls[i] = 1; break;
+            case VhdlTypeKind::FLOATING:
+            case VhdlTypeKind::UNIVERSAL_REAL: cls[i] = 2; break;
+            default:
+                err(boundp->fileline(),
+                    "A bound of " + std::string{physical ? "physical" : "numeric"} + " type '"
+                        + name + "' must be " + (physical ? "an integer" : "an integer or a real")
+                        + ", but this one is of type " + typep->prettyName());
+                return;
+            }
+            ++i;
+        }
+        if (physical && (cls[0] == 2 || cls[1] == 2)) {
+            err(rangep->fileline(), "The bounds of physical type '" + name + "' must be integers");
+        } else if (cls[0] != cls[1]) {
+            err(rangep->fileline(), "The bounds of type '" + name
+                                        + "' must both be integers or both be reals, which is"
+                                          " what decides the kind of type it is");
+        }
+    }
+
     static bool rangeIsReal(const AstVhdlRange* rangep) {
         if (!rangep) return false;
         for (const AstNodeVhdlExpr* const p : {rangep->leftp(), rangep->rightp()}) {
@@ -1259,6 +1307,31 @@ public:
     bool errored() const { return m_errored; }
 
     void analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    void checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    // A function computes a value from what it is given, so its parameters
+    // are all of mode IN and none is a variable it could write; a procedure's
+    // are IN, OUT or INOUT, since BUFFER and LINKAGE describe ports (4.2.2.1)
+    void checkParamMode(const AstVhdlSubprogDecl* subp, const AstVhdlIfaceDecl* ifp) {
+        if (ifp->kind() != VhdlIfaceKind::CONSTANT && ifp->kind() != VhdlIfaceKind::SIGNAL
+            && ifp->kind() != VhdlIfaceKind::VARIABLE) {
+            return;
+        }
+        static const char* const modes[] = {"in", "out", "inout", "buffer", "linkage"};
+        const char* const mode = modes[static_cast<int>(ifp->mode())];
+        if (subp->isFunction()) {
+            if (ifp->mode() != VhdlMode::IN) {
+                err(ifp->fileline(), "A parameter of a function can only be of mode in, but '"
+                                         + ifp->prettyName() + "' is of mode " + mode);
+            } else if (ifp->kind() == VhdlIfaceKind::VARIABLE) {
+                err(ifp->fileline(),
+                    "A parameter of a function cannot be a variable: '" + ifp->prettyName() + "'");
+            }
+        } else if (ifp->mode() == VhdlMode::BUFFER || ifp->mode() == VhdlMode::LINKAGE) {
+            err(ifp->fileline(), "A parameter of a procedure can only be of mode in, out or"
+                                 " inout, but '"
+                                     + ifp->prettyName() + "' is of mode " + mode);
+        }
+    }
 
     // Give a subprogram the parameter subtypes one call site supplies, and
     // analyze it as if it had been written that way (see specialize())
@@ -1295,6 +1368,53 @@ public:
     void specializeWithin(AstNode* nodep) VL_MT_DISABLED;
     // Whether every element of a record has a length of its own (5.3.3)
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
+    // Whether a subtype indication is written with no constraint of its own.
+    // One written with a constraint arrives as a call of the type mark.
+    static bool writtenUnconstrained(const AstVhdlSubtypeInd* sip) {
+        return sip && !sip->constraintp() && sip->typeMarkp() && !VN_IS(sip->typeMarkp(), VhdlCall)
+               && !VN_IS(sip->typeMarkp(), VhdlAttrName);
+    }
+    // Whether a subtype indication leaves some bound open, as the text writes
+    // it: "bit_vector" does, and so does a subtype declared as one or a
+    // record with such an element, but "bit_vector(x'range)" does not, even
+    // where x'range is known only once a subprogram is called (5.3.2.2, 5.3.3)
+    static bool leavesBoundsOpen(const AstVhdlSubtypeInd* sip) {
+        if (!writtenUnconstrained(sip)) return false;
+        const VhdlSymbol* const symp = sip->typeMarkp()->vhdlSymp();
+        if (!symp) return false;
+        if (const AstVhdlSubtypeDecl* const sdp = VN_CAST(symp->declp(), VhdlSubtypeDecl)) {
+            return leavesBoundsOpen(sdp->subtypep());
+        }
+        if (const AstVhdlTypeDecl* const tdp = VN_CAST(symp->declp(), VhdlTypeDecl)) {
+            if (const AstVhdlArrayType* const arrp = VN_CAST(tdp->defp(), VhdlArrayType)) {
+                if (!arrp->indexp()) return false;
+                for (const AstNode* rp = arrp->indexp()->rangesp(); rp; rp = rp->nextp()) {
+                    const AstVhdlSubtypeInd* const isp = VN_CAST(rp, VhdlSubtypeInd);
+                    if (isp && VN_IS(isp->constraintp(), VhdlBox)) return true;
+                }
+                return leavesBoundsOpen(arrp->elementp());
+            }
+            if (const AstVhdlRecordType* const recp = VN_CAST(tdp->defp(), VhdlRecordType)) {
+                for (const AstNode* ep = recp->elemsp(); ep; ep = ep->nextp()) {
+                    const AstVhdlElementDecl* const edp = VN_CAST(ep, VhdlElementDecl);
+                    if (edp && leavesBoundsOpen(edp->subtypep())) return true;
+                }
+            }
+            return false;
+        }
+        // A type STD.STANDARD declares is built in code and has no declaration
+        if (symp->declp()) return false;
+        const VhdlType* const typep = symp->typep();
+        return typep && typep->base()->kind() == VhdlTypeKind::ARRAY && typep->unconstrained();
+    }
+    // Before VHDL-2008 an element of a composite type has all its bounds
+    // (VHDL-93 3.2.1.1, 3.2.2): only 2008 lets them be given per object
+    void checkElementConstrained(FileLine* flp, const VhdlType* elemp) {
+        if (!elemp || elemp->isError() || flp->language() >= V3LangCode::L1076_2008) return;
+        if (elemp->base()->kind() != VhdlTypeKind::ARRAY || elemp->lengthEmittable()) return;
+        err(flp, "Before VHDL-2008 an element of an array or record must be constrained, but "
+                     + elemp->prettyName() + " leaves its bounds open");
+    }
     // Whether a subprogram may be called with no arguments at all (4.2.2.1)
     static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
     // A record subtype whose open elements take their bounds from the values
@@ -1399,6 +1519,7 @@ private:
     void checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
                          const std::string& what) VL_MT_DISABLED;
     void checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
+    static bool altUnreached(const AstVhdlAlternative* altp, bool& settled) VL_MT_DISABLED;
     void checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) VL_MT_DISABLED;
     void checkWaveform(AstNode* wavesp) VL_MT_DISABLED;
     void checkDelay(AstNodeVhdlExpr* nodep, const char* what) VL_MT_DISABLED;
@@ -1455,6 +1576,7 @@ private:
     VhdlType* analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeName(AstVhdlName* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp) VL_MT_DISABLED;
+    void checkLiteralChars(AstVhdlLiteral* nodep, VhdlType* arrayp) VL_MT_DISABLED;
     VhdlType* analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) VL_MT_DISABLED;
@@ -1668,6 +1790,19 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         symp->typep(resolveSubtype(nodep->subtypep()));
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
+        // Only a constant takes its bounds from its value. A signal or a
+        // variable is given them where it is declared, since what it holds
+        // later can be of any length the subtype allows (5.3.2.2, 5.3.3).
+        const VhdlType* const typep = symp->typep();
+        if ((kind == VhdlSymKind::SIGNAL || kind == VhdlSymKind::VARIABLE) && typep
+            && !typep->isError() && leavesBoundsOpen(nodep->subtypep())) {
+            err(nodep->fileline(), std::string{"A "} + symp->kindName()
+                                       + " must be given its bounds"
+                                       + " where it is declared, but " + typep->prettyName()
+                                       + " leaves them open; only a constant takes them from"
+                                         " its value: '"
+                                       + nodep->prettyName() + "'");
+        }
     }
     // "file f : t [open <mode>] is <name>" names the file to open and how
     // (6.4.2.5). The name is a STRING and the mode a FILE_OPEN_KIND.
@@ -1871,6 +2006,7 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
     VhdlScope* const typeScopep = nodep->genericCount() > 0 ? innerp : outerp;
     for (AstNode* paramp = firstParamp; paramp; paramp = paramp->nextp(), ++paramNum) {
         AstVhdlIfaceDecl* const ifp = VN_AS(paramp, VhdlIfaceDecl);
+        if (!m_inSpecialized && !nodep->isInstance()) checkParamMode(nodep, ifp);
         m_scopep = typeScopep;
         VhdlType* const typep = resolveSubtype(ifp->subtypep());
         m_scopep = innerp;
@@ -1955,6 +2091,24 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
         m_scopep = outerp;
     }
     if (reusep) {
+        // A body is written with the specification of the declaration it
+        // completes, element for element (4.2.1, 4.10): "(x, y : integer)"
+        // and "(x : integer; y : integer)" say the same thing and still do
+        // not conform. A copy made by an instantiation or for one call site
+        // was never written by anyone.
+        const AstVhdlSubprogDecl* const declp = VN_CAST(reusep->declp(), VhdlSubprogDecl);
+        if (declp && !m_inSpecialized && !nodep->isInstance() && !nodep->inPkgInstance()
+            && !declp->specText().empty() && !nodep->specText().empty()
+            && declp->specText() != nodep->specText()) {
+            err(nodep->fileline(),
+                "The body of " + std::string{nodep->isFunction() ? "function" : "procedure"} + " '"
+                    + nodep->prettyName()
+                    + "' does not repeat the specification of its declaration exactly; the"
+                      " two may differ only in case, comments, how a number is written and"
+                      " whether a name is expanded\n"
+                    + nodep->warnContextPrimary() + "\n" + declp->warnOther()
+                    + "... Location of the declaration\n" + declp->warnContextSecondary());
+        }
         reusep->hasBody(true);
         reusep->innerp(innerp);
         nodep->vhdlSymp(reusep);
@@ -2750,6 +2904,12 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 }
             }
             m_unitScopes[lib + "." + lower(unitp->name()) + "%body"] = unitScopep;
+            const auto pkgIt = m_primaryUnits.find(lib + "." + lower(unitp->name()));
+            if (pkgIt != m_primaryUnits.end()) {
+                if (const AstVhdlPackage* const pkgp = VN_CAST(pkgIt->second, VhdlPackage)) {
+                    m_pkgsWithBody.insert(pkgp);
+                }
+            }
             VL_RESTORER(m_inPackageBody);
             m_inPackageBody = true;
             iterateAndNextNull(bodyp->declsp());
@@ -4587,6 +4747,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     V3VhdlStd::build();
     VhdlSemVisitor visitor;
     visitor.analyzeUnits(unitsp);
+    visitor.checkBodiesGiven(unitsp);
     // Give every call to an unconstrained subprogram a copy with the lengths
     // it supplies. A copy may itself call one, so repeat until nothing new
     // appears; the bound is defensive, since a chain that never settles is a
@@ -4607,6 +4768,40 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // the pass above
     visitor.specializeResolvers();
     return !visitor.errored();
+}
+
+// Every subprogram declaration is completed by a body in the same
+// declarative region, or for a package declaration in its package body
+// (4.2.1, 4.8). A package whose body this analysis has not seen may be given
+// one later, and a subprogram given the FOREIGN attribute is implemented
+// outside VHDL, so neither is reported. Nor is a generic subprogram: its body
+// is written against generic types that make it no homograph of the
+// declaration, so the two are not paired up by that route.
+void VhdlSemVisitor::checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([&](const AstVhdlSubprogDecl* declp) {
+            if (declp->hasBody() || declp->isInstance() || declp->inPkgInstance()
+                || declp->genericCount() > 0) {
+                return;
+            }
+            const VhdlSymbol* const symp = declp->vhdlSymp();
+            if (!symp || symp->hasBody() || symp->isForeign()) return;
+            for (const AstNode* upp = declp->backp(); upp; upp = upp->backp()) {
+                // A subprogram of an interface list is a generic, and one of
+                // a protected type is completed by the protected type body
+                if (VN_IS(upp, VhdlIfaceDecl) || VN_IS(upp, VhdlProtectedType)) return;
+                if (const AstVhdlPackage* const pkgp = VN_CAST(upp, VhdlPackage)) {
+                    if (!m_pkgsWithBody.count(pkgp)) return;
+                    break;
+                }
+                if (VN_IS(upp, NodeVhdlUnit)) break;
+            }
+            err(declp->fileline(),
+                std::string{declp->isFunction() ? "Function" : "Procedure"} + " '"
+                    + declp->prettyName() + "' is declared but never given a body"
+                    + (VN_IS(unitp, VhdlPackage) ? " in the package body" : " in this region"));
+        });
+    }
 }
 
 void V3VhdlSem::clear() {
@@ -5320,7 +5515,10 @@ VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp)
     case VhdlLitKind::BITSTRING:
         // A string or bit string literal takes its type from the context; if
         // none is given it is a STRING (9.3.2)
-        if (wantp && wantp->base()->kind() == VhdlTypeKind::ARRAY) return wantp;
+        if (wantp && wantp->base()->kind() == VhdlTypeKind::ARRAY) {
+            checkLiteralChars(nodep, wantp);
+            return wantp;
+        }
         return nodep->kind() == VhdlLitKind::STRING ? V3VhdlStd::stringType()
                                                     : V3VhdlStd::bitVectorType();
     case VhdlLitKind::NULLLIT:
@@ -5328,6 +5526,26 @@ VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp)
         return V3VhdlStd::errorType();
     }
     return V3VhdlStd::errorType();  // LCOV_EXCL_LINE
+}
+
+// Each character of a string or bit string literal stands for the character
+// literal of the element type that it spells (9.3.2), so B"0012" is not a
+// BIT_VECTOR: BIT has no '2'. The context alone fixes the literal's type, so
+// this is a check on a type already chosen, never a reason to choose another.
+void VhdlSemVisitor::checkLiteralChars(AstVhdlLiteral* nodep, VhdlType* arrayp) {
+    const VhdlType* const elemp = arrayp->base()->elementp();
+    if (!elemp || elemp->isError() || elemp->base()->kind() != VhdlTypeKind::ENUM) return;
+    const std::vector<VhdlSymbol*>& lits = elemp->base()->literals();
+    if (lits.empty()) return;
+    std::set<std::string> chars;
+    for (const VhdlSymbol* const symp : lits) chars.insert(symp->name());
+    for (const char c : nodep->text()) {
+        if (chars.count(vhdlCharLitName(std::string(1, c)))) continue;
+        err(nodep->fileline(), "Type " + elemp->base()->prettyName() + " has no character '"
+                                   + std::string(1, c) + "', so this literal cannot be of type "
+                                   + arrayp->prettyName());
+        return;
+    }
 }
 
 VhdlType* VhdlSemVisitor::analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) {
@@ -5788,6 +6006,11 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
     {
         bool sawOthers = false;
         for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
+            // A positional element after it is as much after it as a named one
+            if (sawOthers && !VN_AS(elemp, VhdlElemAssoc)->choicesp()) {
+                err(elemp->fileline(), "Nothing can follow an 'others' choice in an aggregate");
+                break;
+            }
             for (AstNode* cp = VN_AS(elemp, VhdlElemAssoc)->choicesp(); cp; cp = cp->nextp()) {
                 if (sawOthers) {
                     err(cp->fileline(), "Nothing can follow an 'others' choice in an aggregate");
@@ -7517,8 +7740,10 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
         checkAggregate(aggp, typep, what);
         return;
     }
-    // Another array value must match dimension for dimension
-    VhdlType* const valuep = nodep->vhdlTypep();
+    // Another array value must match dimension for dimension. A string or
+    // bit string literal is the exception: it was handed the target's
+    // subtype to be analyzed with, and its own length is its characters'
+    VhdlType* const valuep = VN_IS(nodep, VhdlLiteral) ? nullptr : nodep->vhdlTypep();
     if (valuep && valuep->isConstrainedArray()
         && valuep->dimensions() == typep->dimensions()) {
         for (size_t dim = 0; dim < typep->dimensions(); ++dim) {
@@ -7777,9 +8002,12 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     }
     checkWaveform(nodep->wavesp());
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
+    bool settled = false;
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         if (altp->condp()) analyzeCondition(altp->condp());
+        VL_RESTORER(m_unreached);
+        if (altUnreached(altp, settled)) m_unreached = true;
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
             AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
             analyzeChoice(chp, nodep->selectorp() ? nodep->selectorp()->vhdlTypep() : nullptr);
@@ -7796,6 +8024,23 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     }
 }
 
+// Whether a settled condition closes off this alternative of a conditional
+// assignment: its own condition folds to FALSE, or an earlier one's folded to
+// TRUE. As for a branch of an if statement, what such an alternative assigns
+// is checked for length only if it runs (10.5.2.1), and it never does.
+bool VhdlSemVisitor::altUnreached(const AstVhdlAlternative* altp, bool& settled) {
+    const bool unreached = settled;
+    if (!altp->condp()) return unreached;
+    // Only a BOOLEAN reads as its position: a STD_LOGIC condition, taken
+    // through "??", is TRUE when it is '1', which sits at position three
+    const VhdlType* const typep = altp->condp()->vhdlTypep();
+    if (!typep || typep->base() != V3VhdlStd::booleanType()) return unreached;
+    const VhdlValue cond = V3VhdlEval::eval(altp->condp());
+    if (!cond.isInt()) return unreached;
+    if (cond.toInt() != 0) settled = true;
+    return unreached || cond.toInt() == 0;
+}
+
 void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
     VhdlType* wantp = nullptr;
     if (VN_IS(nodep->targetp(), VhdlAggregate)) {
@@ -7808,9 +8053,12 @@ void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
         checkAssignedValue(nodep->valuep(), targetp);
     }
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
+    bool settled = false;
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         if (altp->condp()) analyzeCondition(altp->condp());
+        VL_RESTORER(m_unreached);
+        if (altUnreached(altp, settled)) m_unreached = true;
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
             analyzeChoice(VN_AS(cp, VhdlChoice),
                           nodep->selectorp() ? nodep->selectorp()->vhdlTypep() : nullptr);
@@ -7826,6 +8074,7 @@ void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlIf* nodep) {
+    bool settled = false;
     for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         // A condition is of type BOOLEAN, or is converted to one by "??" (9.2.9)
@@ -7838,10 +8087,7 @@ void VhdlSemVisitor::visit(AstVhdlIf* nodep) {
         // written, and reporting it would refuse code the design cannot
         // execute. It is still analyzed; only the run-time checks are held.
         VL_RESTORER(m_unreached);
-        if (altp->condp()) {
-            const VhdlValue cond = V3VhdlEval::eval(altp->condp());
-            if (cond.isInt() && cond.toInt() == 0) m_unreached = true;
-        }
+        if (altUnreached(altp, settled)) m_unreached = true;
         iterateAndNextNull(altp->stmtsp());
     }
 }
@@ -7944,10 +8190,26 @@ void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
                                + typep->prettyName());
 }
 
+// What an assertion or a report statement reports is a STRING, and its
+// severity a SEVERITY_LEVEL, both the ones STD.STANDARD declares (10.3, 10.4):
+// a CHARACTER is not a one-character string, and a type of the design's own
+// named SEVERITY_LEVEL is not the one the simulator knows how to act on
 void VhdlSemVisitor::visit(AstVhdlAssert* nodep) {
     if (nodep->condp()) analyzeCondition(nodep->condp());
-    if (nodep->reportp()) analyzeExpr(nodep->reportp(), V3VhdlStd::stringType());
-    if (nodep->severityp()) analyzeExpr(nodep->severityp(), V3VhdlStd::severityType());
+    const auto check = [&](AstNodeVhdlExpr* exprp, VhdlType* wantp, const char* what) {
+        if (!exprp) return;
+        VhdlType* const typep = analyzeExpr(exprp, wantp);
+        if (!typep || typep->isError() || typep->base() == wantp->base()) return;
+        // A type of the design's own may share the name, and then saying
+        // both names would say nothing
+        const bool sameName = typep->prettyName() == wantp->prettyName();
+        err(exprp->fileline(), std::string{what} + " must be of type " + wantp->prettyName()
+                                   + (sameName ? " from STD.STANDARD, but this is of another type"
+                                                 " of that name"
+                                               : ", but this is of type " + typep->prettyName()));
+    };
+    check(nodep->reportp(), V3VhdlStd::stringType(), "What is reported");
+    check(nodep->severityp(), V3VhdlStd::severityType(), "A severity");
 }
 
 void VhdlSemVisitor::visit(AstVhdlWait* nodep) {

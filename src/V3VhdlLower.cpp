@@ -15439,6 +15439,38 @@ private:
         return VhdlTri::UNKNOWN;
     }
 
+    // Remove the alternatives of a conditional assignment a settled condition
+    // closes off: one whose own condition is FALSE, and every one after a
+    // condition that is TRUE, which then needs no condition at all
+    static void pruneDeadAlternatives(AstNode* altsp) {
+        std::vector<AstVhdlAlternative*> dead;
+        AstVhdlAlternative* alwaysp = nullptr;
+        size_t live = 0;
+        for (AstNode* p = altsp; p; p = p->nextp()) {
+            AstVhdlAlternative* const altp = VN_AS(p, VhdlAlternative);
+            VhdlTri taken = VhdlTri::UNKNOWN;
+            if (!alwaysp && altp->condp()) {
+                taken = staticTruth(V3VhdlEval::eval(altp->condp()), altp->condp());
+            }
+            if (alwaysp || taken == VhdlTri::FALSE) {
+                dead.push_back(altp);
+                continue;
+            }
+            ++live;
+            if (taken == VhdlTri::TRUE) alwaysp = altp;
+        }
+        // An assignment with nothing left would assign nothing; leave that
+        // as written rather than hand the lowering an empty list
+        if (!live || (dead.empty() && !alwaysp)) return;
+        for (AstVhdlAlternative* altp : dead) {
+            VL_DO_DANGLING(altp->unlinkFrBack()->deleteTree(), altp);
+        }
+        if (alwaysp) {
+            AstNode* condp = alwaysp->condp()->unlinkFrBack();
+            VL_DO_DANGLING(condp->deleteTree(), condp);
+        }
+    }
+
     AstNode* lowerIf(AstVhdlIf* nodep) {
         std::vector<AstVhdlAlternative*> alts;
         // A condition the copy made for one call site settles is a branch the
@@ -19837,6 +19869,29 @@ static bool hasUnboundGeneric(const AstVhdlEntity* entp) {
 }
 
 void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    // An alternative of a conditional assignment that a settled condition
+    // closes off never runs, and what it assigns is checked for length only
+    // when it runs (10.5.2.1). Drop it before anything reads the alternatives,
+    // as lowerIf does for a branch of an if statement, so the back end is
+    // not asked to width-check code nothing can execute.
+    {
+        std::vector<AstNode*> altLists;
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            unitp->foreach([&](AstVhdlSigAssign* nodep) {
+                if (!nodep->selectorp() && nodep->altsp()) altLists.push_back(nodep);
+            });
+            unitp->foreach([&](AstVhdlVarAssign* nodep) {
+                if (!nodep->selectorp() && nodep->altsp()) altLists.push_back(nodep);
+            });
+        }
+        for (AstNode* const nodep : altLists) {
+            if (AstVhdlSigAssign* const sigp = VN_CAST(nodep, VhdlSigAssign)) {
+                pruneDeadAlternatives(sigp->altsp());
+            } else {
+                pruneDeadAlternatives(VN_AS(nodep, VhdlVarAssign)->altsp());
+            }
+        }
+    }
     // A record type that appears on a port keeps the shape elaboration gives
     // it: the instance says how long its elements are, one structure is made
     // per set of lengths, and a pin has no way to convert between shapes. So

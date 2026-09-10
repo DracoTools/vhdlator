@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_bitstr_bad.vhd:15:33: A bit string literal cannot begin with an underline
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_bitstr_bad.vhd:16:33: A bit string literal cannot have two underlines in a row
+%Error: t/t_vhdl_bitstr_bad.vhd:17:33: A bit string literal cannot end with an underline
+%Error: Exiting due to

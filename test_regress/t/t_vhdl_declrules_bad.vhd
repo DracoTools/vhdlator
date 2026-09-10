@@ -39,6 +39,7 @@ begin
   p2 : process
     type six is array (1 to 6) of integer;
     variable v : six := (1 => 10, 3 => 30, others => 20, 2 => 25);
+    variable w : six := (others => 20, 25);
   begin
     wait;
   end process;

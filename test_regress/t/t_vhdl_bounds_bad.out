@@ -15,4 +15,5 @@
 %Error: t/t_vhdl_bounds_bad.vhd:51:14: A timeout may not be negative, but this one is -1000000 fs
 %Error: t/t_vhdl_bounds_bad.vhd:56:16: This waveform element takes effect no later than the one before it, so it would never be seen
 %Error: t/t_vhdl_bounds_bad.vhd:62:13: Dimension 3 of attribute 'length is out of range; vec_t has 1 dimension(s)
+%Error: t/t_vhdl_bounds_bad.vhd:25:3: Function 'widen' is declared but never given a body in this region
 %Error: Exiting due to

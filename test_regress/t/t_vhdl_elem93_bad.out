@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_elem93_bad.vhd:20:34: Before VHDL-2008 an element of an array or record must be constrained, but bit_vector leaves its bounds open
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_elem93_bad.vhd:22:5: Before VHDL-2008 an element of an array or record must be constrained, but bit_vector leaves its bounds open
+%Error: Exiting due to

@@ -788,6 +788,9 @@ class AstVhdlSubprogDecl final : public AstNodeVhdlDecl {
     // calls name the copies, and it has nothing left to emit
     bool m_specialized = false;
     std::string m_templateName;  // What the copy was made from, for recursion
+    // The specification as the parser saw it, one lexical element at a time,
+    // for testing that a body conforms to its declaration (4.10)
+    std::string m_specText;
 
 public:
     AstVhdlSubprogDecl(FileLine* fl, const std::string& name, bool isFunction)
@@ -813,6 +816,8 @@ public:
     void specialized(bool flag) { m_specialized = flag; }
     const std::string& templateName() const { return m_templateName; }
     void templateName(const std::string& name) { m_templateName = name; }
+    const std::string& specText() const { return m_specText; }
+    void specText(const std::string& text) { m_specText = text; }
     bool isOperator() const { return m_isOperator; }
     void isOperator(bool flag) { m_isOperator = flag; }
     void dump(std::ostream& str) const override;

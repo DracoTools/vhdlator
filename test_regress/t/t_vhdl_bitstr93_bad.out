@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_bitstr93_bad.vhd:16:33: '2' is not a digit of base B; before VHDL-2008 a bit string literal holds only digits of its base
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_bitstr93_bad.vhd:17:33: 'G' is not a digit of base X; before VHDL-2008 a bit string literal holds only digits of its base
+%Error: t/t_vhdl_bitstr93_bad.vhd:18:33: '8' is not a digit of base O; before VHDL-2008 a bit string literal holds only digits of its base
+%Error: Exiting due to

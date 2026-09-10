@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_typedef_bad.vhd:16:41: An array type cannot have both an index left open with 'range <>' and one with bounds; either every index is open or none is
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_typedef_bad.vhd:17:31: An array type cannot have both an index left open with 'range <>' and one with bounds; either every index is open or none is
+%Error: t/t_vhdl_typedef_bad.vhd:18:16: A record type must declare at least one element
+%Error: Exiting due to

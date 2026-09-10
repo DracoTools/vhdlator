@@ -3,4 +3,5 @@
 %Error: t/t_vhdl_declrules_bad.vhd:23:12: A signal cannot be declared in a subprogram: 's'
 %Error: t/t_vhdl_declrules_bad.vhd:33:5: A component cannot be declared in a process: 'c1'
 %Error: t/t_vhdl_declrules_bad.vhd:41:58: Nothing can follow an 'others' choice in an aggregate
+%Error: t/t_vhdl_declrules_bad.vhd:42:40: Nothing can follow an 'others' choice in an aggregate
 %Error: Exiting due to

@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_subpspec_bad.vhd:22:13: A procedure is named by an identifier, not by an operator symbol: only a function can overload an operator
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_subpspec_bad.vhd:25:12: " + " is not an operator of the language, so a function cannot be named by it
+%Error: t/t_vhdl_subpspec_bad.vhd:29:12: "eor" is not an operator of the language, so a function cannot be named by it
+%Error: Exiting due to
