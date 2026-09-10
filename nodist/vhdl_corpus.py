@@ -115,6 +115,75 @@ def nvc_expectations(nvc_root, phase):
     return table
 
 
+# GHDL's own testsuite says what it expects of each source in a shell script
+# beside it: "analyze foo.vhdl" must be accepted, "analyze_failure foo.vhdl"
+# must be refused. Read that for the same reason VESTS' layout is read -- a
+# directory of bug reproducers is half deliberately-illegal source, and
+# counting clean compiles scores that half backwards.
+GHDL_VERB_RE = re.compile(r'^\s*(analyze_failure|analyze)\b(.*)$', re.M)
+_GHDL_EXPECT = {}
+
+
+def ghdl_expectations(directory):
+    """Map basename -> 'accept' or 'reject' for one GHDL testsuite directory."""
+    if directory in _GHDL_EXPECT:
+        return _GHDL_EXPECT[directory][0]
+    table = {}
+    order = []
+    try:
+        with open(os.path.join(directory, 'testsuite.sh'), encoding='utf-8',
+                  errors='replace') as fh:
+            text = fh.read()
+    except OSError:
+        _GHDL_EXPECT[directory] = (table, order)
+        return table
+    for verb, rest in GHDL_VERB_RE.findall(text):
+        outcome = 'reject' if verb == 'analyze_failure' else 'accept'
+        for word in rest.split():
+            if word.endswith(VHDL_SUFFIXES):
+                if word not in order:
+                    order.append(word)
+                # A source named both ways must be refused: the failing use
+                # is the one the suite is checking
+                if outcome == 'reject' or table.get(word) != 'reject':
+                    table[word] = outcome
+    # Some of these tests write their own sources before analyzing them --
+    # "cp pkga_v1.vhdl pkga.vhdl", or a sed that patches one. The checkout
+    # alone cannot reproduce the sequence, so the whole directory is left out
+    # rather than measured against files that are not there.
+    for word in order:
+        if not os.path.exists(os.path.join(directory, word)):
+            table = {}
+            order = []
+            break
+    _GHDL_EXPECT[directory] = (table, order)
+    return table
+
+
+def ghdl_companions(path):
+    """The sources GHDL's script analyzes before this one, and expects to hold.
+
+    A test of several files is analyzed into one library in the order the
+    script gives, so running one file alone reports a missing design unit
+    whatever the frontend does with the language. The ones the script expects
+    to *fail* are left out: they are there to be refused, and their errors
+    would be read as this file's.
+    """
+    directory = os.path.dirname(path)
+    table = ghdl_expectations(directory)
+    if not table:
+        return []
+    order = _GHDL_EXPECT[directory][1]
+    name = os.path.basename(path)
+    out = []
+    for other in order:
+        if other == name:
+            break
+        if table.get(other) == 'accept':
+            out.append(os.path.join(directory, other))
+    return out
+
+
 def expected_outcome(path):
     """Return 'accept', 'reject' or 'skip' for one source."""
     for pattern, outcome in EXPECT_RULES:
@@ -125,6 +194,12 @@ def expected_outcome(path):
         table = nvc_expectations(match.group(1), match.group(2))
         # A source no test names is not part of the suite's own scoring
         return table.get(os.path.normpath(path), 'skip')
+    if '/ghdl/testsuite/' in path:
+        directory = os.path.dirname(path)
+        if os.path.exists(os.path.join(directory, 'testsuite.sh')):
+            # A directory whose script cannot be followed is not scored at all
+            table = ghdl_expectations(directory)
+            return table.get(os.path.basename(path), 'skip') if table else 'skip'
     return 'accept'
 
 
@@ -178,7 +253,8 @@ def run_one(args):
     """Run Verilator over one source. Returns a Result."""
     verilator, flags, timeout, path = args
     expected = expected_outcome(path)
-    command = [verilator] + flags + extra_flags(path) + [path]
+    command = ([verilator] + flags + extra_flags(path)
+               + (ghdl_companions(path) if '/ghdl/testsuite/' in path else []) + [path])
     start = time.time()
     try:
         proc = subprocess.run(command,
