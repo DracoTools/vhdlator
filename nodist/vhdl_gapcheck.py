@@ -128,13 +128,13 @@ def main():
         outcomes = list(pool.map(verdicts, [(args, path) for path in todo]))
 
     groups = collections.Counter()
-    byGroup = collections.defaultdict(list)
+    by_group = collections.defaultdict(list)
     agreed = []
     split = []
     for path, answers in zip(todo, outcomes):
         line = ', '.join('%s %s' % (who, 'refuses' if no else 'accepts') for who, no in answers)
         groups[line] += 1
-        byGroup[line].append(path)
+        by_group[line].append(path)
         refused = sum(1 for _, no in answers if no)
         if refused * 2 > len(answers):
             agreed.append(path)
@@ -164,7 +164,7 @@ def main():
         print('  %4d  %-12s %s' % (count, clause, example.get(clause, '')[:84]))
 
     for wanted in args.list:
-        chosen = split if wanted == 'split' else byGroup.get(wanted, [])
+        chosen = split if wanted == 'split' else by_group.get(wanted, [])
         print('\n%s -- %d source%s' % (wanted, len(chosen), '' if len(chosen) == 1 else 's'))
         if not chosen and wanted != 'split':
             print('  (no such verdict line; the lines above are the ones seen)')

@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_sigattr_bad.vhd:26:13: 'stable of a signal parameter cannot be read in a subprogram, since the implicit signal it asks about has nowhere there to live: 'p'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_sigattr_bad.vhd:31:13: 'quiet of a signal parameter cannot be read in a subprogram, since the implicit signal it asks about has nowhere there to live: 'p'
+%Error: t/t_vhdl_sigattr_bad.vhd:36:13: 'delayed of a signal parameter cannot be read in a subprogram, since the implicit signal it asks about has nowhere there to live: 'p'
+%Error: Exiting due to

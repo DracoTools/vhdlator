@@ -5606,18 +5606,45 @@ static bool readsTheSignal(const std::string& attr) {
            || attr == "transaction" || attr == "delayed";
 }
 
+// Of these four an implicit signal is made, one per prefix, to hold what the
+// attribute answers about. There is nowhere in a subprogram for such a signal
+// to live -- a subprogram is not a region that a simulation cycle updates --
+// so reading one of a signal parameter is an error (16.2.2, 4.2.2.3).
+static bool makesImplicitSignal(const std::string& attr) {
+    return attr == "stable" || attr == "quiet" || attr == "delayed"
+           || attr == "transaction";
+}
+
+// Whether this declaration is a parameter of a subprogram rather than a port
+static bool isSubprogramParam(const AstNode* declp) {
+    for (const AstNode* upp = declp; upp; upp = upp->backp()) {
+        if (VN_IS(upp, VhdlSubprogDecl)) return true;
+    }
+    return false;
+}
+
 void VhdlSemVisitor::checkSignalAttrOfOutPort(AstVhdlAttrName* nodep,
                                               const std::string& attrName) {
-    if (nodep->fileline()->language() >= V3LangCode::L1076_2008) return;
     if (!readsTheSignal(attrName)) return;
     const AstNodeVhdlExpr* const prefixp = nodep->prefixp();
     const VhdlSymbol* const symp
         = prefixp && prefixp->vhdlSymp() ? prefixp->vhdlSymp()->resolved() : nullptr;
     // An interface object -- a port, or a subprogram parameter -- carries its
-    // mode on the declaration rather than on the symbol
+    // mode and its class on the declaration rather than on the symbol
     const AstVhdlIfaceDecl* const portp
         = symp ? VN_CAST(symp->declp(), VhdlIfaceDecl) : nullptr;
-    if (!portp || portp->mode() != VhdlMode::OUT) return;
+    if (!portp) return;
+    if (portp->kind() == VhdlIfaceKind::SIGNAL && makesImplicitSignal(attrName)
+        && isSubprogramParam(portp)) {
+        err(nodep->fileline(), "'" + attrName
+                                   + " of a signal parameter cannot be read in a subprogram,"
+                                     " since the implicit signal it asks about has nowhere"
+                                     " there to live: '"
+                                   + symp->name() + "'");
+        return;
+    }
+    if (nodep->fileline()->language() >= V3LangCode::L1076_2008) return;
+    if (portp->mode() != VhdlMode::OUT) return;
     err(nodep->fileline(), "A port of mode out cannot be read before VHDL-2008, and '"
                                + attrName + " reads it: '" + symp->name() + "'");
 }
