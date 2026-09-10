@@ -1,0 +1,12 @@
+%Error: t/t_vhdl_objclass_bad.vhd:41:5: The target of a signal assignment must be a signal, but 'x' is a variable
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_objclass_bad.vhd:45:5: 'x' is of mode in, so nothing can assign it
+%Error: t/t_vhdl_objclass_bad.vhd:60:5: The target of a variable assignment must be a variable, but 'k' is a constant
+%Error: t/t_vhdl_objclass_bad.vhd:61:5: The target of a signal assignment must be a signal, but 'v' is a variable
+%Error: t/t_vhdl_objclass_bad.vhd:62:5: The target of a variable assignment must be a variable, but 's' is a signal
+%Error: t/t_vhdl_objclass_bad.vhd:63:5: 'i' is of mode in, so nothing can assign it
+%Error: t/t_vhdl_objclass_bad.vhd:64:9: What is given for parameter 'x' of 'ok1' must name a signal, but 'v' is a variable
+%Error: t/t_vhdl_objclass_bad.vhd:65:9: What is given for parameter 'x' of 'ok2' must name a variable, but 's' is a signal
+%Error: t/t_vhdl_objclass_bad.vhd:66:9: What is given for parameter 'x' of 'ok2' must name a variable, but 'k' is a constant
+%Error: t/t_vhdl_objclass_bad.vhd:67:14: What is given for parameter 'x' of 'ok3' must name a signal, but this is a value
+%Error: Exiting due to

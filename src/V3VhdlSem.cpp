@@ -1308,6 +1308,29 @@ public:
 
     void analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    // The class of object a name denotes, and whether it is of mode IN.
+    // UNKNOWN where the name reaches its object through an access value or a
+    // call, whose class is not the name's to say.
+    enum class ObjClass : uint8_t { UNKNOWN, CONSTANT, SIGNAL, VARIABLE, FILE };
+    struct ObjInfo final {
+        ObjClass cls = ObjClass::UNKNOWN;
+        bool modeIn = false;
+        const VhdlSymbol* symp = nullptr;
+    };
+    static ObjInfo objectOfName(const AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    static ObjInfo objectOfSymbol(const VhdlSymbol* symp) VL_MT_DISABLED;
+    static const char* objClassName(ObjClass cls) {
+        switch (cls) {
+        case ObjClass::CONSTANT: return "a constant";
+        case ObjClass::SIGNAL: return "a signal";
+        case ObjClass::VARIABLE: return "a variable";
+        case ObjClass::FILE: return "a file";
+        default: return "not an object";
+        }
+    }
+    void checkAssignTarget(const AstNodeVhdlExpr* targetp, bool signal) VL_MT_DISABLED;
+    void checkActualClass(const VhdlSymbol* subp, int formal,
+                          const AstNodeVhdlExpr* actualp) VL_MT_DISABLED;
     // A function computes a value from what it is given, so its parameters
     // are all of mode IN and none is a variable it could write; a procedure's
     // are IN, OUT or INOUT, since BUFFER and LINKAGE describe ports (4.2.2.1)
@@ -1519,6 +1542,7 @@ private:
     void checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
                          const std::string& what) VL_MT_DISABLED;
     void checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
+    bool valueFitsType(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
     static bool altUnreached(const AstVhdlAlternative* altp, bool& settled) VL_MT_DISABLED;
     void checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) VL_MT_DISABLED;
     void checkWaveform(AstNode* wavesp) VL_MT_DISABLED;
@@ -6109,6 +6133,11 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                 if (!asElement && asWhole) hintp = wantp->base();
             }
             analyzeExpr(eap->valuep(), hintp);
+            if (!valueFitsType(eap->valuep(), hintp)) {
+                err(eap->valuep()->fileline(),
+                    "An element of this aggregate must be of type " + hintp->prettyName()
+                        + ", but this one is of type " + eap->valuep()->vhdlTypep()->prettyName());
+            }
             checkValueInRange(eap->valuep(), hintp, "an element of this aggregate");
         }
         // Where the context imposes no constraint -- an aggregate standing as
@@ -6144,25 +6173,74 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
         = wantp->elements().size() == wantp->base()->elements().size()
               ? wantp->elements()
               : wantp->base()->elements();
+    // Which elements each association stands for: its position, the
+    // elements its choices name, or for "others" every one no other
+    // association names (9.3.3.2)
+    std::vector<std::vector<VhdlSymbol*>> covers;
+    std::set<const VhdlSymbol*> given;
+    bool unknownChoice = false;
     for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
         AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
-        VhdlType* fieldp = nullptr;
-        if (eap->choicesp()) {
-            const AstVhdlChoice* const chp = eap->choicesp();
-            const AstVhdlName* const namep = VN_CAST(chp->valuep(), VhdlName);
-            if (namep) {
-                for (VhdlSymbol* const symp : elems) {
-                    if (symp->name() == namep->name()) fieldp = symp->typep();
-                }
-            } else if (chp->isOthers()) {
-                // "others => x" covers whatever is left
-                fieldp = elems.empty() ? nullptr : elems.back()->typep();
-            }
-        } else if (pos < elems.size()) {
-            fieldp = elems[pos]->typep();
+        covers.emplace_back();
+        if (!eap->choicesp()) {
+            if (pos < elems.size()) covers.back().push_back(elems[pos]);
+            ++pos;
         }
-        ++pos;
+        for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+            const AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+            const AstVhdlName* const namep = VN_CAST(chp->valuep(), VhdlName);
+            if (!namep) {
+                if (!chp->isOthers()) unknownChoice = true;
+                continue;
+            }
+            bool found = false;
+            for (VhdlSymbol* const symp : elems) {
+                if (symp->name() != namep->name()) continue;
+                covers.back().push_back(symp);
+                found = true;
+            }
+            if (!found) unknownChoice = true;
+        }
+        for (const VhdlSymbol* const symp : covers.back()) given.insert(symp);
+    }
+    size_t idx = 0;
+    for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp(), ++idx) {
+        AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
+        std::vector<VhdlSymbol*>& mine = covers[idx];
+        bool isOthers = false;
+        for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+            if (VN_AS(cp, VhdlChoice)->isOthers()) isOthers = true;
+        }
+        if (isOthers) {
+            for (VhdlSymbol* const symp : elems) {
+                if (!given.count(symp)) mine.push_back(symp);
+            }
+            if (mine.empty() && !unknownChoice) {
+                err(eap->fileline(), "'others' in a record aggregate must stand for at least one"
+                                     " element, but every element is already given");
+            }
+        }
+        VhdlType* const fieldp = mine.empty() ? nullptr : mine.front()->typep();
+        // One value is given to all of them, so they are all of one type
+        const VhdlSymbol* otherp = nullptr;
+        for (const VhdlSymbol* const symp : mine) {
+            if (fieldp && symp->typep() && symp->typep()->base() != fieldp->base()) otherp = symp;
+        }
+        if (otherp) {
+            err(eap->fileline(), "Elements given one value together must be of one type, but '"
+                                     + mine.front()->name() + "' is of type "
+                                     + fieldp->prettyName() + " and '" + otherp->name()
+                                     + "' of type " + otherp->typep()->prettyName());
+            analyzeExpr(eap->valuep(), nullptr);
+            continue;
+        }
         analyzeExpr(eap->valuep(), fieldp);
+        if (fieldp && !valueFitsType(eap->valuep(), fieldp)) {
+            err(eap->valuep()->fileline(),
+                "Element '" + mine.front()->name() + "' of this aggregate is of type "
+                    + fieldp->prettyName() + ", but the value is of type "
+                    + eap->valuep()->vhdlTypep()->prettyName());
+        }
     }
     return wantp;
 }
@@ -6573,8 +6651,40 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() == VhdlSymKind::TYPE) {
             nodep->prefixp()->vhdlSymp(symp);
+            int operands = 0;
             for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
                 if (AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
+                    // A conversion has one operand, whose type is found from
+                    // it alone: not a value that takes its type from its
+                    // context, which here would be circular (9.3.6)
+                    const AstVhdlLiteral* const litp = VN_CAST(asp->actualp(), VhdlLiteral);
+                    if (litp
+                        && (litp->kind() == VhdlLitKind::STRING
+                            || litp->kind() == VhdlLitKind::BITSTRING
+                            || litp->kind() == VhdlLitKind::NULLLIT)) {
+                        err(asp->actualp()->fileline(),
+                            std::string{"The operand of a type conversion cannot be "}
+                                + (litp->kind() == VhdlLitKind::NULLLIT ? "null"
+                                                                        : "a string literal")
+                                + ", since its type would come only from the conversion;"
+                                  " qualify it instead: "
+                                + symp->name() + "'(...)");
+                    } else if (VN_IS(asp->actualp(), VhdlAggregate)
+                               || VN_IS(asp->actualp(), VhdlAllocator)) {
+                        err(asp->actualp()->fileline(),
+                            std::string{"The operand of a type conversion cannot be "}
+                                + (VN_IS(asp->actualp(), VhdlAggregate) ? "an aggregate"
+                                                                        : "an allocator")
+                                + ", since its type would come only from the conversion;"
+                                  " qualify it instead: "
+                                + symp->name() + "'(...)");
+                    }
+                    if (asp->actualp()) ++operands;
+                    if (operands == 2) {
+                        err(asp->fileline(),
+                            "A type conversion has exactly one operand, but this one to "
+                                + symp->typep()->prettyName() + " is given more");
+                    }
                     analyzeExpr(asp->actualp(), nullptr);
                     // The result of a conversion must belong to the subtype
                     // the type mark names (9.3.6)
@@ -6873,6 +6983,9 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             if (!assocs[i] || !assocs[i]->actualp() || formalOf[i] < 0) continue;
             VhdlType* const paramp = vhdlFormalTypeAt(nodep->vhdlSymp(), formalOf[i], elemOf[i]);
             analyzeExpr(assocs[i]->actualp(), paramp);
+            if (elemOf[i].empty()) {
+                checkActualClass(nodep->vhdlSymp(), formalOf[i], assocs[i]->actualp());
+            }
             // A parameter written against an unconstrained array takes its
             // index range from the actual (5.3.2.2). Where the actual is a
             // value rather than an object -- a string literal, an aggregate,
@@ -7106,6 +7219,15 @@ void VhdlSemVisitor::checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* target
 // a different one. The universal types are the exception the language makes:
 // they convert to any type of their own class (9.3.6).
 bool VhdlSemVisitor::checkAssignedType(AstNodeVhdlExpr* nodep, VhdlType* targetp) {
+    if (valueFitsType(nodep, targetp)) return true;
+    err(nodep->fileline(), "Assignment target is of type " + targetp->prettyName()
+                               + ", but the value is of type " + nodep->vhdlTypep()->prettyName());
+    return false;
+}
+
+// Whether a value's type is the one a context requires, allowing what the
+// language allows in place of it
+bool VhdlSemVisitor::valueFitsType(AstNodeVhdlExpr* nodep, VhdlType* targetp) {
     if (m_inSpecialized) return true;  // The template was checked already
     if (!nodep || !targetp || targetp->isError()) return true;
     VhdlType* const valuep = nodep->vhdlTypep();
@@ -7132,10 +7254,7 @@ bool VhdlSemVisitor::checkAssignedType(AstNodeVhdlExpr* nodep, VhdlType* targetp
     // the target it says nothing rather than reporting a type that another
     // reading of the same text does not have. nvc 1.22.1 and GHDL 7.0.0-dev
     // both accept such a design; Questa 2025.2 refuses it.
-    if (indexedCallWouldFit(nodep, valuep, targetp)) return true;
-    err(nodep->fileline(), "Assignment target is of type " + targetp->prettyName()
-                               + ", but the value is of type " + valuep->prettyName());
-    return false;
+    return indexedCallWouldFit(nodep, valuep, targetp);
 }
 
 bool VhdlSemVisitor::indexedCallWouldFit(const AstNodeVhdlExpr* nodep, const VhdlType* valuep,
@@ -7191,6 +7310,16 @@ VhdlType* VhdlSemVisitor::analyzeIndexedName(AstVhdlCall* nodep, VhdlType* array
 // A slice is of the array's type, constrained by the slice's own range, which
 // must run the same way as the array's and lie within it (8.5)
 VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp) {
+    // A slice is a run of elements of a one-dimensional array, named by one
+    // discrete range: a block of a matrix is not a slice of it
+    if (nodep->argsp() && nodep->argsp()->nextp()) {
+        err(nodep->fileline(), "A slice is named by one discrete range, but this one is"
+                               " given several");
+    } else if (arrayp->base()->indexTypes().size() > 1) {
+        err(nodep->fileline(),
+            "Only a one-dimensional array can be sliced, but " + arrayp->prettyName() + " has "
+                + std::to_string(arrayp->base()->indexTypes().size()) + " dimensions");
+    }
     VhdlType* const indexp = arrayp->indexTypes().empty() ? nullptr : arrayp->indexTypes()[0];
     const RangeInfo info = analyzeRange(nodep->argsp(), indexp);
     VhdlType* const outp = cloneSubtype(arrayp, nodep->fileline());
@@ -7922,9 +8051,16 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
     } else if (AstVhdlAggregate* const p = VN_CAST(nodep, VhdlAggregate)) {
         resultp = analyzeAggregate(p, wantp);
     } else if (AstVhdlQualified* const p = VN_CAST(nodep, VhdlQualified)) {
-        // A qualified expression states its own type (9.3.5)
+        // A qualified expression states its own type (9.3.5), which is what
+        // its operand must already be: it names a type, it converts nothing
         resultp = resolveTypeMark(p->typeMarkp());
         analyzeExpr(p->valuep(), resultp);
+        if (p->valuep() && !valueFitsType(p->valuep(), resultp)) {
+            err(p->valuep()->fileline(),
+                "A qualified expression states the type of its operand, which must be "
+                    + resultp->prettyName() + ", but this is of type "
+                    + p->valuep()->vhdlTypep()->prettyName());
+        }
         // Where the type mark names an unconstrained array, what is qualified
         // is what says how long the value is (5.3.2.2), just as it does for a
         // conversion: "integer_vector'(7, 8, 9)" is three elements even though
@@ -7991,6 +8127,7 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     }
     VhdlType* targetp = analyzeExpr(nodep->targetp(), wantp);
     if (wantp && (!targetp || targetp->isError())) targetp = wantp;
+    checkAssignTarget(nodep->targetp(), true);
     // Every waveform element is of the target's type (10.5.2.2)
     for (AstNode* wp = nodep->wavesp(); wp; wp = wp->nextp()) {
         AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
@@ -8024,6 +8161,158 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     }
 }
 
+// The object a name denotes: through indexing, slicing and the selection of
+// a record element to the object those belong to (8.1). An access value
+// designates an object that is a variable whatever the name began with, and
+// a call's result is no object, so for those the class is left UNKNOWN.
+VhdlSemVisitor::ObjInfo VhdlSemVisitor::objectOfName(const AstNodeVhdlExpr* nodep) {
+    for (int depth = 0; nodep && depth < 64; ++depth) {
+        if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
+            return objectOfSymbol(namep->vhdlSymp());
+        }
+        if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            const VhdlType* const prefTypep = selp->prefixp()->vhdlTypep();
+            if (selp->isAll() || !prefTypep || prefTypep->base()->kind() == VhdlTypeKind::ACCESS) {
+                return {};
+            }
+            // An expanded name denotes the object itself; a record element
+            // belongs to the object its prefix denotes
+            const VhdlSymbol* const symp = selp->vhdlSymp();
+            if (symp && symp->kind() != VhdlSymKind::RECORD_ELEMENT) return objectOfSymbol(symp);
+            if (prefTypep->base()->kind() != VhdlTypeKind::RECORD) return {};
+            nodep = selp->prefixp();
+            continue;
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            // Indexed or sliced, the prefix is an array object; a call's is
+            // a function, and a conversion's a type mark
+            const AstNodeVhdlExpr* const prefp = callp->prefixp();
+            const VhdlSymbol* const psymp = prefp->vhdlSymp();
+            const VhdlType* const prefTypep = prefp->vhdlTypep();
+            if (!prefTypep || prefTypep->base()->kind() != VhdlTypeKind::ARRAY) return {};
+            if (psymp
+                && (psymp->kind() == VhdlSymKind::FUNCTION
+                    || psymp->kind() == VhdlSymKind::TYPE)) {
+                return {};
+            }
+            nodep = prefp;
+            continue;
+        }
+        return {};
+    }
+    return {};
+}
+
+VhdlSemVisitor::ObjInfo VhdlSemVisitor::objectOfSymbol(const VhdlSymbol* symp) {
+    ObjInfo info;
+    if (!symp) return info;
+    symp = symp->resolved();
+    info.symp = symp;
+    // An interface object carries its class and its mode on the declaration
+    const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl);
+    switch (symp->kind()) {
+    case VhdlSymKind::SIGNAL:
+    case VhdlSymKind::PORT:
+        info.cls = ObjClass::SIGNAL;
+        info.modeIn = ifp && ifp->mode() == VhdlMode::IN;
+        break;
+    case VhdlSymKind::VARIABLE:
+    case VhdlSymKind::SHARED_VARIABLE: info.cls = ObjClass::VARIABLE; break;
+    case VhdlSymKind::FILE: info.cls = ObjClass::FILE; break;
+    case VhdlSymKind::CONSTANT:
+    case VhdlSymKind::GENERIC:
+    case VhdlSymKind::LOOP_PARAMETER:
+    case VhdlSymKind::GENERATE_PARAMETER: info.cls = ObjClass::CONSTANT; break;
+    case VhdlSymKind::PARAMETER:
+        if (!ifp) break;
+        switch (ifp->kind()) {
+        case VhdlIfaceKind::CONSTANT: info.cls = ObjClass::CONSTANT; break;
+        case VhdlIfaceKind::VARIABLE: info.cls = ObjClass::VARIABLE; break;
+        case VhdlIfaceKind::SIGNAL: info.cls = ObjClass::SIGNAL; break;
+        case VhdlIfaceKind::FILE: info.cls = ObjClass::FILE; break;
+        default: break;
+        }
+        info.modeIn = ifp->mode() == VhdlMode::IN;
+        break;
+    default: break;
+    }
+    return info;
+}
+
+// A signal assignment writes a signal and a variable assignment a variable,
+// and neither writes an object of mode IN (10.5.2.1, 10.6.2.1, 6.5.2). An
+// out or inout parameter given no class is a variable (4.2.2.1), so "x <= 1"
+// inside the procedure that declares it is not a signal assignment to make.
+void VhdlSemVisitor::checkAssignTarget(const AstNodeVhdlExpr* targetp, bool signal) {
+    if (m_inSpecialized || !targetp) return;
+    if (const AstVhdlAggregate* const aggp = VN_CAST(targetp, VhdlAggregate)) {
+        for (const AstNode* ep = aggp->elemsp(); ep; ep = ep->nextp()) {
+            checkAssignTarget(VN_AS(ep, VhdlElemAssoc)->valuep(), signal);
+        }
+        return;
+    }
+    const ObjInfo info = objectOfName(targetp);
+    if (info.cls == ObjClass::UNKNOWN) return;
+    const ObjClass want = signal ? ObjClass::SIGNAL : ObjClass::VARIABLE;
+    const std::string name = info.symp ? info.symp->name() : "";
+    if (info.cls != want) {
+        err(targetp->fileline(), std::string{"The target of a "} + (signal ? "signal" : "variable")
+                                     + " assignment must be " + objClassName(want) + ", but '"
+                                     + name + "' is " + objClassName(info.cls));
+    } else if (info.modeIn) {
+        err(targetp->fileline(), "'" + name + "' is of mode in, so nothing can assign it");
+    }
+}
+
+// A signal parameter is given a name denoting a signal, and a variable
+// parameter one denoting a variable: what the subprogram reads or writes
+// through it is that object, not a copy of a value (4.2.2.2, 4.2.2.3). And a
+// parameter the subprogram may write needs an object that may be written.
+// A parameter of mode IN given no class is a constant, which takes any value.
+void VhdlSemVisitor::checkActualClass(const VhdlSymbol* subp, int formal,
+                                      const AstNodeVhdlExpr* actualp) {
+    if (m_inSpecialized || !subp || !actualp || formal < 0) return;
+    const AstVhdlSubprogDecl* const declp = VN_CAST(subp->resolved()->declp(), VhdlSubprogDecl);
+    if (!declp) return;
+    const AstVhdlIfaceDecl* ifp = nullptr;
+    int idx = -declp->genericCount();
+    for (const AstNode* p = declp->paramsp(); p; p = p->nextp(), ++idx) {
+        if (idx == formal) {
+            ifp = VN_CAST(p, VhdlIfaceDecl);
+            break;
+        }
+    }
+    if (!ifp) return;
+    ObjClass want = ObjClass::UNKNOWN;
+    if (ifp->kind() == VhdlIfaceKind::SIGNAL) {
+        want = ObjClass::SIGNAL;
+    } else if (ifp->kind() == VhdlIfaceKind::VARIABLE && ifp->mode() != VhdlMode::IN) {
+        want = ObjClass::VARIABLE;
+    } else {
+        return;
+    }
+    // A value that is no name at all denotes no object; a name reached
+    // through an access value, a call or an attribute is left alone
+    const bool notName = VN_IS(actualp, VhdlLiteral) || VN_IS(actualp, VhdlBinary)
+                         || VN_IS(actualp, VhdlUnary) || VN_IS(actualp, VhdlAggregate)
+                         || VN_IS(actualp, VhdlQualified);
+    const ObjInfo info = notName ? ObjInfo{} : objectOfName(actualp);
+    if (!notName && info.cls == ObjClass::UNKNOWN) return;
+    const std::string formalText
+        = "parameter '" + ifp->prettyName() + "' of '" + subp->resolved()->name() + "'";
+    if (notName || info.cls != want) {
+        err(actualp->fileline(),
+            "What is given for " + formalText + " must name " + objClassName(want)
+                + (notName ? ", but this is a value"
+                           : ", but '" + info.symp->name() + "' is " + objClassName(info.cls)));
+    } else if (ifp->mode() != VhdlMode::IN && info.modeIn) {
+        err(actualp->fileline(), "'" + info.symp->name()
+                                     + "' is of mode in, so it cannot be given"
+                                       " for "
+                                     + formalText + ", which may write it");
+    }
+}
+
 // Whether a settled condition closes off this alternative of a conditional
 // assignment: its own condition folds to FALSE, or an earlier one's folded to
 // TRUE. As for a branch of an if statement, what such an alternative assigns
@@ -8048,6 +8337,7 @@ void VhdlSemVisitor::visit(AstVhdlVarAssign* nodep) {
     }
     VhdlType* targetp = analyzeExpr(nodep->targetp(), wantp);
     if (wantp && (!targetp || targetp->isError())) targetp = wantp;
+    checkAssignTarget(nodep->targetp(), false);
     if (nodep->valuep()) {
         analyzeExpr(nodep->valuep(), targetp);
         checkAssignedValue(nodep->valuep(), targetp);

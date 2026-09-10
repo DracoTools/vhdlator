@@ -1,0 +1,11 @@
+%Error: t/t_vhdl_exprtype_bad.vhd:40:19: A qualified expression states the type of its operand, which must be integer, but this is of type boolean
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_exprtype_bad.vhd:41:19: Elements given one value together must be of one type, but 'b' is of type boolean and 'c' of type integer
+%Error: t/t_vhdl_exprtype_bad.vhd:42:11: Elements given one value together must be of one type, but 'a' is of type integer and 'b' of type boolean
+%Error: t/t_vhdl_exprtype_bad.vhd:43:23: 'others' in a record aggregate must stand for at least one element, but every element is already given
+%Error: t/t_vhdl_exprtype_bad.vhd:44:18: An element of this aggregate must be of type integer, but this one is of type universal_real
+%Error: t/t_vhdl_exprtype_bad.vhd:45:22: The operand of a type conversion cannot be a string literal, since its type would come only from the conversion; qualify it instead: bit_vector'(...)
+%Error: t/t_vhdl_exprtype_bad.vhd:46:21: A type conversion has exactly one operand, but this one to integer is given more
+%Error: t/t_vhdl_exprtype_bad.vhd:47:6: A slice is named by one discrete range, but this one is given several
+%Error: t/t_vhdl_exprtype_bad.vhd:47:27: A slice is named by one discrete range, but this one is given several
+%Error: Exiting due to
