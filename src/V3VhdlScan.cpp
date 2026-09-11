@@ -573,6 +573,11 @@ VhdlToken V3VhdlScan::scanStringLiteral(FileLine* flp, char quote) {
                 closed = true;
                 break;
             }
+        } else if (c == '"' && quote == '%') {
+            // A string written between percent signs stands for one between
+            // quotation marks, and so holds none of them (VHDL-93 13.10)
+            flp->v3error("A string literal delimited by '%' cannot contain a '\"'");
+            tok.text += advance();
         } else if (isGraphic(c) || c == '\t') {
             tok.text += advance();  // See the note on tabs above
         } else {

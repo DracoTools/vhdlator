@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_attrprefix_bad.vhd:40:15: Attribute 'high is given a dimension, which only an array has, but the prefix is of type small
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_attrprefix_bad.vhd:41:11: Before VHDL-2019 attribute 'high is asked of a type, not of an object of it like 'v'
+%Error: t/t_vhdl_attrprefix_bad.vhd:42:11: Before VHDL-2019 attribute 'ascending is asked of a type, not of an object of it like 'v'
+%Error: t/t_vhdl_attrprefix_bad.vhd:43:21: Before VHDL-2019 attribute 'base is asked of a type, not of an object of it like 'v'
+%Error: t/t_vhdl_attrprefix_bad.vhd:44:15: Attribute 'length asks about an array, but the prefix is of type color
+%Error: t/t_vhdl_attrprefix_bad.vhd:45:31: Attribute 'length asks about an array, but 'v' is of type small
+%Error: t/t_vhdl_attrprefix_bad.vhd:46:22: The prefix of a slice is a name or a function call, and a qualified expression is neither
+%Error: t/t_vhdl_attrprefix_bad.vhd:47:22: The prefix of an indexed name is a name or a function call, and a type conversion is neither
+%Error: Exiting due to

@@ -1,0 +1,8 @@
+%Warning-VHDLELABORDER: t/t_vhdl_elabord_bad.vhd:22:28: Function 'f' is called before its body is elaborated: the declarations of a region are elaborated in order
+                        ... For warning description see https://verilator.org/warn/VHDLELABORDER?v=latest
+                        ... Use "/* verilator lint_off VHDLELABORDER */" and lint_on around source to disable this message.
+%Error: t/t_vhdl_elabord_bad.vhd:24:28: Deferred constant 'd' is read before its full declaration is elaborated
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Warning-VHDLELABORDER: t/t_vhdl_elabord_bad.vhd:23:19: An object of protected type pt is declared before the type's body is elaborated: 'v1'
+%Warning-VHDLELABORDER: t/t_vhdl_elabord_bad.vhd:52:28: Function 'g' is called before its body is elaborated: the declarations of a region are elaborated in order
+%Error: Exiting due to

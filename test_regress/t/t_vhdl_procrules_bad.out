@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_procrules_bad.vhd:34:7: A method of a protected type cannot wait: it holds the object for itself until it returns
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_procrules_bad.vhd:52:5: A procedure declared outside a process assigns only signals it is given as parameters, and 's' is not one
+%Error: t/t_vhdl_procrules_bad.vhd:56:9: Generic 'width' has no default value, so it must be given one in the generic map
+%Error: t/t_vhdl_procrules_bad.vhd:64:16: A type conversion changes a value between closely related types, and rec1 and rec2 are not
+%Error: Exiting due to

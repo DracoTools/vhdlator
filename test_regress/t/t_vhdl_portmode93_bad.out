@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_portmode93_bad.vhd:25:60: Port 'pout' is of mode out, and before VHDL-2008 a port of mode inout is given only a port of its own mode: 'c1'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_portmode93_bad.vhd:26:71: Port 'pio' is of mode inout, and before VHDL-2008 a port of mode buffer is given only a port of its own mode: 'c2'
+%Error: Exiting due to

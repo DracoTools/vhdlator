@@ -5,18 +5,16 @@
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
 -- SPDX-License-Identifier: CC0-1.0
 
-package pk is
-    -- A shared variable is of a protected type (6.4.2.4)
+package pk_t is
+    -- A shared variable is of a protected type (6.4.2.4), whose body is
+    -- elaborated before any object of it is declared (14.4.2)
     type counter_t is protected
         procedure add (constant n : natural);
         impure function get return natural;
     end protected;
-    shared variable calls : counter_t;
-    procedure note (constant n : natural);
-    function twice (constant n : natural) return natural;
 end package;
 
-package body pk is
+package body pk_t is
     type counter_t is protected body
         variable total : natural := 0;
         procedure add (constant n : natural) is
@@ -28,7 +26,16 @@ package body pk is
             return total;
         end function;
     end protected body;
+end package body;
 
+use work.pk_t.all;
+package pk is
+    shared variable calls : counter_t;
+    procedure note (constant n : natural);
+    function twice (constant n : natural) return natural;
+end package;
+
+package body pk is
     -- Reaches an object the package declares, which is one object for the
     -- whole design: a subprogram emitted as a function of its own still
     -- names it
@@ -43,6 +50,7 @@ package body pk is
     end function;
 end package body;
 
+use work.pk_t.all;
 use work.pk.all;
 
 entity t_vhdl_noinline is

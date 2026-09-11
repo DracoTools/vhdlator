@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_aggtarget_bad.vhd:32:8: What a selected assignment chooses on is of a discrete type or a one-dimensional array of characters, but this is of type real
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_aggtarget_bad.vhd:33:6: A name in an aggregate target is locally static, and this one is not
+%Error: t/t_vhdl_aggtarget_bad.vhd:34:7: An aggregate target names each object once, but 'x' appears twice
+%Error: t/t_vhdl_aggtarget_bad.vhd:35:3: The signals of an aggregate target are all guarded or none of them is
+%Error: t/t_vhdl_aggtarget_bad.vhd:36:3: 'gb' is a guarded signal, so a concurrent assignment to it must be guarded
+%Error: Exiting due to

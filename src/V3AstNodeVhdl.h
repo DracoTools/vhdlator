@@ -567,6 +567,10 @@ class AstVhdlWaveform final : public AstNodeVhdl {
     // waveform_element (10.5.2.1): value [after time]
     // @astgen op1 := valuep : Optional[AstNodeVhdlExpr]  // Absent means "unaffected"
     // @astgen op2 := afterp : Optional[AstNodeVhdlExpr]
+    // Written "null": a null transaction, which turns the driver off. It has
+    // no value either, but it is not "unaffected" (10.5.2.2).
+    bool m_nullTxn = false;
+
 public:
     AstVhdlWaveform(FileLine* fl, AstNodeVhdlExpr* valuep, AstNodeVhdlExpr* afterp)
         : ASTGEN_SUPER_VhdlWaveform(fl) {
@@ -574,6 +578,8 @@ public:
         this->afterp(afterp);
     }
     ASTGEN_MEMBERS_AstVhdlWaveform;
+    bool nullTxn() const { return m_nullTxn; }
+    void nullTxn(bool flag) { m_nullTxn = flag; }
 };
 
 
@@ -704,6 +710,7 @@ class AstVhdlIfaceDecl final : public AstNodeVhdlDecl {
     const VhdlIfaceKind m_kind;
     VhdlMode m_mode = VhdlMode::IN;
     bool m_modeExplicit = false;  // Mode was written out
+    bool m_classExplicit = false;  // Class was written out
     VhdlSignalKind m_signalKind = VhdlSignalKind::NONE;
     // "package p is new work.poly generic map (<>)": which package the formal
     // stands for, and whether the map was written as a box (6.5.5)
@@ -726,6 +733,8 @@ public:
         m_modeExplicit = true;
     }
     bool modeExplicit() const { return m_modeExplicit; }
+    bool classExplicit() const { return m_classExplicit; }
+    void classExplicit(bool flag) { m_classExplicit = flag; }
     VhdlSignalKind signalKind() const { return m_signalKind; }
     void signalKind(VhdlSignalKind kind) { m_signalKind = kind; }
     bool isBound() const { return m_bound; }
@@ -750,6 +759,9 @@ class AstVhdlObjectDecl final : public AstNodeVhdlDecl {
     // the back end as a parameter, not as a variable, because a type declared
     // in the same package may be as long as it says (4.9).
     bool m_elabConstant = false;
+    // The subtype indication as the parser saw it, one lexical element at a
+    // time, for a deferred constant's full declaration to conform to (4.7)
+    std::string m_specText;
 
 public:
     AstVhdlObjectDecl(FileLine* fl, const std::string& name, VhdlObjKind kind)
@@ -757,6 +769,8 @@ public:
         , m_kind{kind} {}
     ASTGEN_MEMBERS_AstVhdlObjectDecl;
     VhdlObjKind kind() const { return m_kind; }
+    const std::string& specText() const { return m_specText; }
+    void specText(const std::string& text) { m_specText = text; }
     bool isElabConstant() const { return m_elabConstant; }
     void elabConstant(bool flag) { m_elabConstant = flag; }
     VhdlSignalKind signalKind() const { return m_signalKind; }

@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_seq93_bad.vhd:26:5: Before VHDL-2008 a conditional assignment is not a sequential statement
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_seq93_bad.vhd:27:5: Before VHDL-2008 a conditional assignment is not a sequential statement
+%Error: t/t_vhdl_seq93_bad.vhd:28:5: Before VHDL-2008 a selected assignment is not a sequential statement
+%Error: Exiting due to

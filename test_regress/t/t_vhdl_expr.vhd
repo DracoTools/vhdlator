@@ -71,7 +71,7 @@ begin
     ok <= g;
     -- Attributes
     v := nibble_t'length;
-    ok <= s'left = idle;
+    ok <= state_t'left = idle;
     -- Aggregates, taking their type from the target
     n  <= (others => '0');
     pr <= (a => 1, b => '0');

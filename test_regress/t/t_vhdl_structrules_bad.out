@@ -1,0 +1,9 @@
+%Error: t/t_vhdl_structrules_bad.vhd:20:12: The full declaration of deferred constant 'bad_deferred' does not repeat its subtype exactly as the deferred one writes it
+        t/t_vhdl_structrules_bad.vhd:15:12: ... Location of the deferred declaration
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_structrules_bad.vhd:24:36: A generic can only be of mode in: 'g_bad'
+%Error: t/t_vhdl_structrules_bad.vhd:37:5: An entity's statements are passive, so they cannot assign a signal
+%Error: t/t_vhdl_structrules_bad.vhd:50:5: A null transaction turns a driver off, which only a guarded signal -- one declared bus or register -- has, and 'plain' is not one
+%Error: t/t_vhdl_structrules_bad.vhd:53:12: 'others' must be the only choice of the last alternative of this case statement
+%Error: t/t_vhdl_structrules_bad.vhd:56:12: 'others' must be the only choice of the last alternative of this case statement
+%Error: Exiting due to

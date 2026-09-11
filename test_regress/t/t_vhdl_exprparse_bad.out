@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_exprparse_bad.vhd:20:20: An access type names the subtype it designates
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_exprparse_bad.vhd:31:18: Different logical operators in one expression are parenthesized to say which applies first
+%Error: t/t_vhdl_exprparse_bad.vhd:32:18: A 'nand' or 'nor' is not repeated without parentheses, since it is not associative
+%Error: t/t_vhdl_exprparse_bad.vhd:33:5: A wait statement's 'on' names at least one signal
+%Error: t/t_vhdl_exprparse_bad.vhd:39:3: A generate statement must have a label
+%Error: Exiting due to

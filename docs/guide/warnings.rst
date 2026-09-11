@@ -2681,6 +2681,55 @@ List Of Warnings
    To resolve this, rename the inner or outer variable to an unique name.
 
 
+.. option:: VHDLELABORDER
+
+   Warns that a VHDL declaration uses something whose body has not been
+   elaborated yet: a function called while the declarations of a region are
+   elaborated and before the function's body, or an object of a protected
+   type declared before the protected type's body. IEEE 1076-2008 14.4.2 elaborates
+   declarations in order, so a simulator that elaborates at run time reports
+   the call as an error when it happens.
+
+   Verilator compiles the whole design before any of it runs, so the body is
+   there to be used and the design behaves as if the declarations had been
+   written in the other order. It is a warning rather than an error because
+   such designs are common and other tools accept them too.
+
+   Faulty example:
+
+   .. code-block:: vhdl
+
+      function f return natural;
+      constant c : natural := f;   -- f's body is not elaborated yet
+      function f return natural is begin return 1; end function;
+
+   To resolve this, move the body before the declaration that uses it; for a
+   package, move the use into the package body after the body it needs.
+
+
+.. option:: VHDLSHARED
+
+   Warns that a VHDL shared variable, in VHDL-2000 or later, is of an
+   ordinary type rather than a protected type. IEEE 1076-2008 6.4.2.4
+   requires a protected type, whose methods are what make it safe for
+   several processes to use at once.
+
+   Libraries written for VHDL-93, UVVM among them, still declare shared
+   variables of ordinary types, and other simulators accept them under
+   relaxed rules. Verilator runs processes one at a time, so such a variable
+   behaves as it would in VHDL-93, and this is a warning rather than an
+   error.
+
+   Faulty example:
+
+   .. code-block:: vhdl
+
+      shared variable count : natural := 0;   -- Not a protected type
+
+   To resolve this, declare the variable of a protected type with methods
+   that read and update it, or disable the warning.
+
+
 .. option:: VHDLUNBOUND
 
    Warns that a VHDL component instance has no entity bound to it: no entity

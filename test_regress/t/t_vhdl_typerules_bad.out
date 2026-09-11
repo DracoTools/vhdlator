@@ -1,0 +1,13 @@
+%Error: t/t_vhdl_typerules_bad.vhd:43:25: A protected type declaration declares only its methods, attribute specifications and use clauses
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_typerules_bad.vhd:44:3: Access type 'fa' cannot designate file type ft
+%Error: t/t_vhdl_typerules_bad.vhd:45:3: Access type 'pa' cannot designate protected type pt
+%Error: t/t_vhdl_typerules_bad.vhd:46:38: Incomplete type 'inc' is completed as a type the access type designating it cannot designate
+%Error: t/t_vhdl_typerules_bad.vhd:48:38: A pure function cannot declare a file: 'fh'
+%Error: t/t_vhdl_typerules_bad.vhd:49:32: No visible operator "/" takes universal_real and universal_integer
+%Error: t/t_vhdl_typerules_bad.vhd:50:29: No visible operator "*" takes universal_real and universal_integer
+%Error: t/t_vhdl_typerules_bad.vhd:59:15: The type of an aggregate target comes from the value assigned to it, which a string literal or an aggregate does not have on its own; qualify it
+%Error: t/t_vhdl_typerules_bad.vhd:60:12: No visible operator "*" takes real and universal_integer
+%Error: t/t_vhdl_typerules_bad.vhd:67:42: Aggregate has 2 element(s), but the default value of 'i' needs 3
+%Error: t/t_vhdl_typerules_bad.vhd:47:3: Incomplete type 'never' is given no full declaration
+%Error: Exiting due to

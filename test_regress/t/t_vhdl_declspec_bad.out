@@ -1,0 +1,13 @@
+%Error: t/t_vhdl_declspec_bad.vhd:40:14: Only an alias of an object is given a subtype, and 'i2' names something that is not one
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_declspec_bad.vhd:41:3: Alias 'c3' is of type bit, but what it names is of type integer
+%Error: t/t_vhdl_declspec_bad.vhd:42:3: Attribute 'ap' holds a constant value, which a value of type ptr cannot be
+%Error: t/t_vhdl_declspec_bad.vhd:43:3: Attribute 'af' holds a constant value, which a value of type ft cannot be
+%Error: t/t_vhdl_declspec_bad.vhd:44:3: An attribute specification that says 'others' or 'all' is the last for attribute 'att' of class signal in its declarative part
+%Error: t/t_vhdl_declspec_bad.vhd:45:20: Attribute 'att' is given to 'nothing', which is not declared here
+%Error: t/t_vhdl_declspec_bad.vhd:46:20: An attribute of package 't_vhdl_declspec_pkg' is specified in that package's own declarative part
+%Error: t/t_vhdl_declspec_bad.vhd:47:39: A secondary unit is a multiple of a unit of its own physical type, and the one 'pm' is given is not one
+%Error: t/t_vhdl_declspec_bad.vhd:48:19: A bound of a range is a value, but 'other' is a type
+%Error: t/t_vhdl_declspec_bad.vhd:48:3: The bounds of type 'r' must be locally static
+%Error: t/t_vhdl_declspec_bad.vhd:49:28: This index constraint names subtype other, but the index is of type integer
+%Error: Exiting due to

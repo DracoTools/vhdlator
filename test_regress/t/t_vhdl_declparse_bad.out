@@ -1,0 +1,12 @@
+%Error: t/t_vhdl_declparse_bad.vhd:31:45: An attribute specification names a declaration by its simple name, and this is not one
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_declparse_bad.vhd:32:20: An entity specification names at least one declaration, or says 'others' or 'all'
+%Error: t/t_vhdl_declparse_bad.vhd:33:35: The primary unit of a physical type is declared by its name alone, with no value: 'xa'
+%Error: t/t_vhdl_declparse_bad.vhd:34:44: A secondary unit is a whole number of another unit, but 'xc' is given 1.5
+%Error: t/t_vhdl_declparse_bad.vhd:35:46: A secondary unit is given a physical literal, a number and a unit: 'xe'
+%Error: t/t_vhdl_declparse_bad.vhd:36:32: A file type names what it holds by a type mark alone, with no constraint
+%Error: t/t_vhdl_declparse_bad.vhd:37:3: A configuration specification binds its instances to an entity, a configuration or 'open', and this one names none
+%Error: t/t_vhdl_declparse_bad.vhd:42:3: A block statement must have a label
+%Error: t/t_vhdl_declparse_bad.vhd:43:16: A block's port map follows its port clause, and this block has none
+%Error: t/t_vhdl_declparse_bad.vhd:44:16: A block's generic map follows its generic clause, and this block has none
+%Error: Exiting due to

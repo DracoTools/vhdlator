@@ -1,0 +1,11 @@
+%Error: t/t_vhdl_visrules_bad.vhd:45:10: Declaration of 'clk' conflicts with the port of the same name its entity declares, whose region an architecture continues
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_visrules_bad.vhd:46:12: Declaration of 'width' conflicts with the generic of the same name its entity declares, whose region an architecture continues
+%Error: t/t_vhdl_visrules_bad.vhd:47:28: 'k' is declared by more than one package a use clause makes visible here, so neither is visible
+%Error: t/t_vhdl_visrules_bad.vhd:48:31: A selected name selects from an object or a design unit, and 'rec' is a type
+%Error: t/t_vhdl_visrules_bad.vhd:49:29: A use clause looks into a library or a package, and 'work.t_vhdl_visrules_e' is an entity
+%Error: t/t_vhdl_visrules_bad.vhd:50:34: Nothing follows '.all' in a use clause
+%Error: t/t_vhdl_visrules_bad.vhd:59:9: Label 'v' is already declared in this process
+%Error: t/t_vhdl_visrules_bad.vhd:60:10: Label 'l1' is already declared in this process
+%Error: t/t_vhdl_visrules_bad.vhd:64:57: The alternatives of a generate statement have distinct labels, and 'alt1' is used twice
+%Error: Exiting due to

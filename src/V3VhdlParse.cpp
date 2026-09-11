@@ -384,6 +384,9 @@ AstNodeVhdlUnit* V3VhdlParse::parsePackage() {
     }
 
     AstVhdlPackage* const nodep = new AstVhdlPackage{flp, name};
+    if (peekType() == VhdlTokType::KWD_GENERIC && here()->language() < V3LangCode::L1076_2008) {
+        here()->v3error("Before VHDL-2008 a package has no generics");
+    }
     if (check(VhdlTokType::KWD_GENERIC)) {
         expect(VhdlTokType::LPAREN, "'(' after 'generic'");
         nodep->addGenericsp(parseInterfaceList(VhdlIfaceKind::CONSTANT));
@@ -573,6 +576,11 @@ AstNodeVhdl* V3VhdlParse::parseDeclarativeItem() {
     case VhdlTokType::KWD_GROUP: return parseGroup();
     case VhdlTokType::KWD_USE: return parseContextItem();
     case VhdlTokType::KWD_PACKAGE:
+        // A package declared inside another region is VHDL-2008's (4.7)
+        if (here()->language() < V3LangCode::L1076_2008) {
+            here()->v3error("Before VHDL-2008 a package is a design unit of its own, and"
+                            " cannot be declared inside another");
+        }
         return (peekType(1) == VhdlTokType::KWD_BODY) ? parsePackageBody() : parsePackage();
     case VhdlTokType::KWD_CONTEXT: return parseContextItem();
     default: return nullptr;
@@ -730,6 +738,7 @@ AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceElement(VhdlIfaceKind dflt) {
     for (size_t i = 0; i < names.size(); ++i) {
         AstVhdlIfaceDecl* const nodep = new AstVhdlIfaceDecl{names[i].second, names[i].first, kind};
         if (modeGiven) nodep->mode(mode);
+        nodep->classExplicit(classGiven);
         nodep->signalKind(sigKind);
         const bool last = (i + 1 == names.size());
         if (subtypep) nodep->subtypep(last ? subtypep : subtypep->cloneTree(false));
@@ -771,7 +780,15 @@ AstNodeVhdl* V3VhdlParse::parseObjectDecl() {
         return nullptr;
     }
 
-    AstVhdlSubtypeInd* const subtypep = parseSubtypeIndication();
+    // How the subtype is spelled, for a deferred constant's full declaration
+    // to be tested against (4.7, 4.10)
+    std::string spec;
+    AstVhdlSubtypeInd* subtypep = nullptr;
+    {
+        VL_RESTORER(m_specp);
+        m_specp = &spec;
+        subtypep = parseSubtypeIndication();
+    }
     VhdlSignalKind sigKind = VhdlSignalKind::NONE;
     if (check(VhdlTokType::KWD_REGISTER)) {
         sigKind = VhdlSignalKind::REGISTER;
@@ -796,6 +813,7 @@ AstNodeVhdl* V3VhdlParse::parseObjectDecl() {
         AstVhdlObjectDecl* const nodep
             = new AstVhdlObjectDecl{names[i].second, names[i].first, kind};
         nodep->signalKind(sigKind);
+        nodep->specText(spec);
         const bool last = (i + 1 == names.size());
         if (subtypep) nodep->subtypep(last ? subtypep : subtypep->cloneTree(false));
         if (defaultp) nodep->defaultp(last ? defaultp : defaultp->cloneTree(false));
@@ -850,12 +868,35 @@ AstNodeVhdl* V3VhdlParse::parseTypeDefinition(const std::string& typeName) {
         AstVhdlRange* const rangep = parseRange();
         if (check(VhdlTokType::KWD_UNITS)) {
             AstVhdlPhysicalType* const nodep = new AstVhdlPhysicalType{flp, rangep};
-            // The primary unit has no value; secondary units are "name = expr"
+            // The primary unit has no value; secondary units are
+            // "name = physical_literal" whose abstract literal is an integer
+            // (5.2.4.1)
+            bool primary = true;
             while (peekType() == VhdlTokType::IDENTIFIER) {
                 FileLine* const uflp = here();
                 const std::string uname = consume().text;
                 AstNodeVhdlExpr* valuep = nullptr;
-                if (check(VhdlTokType::EQ)) valuep = parseExpression();
+                if (check(VhdlTokType::EQ)) {
+                    valuep = parseExpression();
+                    const AstVhdlLiteral* const litp = VN_CAST(valuep, VhdlLiteral);
+                    if (primary) {
+                        uflp->v3error("The primary unit of a physical type is declared by its"
+                                      " name alone, with no value: '"
+                                      << uname << "'");
+                    } else if (litp && litp->kind() == VhdlLitKind::PHYSICAL
+                               && litp->name().find('.') != std::string::npos) {
+                        valuep->fileline()->v3error(
+                            "A secondary unit is a whole number of another unit, but '"
+                            << uname << "' is given " << litp->name());
+                    } else if (valuep && !(litp && litp->kind() == VhdlLitKind::PHYSICAL)
+                               && !VN_IS(valuep, VhdlName)) {
+                        valuep->fileline()->v3error(
+                            "A secondary unit is given a physical literal, a number and"
+                            " a unit: '"
+                            << uname << "'");
+                    }
+                }
+                primary = false;
                 nodep->addUnitsp(new AstVhdlUnitDecl{uflp, uname, valuep});
                 expect(VhdlTokType::SEMICOLON, "';' after a unit declaration");
             }
@@ -941,7 +982,10 @@ AstNodeVhdl* V3VhdlParse::parseTypeDefinition(const std::string& typeName) {
     case VhdlTokType::KWD_ACCESS: {
         consume();
         AstVhdlSubtypeInd* sip = parseSubtypeIndication();
-        if (!sip) sip = new AstVhdlSubtypeInd{flp, nullptr};
+        if (!sip) {
+            here()->v3error("An access type names the subtype it designates");
+            sip = new AstVhdlSubtypeInd{flp, nullptr};
+        }
         return new AstVhdlAccessType{flp, sip};
     }
     case VhdlTokType::KWD_FILE: {
@@ -949,6 +993,11 @@ AstNodeVhdl* V3VhdlParse::parseTypeDefinition(const std::string& typeName) {
         expect(VhdlTokType::KWD_OF, "'of' after 'file'");
         AstNodeVhdlExpr* markp = parseName();
         if (!markp) markp = new AstVhdlName{flp, ""};
+        // Of what a type mark names, with no constraint of its own (5.5.1)
+        if (!VN_IS(markp, VhdlName) && !VN_IS(markp, VhdlSelected)) {
+            markp->fileline()->v3error("A file type names what it holds by a type mark alone,"
+                                       " with no constraint");
+        }
         return new AstVhdlFileType{flp, markp};
     }
     case VhdlTokType::KWD_PROTECTED: {
@@ -1266,6 +1315,12 @@ AstVhdlEntitySpec* V3VhdlParse::parseEntitySpec(bool componentForm) {
                 namep = parseName();
             }
             if (!namep) break;
+            // An attribute specification names what it decorates by its
+            // simple name, a character literal or an operator symbol (7.2)
+            if (!componentForm && !VN_IS(namep, VhdlName)) {
+                namep->fileline()->v3error("An attribute specification names a declaration"
+                                           " by its simple name, and this is not one");
+            }
             if (peekType() == VhdlTokType::LBRACKET) {
                 // An overloaded designator is disambiguated by a signature
                 AstVhdlSignature* const sigp = parseSignature();
@@ -1273,6 +1328,10 @@ AstVhdlEntitySpec* V3VhdlParse::parseEntitySpec(bool componentForm) {
             }
             nodep->addNamesp(namep);
         } while (check(VhdlTokType::COMMA));
+        if (!nodep->namesp()) {
+            flp->v3error("An entity specification names at least one declaration, or says"
+                         " 'others' or 'all'");
+        }
     }
     if (check(VhdlTokType::COLON)) {
         if (componentForm) {
@@ -1295,6 +1354,12 @@ AstNodeVhdl* V3VhdlParse::parseConfigSpec() {
     AstVhdlEntitySpec* const specp = parseEntitySpec(true);
     AstVhdlConfigSpec* const nodep = new AstVhdlConfigSpec{flp, specp};
     nodep->bindingp(parseBinding());
+    // What it binds the instances to is the point of one; only a component
+    // configuration may leave that to be said elsewhere (7.3.2.1)
+    if (nodep->bindingp()->kind().empty()) {
+        flp->v3error("A configuration specification binds its instances to an entity, a"
+                     " configuration or 'open', and this one names none");
+    }
     expect(VhdlTokType::SEMICOLON, "';' after the configuration specification");
     // VHDL-2008 allows an explicit "end for;"
     if (check(VhdlTokType::KWD_END)) {
@@ -1589,6 +1654,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseBlock(const std::string& label) {
     consume();  // "block"
     AstVhdlBlock* const nodep = new AstVhdlBlock{flp};
     nodep->name(label);
+    if (label.empty()) flp->v3error("A block statement must have a label");
     if (check(VhdlTokType::LPAREN)) {
         nodep->guardp(parseExpression());
         expect(VhdlTokType::RPAREN, "')' after the guard expression");
@@ -1599,6 +1665,9 @@ AstNodeVhdlStmt* V3VhdlParse::parseBlock(const std::string& label) {
         AstVhdlBlockHeader* const headerp = new AstVhdlBlockHeader{here()};
         if (check(VhdlTokType::KWD_GENERIC)) {
             if (check(VhdlTokType::KWD_MAP)) {
+                // The map follows the clause it gives values to (11.2)
+                headerp->fileline()->v3error("A block's generic map follows its generic clause,"
+                                             " and this block has none");
                 expect(VhdlTokType::LPAREN, "'(' after 'generic map'");
                 headerp->addGenericMapp(parseAssociationList());
                 expect(VhdlTokType::RPAREN, "')' after the generic map");
@@ -1618,6 +1687,8 @@ AstNodeVhdlStmt* V3VhdlParse::parseBlock(const std::string& label) {
         }
         if (check(VhdlTokType::KWD_PORT)) {
             if (check(VhdlTokType::KWD_MAP)) {
+                headerp->fileline()->v3error("A block's port map follows its port clause, and"
+                                             " this block has none");
                 expect(VhdlTokType::LPAREN, "'(' after 'port map'");
                 headerp->addPortMapp(parseAssociationList());
                 expect(VhdlTokType::RPAREN, "')' after the port map");
@@ -1707,6 +1778,7 @@ AstVhdlGenerateBody* V3VhdlParse::parseGenerateBody() {
 AstNodeVhdlStmt* V3VhdlParse::parseGenerate(const std::string& label) {
     // for/if/case generate_statement (11.8)
     FileLine* const flp = here();
+    if (label.empty()) flp->v3error("A generate statement must have a label");
     AstVhdlGenerate* nodep = nullptr;
     if (check(VhdlTokType::KWD_FOR)) {
         nodep = new AstVhdlGenerate{flp, VhdlLoopKind::FOR};
@@ -1858,6 +1930,8 @@ AstNodeVhdlStmt* V3VhdlParse::parseWait(const std::string& label) {
             if (!sigp) break;
             nodep->addSensp(sigp);
         } while (check(VhdlTokType::COMMA));
+        // "on" names at least one signal (10.2)
+        if (!nodep->sensp()) flp->v3error("A wait statement's 'on' names at least one signal");
     }
     if (check(VhdlTokType::KWD_UNTIL)) nodep->condp(parseExpression());
     if (check(VhdlTokType::KWD_FOR)) nodep->timeoutp(parseExpression());
@@ -1994,10 +2068,13 @@ AstVhdlWaveform* V3VhdlParse::parseWaveform() {
     do {
         FileLine* const wflp = here();
         AstNodeVhdlExpr* valuep = nullptr;
-        if (!check(VhdlTokType::KWD_NULL)) valuep = parseExpression();
+        const bool nullTxn = check(VhdlTokType::KWD_NULL);
+        if (!nullTxn) valuep = parseExpression();
         AstNodeVhdlExpr* afterp = nullptr;
         if (check(VhdlTokType::KWD_AFTER)) afterp = parseExpression();
-        listp = AstNode::addNextNull(listp, new AstVhdlWaveform{wflp, valuep, afterp});
+        AstVhdlWaveform* const wavep = new AstVhdlWaveform{wflp, valuep, afterp};
+        wavep->nullTxn(nullTxn);
+        listp = AstNode::addNextNull(listp, wavep);
     } while (check(VhdlTokType::COMMA));
     return listp;
 }
@@ -2321,6 +2398,11 @@ AstNodeVhdlExpr* V3VhdlParse::parseExpression() {
         lhsp = parseRelation();
     }
     if (!lhsp) return nullptr;
+    // A logical expression repeats one operator, and "nand" and "nor" not
+    // even that, since neither is associative: anything else is written with
+    // parentheses (9.1)
+    int count = 0;
+    VhdlBinaryOp firstOp = VhdlBinaryOp::AND;
     while (true) {
         VhdlBinaryOp op;
         switch (peekType()) {
@@ -2333,6 +2415,16 @@ AstNodeVhdlExpr* V3VhdlParse::parseExpression() {
         default: return lhsp;
         }
         FileLine* const flp = here();
+        if (count == 0) {
+            firstOp = op;
+        } else if (op != firstOp) {
+            flp->v3error("Different logical operators in one expression are parenthesized"
+                         " to say which applies first");
+        } else if (op == VhdlBinaryOp::NAND || op == VhdlBinaryOp::NOR) {
+            flp->v3error("A 'nand' or 'nor' is not repeated without parentheses, since it"
+                         " is not associative");
+        }
+        ++count;
         consume();
         AstNodeVhdlExpr* const rhsp = parseRelation();
         if (!rhsp) return lhsp;

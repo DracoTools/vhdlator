@@ -29,12 +29,12 @@ package p is
   constant neg_c : integer := -mask_c / 3;
   constant modulo_c : integer := (-7) mod 3;
   constant remain_c : integer := (-7) rem 3;
-  constant high_c : integer := byte_t'high;
+  constant high_c : integer := integer(byte_t'high);
   constant pos_c : integer := state_t'pos(done);
   constant succ_c : state_t := state_t'succ(idle);
   constant image_c : string := "n=" & integer'image(42);
   constant value_c : integer := integer'value("17");
-  constant real_c : real := 5.0 / 2;
+  constant real_c : real := real(5.0 / 2);
   -- A decimal real literal is one number, not a sum of scaled digits: adding
   -- 7*0.1 and then 5*0.01 gives 0.7500000000000001 rather than 0.75 (15.5.2)
   constant three_quarters : real := 0.75;

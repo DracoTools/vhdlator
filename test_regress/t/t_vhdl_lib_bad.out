@@ -1,4 +1,5 @@
-%Error: t/t_vhdl_lib_bad.vhd:12:1: Circular dependency between design units: 'work.circ_a' and 'work.circ_b'
+%Error: t/t_vhdl_lib_bad.vhd:12:1: Design unit 'work.circ_a' needs 'work.circ_b', which is written after it in the same file; a design file is analyzed in order
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_lib_bad.vhd:12:1: Circular dependency between design units: 'work.circ_a' and 'work.circ_b'
 %Error: t/t_vhdl_lib_bad.vhd:20:1: Design unit 'work.nowhere' not found, needed by 'work.t'
 %Error: Exiting due to

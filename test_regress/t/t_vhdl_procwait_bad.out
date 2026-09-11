@@ -1,11 +1,13 @@
 %Error: t/t_vhdl_procwait_bad.vhd:32:12: A variable declared in an architecture must be a shared variable: 'bad_var'
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_procwait_bad.vhd:31:19: A shared variable must be of a protected type since VHDL-2000, but 'bad_shared' is of type integer
+%Warning-VHDLSHARED: t/t_vhdl_procwait_bad.vhd:31:19: A shared variable is of a protected type since VHDL-2000, but 'bad_shared' is of type integer
+                     ... For warning description see https://verilator.org/warn/VHDLSHARED?v=latest
+                     ... Use "/* verilator lint_off VHDLSHARED */" and lint_on around source to disable this message.
 %Error: t/t_vhdl_procwait_bad.vhd:43:5: A function cannot wait, and the procedure called here does: it computes its value at once, in no simulated time
 %Error: t/t_vhdl_procwait_bad.vhd:61:5: A process with a sensitivity list cannot wait: it resumes when a signal in its list changes and at no other point
 %Error: t/t_vhdl_procwait_bad.vhd:65:5: A process with a sensitivity list cannot wait, and the procedure called here does: it resumes when a signal in its list changes and at no other point
 %Error: t/t_vhdl_procwait_bad.vhd:70:21: A shared variable cannot be declared in a process, where every variable belongs to it alone: 'sv'
-%Error: t/t_vhdl_procwait_bad.vhd:70:21: A shared variable must be of a protected type since VHDL-2000, but 'sv' is of type integer
+%Warning-VHDLSHARED: t/t_vhdl_procwait_bad.vhd:70:21: A shared variable is of a protected type since VHDL-2000, but 'sv' is of type integer
 %Error: t/t_vhdl_procwait_bad.vhd:72:13: A sensitivity list names signals, but 'x' is a variable
 %Error: t/t_vhdl_procwait_bad.vhd:73:14: A signal in a sensitivity list is named statically, but this name's index depends on 'i'
 %Error: t/t_vhdl_procwait_bad.vhd:74:14: A timeout is of type time, but this number has no unit

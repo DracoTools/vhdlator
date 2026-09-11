@@ -51,6 +51,9 @@ std::vector<V3VhdlLib::Unit> s_units;  // Every unit, in the order read
 std::map<std::string, size_t> s_byKey;  // key -> index into s_units
 std::vector<AstNodeVhdlUnit*> s_ordered;  // Result of computeOrder()
 std::set<std::string> s_reportedMissing;  // Keys already complained about
+// Where each key was first written: a later unit of the same name replaces
+// it, but a unit written in between was analyzed against the first (13.5)
+std::map<std::string, const FileLine*> s_firstWritten;
 // Units whose key was already taken. Reported by computeOrder rather than by
 // addFile, so that every library diagnostic comes from one place and a
 // duplicate does not stop the missing and circular checks from running.
@@ -125,6 +128,7 @@ bool V3VhdlLib::isPredefinedLib(const std::string& libname) {
 void V3VhdlLib::clear() {
     s_units.clear();
     s_byKey.clear();
+    s_firstWritten.clear();
     s_ordered.clear();
     s_reportedMissing.clear();
 }
@@ -154,6 +158,17 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             std::vector<std::string> parts;
             if (flattenName(cfgp->entityNamep(), parts) && !parts.empty()) {
                 unit.dependsOn.push_back(primaryKey(work, parts.back()));
+                // And the architecture it configures, whose statements its
+                // block configurations name (3.4)
+                const AstVhdlBlockConfig* const bcp = cfgp->blockConfigp();
+                const AstVhdlEntitySpec* const specp
+                    = bcp ? VN_CAST(bcp->specp(), VhdlEntitySpec) : nullptr;
+                const AstVhdlName* const archp
+                    = specp ? VN_CAST(specp->namesp(), VhdlName) : nullptr;
+                if (archp) {
+                    unit.dependsOn.push_back(primaryKey(work, parts.back()) + "("
+                                             + lower(archp->name()) + ")");
+                }
             }
         } else if (const AstVhdlPackageInst* const instp = VN_CAST(unitp, VhdlPackageInst)) {
             // A package instantiation needs the package it copies, which its
@@ -192,10 +207,28 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             unit.key = primaryKey(work, unitp->name());
         }
 
+        std::set<const AstNode*> contextItems;
         for (AstNode* itemp = unitp->contextp(); itemp; itemp = itemp->nextp()) {
+            contextItems.insert(itemp);
             addContextDependency(VN_AS(itemp, VhdlContextItem), work, unit.dependsOn,
                                  unit.followsLibs);
         }
+        // A use clause in a declarative part needs its package as much as one
+        // in the context clause does (12.4). Only "lib.unit.item" is a design
+        // unit for certain: "use inst.all" may name a package instantiated
+        // in the region itself.
+        unitp->foreach([&](const AstVhdlContextItem* itemp) {
+            if (contextItems.count(itemp) || itemp->kind() != VhdlContextKind::USE) return;
+            for (AstNode* nodep = itemp->namesp(); nodep; nodep = nodep->nextp()) {
+                std::vector<std::string> parts;
+                if (!flattenName(VN_AS(nodep, NodeVhdlExpr), parts) || parts.size() < 2) continue;
+                // "use work.unit" names a unit too, where the prefix is
+                // certainly a library
+                if (parts.size() == 2 && (parts[0] != "work" || parts[1] == "all")) continue;
+                const std::string lib = parts[0] == "work" ? work : parts[0];
+                unit.dependsOn.push_back(lib + "." + parts[1]);
+            }
+        });
         // "package p is new work.poly generic map (<>)" needs work.poly
         // analyzed first, and says so nowhere in the context clause (6.5.5)
         unitp->foreach([&](const AstVhdlIfaceDecl* ifp) {
@@ -207,6 +240,21 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, name));
         });
 
+        // "ieee.numeric_bit.to_unsigned(x, 8)" names a package no context
+        // clause need mention (12.3), and it has to be analyzed first
+        unitp->foreach([&](const AstVhdlSelected* selp) {
+            const AstVhdlSelected* innerp = selp;
+            while (VN_IS(innerp->prefixp(), VhdlSelected)) {
+                innerp = VN_AS(innerp->prefixp(), VhdlSelected);
+            }
+            if (innerp != selp) return;  // Only the innermost
+            const AstVhdlName* const libp = VN_CAST(selp->prefixp(), VhdlName);
+            const AstVhdlName* const pkgp = VN_CAST(selp->suffixp(), VhdlName);
+            if (!libp || !pkgp || !isPredefinedLib(libp->name())) return;
+            unit.softDependsOn.push_back(primaryKey(lower(libp->name()), pkgp->name()));
+        });
+
+        s_firstWritten.emplace(unit.key, unitp->fileline());
         const auto it = s_byKey.find(unit.key);
         if (it != s_byKey.end()) {
             // Analyzing a design unit deletes any earlier one of the same
@@ -283,6 +331,18 @@ bool V3VhdlLib::computeOrder() {
                     continue;
                 }
                 const size_t next = it->second;
+                // A design file is analyzed in order (13.1), so a unit cannot
+                // need one written after it in the same file: that one is not
+                // yet in the library when this one is analyzed
+                const FileLine* const ufl = unit.nodep->fileline();
+                const FileLine* const dfl = s_firstWritten[s_units[next].key];
+                if (!soft && ufl->filename() == dfl->filename() && dfl->lineno() > ufl->lineno()) {
+                    unit.nodep->fileline()->v3error(
+                        "Design unit '" << unit.key << "' needs '" << s_units[next].key
+                                        << "', which is written after it in the same file;"
+                                           " a design file is analyzed in order");
+                    ok = false;
+                }
                 // A soft dependency only says which order to take two units
                 // in, so where it would close a cycle it is simply dropped --
                 // "use work.all" names the whole library, itself included

@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_unitorder_bad.vhd:15:1: Design unit 'work.nowhere' not found, needed by 'work.t_vhdl_unitorder_bad(a)'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_unitorder_bad.vhd:20:1: Design unit 'work.t_vhdl_unitorder_bad(missing)' not found, needed by 'work.t_vhdl_unitorder_cfg'
+%Error: t/t_vhdl_unitorder_bad.vhd:25:1: Design unit 'work.t_vhdl_unitorder_late(early)' needs 'work.t_vhdl_unitorder_late', which is written after it in the same file; a design file is analyzed in order
+%Error: t/t_vhdl_unitorder_bad.vhd:21:3: Entity 't_vhdl_unitorder_bad' has no architecture 'missing' for this configuration to configure
+%Error: Exiting due to

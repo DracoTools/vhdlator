@@ -626,8 +626,6 @@ void V3VhdlStd::build() {
     addFunc(s_standardp, "*", s_univRealp, {s_univRealp, s_univIntp});
     addFunc(s_standardp, "*", s_univRealp, {s_univIntp, s_univRealp});
     addFunc(s_standardp, "/", s_univRealp, {s_univRealp, s_univIntp});
-    addFunc(s_standardp, "*", s_realp, {s_realp, s_univIntp});
-    addFunc(s_standardp, "*", s_realp, {s_univIntp, s_realp});
 
     // The FOREIGN attribute (16.2), how a subprogram binds to C
     {

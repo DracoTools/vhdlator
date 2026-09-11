@@ -1,0 +1,12 @@
+%Error: t/t_vhdl_semrules_bad.vhd:50:20: A case choice is locally static, and this one depends on generic 'g'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_semrules_bad.vhd:51:13: The prefix of 'driving is a signal
+%Error: t/t_vhdl_semrules_bad.vhd:52:13: 'driving asks what is driven, and 'd' is of mode in
+%Error: t/t_vhdl_semrules_bad.vhd:69:27: The initial value of constant 'c' must be of type integer, but is of type mc
+%Error: t/t_vhdl_semrules_bad.vhd:70:10: A signal must be given its bounds where it is declared, but vv leaves them open; only a constant takes them from its value: 'x'
+%Error: t/t_vhdl_semrules_bad.vhd:71:14: 'mc' is declared by more than one package a use clause makes visible here, so neither is visible
+%Error: t/t_vhdl_semrules_bad.vhd:72:31: Package 't_vhdl_semrules_gen' has generics, so a use clause names an instance of it rather than it
+%Error: t/t_vhdl_semrules_bad.vhd:77:9: Generic 'bg' has no default value, so it must be given one in the block's generic map
+%Error: t/t_vhdl_semrules_bad.vhd:41:14: A signal parameter of mode out cannot be read: 'c'
+%Error: t/t_vhdl_semrules_bad.vhd:53:12: A subprogram is given values, and 'integer' is a type
+%Error: Exiting due to

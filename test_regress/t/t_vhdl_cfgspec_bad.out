@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_cfgspec_bad.vhd:34:7: Instance 'i3' is of component c1, not c2
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_cfgspec_bad.vhd:35:12: A configuration specification names a component, and 't_vhdl_cfgspec_bad' is not one
+%Error: t/t_vhdl_cfgspec_bad.vhd:36:7: 'nosuch' labels no component instance in this region
+%Error: t/t_vhdl_cfgspec_bad.vhd:37:7: 'i2' is not an instance of a component
+%Error: t/t_vhdl_cfgspec_bad.vhd:38:7: Instance 'i1' is configured more than once
+%Error: t/t_vhdl_cfgspec_bad.vhd:39:7: 'i5' labels no component instance in this region
+%Error: t/t_vhdl_cfgspec_bad.vhd:40:30: An entity aspect names an entity, and 'work.t_vhdl_cfgspec_pkg' is not one
+%Error: t/t_vhdl_cfgspec_bad.vhd:41:3: Component c2 is already given an 'all' or 'others' configuration specification here
+%Error: Exiting due to

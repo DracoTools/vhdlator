@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_targets_bad.vhd:50:6: The target of a variable assignment is a variable or an aggregate of them, and this denotes no object
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_targets_bad.vhd:51:8: The target of a variable assignment is a variable or an aggregate of them, and this denotes no object
+%Error: t/t_vhdl_targets_bad.vhd:52:5: The target of a variable assignment is a variable or an aggregate of them, and this denotes no object
+%Error: t/t_vhdl_targets_bad.vhd:53:7: A name in an aggregate target is locally static, and this one is not
+%Error: t/t_vhdl_targets_bad.vhd:54:9: An aggregate target names each object once, but 'x' appears twice
+%Error: t/t_vhdl_targets_bad.vhd:58:33: The implicit signal GUARD is the value of its block's guard expression, and cannot be assigned
+%Error: t/t_vhdl_targets_bad.vhd:59:55: Port 'i' is of type bit, but its actual is of type bit_vector
+%Error: t/t_vhdl_targets_bad.vhd:21:8: A port of mode linkage is read only as the actual of another port of mode linkage: 'l'
+%Error: Exiting due to

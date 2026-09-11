@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_cfgnames_bad.vhd:49:5: 'nosuch' is not a block or generate statement of the region this block configuration is in
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_cfgnames_bad.vhd:58:9: This block configuration configures architecture 'rtl', which the binding names, not 'other'
+%Error: t/t_vhdl_cfgnames_bad.vhd:70:11: 'missing' is not a block or generate statement of the region this block configuration is in
+%Error: Exiting due to
