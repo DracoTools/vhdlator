@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_portdecl_bad.vhd:13:5: A port is a signal, so it cannot be declared a constant
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_portdecl_bad.vhd:14:5: A port is a signal, so it cannot be declared a variable
+%Error: t/t_vhdl_portdecl_bad.vhd:20:12: An interface list must declare at least one element
+%Error: Exiting due to

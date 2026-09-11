@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_portmode_bad.vhd:40:66: Port 'pi' is of mode in, so it cannot be given for port 'b', which writes it
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_portmode_bad.vhd:41:75: Port 'pi' is of mode in, so it cannot be given for port 'c', which writes it
+%Error: t/t_vhdl_portmode_bad.vhd:42:10: Port 'a' of mode in has no default value, so it must be given something in the port map
+%Error: t/t_vhdl_portmode_bad.vhd:43:10: Port 'a' of mode in has no default value, so it must be given something in the port map
+%Error: Exiting due to

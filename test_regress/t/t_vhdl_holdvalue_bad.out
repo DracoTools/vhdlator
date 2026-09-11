@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_holdvalue_bad.vhd:27:24: The default value of 'g_bad' must be of type integer, but is of type boolean
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_holdvalue_bad.vhd:31:23: The default value of 'p_bad' must be of type bit, but is of type universal_integer
+%Error: t/t_vhdl_holdvalue_bad.vhd:36:12: A constant holds a value, so it cannot be of an access type: 'c_ptr' is of type int_ptr
+%Error: t/t_vhdl_holdvalue_bad.vhd:37:10: A signal holds a value, so it cannot be of an access type: 's_ptr' is of type int_ptr
+%Error: t/t_vhdl_holdvalue_bad.vhd:38:12: A constant given no value is a deferred constant, which only a package declaration may declare: 'c_deferred'
+%Error: Exiting due to

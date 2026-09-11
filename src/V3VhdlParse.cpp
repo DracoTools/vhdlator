@@ -582,6 +582,11 @@ AstNodeVhdl* V3VhdlParse::parseDeclarativeItem() {
 AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceList(VhdlIfaceKind dflt) {
     // interface_list ::= interface_element { ; interface_element }   (6.5.6)
     AstVhdlIfaceDecl* listp = nullptr;
+    // An interface list has at least one element: "port ( )" declares no
+    // ports by leaving the clause out, not by leaving it empty
+    if (peekType() == VhdlTokType::RPAREN) {
+        here()->v3error("An interface list must declare at least one element");
+    }
     do {
         if (peekType() == VhdlTokType::RPAREN) break;  // Tolerate a trailing ';'
         AstVhdlIfaceDecl* const elemp = parseInterfaceElement(dflt);
@@ -675,7 +680,14 @@ AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceElement(VhdlIfaceKind dflt) {
         kind = VhdlIfaceKind::FILE;
         classGiven = true;
     }
-    (void)classGiven;
+    // A port clause is parsed with SIGNAL as its class, and a port is a
+    // signal whatever is written (6.5.6.3)
+    if (classGiven && dflt == VhdlIfaceKind::SIGNAL && kind != VhdlIfaceKind::SIGNAL) {
+        flp->v3error("A port is a signal, so it cannot be declared "
+                     << (kind == VhdlIfaceKind::CONSTANT   ? "a constant"
+                         : kind == VhdlIfaceKind::VARIABLE ? "a variable"
+                                                           : "a file"));
+    }
 
     // identifier_list
     std::vector<std::pair<std::string, FileLine*>> names;

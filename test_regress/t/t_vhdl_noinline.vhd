@@ -6,18 +6,35 @@
 -- SPDX-License-Identifier: CC0-1.0
 
 package pk is
-    shared variable calls : natural;
+    -- A shared variable is of a protected type (6.4.2.4)
+    type counter_t is protected
+        procedure add (constant n : natural);
+        impure function get return natural;
+    end protected;
+    shared variable calls : counter_t;
     procedure note (constant n : natural);
     function twice (constant n : natural) return natural;
 end package;
 
 package body pk is
+    type counter_t is protected body
+        variable total : natural := 0;
+        procedure add (constant n : natural) is
+        begin
+            total := total + n;
+        end procedure;
+        impure function get return natural is
+        begin
+            return total;
+        end function;
+    end protected body;
+
     -- Reaches an object the package declares, which is one object for the
     -- whole design: a subprogram emitted as a function of its own still
     -- names it
     procedure note (constant n : natural) is
     begin
-        calls := calls + n;
+        calls.add(n);
     end procedure;
 
     function twice (constant n : natural) return natural is
@@ -73,7 +90,7 @@ begin
         wait for 1 ns;
         assert q = 12 report "q=" & natural'image(q) severity failure;
 
-        assert calls = 12 report "calls=" & natural'image(calls) severity failure;
+        assert calls.get = 12 report "calls=" & natural'image(calls.get) severity failure;
 
         report "*-* All Finished *-*";
         std.env.finish;

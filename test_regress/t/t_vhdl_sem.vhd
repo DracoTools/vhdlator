@@ -71,7 +71,17 @@ end entity;
 architecture rtl of t is
   signal count : natural := 0;
   signal flag  : boolean;
-  shared variable total : integer;
+  type acc_t is protected
+    procedure add (n : integer);
+  end protected;
+  type acc_t is protected body
+    variable sum : integer := 0;
+    procedure add (n : integer) is
+    begin
+      sum := sum + n;
+    end procedure;
+  end protected body;
+  shared variable total : acc_t;
 begin
   main : process (clk) is
     variable local : integer := 0;

@@ -36,6 +36,7 @@ VHDLENTITY work.t
   port q : bit_vector
   generic width : positive
 VHDLARCHITECTURE work.rtl
+  type acc_t : acc_t
   signal count : natural
   signal flag : boolean
-  shared variable total : integer
+  shared variable total : acc_t

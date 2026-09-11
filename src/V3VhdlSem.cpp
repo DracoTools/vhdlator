@@ -49,6 +49,14 @@
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
+// The node a node is a child of. backp() is the previous sibling for any
+// node but the first of a list, so walking it upward passes through every
+// declaration written earlier in the same region before reaching the region.
+static const AstNode* parentOf(const AstNode* nodep) {
+    while (nodep->backp() && nodep->backp()->nextp() == nodep) nodep = nodep->backp();
+    return nodep->backp();
+}
+
 //######################################################################
 
 namespace {
@@ -175,7 +183,32 @@ class VhdlSemVisitor final : public VNVisitor {
             } else if (VN_IS(dp, VhdlComponentDecl)) {
                 err(dp->fileline(), "A component cannot be declared in " + where + ": '"
                                         + VN_AS(dp, NodeVhdlDecl)->name() + "'");
+            } else if (VN_IS(dp, VhdlConfigSpec) || VN_IS(dp, VhdlDisconnectSpec)) {
+                // Both are about the structure of a design, which a process
+                // or a subprogram has none of (11.3, 4.3)
+                err(dp->fileline(),
+                    std::string{VN_IS(dp, VhdlConfigSpec) ? "A configuration" : "A disconnection"}
+                        + " specification cannot be written in " + where);
             }
+            if (const AstVhdlObjectDecl* const odp = VN_CAST(dp, VhdlObjectDecl)) {
+                if (odp->kind() == VhdlObjKind::SHARED_VARIABLE) {
+                    err(dp->fileline(), "A shared variable cannot be declared in " + where
+                                            + ", where every variable belongs to it alone: '"
+                                            + odp->name() + "'");
+                }
+            }
+        }
+    }
+
+    // Outside a process or a subprogram a variable is visible to every
+    // process at once, so it has to be declared shared for that to be what
+    // the design meant (6.4.2.4)
+    void rejectUnsharedVariables(AstNode* declsp, const std::string& where) {
+        for (AstNode* dp = declsp; dp; dp = dp->nextp()) {
+            const AstVhdlObjectDecl* const odp = VN_CAST(dp, VhdlObjectDecl);
+            if (!odp || odp->kind() != VhdlObjKind::VARIABLE) continue;
+            err(dp->fileline(), "A variable declared in " + where + " must be a shared variable: '"
+                                    + odp->name() + "'");
         }
     }
 
@@ -1308,6 +1341,21 @@ public:
 
     void analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    // A constant, a signal, a generic and a port hold values, and a value is
+    // never an access, a file or a protected object: only a variable can be
+    // one of those (6.4.2.2, 6.4.2.3, 6.5.2)
+    void checkHoldsValue(FileLine* flp, const VhdlType* typep, const char* what,
+                         const std::string& name) {
+        if (!typep || typep->isError() || m_inSpecialized) return;
+        const VhdlTypeKind kind = typep->base()->kind();
+        const char* const which = kind == VhdlTypeKind::ACCESS      ? "an access"
+                                  : kind == VhdlTypeKind::FILE      ? "a file"
+                                  : kind == VhdlTypeKind::PROTECTED ? "a protected"
+                                                                    : nullptr;
+        if (!which) return;
+        err(flp, std::string{what} + " holds a value, so it cannot be of " + which + " type: '"
+                     + name + "' is of type " + typep->prettyName());
+    }
     // The class of object a name denotes, and whether it is of mode IN.
     // UNKNOWN where the name reaches its object through an access value or a
     // call, whose class is not the name's to say.
@@ -1315,8 +1363,15 @@ public:
     struct ObjInfo final {
         ObjClass cls = ObjClass::UNKNOWN;
         bool modeIn = false;
+        bool modeOut = false;
         const VhdlSymbol* symp = nullptr;
     };
+    // Subprogram bodies already found able to suspend, or not
+    std::map<const AstVhdlSubprogDecl*, bool> m_suspends;
+    AstNode* suspendingStmt(AstNode* stmtsp) VL_MT_DISABLED;
+    bool procedureSuspends(const AstVhdlProcCall* pcp) VL_MT_DISABLED;
+    void checkSensitivityName(AstNodeVhdlExpr* exprp) VL_MT_DISABLED;
+    static const VhdlSymbol* nonStaticIndex(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
     static ObjInfo objectOfName(const AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
     static ObjInfo objectOfSymbol(const VhdlSymbol* symp) VL_MT_DISABLED;
     static const char* objClassName(ObjClass cls) {
@@ -1589,6 +1644,7 @@ private:
                                    bool generics) VL_MT_DISABLED;
     static const VhdlSymbol* portAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
     void markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
     // Expressions (clauses 8, 9, 12.5)
@@ -1818,6 +1874,44 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         // variable is given them where it is declared, since what it holds
         // later can be of any length the subtype allows (5.3.2.2, 5.3.3).
         const VhdlType* const typep = symp->typep();
+        if (kind == VhdlSymKind::CONSTANT) {
+            checkHoldsValue(nodep->fileline(), typep, "A constant", nodep->prettyName());
+        } else if (kind == VhdlSymKind::SIGNAL) {
+            checkHoldsValue(nodep->fileline(), typep, "A signal", nodep->prettyName());
+        }
+        // A constant given no value is deferred, and only a package
+        // declaration may defer one: its package body gives the value
+        // (4.7, 6.4.2.2)
+        if (kind == VhdlSymKind::CONSTANT && !nodep->defaultp() && !m_inSpecialized) {
+            bool inPackage = false;
+            for (const AstNode* upp = parentOf(nodep); upp; upp = parentOf(upp)) {
+                if (VN_IS(upp, VhdlSubprogDecl) || VN_IS(upp, VhdlProcess)
+                    || VN_IS(upp, VhdlProtectedType)) {
+                    break;
+                }
+                if (VN_IS(upp, VhdlPackage) || VN_IS(upp, VhdlPackageInst)) {
+                    inPackage = true;
+                    break;
+                }
+                if (VN_IS(upp, NodeVhdlUnit)) break;
+            }
+            if (!inPackage && !m_inPackageInstance) {
+                err(nodep->fileline(), "A constant given no value is a deferred constant, which"
+                                       " only a package declaration may declare: '"
+                                           + nodep->prettyName() + "'");
+            }
+        }
+        // Since VHDL-2000 a shared variable is of a protected type, which is
+        // what makes it safe for several processes to use (6.4.2.4)
+        if (kind == VhdlSymKind::SHARED_VARIABLE && typep && !typep->isError()
+            && typep->base()->kind() != VhdlTypeKind::PROTECTED
+            && typep->base()->kind() != VhdlTypeKind::INCOMPLETE
+            && nodep->fileline()->language() >= V3LangCode::L1076_2000 && !m_inSpecialized) {
+            err(nodep->fileline(), "A shared variable must be of a protected type since"
+                                   " VHDL-2000, but '"
+                                       + nodep->prettyName() + "' is of type "
+                                       + typep->prettyName());
+        }
         if ((kind == VhdlSymKind::SIGNAL || kind == VhdlSymKind::VARIABLE) && typep
             && !typep->isError() && leavesBoundsOpen(nodep->subtypep())) {
             err(nodep->fileline(), std::string{"A "} + symp->kindName()
@@ -1982,7 +2076,21 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
     }
     nodep->vhdlSymp(symp);
     declare(symp, nodep->fileline());
-    if (nodep->defaultp()) analyzeExpr(nodep->defaultp(), symp->typep());
+    if (kind == VhdlSymKind::GENERIC) {
+        checkHoldsValue(nodep->fileline(), symp->typep(), "A generic", nodep->prettyName());
+    } else if (kind == VhdlSymKind::PORT) {
+        checkHoldsValue(nodep->fileline(), symp->typep(), "A port", nodep->prettyName());
+    }
+    if (nodep->defaultp()) {
+        analyzeExpr(nodep->defaultp(), symp->typep());
+        if ((kind == VhdlSymKind::GENERIC || kind == VhdlSymKind::PORT)
+            && !valueFitsType(nodep->defaultp(), symp->typep())) {
+            err(nodep->defaultp()->fileline(),
+                "The default value of '" + nodep->prettyName() + "' must be of type "
+                    + symp->typep()->prettyName() + ", but is of type "
+                    + nodep->defaultp()->vhdlTypep()->prettyName());
+        }
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
@@ -2158,6 +2266,17 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
             rejectDecls(nodep->declsp(), "a subprogram");
             iterateAndNextNull(nodep->declsp());
             iterateAndNextNull(nodep->stmtsp());
+            // A function computes its value at once, in no simulated time, so
+            // nothing in it waits -- itself or in a procedure it calls (10.2)
+            if (nodep->isFunction() && !m_inSpecialized) {
+                if (AstNode* const waitp = suspendingStmt(nodep->stmtsp())) {
+                    err(waitp->fileline(),
+                        std::string{"A function cannot wait"}
+                            + (VN_IS(waitp, VhdlWait) ? ""
+                                                      : ", and the procedure called here does")
+                            + ": it computes its value at once, in no simulated time");
+                }
+            }
             // A function whose result type leaves something open gets it
             // from what the body returns (5.3.3, 4.2.1). That is a record
             // with an element of an unconstrained array type, and it is
@@ -2507,12 +2626,121 @@ void VhdlSemVisitor::visit(AstVhdlProcess* nodep) {
     // process's own, so it is analyzed before that region is opened (11.3)
     for (AstNode* sp = nodep->sensp(); sp; sp = sp->nextp()) {
         analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
+        checkSensitivityName(VN_AS(sp, NodeVhdlExpr));
     }
     pushScope(nodep->name().empty() ? "process" : nodep->name());
     rejectDecls(nodep->declsp(), "a process");
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
     popScope();
+    // A process with a sensitivity list resumes when one of those signals
+    // changes and at no other point, so nothing in it may wait -- itself or
+    // in a procedure it calls (11.3, 10.2)
+    if ((nodep->hasSensList() || nodep->sensAll()) && !m_inSpecialized) {
+        if (AstNode* const waitp = suspendingStmt(nodep->stmtsp())) {
+            err(waitp->fileline(),
+                std::string{"A process with a sensitivity list cannot wait"}
+                    + (VN_IS(waitp, VhdlWait) ? "" : ", and the procedure called here does")
+                    + ": it resumes when a signal in its list changes and at no other point");
+        }
+    }
+}
+
+// The first statement among these that can suspend the process running
+// them: a wait statement, or a call of a procedure that can (10.2)
+AstNode* VhdlSemVisitor::suspendingStmt(AstNode* stmtsp) {
+    AstNode* foundp = nullptr;
+    for (AstNode* sp = stmtsp; sp && !foundp; sp = sp->nextp()) {
+        sp->foreach([&](AstNode* np) {
+            if (foundp) return;
+            if (VN_IS(np, VhdlWait)) {
+                foundp = np;
+            } else if (const AstVhdlProcCall* const pcp = VN_CAST(np, VhdlProcCall)) {
+                if (procedureSuspends(pcp)) foundp = np;
+            }
+        });
+    }
+    return foundp;
+}
+
+bool VhdlSemVisitor::procedureSuspends(const AstVhdlProcCall* pcp) {
+    const AstNodeVhdlExpr* callp = pcp->callp();
+    const VhdlSymbol* symp = callp ? callp->vhdlSymp() : nullptr;
+    if (!symp) {
+        if (const AstVhdlCall* const cp = VN_CAST(callp, VhdlCall)) {
+            symp = cp->prefixp()->vhdlSymp();
+        }
+    }
+    if (!symp) return false;
+    AstVhdlSubprogDecl* const bodyp = symp->resolved()->bodyp();
+    if (!bodyp) return false;
+    const auto it = m_suspends.find(bodyp);
+    if (it != m_suspends.end()) return it->second;
+    m_suspends[bodyp] = false;  // A recursion is decided by the rest of the body
+    const bool suspends = suspendingStmt(bodyp->stmtsp()) != nullptr;
+    m_suspends[bodyp] = suspends;
+    return suspends;
+}
+
+// What a sensitivity list or a "wait on" names is a signal, by a static name,
+// since the list is fixed when the process is elaborated (10.2, 11.3)
+void VhdlSemVisitor::checkSensitivityName(AstNodeVhdlExpr* exprp) {
+    if (m_inSpecialized || !exprp) return;
+    const bool notName = VN_IS(exprp, VhdlLiteral) || VN_IS(exprp, VhdlBinary)
+                         || VN_IS(exprp, VhdlUnary) || VN_IS(exprp, VhdlAggregate)
+                         || VN_IS(exprp, VhdlQualified);
+    const ObjInfo info = notName ? ObjInfo{} : objectOfName(exprp);
+    if (notName || (info.cls != ObjClass::UNKNOWN && info.cls != ObjClass::SIGNAL)) {
+        err(exprp->fileline(),
+            "A sensitivity list names signals, but "
+                + (notName ? std::string{"this is a value"}
+                           : "'" + info.symp->name() + "' is " + objClassName(info.cls)));
+        return;
+    }
+    if (info.cls != ObjClass::SIGNAL) return;
+    if (const VhdlSymbol* const varyingp = nonStaticIndex(exprp)) {
+        err(exprp->fileline(), "A signal in a sensitivity list is named statically, but this"
+                               " name's index depends on '"
+                                   + varyingp->name() + "'");
+        return;
+    }
+    // Before VHDL-2008 a port of mode out cannot be read, and being
+    // sensitive to one reads it
+    if (info.modeOut && exprp->fileline()->language() < V3LangCode::L1076_2008) {
+        err(exprp->fileline(), "A port of mode out cannot be read before VHDL-2008, and a"
+                               " sensitivity list reads it: '"
+                                   + info.symp->name() + "'");
+    }
+}
+
+// An object of a name's indexes or slice bounds that is not static: a
+// variable or a signal, whose value is only known as the design runs
+const VhdlSymbol* VhdlSemVisitor::nonStaticIndex(AstNodeVhdlExpr* nodep) {
+    for (int depth = 0; nodep && depth < 64; ++depth) {
+        if (AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            nodep = selp->prefixp();
+            continue;
+        }
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp) return nullptr;
+        const VhdlSymbol* foundp = nullptr;
+        for (AstNode* ap = callp->argsp(); ap && !foundp; ap = ap->nextp()) {
+            ap->foreach([&](const AstVhdlName* namep) {
+                const VhdlSymbol* const symp
+                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                if (!foundp && symp
+                    && (symp->kind() == VhdlSymKind::VARIABLE
+                        || symp->kind() == VhdlSymKind::SHARED_VARIABLE
+                        || symp->kind() == VhdlSymKind::SIGNAL
+                        || symp->kind() == VhdlSymKind::PORT)) {
+                    foundp = symp;
+                }
+            });
+        }
+        if (foundp) return foundp;
+        nodep = callp->prefixp();
+    }
+    return nullptr;
 }
 
 void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
@@ -2550,6 +2778,7 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
             }
         }
     }
+    if (!m_inSpecialized) rejectUnsharedVariables(nodep->declsp(), "a block");
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
     popScope();
@@ -2636,6 +2865,7 @@ void VhdlSemVisitor::visit(AstVhdlGenerateBody* nodep) {
         analyzeChoice(VN_AS(p, VhdlChoice), m_genSelTypep);
     }
     pushScope(nodep->name().empty() ? "generate body" : nodep->name());
+    if (!m_inSpecialized) rejectUnsharedVariables(nodep->declsp(), "a generate statement");
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
     popScope();
@@ -2868,6 +3098,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             fillOpenGenericDefaults(unitScopep);
             m_ifacePos = 0;
             iterateAndNextNull(entp->portsp());
+            if (!m_inSpecialized) rejectUnsharedVariables(entp->declsp(), "an entity");
             iterateAndNextNull(entp->declsp());
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
             m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
@@ -2897,6 +3128,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // which is the one an entity copied for a generic type gets
                 m_archUnits[lib + "." + parts.back()] = archp;
             }
+            if (!m_inSpecialized) rejectUnsharedVariables(archp->declsp(), "an architecture");
             iterateAndNextNull(archp->declsp());
             iterateAndNextNull(archp->stmtsp());
             analyzeDrivers(archp);
@@ -2904,6 +3136,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             // A package's own name is visible inside it (12.1)
             unitScopep->addNamed(lower(unitp->name()), unitScopep);
             iterateAndNextNull(pkgp->genericsp());
+            if (!m_inSpecialized) rejectUnsharedVariables(pkgp->declsp(), "a package");
             iterateAndNextNull(pkgp->declsp());
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
             m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
@@ -2936,6 +3169,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             }
             VL_RESTORER(m_inPackageBody);
             m_inPackageBody = true;
+            if (!m_inSpecialized) rejectUnsharedVariables(bodyp->declsp(), "a package body");
             iterateAndNextNull(bodyp->declsp());
         } else if (AstVhdlConfiguration* const cfgp = VN_CAST(unitp, VhdlConfiguration)) {
             // A binding indication may carry generic and port maps of its
@@ -4810,7 +5044,7 @@ void VhdlSemVisitor::checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& units
             }
             const VhdlSymbol* const symp = declp->vhdlSymp();
             if (!symp || symp->hasBody() || symp->isForeign()) return;
-            for (const AstNode* upp = declp->backp(); upp; upp = upp->backp()) {
+            for (const AstNode* upp = parentOf(declp); upp; upp = parentOf(upp)) {
                 // A subprogram of an interface list is a generic, and one of
                 // a protected type is completed by the protected type body
                 if (VN_IS(upp, VhdlIfaceDecl) || VN_IS(upp, VhdlProtectedType)) return;
@@ -5859,7 +6093,7 @@ static bool makesImplicitSignal(const std::string& attr) {
 
 // Whether this declaration is a parameter of a subprogram rather than a port
 static bool isSubprogramParam(const AstNode* declp) {
-    for (const AstNode* upp = declp; upp; upp = upp->backp()) {
+    for (const AstNode* upp = declp; upp; upp = parentOf(upp)) {
         if (VN_IS(upp, VhdlSubprogDecl)) return true;
     }
     return false;
@@ -8215,6 +8449,7 @@ VhdlSemVisitor::ObjInfo VhdlSemVisitor::objectOfSymbol(const VhdlSymbol* symp) {
     case VhdlSymKind::PORT:
         info.cls = ObjClass::SIGNAL;
         info.modeIn = ifp && ifp->mode() == VhdlMode::IN;
+        info.modeOut = ifp && ifp->mode() == VhdlMode::OUT;
         break;
     case VhdlSymKind::VARIABLE:
     case VhdlSymKind::SHARED_VARIABLE: info.cls = ObjClass::VARIABLE; break;
@@ -8505,11 +8740,25 @@ void VhdlSemVisitor::visit(AstVhdlAssert* nodep) {
 void VhdlSemVisitor::visit(AstVhdlWait* nodep) {
     for (AstNode* sp = nodep->sensp(); sp; sp = sp->nextp()) {
         analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
+        checkSensitivityName(VN_AS(sp, NodeVhdlExpr));
     }
     if (nodep->condp()) analyzeCondition(nodep->condp());
     if (nodep->timeoutp()) {
         analyzeExpr(nodep->timeoutp(), V3VhdlStd::timeType());
-        checkDelay(nodep->timeoutp(), "timeout");
+        // A timeout is a length of time, not a number of anything (10.2): a
+        // bare integer names no unit, so it is not a TIME either
+        const AstNodeVhdlExpr* barep = nodep->timeoutp();
+        if (const AstVhdlUnary* const unp = VN_CAST(barep, VhdlUnary)) barep = unp->lhsp();
+        const AstVhdlLiteral* const litp = VN_CAST(barep, VhdlLiteral);
+        if (litp && (litp->kind() == VhdlLitKind::INTEGER || litp->kind() == VhdlLitKind::REAL)) {
+            err(nodep->timeoutp()->fileline(),
+                "A timeout is of type time, but this number has no unit");
+        } else if (!valueFitsType(nodep->timeoutp(), V3VhdlStd::timeType())) {
+            err(nodep->timeoutp()->fileline(), "A timeout is of type time, but this is of type "
+                                                   + nodep->timeoutp()->vhdlTypep()->prettyName());
+        } else {
+            checkDelay(nodep->timeoutp(), "timeout");
+        }
     }
 }
 
@@ -8619,6 +8868,7 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
     bindOpenGenericBounds(nodep, unitScopep);
     analyzeAssociations(nodep->portMapp(), unitScopep);
     markDrivingPorts(nodep, unitScopep);
+    if (!m_inSpecialized) checkPortAssociations(nodep, unitScopep);
 }
 
 // A port of mode out drives whatever signal the instance associates with it,
@@ -8650,6 +8900,65 @@ void VhdlSemVisitor::markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitSco
         const AstVhdlIfaceDecl* const declp = VN_CAST(portp->declp(), VhdlIfaceDecl);
         if (!declp || declp->mode() != VhdlMode::OUT) continue;
         asp->drives(true);
+    }
+}
+
+// What a port map may give a port (6.5.6.3). A formal the instance writes
+// cannot be given a port of mode in, which nothing may write; before
+// VHDL-2008 a formal of mode in cannot be given a port of mode out, which
+// nothing may read; and a port of mode in with no default of its own must be
+// given something, since otherwise it has no value at all.
+void VhdlSemVisitor::checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) {
+    if (!unitScopep) return;
+    std::set<const VhdlSymbol*> given;
+    int position = 0;
+    for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+        AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+        const int here = position++;
+        const VhdlSymbol* portp = nullptr;
+        if (!asp->formalp()) { portp = portAt(unitScopep, here); }
+        const bool open = !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen);
+        if (asp->formalp()) {
+            // Named whole, in part, or through a conversion: any mention of
+            // the port associates it, unless what it is given is "open"
+            asp->formalp()->foreach([&](const AstVhdlName* namep) {
+                const VhdlSymbol* const symp = namep->vhdlSymp();
+                if (symp && symp->kind() == VhdlSymKind::PORT) {
+                    if (VN_IS(asp->formalp(), VhdlName)) portp = symp;
+                    if (!open) given.insert(symp);
+                }
+            });
+        }
+        if (portp && !open) given.insert(portp);
+        if (!portp || open) continue;
+        const AstVhdlIfaceDecl* const formalp = VN_CAST(portp->declp(), VhdlIfaceDecl);
+        if (!formalp) continue;
+        const ObjInfo info = objectOfName(asp->actualp());
+        if (info.cls != ObjClass::SIGNAL || !info.symp) continue;
+        const VhdlMode fmode = formalp->mode();
+        const bool writes
+            = fmode == VhdlMode::OUT || fmode == VhdlMode::INOUT || fmode == VhdlMode::BUFFER;
+        if (writes && info.modeIn) {
+            err(asp->actualp()->fileline(),
+                "Port '" + info.symp->name() + "' is of mode in, so it cannot be given for port '"
+                    + portp->name() + "', which writes it");
+        } else if (fmode == VhdlMode::IN && info.modeOut
+                   && asp->fileline()->language() < V3LangCode::L1076_2008) {
+            err(asp->actualp()->fileline(),
+                "Port '" + info.symp->name()
+                    + "' is of mode out, which cannot be read before VHDL-2008, so it cannot"
+                      " be given for port '"
+                    + portp->name() + "' of mode in");
+        }
+    }
+    for (const auto& pair : unitScopep->direct()) {
+        const VhdlSymbol* const symp = pair.second;
+        if (symp->kind() != VhdlSymKind::PORT || given.count(symp)) continue;
+        const AstVhdlIfaceDecl* const declp = VN_CAST(symp->declp(), VhdlIfaceDecl);
+        if (!declp || declp->mode() != VhdlMode::IN || declp->defaultp()) continue;
+        err(nodep->fileline(), "Port '" + symp->name()
+                                   + "' of mode in has no default value, so it must be given"
+                                     " something in the port map");
     }
 }
 
