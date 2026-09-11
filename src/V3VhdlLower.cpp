@@ -7276,7 +7276,39 @@ private:
             return valuep;
         }
         newp->addArgsp(new AstArg{flp, "", valuep});
+        // Verilog's "new" is an expression only as the value of an
+        // assignment, which is where it learns what class to make. Anywhere
+        // else -- the value of another allocation, an actual of a call -- the
+        // object is made into a temporary first, and the temporary is the
+        // expression's value.
+        if (!allocatorIsAssigned(nodep)) {
+            AstNodeDType* const dtypep
+                = nodep->vhdlTypep() ? lowerType(nodep->vhdlTypep(), flp) : nullptr;
+            if (VN_IS(dtypep, ClassRefDType)) {
+                AstVar* const tmpp = newTempVar("__Valloc", dtypep, flp);
+                return new AstExprStmt{
+                    flp, new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, newp},
+                    new AstVarRef{flp, tmpp, VAccess::READ}};
+            }
+            if (dtypep) VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+        }
         return newp;
+    }
+
+    // Whether an allocator is itself what an assignment, a declaration or a
+    // return gives, which is the one place its "new" can stand as it is
+    static bool allocatorIsAssigned(const AstVhdlAllocator* nodep) {
+        const AstNode* childp = nodep;
+        while (childp->backp() && childp->backp()->nextp() == childp) childp = childp->backp();
+        const AstNode* const parentp = childp->backp();
+        if (childp != nodep) return false;  // One of a list, so an argument or an element
+        if (const AstVhdlVarAssign* const asgp = VN_CAST(parentp, VhdlVarAssign)) {
+            return asgp->valuep() == nodep;
+        }
+        if (const AstVhdlObjectDecl* const declp = VN_CAST(parentp, VhdlObjectDecl)) {
+            return declp->defaultp() == nodep;
+        }
+        return VN_IS(parentp, VhdlReturn);
     }
 
     // "new t(l to r)" for an array whose bounds only the allocation fixes:
