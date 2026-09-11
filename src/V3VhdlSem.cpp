@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <set>
@@ -4148,7 +4149,7 @@ void VhdlSemVisitor::applyContextItem(AstVhdlContextItem* ctxp) {
         // "use work.all" makes the library's design units visible by simple
         // name (12.4), which "entity e" relies on
         if (parts.size() == 2 && parts[1] == "all") {
-            m_scopep->addNamed("%all:" + lib, libScope(lib));
+            m_scopep->addNamed("*all:" + lib, libScope(lib));
         }
         VhdlScope* targetp = nullptr;
         const auto it = m_unitScopes.find(lib + "." + parts[1]);
@@ -11313,7 +11314,7 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
                 const auto isEntity
                     = [](const VhdlSymbol* symp) { return symp->kind() == VhdlSymKind::ENTITY; };
                 const bool unitVisible = m_scopep->findNamed(parts.back())
-                                         || m_scopep->findNamed("%all:" + m_libname);
+                                         || m_scopep->findNamed("*all:" + m_libname);
                 if (found.empty() && !unitVisible) {
                     err(unitNamep->fileline(), "No entity '" + parts.back()
                                                    + "' is visible here; name it with its"
@@ -11459,6 +11460,26 @@ void VhdlSemVisitor::checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* un
         // GHDL 7.0.0-dev refuse "foo => std_ulogic_vector(bar)", Questa 2025.2
         // takes it
         if (const AstVhdlCall* const cvp = VN_CAST(asp->actualp(), VhdlCall)) {
+            // "x => f(s)" with s a signal is a conversion function on the
+            // actual, whose one parameter is a constant (6.5.7.1): GHDL
+            // 7.0.0-dev and Questa 2025.2 refuse a signal parameter there
+            const VhdlSymbol* const fsymp
+                = cvp->vhdlSymp() ? cvp->vhdlSymp()->resolved() : nullptr;
+            const AstVhdlSubprogDecl* const fdeclp
+                = fsymp && fsymp->kind() == VhdlSymKind::FUNCTION
+                      ? VN_CAST(fsymp->declp(), VhdlSubprogDecl)
+                      : nullptr;
+            const AstVhdlAssoc* const onlyp = VN_CAST(cvp->argsp(), VhdlAssoc);
+            const AstVhdlIfaceDecl* const fparamp = fdeclp ? fdeclp->paramsp() : nullptr;
+            if (fparamp && !fparamp->nextp() && onlyp && !onlyp->nextp()
+                && fparamp->kind() == VhdlIfaceKind::SIGNAL && !m_inSpecialized && onlyp->actualp()
+                && objectOfName(onlyp->actualp()).cls == ObjClass::SIGNAL) {
+                err(cvp->fileline(), "'" + fsymp->name()
+                                         + "' stands as a conversion function in this port"
+                                           " map, and its parameter must then be a constant,"
+                                           " not signal '"
+                                         + fparamp->prettyName() + "'");
+            }
             const VhdlSymbol* const tsymp = cvp->prefixp() && cvp->prefixp()->vhdlSymp()
                                                 ? cvp->prefixp()->vhdlSymp()->resolved()
                                                 : nullptr;
@@ -11601,6 +11622,20 @@ void VhdlSemVisitor::checkPartialAssociations(AstVhdlInstance* nodep) {
                     key = symp->name() + key;
                 break;
             }
+            // An element of it at a static index: "v(1)(3 downto 2)"
+            if (const AstVhdlCall* const idxp = VN_CAST(np, VhdlCall)) {
+                const AstVhdlAssoc* const ap = VN_CAST(idxp->argsp(), VhdlAssoc);
+                const VhdlValue iv = ap && !ap->nextp() && ap->actualp() && !ap->formalp()
+                                         ? V3VhdlEval::eval(ap->actualp())
+                                         : VhdlValue{};
+                if (!iv.isInt()) {
+                    key.clear();
+                    break;
+                }
+                key = "(" + std::to_string(iv.toInt()) + ")" + key;
+                np = idxp->prefixp();
+                continue;
+            }
             const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected);
             const AstVhdlName* const sufp = selp ? VN_CAST(selp->suffixp(), VhdlName) : nullptr;
             if (!sufp) {
@@ -11618,7 +11653,7 @@ void VhdlSemVisitor::checkPartialAssociations(AstVhdlInstance* nodep) {
                                        " locally static name, and this one depends on "
                                            + std::string{varyp->kindName()} + " '" + varyp->name()
                                            + "'");
-                unread.insert(key.substr(0, key.find('.')));
+                unread.insert(key.substr(0, key.find_first_of(".(")));
                 continue;
             }
         }
@@ -11631,7 +11666,7 @@ void VhdlSemVisitor::checkPartialAssociations(AstVhdlInstance* nodep) {
             continue;
         }
         // A part whose bounds do not fold here says nothing about coverage
-        const auto unknownPart = [&]() { unread.insert(key.substr(0, key.find('.'))); };
+        const auto unknownPart = [&]() { unread.insert(key.substr(0, key.find_first_of(".("))); };
         int64_t lo = 0;
         int64_t hi = 0;
         if (AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
@@ -11658,8 +11693,20 @@ void VhdlSemVisitor::checkPartialAssociations(AstVhdlInstance* nodep) {
         parts[key].push_back({lo, hi, asp->fileline()});
         arrays[key] = arrayp;
     }
+    // An element associated in parts of its own -- "v(2)(7 downto 4)" -- is
+    // one the array around it has associated, as far as that array goes
+    std::vector<std::pair<std::string, Part>> inner;
+    for (const auto& pair : parts) {
+        const size_t open = pair.first.rfind('(');
+        if (open == std::string::npos || pair.first.back() != ')') continue;
+        const std::string outer = pair.first.substr(0, open);
+        if (!parts.count(outer) || pair.second.empty()) continue;
+        const int64_t idx = std::strtoll(pair.first.c_str() + open + 1, nullptr, 10);
+        inner.emplace_back(outer, Part{idx, idx, pair.second.front().flp});
+    }
+    for (const auto& pair : inner) parts[pair.first].push_back(pair.second);
     for (auto& pair : parts) {
-        if (unread.count(pair.first.substr(0, pair.first.find('.')))) continue;
+        if (unread.count(pair.first.substr(0, pair.first.find_first_of(".(")))) continue;
         std::vector<Part>& list = pair.second;
         std::sort(list.begin(), list.end(),
                   [](const Part& a, const Part& b) { return a.lo < b.lo; });
