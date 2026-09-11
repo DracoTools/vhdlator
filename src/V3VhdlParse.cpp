@@ -1930,6 +1930,8 @@ AstNodeVhdlStmt* V3VhdlParse::parseCase(const std::string& label) {
     nodep->name(label);
     nodep->matching(matching);
     expect(VhdlTokType::KWD_IS, "'is' after the case expression");
+    // A case statement has at least one alternative (10.9)
+    if (peekType() != VhdlTokType::KWD_WHEN) syntaxError("'when' to start an alternative");
     while (check(VhdlTokType::KWD_WHEN)) {
         AstVhdlAlternative* const altp = new AstVhdlAlternative{here()};
         altp->addChoicesp(parseChoices());

@@ -1601,6 +1601,8 @@ private:
     bool valueFitsType(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
     static bool altUnreached(const AstVhdlAlternative* altp, bool& settled) VL_MT_DISABLED;
     void checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) VL_MT_DISABLED;
+    void checkChoices(AstNode* altsp, bool matching, FileLine* flp, VhdlType* typep,
+                      const std::string& what) VL_MT_DISABLED;
     void checkWaveform(AstNode* wavesp) VL_MT_DISABLED;
     void checkDelay(AstNodeVhdlExpr* nodep, const char* what) VL_MT_DISABLED;
     void checkAggregate(AstVhdlAggregate* nodep, VhdlType* typep,
@@ -1646,6 +1648,7 @@ private:
     static const VhdlSymbol* portAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
     void markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void checkPartialAssociations(AstVhdlInstance* nodep) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
     // Expressions (clauses 8, 9, 12.5)
@@ -6551,6 +6554,13 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                 "Element '" + mine.front()->name() + "' of this aggregate is of type "
                     + fieldp->prettyName() + ", but the value is of type "
                     + eap->valuep()->vhdlTypep()->prettyName());
+            continue;
+        }
+        // Each element given the value gets it whole, so it is as long as
+        // each of them -- which for "others" may differ element to element
+        for (const VhdlSymbol* const symp : mine) {
+            checkArrayValue(eap->valuep(), symp->typep(),
+                            "element '" + symp->name() + "' of this aggregate");
         }
     }
     return wantp;
@@ -8470,6 +8480,10 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
         }
         checkWaveform(altp->wavesp());
     }
+    if (nodep->selectorp()) {
+        checkChoices(nodep->altsp(), nodep->matching(), nodep->fileline(),
+                     nodep->selectorp()->vhdlTypep(), "this selected assignment");
+    }
 }
 
 // The object a name denotes: through indexing, slicing and the selection of
@@ -8713,8 +8727,22 @@ void VhdlSemVisitor::visit(AstVhdlCase* nodep) {
 // a case that is neither complete nor has an "others" has no defined
 // behaviour to emit, and a duplicated choice has two.
 void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
-    if (!typep || typep->isError() || nodep->matching()) return;
-    const bool discrete = typep->isDiscrete() && typep->bounded();
+    checkChoices(nodep->altsp(), nodep->matching(), nodep->fileline(), typep,
+                 "this case statement");
+}
+
+// The choices of a case statement or a selected assignment must name every
+// value of the expression's subtype exactly once (10.9, 10.5.4). Verilator
+// needs this before lowering anyway: a selection that is neither complete nor
+// has an "others" has no defined behaviour to emit, and a duplicated choice
+// has two.
+void VhdlSemVisitor::checkChoices(AstNode* altsp, bool matching, FileLine* flp, VhdlType* typep,
+                                  const std::string& what) {
+    if (!typep || typep->isError() || matching || m_inSpecialized) return;
+    // Duplicates are found among any discrete choices; whether they cover
+    // every value can only be asked of a subtype with bounds
+    const bool bounded = typep->isDiscrete() && typep->bounded();
+    const bool discrete = typep->isDiscrete();
     const bool array = typep->base()->kind() == VhdlTypeKind::ARRAY;
     if (!discrete && !array) return;
 
@@ -8723,7 +8751,7 @@ void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
     std::vector<std::pair<int64_t, int64_t>> covered;  // Discrete choices
     std::vector<FileLine*> flps;
     std::map<std::string, FileLine*> seenStrings;  // Array choices
-    for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
+    for (AstNode* ap = altsp; ap; ap = ap->nextp()) {
         AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
         for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
             AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
@@ -8748,11 +8776,22 @@ void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
             if (!valuep) continue;
             const VhdlValue val = V3VhdlEval::eval(valuep);
             if (val.isStr()) {
+                // A choice is a value of the expression's subtype, and so
+                // exactly as long as it (10.9)
+                const int64_t have = static_cast<int64_t>(val.toStr().size());
+                if (typep->isConstrainedArray() && typep->dimensions() == 1
+                    && have != typep->dimLength(0)) {
+                    err(valuep->fileline(), "Choice " + val.prettyName() + " has "
+                                                + std::to_string(have)
+                                                + " element(s), but what it is a choice for has "
+                                                + std::to_string(typep->dimLength(0)));
+                    continue;
+                }
                 const auto pair = seenStrings.emplace(val.toStr(), valuep->fileline());
                 if (!pair.second) {
                     err(valuep->fileline(), "Choice " + val.prettyName()
                                                 + " is given by more than one alternative of "
-                                                  "this case statement");
+                                                + what);
                 }
                 continue;
             }
@@ -8772,12 +8811,12 @@ void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
               [&covered](size_t a, size_t b) { return covered[a] < covered[b]; });
     for (size_t i = 1; i < order.size(); ++i) {
         if (covered[order[i]].first > covered[order[i - 1]].second) continue;
-        err(flps[order[i]],
-            "Choice " + VhdlValue::mkInt(covered[order[i]].first, typep).prettyName()
-                + " is given by more than one alternative of this case statement");
+        err(flps[order[i]], "Choice "
+                                + VhdlValue::mkInt(covered[order[i]].first, typep).prettyName()
+                                + " is given by more than one alternative of " + what);
         return;
     }
-    if (hasOthers) return;
+    if (hasOthers || !bounded) return;
     // Without "others" the alternatives must leave no value of the subtype
     // unaccounted for
     int64_t next = typep->low();
@@ -8788,9 +8827,10 @@ void VhdlSemVisitor::checkCaseChoices(AstVhdlCase* nodep, VhdlType* typep) {
         if (next > last) break;
     }
     if (next > last) return;
-    err(nodep->fileline(), "This case statement has no alternative for value "
-                               + VhdlValue::mkInt(next, typep).prettyName() + " of "
-                               + typep->prettyName());
+    std::string subject = what;
+    subject[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(subject[0])));
+    err(flp, subject + " has no alternative for value "
+                 + VhdlValue::mkInt(next, typep).prettyName() + " of " + typep->prettyName());
 }
 
 // What an assertion or a report statement reports is a STRING, and its
@@ -9029,6 +9069,7 @@ void VhdlSemVisitor::checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* un
                     + portp->name() + "' of mode in");
         }
     }
+    checkPartialAssociations(nodep);
     for (const auto& pair : unitScopep->direct()) {
         const VhdlSymbol* const symp = pair.second;
         if (symp->kind() != VhdlSymKind::PORT || given.count(symp)) continue;
@@ -9037,6 +9078,108 @@ void VhdlSemVisitor::checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* un
         err(nodep->fileline(), "Port '" + symp->name()
                                    + "' of mode in has no default value, so it must be given"
                                      " something in the port map");
+    }
+}
+
+// A port associated in parts -- "a(15 downto 0) => x, a(31 downto 16) => y"
+// -- is associated once in every element, and no element twice (6.5.7.1):
+// the parts together are the port's one association. Checked where the parts
+// are indexes or slices with static bounds of a one-dimensional array.
+void VhdlSemVisitor::checkPartialAssociations(AstVhdlInstance* nodep) {
+    struct Part final {
+        int64_t lo;
+        int64_t hi;
+        FileLine* flp;
+    };
+    // Per subelement written, by its text: the port and any record elements
+    std::map<std::string, std::vector<Part>> parts;
+    std::map<std::string, const VhdlType*> arrays;
+    // Ports with a part written some other way -- "v(1)(3 downto 2)" -- whose
+    // coverage this does not work out, so it says nothing about them
+    std::set<std::string> unread;
+    for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+        AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
+        const AstVhdlCall* const callp = VN_CAST(asp->formalp(), VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) {
+            if (asp->formalp() && !VN_IS(asp->formalp(), VhdlName)) {
+                asp->formalp()->foreach([&](const AstVhdlName* namep) {
+                    const VhdlSymbol* const symp = namep->vhdlSymp();
+                    if (symp && symp->kind() == VhdlSymKind::PORT) unread.insert(symp->name());
+                });
+            }
+            continue;
+        }
+        // The part's prefix is the port, or a record element of it
+        std::string key;
+        const AstNodeVhdlExpr* prefp = callp->prefixp();
+        for (const AstNodeVhdlExpr* np = prefp; np;) {
+            if (const AstVhdlName* const namep = VN_CAST(np, VhdlName)) {
+                const VhdlSymbol* const symp = namep->vhdlSymp();
+                if (!symp || symp->kind() != VhdlSymKind::PORT)
+                    key.clear();
+                else
+                    key = symp->name() + key;
+                break;
+            }
+            const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected);
+            const AstVhdlName* const sufp = selp ? VN_CAST(selp->suffixp(), VhdlName) : nullptr;
+            if (!sufp) {
+                key.clear();
+                break;
+            }
+            key = "." + sufp->name() + key;
+            np = selp->prefixp();
+        }
+        const VhdlType* const arrayp = prefp->vhdlTypep();
+        if (key.empty() || !arrayp || !arrayp->isConstrainedArray() || arrayp->dimensions() != 1) {
+            callp->foreach([&](const AstVhdlName* namep) {
+                const VhdlSymbol* const symp = namep->vhdlSymp();
+                if (symp && symp->kind() == VhdlSymKind::PORT) unread.insert(symp->name());
+            });
+            continue;
+        }
+        int64_t lo = 0;
+        int64_t hi = 0;
+        if (const AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
+            if (!rp->leftp() || !rp->rightp()) continue;
+            const VhdlValue a = V3VhdlEval::eval(rp->leftp());
+            const VhdlValue b = V3VhdlEval::eval(rp->rightp());
+            if (!a.isInt() || !b.isInt()) continue;
+            lo = std::min(a.toInt(), b.toInt());
+            hi = std::max(a.toInt(), b.toInt());
+        } else if (const AstVhdlAssoc* const ip = VN_CAST(callp->argsp(), VhdlAssoc)) {
+            if (!ip->actualp()) continue;
+            const VhdlValue v = V3VhdlEval::eval(ip->actualp());
+            if (!v.isInt()) continue;
+            lo = hi = v.toInt();
+        } else {
+            continue;
+        }
+        parts[key].push_back({lo, hi, asp->fileline()});
+        arrays[key] = arrayp;
+    }
+    for (auto& pair : parts) {
+        if (unread.count(pair.first.substr(0, pair.first.find('.')))) continue;
+        std::vector<Part>& list = pair.second;
+        std::sort(list.begin(), list.end(),
+                  [](const Part& a, const Part& b) { return a.lo < b.lo; });
+        const VhdlType* const indexp = arrays[pair.first]->indexTypes()[0];
+        int64_t next = indexp->low();
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (i && list[i].lo <= list[i - 1].hi) {
+                err(list[i].flp, "Element " + std::to_string(list[i].lo) + " of port '"
+                                     + pair.first + "' is associated more than once");
+                next = indexp->high() + 1;  // One report is enough
+                break;
+            }
+            if (list[i].lo > next) break;
+            next = list[i].hi + 1;
+        }
+        if (next <= indexp->high()) {
+            err(nodep->fileline(), "Port '" + pair.first + "' is associated in parts, but element "
+                                       + std::to_string(next)
+                                       + " is in none of them; every element must be");
+        }
     }
 }
 
