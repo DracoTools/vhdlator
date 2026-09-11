@@ -6,7 +6,8 @@
 
 -- A logical expression repeats one operator, and nand and nor not even that.
 -- A wait statement's 'on' names a signal. A generate statement has a label.
--- An access type names what it designates.
+-- An access type names what it designates, and an instance what it
+-- instantiates.
 -- References: nvc 1.22.1, GHDL 7.0.0-dev, Questa 2025.2.
 
 entity t_vhdl_exprparse_bad is
@@ -37,4 +38,5 @@ begin
   g : for i in 0 to 1 generate end generate;
   -- Illegal
   for i in 0 to 1 generate end generate;
+  ins : entity ;
 end architecture;

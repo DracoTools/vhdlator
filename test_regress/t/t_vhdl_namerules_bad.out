@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_namerules_bad.vhd:18:3: A package declaration declares subprograms, and their bodies go in the package body: 'g'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_namerules_bad.vhd:25:3: Function 'f' already has a body
+%Error: t/t_vhdl_namerules_bad.vhd:43:33: Record type rec has no element 'z'
+%Error: t/t_vhdl_namerules_bad.vhd:44:24: A type mark names a type or a subtype, and attribute 'range gives none
+%Error: t/t_vhdl_namerules_bad.vhd:45:21: A type mark names a type or a subtype, and attribute 'image gives none
+%Error: t/t_vhdl_namerules_bad.vhd:46:17: A subprogram's parameters are objects; a type, a subprogram or a package is given only as a generic
+%Error: t/t_vhdl_namerules_bad.vhd:55:34: The prefix of 'event is a static signal name, but this one's index depends on 'i'
+%Error: t/t_vhdl_namerules_bad.vhd:47:34: No configuration 'nocfg' is visible here for this binding to name
+%Error: Exiting due to

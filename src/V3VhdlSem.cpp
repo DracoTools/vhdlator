@@ -57,6 +57,14 @@ static const AstNode* parentOf(const AstNode* nodep) {
     return nodep->backp();
 }
 
+// The design unit a node is written in
+static const AstNodeVhdlUnit* unitOf(const AstNode* nodep) {
+    for (const AstNode* upp = nodep; upp; upp = parentOf(upp)) {
+        if (const AstNodeVhdlUnit* const unitp = VN_CAST(upp, NodeVhdlUnit)) return unitp;
+    }
+    return nullptr;
+}
+
 // Of these four an implicit signal is made, one per prefix, to hold what the
 // attribute answers about. There is nowhere in a subprogram for such a signal
 // to live -- a subprogram is not a region that a simulation cycle updates --
@@ -922,6 +930,12 @@ class VhdlSemVisitor final : public VNVisitor {
                 markp->vhdlTypep(typep);
                 return typep;
             }
+            // Any other attribute gives a value or a range, not a subtype
+            if (!m_inSpecialized) {
+                err(markp->fileline(), "A type mark names a type or a subtype, and attribute '"
+                                           + attr + " gives none");
+            }
+            return V3VhdlStd::errorType();
         }
         if (const AstVhdlName* const namep = VN_CAST(markp, VhdlName)) {
             if (nameBeingDeclared(namep)) return V3VhdlStd::errorType();
@@ -1659,6 +1673,7 @@ public:
     bool procedureSuspends(const AstVhdlProcCall* pcp) VL_MT_DISABLED;
     void checkSensitivityName(AstNodeVhdlExpr* exprp) VL_MT_DISABLED;
     static const VhdlSymbol* nonStaticIndex(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    static const VhdlSymbol* nonStaticSignalIndex(AstNodeVhdlExpr* exprp) VL_MT_DISABLED;
     void checkOutReads(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     void checkElaborationOrder(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     static ObjInfo objectOfName(const AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
@@ -2628,7 +2643,38 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
                 reusep = otherp;
                 break;
             }
+            // A subprogram has one body (4.3)
+            if (otherp->hasBody() && symp->homographOf(otherp) && !m_inSpecialized && !m_inPkgInst
+                && !m_inPackageInstance && !nodep->isInstance() && !nodep->inPkgInstance()
+                && otherp->bodyp() && otherp->bodyp() != nodep && !otherp->bodyp()->isInstance()
+                && parentOf(otherp->bodyp()) == parentOf(nodep)) {
+                err(nodep->fileline(), std::string{nodep->isFunction() ? "Function" : "Procedure"}
+                                           + " '" + nodep->prettyName() + "' already has a body");
+                break;
+            }
         }
+    }
+    // A parameter is an object: a type, a subprogram or a package is given
+    // only as a generic (6.5.6.1)
+    if (!m_inSpecialized) {
+        int idx = -nodep->genericCount();
+        for (const AstNode* p = nodep->paramsp(); p; p = p->nextp(), ++idx) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (idx < 0 || !ifp) continue;
+            if (ifp->kind() == VhdlIfaceKind::SUBPROGRAM || ifp->kind() == VhdlIfaceKind::TYPE
+                || ifp->kind() == VhdlIfaceKind::PACKAGE) {
+                err(ifp->fileline(), "A subprogram's parameters are objects; a type, a"
+                                     " subprogram or a package is given only as a generic");
+            }
+        }
+    }
+    // A package declaration declares its subprograms; their bodies go in the
+    // package body (4.7)
+    if (nodep->hasBody() && VN_IS(parentOf(nodep), VhdlPackage) && !m_inSpecialized
+        && !nodep->isInstance()) {
+        err(nodep->fileline(), "A package declaration declares subprograms, and their bodies go"
+                               " in the package body: '"
+                                   + nodep->prettyName() + "'");
     }
     // A call to the uninstantiated name inside a copy means the copy itself:
     // that is how a generic subprogram recurses (4.4)
@@ -3319,30 +3365,7 @@ void VhdlSemVisitor::checkSensitivityName(AstNodeVhdlExpr* exprp) {
         return;
     }
     if (info.cls != ObjClass::SIGNAL) return;
-    const VhdlSymbol* varyingp = nonStaticIndex(exprp);
-    // A loop parameter takes each of its values in turn, so a name indexed
-    // by one is not static either (9.4.3)
-    if (!varyingp) {
-        for (AstNodeVhdlExpr* np = exprp; np && !varyingp;) {
-            AstVhdlCall* const callp = VN_CAST(np, VhdlCall);
-            if (!callp) {
-                AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected);
-                np = selp ? selp->prefixp() : nullptr;
-                continue;
-            }
-            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
-                ap->foreach([&](const AstVhdlName* namep) {
-                    const VhdlSymbol* const symp
-                        = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
-                    if (!varyingp && symp && symp->kind() == VhdlSymKind::LOOP_PARAMETER) {
-                        varyingp = symp;
-                    }
-                });
-            }
-            np = callp->prefixp();
-        }
-    }
-    if (varyingp) {
+    if (const VhdlSymbol* const varyingp = nonStaticSignalIndex(exprp)) {
         err(exprp->fileline(), "A signal in a sensitivity list is named statically, but this"
                                " name's index depends on '"
                                    + varyingp->name() + "'");
@@ -3486,6 +3509,31 @@ void VhdlSemVisitor::checkOutReads(AstNodeVhdlUnit* unitp) {
             std::string{"A "} + (info.symp->kind() == VhdlSymKind::PORT ? "port" : "parameter")
                 + " of mode out cannot be read before VHDL-2008: '" + info.symp->name() + "'");
     });
+}
+
+// What makes a signal name not static (9.4.3): an object in an index, as
+// for any name, or a loop parameter, which takes each of its values in turn
+const VhdlSymbol* VhdlSemVisitor::nonStaticSignalIndex(AstNodeVhdlExpr* exprp) {
+    const VhdlSymbol* varyingp = nonStaticIndex(exprp);
+    for (AstNodeVhdlExpr* np = exprp; np && !varyingp;) {
+        AstVhdlCall* const callp = VN_CAST(np, VhdlCall);
+        if (!callp) {
+            AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected);
+            np = selp ? selp->prefixp() : nullptr;
+            continue;
+        }
+        for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+            ap->foreach([&](const AstVhdlName* namep) {
+                const VhdlSymbol* const symp
+                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                if (!varyingp && symp && symp->kind() == VhdlSymKind::LOOP_PARAMETER) {
+                    varyingp = symp;
+                }
+            });
+        }
+        np = callp->prefixp();
+    }
+    return varyingp;
 }
 
 // An object of a name's indexes or slice bounds that is not static: a
@@ -5925,14 +5973,6 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
 // outside VHDL, so neither is reported. Nor is a generic subprogram: its body
 // is written against generic types that make it no homograph of the
 // declaration, so the two are not paired up by that route.
-// The design unit a node is written in
-static const AstNodeVhdlUnit* unitOf(const AstNode* nodep) {
-    for (const AstNode* upp = nodep; upp; upp = parentOf(upp)) {
-        if (const AstNodeVhdlUnit* const unitp = VN_CAST(upp, NodeVhdlUnit)) return unitp;
-    }
-    return nullptr;
-}
-
 // Whether a is written before b in one file
 static bool writtenBefore(const AstNode* ap, const AstNode* bp) {
     const FileLine* const afl = ap->fileline();
@@ -7202,6 +7242,19 @@ void VhdlSemVisitor::checkAttrPrefix(AstVhdlAttrName* nodep, const VhdlType* pre
     const std::string& attr = nodep->name();
     // 'DRIVING and 'DRIVING_VALUE ask what this process drives a signal to,
     // so their prefix is a signal it may drive (16.2.4)
+    // An attribute of a signal is an implicit signal, or reads what one
+    // keeps, for that one signal: its prefix is a static name (16.2.4)
+    if (readsTheSignal(attr) || attr == "driving" || attr == "driving_value") {
+        if (objectOfName(nodep->prefixp()).cls == ObjClass::SIGNAL) {
+            if (const VhdlSymbol* const varyingp = nonStaticSignalIndex(nodep->prefixp())) {
+                err(nodep->fileline(), "The prefix of '" + attr
+                                           + " is a static signal name, but this one's index"
+                                             " depends on '"
+                                           + varyingp->name() + "'");
+                return;
+            }
+        }
+    }
     if (attr == "driving" || attr == "driving_value") {
         const ObjInfo info = objectOfName(nodep->prefixp());
         if (info.cls != ObjClass::SIGNAL) {
@@ -7589,7 +7642,15 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                 covers.back().push_back(symp);
                 found = true;
             }
-            if (!found) unknownChoice = true;
+            if (!found) {
+                unknownChoice = true;
+                // A choice of a record aggregate names one of its elements
+                // (9.3.3.2)
+                if (!m_inSpecialized) {
+                    err(namep->fileline(), "Record type " + wantp->prettyName()
+                                               + " has no element '" + namep->name() + "'");
+                }
+            }
         }
         for (const VhdlSymbol* const symp : covers.back()) given.insert(symp);
     }
@@ -10894,8 +10955,17 @@ void VhdlSemVisitor::checkConfigSpecs(const AstNode* declsp, const AstNode* stmt
                 err(lp->fileline(), "Instance '" + label + "' is configured more than once");
             }
         }
-        // An entity aspect names an entity (7.3.2.2)
+        // A configuration aspect names a configuration it can see (7.3.2.2)
         const AstVhdlBinding* const bindp = csp->bindingp();
+        if (bindp && bindp->kind() == "configuration") {
+            const AstVhdlName* const cnamep = VN_CAST(bindp->unitp(), VhdlName);
+            std::vector<VhdlSymbol*> cfound;
+            if (cnamep) lookup(cnamep->name(), cfound);
+            if (cnamep && cfound.empty()) {
+                err(cnamep->fileline(), "No configuration '" + cnamep->name()
+                                            + "' is visible here for this binding to name");
+            }
+        }
         if (bindp && bindp->kind() == "entity" && bindp->unitp()) {
             const AstNodeVhdlExpr* entp = bindp->unitp();
             if (const AstVhdlCall* const callp = VN_CAST(entp, VhdlCall)) entp = callp->prefixp();

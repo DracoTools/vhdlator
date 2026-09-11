@@ -1761,7 +1761,11 @@ AstNodeVhdlStmt* V3VhdlParse::parseInstance(const std::string& label) {
         kind = "configuration";
     }
     AstNodeVhdlExpr* unitp = parseName();
-    if (!unitp) unitp = new AstVhdlName{flp, ""};
+    if (!unitp) {
+        // What is instantiated is named (11.7)
+        here()->v3error("An instance names the " << kind << " it instantiates");
+        unitp = new AstVhdlName{flp, ""};
+    }
     if (kind == "entity" && check(VhdlTokType::LPAREN)) {
         archName = identifier("an architecture name");
         expect(VhdlTokType::RPAREN, "')' after the architecture name");
