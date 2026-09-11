@@ -716,6 +716,9 @@ class AstVhdlIfaceDecl final : public AstNodeVhdlDecl {
     // stands for, and whether the map was written as a box (6.5.5)
     std::string m_newFrom;
     bool m_boxMap = false;
+    // The formals its generic map names, to be found among the generics of
+    // the package it is new of (6.5.7.2)
+    std::vector<std::pair<FileLine*, std::string>> m_mapFormals;
     // A generic type an instance has already settled: the copy of the entity
     // made for that instance declares the actual type under this name, so
     // there is nothing left for the back end to be given (6.5.5)
@@ -743,6 +746,12 @@ public:
     void newFrom(const std::string& name) { m_newFrom = name; }
     bool boxMap() const { return m_boxMap; }
     void boxMap(bool flag) { m_boxMap = flag; }
+    const std::vector<std::pair<FileLine*, std::string>>& mapFormals() const {
+        return m_mapFormals;
+    }
+    void addMapFormal(FileLine* fl, const std::string& name) {
+        m_mapFormals.emplace_back(fl, name);
+    }
     void dump(std::ostream& str) const override;
 };
 

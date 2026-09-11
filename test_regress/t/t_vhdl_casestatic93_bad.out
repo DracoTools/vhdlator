@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_casestatic93_bad.vhd:27:10: Before VHDL-2008 what a case statement chooses on has a locally static subtype, and 'v' does not: its subtype leaves the bounds to what it is given
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_casestatic93_bad.vhd:31:8: Before VHDL-2008 what a selected assignment chooses on has a locally static subtype, and 'sf' does not: its subtype depends on constant 'slices', which a function call gives its value
+%Error: Exiting due to

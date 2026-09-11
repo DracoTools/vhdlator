@@ -2034,6 +2034,7 @@ private:
     void checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void checkPartialAssociations(AstVhdlInstance* nodep) VL_MT_DISABLED;
     static const VhdlSymbol* notLocallyStatic(const AstNode* exprsp) VL_MT_DISABLED;
+    void checkSelectorStatic(const AstNodeVhdlExpr* exprp, const std::string& what) VL_MT_DISABLED;
     void checkGenericAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
 
@@ -2508,6 +2509,21 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
             key = m_libname + key.substr(dot);
         }
         const auto scopeIt = m_unitScopes.find(key);
+        // What its generic map names is a generic of that package (6.5.7.2)
+        const auto unitIt = m_primaryUnits.find(key);
+        const AstVhdlPackage* const genPkgp
+            = unitIt == m_primaryUnits.end() ? nullptr : VN_CAST(unitIt->second, VhdlPackage);
+        for (const auto& formal : nodep->mapFormals()) {
+            if (!genPkgp || m_inSpecialized) break;
+            bool known = false;
+            for (const AstNode* p = genPkgp->genericsp(); p && !known; p = p->nextp()) {
+                known = VN_AS(p, VhdlIfaceDecl)->name() == formal.second;
+            }
+            if (!known) {
+                err(formal.first, "Package '" + genPkgp->prettyName() + "' has no generic named '"
+                                      + formal.second + "'");
+            }
+        }
         if (scopeIt != m_unitScopes.end()) {
             symp->innerp(scopeIt->second);
             m_scopep->addNamed(lower(nodep->name()), scopeIt->second);
@@ -10965,12 +10981,65 @@ void VhdlSemVisitor::checkSelector(AstNodeVhdlExpr* exprp, const VhdlType* typep
     if (basep->isDiscrete()) return;
     if (basep->kind() == VhdlTypeKind::ARRAY && basep->indexTypes().size() == 1) {
         const VhdlType* const elemp = basep->elementp();
-        if (!elemp || elemp->base()->kind() == VhdlTypeKind::ENUM) return;
+        if (!elemp || elemp->base()->kind() == VhdlTypeKind::ENUM) {
+            checkSelectorStatic(exprp, what);
+            return;
+        }
     }
     err(exprp->fileline(), "What " + what
                                + " chooses on is of a discrete type or a one-dimensional array"
                                  " of characters, but this is of type "
                                + typep->prettyName());
+}
+
+// Before VHDL-2008 an array selector names an object whose subtype is locally
+// static (VHDL-93 8.8): not a parameter or port left unconstrained, and not
+// one constrained by a generic or by a constant a function call gives its
+// value. VHDL-2008 dropped the rule.
+void VhdlSemVisitor::checkSelectorStatic(const AstNodeVhdlExpr* exprp, const std::string& what) {
+    if (exprp->fileline()->language() >= V3LangCode::L1076_2008) return;
+    const AstVhdlName* const namep = VN_CAST(exprp, VhdlName);
+    const VhdlSymbol* const symp
+        = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+    if (!symp) return;
+    const AstVhdlSubtypeInd* sip = nullptr;
+    if (const AstVhdlObjectDecl* const odp = VN_CAST(symp->declp(), VhdlObjectDecl)) {
+        sip = odp->subtypep();
+    } else if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
+        sip = ifp->subtypep();
+    }
+    if (!sip) return;
+    std::string why;
+    if (writtenBare(sip) && sip->typeMarkp()
+        && markLeavesIndexOpen(sip->typeMarkp()->vhdlSymp())) {
+        why = "its subtype leaves the bounds to what it is given";
+    } else if (const VhdlSymbol* const varyp = notLocallyStatic(sip)) {
+        why = "its subtype depends on " + std::string{varyp->kindName()} + " '" + varyp->name()
+              + "'";
+    } else {
+        // A constant whose value a call to a function of the design gives
+        sip->foreach([&](const AstVhdlName* innerp) {
+            const VhdlSymbol* const csymp
+                = innerp->vhdlSymp() ? innerp->vhdlSymp()->resolved() : nullptr;
+            const AstVhdlObjectDecl* const cdp = csymp && csymp->kind() == VhdlSymKind::CONSTANT
+                                                     ? VN_CAST(csymp->declp(), VhdlObjectDecl)
+                                                     : nullptr;
+            if (!why.empty() || !cdp || !cdp->defaultp()) return;
+            cdp->defaultp()->foreach([&](const AstVhdlCall* callp) {
+                const VhdlSymbol* const fsymp
+                    = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+                if (why.empty() && fsymp && fsymp->kind() == VhdlSymKind::FUNCTION
+                    && !fsymp->predefined()) {
+                    why = "its subtype depends on constant '" + csymp->name()
+                          + "', which a function call gives its value";
+                }
+            });
+        });
+    }
+    if (why.empty()) return;
+    err(exprp->fileline(), "Before VHDL-2008 what " + what
+                               + " chooses on has a locally static subtype, and '" + symp->name()
+                               + "' does not: " + why);
 }
 
 // The choices of a case statement or a selected assignment must name every
@@ -11057,6 +11126,17 @@ void VhdlSemVisitor::checkChoices(AstNode* altsp, bool matching, FileLine* flp, 
                                                 + std::to_string(have)
                                                 + " element(s), but what it is a choice for has "
                                                 + std::to_string(typep->dimLength(0)));
+                    continue;
+                }
+                // Where the subtype leaves the length open, the choices are
+                // still values of one subtype, and so all of one length
+                if (!typep->isConstrainedArray() && !seenStrings.empty()
+                    && static_cast<int64_t>(seenStrings.begin()->first.size()) != have) {
+                    err(valuep->fileline(), "Choice " + val.prettyName() + " has "
+                                                + std::to_string(have)
+                                                + " element(s), but the choices before it have "
+                                                + std::to_string(seenStrings.begin()->first.size())
+                                                + ", and all are values of one subtype");
                     continue;
                 }
                 const auto pair = seenStrings.emplace(val.toStr(), valuep->fileline());

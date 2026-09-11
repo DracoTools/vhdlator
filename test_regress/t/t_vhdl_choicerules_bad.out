@@ -1,7 +1,8 @@
-%Error: t/t_vhdl_choicerules_bad.vhd:23:28: The subtype of variable 'x' has a null range, so no value can be given it
+%Error: t/t_vhdl_choicerules_bad.vhd:22:40: Choice "de" has 2 element(s), but the choices before it have 3, and all are values of one subtype
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_choicerules_bad.vhd:30:5: This case statement has no 'others', and its 1 choice(s) do not name every one of the 256 ** 3 values of what it chooses on
-%Error: t/t_vhdl_choicerules_bad.vhd:31:5: This case statement has no 'others', and its 2 choice(s) do not name every one of the 2 ** 2 values of what it chooses on
-%Error: t/t_vhdl_choicerules_bad.vhd:33:42: Choice "1---" is given by more than one alternative of this case statement
-%Error: t/t_vhdl_choicerules_bad.vhd:35:14: Division by zero in a static expression, so no value of the assignment target results
+%Error: t/t_vhdl_choicerules_bad.vhd:27:28: The subtype of variable 'x' has a null range, so no value can be given it
+%Error: t/t_vhdl_choicerules_bad.vhd:34:5: This case statement has no 'others', and its 1 choice(s) do not name every one of the 256 ** 3 values of what it chooses on
+%Error: t/t_vhdl_choicerules_bad.vhd:35:5: This case statement has no 'others', and its 2 choice(s) do not name every one of the 2 ** 2 values of what it chooses on
+%Error: t/t_vhdl_choicerules_bad.vhd:37:42: Choice "1---" is given by more than one alternative of this case statement
+%Error: t/t_vhdl_choicerules_bad.vhd:39:14: Division by zero in a static expression, so no value of the assignment target results
 %Error: Exiting due to

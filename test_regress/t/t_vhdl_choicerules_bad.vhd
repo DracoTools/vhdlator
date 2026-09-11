@@ -5,8 +5,8 @@
 -- SPDX-License-Identifier: CC0-1.0
 
 -- Without "others" the choices of an array selector name every value of it,
--- and two choices of a matching case written alike match the same values
--- (10.9). A subtype with a null range has no value to give an object (5.2.1),
+-- all of them values of one subtype and so of one length, and two choices of
+-- a matching case written alike match the same values (10.9). A subtype with a null range has no value to give an object (5.2.1),
 -- and a static division by zero has none either (9.4). References: nvc
 -- 1.22.1, GHDL 7.0.0-dev, Questa 2025.2.
 
@@ -17,6 +17,10 @@ entity t is
 end entity;
 
 architecture a of t is
+  procedure p(s : string) is
+  begin
+    case s is when "abc" => null; when "de" => null; when others => null; end case;  -- Bad
+  end procedure;
 begin
   process
     type t_null is range 0 to -1;

@@ -668,8 +668,16 @@ AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceElement(VhdlIfaceKind dflt) {
             expect(VhdlTokType::LPAREN, "'(' after 'generic map'");
             if (check(VhdlTokType::BOX)) {
                 nodep->boxMap(true);
-            } else {
-                parseAssociationList();
+            } else if (AstVhdlAssoc* const listp = parseAssociationList()) {
+                // Only which formals it names is kept: the actuals are those
+                // of the package the instance will be given (6.5.5)
+                for (AstNode* ap = listp; ap; ap = ap->nextp()) {
+                    const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                    const AstVhdlName* const namep
+                        = asp && asp->formalp() ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+                    if (namep) nodep->addMapFormal(namep->fileline(), namep->name());
+                }
+                VL_DO_DANGLING(listp->deleteTree(), listp);
             }
             expect(VhdlTokType::RPAREN, "')' after the generic map");
         }
