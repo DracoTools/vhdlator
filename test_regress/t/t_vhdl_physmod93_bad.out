@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_physmod93_bad.vhd:14:33: Before VHDL-2008 a physical type has no "mod" operator: time
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_physmod93_bad.vhd:15:33: Before VHDL-2008 a physical type has no "rem" operator: time
+%Error: Exiting due to

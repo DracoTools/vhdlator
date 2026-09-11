@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_sigattrtime_bad.vhd:21:21: The time 'stable is given must be static, but this one depends on 't'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_sigattrtime_bad.vhd:22:20: The time 'quiet is given must be static, but this one depends on 'c'
+%Error: Exiting due to

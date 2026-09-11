@@ -57,6 +57,14 @@ static const AstNode* parentOf(const AstNode* nodep) {
     return nodep->backp();
 }
 
+// Of these four an implicit signal is made, one per prefix, to hold what the
+// attribute answers about. There is nowhere in a subprogram for such a signal
+// to live -- a subprogram is not a region that a simulation cycle updates --
+// so reading one of a signal parameter is an error (16.2.2, 4.2.2.3).
+static bool makesImplicitSignal(const std::string& attr) {
+    return attr == "stable" || attr == "quiet" || attr == "delayed" || attr == "transaction";
+}
+
 //######################################################################
 
 namespace {
@@ -893,6 +901,17 @@ class VhdlSemVisitor final : public VNVisitor {
         // Set before applying the constraint, so that a subtype indication
         // mentioning itself stops rather than recursing
         if (cachep) cachep->vhdlTypep(typep);
+        // Written as a subtype indication, "integer (0 to 10)" is an index
+        // constraint, and only an array has an index to constrain (6.3) --
+        // or an access to one, where it constrains what is designated (5.4.1)
+        if (cachep && !argLists.empty() && !basep->isGenericFormal()
+            && basep->base()->kind() != VhdlTypeKind::ARRAY
+            && basep->base()->kind() != VhdlTypeKind::RECORD
+            && basep->base()->kind() != VhdlTypeKind::ACCESS && !m_inSpecialized) {
+            err(flp, "An index constraint applies to an array, but " + basep->prettyName()
+                         + " is not one");
+            return typep;
+        }
         VhdlType* curp = typep;
         VhdlType* curBasep = basep;
         for (size_t i = 0; i < argLists.size(); ++i) {
@@ -928,6 +947,12 @@ class VhdlSemVisitor final : public VNVisitor {
         }
         if (AstVhdlRange* const rp = VN_CAST(constraintp, VhdlRange)) {
             // A range constraint narrows a scalar type (5.2.1)
+            if (!basep->isScalar() && !basep->isError() && !basep->isGenericFormal()
+                && !m_inSpecialized) {
+                err(flp, "A range constraint narrows a scalar type, but " + basep->prettyName()
+                             + " is not one");
+                return;
+            }
             const RangeInfo info = analyzeRange(rp, basep->isScalar() ? basep : nullptr);
             applyRange(typep, info);
             // A scalar range whose bounds name a generic is still the range
@@ -953,6 +978,23 @@ class VhdlSemVisitor final : public VNVisitor {
             // A parenthesized type mark that is not an array is a conversion
             // or a call the caller mistook for a subtype; leave it alone
             return;
+        }
+        // An array subtype whose index is already constrained keeps that
+        // constraint; only "open" may stand in its place (5.3.2.2, 6.3)
+        if (basep->isConstrainedArray() && !m_inSpecialized) {
+            bool allOpen = true;
+            for (AstNode* rp = firstp; rp; rp = rp->nextp()) {
+                const AstVhdlAssoc* const ap = VN_CAST(rp, VhdlAssoc);
+                const bool isOpen = VN_IS(rp, VhdlOpen)
+                                    || (ap && (!ap->actualp() || VN_IS(ap->actualp(), VhdlOpen)));
+                if (!isOpen && !VN_IS(rp, VhdlIndexConstraint)) allOpen = false;
+            }
+            if (!allOpen) {
+                err(flp, basep->prettyName()
+                             + " is already constrained, so its index cannot be constrained"
+                               " again; write 'open' to constrain only its element");
+                return;
+            }
         }
         std::vector<VhdlType*> indexes;
         std::vector<bool> openAt;  // Which of them the text left open
@@ -2384,7 +2426,7 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         }
         // "alias r is p[real, real]": a signature says which of an overloaded
         // name's declarations the alias denotes (4.5.3, 6.6.2)
-        if (nodep->signaturep() && found.size() > 1) {
+        if (nodep->signaturep() && !found.empty()) {
             std::vector<VhdlType*> wantParams;
             for (AstNode* p = nodep->signaturep()->paramTypesp(); p; p = p->nextp()) {
                 wantParams.push_back(resolveTypeMark(VN_AS(p, NodeVhdlExpr)));
@@ -2412,6 +2454,16 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
                 if (ok) matched.push_back(candp);
             }
             if (matched.size() == 1) found.swap(matched);
+            // A signature that matches none of them names nothing to alias
+            bool anyOverloadable = false;
+            for (const VhdlSymbol* const candp : found) {
+                if (candp->isOverloadable()) anyOverloadable = true;
+            }
+            if (matched.empty() && anyOverloadable && !m_inSpecialized) {
+                err(nodep->fileline(), "No declaration of '" + parts.back()
+                                           + "' matches the signature of alias '"
+                                           + nodep->prettyName() + "'");
+            }
         }
         // An overloaded name aliases every one of its declarations at once,
         // so only an unambiguous target is worth recording here
@@ -2446,6 +2498,30 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     // object alias of 6.6.2, so it is analyzed as the expression it is
     if (objectAlias) {
         VhdlType* const typep = analyzeExpr(nodep->targetp(), symp->typep());
+        // What an object alias names is an object; the result of a function
+        // or of a conversion is a value, which nothing can alias (6.6.2), and
+        // so is an attribute's -- but for the four that denote signals
+        if (const AstVhdlAttrName* const attrp = VN_CAST(nodep->targetp(), VhdlAttrName)) {
+            if (!makesImplicitSignal(attrp->name()) && !m_inSpecialized) {
+                err(nodep->targetp()->fileline(), "An alias names an object, but '" + attrp->name()
+                                                      + " gives a value: '" + nodep->prettyName()
+                                                      + "'");
+            }
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(nodep->targetp(), VhdlCall)) {
+            const VhdlSymbol* csymp = callp->vhdlSymp();
+            if (!csymp) csymp = callp->prefixp()->vhdlSymp();
+            csymp = csymp ? csymp->resolved() : nullptr;
+            if (csymp
+                && (csymp->kind() == VhdlSymKind::FUNCTION || csymp->kind() == VhdlSymKind::TYPE)
+                && !m_inSpecialized) {
+                err(nodep->targetp()->fileline(),
+                    "An alias names an object, but this is the result of a "
+                        + std::string{csymp->kind() == VhdlSymKind::TYPE ? "type conversion"
+                                                                         : "function call"}
+                        + ", which is a value: '" + nodep->prettyName() + "'");
+            }
+        }
         if (!symp->typep() && typep && !typep->isError()) symp->typep(typep);
         // An alias written with a subtype of its own may constrain the index
         // and leave the element alone, in which case the element is what the
@@ -6026,6 +6102,16 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
         analyzeExpr(nodep->lhsp(), nodep->vhdlSymp()->paramTypes()[0]);
         analyzeExpr(nodep->rhsp(), nodep->vhdlSymp()->paramTypes()[1]);
     }
+    // VHDL-2008 gave physical types "mod" and "rem"; before it they had
+    // neither (9.2.7)
+    if ((nodep->op() == VhdlBinaryOp::MOD || nodep->op() == VhdlBinaryOp::REM) && resultp
+        && resultp->base()->kind() == VhdlTypeKind::PHYSICAL && nodep->vhdlSymp()
+        && nodep->vhdlSymp()->predefined()
+        && nodep->fileline()->language() < V3LangCode::L1076_2008) {
+        err(nodep->fileline(), std::string{"Before VHDL-2008 a physical type has no \""}
+                                   + (nodep->op() == VhdlBinaryOp::MOD ? "mod" : "rem")
+                                   + "\" operator: " + resultp->prettyName());
+    }
     // An operator declared to return an unconstrained array may give a result
     // as long as what it was handed, and then an operand's own subtype says
     // how long it is. Only for the operators that do: "&" is as long as both
@@ -6192,15 +6278,6 @@ static bool readsTheSignal(const std::string& attr) {
            || attr == "transaction" || attr == "delayed";
 }
 
-// Of these four an implicit signal is made, one per prefix, to hold what the
-// attribute answers about. There is nowhere in a subprogram for such a signal
-// to live -- a subprogram is not a region that a simulation cycle updates --
-// so reading one of a signal parameter is an error (16.2.2, 4.2.2.3).
-static bool makesImplicitSignal(const std::string& attr) {
-    return attr == "stable" || attr == "quiet" || attr == "delayed"
-           || attr == "transaction";
-}
-
 // Whether this declaration is a parameter of a subprogram rather than a port
 static bool isSubprogramParam(const AstNode* declp) {
     for (const AstNode* upp = declp; upp; upp = parentOf(upp)) {
@@ -6327,6 +6404,33 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
     }
     if (nodep->argp()) analyzeExpr(nodep->argp(), nullptr);
+    // The time 'DELAYED, 'STABLE and 'QUIET take is static: each makes an
+    // implicit signal when the design is elaborated, and the time is part of
+    // what that signal is (16.2.3)
+    if (makesImplicitSignal(attr) && attr != "transaction" && nodep->argp() && !m_inSpecialized) {
+        const VhdlSymbol* varyingp = nullptr;
+        nodep->argp()->foreach([&](const AstVhdlName* namep) {
+            const VhdlSymbol* const symp
+                = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+            if (!varyingp && symp
+                && (symp->kind() == VhdlSymKind::VARIABLE
+                    || symp->kind() == VhdlSymKind::SHARED_VARIABLE
+                    || symp->kind() == VhdlSymKind::SIGNAL || symp->kind() == VhdlSymKind::PORT
+                    || symp->kind() == VhdlSymKind::PARAMETER
+                    // A constant of a subprogram that does not fold is only
+                    // as static as the parameters it was given
+                    || (symp->kind() == VhdlSymKind::CONSTANT && !symp->value().known()
+                        && symp->declp() && isSubprogramParam(symp->declp())))) {
+                varyingp = symp;
+            }
+        });
+        if (varyingp) {
+            err(nodep->argp()->fileline(), "The time '" + attr
+                                               + " is given must be static, but this one"
+                                                 " depends on '"
+                                               + varyingp->name() + "'");
+        }
+    }
     if (attr == "event" || attr == "active" || attr == "quiet" || attr == "stable"
         || attr == "driving") {
         return V3VhdlStd::booleanType();

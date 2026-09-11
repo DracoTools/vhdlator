@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_aliasobj_bad.vhd:28:43: An alias names an object, but this is the result of a function call, which is a value: 'bad1'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_aliasobj_bad.vhd:29:29: An alias names an object, but 'image gives a value: 'bad2'
+%Error: t/t_vhdl_aliasobj_bad.vhd:30:3: No declaration of 'p' matches the signature of alias 'bad3'
+%Error: Exiting due to
