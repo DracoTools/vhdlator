@@ -10,6 +10,7 @@
 %Warning-VHDLSHARED: t/t_vhdl_procwait_bad.vhd:70:21: A shared variable is of a protected type since VHDL-2000, but 'sv' is of type integer
 %Error: t/t_vhdl_procwait_bad.vhd:72:13: A sensitivity list names signals, but 'x' is a variable
 %Error: t/t_vhdl_procwait_bad.vhd:73:14: A signal in a sensitivity list is named statically, but this name's index depends on 'i'
-%Error: t/t_vhdl_procwait_bad.vhd:74:14: A timeout is of type time, but this number has no unit
-%Error: t/t_vhdl_procwait_bad.vhd:75:28: A timeout is of type time, but this is of type boolean
+%Error: t/t_vhdl_procwait_bad.vhd:74:35: A signal in a sensitivity list is named statically, but this name's index depends on 'k'
+%Error: t/t_vhdl_procwait_bad.vhd:75:14: A timeout is of type time, but this number has no unit
+%Error: t/t_vhdl_procwait_bad.vhd:76:28: A timeout is of type time, but this is of type boolean
 %Error: Exiting due to

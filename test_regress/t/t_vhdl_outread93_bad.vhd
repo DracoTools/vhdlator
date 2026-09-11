@@ -31,6 +31,12 @@ architecture a of t_vhdl_outread93_bad is
   begin
     return 0;
   end function;
+  type rec_t is record
+    y : integer;
+  end record;
+  type ptr_t is access rec_t;
+  -- Going through an out parameter of an access type reads it
+  procedure setp (x : out ptr_t) is begin x.y := 1; end procedure;
   procedure fill (v : out bit_vector) is
     alias w : bit_vector(1 to v'length) is v;
   begin

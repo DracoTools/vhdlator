@@ -1,12 +1,13 @@
-%Error: t/t_vhdl_stmtrules_bad.vhd:45:20: A resolution function takes an array of mvl and returns one, and no 'res2' does
+%Error: t/t_vhdl_stmtrules_bad.vhd:48:20: A resolution function takes an array of mvl and returns one, and no 'res2' does
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_stmtrules_bad.vhd:46:20: The range of type 't2' is two bounds or a range attribute, not a type mark
-%Error: t/t_vhdl_stmtrules_bad.vhd:47:21: An array index is a discrete range, not a value
-%Error: t/t_vhdl_stmtrules_bad.vhd:48:45: The function returns integer, but this value is of type universal_real
-%Error: t/t_vhdl_stmtrules_bad.vhd:53:18: A for generate runs over a discrete range, and this one is of type real
-%Error: t/t_vhdl_stmtrules_bad.vhd:64:14: A for loop runs over a discrete range, and this one is of type real
-%Error: t/t_vhdl_stmtrules_bad.vhd:65:20: A case choice is locally static, and this one depends on variable 'v'
-%Error: t/t_vhdl_stmtrules_bad.vhd:66:8: What is given for parameter 'x' of 'pv' must name a variable, but 's' is a signal
-%Error: t/t_vhdl_stmtrules_bad.vhd:67:10: What is given for parameter 'x' of 'ps' is a static signal name, but this one's index depends on 'n'
-%Error: t/t_vhdl_stmtrules_bad.vhd:71:70: What is given for port 'o' is a static signal name, but this one's index depends on 's'
+%Error: t/t_vhdl_stmtrules_bad.vhd:49:20: The range of type 't2' is two bounds or a range attribute, not a type mark
+%Error: t/t_vhdl_stmtrules_bad.vhd:50:21: An array index is a discrete range, not a value
+%Error: t/t_vhdl_stmtrules_bad.vhd:51:43: Aggregate has 2 element(s), but constant 'g1' needs 3
+%Error: t/t_vhdl_stmtrules_bad.vhd:52:45: The function returns integer, but this value is of type universal_real
+%Error: t/t_vhdl_stmtrules_bad.vhd:57:18: A for generate runs over a discrete range, and this one is of type real
+%Error: t/t_vhdl_stmtrules_bad.vhd:68:14: A for loop runs over a discrete range, and this one is of type real
+%Error: t/t_vhdl_stmtrules_bad.vhd:69:20: A case choice is locally static, and this one depends on variable 'v'
+%Error: t/t_vhdl_stmtrules_bad.vhd:70:8: What is given for parameter 'x' of 'pv' must name a variable, but 's' is a signal
+%Error: t/t_vhdl_stmtrules_bad.vhd:71:10: What is given for parameter 'x' of 'ps' is a static signal name, but this one's index depends on 'n'
+%Error: t/t_vhdl_stmtrules_bad.vhd:75:70: What is given for port 'o' is a static signal name, but this one's index depends on 's'
 %Error: Exiting due to

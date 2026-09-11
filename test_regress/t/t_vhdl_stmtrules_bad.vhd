@@ -8,8 +8,9 @@
 -- of its result type. A case choice is locally static. A variable parameter
 -- is given a variable, and a signal parameter or an output a static signal
 -- name. A type's range is two bounds or a range attribute, and an array's
--- index a range. A resolution function takes an array of the type's values,
--- or of its element's, and returns one.
+-- index a range; each row of an aggregate is as long as its dimension. A
+-- resolution function takes an array of the type's values, or of its
+-- element's, and returns one.
 -- References: nvc 1.22.1, GHDL 7.0.0-dev, Questa 2025.2.
 
 entity t_vhdl_stmtrules_sub is
@@ -27,6 +28,7 @@ architecture a of t_vhdl_stmtrules_bad is
   type mvl is ('0', '1', 'Z');
   type mvl_vec is array (natural range <>) of mvl;
   type mvl_vec2 is array (natural range <>) of mvl_vec(0 to 1);
+  type grid is array (0 to 1, 0 to 2) of bit;
   type rec is record
     v : bit_vector(0 to 3);
   end record;
@@ -39,12 +41,14 @@ architecture a of t_vhdl_stmtrules_bad is
   -- Legal
   subtype rmvl is res mvl;
   subtype rmvl2d is ((res)) mvl_vec2;
+  constant g0 : grid := (('1', '0', '1'), "010");
   function v (x : integer) return bit_vector is begin return "0000"; end function;
   function f return integer is begin return 1; end function;
   -- Illegal
   subtype rmvl2 is res2 mvl;
   type t2 is range integer;
   type t3 is array (5) of integer;
+  constant g1 : grid := (('1', '0', '1'), ('1', '0'));
   function g return integer is begin return 1.5; end function;
 begin
   -- Legal

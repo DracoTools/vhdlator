@@ -1,5 +1,6 @@
-%Error: t/t_vhdl_rev93_bad.vhd:14:3: Before VHDL-2008 a package has no generics
+%Error: t/t_vhdl_rev93_bad.vhd:15:3: Before VHDL-2008 a package has no generics
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_rev93_bad.vhd:24:3: Before VHDL-2008 a package is a design unit of its own, and cannot be declared inside another
-%Error: t/t_vhdl_rev93_bad.vhd:25:27: A string literal delimited by '%' cannot contain a '"'
+%Error: t/t_vhdl_rev93_bad.vhd:25:3: Before VHDL-2008 a package is a design unit of its own, and cannot be declared inside another
+%Error: t/t_vhdl_rev93_bad.vhd:26:27: A string literal delimited by '%' cannot contain a '"'
+%Error: t/t_vhdl_rev93_bad.vhd:27:3: Operator "and" takes two operands, and a function overloading it has a parameter for each, but this one has 1
 %Error: Exiting due to

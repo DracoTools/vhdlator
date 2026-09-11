@@ -71,6 +71,7 @@ begin
   begin
     wait on x;
     wait on v(i);
+    for k in 0 to 1 loop wait on v(k); end loop;
     wait for 5;
     wait until s = '1' for true;
   end process;

@@ -2887,6 +2887,15 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
             err(nodep->fileline(), "Alias '" + nodep->prettyName() + "' is of type "
                                        + ownp->prettyName() + ", but what it names is of type "
                                        + typep->prettyName());
+        } else if (ownp && typep && !m_inSpecialized && ownp->isConstrainedArray()
+                   && typep->isConstrainedArray() && ownp->dimensions() == 1
+                   && typep->dimensions() == 1 && ownp->lengthEmittable()
+                   && typep->lengthEmittable() && ownp->dimLength(0) != typep->dimLength(0)) {
+            // And as long as it, an element for each (6.6.2)
+            err(nodep->fileline(), "Alias '" + nodep->prettyName() + "' is "
+                                       + std::to_string(ownp->dimLength(0))
+                                       + " elements long, but what it names is "
+                                       + std::to_string(typep->dimLength(0)));
         }
         // Before VHDL-2008 an object alias names no multidimensional array
         // (VHDL-93 4.3.3.1)
@@ -3310,7 +3319,30 @@ void VhdlSemVisitor::checkSensitivityName(AstNodeVhdlExpr* exprp) {
         return;
     }
     if (info.cls != ObjClass::SIGNAL) return;
-    if (const VhdlSymbol* const varyingp = nonStaticIndex(exprp)) {
+    const VhdlSymbol* varyingp = nonStaticIndex(exprp);
+    // A loop parameter takes each of its values in turn, so a name indexed
+    // by one is not static either (9.4.3)
+    if (!varyingp) {
+        for (AstNodeVhdlExpr* np = exprp; np && !varyingp;) {
+            AstVhdlCall* const callp = VN_CAST(np, VhdlCall);
+            if (!callp) {
+                AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected);
+                np = selp ? selp->prefixp() : nullptr;
+                continue;
+            }
+            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+                ap->foreach([&](const AstVhdlName* namep) {
+                    const VhdlSymbol* const symp
+                        = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                    if (!varyingp && symp && symp->kind() == VhdlSymKind::LOOP_PARAMETER) {
+                        varyingp = symp;
+                    }
+                });
+            }
+            np = callp->prefixp();
+        }
+    }
+    if (varyingp) {
         err(exprp->fileline(), "A signal in a sensitivity list is named statically, but this"
                                " name's index depends on '"
                                    + varyingp->name() + "'");
@@ -3334,14 +3366,27 @@ static bool nameIsRead(const AstNode* nodep) {
             if (VN_IS(upp, NodeVhdlStmt) || VN_IS(upp, NodeVhdlDecl)) break;
         }
     }
+    // Going through an access value to what it designates reads the access
+    // value, whatever is then done with what it points at (8.1)
+    const auto derefs = [](const AstNode* childp) {
+        const AstNodeVhdlExpr* const exprp = VN_CAST(childp, NodeVhdlExpr);
+        return exprp && exprp->vhdlTypep()
+               && exprp->vhdlTypep()->base()->kind() == VhdlTypeKind::ACCESS;
+    };
     const AstNode* childp = nodep;
     for (const AstNode* upp = parentOf(nodep); upp; childp = upp, upp = parentOf(upp)) {
         if (const AstVhdlCall* const callp = VN_CAST(upp, VhdlCall)) {
-            if (callp->prefixp() == childp) continue;  // Indexed or sliced
+            if (callp->prefixp() == childp) {  // Indexed or sliced
+                if (derefs(childp)) return true;
+                continue;
+            }
             return true;  // An index or an argument
         }
         if (const AstVhdlSelected* const selp = VN_CAST(upp, VhdlSelected)) {
-            if (selp->prefixp() == childp) continue;  // A record element of it
+            if (selp->prefixp() == childp) {  // A record element of it
+                if (derefs(childp)) return true;
+                continue;
+            }
             return false;
         }
         if (const AstVhdlAttrName* const attrp = VN_CAST(upp, VhdlAttrName)) {
@@ -9471,7 +9516,31 @@ void VhdlSemVisitor::checkAggregate(AstVhdlAggregate* nodep, VhdlType* typep,
             flps.push_back(flp);
         }
     }
-    if (!allStatic || typep->dimensions() != 1) return;
+    // A multidimensional aggregate is an aggregate of rows, each an
+    // aggregate (or a string) of the dimensions left (9.3.3.3): its
+    // positional rows are counted against the first dimension, and each
+    // row is checked against the rest
+    if (typep->dimensions() > 1) {
+        if (!typep->isConstrainedArray() || !typep->lengthEmittable()) return;
+        VhdlType* const rowp = VhdlSymTab::newType(VhdlTypeKind::ARRAY, "", nodep->fileline());
+        for (size_t i = 1; i < typep->indexTypes().size(); ++i) {
+            rowp->addIndexType(typep->indexTypes()[i]);
+        }
+        rowp->elementp(typep->elementp() ? typep->elementp() : typep->base()->elementp());
+        rowp->unconstrained(false);
+        int64_t rows = 0;
+        for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
+            AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
+            if (!eap->choicesp()) ++rows;
+            if (eap->valuep()) checkArrayValue(eap->valuep(), rowp, what);
+        }
+        if (!hasNamed && !hasOthers && rows != typep->dimLength(0)) {
+            err(nodep->fileline(), "Aggregate has " + std::to_string(rows) + " row(s), but " + what
+                                       + " needs " + std::to_string(typep->dimLength(0)));
+        }
+        return;
+    }
+    if (!allStatic) return;
     const int64_t want = typep->dimLength(0);
 
     if (hasOthers) {

@@ -6,7 +6,9 @@
 %Error: t/t_vhdl_declparse_bad.vhd:35:46: A secondary unit is given a physical literal, a number and a unit: 'xe'
 %Error: t/t_vhdl_declparse_bad.vhd:36:32: A file type names what it holds by a type mark alone, with no constraint
 %Error: t/t_vhdl_declparse_bad.vhd:37:3: A configuration specification binds its instances to an entity, a configuration or 'open', and this one names none
-%Error: t/t_vhdl_declparse_bad.vhd:42:3: A block statement must have a label
-%Error: t/t_vhdl_declparse_bad.vhd:43:16: A block's port map follows its port clause, and this block has none
-%Error: t/t_vhdl_declparse_bad.vhd:44:16: A block's generic map follows its generic clause, and this block has none
+%Error: t/t_vhdl_declparse_bad.vhd:38:3: Operator "not" takes one operand, and a function overloading it has a parameter for each, but this one has 2
+%Error: t/t_vhdl_declparse_bad.vhd:39:3: Operator "*" takes two operands, and a function overloading it has a parameter for each, but this one has 1
+%Error: t/t_vhdl_declparse_bad.vhd:44:3: A block statement must have a label
+%Error: t/t_vhdl_declparse_bad.vhd:45:16: A block's port map follows its port clause, and this block has none
+%Error: t/t_vhdl_declparse_bad.vhd:46:16: A block's generic map follows its generic clause, and this block has none
 %Error: Exiting due to

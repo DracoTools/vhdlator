@@ -4,7 +4,7 @@
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
 -- SPDX-License-Identifier: CC0-1.0
 
--- Only an alias of an object has a subtype, and it is of the object's type.
+-- Only an alias of an object has a subtype, of the object's type and length.
 -- An attribute holds a constant, which no access or file value can be; its
 -- specification names something declared already, a design unit only from
 -- within that unit, and one saying "others" is the last. A physical type's
@@ -32,6 +32,7 @@ architecture a of t_vhdl_declspec_bad is
   end units;
   signal s1, s2, s3 : bit;
   constant c : integer := 5;
+  signal bv4 : bit_vector(0 to 3);
   -- Legal
   alias c2 : integer is c;
   attribute att of s1 : signal is 1;
@@ -39,6 +40,7 @@ architecture a of t_vhdl_declspec_bad is
   -- Illegal
   alias i2 : bit is integer;
   alias c3 : bit is c;
+  alias al : bit_vector(0 to 2) is bv4;
   attribute ap : ptr;
   attribute af : ft;
   attribute att of s2 : signal is 3;

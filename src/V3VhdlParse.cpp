@@ -1182,6 +1182,34 @@ AstNodeVhdl* V3VhdlParse::parseSubprogram(bool inInterface) {
                                                         : VhdlIfaceKind::VARIABLE));
         expect(VhdlTokType::RPAREN, "')' after the parameter list");
     }
+    // An operator function has a parameter per operand, defaulted or not
+    // (4.5.2): one for "not", "abs" and "??", one or two for "+" and "-",
+    // and two for the rest -- or, from VHDL-2008, one for a logical
+    // operator, which then reduces an array
+    if (isOperator && isOperatorSymbol(name)) {
+        int params = -nodep->genericCount();
+        for (AstNode* p = nodep->paramsp(); p; p = p->nextp()) ++params;
+        const bool logical = name == "and" || name == "or" || name == "nand" || name == "nor"
+                             || name == "xor" || name == "xnor";
+        const bool unaryOnly = name == "not" || name == "abs" || name == "??";
+        bool ok = false;
+        if (unaryOnly) {
+            ok = params == 1;
+        } else if (name == "+" || name == "-") {
+            ok = params == 1 || params == 2;
+        } else if (logical) {
+            ok = params == 2 || (params == 1 && flp->language() >= V3LangCode::L1076_2008);
+        } else {
+            ok = params == 2;
+        }
+        if (!ok) {
+            flp->v3error("Operator \"" << name << "\" takes "
+                                       << (unaryOnly ? "one operand" : "two operands")
+                                       << ", and a function overloading it has a parameter"
+                                          " for each, but this one has "
+                                       << params);
+        }
+    }
     if (isFunction) {
         expect(VhdlTokType::KWD_RETURN, "'return' in a function declaration");
         // VHDL-2019 allows a full subtype indication as the return

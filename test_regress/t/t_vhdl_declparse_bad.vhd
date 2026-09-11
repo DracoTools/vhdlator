@@ -8,7 +8,7 @@
 -- simple name. A physical type's primary unit is declared by its name
 -- alone, and a secondary unit as a whole number of another. A file type
 -- names a type mark alone. A configuration specification says what it binds
--- to. A block has a label, and its maps follow the clauses they give values
+-- to. An operator function has a parameter for each operand. A block has a label, and its maps follow the clauses they give values
 -- to.
 -- References: nvc 1.22.1, GHDL 7.0.0-dev, Questa 2025.2.
 
@@ -35,6 +35,8 @@ architecture a of t_vhdl_declparse_bad is
   type len4 is range 0 to 9 units xd; xe = 2 * xd; end units;
   type ft is file of bit_vector(0 to 3);
   for u : comp;
+  function "not" (a : bit; b : bit := '0') return bit is begin return a; end function;
+  function "*" (a : bit) return bit is begin return a; end function;
 begin
   -- Legal
   blk : block port (p : bit); port map (p => s); begin end block;
