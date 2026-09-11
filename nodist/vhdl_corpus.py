@@ -75,7 +75,6 @@ EXPECT_RULES = (
 # Sources a corpus writes against an older revision than the default
 PER_PATH_FLAGS = ((re.compile(r'/vests/vhdl-93/'), ['--vhdl-std', '93']), )
 
-
 # NVC's phase corpora are half deliberately-illegal source, and NVC declares
 # which half in its own C test harness rather than in the directory layout: a
 # test that lists expected diagnostics is a source that must be refused.  Read
@@ -101,8 +100,7 @@ def nvc_expectations(nvc_root, phase):
         body = chunk.split('END_TEST')[0]
         # An entry of the form '{ 20, "..." }' is a diagnostic the source must
         # produce; the list always ends '{ -1, NULL }', which is not one
-        expects = re.search(r'error_t\s+\w*expect\w*\s*\[\]\s*=\s*\{(.*?)\n\s*\};', body,
-                            re.S)
+        expects = re.search(r'error_t\s+\w*expect\w*\s*\[\]\s*=\s*\{(.*?)\n\s*\};', body, re.S)
         wants_error = bool(expects and re.search(r'\{\s*\d+\s*,', expects.group(1)))
         for name in re.findall(r'input_from_file\(TESTDIR\s*"([^"]+)"', body):
             full = os.path.normpath(os.path.join(nvc_root, 'test', name.lstrip('/')))
@@ -123,6 +121,22 @@ def nvc_expectations(nvc_root, phase):
 # counting clean compiles scores that half backwards.
 GHDL_VERB_RE = re.compile(r'^\s*(analyze_failure|analyze)\b(.*)$', re.M)
 _GHDL_EXPECT = {}
+# The script also says which revision each source is analyzed under: GHDL's
+# own default, VHDL-93, unless GHDL_STD_FLAGS or an analyze line says
+# otherwise. A VHDL-93 source is not a VHDL-2008 one -- a shared variable of
+# an ordinary type is legal in one and not the other -- so the file is
+# measured under the revision its suite gives it.
+GHDL_STD_RE = re.compile(r'--std=(\w+)')
+GHDL_STDS = {
+    '87': '93',
+    '93': '93',
+    '93c': '93',
+    '00': '2000',
+    '02': '2002',
+    '08': '2008',
+    '19': '2019'
+}
+_GHDL_STD = {}
 
 
 def ghdl_expectations(directory):
@@ -138,10 +152,22 @@ def ghdl_expectations(directory):
     except OSError:
         _GHDL_EXPECT[directory] = (table, order)
         return table
-    for verb, rest in GHDL_VERB_RE.findall(text):
+    stds = _GHDL_STD.setdefault(directory, {})
+    current = '93'
+    for line in text.splitlines():
+        verbm = GHDL_VERB_RE.match(line)
+        stdm = GHDL_STD_RE.search(line)
+        if stdm and not verbm and 'GHDL_STD_FLAGS' in line:
+            # Set for the lines that follow
+            current = GHDL_STDS.get(stdm.group(1), current)
+        if not verbm:
+            continue
+        verb, rest = verbm.groups()
+        std = GHDL_STDS.get(stdm.group(1), current) if stdm else current
         outcome = 'reject' if verb == 'analyze_failure' else 'accept'
         for word in rest.split():
             if word.endswith(VHDL_SUFFIXES):
+                stds.setdefault(word, std)
                 if word not in order:
                     order.append(word)
                 # A source named both ways must be refused: the failing use
@@ -204,11 +230,64 @@ def expected_outcome(path):
     return 'accept'
 
 
+# NVC's regress list names the revision a test needs beside how it should
+# end -- "shared4 normal,2008,relax=shared" -- and a test that names none is
+# run as VHDL-93, NVC's own default for the list
+NVC_REGRESS_RE = re.compile(r'(.*/nvc)/test/regress/([^/]+)\.vhdl?$')
+_NVC_STD = {}
+
+
+def nvc_regress_std(nvc_root, name):
+    if nvc_root not in _NVC_STD:
+        table = {}
+        try:
+            with open(os.path.join(nvc_root, 'test', 'regress', 'testlist.txt'),
+                      encoding='utf-8',
+                      errors='replace') as fh:
+                for line in fh:
+                    words = line.split()
+                    if len(words) < 2:
+                        continue
+                    flags = words[1].split(',')
+                    std = '93'
+                    if 'shell' in flags:
+                        # Run by a script of its own, which says the revision
+                        # if it says one; the frontend's default otherwise
+                        std = None
+                        script = os.path.join(nvc_root, 'test', 'regress', words[0] + '.sh')
+                        try:
+                            with open(script, encoding='utf-8', errors='replace') as sh:
+                                said = re.search(r'--std=(\d+)', sh.read())
+                            if said:
+                                std = {'1993': '93'}.get(said.group(1), said.group(1))
+                        except OSError:
+                            pass
+                    for flag in flags:
+                        if flag in ('2000', '2002', '2008', '2019'):
+                            std = flag
+                    table[words[0]] = std
+        except OSError:
+            pass
+        _NVC_STD[nvc_root] = table
+    return _NVC_STD[nvc_root].get(name)
+
+
 def extra_flags(path):
     """Return flags this source needs beyond the common ones."""
     for pattern, flags in PER_PATH_FLAGS:
         if pattern.search(path):
             return flags
+    if '/ghdl/testsuite/' in path:
+        directory = os.path.dirname(path)
+        ghdl_expectations(directory)
+        std = _GHDL_STD.get(directory, {}).get(os.path.basename(path))
+        if std:
+            return ['--vhdl-std', std]
+    match = NVC_REGRESS_RE.match(os.path.normpath(os.path.abspath(path)))
+    if match:
+        std = nvc_regress_std(match.group(1), match.group(2))
+        if std:
+            return ['--vhdl-std', std]
     return []
 
 
@@ -250,13 +329,17 @@ def find_sources(root, subdirs):
     return sorted(found)
 
 
-def run_group(command, timeout):
+def run_group(command, timeout, cwd=None):
     """Run a command in a process group of its own, and on timeout kill the
     whole group.  bin/verilator is a wrapper that runs verilator_bin as a
     child, so killing only the process started would leave the compiler
     running -- for hours, and holding its memory, on a source that hangs it."""
     proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True)
     try:
         stdout, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -273,8 +356,8 @@ def run_one(args):
     """Run Verilator over one source. Returns a Result."""
     verilator, flags, timeout, path = args
     expected = expected_outcome(path)
-    command = ([verilator] + flags + extra_flags(path)
-               + (ghdl_companions(path) if '/ghdl/testsuite/' in path else []) + [path])
+    command = ([verilator] + flags + extra_flags(path) +
+               (ghdl_companions(path) if '/ghdl/testsuite/' in path else []) + [path])
     start = time.time()
     try:
         stdout, returncode = run_group(command, timeout)
@@ -307,9 +390,8 @@ def summarize_failures(results, limit):
         if result.as_expected:
             continue
         if result.expected in ('reject', 'diagnose'):
-            key = ('(accepted, but the corpus says this must be refused)'
-                   if result.expected == 'reject' else
-                   '(nothing reported, but the corpus expects a diagnostic here)')
+            key = ('(accepted, but the corpus says this must be refused)' if result.expected
+                   == 'reject' else '(nothing reported, but the corpus expects a diagnostic here)')
             counts[key] = counts.get(key, 0) + 1
             continue
         # Strip file/line so distinct files with the same cause group together
@@ -343,8 +425,8 @@ def score_corpus(name, root, globs, args):
     passed = sum(1 for r in results if r.as_expected)
     total = len(results)
     must_reject = sum(1 for r in results if r.expected in ('reject', 'diagnose'))
-    wrongly_accepted = sum(1 for r in results if r.expected in ('reject', 'diagnose')
-                           and not r.as_expected)
+    wrongly_accepted = sum(1 for r in results
+                           if r.expected in ('reject', 'diagnose') and not r.as_expected)
     # VESTS says a non-compliant case must not compile; NVC's harness lists
     # warnings as readily as errors, so what it asks for is a diagnostic
     demand = 'diagnosed' if any(r.expected == 'diagnose' for r in results) else 'refused'
@@ -354,8 +436,7 @@ def score_corpus(name, root, globs, args):
         note = '   [%d must be %s, %d were not]' % (must_reject, demand, wrongly_accepted)
     if name in NEEDS_LIBRARY:
         note += '   [a floor: each file needs its library compiled alongside]'
-    print('%-16s  %5d/%-5d  %5.1f%%   (%.1fs)%s' %
-          (name, passed, total, percent, elapsed, note))
+    print('%-16s  %5d/%-5d  %5.1f%%   (%.1fs)%s' % (name, passed, total, percent, elapsed, note))
 
     for message, count in summarize_failures(results, args.failures):
         print('%-16s      %4dx  %s' % ('', count, message[:120]))

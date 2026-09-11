@@ -30,40 +30,42 @@ Typical use, from the Verilator repository root:
 
 import argparse
 import collections
+import importlib.util
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 
+def _corpus_module():
+    """The scoreboard, whose reading of each suite's revisions this shares."""
+    spec = importlib.util.spec_from_file_location(
+        "vhdl_corpus", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vhdl_corpus.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CORPUS = _corpus_module()
+
+
 def std_of(path):
-    """Which revision this source is written against."""
-    return "93" if "/vhdl-93/" in path else "2008"
+    """Which revision this source is written against, as its suite says:
+    "93", "2000", "2002", "2008" or "2019"."""
+    flags = _CORPUS.extra_flags(path)
+    if "--vhdl-std" in flags:
+        return flags[flags.index("--vhdl-std") + 1]
+    return "2008"
 
 
 def refuses(command, cwd):
     # In a process group of its own, so a timeout takes any child with it
     try:
-        proc = subprocess.Popen(  # pylint: disable=consider-using-with
-            command,
-            cwd=cwd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True)
-    except OSError:
-        return False
-    try:
-        return proc.wait(timeout=60) != 0
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        proc.wait()
+        return _CORPUS.run_group(command, 60, cwd=cwd)[1] != 0
+    except (subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -72,19 +74,16 @@ def verdicts(args_path):
     args, path = args_path
     with tempfile.TemporaryDirectory() as work:
         std = std_of(path)
-        out = [("nvc",
-                refuses([args.nvc, "--std=" + ("1993" if std == "93" else "2008"), "-a", path],
-                        work)),
-               ("ghdl",
-                refuses([args.ghdl, "-a", "--std=" + ("93" if std == "93" else "08"), path],
-                        work))]
+        year = "1993" if std == "93" else std
+        out = [("nvc", refuses([args.nvc, "--std=" + year, "-a", path], work)),
+               ("ghdl", refuses([args.ghdl, "-a", "--std=" + year[2:], path], work))]
         if args.questa:
             # vcom needs a library of its own, and one per source keeps the
             # sources from seeing each other's design units
             subprocess.run([args.vlib, "work"], cwd=work, capture_output=True, check=False)
-            out.append(("questa",
-                        refuses([args.vcom, "-" + ("93" if std == "93" else "2008"), "-quiet",
-                                 path], work)))
+            # vcom has no switch for VHDL-2000, whose rules VHDL-2002 kept
+            vcom_std = "-" + {"93": "93", "2000": "2002"}.get(std, year)
+            out.append(("questa", refuses([args.vcom, vcom_std, "-quiet", path], work)))
         return out
 
 
@@ -110,18 +109,23 @@ def main():
     parser.add_argument('--corpus', action='append', default=[], help='limit to these corpora')
     parser.add_argument('--nvc', default='nvc', help='nvc binary (default: nvc)')
     parser.add_argument('--ghdl', default='ghdl', help='ghdl binary (default: ghdl)')
-    parser.add_argument('--questa', action='store_true',
+    parser.add_argument('--questa',
+                        action='store_true',
                         help="also ask Questa's vcom, which breaks a tie between the other two")
     parser.add_argument('--vcom', default='vcom', help='Questa vcom binary (default: vcom)')
     parser.add_argument('--vlib', default='vlib', help='Questa vlib binary (default: vlib)')
     parser.add_argument('--jobs', type=int, default=8, help='parallel jobs (default: 8)')
     parser.add_argument('--groups', type=int, default=20, help='clauses to list (default: 20)')
-    parser.add_argument('--list', action='append', default=[], metavar='VERDICT',
+    parser.add_argument('--list',
+                        action='append',
+                        default=[],
+                        metavar='VERDICT',
                         help="name every source under one verdict line, e.g."
                         " --list 'nvc refuses, ghdl refuses, questa accepts'."
                         " Give 'split' for every source the references do not"
                         " settle by a majority; repeatable.")
-    parser.add_argument('--save', default=None,
+    parser.add_argument('--save',
+                        default=None,
                         help='write each source and how every reference answered')
     args = parser.parse_args()
 
@@ -157,8 +161,13 @@ def main():
             split.append(path)
     if args.save:
         with open(args.save, 'w', encoding='utf-8') as fh:
-            json.dump({path: dict(answers) for path, answers in zip(todo, outcomes)}, fh,
-                      indent=2, sort_keys=True)
+            json.dump({
+                path: dict(answers)
+                for path, answers in zip(todo, outcomes)
+            },
+                      fh,
+                      indent=2,
+                      sort_keys=True)
         print('Wrote %s' % args.save)
     print()
     for text, count in groups.most_common():
