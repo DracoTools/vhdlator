@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_attrspec_bad.vhd:22:23: 'c1' is not of entity class signal, so attribute 'weight' cannot be given to it as one
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_attrspec_bad.vhd:23:37: Attribute 'scale' is of type real, but the value given it is of type universal_integer
+%Error: Exiting due to

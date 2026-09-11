@@ -6,7 +6,8 @@
 
 -- An index constraint applies to an array, or to an access to one; a range
 -- constraint to a scalar type; and an index already constrained keeps its
--- constraint, which only "open" may stand in place of.
+-- constraint, which only "open" may stand in place of. An allocator names
+-- the type of what it creates, not the access type it returns.
 
 entity t_vhdl_constraint_bad is
 end entity;
@@ -22,4 +23,11 @@ architecture a of t_vhdl_constraint_bad is
   subtype bad2 is string range 2 to 5;
   subtype bad3 is arr2d_t(0 to 1)(0 to 3);
 begin
+  process
+    variable p : str_ptr;
+  begin
+    p := new string(1 to 4);
+    p := new str_ptr(1 to 4);
+    wait;
+  end process;
 end architecture;

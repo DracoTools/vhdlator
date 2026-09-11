@@ -1,5 +1,6 @@
-%Error: t/t_vhdl_constraint_bad.vhd:21:19: An index constraint applies to an array, but integer is not one
+%Error: t/t_vhdl_constraint_bad.vhd:22:19: An index constraint applies to an array, but integer is not one
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_constraint_bad.vhd:22:19: A range constraint narrows a scalar type, but string is not one
-%Error: t/t_vhdl_constraint_bad.vhd:23:19: arr2d_t is already constrained, so its index cannot be constrained again; write 'open' to constrain only its element
+%Error: t/t_vhdl_constraint_bad.vhd:23:19: A range constraint narrows a scalar type, but string is not one
+%Error: t/t_vhdl_constraint_bad.vhd:24:19: arr2d_t is already constrained, so its index cannot be constrained again; write 'open' to constrain only its element
+%Error: t/t_vhdl_constraint_bad.vhd:30:10: An allocator names the type of the object it creates, but str_ptr is the access type; name what it designates
 %Error: Exiting due to

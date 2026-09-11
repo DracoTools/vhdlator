@@ -1322,6 +1322,7 @@ class VhdlSemVisitor final : public VNVisitor {
         if (AstVhdlFileType* const filep = VN_CAST(defp, VhdlFileType)) {
             VhdlType* const typep = VhdlSymTab::newType(VhdlTypeKind::FILE, name, flp);
             typep->designatedp(resolveTypeMark(filep->designatedp()));
+            checkFileElement(filep->fileline(), typep->designatedp());
             return typep;
         }
         if (AstVhdlProtectedType* const protp = VN_CAST(defp, VhdlProtectedType)) {
@@ -1399,6 +1400,37 @@ public:
 
     void analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
+    // Whether a value of this type holds an access value somewhere in it
+    static bool holdsAccess(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 16) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::ACCESS) return true;
+        if (basep->kind() == VhdlTypeKind::ARRAY) return holdsAccess(basep->elementp(), depth + 1);
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            for (const VhdlSymbol* const ep : basep->elements()) {
+                if (holdsAccess(ep->typep(), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+    // A file holds values it can write out and read back, which an access, a
+    // file or a protected object is not, and a multi-dimensional array's
+    // shape is not something a file records (5.5)
+    void checkFileElement(FileLine* flp, const VhdlType* typep) {
+        if (!typep || typep->isError()) return;
+        const VhdlTypeKind kind = typep->base()->kind();
+        std::string why;
+        if (kind == VhdlTypeKind::FILE || kind == VhdlTypeKind::PROTECTED) {
+            why = std::string{"it is of a "} + (kind == VhdlTypeKind::FILE ? "file" : "protected")
+                  + " type";
+        } else if (holdsAccess(typep)) {
+            why = "it holds an access value";
+        } else if (kind == VhdlTypeKind::ARRAY && typep->base()->indexTypes().size() > 1) {
+            why = "it is a multi-dimensional array";
+        }
+        if (why.empty()) return;
+        err(flp, "A file cannot hold values of " + typep->prettyName() + ", since " + why);
+    }
     // A constant, a signal, a generic and a port hold values, and a value is
     // never an access, a file or a protected object: only a variable can be
     // one of those (6.4.2.2, 6.4.2.3, 6.5.2)
@@ -2559,9 +2591,18 @@ void VhdlSemVisitor::visit(AstVhdlAttrDecl* nodep) {
 // The entity classes of 7.2 that name something analysis has a symbol for.
 // A class the symbol table does not distinguish matches any kind.
 static bool entityClassMatches(const std::string& cls, VhdlSymKind kind) {
+    // A subprogram parameter is an object of whichever class it was declared
+    if (kind == VhdlSymKind::PARAMETER) {
+        return cls == "constant" || cls == "variable" || cls == "signal" || cls == "file";
+    }
     if (cls == "signal") return kind == VhdlSymKind::SIGNAL || kind == VhdlSymKind::PORT;
-    if (cls == "variable") return kind == VhdlSymKind::VARIABLE;
-    if (cls == "constant") return kind == VhdlSymKind::CONSTANT || kind == VhdlSymKind::GENERIC;
+    if (cls == "variable") {
+        return kind == VhdlSymKind::VARIABLE || kind == VhdlSymKind::SHARED_VARIABLE;
+    }
+    if (cls == "constant") {
+        return kind == VhdlSymKind::CONSTANT || kind == VhdlSymKind::GENERIC
+               || kind == VhdlSymKind::LOOP_PARAMETER || kind == VhdlSymKind::GENERATE_PARAMETER;
+    }
     if (cls == "type" || cls == "subtype") return kind == VhdlSymKind::TYPE;
     if (cls == "function") return kind == VhdlSymKind::FUNCTION;
     if (cls == "procedure") return kind == VhdlSymKind::PROCEDURE;
@@ -2589,6 +2630,13 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
         return;
     }
     analyzeExpr(nodep->valuep(), attrTypep);
+    // The value is of the attribute's type (7.2)
+    if (!valueFitsType(nodep->valuep(), attrTypep)) {
+        err(nodep->valuep()->fileline(), "Attribute '" + nodep->name() + "' is of type "
+                                             + attrTypep->prettyName()
+                                             + ", but the value given it is of type "
+                                             + nodep->valuep()->vhdlTypep()->prettyName());
+    }
     AstVhdlEntitySpec* const specp = nodep->specp();
     if (!specp || specp->all() || specp->others()) return;
     const std::string cls = specp->entityClass();
@@ -2598,6 +2646,16 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
         if (!flatten(namep, parts) || parts.empty()) continue;
         std::vector<VhdlSymbol*> found;
         lookup(parts.back(), found);
+        // What the specification names is of the class it says (7.2)
+        bool anyOfClass = false;
+        for (VhdlSymbol* const symp : found) {
+            if (entityClassMatches(cls, symp->resolved()->kind())) anyOfClass = true;
+        }
+        if (!found.empty() && !anyOfClass && !m_inSpecialized) {
+            err(namep->fileline(), "'" + parts.back() + "' is not of entity class " + cls
+                                       + ", so attribute '" + nodep->name()
+                                       + "' cannot be given to it as one");
+        }
         for (VhdlSymbol* const symp : found) {
             VhdlSymbol* const realp = symp->resolved();
             if (!entityClassMatches(cls, realp->kind())) continue;
@@ -8526,6 +8584,14 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
     } else if (AstVhdlAllocator* const p = VN_CAST(nodep, VhdlAllocator)) {
         if (p->subtypep()) {
             resultp = resolveSubtype(p->subtypep());
+            // An allocator creates an object of the designated type; the
+            // access type is what it returns, not what it makes (9.3.7)
+            if (resultp && wantp && wantp->kind() == VhdlTypeKind::ACCESS
+                && resultp->base() == wantp->base() && !m_inSpecialized) {
+                err(p->subtypep()->fileline(),
+                    "An allocator names the type of the object it creates, but "
+                        + resultp->prettyName() + " is the access type; name what it designates");
+            }
         } else if (p->valuep()) {
             resultp = analyzeExpr(p->valuep(), nullptr);
         }

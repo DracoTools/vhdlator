@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_filetype_bad.vhd:24:16: A file cannot hold values of int_ptr, since it holds an access value
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_filetype_bad.vhd:25:16: A file cannot hold values of int_file, since it is of a file type
+%Error: t/t_vhdl_filetype_bad.vhd:26:16: A file cannot hold values of rec_with_ptr, since it holds an access value
+%Error: t/t_vhdl_filetype_bad.vhd:27:16: A file cannot hold values of matrix, since it is a multi-dimensional array
+%Error: t/t_vhdl_filetype_bad.vhd:32:15: No visible operator "=" takes int_file and int_file
+%Error: Exiting due to

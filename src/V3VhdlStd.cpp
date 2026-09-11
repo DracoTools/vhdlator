@@ -323,9 +323,12 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
     VhdlType* const boolp = s_booleanp;
     if (!boolp) return;  // STANDARD is still being built
 
-    // Every type has equality (5.2.6)
-    addFunc(scopep, "=", boolp, {typep, typep});
-    addFunc(scopep, "/=", boolp, {typep, typep});
+    // Every type has equality (5.2.6), but for a file type and a protected
+    // type, whose values are not ones to compare (5.5, 5.6)
+    if (typep->kind() != VhdlTypeKind::FILE && typep->kind() != VhdlTypeKind::PROTECTED) {
+        addFunc(scopep, "=", boolp, {typep, typep});
+        addFunc(scopep, "/=", boolp, {typep, typep});
+    }
 
     // Scalar and discrete-array types are ordered
     const bool ordered
