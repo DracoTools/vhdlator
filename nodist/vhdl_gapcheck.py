@@ -137,7 +137,8 @@ def main():
             continue
         for failure in entry.get('failures', []):
             if failure.get('expected') in ('reject', 'diagnose'):
-                todo.append(os.path.join(entry['root'], failure['file']))
+                # Absolute, since each reference runs in a directory of its own
+                todo.append(os.path.abspath(os.path.join(entry['root'], failure['file'])))
     if not todo:
         print('Nothing to check: no source in this report was expected to fail and did not')
         return 0
