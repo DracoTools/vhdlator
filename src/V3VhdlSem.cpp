@@ -7029,11 +7029,19 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
 // having come from packages -- two different ones -- is what says so.
 bool VhdlSemVisitor::conflictingPotentials(const std::vector<VhdlSymbol*>& found) const {
     std::set<const VhdlSymbol*> roots;
-    std::set<const AstNodeVhdlUnit*> units;
+    std::set<const void*> units;
     bool anyPlain = false;
     for (VhdlSymbol* const symp : found) {
         VhdlSymbol* const rootp = aliasRoot(symp);
         if (!roots.insert(rootp).second) continue;
+        // STANDARD and TEXTIO are packages too, built in code: TIME's unit
+        // MIN and a package's function MIN hide each other (GHDL 7.0.0-dev
+        // and Questa 2025.2; nvc 1.22.1 takes the function)
+        if (!symp->declp() && rootp->predefined() && rootp->declScopep()) {
+            units.insert(rootp->declScopep());
+            if (!rootp->isOverloadable()) anyPlain = true;
+            continue;
+        }
         const AstNodeVhdlUnit* const unitp = symp->declp() ? unitOf(symp->declp()) : nullptr;
         if (!VN_IS(unitp, VhdlPackage) && !VN_IS(unitp, VhdlPackageInst)) return false;
         // Declared by the unit being analyzed, or by the package whose body
@@ -7954,6 +7962,11 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                         + ", but this one is of type " + eap->valuep()->vhdlTypep()->prettyName());
             }
             checkValueInRange(eap->valuep(), hintp, "an element of this aggregate");
+            // An element that is itself an array is as long as the element
+            // subtype (nvc 1.22.1 and Questa 2025.2; GHDL 7.0.0-dev warns)
+            if (hintp == elemTypep && !VN_IS(eap->valuep(), VhdlAggregate)) {
+                checkArrayValue(eap->valuep(), hintp, "an element of this aggregate");
+            }
         }
         // Where the context imposes no constraint -- an aggregate standing as
         // an operand, or returned where the result subtype is unconstrained
@@ -8638,6 +8651,18 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             scopep->lookupLocal(parts.back(), found);
         } else {
             lookup(parts.back(), found);
+            if (conflictingPotentials(found) && !m_inSpecialized) {
+                err(nodep->prefixp()->fileline(),
+                    "'" + parts.back()
+                        + "' is declared by more than one package a use clause makes visible"
+                          " here, and one of them cannot be overloaded, so neither is visible");
+                for (AstNode* ap = nodep->argsp(); ap; ap = ap->nextp()) {
+                    if (AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc)) {
+                        if (asp->actualp()) analyzeExpr(asp->actualp(), nullptr);
+                    }
+                }
+                return V3VhdlStd::errorType();
+            }
         }
     }
 
@@ -8838,7 +8863,24 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // unit -- and indexing it is an indexed name or a slice (8.4, 8.5)
     if (namedPrefix && VN_IS(nodep->prefixp(), VhdlSelected)) {
         bool callable = false;
+        // "r.elem(a to b)" of a record object selects its element, whatever
+        // function of that name a search by simple name also finds (UVVM's
+        // cov_bin.bin_vector beside its function bin_vector)
+        bool ofRecord = false;
+        if (parts.size() == 2) {
+            std::vector<VhdlSymbol*> heads;
+            lookup(parts[0], heads);
+            for (const VhdlSymbol* const headp : heads) {
+                const VhdlSymbol* const realp = headp->resolved();
+                if (realp->isOverloadable() || !realp->typep()) continue;
+                const VhdlSymKind kind = realp->kind();
+                if (kind == VhdlSymKind::TYPE || kind == VhdlSymKind::PACKAGE) continue;
+                ofRecord = realp->typep()->base()->kind() == VhdlTypeKind::RECORD;
+                break;
+            }
+        }
         for (const VhdlSymbol* const symp : found) {
+            if (ofRecord) break;
             // An alias of a subprogram is called like the subprogram (6.6.3),
             // so what it denotes is what says whether this is a call -- the
             // search above the loop asks the same question the same way
@@ -8872,10 +8914,15 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // the predefined operator on universal_integer, whose argument fits
     // without conversion, and the design's own is never considered.
     int bestFits = -1;
+    // A discrete range is no actual of any subprogram, so a name given one
+    // is a slice, of an object or of what a call with no arguments returns
+    const bool anyRange
+        = std::any_of(assocs.begin(), assocs.end(), [](const AstVhdlAssoc* asp) { return !asp; });
     for (VhdlSymbol* const symp : found) {
         // An alias of a subprogram is called like the subprogram it names
         const VhdlSymKind kind = symp->resolved()->kind();
         if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
+        if (anyRange) continue;
         if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
         bool ok = true;
         int score = 0;
@@ -8925,6 +8972,22 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         // naming it (4.2.2.1), and then a following parenthesis indexes the
         // result rather than passing arguments: "cfg.get_val(3)" where
         // get_val takes nothing and returns an array (8.1).
+        // Two such functions leave the name ambiguous, whatever follows it
+        std::set<const VhdlSymbol*> noArgs;
+        for (VhdlSymbol* const symp : found) {
+            const VhdlSymbol* const fp = symp->resolved();
+            if (fp->kind() != VhdlSymKind::FUNCTION) continue;
+            if (!fp->paramTypes().empty() && !allParamsDefaulted(fp)) continue;
+            const VhdlType* const retp = fp->returnTypep();
+            if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY)
+                noArgs.insert(aliasRoot(symp));
+        }
+        if (noArgs.size() > 1 && !m_inSpecialized && !parts.empty()) {
+            err(nodep->fileline(), "'" + parts.back() + "' names " + std::to_string(noArgs.size())
+                                       + " functions called with no arguments, and nothing"
+                                         " here decides which one's result this indexes");
+            return V3VhdlStd::errorType();
+        }
         for (VhdlSymbol* const symp : found) {
             if (symp->resolved()->kind() != VhdlSymKind::FUNCTION) continue;
             VhdlSymbol* const fp = symp->resolved();
@@ -10682,6 +10745,24 @@ void VhdlSemVisitor::checkActualClass(const VhdlSymbol* subp, int formal,
         }
     }
     if (!ifp) return;
+    // A formal of mode in or inout reads what it is given, and before
+    // VHDL-2008 nothing reads a port or parameter of mode out (4.2.2.1). A
+    // function's arguments are read where they are written, which the rule
+    // for reading names already covers.
+    if ((ifp->mode() == VhdlMode::IN || ifp->mode() == VhdlMode::INOUT)
+        && subp->resolved()->kind() == VhdlSymKind::PROCEDURE
+        && actualp->fileline()->language() < V3LangCode::L1076_2008) {
+        const ObjInfo readp = objectOfName(actualp);
+        if (readp.modeOut && readp.symp) {
+            err(actualp->fileline(),
+                std::string{"A "}
+                    + (readp.symp->kind() == VhdlSymKind::PORT ? "port" : "parameter")
+                    + " of mode out cannot be read before VHDL-2008, and parameter '"
+                    + ifp->prettyName() + "' of '" + subp->resolved()->name() + "' reads '"
+                    + readp.symp->name() + "'");
+            return;
+        }
+    }
     ObjClass want = ObjClass::UNKNOWN;
     if (ifp->kind() == VhdlIfaceKind::SIGNAL) {
         want = ObjClass::SIGNAL;

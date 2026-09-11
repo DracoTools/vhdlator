@@ -942,7 +942,16 @@ AstNodeVhdl* V3VhdlParse::parseTypeDefinition(const std::string& typeName) {
                 sip->constraintp(new AstVhdlBox{iflp});
                 indexp->addRangesp(sip);
             } else {
-                indexp->addRangesp(parseDiscreteRange());
+                AstNodeVhdl* const rangep = parseDiscreteRange();
+                // "1 tnatural range <>" leaves an index open with no type
+                // mark to say of what: a literal is not a name (5.3.2.1)
+                const AstVhdlSubtypeInd* const sip = VN_CAST(rangep, VhdlSubtypeInd);
+                if (sip && VN_IS(sip->constraintp(), VhdlBox) && !VN_IS(sip->typeMarkp(), VhdlName)
+                    && !VN_IS(sip->typeMarkp(), VhdlSelected)) {
+                    iflp->v3error("An index left open is written 'type_mark range <>', and"
+                                  " this names no type");
+                }
+                indexp->addRangesp(rangep);
             }
         } while (check(VhdlTokType::COMMA));
         expect(VhdlTokType::RPAREN, "')' after the array index");
@@ -1392,8 +1401,13 @@ AstNodeVhdl* V3VhdlParse::parseConfigSpec() {
                      " configuration or 'open', and this one names none");
     }
     expect(VhdlTokType::SEMICOLON, "';' after the configuration specification");
-    // VHDL-2008 allows an explicit "end for;"
-    if (check(VhdlTokType::KWD_END)) {
+    // VHDL-2008 allows an explicit "end for;", and only it (7.3.1)
+    if (peekType() == VhdlTokType::KWD_END) {
+        if (here()->language() < V3LangCode::L1076_2008) {
+            here()->v3error("Before VHDL-2008 a configuration specification is not closed by"
+                            " 'end for'");
+        }
+        consume();
         expect(VhdlTokType::KWD_FOR, "'for' after 'end'");
         expect(VhdlTokType::SEMICOLON, "';' after 'end for'");
     }

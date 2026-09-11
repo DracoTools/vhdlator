@@ -615,6 +615,13 @@ VhdlToken V3VhdlScan::scanToolDirective(FileLine* flp) {
     VhdlToken tok;
     tok.flp = flp;
     tok.type = VhdlTokType::TOOL_DIRECTIVE;
+    // VHDL-2008 brought tool directives; before it the grave accent is a
+    // character only a comment or a string may hold (VHDL-93 13.1). nvc
+    // 1.22.1 differs by directive, GHDL 7.0.0-dev and Questa 2025.2 refuse.
+    if (m_lang < V3LangCode::L1076_2008) {
+        flp->v3error("Before VHDL-2008 a grave accent is allowed only in a comment or a string;"
+                     " tool directives are VHDL-2008's");
+    }
     advance();  // grave accent
     while (!atEnd() && !isLineEnd(static_cast<unsigned char>(peek()))) tok.text += advance();
     return tok;

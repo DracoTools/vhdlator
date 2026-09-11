@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_outparam93_bad.vhd:40:10: A parameter of mode out cannot be read before VHDL-2008, and parameter 'x' of 'bump' reads 'v'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_outparam93_bad.vhd:47:10: A port of mode out cannot be read before VHDL-2008, and parameter 'sig' of 'take' reads 'po'
+%Error: Exiting due to

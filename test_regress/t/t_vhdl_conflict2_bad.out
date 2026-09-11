@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_conflict2_bad.vhd:49:8: 'min' is declared by more than one package a use clause makes visible here, and one of them cannot be overloaded, so neither is visible
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_conflict2_bad.vhd:51:24: 'f' names 2 functions called with no arguments, and nothing here decides which one's result this indexes
+%Error: Exiting due to
