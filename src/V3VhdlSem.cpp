@@ -1372,6 +1372,7 @@ public:
     bool procedureSuspends(const AstVhdlProcCall* pcp) VL_MT_DISABLED;
     void checkSensitivityName(AstNodeVhdlExpr* exprp) VL_MT_DISABLED;
     static const VhdlSymbol* nonStaticIndex(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    void checkOutReads(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     static ObjInfo objectOfName(const AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
     static ObjInfo objectOfSymbol(const VhdlSymbol* symp) VL_MT_DISABLED;
     static const char* objClassName(ObjClass cls) {
@@ -2702,15 +2703,90 @@ void VhdlSemVisitor::checkSensitivityName(AstNodeVhdlExpr* exprp) {
         err(exprp->fileline(), "A signal in a sensitivity list is named statically, but this"
                                " name's index depends on '"
                                    + varyingp->name() + "'");
-        return;
     }
-    // Before VHDL-2008 a port of mode out cannot be read, and being
-    // sensitive to one reads it
-    if (info.modeOut && exprp->fileline()->language() < V3LangCode::L1076_2008) {
-        err(exprp->fileline(), "A port of mode out cannot be read before VHDL-2008, and a"
-                               " sensitivity list reads it: '"
-                                   + info.symp->name() + "'");
+}
+
+// Whether a name denoting an object reads it where it stands: everywhere
+// but as (the root of) an assignment's target. An association is left to the
+// rules for associations, and an attribute's prefix to the rules for
+// attributes, since whether those read the object depends on which.
+static bool nameIsRead(const AstNode* nodep) {
+    // Anywhere inside an association's formal part -- a conversion written
+    // on the formal, "to_int(o) => s" -- the object is the one the
+    // association writes through, not a value read
+    {
+        const AstNode* childp = nodep;
+        for (const AstNode* upp = parentOf(nodep); upp; childp = upp, upp = parentOf(upp)) {
+            if (const AstVhdlAssoc* const asp = VN_CAST(upp, VhdlAssoc)) {
+                if (asp->formalp() == childp) return false;
+            }
+            if (VN_IS(upp, NodeVhdlStmt) || VN_IS(upp, NodeVhdlDecl)) break;
+        }
     }
+    const AstNode* childp = nodep;
+    for (const AstNode* upp = parentOf(nodep); upp; childp = upp, upp = parentOf(upp)) {
+        if (const AstVhdlCall* const callp = VN_CAST(upp, VhdlCall)) {
+            if (callp->prefixp() == childp) continue;  // Indexed or sliced
+            return true;  // An index or an argument
+        }
+        if (const AstVhdlSelected* const selp = VN_CAST(upp, VhdlSelected)) {
+            if (selp->prefixp() == childp) continue;  // A record element of it
+            return false;
+        }
+        if (const AstVhdlAttrName* const attrp = VN_CAST(upp, VhdlAttrName)) {
+            return attrp->prefixp() != childp;  // An argument is a value read
+        }
+        if (const AstVhdlAssoc* const asp = VN_CAST(upp, VhdlAssoc)) {
+            if (asp->formalp() == childp) return false;
+            // An index, a function's argument and an attribute's argument
+            // are values read; what a procedure or a port map does with its
+            // actual depends on the formal's mode, which their own rules ask
+            const AstNode* const ownerp = parentOf(upp);
+            if (const AstVhdlCall* const callp = VN_CAST(ownerp, VhdlCall)) {
+                const VhdlSymbol* symp = callp->vhdlSymp();
+                if (!symp) symp = callp->prefixp()->vhdlSymp();
+                if (symp && symp->resolved()->kind() == VhdlSymKind::PROCEDURE) return false;
+                // A conversion standing as the whole actual of a port map or
+                // a procedure call converts what the formal's mode says
+                // flows, which is the association's to say
+                if (const AstVhdlAssoc* const outerp = VN_CAST(parentOf(callp), VhdlAssoc)) {
+                    const AstVhdlCall* const ocallp = VN_CAST(parentOf(outerp), VhdlCall);
+                    if (!ocallp) return false;  // A port or generic map
+                    const VhdlSymbol* osymp = ocallp->vhdlSymp();
+                    if (!osymp) osymp = ocallp->prefixp()->vhdlSymp();
+                    if (osymp && osymp->resolved()->kind() == VhdlSymKind::PROCEDURE) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            return VN_IS(ownerp, VhdlAttrName);
+        }
+        // An alias names the object; it reads nothing until it is used
+        if (VN_IS(upp, VhdlAliasDecl)) return false;
+        if (VN_IS(upp, VhdlElemAssoc) || VN_IS(upp, VhdlAggregate)) continue;
+        if (const AstVhdlSigAssign* const asgp = VN_CAST(upp, VhdlSigAssign)) {
+            return asgp->targetp() != childp;
+        }
+        if (const AstVhdlVarAssign* const asgp = VN_CAST(upp, VhdlVarAssign)) {
+            return asgp->targetp() != childp;
+        }
+        return true;
+    }
+    return false;
+}
+
+// Before VHDL-2008 a port or a parameter of mode out is written and never
+// read (6.5.2); VHDL-2008 lets both be read
+void VhdlSemVisitor::checkOutReads(AstNodeVhdlUnit* unitp) {
+    unitp->foreach([&](const AstVhdlName* namep) {
+        if (namep->fileline()->language() >= V3LangCode::L1076_2008) return;
+        const ObjInfo info = objectOfSymbol(namep->vhdlSymp());
+        if (!info.modeOut || !nameIsRead(namep)) return;
+        err(namep->fileline(),
+            std::string{"A "} + (info.symp->kind() == VhdlSymKind::PORT ? "port" : "parameter")
+                + " of mode out cannot be read before VHDL-2008: '" + info.symp->name() + "'");
+    });
 }
 
 // An object of a name's indexes or slice bounds that is not static: a
@@ -5036,6 +5112,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
 // is written against generic types that make it no homograph of the
 // declaration, so the two are not paired up by that route.
 void VhdlSemVisitor::checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    for (AstNodeVhdlUnit* const unitp : unitsp) checkOutReads(unitp);
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         unitp->foreach([&](const AstVhdlSubprogDecl* declp) {
             if (declp->hasBody() || declp->isInstance() || declp->inPkgInstance()
@@ -8468,6 +8545,7 @@ VhdlSemVisitor::ObjInfo VhdlSemVisitor::objectOfSymbol(const VhdlSymbol* symp) {
         default: break;
         }
         info.modeIn = ifp->mode() == VhdlMode::IN;
+        info.modeOut = ifp->mode() == VhdlMode::OUT;
         break;
     default: break;
     }

@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_outread93_bad.vhd:38:13: A parameter of mode out cannot be read before VHDL-2008: 'v'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_outread93_bad.vhd:45:12: A port of mode out cannot be read before VHDL-2008: 'o'
+%Error: t/t_vhdl_outread93_bad.vhd:47:17: A port of mode out cannot be read before VHDL-2008: 'o'
+%Error: t/t_vhdl_outread93_bad.vhd:48:18: A port of mode out cannot be read before VHDL-2008: 'o'
+%Error: t/t_vhdl_outread93_bad.vhd:49:26: A port of mode out cannot be read before VHDL-2008: 'n'
+%Error: Exiting due to
