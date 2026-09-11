@@ -2298,6 +2298,25 @@ AstNodeVhdlExpr* V3VhdlParse::parseExpression() {
         FileLine* const flp = here();
         consume();
         lhsp = new AstVhdlUnary{flp, VhdlUnaryOp::COND_CONV, parsePrimary()};
+        // "??" applies to one primary and that is the whole expression, so
+        // "?? a and b" is not one (9.1); it is read on for recovery's sake
+        switch (peekType()) {
+        case VhdlTokType::KWD_AND:
+        case VhdlTokType::KWD_OR:
+        case VhdlTokType::KWD_XOR:
+        case VhdlTokType::KWD_NAND:
+        case VhdlTokType::KWD_NOR:
+        case VhdlTokType::KWD_XNOR:
+        case VhdlTokType::EQ:
+        case VhdlTokType::NE:
+        case VhdlTokType::LT:
+        case VhdlTokType::GT:
+        case VhdlTokType::GE:
+            here()->v3error("An expression the condition operator begins is that one primary"
+                            " and nothing more; parenthesize everything it applies to");
+            break;
+        default: break;
+        }
     } else {
         lhsp = parseRelation();
     }

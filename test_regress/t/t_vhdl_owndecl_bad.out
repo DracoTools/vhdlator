@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_owndecl_bad.vhd:27:33: 's1' is being declared here, and a name is not visible within its own declaration
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_owndecl_bad.vhd:28:30: 'c1' is being declared here, and a name is not visible within its own declaration
+%Error: t/t_vhdl_owndecl_bad.vhd:29:19: 't1' is being declared here, and a name is not visible within its own declaration
+%Error: t/t_vhdl_owndecl_bad.vhd:30:17: 'a1' is being declared here, and a name is not visible within its own declaration
+%Error: Exiting due to

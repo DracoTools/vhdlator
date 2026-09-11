@@ -104,6 +104,19 @@ class VhdlSemVisitor final : public VNVisitor {
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
     bool m_inPackageBody = false;
+    // Names whose own declaration is being analyzed. A declaration's scope
+    // begins where it does, so within it the name denotes nothing yet --
+    // not the outer object it is about to hide (12.2, 12.3)
+    std::set<std::string> m_declaring;
+    bool nameBeingDeclared(const AstVhdlName* namep) {
+        if (m_inSpecialized || namep->isChar() || !m_declaring.count(namep->name())) {
+            return false;
+        }
+        err(namep->fileline(), "'" + namep->prettyName()
+                                   + "' is being declared here, and a name is not visible"
+                                     " within its own declaration");
+        return true;
+    }
     // Package declarations whose body this analysis has seen, and so whose
     // subprograms are known to have been given bodies or not (4.8)
     std::set<const AstVhdlPackage*> m_pkgsWithBody;
@@ -827,6 +840,9 @@ class VhdlSemVisitor final : public VNVisitor {
                 markp->vhdlTypep(typep);
                 return typep;
             }
+        }
+        if (const AstVhdlName* const namep = VN_CAST(markp, VhdlName)) {
+            if (nameBeingDeclared(namep)) return V3VhdlStd::errorType();
         }
         VhdlSymbol* const symp = lookupOne(markp, VhdlSymKind::TYPE, "type");
         if (!symp || !symp->typep()) return V3VhdlStd::errorType();
@@ -1830,6 +1846,8 @@ void VhdlSemVisitor::checkCompositeElements(VhdlType* typep, FileLine* flp) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlSubtypeDecl* nodep) {
+    VL_RESTORER_COPY(m_declaring);
+    m_declaring.insert(nodep->name());
     VhdlType* const typep = resolveSubtype(nodep->subtypep());
     // resolveSubtype makes a fresh type when the indication is constrained;
     // that one is ours to name. An unconstrained indication returns the base
@@ -1842,6 +1860,8 @@ void VhdlSemVisitor::visit(AstVhdlSubtypeDecl* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
+    VL_RESTORER_COPY(m_declaring);
+    m_declaring.insert(nodep->name());
     VhdlSymKind kind = VhdlSymKind::CONSTANT;
     switch (nodep->kind()) {
     case VhdlObjKind::CONSTANT: kind = VhdlSymKind::CONSTANT; break;
@@ -2332,7 +2352,16 @@ void VhdlSemVisitor::visit(AstVhdlComponentDecl* nodep) {
 
 void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::ALIAS, nodep->name(), nodep);
-    if (nodep->subtypep()) symp->typep(resolveSubtype(nodep->subtypep()));
+    {
+        VL_RESTORER_COPY(m_declaring);
+        m_declaring.insert(nodep->name());
+        if (nodep->subtypep()) symp->typep(resolveSubtype(nodep->subtypep()));
+        // "alias a is a" names nothing; an expanded name reaches the outer a.
+        // An alias of a subprogram is overloadable, and hides nothing its
+        // signature does not match, so it may repeat the designator.
+        const AstVhdlName* const targetp = VN_CAST(nodep->targetp(), VhdlName);
+        if (targetp && !nodep->signaturep()) nameBeingDeclared(targetp);
+    }
     // Record what the alias denotes, so that an alias of a type may be used
     // as a type mark and an alias of an object as an object (6.6)
     std::vector<std::string> parts;
@@ -5748,6 +5777,7 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
 }
 
 VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
+    if (nameBeingDeclared(nodep)) return V3VhdlStd::errorType();
     const std::string key = nodep->isChar() ? vhdlCharLitName(nodep->name()) : nodep->name();
     std::vector<VhdlSymbol*> found;
     lookup(key, found);
