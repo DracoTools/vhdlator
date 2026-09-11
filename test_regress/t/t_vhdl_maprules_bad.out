@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_maprules_bad.vhd:18:47: Package 'gen' has no generic named 'depth'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_maprules_bad.vhd:35:11: A null range is a choice only of an aggregate with a single element association and that one choice
+%Error: t/t_vhdl_maprules_bad.vhd:43:11: The index specification of a block configuration is locally static, and 'n' is a signal
+%Error: Exiting due to

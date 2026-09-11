@@ -1,0 +1,9 @@
+%Error: t/t_vhdl_usesel_bad.vhd:41:24: 'ieee' is not visible here: a library is named by a library clause before a use clause looks into it
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_usesel_bad.vhd:57:13: No visible subprogram 'f' takes 1 argument(s) of these types
+%Error: t/t_vhdl_usesel_bad.vhd:58:12: Cannot find declaration of 'c'
+%Error: t/t_vhdl_usesel_bad.vhd:62:15: An entity instantiation names an entity, and 'leaf' here names a component
+%Error: t/t_vhdl_usesel_bad.vhd:72:15: No entity 'leaf' is visible here; name it with its library, as in 'entity work.leaf'
+%Error: t/t_vhdl_usesel_bad.vhd:82:30: 'rtl' here names an architecture, which has no value
+%Error: t/t_vhdl_usesel_bad.vhd:94:18: 'work' is a library, but a type is required here
+%Error: Exiting due to

@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_genrules_bad.vhd:23:12: A type conversion changes a value between closely related types, and universal_integer and t are not
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_genrules_bad.vhd:24:12: A type conversion changes a value between closely related types, and u and t are not
+%Error: t/t_vhdl_genrules_bad.vhd:25:18: A type conversion changes a value between closely related types, and t and integer are not
+%Error: t/t_vhdl_genrules_bad.vhd:52:54: Generic type 't' has the predefined "=" and "/=", and text is a file type, which has neither
+%Error: t/t_vhdl_genrules_bad.vhd:53:68: Generic type 'u' has the predefined "=" and "/=", and pt is a protected type, which has neither
+%Error: Exiting due to

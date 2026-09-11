@@ -262,7 +262,10 @@ AstNodeVhdlUnit* V3VhdlParse::parseDesignUnit() {
         break;
     case VhdlTokType::KWD_CONFIGURATION: unitp = parseConfiguration(); break;
     case VhdlTokType::KWD_CONTEXT: unitp = parseContextDecl(); break;
-    case VhdlTokType::END_OF_FILE: break;
+    case VhdlTokType::END_OF_FILE:
+        // A context clause is the start of a design unit, not one (13.1)
+        if (contextp) syntaxError("a design unit after the context clause");
+        break;
     default:
         syntaxError("a design unit (entity, architecture, package, configuration or context)");
         break;

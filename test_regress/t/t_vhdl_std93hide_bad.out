@@ -1,0 +1,7 @@
+%Error: t/t_vhdl_std93hide_bad.vhd:24:13: No visible operator "&" takes boolean and boolean
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_std93hide_bad.vhd:25:17: No visible subprogram 'minimum' takes 2 argument(s) of these types
+%Error: t/t_vhdl_std93hide_bad.vhd:26:21: No visible subprogram 'to_string' takes 1 argument(s) of these types
+%Error: t/t_vhdl_std93hide_bad.vhd:27:19: No visible subprogram 'rising_edge' takes 1 argument(s) of these types
+%Error: t/t_vhdl_std93hide_bad.vhd:28:10: No visible operator "and" matches this use
+%Error: Exiting due to

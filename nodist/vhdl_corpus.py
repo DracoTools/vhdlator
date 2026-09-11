@@ -137,6 +137,10 @@ GHDL_STDS = {
     '19': '2019'
 }
 _GHDL_STD = {}
+# "clean" empties the library, so a source analyzed after one sees none of
+# those analyzed before it -- and they may be of another revision entirely
+GHDL_CLEAN_RE = re.compile(r'^\s*clean\b')
+_GHDL_SEGMENT = {}
 
 
 def ghdl_expectations(directory):
@@ -153,8 +157,13 @@ def ghdl_expectations(directory):
         _GHDL_EXPECT[directory] = (table, order)
         return table
     stds = _GHDL_STD.setdefault(directory, {})
+    segments = _GHDL_SEGMENT.setdefault(directory, {})
     current = '93'
+    segment = 0
     for line in text.splitlines():
+        if GHDL_CLEAN_RE.match(line):
+            segment += 1
+            continue
         verbm = GHDL_VERB_RE.match(line)
         stdm = GHDL_STD_RE.search(line)
         if stdm and not verbm and 'GHDL_STD_FLAGS' in line:
@@ -168,6 +177,7 @@ def ghdl_expectations(directory):
         for word in rest.split():
             if word.endswith(VHDL_SUFFIXES):
                 stds.setdefault(word, std)
+                segments.setdefault(word, set()).add(segment)
                 if word not in order:
                     order.append(word)
                 # A source named both ways must be refused: the failing use
@@ -201,12 +211,14 @@ def ghdl_companions(path):
     if not table:
         return []
     order = _GHDL_EXPECT[directory][1]
+    segments = _GHDL_SEGMENT.get(directory, {})
     name = os.path.basename(path)
     out = []
     for other in order:
         if other == name:
             break
-        if table.get(other) == 'accept':
+        shared = segments.get(other, set()) & segments.get(name, set())
+        if table.get(other) == 'accept' and shared:
             out.append(os.path.join(directory, other))
     return out
 

@@ -61,6 +61,20 @@ VhdlType* s_textp = nullptr;
 VhdlType* s_sidep = nullptr;
 VhdlScope* s_envp = nullptr;
 
+// What is declared while one of these is alive is a VHDL-2008 addition to the
+// predefined environment, which a unit written in VHDL-93 does not see
+class Mark2008 final {
+    const bool m_saved;
+
+public:
+    Mark2008()
+        : m_saved{VhdlScope::mark2008()} {
+        VhdlScope::mark2008(true);
+    }
+    ~Mark2008() { VhdlScope::mark2008(m_saved); }
+    VL_UNCOPYABLE(Mark2008);
+};
+
 FileLine* stdFileline() {
     static FileLine* s_flp = nullptr;
     if (!s_flp) s_flp = new FileLine{"<std.standard>"};
@@ -340,6 +354,7 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         addFunc(scopep, "<=", boolp, {typep, typep});
         addFunc(scopep, ">", boolp, {typep, typep});
         addFunc(scopep, ">=", boolp, {typep, typep});
+        const Mark2008 mark;
         addFunc(scopep, "minimum", typep, {typep, typep});
         addFunc(scopep, "maximum", typep, {typep, typep});
     }
@@ -348,6 +363,7 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
     // where the ordering operators above need a discrete one.
     if (typep->kind() == VhdlTypeKind::ARRAY && typep->dimensions() == 1 && typep->elementp()
         && typep->elementp()->isScalar()) {
+        const Mark2008 mark;
         addFunc(scopep, "minimum", typep->elementp(), {typep});
         addFunc(scopep, "maximum", typep->elementp(), {typep});
     }
@@ -384,7 +400,8 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
             addFunc(scopep, "/", typep, {typep, s_realp});
         }
         if (s_univIntp) addFunc(scopep, "/", s_univIntp, {typep, typep});
-        // "mod" and "rem" over a physical type give the same type (9.2.4)
+        // "mod" and "rem" over a physical type give the same type (9.2.4).
+        // VHDL-2008 added them, and V3VhdlSem says so where one is used.
         addFunc(scopep, "mod", typep, {typep, typep});
         addFunc(scopep, "rem", typep, {typep, typep});
     }
@@ -402,13 +419,14 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         }
         addFunc(scopep, "not", typep, {typep});
         if (typep->kind() == VhdlTypeKind::ARRAY) {
-            // Reduction operators and shifts, VHDL-2008 9.2.8 and 9.2.4
+            // Shifts (9.2.4), and the reduction operators VHDL-2008 added (9.2.2)
             VhdlType* const elemp = typep->elementp();
-            for (const char* const op : {"and", "or", "nand", "nor", "xor", "xnor"}) {
-                addFunc(scopep, op, elemp, {typep});
-            }
             for (const char* const op : {"sll", "srl", "sla", "sra", "rol", "ror"}) {
                 addFunc(scopep, op, typep, {typep, s_integerp ? s_integerp : typep});
+            }
+            const Mark2008 mark;
+            for (const char* const op : {"and", "or", "nand", "nor", "xor", "xnor"}) {
+                addFunc(scopep, op, elemp, {typep});
             }
             // Every logical operator has element/array forms, not just "and"
             for (const char* const op : {"and", "or", "nand", "nor", "xor", "xnor"}) {
@@ -446,6 +464,7 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
             matchp = typep->elementp();
         }
         if (matchp) {
+            const Mark2008 mark;
             addFunc(scopep, "?=", matchp, {typep, typep});
             addFunc(scopep, "?/=", matchp, {typep, typep});
             if (ordering) {
@@ -458,6 +477,7 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
 
     // The condition operator, for anything that converts to a condition (9.2.9)
     if (typep == s_bitp || typep == s_booleanp) {
+        const Mark2008 mark;
         addFunc(scopep, "??", boolp, {typep});
     }
 
@@ -469,6 +489,7 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
         && (typep->isScalar()
             || (typep->kind() == VhdlTypeKind::ARRAY && typep->dimensions() == 1
                 && isCharacterType(typep->elementp())))) {
+        const Mark2008 mark;
         addFunc(scopep, "to_string", s_stringp, {typep});
     }
 
@@ -485,7 +506,10 @@ void V3VhdlStd::addImplicitOperators(VhdlScope* scopep, VhdlType* typep) {
                                        {"external_name", s_stringp},
                                        {"open_kind", s_fileOpenKindp, true}});
         addProcN(scopep, "file_close", {{"f", typep}});
-        addProcN(scopep, "flush", {{"f", typep}});
+        {
+            const Mark2008 mark;
+            addProcN(scopep, "flush", {{"f", typep}});
+        }
         addFuncN(scopep, "endfile", boolp, {{"f", typep}});
         if (valuep) {
             addProcN(scopep, "read", {{"f", typep}, {"value", valuep}});
@@ -575,11 +599,14 @@ void V3VhdlStd::build() {
     s_positivep = makeSubtype(s_standardp, "positive", s_integerp, 1, 2147483647LL);
 
     s_stringp = makeArray(s_standardp, "string", s_positivep, s_characterp);
-    s_booleanVecp = makeArray(s_standardp, "boolean_vector", s_naturalp, s_booleanp);
     s_bitVecp = makeArray(s_standardp, "bit_vector", s_naturalp, s_bitp);
-    s_integerVecp = makeArray(s_standardp, "integer_vector", s_naturalp, s_integerp);
-    s_realVecp = makeArray(s_standardp, "real_vector", s_naturalp, s_realp);
-    s_timeVecp = makeArray(s_standardp, "time_vector", s_naturalp, s_timep);
+    {
+        const Mark2008 mark;
+        s_booleanVecp = makeArray(s_standardp, "boolean_vector", s_naturalp, s_booleanp);
+        s_integerVecp = makeArray(s_standardp, "integer_vector", s_naturalp, s_integerp);
+        s_realVecp = makeArray(s_standardp, "real_vector", s_naturalp, s_realp);
+        s_timeVecp = makeArray(s_standardp, "time_vector", s_naturalp, s_timep);
+    }
 
     s_fileOpenKindp
         = makeEnum(s_standardp, "file_open_kind", {"read_mode", "write_mode", "append_mode"});
@@ -590,6 +617,7 @@ void V3VhdlStd::build() {
     addFunc(s_standardp, "now", s_delayp, {});
     // VHDL-2008 gives BIT and BOOLEAN their own edge functions (16.3)
     if (s_bitp && s_booleanp) {
+        const Mark2008 mark;
         addFunc(s_standardp, "rising_edge", s_booleanp, {s_bitp});
         addFunc(s_standardp, "falling_edge", s_booleanp, {s_bitp});
         addFunc(s_standardp, "rising_edge", s_booleanp, {s_booleanp});
@@ -598,24 +626,31 @@ void V3VhdlStd::build() {
 
     // Implicit operators for every predefined type
     for (VhdlType* const typep :
-         {s_booleanp, s_bitp, s_characterp, s_severityp, s_integerp, s_realp, s_timep,
-          s_stringp, s_booleanVecp, s_bitVecp, s_integerVecp, s_realVecp, s_timeVecp,
-          s_fileOpenKindp, s_fileOpenStatusp, s_univIntp, s_univRealp}) {
+         {s_booleanp, s_bitp, s_characterp, s_severityp, s_integerp, s_realp, s_timep, s_stringp,
+          s_bitVecp, s_fileOpenKindp, s_fileOpenStatusp, s_univIntp, s_univRealp}) {
         addImplicitOperators(s_standardp, typep);
     }
+    {
+        // What VHDL-2008 added to STANDARD (16.3)
+        const Mark2008 mark;
+        for (VhdlType* const typep : {s_booleanVecp, s_integerVecp, s_realVecp, s_timeVecp}) {
+            addImplicitOperators(s_standardp, typep);
+        }
 
-    // The radix forms that come with BIT_VECTOR, and no other type (5.3.2.4)
-    for (const char* const op : {"to_bstring", "to_binary_string", "to_ostring",
-                                 "to_octal_string", "to_hstring", "to_hex_string"}) {
-        addFuncN(s_standardp, op, s_stringp, {{"value", s_bitVecp}});
+        // The radix forms that come with BIT_VECTOR, and no other type (5.3.2.4)
+        for (const char* const op : {"to_bstring", "to_binary_string", "to_ostring",
+                                     "to_octal_string", "to_hstring", "to_hex_string"}) {
+            addFuncN(s_standardp, op, s_stringp, {{"value", s_bitVecp}});
+        }
+
+        // The overloaded TO_STRING forms of 16.3, which take a second argument
+        // saying how to write the value. The one-argument forms come with each
+        // type, from addImplicitOperators.
+        addFuncN(s_standardp, "to_string", s_stringp,
+                 {{"value", s_realp}, {"digits", s_naturalp}});
+        addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_realp}, {"format", s_stringp}});
+        addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_timep}, {"unit", s_timep}});
     }
-
-    // The overloaded TO_STRING forms of 16.3, which take a second argument
-    // saying how to write the value. The one-argument forms come with each
-    // type, from addImplicitOperators.
-    addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_realp}, {"digits", s_naturalp}});
-    addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_realp}, {"format", s_stringp}});
-    addFuncN(s_standardp, "to_string", s_stringp, {{"value", s_timep}, {"unit", s_timep}});
 
     // A literal's universal type must interoperate with the named types it
     // may be interpreted as (9.3.2)
@@ -675,14 +710,20 @@ void V3VhdlStd::buildTextio() {
         addImplicitOperators(s_textiop, typep);
     }
 
-    addFuncN(s_textiop, "justify", s_stringp,
-             {{"value", s_stringp}, {"justified", s_sidep, true}, {"field", widthp, true}});
+    {
+        const Mark2008 mark;
+        addFuncN(s_textiop, "justify", s_stringp,
+                 {{"value", s_stringp}, {"justified", s_sidep, true}, {"field", widthp, true}});
+    }
     addObject(s_textiop, VhdlSymKind::FILE, "input", s_textp);
     addObject(s_textiop, VhdlSymKind::FILE, "output", s_textp);
 
     addProcN(s_textiop, "readline", {{"f", s_textp}, {"l", s_linep}});
     addProcN(s_textiop, "writeline", {{"f", s_textp}, {"l", s_linep}});
-    addProcN(s_textiop, "tee", {{"f", s_textp}, {"l", s_linep}});
+    {
+        const Mark2008 mark;
+        addProcN(s_textiop, "tee", {{"f", s_textp}, {"l", s_linep}});
+    }
     // ENDFILE comes with the file type itself, so TEXT already has it (5.5.2)
     addFuncN(s_textiop, "endline", s_booleanp, {{"l", s_linep}});
 
@@ -703,6 +744,7 @@ void V3VhdlStd::buildTextio() {
                                           {"justified", s_sidep, true},
                                           {"field", widthp, true}});
         }
+        const Mark2008 mark;
         addProcN(s_textiop, "sread", {{"l", s_linep}, {"value", typep}, {"strlen", s_naturalp}});
     }
     // REAL and TIME take one more, saying how the value is to be written
@@ -712,7 +754,10 @@ void V3VhdlStd::buildTextio() {
                                   {"justified", s_sidep, true},
                                   {"field", widthp, true},
                                   {"digits", s_naturalp, true}});
-    addProcN(s_textiop, "write", {{"l", s_linep}, {"value", s_realp}, {"format", s_stringp}});
+    {
+        const Mark2008 mark;
+        addProcN(s_textiop, "write", {{"l", s_linep}, {"value", s_realp}, {"format", s_stringp}});
+    }
     addProcN(s_textiop, "write", {{"l", s_linep},
                                   {"value", s_timep},
                                   {"justified", s_sidep, true},
@@ -721,6 +766,7 @@ void V3VhdlStd::buildTextio() {
     // The radix operations are declared for BIT_VECTOR only (16.4). Declaring
     // them for STRING as well made every call with a literal argument
     // ambiguous, since a string literal fits either.
+    const Mark2008 mark;
     {
         VhdlType* const typep = s_bitVecp;
         for (const char* const op : {"hread", "oread", "bread"}) {

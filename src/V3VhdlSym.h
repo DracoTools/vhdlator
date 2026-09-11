@@ -36,6 +36,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,7 @@ class VhdlSymbol final {
     int m_position = 0;  // Enumeration literal position, or record element index
     bool m_predefined = false;  // Comes from std.standard rather than source
     bool m_hasBody = false;  // A subprogram whose body has been seen
+    bool m_since2008 = false;  // Predefined by VHDL-2008, and by no earlier revision
     // The value of a constant, generic or physical unit, where it folds (9.4).
     // Unknown for anything whose value is not fixed until elaboration.
     VhdlValue m_value;
@@ -151,6 +153,8 @@ public:
     bool predefined() const { return m_predefined; }
     void predefined(bool flag) { m_predefined = flag; }
     bool hasBody() const { return m_hasBody; }
+    bool since2008() const { return m_since2008; }
+    void since2008(bool flag) { m_since2008 = flag; }
     void hasBody(bool flag) { m_hasBody = flag; }
     bool deferred() const { return m_deferred; }
     void deferred(bool flag) { m_deferred = flag; }
@@ -291,6 +295,14 @@ class VhdlScope final {
     // Made potentially visible by a use clause (12.4). Searched only when the
     // enclosing regions declare nothing of that name.
     std::vector<VhdlScope*> m_usedp;
+    // Of those, the ones a use clause named only some declarations of --
+    // "use work.pkg.f" rather than "use work.pkg.all" -- and which (12.4)
+    std::map<const VhdlScope*, std::set<std::string>> m_useOnly;
+    // What VHDL-2008 added to the predefined environment is declared once, for
+    // every revision, and marked as it is inserted; a unit written in an
+    // earlier revision is then analyzed without it (16.3)
+    static bool s_mark2008;  // Insertions now are VHDL-2008 additions
+    static bool s_hide2008;  // Lookups now leave VHDL-2008 additions out
     // Regions this one continues (12.1): an architecture continues its
     // entity's, a package body its package's. What they declare is directly
     // visible here, not merely potentially visible.
@@ -323,6 +335,11 @@ public:
         m_pathPrefix = path;
     }
 
+    static bool mark2008() { return s_mark2008; }
+    static void mark2008(bool flag) { s_mark2008 = flag; }
+    static bool hide2008() { return s_hide2008; }
+    static void hide2008(bool flag) { s_hide2008 = flag; }
+
     // Declare a symbol here. Returns the symbol it hides, if any, so the
     // caller can complain about an illegal redeclaration (12.3).
     VhdlSymbol* insert(VhdlSymbol* symp) VL_MT_DISABLED;
@@ -337,6 +354,9 @@ public:
 
     // Make another region's declarations potentially visible (use ... .all)
     void addUse(VhdlScope* scopep) VL_MT_DISABLED;
+    // Make only the declarations of these names potentially visible, unless
+    // a use clause has made them all visible already (use ... .name)
+    void addUseOf(VhdlScope* scopep, const std::set<std::string>& names) VL_MT_DISABLED;
 
     // Continue another region here, so that its declarations are directly
     // visible in this one (12.1)

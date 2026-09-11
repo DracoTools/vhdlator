@@ -177,7 +177,11 @@ bool VhdlSymbol::homographOf(const VhdlSymbol* otherp) const {
 //######################################################################
 // VhdlScope
 
+bool VhdlScope::s_mark2008 = false;
+bool VhdlScope::s_hide2008 = false;
+
 VhdlSymbol* VhdlScope::insert(VhdlSymbol* symp) {
+    if (s_mark2008) symp->since2008(true);
     VhdlSymbol* hiddenp = nullptr;
     const auto range = m_direct.equal_range(symp->name());
     for (auto it = range.first; it != range.second; ++it) {
@@ -203,7 +207,10 @@ VhdlSymbol* VhdlScope::insert(VhdlSymbol* symp) {
 
 void VhdlScope::lookupLocal(const std::string& name, std::vector<VhdlSymbol*>& out) const {
     const auto range = m_direct.equal_range(name);
-    for (auto it = range.first; it != range.second; ++it) out.push_back(it->second);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (s_hide2008 && it->second->since2008()) continue;
+        out.push_back(it->second);
+    }
 }
 
 // Whether two declarations of one name are homographs: overloadable ones are
@@ -235,7 +242,13 @@ static void addUnhidden(const VhdlScope* scopep, const std::string& name,
         for (size_t i = 0; i < innerCount && !hidden; ++i) {
             if (out[i] == symp) continue;
             if (sameProfile(out[i], symp)) hidden = true;
-            if (!out[i]->isOverloadable() && out[i]->homographOf(symp)) hidden = true;
+            // One of them not overloadable makes the two homographs whatever
+            // their profiles, and the inner hides the outer (12.3): an
+            // enumeration literal A hides an architecture A around it
+            if ((!out[i]->isOverloadable() || !symp->isOverloadable())
+                && out[i]->homographOf(symp)) {
+                hidden = true;
+            }
         }
         if (!hidden) out.push_back(symp);
     }
@@ -266,6 +279,8 @@ void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) c
     // homograph does hide one, though.
     for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
         for (const VhdlScope* const usedp : scopep->m_usedp) {
+            const auto onlyIt = scopep->m_useOnly.find(usedp);
+            if (onlyIt != scopep->m_useOnly.end() && !onlyIt->second.count(name)) continue;
             addUnhidden(usedp, name, out, directCount);
         }
     }
@@ -317,6 +332,19 @@ void VhdlScope::addUse(VhdlScope* scopep) {
     if (std::find(m_usedp.begin(), m_usedp.end(), scopep) == m_usedp.end()) {
         m_usedp.push_back(scopep);
     }
+    m_useOnly.erase(scopep);
+}
+
+void VhdlScope::addUseOf(VhdlScope* scopep, const std::set<std::string>& names) {
+    if (!scopep) return;
+    if (std::find(m_usedp.begin(), m_usedp.end(), scopep) != m_usedp.end()) {
+        // Already made visible, whole or in part
+        const auto onlyIt = m_useOnly.find(scopep);
+        if (onlyIt != m_useOnly.end()) onlyIt->second.insert(names.begin(), names.end());
+        return;
+    }
+    m_usedp.push_back(scopep);
+    m_useOnly[scopep] = names;
 }
 
 void VhdlScope::addNamed(const std::string& name, VhdlScope* scopep) {
@@ -334,6 +362,8 @@ VhdlScope* VhdlScope::findNamed(const std::string& name) const {
         // and a used region's own uses are not followed: potential
         // visibility does not pass on.
         for (const VhdlScope* const usedp : scopep->m_usedp) {
+            const auto onlyIt = scopep->m_useOnly.find(usedp);
+            if (onlyIt != scopep->m_useOnly.end() && !onlyIt->second.count(name)) continue;
             const auto uit = usedp->m_named.find(name);
             if (uit != usedp->m_named.end()) return uit->second;
         }

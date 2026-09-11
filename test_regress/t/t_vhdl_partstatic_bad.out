@@ -1,0 +1,6 @@
+%Error: t/t_vhdl_partstatic_bad.vhd:42:35: A port associated in parts names each part with a locally static name, and this one depends on generic 'g'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_partstatic_bad.vhd:43:35: A port associated in parts names each part with a locally static name, and this one depends on generic 'g'
+%Error: t/t_vhdl_partstatic_bad.vhd:44:53: Port 'd' takes its bounds from its actual, and a conversion to bit_vector, which has none, gives it none
+%Error: t/t_vhdl_partstatic_bad.vhd:47:69: A port associated in parts names each part with a locally static name, and this one depends on generate parameter 'i'
+%Error: Exiting due to

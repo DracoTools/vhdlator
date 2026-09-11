@@ -1,0 +1,11 @@
+%Error: t/t_vhdl_purity_bad.vhd:25:14: A pure function reads nothing declared outside it, and 'v' is a variable declared outside 'get'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_purity_bad.vhd:51:11: A pure function reads nothing declared outside it, and 's' is a signal declared outside 'g'
+%Error: t/t_vhdl_purity_bad.vhd:52:11: A pure function reads nothing declared outside it, and 'ps' is a signal declared outside 'g'
+%Error: t/t_vhdl_purity_bad.vhd:53:11: A pure function reads nothing declared outside it, and 'sv' is a shared variable declared outside 'g'
+%Error: t/t_vhdl_purity_bad.vhd:54:11: A pure function cannot call impure function 'imp': 'g'
+%Error: t/t_vhdl_purity_bad.vhd:57:8: A pure function reads nothing declared outside it, and 'bv' is a signal declared outside 'g'
+%Error: t/t_vhdl_purity_bad.vhd:58:16: A pure function reads nothing declared outside it, and 'f' is a file declared outside 'g'
+%Error: t/t_vhdl_purity_bad.vhd:66:14: A pure function reads nothing declared outside it, and 'pv' is a variable declared outside 'h'
+%Error: t/t_vhdl_purity_bad.vhd:56:11: A pure function reads nothing declared outside it, and an external name denotes a signal: 'g'
+%Error: Exiting due to

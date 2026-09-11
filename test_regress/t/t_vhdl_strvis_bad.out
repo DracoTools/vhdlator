@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_strvis_bad.vhd:23:10: Character literal '0' of type std_ulogic is not visible here, so a string literal cannot use it
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_strvis_bad.vhd:24:10: Character literal '1' of type std_ulogic is not visible here, so a string literal cannot use it
+%Error: Exiting due to

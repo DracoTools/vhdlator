@@ -1,0 +1,9 @@
+%Error: t/t_vhdl_attrrules_bad.vhd:34:21: 'rec' is not of entity class subtype, so attribute 'attr' cannot be given to it as one
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_attrrules_bad.vhd:35:21: 'sub' is not of entity class type, so attribute 'attr' cannot be given to it as one
+%Error: t/t_vhdl_attrrules_bad.vhd:36:21: Attribute 'attr' is given to 'natural' in the declarative part that declares it, and this is not that one
+%Error: t/t_vhdl_attrrules_bad.vhd:40:21: Attribute 'attr' is given to 'pc' in the declarative part that declares it, and this is not that one
+%Error: t/t_vhdl_attrrules_bad.vhd:54:23: Attribute 'attr' is given to 's' in the declarative part that declares it, and this is not that one
+%Error: t/t_vhdl_attrrules_bad.vhd:56:9: Attribute 'num' is of type positive, which is not an array, so it cannot be indexed
+%Error: t/t_vhdl_attrrules_bad.vhd:58:22: The prefix of 'simple_name is a named entity, and the subtype of 'bv' has no name
+%Error: Exiting due to
