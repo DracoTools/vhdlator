@@ -1840,6 +1840,14 @@ public:
         if (!writtenUnconstrained(sip)) return false;
         const VhdlSymbol* const symp = sip->typeMarkp()->vhdlSymp();
         if (!symp) return false;
+        // A generic type an instantiation has given an unconstrained array
+        // type: the copy's objects of it have no bounds (nvc 1.22.1, GHDL
+        // 7.0.0-dev; Questa 2025.2 takes it)
+        if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
+            const VhdlType* const typep = symp->typep();
+            return ifp->kind() == VhdlIfaceKind::TYPE && typep && !typep->isError()
+                   && typep->base()->kind() == VhdlTypeKind::ARRAY && typep->unconstrained();
+        }
         if (const AstVhdlSubtypeDecl* const sdp = VN_CAST(symp->declp(), VhdlSubtypeDecl)) {
             return leavesBoundsOpen(sdp->subtypep());
         }
