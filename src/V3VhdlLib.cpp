@@ -54,6 +54,8 @@ std::set<std::string> s_reportedMissing;  // Keys already complained about
 // Where each key was first written: a later unit of the same name replaces
 // it, but a unit written in between was analyzed against the first (13.5)
 std::map<std::string, const FileLine*> s_firstWritten;
+// Where a unit was written again, replacing the one before (13.5)
+std::map<std::string, const FileLine*> s_replacedAt;
 // Units whose key was already taken. Reported by computeOrder rather than by
 // addFile, so that every library diagnostic comes from one place and a
 // duplicate does not stop the missing and circular checks from running.
@@ -129,6 +131,7 @@ void V3VhdlLib::clear() {
     s_units.clear();
     s_byKey.clear();
     s_firstWritten.clear();
+    s_replacedAt.clear();
     s_ordered.clear();
     s_reportedMissing.clear();
 }
@@ -261,6 +264,7 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             // simple name in the same library (13.5), so the last one written
             // is the one the design is built from
             s_units[it->second] = unit;
+            s_replacedAt[unit.key] = unitp->fileline();
             continue;
         }
         s_byKey.emplace(unit.key, s_units.size());
@@ -342,6 +346,27 @@ bool V3VhdlLib::computeOrder() {
                                         << "', which is written after it in the same file;"
                                            " a design file is analyzed in order");
                     ok = false;
+                }
+                // A unit analyzed against a version of another that was then
+                // replaced is obsolete (13.5), and one written after the
+                // replacement cannot use it until it is analyzed again
+                if (!soft && ufl->filename() == s_units[next].nodep->fileline()->filename()) {
+                    const FileLine* const nfl = s_units[next].nodep->fileline();
+                    for (const std::string& ddep : s_units[next].dependsOn) {
+                        const auto rit = s_replacedAt.find(ddep);
+                        if (rit == s_replacedAt.end()) continue;
+                        const FileLine* const rfl = rit->second;
+                        if (rfl->filename() != ufl->filename()) continue;
+                        if (nfl->lineno() < rfl->lineno() && ufl->lineno() > rfl->lineno()) {
+                            unit.nodep->fileline()->v3error(
+                                "Design unit '" << unit.key << "' needs '" << s_units[next].key
+                                                << "', which was analyzed against the '" << ddep
+                                                << "' written again at line " << rfl->lineno()
+                                                << ", and is obsolete until analyzed again");
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
                 // A soft dependency only says which order to take two units
                 // in, so where it would close a cycle it is simply dropped --

@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_pkgnobody_bad.vhd:22:1: Package 'gen1' is completed by a body, which is analyzed before the package is instantiated, and there is none
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

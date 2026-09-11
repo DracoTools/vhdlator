@@ -4678,6 +4678,23 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     // A nested package has no body of its own; the key here names the outer
     // one, whose body is not what this copy takes
     const auto bodyIt = nested ? m_packageBodies.end() : m_packageBodies.find(key);
+    // A package whose declarations a body completes is instantiated only
+    // once that body is analyzed (4.9): the copy needs it
+    if (!nested && bodyIt == m_packageBodies.end() && !m_inSpecialized) {
+        bool needsBody = false;
+        for (const AstNode* p = pkgp->declsp(); p && !needsBody; p = p->nextp()) {
+            if (const AstVhdlSubprogDecl* const subp = VN_CAST(p, VhdlSubprogDecl)) {
+                needsBody = !subp->hasBody() && !subp->isInstance();
+            } else if (const AstVhdlObjectDecl* const odp = VN_CAST(p, VhdlObjectDecl)) {
+                needsBody = odp->kind() == VhdlObjKind::CONSTANT && !odp->defaultp();
+            }
+        }
+        if (needsBody) {
+            err(nodep->fileline(), "Package '" + pkgp->prettyName()
+                                       + "' is completed by a body, which is analyzed before"
+                                         " the package is instantiated, and there is none");
+        }
+    }
     if (bodyIt != m_packageBodies.end()) {
         // The body has a context clause of its own -- IEEE's fixed_generic_pkg
         // body uses MATH_REAL where its declaration does not

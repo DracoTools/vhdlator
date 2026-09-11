@@ -239,6 +239,19 @@ def expected_outcome(path):
             # A directory whose script cannot be followed is not scored at all
             table = ghdl_expectations(directory)
             return table.get(os.path.basename(path), 'skip') if table else 'skip'
+    # An NVC regress test run by a script of its own may expect the analysis
+    # to fail: "! nvc -a $TESTDIR/regress/order4.vhd 2>err"
+    match = NVC_REGRESS_RE.match(path)
+    if match:
+        script = os.path.join(match.group(1), 'test', 'regress', match.group(2) + '.sh')
+        try:
+            with open(script, encoding='utf-8', errors='replace') as sh:
+                text = sh.read()
+            name = re.escape(os.path.basename(path))
+            if re.search(r'^\s*!\s*nvc\b[^\n]*\s-a\s[^\n]*' + name, text, re.M):
+                return 'reject'
+        except OSError:
+            pass
     return 'accept'
 
 
