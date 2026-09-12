@@ -3961,7 +3961,12 @@ void VhdlSemVisitor::visit(AstVhdlLoop* nodep) {
         // is that of the discrete range (10.10)
         const RangeInfo info = analyzeRange(nodep->rangep(), nullptr);
         checkDiscreteRange(info, nodep->rangep(), "A for loop");
-        pushScope("loop");
+        VhdlScope* const outerp = m_scopep;
+        VhdlScope* const loopScopep = pushScope("loop");
+        // A loop statement is a declarative region, and its label names that
+        // region: "L1.i" reads the parameter of the loop labelled L1 from
+        // inside a loop that declares an "i" of its own (8.3, 10.10)
+        if (!nodep->label().empty()) outerp->addNamed(nodep->label(), loopScopep);
         VhdlSymbol* const symp
             = VhdlSymTab::newSymbol(VhdlSymKind::LOOP_PARAMETER, nodep->paramName(), nodep);
         symp->typep(loopParamType(info, nodep->fileline()));

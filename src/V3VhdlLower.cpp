@@ -14375,9 +14375,13 @@ private:
 
     void lowerGenerate(AstVhdlGenerate* nodep) {
         FileLine* const flp = nodep->fileline();
+        // A block is a declarative region of its own, so two blocks may each
+        // label a generate "g" (11.2). The blocks are flattened into the
+        // architecture, so the label carries the blocks it stands in, which
+        // is what an instance inside a block already does.
         const std::string label = nodep->label().empty()
                                       ? "__Vgen" + std::to_string(++m_processNum)
-                                      : nodep->label();
+                                      : m_blockPrefix + nodep->label();
         VL_RESTORER(m_cfgScopep);
         m_cfgScopep = cfgScopeIn(nodep->label());
         if (nodep->kind() == VhdlLoopKind::FOR) {
