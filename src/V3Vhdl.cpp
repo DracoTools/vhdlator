@@ -129,6 +129,10 @@ const VhdlBundledUnit VHDL_IEEE_UNITS[] = {
     {"math_real", "", "math_real.vhdl math_real-body.vhdl"},
     {"math_complex", "math_real", "math_complex.vhdl math_complex-body.vhdl"},
     {"std_logic_textio", "std_logic_1164", "std_logic_textio.vhdl"},
+    // The context declarations of 16.9, which a design uses in place of the
+    // library and use clauses they stand for
+    {"ieee_std_context", "std_logic_1164 numeric_std", "ieee_std_context.vhdl"},
+    {"ieee_bit_context", "numeric_bit", "ieee_bit_context.vhdl"},
     {"fixed_float_types", "", "fixed_float_types.vhdl"},
     {"fixed_generic_pkg", "fixed_float_types numeric_std math_real",
      "fixed_generic_pkg.vhdl fixed_generic_pkg-body.vhdl"},
@@ -142,8 +146,7 @@ const VhdlBundledUnit VHDL_IEEE_UNITS[] = {
     {"std_logic_arith", "std_logic_1164", "std_logic_arith.vhdl"},
     {"std_logic_unsigned", "std_logic_arith", "std_logic_unsigned.vhdl"},
     {"std_logic_signed", "std_logic_arith", "std_logic_signed.vhdl"},
-    {"std_logic_misc", "std_logic_1164",
-     "std_logic_misc.vhdl std_logic_misc-body.vhdl"},
+    {"std_logic_misc", "std_logic_1164", "std_logic_misc.vhdl std_logic_misc-body.vhdl"},
 };
 
 std::vector<std::string> splitWords(const std::string& text) {

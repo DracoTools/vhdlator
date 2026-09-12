@@ -50,6 +50,17 @@ path = "include/vhdl/ieee/**"
 SPDX-FileCopyrightText = "2019 IEEE P1076 WG Authors"
 SPDX-License-Identifier = "Apache-2.0"
 
+# The two context declarations of IEEE Std 1076-2008 clause 16.9, which the
+# working group's package release does not carry, written out here as every
+# other simulator writes them.
+[[annotations]]
+path = [
+    "include/vhdl/ieee/ieee_bit_context.vhdl",
+    "include/vhdl/ieee/ieee_std_context.vhdl",
+]
+SPDX-FileCopyrightText = "2026 Wilson Snyder"
+SPDX-License-Identifier = "LGPL-3.0-only OR Artistic-2.0"
+
 # The four packages Synopsys published in 1990-1992 and every simulator
 # ships beside the IEEE ones, unmodified. Their own notice allows use and
 # distribution without restriction so long as it is kept, so it is kept.

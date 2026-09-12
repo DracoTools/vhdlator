@@ -4778,6 +4778,7 @@ private:
     // one is legal and there is nothing to fold. Such a generic is not a
     // parameter at all: it is data arriving from outside, which is a port.
     std::set<const VhdlSymbol*> m_dataGenerics;
+
     // The variables such generics were lowered to, so their port entries can
     // be written after the ports proper: a generic clause stands ahead of a
     // port clause, and giving one of these an early port position would move
@@ -5501,6 +5502,11 @@ private:
     AstNodeExpr* lowerAttr(AstVhdlAttrName* nodep) {
         FileLine* const flp = nodep->fileline();
         const std::string& attr = nodep->name();
+        // "fmt'subtype(v)" is a conversion whose type mark is written as an
+        // attribute, so it converts rather than asking anything (16.2.5)
+        if ((attr == "subtype" || attr == "element") && nodep->argp()) {
+            return lowerConversion(nodep->vhdlTypep(), nodep->argp(), flp);
+        }
         AstNodeExpr* const argp = nodep->argp() ? lowerExpr(nodep->argp()) : nullptr;
         // An enumeration value is its own position, and a position its own
         // value, so 'POS and 'VAL are identities in the emitted code (16.2.3)
@@ -20163,6 +20169,16 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 if (!asymp) continue;
                 const VhdlSymbol* const constp = asymp->resolved();
                 if (constp->kind() != VhdlSymKind::CONSTANT || constp->hasValue()) continue;
+                // A constant settled by elaboration is a parameter of the
+                // module that declares it, and the back end folds it there,
+                // so a generic it is handed to stays a parameter as well.
+                // "WIDTH => WIDTH", with the width computed by a function,
+                // is how a design usually writes it.
+                const AstVhdlObjectDecl* const cdeclp = VN_CAST(constp->declp(), VhdlObjectDecl);
+                if (cdeclp && cdeclp->isElabConstant()
+                    && V3VhdlEval::backEndFolds(cdeclp->defaultp())) {
+                    continue;
+                }
                 m_dataGenerics.insert(gsymp->resolved());
             }
         });

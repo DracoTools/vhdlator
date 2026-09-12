@@ -386,13 +386,16 @@ class VhdlSemVisitor final : public VNVisitor {
             scopep->lookupLocal(parts.back(), found);
         }
         for (VhdlSymbol* const symp : found) {
-            if (!symp->isObject()) continue;
-            VhdlType* typep = symp->typep();
+            // An alias is another name for the object, and a method is
+            // reached through it just as well (6.6.1)
+            VhdlSymbol* const realp = symp->resolved();
+            if (!realp->isObject()) continue;
+            VhdlType* typep = realp->typep();
             if (typep && typep->kind() == VhdlTypeKind::ACCESS) typep = typep->designatedp();
             if (!typep || typep->base()->kind() != VhdlTypeKind::PROTECTED) continue;
             if (!typep->base()->scopep()) continue;
             methScopep = typep->base()->scopep();
-            return symp;
+            return realp;
         }
         return nullptr;
     }
@@ -3297,6 +3300,14 @@ void VhdlSemVisitor::visit(AstVhdlAttrSpec* nodep) {
         for (VhdlSymbol* const symp : found) {
             VhdlSymbol* const realp = symp->resolved();
             if (realp->kind() != want) continue;
+            // One attribute of one named entity is specified once (7.2)
+            if (!realp->foreignName().empty() && !m_inSpecialized && !m_inPkgInst
+                && !m_inPackageInstance) {
+                err(nodep->fileline(),
+                    "Attribute 'foreign' is already given a value for '" + parts[0] + "'");
+                ++marked;
+                continue;
+            }
             realp->foreignName(cname);
             realp->foreignDpi(dpi);
             ++marked;
@@ -7733,6 +7744,25 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
             }
         }
     }
+    // A type mark may itself be written as an attribute, and one attribute
+    // may then be asked of another: "y'subtype'right" asks about the right
+    // bound of the subtype 'subtype gives (16.2.5)
+    //
+    // Not for the name attributes: those ask about the name the prefix is
+    // written as, and "v'subtype" is a subtype no declaration names, which
+    // is a rule of its own below.
+    if (!prefixTypep && nodep->name() != "instance_name" && nodep->name() != "path_name"
+        && nodep->name() != "simple_name") {
+        if (AstVhdlAttrName* const markp = VN_CAST(nodep->prefixp(), VhdlAttrName)) {
+            // 'base is left out: it is asked of a type mark, and asking it
+            // of an object is the pre-2019 error checkAttrPrefix reports
+            const std::string& inner = markp->name();
+            if (inner == "subtype" || inner == "element") {
+                VhdlType* const typep = resolveTypeMark(markp);
+                if (typep && !typep->isError()) prefixTypep = typep;
+            }
+        }
+    }
     // The name attributes ask about the *name*, not about a value, so their
     // prefix may be a design unit, a package or a statement label -- none of
     // which analyzes as an expression (16.2.7)
@@ -7876,6 +7906,14 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         return prefixTypep ? prefixTypep : V3VhdlStd::errorType();
     }
     if (attr == "last_event" || attr == "last_active") return V3VhdlStd::timeType();
+    // 'SUBTYPE and 'ELEMENT name a subtype, so one written in an expression
+    // is the type mark of a conversion -- "fmt'subtype(v)" (16.2.5, 9.3.6)
+    if (attr == "subtype" || attr == "element") {
+        VhdlType* const typep = resolveTypeMark(nodep);
+        if (!typep || typep->isError()) return V3VhdlStd::errorType();
+        if (nodep->argp()) analyzeExpr(nodep->argp(), nullptr);
+        return typep;
+    }
     // A user-defined attribute (7.2)
     std::vector<VhdlSymbol*> found;
     lookup(attr, found);
@@ -9934,10 +9972,18 @@ VhdlType* VhdlSemVisitor::constrainElementFromValue(VhdlType* typep, AstNodeVhdl
 // generic an instantiation supplied is emitted as a parameter, and a
 // parameter's value may only name other parameters (4.9)
 void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& unitsp) {
-    const auto markIn = [](AstNode* exprp, bool& changed) {
+    // A constant the back end cannot fold is left alone: making it a
+    // parameter would only move the failure to the parameter's value. What
+    // hands a generic such a value is handed it as data instead, which
+    // lowering decides.
+    const auto markIn = [](AstNode* exprp, bool& changed, bool foldableOnly = false) {
         exprp->foreach([&](AstNodeVhdlExpr* refp) {
             const VhdlSymbol* const symp = refp->vhdlSymp();
             if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
+            if (foldableOnly) {
+                const AstVhdlObjectDecl* const valuep = VN_CAST(symp->declp(), VhdlObjectDecl);
+                if (!valuep || !V3VhdlEval::backEndFolds(valuep->defaultp())) return;
+            }
             AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
             // A deferred constant is written twice: once in the package with
             // no value and once in the body with one. Both say the same
@@ -9966,6 +10012,20 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
             // the bounds arrive as the type mark's arguments
             unitp->foreach([&](AstVhdlSubtypeInd* indp) { markIn(indp, ignored); });
             unitp->foreach([&](AstVhdlTypeDecl* declp) { markIn(declp, ignored); });
+            // What an instantiation hands a generic becomes a parameter's
+            // value, so a constant named there is settled by elaboration as
+            // well -- a record of settings passed down a hierarchy is the
+            // usual shape (6.5.6.2)
+            unitp->foreach([&](AstVhdlInstance* instp) {
+                for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
+                    markIn(p, ignored, true);
+                }
+            });
+            unitp->foreach([&](AstVhdlBinding* bindp) {
+                for (AstNode* p = bindp->genericMapp(); p; p = p->nextp()) {
+                    markIn(p, ignored, true);
+                }
+            });
         }
     }
     for (int round = 0; round < 16; ++round) {

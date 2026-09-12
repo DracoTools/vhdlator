@@ -1303,3 +1303,70 @@ void V3VhdlEval::selfTest() {
     UASSERT_SELFTEST(bool, powOvf(2, 64, out), false);
     UASSERT_SELFTEST(bool, powOvf(2, -1, out), false);
 }
+
+//######################################################################
+// Whether the back end can fold an expression
+
+namespace {
+
+// A type the back end has no value for: a handle, not a number
+bool unfoldableType(const VhdlType* typep) {
+    if (!typep) return false;
+    const VhdlTypeKind kind = typep->base()->kind();
+    return kind == VhdlTypeKind::ACCESS || kind == VhdlTypeKind::PROTECTED
+           || kind == VhdlTypeKind::FILE;
+}
+
+bool exprFolds(const AstNode* nodep, std::set<const VhdlSymbol*>& seen, bool inBody);
+
+bool bodyFolds(const VhdlSymbol* symp, std::set<const VhdlSymbol*>& seen) {
+    if (!seen.insert(symp).second) return true;  // Already being asked about
+    const AstVhdlSubprogDecl* bodyp = VN_CAST(symp->fullDeclp(), VhdlSubprogDecl);
+    if (!bodyp || !bodyp->hasBody()) bodyp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+    // No body to read means the back end implements the function itself, as
+    // it does the mathematics of IEEE.MATH_REAL
+    if (!bodyp || !bodyp->hasBody()) return true;
+    return exprFolds(bodyp, seen, true);
+}
+
+// inBody: a subprogram's own variables are read and written while it runs,
+// which the back end does too; it is a variable of something *outside* that
+// has no value to fold
+bool exprFolds(const AstNode* nodep, std::set<const VhdlSymbol*>& seen, bool inBody) {
+    bool folds = true;
+    nodep->foreach([&](const AstNodeVhdlExpr* exprp) {
+        if (!folds) return;
+        if (unfoldableType(exprp->vhdlTypep())) {
+            folds = false;
+            return;
+        }
+        const VhdlSymbol* const symp = exprp->vhdlSymp();
+        if (!symp) return;
+        const VhdlSymbol* const realp = symp->resolved();
+        switch (realp->kind()) {
+        case VhdlSymKind::FUNCTION:
+        case VhdlSymKind::PROCEDURE: {
+            const AstVhdlSubprogDecl* const subp = VN_CAST(realp->declp(), VhdlSubprogDecl);
+            if (!subp || !subp->vhdlPure() || !bodyFolds(realp, seen)) folds = false;
+            break;
+        }
+        case VhdlSymKind::VARIABLE:
+            if (!inBody) folds = false;
+            break;
+        case VhdlSymKind::SHARED_VARIABLE:
+        case VhdlSymKind::SIGNAL:
+        case VhdlSymKind::PORT:
+        case VhdlSymKind::FILE: folds = false; break;
+        default: break;
+        }
+    });
+    return folds;
+}
+
+}  // namespace
+
+bool V3VhdlEval::backEndFolds(const AstNode* nodep) {
+    if (!nodep) return false;
+    std::set<const VhdlSymbol*> seen;
+    return exprFolds(nodep, seen, false);
+}

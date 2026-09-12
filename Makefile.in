@@ -268,6 +268,7 @@ VL_INST_INC_SRCDIR_FILES = \
   include/*.sv \
   include/fstcpp/*.[chv]* \
   include/vltstd/*.[chv]* \
+  include/vhdl/ieee/*.vhdl \
 
 VL_INST_DATA_SRCDIR_FILES = \
   examples/*/*.[chv]* \
@@ -318,6 +319,7 @@ installman: $(VL_INST_MAN_FILES)
 installdata:
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/include/fstcpp
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/include/vltstd
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/include/vhdl/ieee
 	for p in $(VL_INST_INC_BLDDIR_FILES) ; do \
 		$(INSTALL_DATA) $$p $(DESTDIR)$(pkgdatadir)/$$p; \
 	done
@@ -368,6 +370,8 @@ uninstall:
 	-rmdir $(DESTDIR)$(pkgdatadir)/bin
 	-rmdir $(DESTDIR)$(pkgdatadir)/include/fstcpp
 	-rmdir $(DESTDIR)$(pkgdatadir)/include/vltstd
+	-rmdir $(DESTDIR)$(pkgdatadir)/include/vhdl/ieee
+	-rmdir $(DESTDIR)$(pkgdatadir)/include/vhdl
 	-rmdir $(DESTDIR)$(pkgdatadir)/include
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_binary
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_vhdl

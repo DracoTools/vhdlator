@@ -55,6 +55,13 @@ public:
     // reason is left in *errp for the caller to report.
     static VhdlValue eval(AstNodeVhdlExpr* nodep, std::string* errp = nullptr) VL_MT_DISABLED;
 
+    // Whether the back end can fold an expression to a value, which it does
+    // by running what it names. Being static is not the same question: a
+    // call on a pure function of the design folds, and one that builds a
+    // value out of an access or a protected type -- a verification library's
+    // handle -- does not, however static its arguments.
+    static bool backEndFolds(const AstNode* nodep) VL_MT_DISABLED;
+
     // The value as 'IMAGE would give it (16.2.6)
     static std::string image(const VhdlValue& val) VL_MT_DISABLED;
     // The inverse, as 'VALUE would give it. Returns UNKNOWN if the text does
