@@ -23,6 +23,8 @@ int c_popcount(int v) {
 
 int c_triple(int v) { return v * 3; }
 
+int c_quad(int v) { return v * 4; }
+
 int c_add(int a, int b) { return a + b; }
 
 void c_divmod(int num, int den, int* q, int* r) {

@@ -3337,7 +3337,9 @@ bool VhdlSemVisitor::parseForeign(const std::string& text, FileLine* flp, std::s
     std::string kind = words[0];
     for (char& c : kind) c = std::toupper(static_cast<unsigned char>(c));
     size_t first = 1;
-    if (kind == "VHPIDIRECT") {
+    if (kind == "VHPIDIRECT" || kind == "VHPI") {
+        // nvc 1.22.1 writes "VHPI <library> <symbol>" for a model it loads
+        // through VHPI; the symbol is bound the same way here
         dpir = false;
     } else if (kind == "DPI-C" || kind == "DPI") {
         dpir = true;
@@ -3347,12 +3349,8 @@ bool VhdlSemVisitor::parseForeign(const std::string& text, FileLine* flp, std::s
         first = 0;
     }
     // GHDL allows "VHPIDIRECT <library> <symbol>". Verilator links statically,
-    // so the library name has nothing to name and is ignored.
-    if (words.size() - first > 2) {
-        err(flp, "The FOREIGN attribute's value has more words than 'VHPIDIRECT [library] "
-                 "symbol'");
-        return false;
-    }
+    // so the library name has nothing to name and is ignored; so is anything
+    // else the string carries, since its content is implementation defined.
     if (words.size() == first) {
         err(flp, "The FOREIGN attribute's value names no C symbol");
         return false;

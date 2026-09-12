@@ -27,10 +27,6 @@ package foreign_bad_pkg is
   function f3 (v : integer) return integer;
   attribute foreign of f3 : function is "VHPIDIRECT";
 
-  -- Says too much
-  function f4 (v : integer) return integer;
-  attribute foreign of f4 : function is "VHPIDIRECT one two three";
-
   -- Every subprogram binds to a symbol of its own, so 'all' cannot mean one
   function f6 (v : integer) return integer;
   attribute foreign of all : function is "VHPIDIRECT c_all";

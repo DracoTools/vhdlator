@@ -19282,7 +19282,10 @@ private:
             // module's and this is going into the unit
             if (madeIt != m_funcs.end() && callableHere(madeIt->second)) return nullptr;
         }
-        if (symp->isForeign()) {
+        // A body written beside the FOREIGN attribute is what this emits:
+        // the attribute names a C symbol that may not be there to link, and
+        // nvc 1.22.1 and GHDL 7.0.0-dev both fall back on the body
+        if (symp->isForeign() && !nodep->hasBody() && !symp->bodyp()) {
             lowerForeignSubprogram(nodep, symp);
             return nullptr;
         }
@@ -19686,11 +19689,7 @@ private:
     // there is no dlopen and the C++ compiler can inline across the boundary.
     void lowerForeignSubprogram(AstVhdlSubprogDecl* nodep, VhdlSymbol* symp) {
         FileLine* const flp = nodep->fileline();
-        if (nodep->hasBody()) {
-            flp->v3error("Subprogram '" + symp->name()
-                         + "' has the FOREIGN attribute, so it must not also have a body");
-            return;
-        }
+
         // The C name is what the FOREIGN string said; the VHDL name may be
         // spelled differently and may be overloaded
         const std::string name = uniqueName(symp);

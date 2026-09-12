@@ -4,7 +4,6 @@
 %Error: t/t_vhdl_foreign_bad.vhd:20:24: Cannot find the function 'nosuch' the FOREIGN attribute names
 %Error: t/t_vhdl_foreign_bad.vhd:24:3: The FOREIGN attribute's value is empty
 %Error: t/t_vhdl_foreign_bad.vhd:28:3: The FOREIGN attribute's value names no C symbol
-%Error: t/t_vhdl_foreign_bad.vhd:32:3: The FOREIGN attribute's value has more words than 'VHPIDIRECT [library] symbol'
-%Error: t/t_vhdl_foreign_bad.vhd:36:3: The FOREIGN attribute must name the subprogram it applies to, since each one binds to a C symbol of its own
-%Error: t/t_vhdl_foreign_bad.vhd:41:24: 'f5' is overloaded, so the FOREIGN attribute cannot say which declaration it applies to
+%Error: t/t_vhdl_foreign_bad.vhd:32:3: The FOREIGN attribute must name the subprogram it applies to, since each one binds to a C symbol of its own
+%Error: t/t_vhdl_foreign_bad.vhd:37:24: 'f5' is overloaded, so the FOREIGN attribute cannot say which declaration it applies to
 %Error: Exiting due to

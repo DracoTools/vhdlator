@@ -1,9 +1,7 @@
-%Error-UNSUPPORTED: t/t_vhdl_foreign_lower_bad.vhd:33:3: Unsupported: FOREIGN attribute on an architecture; only a subprogram may be implemented outside VHDL here
+%Error-UNSUPPORTED: t/t_vhdl_foreign_lower_bad.vhd:26:3: Unsupported: FOREIGN attribute on an architecture; only a subprogram may be implemented outside VHDL here
                     ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
-%Error: t/t_vhdl_foreign_lower_bad.vhd:18:3: Subprogram 'f_body' has the FOREIGN attribute, so it must not also have a body
+%Error: t/t_vhdl_foreign_lower_bad.vhd:18:3: A foreign function must return a constrained type, as C has no way to say how long the result is
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_foreign_lower_bad.vhd:25:3: A foreign function must return a constrained type, as C has no way to say how long the result is
-%Error-UNSUPPORTED: t/t_vhdl_foreign_lower_bad.vhd:29:23: Unsupported: unconstrained parameter 'v' of a foreign subprogram
-%Error: t/t_vhdl_foreign_lower_bad.vhd:39:14: Unsupported: VHDL call to 'f_open' whose parameter 'v' has no length at this call cannot be lowered yet
-%Error: t/t_vhdl_foreign_lower_bad.vhd:40:29: Unsupported: VHDL call to 'f_body' cannot be lowered yet
+%Error-UNSUPPORTED: t/t_vhdl_foreign_lower_bad.vhd:22:23: Unsupported: unconstrained parameter 'v' of a foreign subprogram
+%Error: t/t_vhdl_foreign_lower_bad.vhd:32:14: Unsupported: VHDL call to 'f_open' whose parameter 'v' has no length at this call cannot be lowered yet
 %Error: Exiting due to

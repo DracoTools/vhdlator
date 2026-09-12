@@ -14,13 +14,6 @@ end entity;
 
 architecture rtl of t_vhdl_foreign_lower_bad is
 
-  -- A body as well as a C implementation
-  function f_body (v : integer) return integer is
-  begin
-    return v;
-  end function;
-  attribute foreign of f_body : function is "VHPIDIRECT c_f_body";
-
   -- C has no way to say how long the result is
   function f_open (v : std_logic_vector) return std_logic_vector;
   attribute foreign of f_open : function is "VHPIDIRECT c_f_open";
@@ -37,5 +30,5 @@ architecture rtl of t_vhdl_foreign_lower_bad is
   signal n : integer;
 begin
   b <= f_open(a);
-  n <= f_openarg(a) + f_body(1);
+  n <= f_openarg(a);
 end architecture;
