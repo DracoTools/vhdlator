@@ -1097,7 +1097,7 @@ class VhdlSemVisitor final : public VNVisitor {
             // this subtype has; it is only not a pair of numbers yet. Keep it
             // so that an array indexed by this subtype can emit it (14.4.2).
             if (!info.unbounded && info.valid && !typep->bounded()) typep->boundsp(rp);
-            checkSubrange(typep, basep, flp);
+            checkSubrange(typep, basep, flp, rp);
             return;
         }
         // Otherwise an index constraint, over the array's dimensions
@@ -1191,7 +1191,7 @@ class VhdlSemVisitor final : public VNVisitor {
             VhdlType* idxp = info.typep ? info.typep : wantp;
             if (!info.unbounded && info.left.known() && info.right.known()) {
                 idxp = makeRangeSubtype(info, flp);
-                checkSubrange(idxp, wantp, flp);
+                checkSubrange(idxp, wantp, flp, rp);
             } else if (!info.unbounded && info.valid) {
                 // A range whose bounds did not fold constrains nothing
                 // static, but it is still a range: a bound that names a
@@ -1295,7 +1295,16 @@ class VhdlSemVisitor final : public VNVisitor {
     }
 
     // A subtype's range must lie within the range it narrows (5.2.1)
-    void checkSubrange(const VhdlType* typep, const VhdlType* basep, FileLine* flp) {
+    // A range outside its base type's is an error where the design wrote it
+    // out, and a condition met at elaboration otherwise: "string(x'range)" of
+    // a parameter, or a bound a function call gives, is refused by no
+    // reference simulator at analysis (5.2.1, 9.4.2)
+    void checkSubrange(const VhdlType* typep, const VhdlType* basep, FileLine* flp,
+                       const AstNode* rangep = nullptr) {
+        // In a copy made for one call site the bounds are that call's, not
+        // something the design wrote (4.2.2.1)
+        if (m_inSpecialized) return;
+        if (rangep && notLocallyStatic(rangep)) return;
         if (!typep || !basep || !typep->bounded() || !basep->bounded()) return;
         if (typep->isNull()) return;  // A null range names no value at all
         if (basep->base()->kind() == VhdlTypeKind::FLOATING) {
@@ -2421,8 +2430,13 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
                 std::string{"The subtype of "} + symp->kindName() + " '" + nodep->name()
                     + "' has a null range, so no value can be given it");
         }
-        checkArrayValue(nodep->defaultp(), symp->typep(),
-                        std::string{symp->kindName()} + " '" + nodep->name() + "'");
+        // An object whose own bounds are not locally static -- taken from a
+        // function's result, say -- is checked against its value when the
+        // design elaborates, which is where the references report it
+        if (!notLocallyStatic(nodep->subtypep())) {
+            checkArrayValue(nodep->defaultp(), symp->typep(),
+                            std::string{symp->kindName()} + " '" + nodep->name() + "'");
+        }
         // A constant with a static value is what every later fold builds on
         if (kind == VhdlSymKind::CONSTANT) symp->value(V3VhdlEval::eval(nodep->defaultp()));
     } else if (kind == VhdlSymKind::CONSTANT) {
@@ -7138,11 +7152,18 @@ VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
         // A design unit's name denotes the unit, which has no value; only an
         // attribute of it may be asked for (16.2)
         const VhdlSymKind kind = objects[0]->kind();
-        const AstVhdlAttrName* const attrp = VN_CAST(parentOf(nodep), VhdlAttrName);
+        // A design unit's or a library's name may be the prefix of a selected
+        // name or of an attribute: "work.e'delay", "work.pkg.c"
+        const AstNode* upp = nodep;
+        while (const AstVhdlSelected* const selp = VN_CAST(parentOf(upp), VhdlSelected)) {
+            if (selp->prefixp() != upp) break;
+            upp = selp;
+        }
+        const AstVhdlAttrName* const attrp = VN_CAST(parentOf(upp), VhdlAttrName);
         if ((kind == VhdlSymKind::ENTITY || kind == VhdlSymKind::ARCHITECTURE
              || kind == VhdlSymKind::CONFIGURATION || kind == VhdlSymKind::CONTEXT
              || kind == VhdlSymKind::LIBRARY)
-            && !(attrp && attrp->prefixp() == nodep) && !m_inSpecialized) {
+            && !(attrp && attrp->prefixp() == upp) && upp == nodep && !m_inSpecialized) {
             const bool vowel = kind == VhdlSymKind::ARCHITECTURE || kind == VhdlSymKind::ENTITY;
             err(nodep->fileline(), "'" + nodep->name() + "' here names " + (vowel ? "an " : "a ")
                                        + objects[0]->kindName() + ", which has no value");
@@ -11042,25 +11063,6 @@ void VhdlSemVisitor::checkSelectorStatic(const AstNodeVhdlExpr* exprp, const std
     } else if (const VhdlSymbol* const varyp = notLocallyStatic(sip)) {
         why = "its subtype depends on " + std::string{varyp->kindName()} + " '" + varyp->name()
               + "'";
-    } else {
-        // A constant whose value a call to a function of the design gives
-        sip->foreach([&](const AstVhdlName* innerp) {
-            const VhdlSymbol* const csymp
-                = innerp->vhdlSymp() ? innerp->vhdlSymp()->resolved() : nullptr;
-            const AstVhdlObjectDecl* const cdp = csymp && csymp->kind() == VhdlSymKind::CONSTANT
-                                                     ? VN_CAST(csymp->declp(), VhdlObjectDecl)
-                                                     : nullptr;
-            if (!why.empty() || !cdp || !cdp->defaultp()) return;
-            cdp->defaultp()->foreach([&](const AstVhdlCall* callp) {
-                const VhdlSymbol* const fsymp
-                    = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
-                if (why.empty() && fsymp && fsymp->kind() == VhdlSymKind::FUNCTION
-                    && !fsymp->predefined()) {
-                    why = "its subtype depends on constant '" + csymp->name()
-                          + "', which a function call gives its value";
-                }
-            });
-        });
     }
     if (why.empty()) return;
     err(exprp->fileline(), "Before VHDL-2008 what " + what
@@ -11575,6 +11577,21 @@ const VhdlSymbol* VhdlSemVisitor::notLocallyStatic(const AstNode* exprsp) {
         case VhdlSymKind::PORT:
         case VhdlSymKind::VARIABLE:
         case VhdlSymKind::SHARED_VARIABLE: return true;
+        case VhdlSymKind::CONSTANT: {
+            // A constant is locally static only where its own value is, and
+            // a call to a function of the design never is (9.4.2)
+            const AstVhdlObjectDecl* const odp = VN_CAST(symp->declp(), VhdlObjectDecl);
+            if (!odp || !odp->defaultp()) return false;
+            bool called = false;
+            odp->defaultp()->foreach([&](const AstVhdlCall* callp) {
+                const VhdlSymbol* const fsymp
+                    = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+                if (fsymp && fsymp->kind() == VhdlSymKind::FUNCTION && !fsymp->predefined()) {
+                    called = true;
+                }
+            });
+            return called;
+        }
         default: return false;
         }
     };
@@ -11597,6 +11614,13 @@ const VhdlSymbol* VhdlSemVisitor::notLocallyStatic(const AstNode* exprsp) {
                 sip = ifp->subtypep();
             }
             if (!sip) return;
+            // An object whose bounds come from what it is given -- an
+            // unconstrained parameter -- has no static range either
+            if (writtenBare(sip) && sip->typeMarkp()
+                && markLeavesIndexOpen(sip->typeMarkp()->vhdlSymp())) {
+                foundp = symp;
+                return;
+            }
             sip->foreach([&](const AstVhdlName* innerp) {
                 const VhdlSymbol* const isymp
                     = innerp->vhdlSymp() ? innerp->vhdlSymp()->resolved() : nullptr;
