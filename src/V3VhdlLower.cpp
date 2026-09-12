@@ -196,6 +196,22 @@ class VhdlLowerVisitor final {
     std::map<std::string, std::pair<std::string, std::string>> m_configOf;
     std::string m_prefix;  // Name prefix for declarations inside a process
     std::string m_blockPrefix;  // Labels of the blocks being lowered, outermost first
+    // Every block label path of the unit being lowered -- "b1", "b1__b2" --
+    // since a block is flattened into the module and its declarations carry
+    // that prefix, which an external name into one has to follow (11.2, 8.7)
+    std::set<std::string> m_blockPaths;
+    // "b1__s1" -> the variable a block's declaration became
+    std::map<std::string, AstVar*> m_blockObjs;
+    // "b1__s1" -> what the block declared under that name
+    std::map<std::string, VhdlSymbol*> m_blockSyms;
+    // External names still to resolve: a process may name what a block
+    // declares before that block has been lowered
+    std::vector<std::pair<AstVarXRef*, std::vector<std::string>>> m_pendingExt;
+    // External names naming what a block declares, whose variable is not made
+    // until that block is lowered. Held by the name the placeholder carries,
+    // since the expression it stands in may be folded away before then.
+    std::map<std::string, VhdlSymbol*> m_pendingBlockExt;
+    int m_blockExtNum = 0;
     std::map<const VhdlType*, AstNodeFTask*> m_valueFuncs;  // "T'VALUE" readers, per type
     // A helper that had to stay in a module, and which module that was
     std::map<const AstNodeFTask*, AstNodeModule*> m_helperMod;
@@ -4668,14 +4684,38 @@ private:
         // two loops in one process may both declare "i". The first keeps the
         // name it was written with, since that is what a trace shows.
         std::string name = m_prefix + symp->name();
-        if (!m_names.insert(name).second) {
+        // Inside a subprogram the names of its own declarations must differ
+        // from each other and from its parameters, whatever the module
+        // around it declares: "for i in ..." in a procedure that takes an "i"
+        // would otherwise emit two variables of that name in one body.
+        std::set<std::string>& names = m_ftaskp ? m_funcNames[m_ftaskp] : m_names;
+        // A parameter is declared straight into the subprogram rather than
+        // through here, so what it is called is read off the body
+        const auto taken = [&](const std::string& tryName) {
+            if (names.count(tryName)) return true;
+            if (!m_ftaskp) return false;
+            for (AstNode* p = m_ftaskp->stmtsp(); p; p = p->nextp()) {
+                const AstVar* const varp = VN_CAST(p, Var);
+                if (varp && varp->name() == tryName) return true;
+            }
+            return false;
+        };
+        if (taken(name)) {
             std::string tryp;
-            do {
-                tryp = name + "__" + std::to_string(++m_nameNum);
-            } while (!m_names.insert(tryp).second);
+            do { tryp = name + "__" + std::to_string(++m_nameNum); } while (taken(tryp));
             name = tryp;
         }
+        names.insert(name);
         AstVar* const varp = new AstVar{flp, varType, name, VFlagChildDType{}, dtypep};
+        // What a block declares is reached from outside by "<<signal b1.s1>>",
+        // and the block is no module of its own, so the path is remembered
+        // against the variable it became (8.7, 11.2). The path comes from
+        // where the object was declared, not from where the lowering is: a
+        // constant is lowered where it is first read, which may be a process
+        // written before the block.
+        const std::string declPath = blockPathOfDecl(symp->declp());
+        const std::string blockPath = declPath.empty() ? m_blockPrefix : declPath;
+        if (!blockPath.empty()) m_blockObjs.emplace(blockPath + symp->name(), varp);
         // Something the design declared, so it is what a waveform shows. The
         // temporaries the lowering makes for itself are not, and are made
         // elsewhere.
@@ -4690,6 +4730,8 @@ private:
         return varp;
     }
     std::set<std::string> m_names;  // Names already used in this module
+    // Names already used in one subprogram, which may shadow the module's
+    std::map<const AstNodeFTask*, std::set<std::string>> m_funcNames;
     int m_nameNum = 0;
 
     // What a signal attribute needs kept about a signal (16.2.2). VHDL's
@@ -7751,6 +7793,103 @@ private:
     // "<< signal .top.uut.x : natural >>" names an object somewhere else in
     // the design (8.7). Verilator resolves a dotted name against the
     // hierarchy already, so the path becomes one.
+    // The label paths of every block in these statements, nested ones joined
+    // the way their declarations are named
+    void collectBlockPaths(AstNode* stmtsp, const std::string& prefix) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            const AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock);
+            if (!blockp) continue;
+            const std::string here = blockp->label().empty() ? prefix : prefix + blockp->label();
+            if (!blockp->label().empty()) m_blockPaths.insert(here);
+            const std::string inner = here.empty() ? here : here + "__";
+            // What the block declares, so that an external name into it finds
+            // the declaration whether or not the block has been lowered yet
+            for (AstNode* dp = blockp->declsp(); dp; dp = dp->nextp()) {
+                const AstVhdlObjectDecl* const odp = VN_CAST(dp, VhdlObjectDecl);
+                if (odp && odp->vhdlSymp())
+                    m_blockSyms.emplace(inner + odp->name(), odp->vhdlSymp());
+            }
+            if (const AstVhdlBlockHeader* const headerp = blockp->headerp()) {
+                for (AstNode* pp = headerp->portsp(); pp; pp = pp->nextp()) {
+                    const AstVhdlIfaceDecl* const ifp = VN_AS(pp, VhdlIfaceDecl);
+                    if (ifp->vhdlSymp()) m_blockSyms.emplace(inner + ifp->name(), ifp->vhdlSymp());
+                }
+                for (AstNode* gp = headerp->genericsp(); gp; gp = gp->nextp()) {
+                    const AstVhdlIfaceDecl* const ifp = VN_AS(gp, VhdlIfaceDecl);
+                    if (ifp->vhdlSymp()) m_blockSyms.emplace(inner + ifp->name(), ifp->vhdlSymp());
+                }
+            }
+            collectBlockPaths(blockp->stmtsp(), inner);
+        }
+    }
+
+    // The labels of the blocks a declaration sits in, outermost first, as the
+    // path of an external name writes them
+    static std::string blockPathOfDecl(const AstNode* declp) {
+        std::string out;
+        for (const AstNode* upp = declp; upp; upp = parentOf(upp)) {
+            const AstVhdlBlock* const blockp = VN_CAST(upp, VhdlBlock);
+            if (blockp && !blockp->label().empty()) out = blockp->label() + "__" + out;
+        }
+        return out;
+    }
+
+    // The variable a path into a block names, if this module has one
+    AstVar* blockObject(const std::vector<std::string>& parts) {
+        for (size_t start = 0; start + 1 < parts.size(); ++start) {
+            std::string path;
+            for (size_t i = start; i < parts.size(); ++i) {
+                path += (path.empty() ? "" : "__") + parts[i];
+            }
+            const auto it = m_blockObjs.find(path);
+            if (it != m_blockObjs.end()) return it->second;
+        }
+        return nullptr;
+    }
+
+    // Once the whole module is lowered, every block it declares is known, so
+    // the external names left hanging can name the variables they meant
+    void settleExternalNames() {
+        // Whatever is still in the tree carrying a placeholder name is an
+        // external name into a block, which the block has since declared
+        if (!m_pendingBlockExt.empty()) {
+            std::vector<AstVarXRef*> holders;
+            const auto collect = [&](AstNode* listp) {
+                for (AstNode* p = listp; p; p = p->nextp()) {
+                    p->foreach([&](AstVarXRef* refp) {
+                        if (refp->name().compare(0, 11, "__Vblockext") == 0) {
+                            holders.push_back(refp);
+                        }
+                    });
+                }
+            };
+            collect(m_stmtsp);
+            collect(m_shadowsp);
+            for (AstVarXRef* const refp : holders) {
+                const auto it = m_pendingBlockExt.find(refp->name());
+                if (it == m_pendingBlockExt.end()) continue;
+                const std::string realName = refp->name().substr(refp->name().find("__", 11) + 2);
+                AstNodeExpr* const newp = lowerRef(it->second, realName, refp->fileline());
+                if (!newp) continue;
+                if (AstVarRef* const varRefp = VN_CAST(newp, VarRef)) {
+                    varRefp->access(refp->access());
+                }
+                refp->replaceWith(newp);
+                VL_DO_DANGLING(refp->deleteTree(), refp);
+            }
+        }
+        m_pendingBlockExt.clear();
+        for (const auto& pending : m_pendingExt) {
+            AstVar* const objp = blockObject(pending.second);
+            AstVarXRef* const refp = pending.first;
+            if (!objp || !refp->backp()) continue;
+            AstVarRef* const newp = new AstVarRef{refp->fileline(), objp, refp->access()};
+            refp->replaceWith(newp);
+            VL_DO_DANGLING(refp->deleteTree(), refp);
+        }
+        m_pendingExt.clear();
+    }
+
     AstNodeExpr* lowerExternalName(AstVhdlExternalName* nodep, bool write) {
         FileLine* const flp = nodep->fileline();
         if (nodep->package()) {
@@ -7775,15 +7914,44 @@ private:
             return nullptr;
         }
         const std::string name = parts.back();
+        // A block is no module of its own, so a path into one names something
+        // of this module: "b1.s1" is the variable the block's declaration
+        // became (8.7, 11.2). Which variable that is may not be known yet --
+        // the process naming it can come before the block -- so the reference
+        // is made as a hierarchical one and settled once the module is whole.
+        for (size_t start = 0; start + 1 < parts.size(); ++start) {
+            std::string path;
+            for (size_t i = start; i < parts.size(); ++i) {
+                path += (path.empty() ? "" : "__") + parts[i];
+            }
+            const auto symIt = m_blockSyms.find(path);
+            if (symIt == m_blockSyms.end()) continue;
+            // What the block declares gets its variable when the block is
+            // lowered, which may be after the process naming it: the
+            // reference waits until the module is whole rather than making a
+            // second variable of its own
+            if (!m_vars.count(symIt->second)) {
+                const std::string holder
+                    = "__Vblockext" + std::to_string(++m_blockExtNum) + "__" + name;
+                m_pendingBlockExt.emplace(holder, symIt->second);
+                return new AstVarXRef{flp, holder, "", write ? VAccess::WRITE : VAccess::READ};
+            }
+            return lowerRef(symIt->second, name, flp);
+        }
+        if (AstVar* const objp = blockObject(parts)) {
+            return new AstVarRef{flp, objp, write ? VAccess::WRITE : VAccess::READ};
+        }
+        size_t upto = parts.size() - 1;
         std::string dotted;
         // An absolute pathname starts at the root of the design, which is the
         // top module; a relative one starts where it is written
-        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        for (size_t i = 0; i < upto; ++i) {
             if (!dotted.empty()) dotted += ".";
             dotted += parts[i];
         }
         AstVarXRef* const refp = new AstVarXRef{
             flp, name, dotted, write ? VAccess::WRITE : VAccess::READ};
+        if (parts.size() > 1) m_pendingExt.emplace_back(refp, parts);
         return refp;
     }
 
@@ -12036,7 +12204,12 @@ private:
             // after that arrives a delta later, as any signal assignment
             // does. A continuous assignment would give it the value with no
             // delta at all and no default to start from.
-            if (ifp->defaultp()) {
+            if (AstConst* const constp = VN_CAST(valuep, Const)) {
+                // The driver the association makes is given the actual's
+                // value when the block is elaborated, so the port holds it
+                // from the start rather than its type's default (14.4.2.5)
+                varp->valuep(constp->cloneTree(false));
+            } else if (ifp->defaultp()) {
                 varp->valuep(lowerExpr(ifp->defaultp()));
             } else if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp, true)) {
                 // With nothing written, the port starts at its type's own
@@ -19810,8 +19983,15 @@ private:
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
         m_names.clear();
+        m_funcNames.clear();
         m_instNames.clear();
         m_blockPrefix.clear();
+        m_blockPaths.clear();
+        m_blockObjs.clear();
+        m_blockSyms.clear();
+        m_pendingExt.clear();
+        m_pendingBlockExt.clear();
+        if (archp) collectBlockPaths(archp->stmtsp(), "");
         m_funcs.clear();
         // A copy made for one call, bound to the signal that call passed,
         // belongs to the module the call is in: reused from another module
@@ -19890,6 +20070,7 @@ private:
                 lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
         }
+        settleExternalNames();
         m_modp->addStmtsp(m_stmtsp);
         m_stmtsp = nullptr;
         m_modp->addStmtsp(m_shadowsp);
