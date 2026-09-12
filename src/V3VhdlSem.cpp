@@ -138,6 +138,11 @@ class VhdlSemVisitor final : public VNVisitor {
     // Package declarations whose body this analysis has seen, and so whose
     // subprograms are known to have been given bodies or not (4.8)
     std::set<const AstVhdlPackage*> m_pkgsWithBody;
+    // Packages declared inside another region. A package that is a design
+    // unit may have its body in another file, so a subprogram it declares
+    // without one is not yet an error; a nested package is completed where it
+    // stands or not at all (4.8).
+    std::set<const AstVhdlPackage*> m_nestedPkgsNoBody;
     int m_ifacePos = 0;  // Position of the interface element being declared
     bool m_errored = false;
     // An entity with a generic type is one entity per type the design hands
@@ -1914,6 +1919,8 @@ private:
     void visit(AstVhdlComponentDecl* nodep) override;
     void visit(AstVhdlAliasDecl* nodep) override;
     void visit(AstVhdlPackage* nodep) override;
+    void visit(AstVhdlPackageBody* nodep) override;
+    void bindOwnGenerics(AstVhdlPackage* nodep, VhdlScope* outerp) VL_MT_DISABLED;
     void visit(AstVhdlPackageInst* nodep) override;
     void visit(AstVhdlSubprogInst* nodep) override;
 
@@ -4550,7 +4557,22 @@ void VhdlSemVisitor::visit(AstVhdlPackage* nodep) {
     // A package's own name is visible inside it (12.1), so a nested package
     // may write "outer.t" for a type the outer one declares
     innerp->addNamed(lower(nodep->name()), innerp);
+    // A package declared inside another region is completed there or not at
+    // all, so whether it has a body is known as soon as it is seen (4.8)
+    if (m_curUnitp != nodep) {
+        bool hasBody = false;
+        for (const AstNode* upp = parentOf(nodep); upp && !hasBody; upp = parentOf(upp)) {
+            upp->foreach([&](const AstVhdlPackageBody* bodyp) {
+                if (lower(bodyp->name()) == lower(nodep->name())) hasBody = true;
+            });
+            if (VN_IS(upp, NodeVhdlUnit)) break;
+        }
+        if (!hasBody) m_nestedPkgsNoBody.insert(nodep);
+    }
     iterateAndNextNull(nodep->genericsp());
+    // A package may carry a generic map of its own, which makes it an
+    // instance of itself: its generics hold what it gives them (4.7)
+    if (nodep->genericMapp()) bindOwnGenerics(nodep, outerp);
     iterateAndNextNull(nodep->declsp());
     m_scopep = outerp;
     outerp->addNamed(lower(nodep->name()), innerp);
@@ -4558,6 +4580,58 @@ void VhdlSemVisitor::visit(AstVhdlPackage* nodep) {
         = VhdlSymTab::newSymbol(VhdlSymKind::PACKAGE, nodep->name(), nodep);
     symp->innerp(innerp);
     declare(symp, nodep->fileline());
+}
+
+// A package body continues the declarative region of the package it completes
+// (12.1), so everything the package declares -- its generics among them -- is
+// visible inside it. This is a package declared inside another region; the
+// body of a package that is a design unit of its own is given the same region
+// where the units are ordered.
+// The values a package with its own generic map gives its generics. The
+// generics were declared just above, so this gives each the value written for
+// it rather than declaring anything of its own.
+void VhdlSemVisitor::bindOwnGenerics(AstVhdlPackage* nodep, VhdlScope* outerp) {
+    std::vector<AstVhdlIfaceDecl*> formals;
+    for (AstNode* p = nodep->genericsp(); p; p = p->nextp()) {
+        formals.push_back(VN_AS(p, VhdlIfaceDecl));
+    }
+    size_t position = 0;
+    for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+        AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+        if (!asp || !asp->actualp()) continue;
+        AstVhdlIfaceDecl* formalp = nullptr;
+        if (const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName)) {
+            for (AstVhdlIfaceDecl* const ifp : formals) {
+                if (lower(ifp->name()) == lower(namep->name())) formalp = ifp;
+            }
+        } else if (position < formals.size()) {
+            formalp = formals[position];
+        }
+        ++position;
+        VhdlSymbol* const symp = formalp ? formalp->vhdlSymp() : nullptr;
+        if (!symp) continue;
+        // The actual is written where the package stands, not inside it
+        VhdlScope* const innerp = m_scopep;
+        m_scopep = outerp;
+        analyzeExpr(asp->actualp(), symp->typep());
+        const VhdlValue val = V3VhdlEval::eval(asp->actualp());
+        m_scopep = innerp;
+        if (val.known() && !val.isComposite()) symp->value(val);
+    }
+}
+
+void VhdlSemVisitor::visit(AstVhdlPackageBody* nodep) {
+    VhdlScope* const pkgScopep = m_scopep->findNamed(lower(nodep->name()));
+    if (!pkgScopep) {
+        iterateChildren(nodep);
+        return;
+    }
+    VL_RESTORER(m_inPackageBody);
+    m_inPackageBody = true;
+    VhdlScope* const outerp = m_scopep;
+    m_scopep = pkgScopep;
+    iterateAndNextNull(nodep->declsp());
+    m_scopep = outerp;
 }
 
 void VhdlSemVisitor::visit(AstVhdlPackageInst* nodep) {
@@ -6490,7 +6564,9 @@ void VhdlSemVisitor::checkBodiesGiven(const std::vector<AstNodeVhdlUnit*>& units
                 // a protected type is completed by the protected type body
                 if (VN_IS(upp, VhdlIfaceDecl) || VN_IS(upp, VhdlProtectedType)) return;
                 if (const AstVhdlPackage* const pkgp = VN_CAST(upp, VhdlPackage)) {
-                    if (!m_pkgsWithBody.count(pkgp)) return;
+                    // A design unit's body may be in a file not read yet; one
+                    // declared inside another region has none at all
+                    if (!m_pkgsWithBody.count(pkgp) && !m_nestedPkgsNoBody.count(pkgp)) return;
                     break;
                 }
                 if (VN_IS(upp, NodeVhdlUnit)) break;
@@ -9996,8 +10072,41 @@ VhdlType* VhdlSemVisitor::constrainElementFromValue(VhdlType* typep, AstNodeVhdl
     }
     VhdlType* const valueTypep = valuep->vhdlTypep();
     if (!valueTypep || valueTypep->base()->kind() != VhdlTypeKind::ARRAY) return typep;
-    VhdlType* const valElemp
+    VhdlType* valElemp
         = valueTypep->elementp() ? valueTypep->elementp() : valueTypep->base()->elementp();
+    // An aggregate has the type it was given, so where that says nothing
+    // about the element the elements themselves do: "(others => nbv)" over
+    // an element type of BIT_VECTOR is as long as nbv (5.3.2.2, 9.3.3.3)
+    if ((!valElemp || !valElemp->lengthEmittable()) && VN_IS(valuep, VhdlAggregate)) {
+        // Every element has to say the same length: one array type has one
+        // element subtype, and a value whose elements differ says nothing
+        // about it -- the references leave that to run time rather than
+        // measuring it from whichever element came first
+        VhdlType* agreedp = nullptr;
+        bool agrees = true;
+        for (AstNode* p = VN_AS(valuep, VhdlAggregate)->elemsp(); agrees && p; p = p->nextp()) {
+            AstVhdlElemAssoc* const eap = VN_CAST(p, VhdlElemAssoc);
+            if (!eap || !eap->valuep()) continue;
+            VhdlType* partp = eap->valuep()->vhdlTypep();
+            // A string or bit string literal carries its length in itself
+            // rather than in its type, so the element is measured the same
+            // way an object of that type would be (9.3.3.3)
+            if (!partp || !partp->lengthEmittable()) {
+                partp = constrainFromValue(elemp, eap->valuep(), flp);
+            }
+            if (!partp || partp->base()->kind() != VhdlTypeKind::ARRAY
+                || !partp->lengthEmittable()) {
+                agrees = false;
+                break;
+            }
+            if (!agreedp) {
+                agreedp = partp;
+            } else if (agreedp->dimLength(0) != partp->dimLength(0)) {
+                agrees = false;
+            }
+        }
+        if (agrees && agreedp) valElemp = agreedp;
+    }
     if (!valElemp || !valElemp->lengthEmittable()) return typep;
     VhdlType* const outp = cloneSubtype(typep, flp);
     outp->elementp(valElemp);

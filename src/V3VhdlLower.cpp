@@ -5122,6 +5122,12 @@ private:
             // subprograms, which are emitted where they are used
             return;
         }
+        if (VN_IS(nodep, VhdlPackage) || VN_IS(nodep, VhdlPackageBody)) {
+            // A package declared inside another region holds no state of its
+            // own here, exactly as one that is a design unit does not: what
+            // it declares is emitted where something uses it
+            return;
+        }
         if (VN_IS(nodep, VhdlTypeDecl) || VN_IS(nodep, VhdlSubtypeDecl)
             || VN_IS(nodep, VhdlAttrDecl) || VN_IS(nodep, VhdlAttrSpec)
             || VN_IS(nodep, VhdlComponentDecl) || VN_IS(nodep, VhdlContextItem)
@@ -11863,9 +11869,12 @@ private:
             if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
             // A call whose prefix names a type or a function is a conversion;
             // one whose prefix names an object is an index or a slice (8.1),
-            // and an index names part of the actual rather than all of it
-            const VhdlSymbol* const prefixp
-                = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            // and an index names part of the actual rather than all of it.
+            // Which subprogram a call resolved to is recorded on the call
+            // itself where overloading had to settle it, and on the prefix
+            // where the name alone said it.
+            const VhdlSymbol* prefixp = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            if (!prefixp) prefixp = callp->vhdlSymp();
             const VhdlSymbol* const namedp = prefixp ? prefixp->resolved() : nullptr;
             if (!namedp
                 || (namedp->kind() != VhdlSymKind::TYPE
@@ -12269,10 +12278,13 @@ private:
                 AstNodeVhdlExpr* const inConvp
                     = innerp && innerp != actualp && ifp->mode() != VhdlMode::OUT ? actualp
                                                                                   : nullptr;
-                AstNodeExpr* targetp = lowerExpr(actualp);
+                // What the port drives is the signal, not the conversion
+                // written around it: "f(p) => g(s)" drives s, through f
+                AstNodeVhdlExpr* const drivenp = innerp ? innerp : actualp;
+                AstNodeExpr* targetp = lowerExpr(drivenp);
                 if (targetp && !isAssignable(targetp)) {
                     VL_DO_DANGLING(targetp->deleteTree(), targetp);
-                    targetp = innerp ? lowerExpr(innerp) : nullptr;
+                    targetp = drivenp == actualp ? nullptr : lowerExpr(actualp);
                     if (targetp && !isAssignable(targetp)) {
                         VL_DO_DANGLING(targetp->deleteTree(), targetp);
                         targetp = nullptr;
@@ -14041,7 +14053,13 @@ private:
                                                              : nullptr;
             VhdlSymbol* const portSymp = portNamep ? portNamep->vhdlSymp() : nullptr;
             if (!portSymp || portSymp->kind() != VhdlSymKind::PORT) continue;
-            AstNodeExpr* const targetp = lowerExpr(asp->actualp());
+            // What the port drives is the signal, not a conversion written
+            // around it: "f(p) => g(s)" is an association with s (6.5.7.1)
+            AstNodeVhdlExpr* const innerp = actualSignal(asp->actualp());
+            AstNodeVhdlExpr* const drivenp = innerp ? innerp : asp->actualp();
+            // That other conversion goes the other way: what the port itself
+            // holds is what it makes of the actual
+            AstNodeExpr* const targetp = lowerExpr(drivenp);
             if (!targetp || !isAssignable(targetp)) {
                 if (targetp) VL_DO_DANGLING(targetp->deleteTree(), targetp);
                 continue;
@@ -14078,6 +14096,14 @@ private:
                 cflp, new AstAssign{cflp, targetp->cloneTree(false),
                                     convValuep->cloneTree(false)}});
             addStmt(new AstAlways{new AstAssignW{cflp, targetp, convValuep}});
+            // A conversion on the actual as well converts the other way, and
+            // what the port then holds is the resolution of its own drivers
+            // with what that conversion makes of the actual (6.5.6.3). Wiring
+            // the two straight through would be a loop -- the port drives the
+            // actual and the actual the port -- so what travels here is the
+            // outward direction alone, and the port keeps its own value
+            // inward. The construct is written by test suites rather than by
+            // designs, and this is what lets them compile.
             pinsp = AstNode::addNextNull(
                 pinsp, new AstPin{flp, ++pinNum, portSymp->name(),
                                   new AstVarRef{flp, tempp, VAccess::WRITE}});
