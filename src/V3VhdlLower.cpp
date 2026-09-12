@@ -9121,7 +9121,24 @@ private:
             powp->dtypeSetInteger();
             return powp;
         }
-        case VhdlBinaryOp::CONCAT: return new AstConcat{flp, lhsp, rhsp};
+        case VhdlBinaryOp::CONCAT: {
+            // VHDL concatenates arrays of any element type (9.2.5), and
+            // Verilog's concatenation is over bits. Where the elements do not
+            // pack -- an array of integers, of strings, of unconstrained
+            // arrays -- the result is written out as every element of both
+            // operands in turn instead.
+            VhdlType* const rtypep = nodep->vhdlTypep();
+            const VhdlType* elemp = nullptr;
+            if (rtypep && rtypep->base()->kind() == VhdlTypeKind::ARRAY) {
+                elemp = rtypep->elementp() ? rtypep->elementp() : rtypep->base()->elementp();
+            }
+            if (elemp && !elementPacks(elemp) && !isStringType(rtypep)) {
+                if (AstNodeExpr* const outp = unpackedConcat(nodep, lhsp, rhsp, flp)) {
+                    return outp;
+                }
+            }
+            return new AstConcat{flp, lhsp, rhsp};
+        }
         case VhdlBinaryOp::SLL:
         case VhdlBinaryOp::SRL:
         case VhdlBinaryOp::SLA:
@@ -9981,6 +9998,76 @@ private:
         }
         VL_DO_DANGLING(rightp->deleteTree(), rightp);
         return new AstSelPlus{flp, fromp, leftp, widthp};
+    }
+
+    // The concatenation of two arrays whose elements do not pack, written
+    // out element by element as an assignment pattern (9.2.5)
+    AstNodeExpr* unpackedConcat(AstVhdlBinary* nodep, AstNodeExpr* lhsp, AstNodeExpr* rhsp,
+                                FileLine* flp) {
+        // Both operands are asked about before either is taken apart: what
+        // is written here is handed back to the caller untouched where this
+        // cannot be done, and one operand already pulled to pieces would
+        // leave it holding nothing
+        if (!canExpand(nodep->lhsp(), lhsp) || !canExpand(nodep->rhsp(), rhsp)) return nullptr;
+        AstNode* const leftMembersp = concatMembers(nodep->lhsp(), lhsp, flp);
+        AstNode* const rightMembersp = concatMembers(nodep->rhsp(), rhsp, flp);
+        UASSERT_OBJ(leftMembersp && rightMembersp, nodep, "Expansion asked about and refused");
+        return new AstPattern{flp, AstNode::addNext(leftMembersp, rightMembersp)};
+    }
+
+    // Whether every element of an operand can be written out, asked before
+    // anything is taken apart
+    bool canExpand(AstNodeVhdlExpr* opp, AstNodeExpr* loweredp) {
+        if (!loweredp) return false;
+        if (const AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
+            if (!patp->itemsp()) return false;
+            for (AstNode* p = patp->itemsp(); p; p = p->nextp()) {
+                const AstPatMember* const memberp = VN_CAST(p, PatMember);
+                if (!memberp || memberp->isDefault() || memberp->keyp() || memberp->repp()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (!repeatable(loweredp)) return false;
+        const VhdlType* const typep = opp ? opp->vhdlTypep() : nullptr;
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
+            || !typep->isConstrainedArray()) {
+            return false;
+        }
+        const VhdlType* const idxp = indexSubtype(typep, 0);
+        if (!idxp || !idxp->bounded()) return false;
+        const int64_t count = idxp->length();
+        return count > 0 && count <= 4096;
+    }
+
+    // Every element of one operand of such a concatenation, in index order.
+    // An aggregate has already become a pattern, and its members are taken as
+    // they stand; anything else is indexed, which needs its length.
+    AstNode* concatMembers(AstNodeVhdlExpr* opp, AstNodeExpr* loweredp, FileLine* flp) {
+        if (AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
+            // An aggregate is already written out element by element
+            AstNode* const outp = patp->itemsp()->unlinkFrBackWithNext();
+            VL_DO_DANGLING(patp->deleteTree(), patp);
+            return outp;
+        }
+        // Anything else is read once per element, so it has to be a name
+        // rather than something that would be worked out again each time
+        const VhdlType* const typep = opp->vhdlTypep();
+        const VhdlType* const idxp = indexSubtype(typep, 0);
+        const int64_t count = idxp->length();
+        AstNode* outp = nullptr;
+        for (int64_t i = 0; i < count; ++i) {
+            const int64_t at = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
+            outp = AstNode::addNextNull(
+                outp, new AstPatMember{flp,
+                                       new AstSelBit{flp, loweredp->cloneTree(false),
+                                                     new AstConst{flp, AstConst::Signed32{},
+                                                                  static_cast<int32_t>(at)}},
+                                       nullptr, nullptr});
+        }
+        VL_DO_DANGLING(loweredp->deleteTree(), loweredp);
+        return outp;
     }
 
     // A type conversion between closely related types (9.3.6). Between

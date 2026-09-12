@@ -48,8 +48,10 @@ Compile the two together and call the function like any other:
 
      verilator --binary --timing design.vhd popcount.c --top-module design
 
-The subprogram has no body in VHDL -- the C function is its body. Giving it
-one as well is an error.
+The C function is the subprogram's body. A body may be written in VHDL as
+well, which is how a design stays portable to a tool that cannot load the C
+model; where there is one, it is what Verilator compiles, and the binding is
+ignored.
 
 Accepted forms of the attribute string:
 
@@ -67,8 +69,16 @@ Accepted forms of the attribute string:
      - The same C symbol, said in a way that makes plain the function is
        shared with a SystemVerilog testbench. Not portable to other VHDL
        tools.
+   * - ``"VHPI work c_popcount"``
+     - The same. The form NVC writes; its library name is ignored here too.
    * - ``"c_popcount"``
      - A bare symbol name, also accepted.
+
+Words beyond the symbol name are ignored rather than refused: the content of
+the string is each tool's to define, and a file written for one tool has to
+analyze in another. The C symbol is the last word. One subprogram may be
+given the attribute only once, which the standard requires (IEEE 1076-2008
+clause 7.2).
 
 A **procedure** becomes a C function returning ``void``, with its ``out``
 and ``inout`` parameters passed by pointer:

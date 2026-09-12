@@ -91,7 +91,9 @@ sequential statements, blocks, ``for``/``if``/``case`` generate statements,
 component and direct entity instantiation, aliases, attributes, and the
 predefined libraries ``std.standard``, ``std.textio``, ``std.env``, and IEEE
 ``std_logic_1164``, ``numeric_std``, ``numeric_bit``,
-``numeric_std_unsigned``, ``math_real`` and ``math_complex``.
+``numeric_std_unsigned``, ``math_real`` and ``math_complex``, along with the
+two context declarations IEEE defines, ``ieee.ieee_std_context`` and
+``ieee.ieee_bit_context``.
 
 A VHDL design that suspends -- a process with no sensitivity list, ``wait``
 in any of its forms, or an ``after`` delay -- needs :vlopt:`--timing`, the
