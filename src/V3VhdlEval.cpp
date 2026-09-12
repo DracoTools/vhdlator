@@ -236,6 +236,11 @@ class VhdlEvaluator final {
     int m_calls = 0;  // Activations nested, against a recursion that has no end
     int m_steps = 0;  // Statements run, against a loop that has none either
     bool m_bail = false;  // The activation being run cannot be folded
+    // Whether a body that is not pure may be run. Only elaboration asks for
+    // that: a handle a verification library builds is made by an impure
+    // function, and what elaboration wants from it is the widths it carries,
+    // not a value to emit in place of the object (9.4.3)
+    const bool m_allowImpure;
 
     // A constant folded from a self-referential declaration would recurse
     // forever; analysis reports the cycle separately, so just stop
@@ -248,10 +253,23 @@ class VhdlEvaluator final {
 
 public:
     // CONSTRUCTORS
-    explicit VhdlEvaluator(std::string* errp)
-        : m_errp{errp} {}
+    explicit VhdlEvaluator(std::string* errp, bool allowImpure = false)
+        : m_errp{errp}
+        , m_allowImpure{allowImpure} {}
 
     // METHODS
+    // The same, with names given values from outside: what an instantiation
+    // hands an entity's generics, so that a bound written in terms of one
+    // folds to the number that instance gives it
+    VhdlValue evalWith(AstNodeVhdlExpr* nodep,
+                       const std::map<const VhdlSymbol*, VhdlValue>& bindings) {
+        m_frames.emplace_back();
+        for (const auto& pair : bindings) m_frames.back()[pair.first] = pair.second;
+        const VhdlValue out = eval(nodep);
+        m_frames.pop_back();
+        return out;
+    }
+
     VhdlValue eval(AstNodeVhdlExpr* nodep) {
         if (!nodep) return VhdlValue{};
         if (m_depth > MAX_DEPTH) return VhdlValue{};
@@ -260,8 +278,15 @@ public:
         if (AstVhdlLiteral* const p = VN_CAST(nodep, VhdlLiteral)) return evalLiteral(p);
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) return evalSymbol(p->vhdlSymp());
         if (AstVhdlSelected* const p = VN_CAST(nodep, VhdlSelected)) {
+            // "r.f" where r has a value of its own is that value's element;
+            // where the name denotes an object in a package it is that object
+            if (const AstVhdlName* const suffixp = VN_CAST(p->suffixp(), VhdlName)) {
+                const VhdlValue rec = eval(p->prefixp());
+                if (rec.isRecord()) return rec.field(suffixp->name());
+            }
             return evalSymbol(p->vhdlSymp());
         }
+        if (AstVhdlAggregate* const p = VN_CAST(nodep, VhdlAggregate)) return evalAggregate(p);
         if (AstVhdlUnary* const p = VN_CAST(nodep, VhdlUnary)) return evalUnary(p);
         if (AstVhdlBinary* const p = VN_CAST(nodep, VhdlBinary)) return evalBinary(p);
         if (AstVhdlQualified* const p = VN_CAST(nodep, VhdlQualified)) {
@@ -304,7 +329,12 @@ private:
         case VhdlSymKind::GENERIC:
             // A deferred constant has no value until its body is analyzed, and
             // a generic none until elaboration
-            return symp->deferred() ? VhdlValue{} : symp->value();
+            if (symp->deferred()) return VhdlValue{};
+            // A composite value is held apart from the one the emitted code
+            // is built from, and is what a width taken from a record's
+            // element is folded with
+            if (!symp->hasValue() && symp->elabValue().known()) return symp->elabValue();
+            return symp->value();
         case VhdlSymKind::PARAMETER:
             // A parameter has a value only in a copy of a subprogram made for
             // one call site, which is where the call's own values were fixed
@@ -315,6 +345,56 @@ private:
             return evalUserCall(nullptr, symp);
         default: return VhdlValue{};
         }
+    }
+
+    // A record aggregate, element by element (9.3.3.2). An element whose own
+    // value does not fold is left unknown rather than stopping the fold: a
+    // handle a verification library builds carries an actor no one can work
+    // out beside the widths everything else is sized from, and it is the
+    // widths elaboration needs.
+    VhdlValue evalAggregate(AstVhdlAggregate* nodep) {
+        VhdlType* const typep = nodep->vhdlTypep();
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return VhdlValue{};
+        const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
+        if (elems.empty()) return VhdlValue{};
+        std::vector<std::pair<std::string, VhdlValue>> fields;
+        fields.reserve(elems.size());
+        for (const VhdlSymbol* const ep : elems) fields.emplace_back(ep->name(), VhdlValue{});
+        VhdlValue out = VhdlValue::mkRecord(std::move(fields), typep);
+        size_t at = 0;
+        AstNodeVhdlExpr* othersp = nullptr;
+        std::set<std::string> named;
+        for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
+            AstVhdlElemAssoc* const ap = VN_CAST(p, VhdlElemAssoc);
+            if (!ap || !ap->valuep()) return VhdlValue{};
+            if (!ap->choicesp()) {
+                // Positional, in declaration order
+                if (at >= elems.size()) return VhdlValue{};
+                out.setField(elems[at]->name(), eval(ap->valuep()));
+                named.insert(elems[at]->name());
+                ++at;
+                continue;
+            }
+            for (AstNode* c = ap->choicesp(); c; c = c->nextp()) {
+                AstVhdlChoice* const cp = VN_CAST(c, VhdlChoice);
+                if (!cp) return VhdlValue{};
+                if (cp->isOthers()) {
+                    othersp = ap->valuep();
+                    continue;
+                }
+                const AstVhdlName* const namep = VN_CAST(cp->exprp(), VhdlName);
+                if (!namep) return VhdlValue{};
+                out.setField(namep->name(), eval(ap->valuep()));
+                named.insert(namep->name());
+            }
+        }
+        if (othersp) {
+            const VhdlValue rest = eval(othersp);
+            for (const VhdlSymbol* const ep : elems) {
+                if (!named.count(ep->name())) out.setField(ep->name(), rest);
+            }
+        }
+        return out;
     }
 
     VhdlValue evalLiteral(AstVhdlLiteral* nodep) {
@@ -865,7 +945,10 @@ private:
             const VhdlSymbol* const symp = targetSym(p->targetp());
             if (!symp) return bail();
             const VhdlValue val = eval(p->valuep());
-            if (!val.known()) return bail();
+            // Elaboration carries an unknown on rather than giving up on the
+            // whole activation: what a handle's actor is decides nothing
+            // about the widths beside it
+            if (!val.known() && !m_allowImpure) return bail();
             m_frames.back()[symp] = val;
             return Flow::NORMAL;
         }
@@ -1022,7 +1105,7 @@ private:
                 continue;
             }
             VhdlSymbol* const symp = op->vhdlSymp();
-            if (!symp || !scalarValued(symp->typep())) continue;
+            if (!symp || !valueHeld(symp->typep())) continue;
             // A variable with no initial value starts at the leftmost value
             // of its subtype, which is not a value held here. Left unknown,
             // so that reading it before it is written stops the fold rather
@@ -1035,6 +1118,20 @@ private:
         // error the running model reports; there is no value to give here
         if (f != Flow::RETURNED) return VhdlValue{};
         return ret;
+    }
+
+    // Whether a value of this type is one this evaluator holds at all: a
+    // scalar, or a record whose elements are themselves held. An array is
+    // not: a value here carries no index range of its own, and a bound is
+    // exactly what such a value is usually asked for.
+    static bool valueHeld(const VhdlType* typep) {
+        if (!typep) return false;
+        if (scalarValued(typep)) return true;
+        if (typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        for (const VhdlSymbol* const ep : typep->base()->elements()) {
+            if (!ep || !valueHeld(ep->typep())) return false;
+        }
+        return true;
     }
 
     // Whether a value of this type is one this evaluator holds faithfully:
@@ -1060,14 +1157,15 @@ private:
         // one may read a signal or a shared variable, so neither is static
         if (funcp->predefined() || funcp->isForeign()) return VhdlValue{};
         AstVhdlSubprogDecl* const declp = funcp->bodyp();
-        if (!declp || !declp->isFunction() || !declp->vhdlPure()) return VhdlValue{};
+        if (!declp || !declp->isFunction()) return VhdlValue{};
+        if (!declp->vhdlPure() && !m_allowImpure) return VhdlValue{};
         if (m_calls >= MAX_CALLS || m_steps >= MAX_STEPS) return VhdlValue{};
         // Only where every value that goes in and the one that comes out is
         // a scalar. A value here is a number, not an array with bounds of its
         // own, so a body that builds one would be run over values that had
         // lost how they were indexed -- and a bound is exactly what such a
         // call is usually asked for.
-        if (!scalarValued(funcp->returnTypep())) return VhdlValue{};
+        if (!valueHeld(funcp->returnTypep())) return VhdlValue{};
 
         // The parameters, in order. A generic subprogram keeps its generics
         // ahead of them, and a call associates only the parameters (4.2.1).
@@ -1085,7 +1183,7 @@ private:
                 return VhdlValue{};
             }
             if (ip->mode() != VhdlMode::IN) return VhdlValue{};
-            if (!scalarValued(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr)) {
+            if (!valueHeld(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr)) {
                 return VhdlValue{};
             }
             parms.push_back(ip);
@@ -1114,7 +1212,7 @@ private:
             }
             if (which >= parms.size() || given[which]) return VhdlValue{};
             const VhdlValue val = eval(actualp);
-            if (!val.known()) return VhdlValue{};
+            if (!val.known() && !m_allowImpure) return VhdlValue{};
             args[which] = val;
             given[which] = true;
         }
@@ -1182,9 +1280,23 @@ VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
     return evaluator.eval(nodep);
 }
 
+VhdlValue V3VhdlEval::evalElab(AstNodeVhdlExpr* nodep) {
+    VhdlEvaluator evaluator{nullptr, true};
+    return evaluator.eval(nodep);
+}
+
+VhdlValue V3VhdlEval::evalElabWith(AstNodeVhdlExpr* nodep,
+                                   const std::map<const VhdlSymbol*, VhdlValue>& bindings) {
+    VhdlEvaluator evaluator{nullptr, true};
+    return evaluator.evalWith(nodep, bindings);
+}
+
 std::string V3VhdlEval::image(const VhdlValue& val) {
     switch (val.kind()) {
     case VhdlValKind::UNKNOWN: return "";
+    // A composite has no 'IMAGE of its own before VHDL-2019
+    case VhdlValKind::RECORD:
+    case VhdlValKind::ARRAY: return "";
     case VhdlValKind::STR: return val.toStr();
     case VhdlValKind::REAL: {
         // 'IMAGE of a real always shows a decimal point, so that the result
@@ -1346,6 +1458,13 @@ bool exprFolds(const AstNode* nodep, std::set<const VhdlSymbol*>& seen, bool inB
         switch (realp->kind()) {
         case VhdlSymKind::FUNCTION:
         case VhdlSymKind::PROCEDURE: {
+            // An operator the language itself defines is one the back end
+            // works out directly; a foreign one it cannot work out at all
+            if (realp->predefined()) break;
+            if (realp->isForeign()) {
+                folds = false;
+                break;
+            }
             const AstVhdlSubprogDecl* const subp = VN_CAST(realp->declp(), VhdlSubprogDecl);
             if (!subp || !subp->vhdlPure() || !bodyFolds(realp, seen)) folds = false;
             break;

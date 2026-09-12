@@ -1283,12 +1283,39 @@ private:
 
     // The range an index subtype was written with, where its bounds did not
     // fold. Null if there is none to emit.
+    // One bound of a range. Where it was hoisted into a parameter of its own,
+    // that parameter is what the emitted code reads, and the instance hands
+    // it the number elaboration worked out.
+    AstNodeExpr* lowerBound(AstNodeVhdlExpr* nodep) {
+        if (!nodep) return nullptr;
+        const auto it = m_hoistName.find(nodep);
+        if (it == m_hoistName.end()) return lowerExpr(nodep);
+        return new AstVarRef{nodep->fileline(), hoistVar(it->second, nodep->fileline()),
+                             VAccess::READ};
+    }
+
+    // The parameter a hoisted bound reads, declared in this module the first
+    // time one of its bounds is emitted
+    AstVar* hoistVar(const std::string& name, FileLine* flp) {
+        const auto it = m_hoistVars.find(name);
+        if (it != m_hoistVars.end()) return it->second;
+        AstVar* const varp
+            = new AstVar{flp, VVarType::GPARAM, name, VFlagChildDType{}, newIntDType(flp)};
+        // An entity nothing instantiates is analyzed all the same, and then
+        // no instance says what the bound is; zero is what a length no one
+        // supplied comes to, and is never read by anything that runs
+        varp->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+        addStmt(varp);
+        m_hoistVars.emplace(name, varp);
+        return varp;
+    }
+
     AstRange* boundsRange(const VhdlType* idxp, FileLine* flp) {
         if (!idxp || !idxp->boundsp()) return nullptr;
         AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
         if (!rp || !rp->leftp() || !rp->rightp()) return nullptr;
-        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
-        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        AstNodeExpr* const leftp = lowerBound(rp->leftp());
+        AstNodeExpr* const rightp = leftp ? lowerBound(rp->rightp()) : nullptr;
         if (!leftp || !rightp) {
             if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
@@ -1326,8 +1353,8 @@ private:
         if (!idxp || !idxp->boundsp()) return false;
         AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
         if (!rp || !rp->leftp() || !rp->rightp()) return false;
-        leftp = lowerExpr(rp->leftp());
-        rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        leftp = lowerBound(rp->leftp());
+        rightp = leftp ? lowerBound(rp->rightp()) : nullptr;
         if (!leftp || !rightp) {
             if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
@@ -1353,8 +1380,8 @@ private:
         if (!idxp || !idxp->boundsp()) return nullptr;
         AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
         if (!rp || !rp->leftp() || !rp->rightp()) return nullptr;
-        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
-        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        AstNodeExpr* const leftp = lowerBound(rp->leftp());
+        AstNodeExpr* const rightp = leftp ? lowerBound(rp->rightp()) : nullptr;
         if (!leftp || !rightp) {
             if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
@@ -4599,6 +4626,10 @@ private:
     // A folded value as the constant it stands for
     AstNodeExpr* lowerValue(const VhdlValue& val, VhdlType* typep, FileLine* flp) {
         if (!val.known()) return nullptr;
+        // A record or an array value is what elaboration worked out, element
+        // by element and some of them unknown. It says how wide something
+        // is; it is not a number to emit in place of the object.
+        if (val.isComposite()) return nullptr;
         if (val.isReal()) return new AstConst{flp, AstConst::RealDouble{}, val.toReal()};
         if (val.isStr()) return lowerBitString(val.toStr(), typep, flp);
         VhdlType* const basep = typep ? typep->base() : nullptr;
@@ -4778,6 +4809,22 @@ private:
     // one is legal and there is nothing to fold. Such a generic is not a
     // parameter at all: it is data arriving from outside, which is a port.
     std::set<const VhdlSymbol*> m_dataGenerics;
+
+    // A bound written in terms of a generic no instance can hand a value the
+    // back end folds -- "std_logic_vector(data_length(bus_handle)-1 downto
+    // 0)", with the handle built by an impure function -- is not something
+    // the back end can work out. Elaboration can: the frontend runs the call
+    // over the value that instance gives, and the number travels to the
+    // module as a parameter of its own. One per bound, named here and read
+    // both where the bound is emitted and where the instance is.
+    struct VhdlHoistedBound final {
+        std::string name;  // The parameter the module gains
+        AstNodeVhdlExpr* exprp;  // The bound, as the entity wrote it
+    };
+    std::map<const AstNodeVhdlExpr*, std::string> m_hoistName;
+    std::map<std::string, std::vector<VhdlHoistedBound>> m_hoists;  // By module name
+    std::map<std::string, AstVar*> m_hoistVars;  // Those declared in this module
+    int m_hoistNum = 0;
 
     // The variables such generics were lowered to, so their port entries can
     // be written after the ports proper: a generic clause stands ahead of a
@@ -5458,7 +5505,7 @@ private:
         // constant. That covers literals, constants, generics with values and
         // every attribute of a static subtype, in one place.
         const VhdlValue val = V3VhdlEval::eval(nodep);
-        if (val.known()) {
+        if (val.known() && !val.isComposite()) {
             // A name of an array constant keeps its storage, so that its
             // index range travels with it and an index reads the right end
             const bool keepRange = (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected))
@@ -14189,8 +14236,42 @@ private:
             }
             instName = alt;
         }
+        // The bounds the entity writes in terms of a generic no parameter
+        // can carry: elaboration works each out over what this instance
+        // hands that generic, and the number goes over as a parameter
+        paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
         m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
+    }
+
+    // What this instance hands the entity's generics, as values elaboration
+    // can work out, and the bounds written in terms of them folded over
+    // those values (6.5.6.2, 9.4.3)
+    AstPin* hoistedPins(const std::string& modName, AstVhdlInstance* nodep, int* pinNump) {
+        const auto it = m_hoists.find(modName);
+        if (it == m_hoists.end()) return nullptr;
+        std::map<const VhdlSymbol*, VhdlValue> bindings;
+        for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+            const VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+            if (!gsymp) continue;  // Positional: the formal is not named here
+            const VhdlValue val = V3VhdlEval::evalElab(asp->actualp());
+            if (val.known()) bindings.emplace(gsymp->resolved(), val);
+        }
+        if (bindings.empty()) return nullptr;
+        AstPin* outp = nullptr;
+        for (const VhdlHoistedBound& hoist : it->second) {
+            const VhdlValue val = V3VhdlEval::evalElabWith(hoist.exprp, bindings);
+            if (!val.isInt()) continue;
+            FileLine* const flp = hoist.exprp->fileline();
+            outp = AstNode::addNext(outp,
+                                    new AstPin{flp, ++*pinNump, hoist.name,
+                                               new AstConst{flp, AstConst::Signed32{},
+                                                            static_cast<int32_t>(val.toInt())}});
+        }
+        return outp;
     }
 
     // An instance of a component no entity is bound to. Nothing is
@@ -19991,6 +20072,7 @@ private:
         m_modp->timeunit(VTimescale::TS_1FS);
         m_netlistp->timeprecisionMerge(flp, VTimescale{VTimescale::TS_1FS});
         m_vars.clear();
+        m_hoistVars.clear();
         m_names.clear();
         m_funcNames.clear();
         m_instNames.clear();
@@ -20163,7 +20245,11 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
                 VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
                 if (!gsymp) continue;
-                if (V3VhdlEval::eval(asp->actualp()).known()) continue;
+                // A value elaboration worked out element by element is not
+                // one the back end can carry: the widths it holds are folded
+                // into the bounds instead, and the object itself travels
+                const VhdlValue actVal = V3VhdlEval::eval(asp->actualp());
+                if (actVal.known() && !actVal.isComposite()) continue;
                 // Only where the actual is a constant that has no value of
                 // its own. A generic reaching down from an enclosing
                 // instance has none here either, but elaboration gives it
@@ -20186,6 +20272,45 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 m_dataGenerics.insert(gsymp->resolved());
             }
         });
+    }
+    // Which bounds are written in terms of one of those. Done once for the
+    // whole design, so that an instance lowered before its entity finds the
+    // same names the entity will declare.
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity);
+        if (!entp) continue;
+        std::vector<VhdlHoistedBound> hoists;
+        const auto hoistIn = [&](AstNode* nodep) {
+            if (!nodep) return;
+            nodep->foreach([&](AstVhdlRange* rangep) {
+                for (AstNodeVhdlExpr* const boundp : {rangep->leftp(), rangep->rightp()}) {
+                    if (!boundp || m_hoistName.count(boundp)) continue;
+                    bool named = false;
+                    boundp->foreach([&](AstNodeVhdlExpr* refp) {
+                        const VhdlSymbol* const symp = refp->vhdlSymp();
+                        if (symp && m_dataGenerics.count(symp->resolved())) named = true;
+                    });
+                    if (!named) continue;
+                    const std::string name = "__Vgb" + std::to_string(++m_hoistNum);
+                    m_hoistName.emplace(boundp, name);
+                    hoists.push_back(VhdlHoistedBound{name, boundp});
+                }
+            });
+        };
+        for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
+            hoistIn(p);
+            // The bounds the emitted code reads are the ones analysis left on
+            // the type, which may be a copy of what the port declaration
+            // holds, so both are asked about
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            const VhdlSymbol* const symp = ifp ? ifp->vhdlSymp() : nullptr;
+            const VhdlType* const typep = symp ? symp->typep() : nullptr;
+            if (!typep) continue;
+            for (const VhdlType* const idxp : typep->indexTypes()) {
+                if (idxp && idxp->boundsp()) hoistIn(idxp->boundsp());
+            }
+        }
+        if (!hoists.empty()) m_hoists.emplace(entp->name(), std::move(hoists));
     }
     // Whether any signal transaction in the design is delivered at a time of
     // its own. This decides whether a process whose timeout expires has to

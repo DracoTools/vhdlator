@@ -2440,8 +2440,27 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             checkArrayValue(nodep->defaultp(), symp->typep(),
                             std::string{symp->kindName()} + " '" + nodep->name() + "'");
         }
-        // A constant with a static value is what every later fold builds on
-        if (kind == VhdlSymKind::CONSTANT) symp->value(V3VhdlEval::eval(nodep->defaultp()));
+        // A constant with a static value is what every later fold builds on.
+        // A composite one is kept apart: a constant whose value is folded
+        // needs no object of its own, and one element of a record being
+        // unknown is no reason to emit the rest as a number.
+        if (kind == VhdlSymKind::CONSTANT) {
+            const VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            if (val.isComposite()) {
+                symp->elabValue(val);
+            } else {
+                symp->value(val);
+            }
+            // What the static rules leave out, elaboration still settles: a
+            // record built by an impure function carries the widths the
+            // design is sized from beside an actor no one can work out. It
+            // is kept apart from the value the emitted code is built from.
+            if (!val.known() && symp->typep()
+                && symp->typep()->base()->kind() == VhdlTypeKind::RECORD) {
+                const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
+                if (elab.isComposite()) symp->elabValue(elab);
+            }
+        }
     } else if (kind == VhdlSymKind::CONSTANT) {
         // A constant declared with no value in a package declaration is
         // deferred; its value comes with the package body (6.4.2.2)
@@ -4979,9 +4998,13 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
     VhdlSymbol* const symp
         = VhdlSymTab::newSymbol(VhdlSymKind::CONSTANT, formalp->name(), formalp);
     symp->typep(typep);
-    if (val.known()) {
+    // A composite value says how wide the generic's elements are, not what
+    // the emitted code reads: the copy still needs an object of its own, so
+    // it takes the same road as a value nothing could work out
+    if (val.known() && !val.isComposite()) {
         symp->value(val);
     } else {
+        if (val.isComposite()) symp->elabValue(val);
         // A value that names a generic of the enclosing entity is fixed once
         // the instance is elaborated but is not a number now. The copy's
         // declarations are emitted into the module that instantiates the
@@ -7576,7 +7599,15 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
         }
     }
 
-    // Otherwise a record element (8.3)
+    // Otherwise a record element (8.3). The prefix of a selected name is a
+    // name or a function call, so an aggregate or a qualified expression --
+    // "r1'(re1 => true).re1" -- is neither, however plain its value is
+    if (!m_inSpecialized
+        && (VN_IS(nodep->prefixp(), VhdlQualified) || VN_IS(nodep->prefixp(), VhdlAggregate))) {
+        err(nodep->fileline(), "The prefix of a selected name is a name or a function call,"
+                               " and a value written out in place is neither");
+        return V3VhdlStd::errorType();
+    }
     VhdlType* const prefixp = analyzeExpr(nodep->prefixp(), nullptr);
     if (!prefixp || prefixp->isError()) return V3VhdlStd::errorType();
     // Of an object: a type has elements, but no values to select them from.
@@ -9986,8 +10017,29 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
             const VhdlSymbol* const symp = refp->vhdlSymp();
             if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
             if (foldableOnly) {
-                const AstVhdlObjectDecl* const valuep = VN_CAST(symp->declp(), VhdlObjectDecl);
-                if (!valuep || !V3VhdlEval::backEndFolds(valuep->defaultp())) return;
+                // Only a record: a handle a verification library builds is
+                // one, and elaboration folds the widths it carries into the
+                // bounds that name it, so it need not be a parameter. Any
+                // other constant is marked as it was before -- an array of
+                // handles still says how many there are, and a bound that
+                // counts them is read from the object.
+                const VhdlType* const typep = symp->typep();
+                if (typep && typep->base()->kind() == VhdlTypeKind::RECORD) {
+                    // A deferred constant is written twice and only the body
+                    // carries the value, so the one that has it is the one
+                    // to ask. Where neither does, nothing is known against
+                    // it and the constant is marked as it was before.
+                    const AstVhdlObjectDecl* valuep = VN_CAST(symp->declp(), VhdlObjectDecl);
+                    if (!valuep || !valuep->defaultp()) {
+                        const AstVhdlObjectDecl* const fullp
+                            = VN_CAST(symp->fullDeclp(), VhdlObjectDecl);
+                        if (fullp && fullp->defaultp()) valuep = fullp;
+                    }
+                    if (valuep && valuep->defaultp()
+                        && !V3VhdlEval::backEndFolds(valuep->defaultp())) {
+                        return;
+                    }
+                }
             }
             AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
             // A deferred constant is written twice: once in the package with
@@ -10015,8 +10067,8 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
             // constraint is written the way a call is -- "bit_vector(n - 1
             // downto 0)" -- and the parser could not tell the two apart, so
             // the bounds arrive as the type mark's arguments
-            unitp->foreach([&](AstVhdlSubtypeInd* indp) { markIn(indp, ignored); });
-            unitp->foreach([&](AstVhdlTypeDecl* declp) { markIn(declp, ignored); });
+            unitp->foreach([&](AstVhdlSubtypeInd* indp) { markIn(indp, ignored, true); });
+            unitp->foreach([&](AstVhdlTypeDecl* declp) { markIn(declp, ignored, true); });
             // What an instantiation hands a generic becomes a parameter's
             // value, so a constant named there is settled by elaboration as
             // well -- a record of settings passed down a hierarchy is the

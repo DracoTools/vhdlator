@@ -386,6 +386,12 @@ enum class VhdlValKind : uint8_t {
     INT,  // Integer, enumeration position, or physical value
     REAL,
     STR,  // String, bit string, or the result of 'IMAGE
+    // A record or an array, each element a value of its own and any of them
+    // possibly unknown. A verification library hands out a record holding an
+    // actor no one can work out beside the widths everything is sized from,
+    // and the widths are what elaboration needs (9.4.3)
+    RECORD,
+    ARRAY,
 };
 
 class VhdlValue final {
@@ -395,6 +401,11 @@ class VhdlValue final {
     double m_real = 0.0;
     std::string m_str;
     VhdlType* m_typep = nullptr;  // The type the value belongs to, when known
+    // The elements of a record or an array. Held behind a pointer so that a
+    // value stays cheap to copy and may hold values of its own type.
+    std::shared_ptr<std::vector<std::pair<std::string, VhdlValue>>> m_fieldsp;
+    int64_t m_left = 0;  // An array value's own bounds, as it was built
+    bool m_ascending = true;
 
 public:
     // CONSTRUCTORS
@@ -420,6 +431,29 @@ public:
         out.m_typep = typep;
         return out;
     }
+    // A record, named element by element
+    static VhdlValue mkRecord(std::vector<std::pair<std::string, VhdlValue>>&& fields,
+                              VhdlType* typep = nullptr) {
+        VhdlValue out;
+        out.m_kind = VhdlValKind::RECORD;
+        out.m_fieldsp
+            = std::make_shared<std::vector<std::pair<std::string, VhdlValue>>>(std::move(fields));
+        out.m_typep = typep;
+        return out;
+    }
+    // An array, in index order, with the leftmost index it was built with
+    static VhdlValue mkArray(std::vector<VhdlValue>&& elems, int64_t left, bool ascending,
+                             VhdlType* typep = nullptr) {
+        VhdlValue out;
+        out.m_kind = VhdlValKind::ARRAY;
+        out.m_fieldsp = std::make_shared<std::vector<std::pair<std::string, VhdlValue>>>();
+        out.m_fieldsp->reserve(elems.size());
+        for (VhdlValue& elem : elems) out.m_fieldsp->emplace_back("", std::move(elem));
+        out.m_left = left;
+        out.m_ascending = ascending;
+        out.m_typep = typep;
+        return out;
+    }
 
     // METHODS
     VhdlValKind kind() const { return m_kind; }
@@ -427,6 +461,56 @@ public:
     bool isInt() const { return m_kind == VhdlValKind::INT; }
     bool isReal() const { return m_kind == VhdlValKind::REAL; }
     bool isStr() const { return m_kind == VhdlValKind::STR; }
+    bool isRecord() const { return m_kind == VhdlValKind::RECORD; }
+    bool isArray() const { return m_kind == VhdlValKind::ARRAY; }
+    bool isComposite() const { return isRecord() || isArray(); }
+    size_t elements() const { return m_fieldsp ? m_fieldsp->size() : 0; }
+    // One element of a record by name, or UNKNOWN where there is none
+    const VhdlValue& field(const std::string& name) const {
+        static const VhdlValue s_unknown;
+        if (!m_fieldsp) return s_unknown;
+        for (const auto& pair : *m_fieldsp) {
+            if (pair.first == name) return pair.second;
+        }
+        return s_unknown;
+    }
+    // One element of an array by its own index, or UNKNOWN where there is none
+    const VhdlValue& element(int64_t index) const {
+        static const VhdlValue s_unknown;
+        if (!m_fieldsp) return s_unknown;
+        const int64_t off = m_ascending ? index - m_left : m_left - index;
+        if (off < 0 || static_cast<size_t>(off) >= m_fieldsp->size()) return s_unknown;
+        return (*m_fieldsp)[static_cast<size_t>(off)].second;
+    }
+    const VhdlValue& elementAt(size_t offset) const {
+        static const VhdlValue s_unknown;
+        if (!m_fieldsp || offset >= m_fieldsp->size()) return s_unknown;
+        return (*m_fieldsp)[offset].second;
+    }
+    int64_t arrayLeft() const { return m_left; }
+    bool arrayAscending() const { return m_ascending; }
+    // Replace one element, the value being built rather than read
+    void setField(const std::string& name, const VhdlValue& val) {
+        if (!m_fieldsp) return;
+        for (auto& pair : *m_fieldsp) {
+            if (pair.first == name) {
+                pair.second = val;
+                return;
+            }
+        }
+        m_fieldsp->emplace_back(name, val);
+    }
+    void setElement(int64_t index, const VhdlValue& val) {
+        if (!m_fieldsp) return;
+        const int64_t off = m_ascending ? index - m_left : m_left - index;
+        if (off < 0 || static_cast<size_t>(off) >= m_fieldsp->size()) return;
+        (*m_fieldsp)[static_cast<size_t>(off)].second = val;
+    }
+    // A copy no other value shares, so that writing into it changes nothing else
+    void ownFields() {
+        if (!m_fieldsp) return;
+        m_fieldsp = std::make_shared<std::vector<std::pair<std::string, VhdlValue>>>(*m_fieldsp);
+    }
     int64_t toInt() const { return m_int; }
     double toReal() const { return m_kind == VhdlValKind::REAL ? m_real : double(m_int); }
     const std::string& toStr() const { return m_str; }

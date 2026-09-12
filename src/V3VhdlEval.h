@@ -37,6 +37,7 @@
 
 #include "V3VhdlSym.h"
 
+#include <map>
 #include <string>
 
 class AstNodeVhdlExpr;
@@ -61,6 +62,18 @@ public:
     // value out of an access or a protected type -- a verification library's
     // handle -- does not, however static its arguments.
     static bool backEndFolds(const AstNode* nodep) VL_MT_DISABLED;
+
+    // The same, for elaboration rather than for a value the emitted code is
+    // built from: a body that is not pure may be run, and what it cannot work
+    // out is left unknown inside an otherwise known value. What comes back
+    // says how wide something is; it never stands in for the object itself.
+    static VhdlValue evalElab(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+
+    // The same, with the generics of an entity given the values one
+    // instantiation hands them
+    static VhdlValue
+    evalElabWith(AstNodeVhdlExpr* nodep,
+                 const std::map<const VhdlSymbol*, VhdlValue>& bindings) VL_MT_DISABLED;
 
     // The value as 'IMAGE would give it (16.2.6)
     static std::string image(const VhdlValue& val) VL_MT_DISABLED;

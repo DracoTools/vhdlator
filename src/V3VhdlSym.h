@@ -110,6 +110,7 @@ class VhdlSymbol final {
     // The value of a constant, generic or physical unit, where it folds (9.4).
     // Unknown for anything whose value is not fixed until elaboration.
     VhdlValue m_value;
+    VhdlValue m_elabValue;  // What elaboration worked out, where value() is not it
     bool m_deferred = false;  // A deferred constant, whose value is in the body
     // Where a deferred constant was given its value: the declaration in the
     // package body completes the one in the package, which has none (6.4.2.2)
@@ -207,7 +208,15 @@ public:
 
     const VhdlValue& value() const { return m_value; }
     void value(const VhdlValue& val) { m_value = val; }
-    bool hasValue() const { return m_value.known(); }
+    // A composite value never answers this: it says how wide something is,
+    // and an object holding one still needs its storage
+    bool hasValue() const { return m_value.known() && !m_value.isComposite(); }
+    // A value worked out for elaboration that the emitted code keeps its
+    // object for: a record some of whose elements no one can work out, of
+    // which the ones that *are* known are what a width is taken from. Unlike
+    // value(), holding one says nothing about how the object is emitted.
+    const VhdlValue& elabValue() const { return m_elabValue; }
+    void elabValue(const VhdlValue& val) { m_elabValue = val; }
 
     const std::vector<VhdlType*>& paramTypes() const { return m_paramTypes; }
     void addParamType(VhdlType* typep) {

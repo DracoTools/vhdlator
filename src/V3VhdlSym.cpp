@@ -95,6 +95,17 @@ std::string VhdlValue::prettyName() const {
         os << std::showpoint << m_real;
         return os.str();
     case VhdlValKind::STR: return '"' + m_str + '"';
+    case VhdlValKind::RECORD:
+    case VhdlValKind::ARRAY: {
+        // Element by element, so that a value with an unknown element among
+        // known ones reads as what it is
+        std::string out = "(";
+        for (size_t i = 0; i < elements(); ++i) {
+            if (i) out += ", ";
+            out += elementAt(i).prettyName();
+        }
+        return out + ")";
+    }
     case VhdlValKind::INT: break;
     }
     // An enumeration value reads back as its literal, and a physical value
