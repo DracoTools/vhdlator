@@ -69,12 +69,41 @@ def refuses(command, cwd):
         return False
 
 
+def siblings_of(path):
+    """The other VHDL sources beside this one, which may hold what it uses.
+
+    A corpus keeps a case's package in its own file next to the entity that
+    uses it, so analyzing the case alone makes every reference report a
+    design unit it cannot find -- a verdict about this script's working
+    directory rather than about the source.  Analyzing the neighbours first
+    is what makes a refusal evidence of anything.  Their own errors are
+    ignored: only the named source's verdict is being taken.
+    """
+    folder = os.path.dirname(path) or "."
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names
+            if n.lower().endswith((".vhd", ".vhdl")) and os.path.join(folder, n) != path]
+
+
 def verdicts(args_path):
     """Return one entry per reference asked: True where it refuses the source."""
     args, path = args_path
+    # More than a handful is a corpus directory rather than a case, and
+    # analyzing all of it would cost more than the answer is worth
+    others = siblings_of(path)
+    if len(others) > 12:
+        others = []
     with tempfile.TemporaryDirectory() as work:
         std = std_of(path)
         year = "1993" if std == "93" else std
+        # Twice over, since nothing here knows which neighbour comes first
+        for _ in range(2 if others else 0):
+            for other in others:
+                refuses([args.nvc, "--std=" + year, "-a", other], work)
+                refuses([args.ghdl, "-a", "--std=" + year[2:], other], work)
         out = [("nvc", refuses([args.nvc, "--std=" + year, "-a", path], work)),
                ("ghdl", refuses([args.ghdl, "-a", "--std=" + year[2:], path], work))]
         if args.questa:
@@ -83,6 +112,9 @@ def verdicts(args_path):
             subprocess.run([args.vlib, "work"], cwd=work, capture_output=True, check=False)
             # vcom has no switch for VHDL-2000, whose rules VHDL-2002 kept
             vcom_std = "-" + {"93": "93", "2000": "2002"}.get(std, year)
+            for _ in range(2 if others else 0):
+                for other in others:
+                    refuses([args.vcom, vcom_std, "-quiet", other], work)
             out.append(("questa", refuses([args.vcom, vcom_std, "-quiet", path], work)))
         return out
 
