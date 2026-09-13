@@ -4513,6 +4513,37 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             }
             if (!m_inSpecialized && !parts.empty()) checkConfiguration(cfgp, lib, parts.back());
             unitp->foreach([this](AstVhdlBinding* bindp) {
+                // What the component itself declares is visible to the
+                // actuals of a binding's generic map: "generic map (g1 => g1
+                // + g1)" is the entity's formal taking the component's own
+                // generic, which is what a configuration is for (3.4.2,
+                // 7.3.2.2). The component's region is found through the
+                // component configuration this binding belongs to.
+                VhdlScope* compScopep = nullptr;
+                for (const AstNode* upp = parentOf(bindp); upp; upp = parentOf(upp)) {
+                    const AstVhdlBlockConfig* const bcp = VN_CAST(upp, VhdlBlockConfig);
+                    const AstVhdlEntitySpec* const specp
+                        = bcp ? VN_CAST(bcp->specp(), VhdlEntitySpec) : nullptr;
+                    if (!specp || specp->entityClass() != "component") continue;
+                    // "for inst : comp use ..." puts the component's name
+                    // last, after the instances it configures
+                    std::string compName;
+                    for (AstNode* np = specp->namesp(); np; np = np->nextp()) {
+                        if (const AstVhdlName* const namep = VN_CAST(np, VhdlName)) {
+                            compName = namep->name();
+                        }
+                    }
+                    if (compName.empty()) break;
+                    std::vector<VhdlSymbol*> found;
+                    lookup(compName, found);
+                    for (const VhdlSymbol* const csymp : found) {
+                        if (csymp->resolved()->kind() == VhdlSymKind::COMPONENT) {
+                            compScopep = csymp->resolved()->innerp();
+                        }
+                    }
+                    break;
+                }
+                if (compScopep) m_scopep->addUse(compScopep);
                 for (AstNode* p = bindp->genericMapp(); p; p = p->nextp()) {
                     AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                     if (asp && asp->actualp()) analyzeExpr(asp->actualp(), nullptr);

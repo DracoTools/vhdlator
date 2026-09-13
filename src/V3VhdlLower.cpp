@@ -14241,6 +14241,29 @@ private:
         }
         AstPin* paramsp = nullptr;
         pinNum = 0;
+        // The generics the component itself declares, which a binding's own
+        // generic map stands in for -- and no others: a port whose bounds
+        // this instance settles has a parameter here that nobody wrote
+        std::set<std::string> bindGenericNames;
+        if (bindingp && bindingp->genericMapp()) {
+            const VhdlSymbol* const csymp = nodep->unitp() ? nodep->unitp()->vhdlSymp() : nullptr;
+            const AstVhdlComponentDecl* const cdeclp
+                = csymp && csymp->resolved()->kind() == VhdlSymKind::COMPONENT
+                      ? VN_CAST(csymp->resolved()->declp(), VhdlComponentDecl)
+                      : nullptr;
+            if (cdeclp) {
+                for (AstNode* gp = cdeclp->genericsp(); gp; gp = gp->nextp()) {
+                    const std::string& gname = VN_AS(gp, VhdlIfaceDecl)->name();
+                    // The bounds of an open port travel as generics of their
+                    // own, which no binding indication writes and which the
+                    // instance still has to supply
+                    if (gname.compare(0, 4, "__v_") == 0 || gname.compare(0, 3, "__v") == 0) {
+                        continue;
+                    }
+                    bindGenericNames.insert(gname);
+                }
+            }
+        }
         size_t genPosition = 0;  // Which generic a positional association names
         for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
@@ -14265,12 +14288,65 @@ private:
                 pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }
+            // A binding's generic map associates the *entity's* generics,
+            // where this one associates the *component's* (7.3.2.2). Where a
+            // binding gives one, it is what the entity is elaborated with,
+            // and what is written here is the component's own -- read by the
+            // binding's actuals rather than passed on.
+            if (bindingp && bindingp->genericMapp() && bindGenericNames.count(pinp->name())) {
+                VL_DO_DANGLING(pinp->deleteTree(), pinp);
+                continue;
+            }
             paramsp = AstNode::addNext(paramsp, pinp);
         }
         // A binding indication may give the generics and the ports itself,
         // which is how a configuration supplies what the instance left out
         // (7.3.2). What the instance wrote comes first and wins.
         if (bindingp) {
+            const VhdlSymbol* const bindCompSymp
+                = nodep->unitp() ? nodep->unitp()->vhdlSymp() : nullptr;
+            const AstVhdlComponentDecl* const compDeclp
+                = bindCompSymp && bindCompSymp->resolved()->kind() == VhdlSymKind::COMPONENT
+                      ? VN_CAST(bindCompSymp->resolved()->declp(), VhdlComponentDecl)
+                      : nullptr;
+            // An actual in a binding's generic map may name the *component's*
+            // own generic -- "generic map (g1 => g1 + g1)" -- which holds
+            // what this instance gave it, or the default the component
+            // declared (3.4.2, 7.3.2.2). Those names stand for that here.
+            VL_RESTORER_COPY(m_bindExprs);
+            if (compDeclp) {
+                size_t genPos = 0;
+                std::map<std::string, AstNodeVhdlExpr*> given;
+                std::vector<std::string> byPosition;
+                for (AstNode* gp = compDeclp->genericsp(); gp; gp = gp->nextp()) {
+                    byPosition.push_back(VN_AS(gp, VhdlIfaceDecl)->name());
+                }
+                for (AstNode* ap = nodep->genericMapp(); ap; ap = ap->nextp(), ++genPos) {
+                    AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                    if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+                    if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                        given.emplace(fnamep->name(), asp->actualp());
+                    } else if (genPos < byPosition.size()) {
+                        given.emplace(byPosition[genPos], asp->actualp());
+                    }
+                }
+                for (AstNode* gp = compDeclp->genericsp(); gp; gp = gp->nextp()) {
+                    AstVhdlIfaceDecl* const ifp = VN_AS(gp, VhdlIfaceDecl);
+                    VhdlSymbol* const gsymp = ifp->vhdlSymp();
+                    if (!gsymp) continue;
+                    const auto it = given.find(ifp->name());
+                    AstNodeVhdlExpr* const valuep
+                        = it != given.end() ? it->second : ifp->defaultp();
+                    if (valuep) m_bindExprs[gsymp] = valuep;
+                }
+            }
+            // A binding's generic map associates the *entity's* generics,
+            // where the instance's own map associates the *component's*
+            // (7.3.2.2). Where the binding gives one, it is what the entity
+            // is elaborated with, and what the instance wrote is the
+            // component's own -- read by the actuals here rather than passed
+            // on.
+            int bindPos = 0;
             for (AstNode* p = bindingp->genericMapp(); p; p = p->nextp()) {
                 // A binding indication may be what chooses a generic type,
                 // and then the entity has to be copied for it just as an
@@ -14284,7 +14360,21 @@ private:
                     unsup(flp, "binding indication that chooses a generic type or package");
                     return;
                 }
-                AstPin* const pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++pinNum);
+                // A generic map of a binding may be positional, and then the
+                // Nth association is the Nth generic of the entity -- counted
+                // within this map rather than after whatever the instance
+                // wrote (6.5.7.1)
+                AstPin* pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++bindPos);
+                // Written positionally, the Nth association is the Nth
+                // generic, which the component named; giving the pin that
+                // name is what lets it take the place of the default the
+                // component would otherwise have handed over (7.3.2.2)
+                if (pinp && pinp->name().empty() && compDeclp) {
+                    int at = 0;
+                    for (AstNode* gp = compDeclp->genericsp(); gp; gp = gp->nextp()) {
+                        if (++at == bindPos) pinp->name(VN_AS(gp, VhdlIfaceDecl)->name());
+                    }
+                }
                 if (pinp && !pinNamed(paramsp, pinp->name())) {
                     paramsp = AstNode::addNext(paramsp, pinp);
                 } else if (pinp) {
