@@ -173,6 +173,35 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
                                              + lower(archp->name()) + ")");
                 }
             }
+            // And whatever its binding indications name: "use entity
+            // work.dut(single)" is a unit this one has to follow, and no
+            // context clause says so (3.4.2, 7.3.2). Soft, because a binding
+            // may name a unit analyzed in an earlier run, or none at all.
+            cfgp->foreach([&](const AstVhdlBinding* bindp) {
+                // "entity work.dut(single)" parses as a call: a name followed
+                // by a parenthesised name is not known to be an architecture
+                // until the binding says so, so the architecture is the
+                // call's argument and the entity is its prefix (7.3.2.1)
+                const AstNodeVhdlExpr* namep = bindp->unitp();
+                std::string arch = lower(bindp->archName());
+                if (const AstVhdlCall* const callp = VN_CAST(namep, VhdlCall)) {
+                    namep = callp->prefixp();
+                    const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+                    const AstVhdlName* const argp
+                        = asp ? VN_CAST(asp->actualp(), VhdlName) : nullptr;
+                    if (arch.empty() && argp) arch = lower(argp->name());
+                }
+                std::vector<std::string> bparts;
+                if (!namep || !flattenName(namep, bparts) || bparts.empty()) return;
+                const std::string lib = bparts.size() >= 2
+                                            ? (lower(bparts[bparts.size() - 2]) == "work"
+                                                   ? work
+                                                   : lower(bparts[bparts.size() - 2]))
+                                            : work;
+                const std::string key = primaryKey(lib, bparts.back());
+                unit.softDependsOn.push_back(key);
+                if (!arch.empty()) unit.softDependsOn.push_back(key + "(" + arch + ")");
+            });
         } else if (const AstVhdlPackageInst* const instp = VN_CAST(unitp, VhdlPackageInst)) {
             // A package instantiation needs the package it copies, which its
             // context clause need not mention (4.9)

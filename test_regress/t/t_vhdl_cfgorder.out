@@ -1,0 +1,6 @@
+t/t_vhdl_cfgorder_c.vhd:9: VHDLENTITY work.tb
+t/t_vhdl_cfgorder_c.vhd:12: VHDLARCHITECTURE work.rtl
+t/t_vhdl_cfgorder_b.vhd:9: VHDLENTITY work.worker
+t/t_vhdl_cfgorder_b.vhd:13: VHDLARCHITECTURE work.fast
+t/t_vhdl_cfgorder.vhd:11: VHDLCONFIGURATION work.cfg_fast
+t/t_vhdl_cfgorder_b.vhd:18: VHDLARCHITECTURE work.slow
