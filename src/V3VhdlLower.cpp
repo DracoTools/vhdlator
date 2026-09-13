@@ -1763,6 +1763,15 @@ private:
                     case VhdlSymKind::SHARED_VARIABLE:
                     case VhdlSymKind::SIGNAL:
                     case VhdlSymKind::PORT:
+                    // A loop's parameter takes a fresh value on each
+                    // iteration of the loop, and which iteration is running
+                    // is not a question the elaboration answers (10.10). A
+                    // *generate* parameter reads the same way round the
+                    // other way: it is the elaboration that makes one copy
+                    // of the body per value (11.8), so a bound written in
+                    // terms of one is a number per copy, and it is
+                    // deliberately not in this list.
+                    case VhdlSymKind::LOOP_PARAMETER:
                     case VhdlSymKind::PARAMETER: return true;
                     case VhdlSymKind::FUNCTION: {
                         // A pure function asked the same thing twice answers
@@ -5713,6 +5722,50 @@ private:
                     return new AstConst{flp, AstConst::Signed32{}, 1};
                 }
                 return new AstLenN{flp, strp};
+            }
+            // A slice's bounds are the ones the slice names, not the
+            // object's (8.5). Where they fold, the analyzer has already put
+            // them in the slice's own subtype and there is nothing to do
+            // here. Where they do not -- text cut at an end only running
+            // settles -- the subtype kept the bounds of the object the slice
+            // was taken from, and answering from it says how long the whole
+            // object is rather than how much of it this names.
+            if (AstVhdlCall* const slicep = VN_CAST(nodep->prefixp(), VhdlCall)) {
+                AstVhdlRange* const srp = VN_CAST(slicep->argsp(), VhdlRange);
+                const VhdlType* const sidxp
+                    = typep && typep->isConstrainedArray() ? indexSubtype(typep, 0) : nullptr;
+                if (srp && srp->leftp() && srp->rightp() && sidxp && sidxp->bounded()
+                    && !sidxp->boundsp()
+                    && (!V3VhdlEval::eval(srp->leftp()).isInt()
+                        || !V3VhdlEval::eval(srp->rightp()).isInt())) {
+                    AstNodeExpr* slp = nullptr;
+                    AstNodeExpr* srightp = nullptr;
+                    bool sasc = true;
+                    bool sdir = true;
+                    if (rangeParts(srp, slp, srightp, sasc, sdir) && sdir) {
+                        if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                        if (attr == "ascending") {
+                            VL_DO_DANGLING(slp->deleteTree(), slp);
+                            VL_DO_DANGLING(srightp->deleteTree(), srightp);
+                            return new AstConst{flp, AstConst::BitTrue{}, sasc};
+                        }
+                        if (attr == "length") {
+                            AstNodeExpr* const diffp
+                                = sasc ? static_cast<AstNodeExpr*>(new AstSub{flp, srightp, slp})
+                                       : static_cast<AstNodeExpr*>(new AstSub{flp, slp, srightp});
+                            return new AstAdd{flp, diffp,
+                                              new AstConst{flp, AstConst::Signed32{}, 1}};
+                        }
+                        const bool wantLeft = (attr == "left") || (attr == "high" && !sasc)
+                                              || (attr == "low" && sasc);
+                        AstNodeExpr* const keepp = wantLeft ? slp : srightp;
+                        AstNodeExpr* const dropp = wantLeft ? srightp : slp;
+                        VL_DO_DANGLING(dropp->deleteTree(), dropp);
+                        return keepp;
+                    }
+                    if (slp) VL_DO_DANGLING(slp->deleteTree(), slp);
+                    if (srightp) VL_DO_DANGLING(srightp->deleteTree(), srightp);
+                }
             }
             int dim = 0;
             if (argp) {
