@@ -11,12 +11,13 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A slice of a value whose length only running decides, read and written,
-# and a local array whose length comes from a string.
+# A slice whose ends are not a fixed distance apart.
 test.top_filename = "t/t_vhdl_dynslice.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_dynslice"],
+             verilator_flags2=[
+                 "--timing", "--top-module t_vhdl_dynslice"
+             ],
              make_top_shell=False,
              make_main=False)
 

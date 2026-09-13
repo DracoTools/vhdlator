@@ -9649,6 +9649,22 @@ private:
                             return refp;
                         }
                     }
+                    // Where it is not carried that way -- a slice written as
+                    // the target, or of a value the back end keeps at a fixed
+                    // length -- the length is still not written in the ends,
+                    // but the other side of the assignment has one, and the
+                    // two are the same length while the design runs (10.5.2).
+                    // That is Verilog's indexed part select, anchored at the
+                    // end this slice names.
+                    if (const int64_t span = sliceSpanFromAssign(nodep)) {
+                        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                        AstNodeExpr* const widthp = new AstConst{flp, AstConst::Unsized32{},
+                                                                 static_cast<uint32_t>(span)};
+                        return sliceAsc ? static_cast<AstNodeExpr*>(
+                                              new AstSelPlus{flp, fromp, leftp, widthp})
+                                        : static_cast<AstNodeExpr*>(
+                                              new AstSelMinus{flp, fromp, leftp, widthp});
+                    }
                 }
                 // A range whose ends run the wrong way round for its
                 // direction is a null range, which is legal and denotes a
@@ -9951,6 +9967,43 @@ private:
         }
         span.clear();
         return known;
+    }
+
+    // How long a slice is, taken from what the assignment it is the target of
+    // gives it: the two must be the same length when the design runs (10.5.2),
+    // so a value whose length the text fixes fixes the slice's too. Zero
+    // where nothing here says one.
+    int64_t sliceSpanFromAssign(const AstVhdlCall* nodep) {
+        const AstNode* childp = nodep;
+        for (const AstNode* upp = parentOf(nodep); upp; childp = upp, upp = parentOf(upp)) {
+            AstNodeVhdlExpr* valuep = nullptr;
+            // Whichever side of the assignment this is, the other one says
+            // how long it is
+            if (const AstVhdlVarAssign* const vap = VN_CAST(upp, VhdlVarAssign)) {
+                valuep = childp == vap->targetp() ? vap->valuep() : vap->targetp();
+            } else if (const AstVhdlSigAssign* const sap = VN_CAST(upp, VhdlSigAssign)) {
+                const AstVhdlWaveform* const wfp = sap->wavesp();
+                valuep
+                    = childp == sap->targetp() ? (wfp ? wfp->valuep() : nullptr) : sap->targetp();
+            } else if (VN_IS(upp, VhdlWaveform)) {
+                continue;  // On the way up from the value to its assignment
+            } else if (VN_IS(upp, NodeVhdlStmt)) {
+                return 0;  // Some other statement: nothing says a length
+            } else {
+                continue;  // A name of the target, on the way up to it
+            }
+            if (!valuep) return 0;
+            // A string or bit string literal carries its length in itself
+            const VhdlValue val = V3VhdlEval::eval(valuep);
+            if (val.isStr()) return static_cast<int64_t>(val.toStr().size());
+            VhdlType* const typep = valuep->vhdlTypep();
+            if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return 0;
+            if (!typep->isConstrainedArray() || !typep->lengthEmittable()) return 0;
+            if (typep->dimensions() != 1) return 0;
+            const int64_t len = typep->dimLength(0);
+            return len > 0 && len <= (1 << 20) ? len : 0;
+        }
+        return 0;
     }
 
     AstNodeExpr* indexedSlice(AstVhdlRange* rp, AstNodeExpr* fromp, AstNodeExpr* leftp,
