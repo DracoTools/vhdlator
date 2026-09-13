@@ -2991,6 +2991,13 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         if (found.size() == 1) {
             symp->aliasp(found[0]);
             if (!symp->typep() && found[0]->typep()) symp->typep(found[0]->typep());
+            // An alias of a package is another name for its region, so
+            // "renamed.thing" reaches what the package declares (6.6.3)
+            if (found[0]->resolved()->kind() == VhdlSymKind::PACKAGE
+                && found[0]->resolved()->innerp()) {
+                symp->innerp(found[0]->resolved()->innerp());
+                m_scopep->addNamed(lower(nodep->name()), found[0]->resolved()->innerp());
+            }
             // An alias of a subprogram is called like one, so it carries the
             // same profile: what it takes and what it gives back
             if (found[0]->isOverloadable()) {
@@ -4223,6 +4230,25 @@ void VhdlSemVisitor::applyContextItem(AstVhdlContextItem* ctxp) {
         }
         if (!targetp) continue;  // Not one of ours, or not yet analyzed
         m_scopep->addNamed(parts[1], targetp);
+        // "use work.pkg", with no suffix, makes the package's own name
+        // visible by itself (12.4) -- which is what an alias of a package,
+        // or a name written out in full without a library clause, then uses
+        if (parts.size() == 2 && parts[1] != "all") {
+            const auto uIt = m_primaryUnits.find(lib + "." + parts[1]);
+            // Only a package: a use clause may name an entity, which GHDL
+            // 7.0.0-dev takes, and that name still denotes the entity
+            const bool isPkg = uIt == m_primaryUnits.end() || VN_IS(uIt->second, VhdlPackage)
+                               || VN_IS(uIt->second, VhdlPackageInst);
+            std::vector<VhdlSymbol*> already;
+            m_scopep->lookupLocal(parts[1], already);
+            if (isPkg && already.empty()) {
+                VhdlSymbol* const psymp
+                    = VhdlSymTab::newSymbol(VhdlSymKind::PACKAGE, parts[1],
+                                            uIt != m_primaryUnits.end() ? uIt->second : nullptr);
+                psymp->innerp(targetp);
+                declare(psymp, exprp->fileline());
+            }
+        }
         // "use pkg.all" makes everything potentially visible, and
         // "use pkg.name" only the declarations of that name
         if (parts.size() == 3 && parts[2] != "all") {
@@ -4392,6 +4418,14 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     // and reachable by selection, for a package the entity
                     // declares: "use pack_int.all" in the architecture
                     m_scopep->addUse(it->second);
+                    // A use clause the entity wrote is in scope for the whole
+                    // of that region, the architecture included (12.1, 12.4),
+                    // and so are the regions the entity named -- a package it
+                    // declares or instantiates among them
+                    for (VhdlScope* const usedp : it->second->uses()) m_scopep->addUse(usedp);
+                    for (const auto& pair : it->second->named()) {
+                        m_scopep->addNamed(pair.first, pair.second);
+                    }
                 }
                 // An instance path names the entity, and the instance form
                 // names the architecture with it (16.2.7)
