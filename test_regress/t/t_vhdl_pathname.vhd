@@ -25,6 +25,10 @@ end package body;
 use work.pk.all;
 
 entity t_vhdl_pathname is
+  -- Named from the unit itself: the region a context clause is analyzed in
+  -- is not a region of the design (12.1, 16.2.7)
+  constant own_path : string := t_vhdl_pathname'path_name;
+  constant own_simple : string := t_vhdl_pathname'simple_name;
 end entity;
 
 architecture arch of t_vhdl_pathname is
@@ -55,6 +59,9 @@ begin
   begin
     assert w'path_name = ":t_vhdl_pathname::w"
       report "w is " & w'path_name severity failure;
+    assert own_path = ":t_vhdl_pathname:"
+      report "own_path is " & own_path severity failure;
+    assert own_simple = "t_vhdl_pathname" severity failure;
     assert t_vhdl_pathname'path_name = ":t_vhdl_pathname:"
       report "unit is " & t_vhdl_pathname'path_name severity failure;
     assert f(v) = 0 severity failure;

@@ -683,6 +683,12 @@ private:
         // generate statement's own label is what the path holds (16.2.7), so
         // an unlabelled body contributes nothing rather than an empty name
         if (name == "generate body") return scopePath(scopep->parentp(), inst);
+        // The region a design unit's context clause is analyzed in is not a
+        // region of the design: what the unit declares is named from the unit
+        // itself (12.1, 16.2.7)
+        if (name.size() > 8 && name.compare(name.size() - 8, 8, "$context") == 0) {
+            return scopePath(scopep->parentp(), inst);
+        }
         if (name == "process" || name == "block" || name == "generate"
             || name == "loop") {
             name.clear();
