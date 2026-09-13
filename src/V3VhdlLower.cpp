@@ -20562,8 +20562,31 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Only a named association is answered here: a positional one would have
     // to be matched against the entity this instance has not yet been bound
     // to, and leaving it a parameter is what the compiler did before.
+    // An instance names its *component's* generic, and the component's
+    // generic and the entity's are two declarations of the same name
+    // (7.3.2.2). It is the entity that is lowered, so marking only the one
+    // the instance named leaves the entity's generic a parameter while the
+    // pin beside it is built as data, and the back end is handed an instance
+    // connecting to a parameter as though it were a port.
+    std::map<std::string, AstVhdlEntity*> entityByName;
     for (AstNodeVhdlUnit* const unitp : unitsp) {
-        unitp->foreach([this](AstVhdlInstance* instp) {
+        if (AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity)) {
+            entityByName.emplace(entp->name(), entp);
+        }
+    }
+    // The name a component instantiation binds to by default is the
+    // component's own, which is the last identifier of what it names (7.3.3)
+    const auto boundName = [](const AstVhdlInstance* instp) -> std::string {
+        const AstNodeVhdlExpr* np = instp->unitp();
+        while (const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected)) {
+            if (!selp->suffixp()) break;
+            np = selp->suffixp();
+        }
+        const AstVhdlName* const namep = VN_CAST(np, VhdlName);
+        return namep ? namep->name() : "";
+    };
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([&](AstVhdlInstance* instp) {
             for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
                 const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                 if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
@@ -20595,6 +20618,15 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     continue;
                 }
                 m_dataGenerics.insert(gsymp->resolved());
+                // And the generic of that name in the entity this binds to
+                const auto entIt = entityByName.find(boundName(instp));
+                if (entIt == entityByName.end()) continue;
+                for (AstNode* gp = entIt->second->genericsp(); gp; gp = gp->nextp()) {
+                    AstVhdlIfaceDecl* const ifp = VN_CAST(gp, VhdlIfaceDecl);
+                    if (ifp && ifp->name() == gsymp->name() && ifp->vhdlSymp()) {
+                        m_dataGenerics.insert(ifp->vhdlSymp()->resolved());
+                    }
+                }
             }
         });
     }
