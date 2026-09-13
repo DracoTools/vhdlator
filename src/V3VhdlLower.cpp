@@ -19698,8 +19698,10 @@ private:
         // template: the actual is a signal of the design, and its length is
         // that signal's, whatever the parameter was declared without (4.2.2.3)
         std::vector<const VhdlSymbol*> paramSyms;
+        std::vector<const AstVhdlIfaceDecl*> paramIfaces;
         for (AstNode* p = firstParamOf(nodep); p; p = p->nextp()) {
             paramSyms.push_back(VN_AS(p, VhdlIfaceDecl)->vhdlSymp());
+            paramIfaces.push_back(VN_AS(p, VhdlIfaceDecl));
         }
         const auto boundHere = [&](size_t i) {
             if (i >= paramSyms.size()) return false;
@@ -19722,6 +19724,20 @@ private:
                 && !recordLengthEmittable(typep)) {
                 return nullptr;
             }
+        }
+        // A parameter the subprogram drives a signal through makes it a
+        // template in the same way. The copy made for a call site is bound
+        // to the signal that call passed (4.2.2.3), and it is that signal
+        // the body drives; an unbound one names no signal, so there is
+        // nothing for the body to drive and nothing to emit. A library
+        // analyzed with no design to instantiate it reaches every such
+        // procedure and binds none of them, which is not a gap in the
+        // library but the absence of a call.
+        for (size_t i = 0; i < paramIfaces.size(); ++i) {
+            if (boundHere(i)) continue;
+            const AstVhdlIfaceDecl* const ifp = paramIfaces[i];
+            if (ifp->kind() != VhdlIfaceKind::SIGNAL) continue;
+            if (ifp->mode() != VhdlMode::IN) return nullptr;
         }
         // The same where only the *result* has no length of its own: the
         // copies made for the call sites carry the lengths their bodies
