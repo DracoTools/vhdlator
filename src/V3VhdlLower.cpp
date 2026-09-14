@@ -4852,10 +4852,24 @@ private:
     // from it. Only a run of scalars: a record, a string or an array of
     // either is a value a parameter cannot carry, and asking for one is an
     // internal error rather than a refusal.
+    // Whether a value of this subtype is one a parameter carries: a number,
+    // or an enumeration, which the back end holds as a number too
+    static bool scalarKind(const VhdlType* typep) {
+        if (!typep || typep->isError()) return false;
+        switch (typep->base()->kind()) {
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+        case VhdlTypeKind::FLOATING:
+        case VhdlTypeKind::ENUM: return true;
+        default: return false;
+        }
+    }
+
     static bool isTableConstant(const VhdlSymbol* symp) {
         if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return false;
         const VhdlType* const typep = symp->typep();
         if (!typep || typep->isError()) return false;
+        if (scalarKind(typep)) return true;
         const VhdlType* const basep = typep->base();
         if (basep->kind() != VhdlTypeKind::ARRAY) return false;
         if (basep->indexTypes().size() != 1) return false;
@@ -20677,6 +20691,24 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 const AstVhdlObjectDecl* const cdeclp = VN_CAST(constp->declp(), VhdlObjectDecl);
                 if (cdeclp && cdeclp->isElabConstant()
                     && V3VhdlEval::backEndFolds(cdeclp->defaultp())) {
+                    continue;
+                }
+                // A deferred constant is declared in the package and given
+                // its value in the package body, and it is that second
+                // declaration which says what the value is (6.4.2.2). Asking
+                // only the first finds no value, so a generic handed one was
+                // made to travel as data for want of looking further.
+                //
+                // Only where the generic is a *number*. One of an array type
+                // given a value this frontend cannot fold has to travel as
+                // data whatever the back end could do with it -- a parameter
+                // of an array type handed an element of a table makes the
+                // instance's output feed back into itself -- and it is the
+                // generic's own type that says which of the two this is.
+                const AstVhdlObjectDecl* const fullp
+                    = VN_CAST(constp->fullDeclp(), VhdlObjectDecl);
+                if (fullp && fullp != cdeclp && scalarKind(gsymp->resolved()->typep())
+                    && V3VhdlEval::backEndFolds(fullp->defaultp())) {
                     continue;
                 }
                 m_dataGenerics.insert(gsymp->resolved());
