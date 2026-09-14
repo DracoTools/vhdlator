@@ -4923,6 +4923,17 @@ private:
         if (nodep->defaultp() && nodep->mode() != VhdlMode::INOUT
             && nodep->mode() != VhdlMode::LINKAGE) {
             varp->valuep(lowerExpr(nodep->defaultp()));
+        } else if (!nodep->defaultp()
+                   && (nodep->mode() == VhdlMode::OUT || nodep->mode() == VhdlMode::BUFFER)
+                   && startsAtItsLeft(symp->typep())) {
+            // With no default written, the driver starts at the leftmost
+            // value of the port's subtype like any other signal (6.4.2.2),
+            // and an INTEGER port's left is not zero. It shows wherever
+            // nothing outside drives the port: the top level of a design
+            // handed to a foreign testbench reads the port before anything
+            // inside has assigned it, and reading zero there says a change
+            // happened that did not, or hides one that did.
+            varp->valuep(defaultValueFor(symp->typep(), flp));
         }
         addStmt(new AstPort{flp, ++pinNum, varp->name()});
         addStmt(varp);
@@ -5300,6 +5311,25 @@ private:
     // Verilator starts it anyway -- unless "mustHave", which is how a
     // composite asks, since one element with no value would leave the whole
     // record or array without one.
+    // Whether a port left with no default is worth starting at its subtype's
+    // left. One value, and one this runtime holds: a logic type's left is
+    // 'U', which is a metavalue this model does not keep and would become the
+    // X that V3Unknown eliminates, so those stay as they were. A composite is
+    // left alone too -- its default is a whole aggregate, written out on
+    // every instance of every entity for a value anything driving the port
+    // replaces at once, and where the length names a generic there may be no
+    // value to write at all.
+    bool startsAtItsLeft(const VhdlType* typep) const {
+        if (!typep || typep->isError() || !typep->bounded()) return false;
+        switch (typep->base()->kind()) {
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+        case VhdlTypeKind::FLOATING: return true;
+        case VhdlTypeKind::ENUM: return !enumIsLogic(typep->base());
+        default: return false;
+        }
+    }
+
     AstNodeExpr* defaultValueFor(VhdlType* typep, FileLine* flp, bool mustHave = false) {
         if (!typep || typep->isError()) return nullptr;
         VhdlType* const basep = typep->base();
