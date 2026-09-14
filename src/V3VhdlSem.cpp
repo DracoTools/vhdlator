@@ -102,6 +102,9 @@ class VhdlSpecVisitor;
 std::string vhdlIndexPartName(int64_t at);
 bool vhdlIsIndexPart(const std::string& part);
 int64_t vhdlIndexPartAt(const std::string& part);
+// Whether a formal is written as a slice of itself. Defined below, beside
+// the binding of actuals to formals.
+static bool vhdlSlicedFormal(const AstNodeVhdlExpr* formalp, std::string& root);
 
 class VhdlSemVisitor final : public VNVisitor {
     // STATE
@@ -1786,6 +1789,12 @@ public:
     void specializeWithin(AstNode* nodep) VL_MT_DISABLED;
     // Whether every element of a record has a length of its own (5.3.3)
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
+    // The subtype a slice of a formal gives it, where the formal has no
+    // length of its own: "proc(s(4 to 15) => ...)" makes s run 4 to 15
+    // rather than taking the actual's own bounds (6.5.7.1). Null where the
+    // range does not fold here.
+    VhdlType* slicedFormalType(VhdlType* formalTypep, AstNode* rangep,
+                               FileLine* flp) VL_MT_DISABLED;
 
     // A fresh subtype that is everything another one is, so that a
     // constraint may be applied to the copy without touching the original
@@ -5186,6 +5195,21 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
     declare(symp, flp);
 }
 
+VhdlType* VhdlSemVisitor::slicedFormalType(VhdlType* formalTypep, AstNode* rangep, FileLine* flp) {
+    if (!formalTypep || !rangep) return nullptr;
+    if (formalTypep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+    if (formalTypep->indexTypes().size() != 1) return nullptr;
+    const RangeInfo info = analyzeRange(rangep, formalTypep->indexTypes()[0]);
+    if (!info.valid || info.unbounded || !info.left.known() || !info.right.known()) {
+        return nullptr;
+    }
+    VhdlType* const outp = cloneSubtype(formalTypep, flp);
+    outp->clearIndexTypes();
+    outp->addIndexType(makeRangeSubtype(info, flp));
+    outp->unconstrained(false);
+    return outp;
+}
+
 VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
                                                  VhdlScope* regionp,
                                                  const std::vector<VhdlType*>& actualTypes,
@@ -5852,10 +5876,20 @@ private:
             byFormal[f] = assocs[k];
         }
         std::vector<AstNodeVhdlExpr*> byFormalExpr(nparams, nullptr);
+        // Where the formal was named by a slice of itself, that slice is
+        // what gives it its bounds (6.5.7.1), so the copy is made for the
+        // range rather than for the actual's own subtype
+        std::vector<AstNode*> byFormalSlice(nparams, nullptr);
         for (size_t i = 0; i < nparams; ++i) {
-            if (byFormal[i]) byFormalExpr[i] = byFormal[i]->actualp();
+            if (!byFormal[i]) continue;
+            byFormalExpr[i] = byFormal[i]->actualp();
+            std::string sliceRoot;
+            if (vhdlSlicedFormal(byFormal[i]->formalp(), sliceRoot)) {
+                const AstVhdlCall* const scallp = VN_CAST(byFormal[i]->formalp(), VhdlCall);
+                byFormalSlice[i] = scallp ? scallp->argsp() : nullptr;
+            }
         }
-        specializeWithActuals(nodep, symp, byFormalExpr, individual, individualIdx);
+        specializeWithActuals(nodep, symp, byFormalExpr, individual, individualIdx, byFormalSlice);
     }
 
     // Whether a copy for these actuals would be one of a terminating series.
@@ -5921,11 +5955,11 @@ private:
     // The copy itself, given what each formal is associated with. An operator
     // the design declared is a subprogram like any other (4.5.2), and its
     // operands are its actuals, so it comes here too.
-    void specializeWithActuals(
-        AstNodeVhdlExpr* nodep, VhdlSymbol* symp,
-        const std::vector<AstNodeVhdlExpr*>& byFormalExpr,
-        const std::map<size_t, std::vector<AstNodeVhdlExpr*>>& individual,
-        const std::map<size_t, std::vector<int64_t>>& individualIdx = {}) {
+    void specializeWithActuals(AstNodeVhdlExpr* nodep, VhdlSymbol* symp,
+                               const std::vector<AstNodeVhdlExpr*>& byFormalExpr,
+                               const std::map<size_t, std::vector<AstNodeVhdlExpr*>>& individual,
+                               const std::map<size_t, std::vector<int64_t>>& individualIdx = {},
+                               const std::vector<AstNode*>& byFormalSlice = {}) {
         const size_t nparams = symp->paramTypes().size();
         const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
         std::vector<VhdlType*> actualTypes;
@@ -5973,6 +6007,14 @@ private:
                 actualValues.push_back(val.isInt() ? val : VhdlValue{});
             }
             VhdlType* typep = actp->vhdlTypep();
+            // A formal named by a slice of itself is as long as that slice
+            // says, whatever length the actual happens to have (6.5.7.1)
+            if (i < byFormalSlice.size() && byFormalSlice[i]) {
+                if (VhdlType* const slicedp = m_sem.slicedFormalType(
+                        symp->paramTypes()[i], byFormalSlice[i], nodep->fileline())) {
+                    typep = slicedp;
+                }
+            }
             // Only a length that is known is worth specializing on
             // A STRING the call cannot measure -- the result of a function,
             // say -- is carried dynamically rather than by length, so it is
@@ -8678,6 +8720,21 @@ static bool vhdlIndividualFormal(const AstNodeVhdlExpr* formalp, std::string& ro
     return true;
 }
 
+// A formal written as a slice of itself: "f(A(3 downto 0) => x)". The whole
+// of the formal is associated by it -- naming its elements one at a time is
+// an individual association, which writes indices rather than a range -- and
+// where the formal has no length of its own the slice is what says how long
+// it is (6.5.7.1).
+static bool vhdlSlicedFormal(const AstNodeVhdlExpr* formalp, std::string& root) {
+    const AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+    if (!callp || !callp->argsp() || callp->argsp()->nextp()) return false;
+    if (!VN_IS(callp->argsp(), VhdlRange)) return false;
+    const AstVhdlName* const prefixp = VN_CAST(callp->prefixp(), VhdlName);
+    if (!prefixp) return false;
+    root = prefixp->name();
+    return true;
+}
+
 // Which formal each actual of a call names: positional up to the first named
 // one, by name after that, and a formal with a default may be left out
 // (6.5.7.1). False where the call cannot be read that way at all.
@@ -8703,6 +8760,14 @@ bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& a
             continue;
         }
         named = true;
+        std::string sliceRoot;
+        if (!formalNamep && vhdlSlicedFormal(asp->formalp(), sliceRoot)) {
+            const int idx = symp->paramIndex(sliceRoot);
+            if (idx < 0 || filled[idx] || individual.count(idx)) return false;
+            formalOf[i] = idx;
+            filled[idx] = true;
+            continue;
+        }
         if (!formalNamep) {
             // The elements of one formal, associated one at a time (6.5.7.1)
             std::string root;
