@@ -1141,9 +1141,28 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
     }
     static void updateReferences(AstVar* varp, PackedVarRef& pref,
                                  const std::vector<SplitNewVar>& vars) {
+        // A reference that both reads and writes the variable -- an inout or
+        // ref argument of a task among them -- is appended to both lists,
+        // because the bits it reads and the bits it writes both decide how
+        // the variable is split. It must still be replaced exactly once, and
+        // with a reference that is itself both: replacing it twice would
+        // delete the node the second pass is about to unlink.
+        std::set<const AstNode*> rwNodes;
+        {
+            std::set<const AstNode*> writtenp;
+            for (const PackedVarRefEntry& ref : pref.lhs()) writtenp.insert(ref.nodep());
+            for (const PackedVarRefEntry& ref : pref.rhs()) {
+                if (writtenp.count(ref.nodep())) rwNodes.insert(ref.nodep());
+            }
+        }
         for (const bool lvalue : {false, true}) {  // Refer the new split variables
             std::vector<PackedVarRefEntry>& refs = lvalue ? pref.lhs() : pref.rhs();
             for (PackedVarRefEntry& ref : refs) {
+                const bool isRw = rwNodes.count(ref.nodep()) != 0;
+                // Left to the write pass, which knows the reference is both
+                if (isRw && !lvalue) continue;
+                const VAccess access
+                    = isRw ? VAccess::READWRITE : (lvalue ? VAccess::WRITE : VAccess::READ);
                 auto varit
                     = std::upper_bound(vars.begin(), vars.end(), ref.lsb(), SplitNewVar::Match());
                 UASSERT_OBJ(varit != vars.end(), ref.nodep(), "Not found");
@@ -1164,7 +1183,7 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
                     prevp = senitemp;
                     inSentitivityList = true;
                 } else {
-                    prevp = extractBits(ref, *varit, lvalue ? VAccess::WRITE : VAccess::READ);
+                    prevp = extractBits(ref, *varit, access);
                 }
                 for (int residue = ref.msb() - varit->msb(); residue > 0;
                      residue -= varit->bitwidth()) {
@@ -1178,8 +1197,7 @@ class SplitPackedVarVisitor final : public VNVisitor, public SplitVarImpl {
                             new AstVarRef{senitemp->fileline(), varit->varp(), VAccess::READ}};
                         senitemp->addNextHere(prevp);
                     } else {
-                        AstNodeExpr* const bitsp
-                            = extractBits(ref, *varit, lvalue ? VAccess::WRITE : VAccess::READ);
+                        AstNodeExpr* const bitsp = extractBits(ref, *varit, access);
                         prevp = new AstConcat{ref.nodep()->fileline(), bitsp,
                                               VN_AS(prevp, NodeExpr)};
                     }
