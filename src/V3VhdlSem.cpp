@@ -746,20 +746,6 @@ class VhdlSemVisitor final : public VNVisitor {
         return outp;
     }
 
-    // A distinct subtype of the same type, sharing its shape
-    static VhdlType* cloneSubtype(VhdlType* basep, FileLine* flp) {
-        VhdlType* const outp = VhdlSymTab::newType(basep->kind(), "", flp);
-        outp->base(basep->base());
-        outp->elementp(basep->elementp());
-        outp->designatedp(basep->designatedp());
-        for (VhdlType* const idxp : basep->indexTypes()) outp->addIndexType(idxp);
-        for (VhdlSymbol* const elemp : basep->elements()) outp->addElement(elemp);
-        outp->resolutionp(basep->resolutionp());
-        outp->unconstrained(basep->unconstrained());
-        outp->copyBounds(basep);
-        return outp;
-    }
-
     // Give a type the bounds a range found, where they folded
     static void applyRange(VhdlType* outp, const RangeInfo& info) {
         if (!outp) return;
@@ -1800,6 +1786,21 @@ public:
     void specializeWithin(AstNode* nodep) VL_MT_DISABLED;
     // Whether every element of a record has a length of its own (5.3.3)
     static bool fullyConstrainedRecord(const VhdlType* typep) VL_MT_DISABLED;
+
+    // A fresh subtype that is everything another one is, so that a
+    // constraint may be applied to the copy without touching the original
+    static VhdlType* cloneSubtype(VhdlType* basep, FileLine* flp) {
+        VhdlType* const outp = VhdlSymTab::newType(basep->kind(), "", flp);
+        outp->base(basep->base());
+        outp->elementp(basep->elementp());
+        outp->designatedp(basep->designatedp());
+        for (VhdlType* const idxp : basep->indexTypes()) outp->addIndexType(idxp);
+        for (VhdlSymbol* const elemp : basep->elements()) outp->addElement(elemp);
+        outp->resolutionp(basep->resolutionp());
+        outp->unconstrained(basep->unconstrained());
+        outp->copyBounds(basep);
+        return outp;
+    }
     // Whether a subtype indication is written with no constraint of its own.
     // One written with a constraint arrives as a call of the type mark.
     static bool writtenUnconstrained(const AstVhdlSubtypeInd* sip) {
@@ -5494,6 +5495,10 @@ class VhdlSpecVisitor final : public VNVisitor {
     using VhdlSpecFrame = std::pair<const VhdlSymbol*, std::vector<VhdlType*>>;
     std::map<const VhdlSymbol*, VhdlSpecFrame> m_copyOf;  // What each copy was made for
     std::vector<VhdlSpecFrame> m_within;  // The copies being made or walked
+    // Formal array type and the element subtype a call supplies -> the type
+    // the copy is made for. One object per pair, so that two calls supplying
+    // the same element share a copy instead of each asking for its own.
+    std::map<std::pair<const VhdlType*, const VhdlType*>, VhdlType*> m_elemSpecs;
     int m_count = 0;
     bool m_madeOne = false;
 
@@ -5712,6 +5717,38 @@ private:
             }
         }
         return nullptr;
+    }
+
+    // A copy made for the element subtype alone. How many elements there are
+    // may be settled only while running while how long each one is is settled
+    // here -- "t_slv_array(0 to n - 1)(7 downto 0)" says the second and not
+    // the first -- and it is the element, not the count, that decides whether
+    // a value can be carried (5.3.2.2). So the copy takes the element and
+    // leaves the index open, and the count travels with the value.
+    VhdlType* elementOnlySpec(VhdlType* formalp, const VhdlType* actualp, FileLine* flp) {
+        if (!formalp || !actualp) return nullptr;
+        if (formalp->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (formalp->indexTypes().size() != 1) return nullptr;
+        VhdlType* const felemp
+            = formalp->elementp() ? formalp->elementp() : formalp->base()->elementp();
+        VhdlType* const aelemp = actualp->elementp()
+                                     ? actualp->elementp()
+                                     : (actualp->base() ? actualp->base()->elementp() : nullptr);
+        if (!felemp || !aelemp) return nullptr;
+        // This is for the formal that says nothing about its element and the
+        // actual that does; where the formal already says it there is
+        // nothing here to settle
+        if (felemp->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (felemp->isConstrainedArray()) return nullptr;
+        if (!aelemp->isConstrainedArray()) return nullptr;
+        const auto key = std::make_pair(static_cast<const VhdlType*>(formalp),
+                                        static_cast<const VhdlType*>(aelemp));
+        const auto it = m_elemSpecs.find(key);
+        if (it != m_elemSpecs.end()) return it->second;
+        VhdlType* const outp = VhdlSemVisitor::cloneSubtype(formalp, flp);
+        outp->elementp(aelemp);
+        m_elemSpecs.emplace(key, outp);
+        return outp;
     }
 
     // What a copy of a subprogram actually depends on about an actual's
@@ -5950,7 +5987,16 @@ private:
                 // is not a number here, and the copy carries it as written --
                 // but one that names a parameter of the subprogram the call
                 // is written in means nothing where the copy is analyzed
-                if (!typep || (!typep->isConstrainedArray() && !lengthTravels(typep))) return;
+                if (!typep || (!typep->isConstrainedArray() && !lengthTravels(typep))) {
+                    // The count may be settled only while running while the
+                    // element is settled here, and it is the element that
+                    // decides whether a value can be carried (5.3.2.2)
+                    VhdlType* const elemSpecp
+                        = elementOnlySpec(symp->paramTypes()[i], typep, nodep->fileline());
+                    if (!elemSpecp) return;
+                    actualTypes.push_back(elemSpecp);
+                    continue;
+                }
                 // A length of two billion is an index subtype's range, not an
                 // object's; specializing on it would be meaningless and would
                 // make the copy's own bounds checks fire

@@ -1612,7 +1612,9 @@ private:
     // with. A copy per call site -- which is what every length that can be
     // known takes, and so what all synthesizable code takes -- cannot serve
     // here, because the length is not decided until the value is built.
-    std::map<const VhdlType*, std::string> m_dynNames;  // Array type -> its carrier
+    // Element type and, where the element is itself an array, its length ->
+    // the carrier structure made for it
+    std::map<std::pair<const VhdlType*, int64_t>, std::string> m_dynNames;
     std::set<const VhdlSymbol*> m_dynSyms;  // Objects held in one
 
     // Whether a bound is one only running decides. A bound that names a
@@ -1845,15 +1847,48 @@ private:
         return VhdlMode::IN;
     }
 
+    // The parameter's own symbol, which the bindings made for a call are
+    // keyed by
+    const VhdlSymbol* paramSymOf(const VhdlSymbol* symp, size_t i) const {
+        const AstVhdlSubprogDecl* declp = symp->bodyp();
+        if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        if (!declp) return nullptr;
+        size_t k = 0;
+        for (const AstNode* p = firstParamOf(declp); p; p = p->nextp(), ++k) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (!ifp) continue;
+            if (k == i) return ifp->vhdlSymp();
+        }
+        return nullptr;
+    }
+
+    // What a parameter's subtype is at this call, which may say more than
+    // the declaration does. "data_array : out t_slv_array" says neither how
+    // many elements there are nor how long each one is; an actual
+    // "arr(0 to n - 1)" settles the element at eight bits and leaves only
+    // the count to running (5.3.2.2). Inside the copy made for a call the
+    // binding holds that subtype; at the call itself the actual still does.
+    const VhdlType* paramTypeHere(const VhdlSymbol* symp, size_t i, const VhdlType* atypep) const {
+        if (const VhdlSymbol* const psymp = paramSymOf(symp, i)) {
+            const auto it = m_bindTypes.find(psymp);
+            if (it != m_bindTypes.end() && it->second) return it->second;
+        }
+        return atypep ? atypep : symp->paramTypes()[i];
+    }
+
     // Whether this parameter is carried with its own bounds. A foreign
     // subprogram's is never one: C has no way to be handed a carrier, and
     // the honest error about the length is the answer there (16.2).
     // A parameter the body writes is carried too, by reference, since its
     // bounds are the actual's and the caller has to see what was written.
-    bool paramCarried(const VhdlSymbol* symp, size_t i) const {
+    bool paramCarried(const VhdlSymbol* symp, size_t i, const VhdlType* atypep = nullptr) const {
         if (symp->isForeign()) return false;
         if (paramIsSignal(symp, i)) return false;
-        return carriedDynamically(symp->paramTypes()[i]);
+        if (carriedDynamically(symp->paramTypes()[i])) return true;
+        // It is the element, not the count, that decides whether a value can
+        // be carried at all, and the element may be settled where the
+        // declaration left it open
+        return carriedDynamically(paramTypeHere(symp, i, atypep));
     }
 
     // Whether a parameter is of the signal class
@@ -1922,10 +1957,39 @@ private:
         // "std_logic_vector(u)" over a carried value is nothing at all, and
         // giving the two their own structures would make it something.
         VhdlType* const keyp = elemp ? elemp->base() : basep;
-        const auto found = m_dynNames.find(keyp);
+        // An element that is itself an array has to be keyed on how long it
+        // is as well: two arrays of std_logic_vector whose elements are
+        // eight and sixteen bits wide share an element base type, and one
+        // structure cannot hold both.
+        int64_t elemLen = -1;
+        if (elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY && elemp->isConstrainedArray()
+            && elemp->indexTypes().size() == 1 && elemp->indexTypes()[0]
+            && elemp->indexTypes()[0]->bounded()) {
+            elemLen = elemp->indexTypes()[0]->length();
+        }
+        const auto keyed = std::make_pair(keyp, elemLen);
+        const auto found = m_dynNames.find(keyed);
         if (found != m_dynNames.end()) return refToDType(found->second, flp);
+        // An element written without a length of its own has no structure
+        // that can be built for it. Where exactly one has already been made
+        // for this element type, that is the one meant: the value arriving
+        // is of that subtype however this reference happens to be written.
+        // More than one, and which was meant is a real question, so the
+        // honest error about the length is the answer.
+        if (elemLen < 0 && elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY) {
+            const std::string* onlyp = nullptr;
+            for (const auto& pair : m_dynNames) {
+                if (pair.first.first != keyp) continue;
+                if (onlyp) {
+                    onlyp = nullptr;
+                    break;
+                }
+                onlyp = &pair.second;
+            }
+            if (onlyp) return refToDType(*onlyp, flp);
+        }
         const std::string name = "__Vdyn" + std::to_string(++m_nameNum) + "__" + keyp->name();
-        m_dynNames.emplace(keyp, name);
+        m_dynNames.emplace(keyed, name);
         AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
         structp->name(name);
         AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
@@ -16906,7 +16970,11 @@ private:
             const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
             const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
             if (at < 0 || at >= static_cast<int>(symp->paramTypes().size())) continue;
-            if (!paramCarried(symp, at)) continue;
+            // What this call settles about the parameter. The declaration
+            // may leave the element open where the actual fixes it, and it
+            // is the element that decides whether a value can be carried.
+            VhdlType* const herep = boundTypeOf(asp->actualp());
+            if (!paramCarried(symp, at, herep)) continue;
             if (paramModeOf(symp, at) == VhdlMode::IN) continue;
             if (isDynObj(asp->actualp())) continue;
             VhdlType* const atypep = asp->actualp()->vhdlTypep();
@@ -16922,7 +16990,10 @@ private:
             if (!fixed && !emittable) {
                 // A slice whose ends only running settles: the object it is
                 // taken from has a length, and the ends go in as numbers
-                VhdlType* const carrp = symp->paramTypes()[at];
+                // The carrier is built for the element this call supplies,
+                // which the declaration's own element may not say
+                VhdlType* const carrp
+                    = carriedDynamically(symp->paramTypes()[at]) ? symp->paramTypes()[at] : herep;
                 AstVar* carrierp = nullptr;
                 if (carrp
                     && dynSliceRoundTrip(asp->actualp(), carrp, prep, postp, carrierp, flp)) {
