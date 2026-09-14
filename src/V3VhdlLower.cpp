@@ -14445,8 +14445,43 @@ private:
                         continue;
                     }
                 }
-                AstPin* const pinp
-                    = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
+                AstPin* pinp = nullptr;
+                {
+                    // An actual with no length of its own -- "(others => '0')"
+                    // is the common one -- is as long as the port it is given
+                    // to, and the port's length may name a generic of the unit
+                    // being instantiated, which has no object in this module.
+                    // The generic map is what says its value here (6.5.7.1).
+                    VL_RESTORER_COPY(m_bindExprs);
+                    // The actual carries the port's own subtype, which is
+                    // where the generic is named
+                    VhdlType* const wantp
+                        = symp && symp->typep()
+                              ? symp->typep()
+                              : (asp->actualp() ? asp->actualp()->vhdlTypep() : nullptr);
+                    if (wantp) {
+                        for (const auto& pair : genericStandIns(nodep, wantp)) {
+                            // A unit that instantiates itself -- "sub"
+                            // handing "width / 2" to its own width -- names
+                            // one symbol on both sides, and standing that
+                            // expression in for it would be a definition in
+                            // terms of itself. The generic keeps its own
+                            // object there, as it did before any of this.
+                            bool selfp = false;
+                            if (pair.second) {
+                                pair.second->foreach([&](AstVhdlName* namep) {
+                                    const VhdlSymbol* const nsymp = namep->vhdlSymp();
+                                    if (nsymp && pair.first
+                                        && nsymp->resolved() == pair.first->resolved()) {
+                                        selfp = true;
+                                    }
+                                });
+                            }
+                            if (!selfp) m_bindExprs[pair.first] = pair.second;
+                        }
+                    }
+                    pinp = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
+                }
                 if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }
@@ -16992,14 +17027,20 @@ private:
                 // taken from has a length, and the ends go in as numbers
                 // The carrier is built for the element this call supplies,
                 // which the declaration's own element may not say
-                VhdlType* const carrp
-                    = carriedDynamically(symp->paramTypes()[at]) ? symp->paramTypes()[at] : herep;
+                const bool declCarried = carriedDynamically(symp->paramTypes()[at]);
+                VhdlType* const carrp = declCarried ? symp->paramTypes()[at] : herep;
                 AstVar* carrierp = nullptr;
                 if (carrp
                     && dynSliceRoundTrip(asp->actualp(), carrp, prep, postp, carrierp, flp)) {
                     m_argCarrier.emplace(asp, carrierp);
                     continue;
                 }
+                // Only the declaration saying it is carried makes a length
+                // this call cannot supply an error. Where it is the actual
+                // that settles the element, the parameter is one the
+                // ordinary path has always carried, and it goes that way
+                // still rather than being refused for a road it never took.
+                if (!declCarried) continue;
                 unsup(flp, "call to '" + symp->name() + "' whose parameter '"
                                + symp->paramName(at)
                                + "' is written and has no length at this call");
