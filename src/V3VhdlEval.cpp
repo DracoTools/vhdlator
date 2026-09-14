@@ -352,8 +352,138 @@ private:
     // handle a verification library builds carries an actor no one can work
     // out beside the widths everything else is sized from, and it is the
     // widths elaboration needs.
+    // Whether an array's elements are numbers. Text is held as a string
+    // rather than element by element, and an array of logic is a bit pattern
+    // the emitted code carries, so neither is turned into a value of
+    // elements here; a table of numbers is what a package writes its
+    // parameters as, and is what this is for.
+    static bool numericElement(const VhdlType* typep) {
+        const VhdlType* const basep = typep->base();
+        // One dimension only. A multidimensional aggregate is written as
+        // rows -- "((1, 2), (3, 4))" -- and its elements are not values of
+        // the element type at all, so counting them as though they were
+        // gives an array of the wrong shape.
+        if (basep->indexTypes().size() != 1) return false;
+        const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        if (!elemp) return false;
+        switch (elemp->base()->kind()) {
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+        case VhdlTypeKind::FLOATING: return true;
+        default: return false;
+        }
+    }
+
+    // An array aggregate whose elements are static is a static value in its
+    // turn (9.4.2), and holding it is what lets a package write a table and
+    // read it back: "constant POLYS : nat_array := (91, 121)" is how a design
+    // states its parameters, and a function that works a bound out of them
+    // cannot fold until the table can be read.
+    VhdlValue evalArrayAggregate(AstVhdlAggregate* nodep, VhdlType* typep) {
+        if (typep->indexTypes().empty()) return VhdlValue{};
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        if (!idxp) return VhdlValue{};
+        // How many elements the value has. A positional aggregate says so
+        // itself, and that is the answer whether or not anything constrains
+        // it: where the target is constrained the two agree, and where it is
+        // not -- the value an attribute specification gives -- the aggregate
+        // is all there is to go on (9.3.3.3). Asking the index subtype
+        // instead is no help, since an unconstrained array is indexed by a
+        // subtype that is perfectly bounded: NATURAL runs to two billion.
+        int64_t positional = 0;
+        bool anyChoice = false;
+        for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
+            const AstVhdlElemAssoc* const ap = VN_CAST(p, VhdlElemAssoc);
+            if (!ap) return VhdlValue{};
+            if (ap->choicesp()) {
+                anyChoice = true;
+            } else {
+                ++positional;
+            }
+        }
+        int64_t left = 0;
+        int64_t length = 0;
+        bool ascending = true;
+        if (!anyChoice && positional > 0) {
+            length = positional;
+            ascending = idxp->ascending();
+            left = idxp->bounded() ? idxp->left() : 0;
+        } else if (idxp->bounded()) {
+            left = idxp->left();
+            length = idxp->length();
+            ascending = idxp->ascending();
+        } else {
+            return VhdlValue{};
+        }
+        if (length <= 0 || length > (1 << 16)) return VhdlValue{};
+        std::vector<VhdlValue> elems(static_cast<size_t>(length));
+        VhdlValue out = VhdlValue::mkArray(std::move(elems), left, ascending, typep);
+        std::set<int64_t> given;
+        AstNodeVhdlExpr* othersp = nullptr;
+        int64_t at = left;
+        for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
+            AstVhdlElemAssoc* const ap = VN_CAST(p, VhdlElemAssoc);
+            if (!ap || !ap->valuep()) return VhdlValue{};
+            if (!ap->choicesp()) {
+                // Positional, from the leftmost index onwards
+                const VhdlValue v = eval(ap->valuep());
+                if (!v.known()) return VhdlValue{};
+                out.setElement(at, v);
+                given.insert(at);
+                at = ascending ? at + 1 : at - 1;
+                continue;
+            }
+            for (AstNode* c = ap->choicesp(); c; c = c->nextp()) {
+                AstVhdlChoice* const cp = VN_CAST(c, VhdlChoice);
+                if (!cp) return VhdlValue{};
+                if (cp->isOthers()) {
+                    othersp = ap->valuep();
+                    continue;
+                }
+                // A choice may be one index or a whole discrete range
+                if (AstVhdlRange* const rp = VN_CAST(cp->exprp(), VhdlRange)) {
+                    const VhdlValue lo = rp->leftp() ? eval(rp->leftp()) : VhdlValue{};
+                    const VhdlValue hi = rp->rightp() ? eval(rp->rightp()) : VhdlValue{};
+                    if (!lo.isInt() || !hi.isInt()) return VhdlValue{};
+                    const VhdlValue v = eval(ap->valuep());
+                    if (!v.known()) return VhdlValue{};
+                    const int64_t from = std::min(lo.toInt(), hi.toInt());
+                    const int64_t to = std::max(lo.toInt(), hi.toInt());
+                    for (int64_t i = from; i <= to; ++i) {
+                        out.setElement(i, v);
+                        given.insert(i);
+                    }
+                    continue;
+                }
+                AstNodeVhdlExpr* const cexprp = VN_CAST(cp->exprp(), NodeVhdlExpr);
+                const VhdlValue idx = cexprp ? eval(cexprp) : VhdlValue{};
+                if (!idx.isInt()) return VhdlValue{};
+                const VhdlValue v = eval(ap->valuep());
+                if (!v.known()) return VhdlValue{};
+                out.setElement(idx.toInt(), v);
+                given.insert(idx.toInt());
+            }
+        }
+        if (othersp) {
+            const VhdlValue rest = eval(othersp);
+            if (!rest.known()) return VhdlValue{};
+            for (int64_t i = 0; i < length; ++i) {
+                const int64_t index = ascending ? left + i : left - i;
+                if (!given.count(index)) out.setElement(index, rest);
+            }
+        } else if (static_cast<int64_t>(given.size()) != length) {
+            // Every element must have been given one, or the value is not one
+            return VhdlValue{};
+        }
+        return out;
+    }
+
     VhdlValue evalAggregate(AstVhdlAggregate* nodep) {
         VhdlType* const typep = nodep->vhdlTypep();
+        if (typep && !typep->isError() && typep->base()->kind() == VhdlTypeKind::ARRAY
+            && numericElement(typep)) {
+            return evalArrayAggregate(nodep, typep);
+        }
         if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return VhdlValue{};
         const std::vector<VhdlSymbol*>& elems = typep->base()->elements();
         if (elems.empty()) return VhdlValue{};
@@ -724,7 +854,16 @@ private:
                 if (prefixSymp) prefixSymp = prefixSymp->resolved();
                 AstNodeVhdlExpr* const valuep
                     = prefixSymp ? prefixSymp->userAttr(attr) : nullptr;
-                return valuep ? eval(valuep) : VhdlValue{};
+                if (!valuep) return VhdlValue{};
+                const VhdlValue whole = eval(valuep);
+                // "obj'attr(i)" names one element of what the specification
+                // gave, not the whole of it (7.2, 8.4)
+                if (nodep->argp() && whole.isArray()) {
+                    const VhdlValue idx = eval(nodep->argp());
+                    if (!idx.isInt()) return VhdlValue{};
+                    return whole.element(idx.toInt());
+                }
+                return whole;
             }
         }
 
@@ -1254,6 +1393,22 @@ private:
             }
         }
         VhdlSymbol* const symp = prefixp ? prefixp->vhdlSymp() : nullptr;
+        // An indexed name is static where the array it names is and the index
+        // is (9.4.2), and reading one element of a value already in hand is
+        // not running code. It is how a package writes a table -- "constant
+        // POLYS : nat_array := (91, 121)" -- and reads it back in a function
+        // that works a bound out.
+        if (symp && symp->kind() != VhdlSymKind::TYPE && prefixp) {
+            AstVhdlAssoc* const idxp = VN_CAST(nodep->argsp(), VhdlAssoc);
+            if (idxp && !idxp->nextp() && !idxp->formalp() && idxp->actualp()) {
+                const VhdlValue whole = eval(prefixp);
+                if (whole.isArray()) {
+                    const VhdlValue idx = eval(idxp->actualp());
+                    if (idx.isInt()) return whole.element(idx.toInt());
+                    return VhdlValue{};
+                }
+            }
+        }
         if (!symp || symp->kind() != VhdlSymKind::TYPE || !symp->typep()) return VhdlValue{};
         AstVhdlAssoc* const asp = VN_CAST(nodep->argsp(), VhdlAssoc);
         if (!asp || asp->nextp()) return VhdlValue{};
