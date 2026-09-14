@@ -15409,6 +15409,85 @@ private:
     // read once into a temporary, so that a name on the left cannot change
     // what the right side means part way through. An element of the target
     // may be a whole slice of the value, if it is of the value's own type.
+    // An aggregate target whose elements are as long as a generic says. There
+    // is no number for the run each name stands for, but there is an
+    // expression, and a select counting from the left takes it (10.6.2). The
+    // value may say nothing about its own length -- it is often a conversion
+    // of a sum -- so the length is the one the target asks for, which is what
+    // the names between the parentheses add up to. Null where this does not
+    // apply, and the caller then does the reckoning in numbers as before.
+    AstNode* aggregateTargetByExpr(AstVhdlAggregate* targetp, AstNodeVhdlExpr* valuep,
+                                   VhdlType* typep, bool signalAssign, bool sequential,
+                                   FileLine* flp) {
+        VhdlType* const elemp = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!elemp || !elementPacks(elemp) || isStringType(typep)) return nullptr;
+        // Every name in the target, in order, and how long a run each stands
+        // for. A choice says where in the value a name takes its part from,
+        // which is a question of numbers; this is for the plain list.
+        std::vector<AstVhdlElemAssoc*> assocs;
+        bool anyExpr = false;
+        for (AstVhdlElemAssoc* p = targetp->elemsp(); p; p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+            if (p->choicesp()) return nullptr;
+            const int64_t span = elementSpan(p->valuep(), typep);
+            if (span < 0) {
+                const VhdlType* const vtp = p->valuep() ? p->valuep()->vhdlTypep() : nullptr;
+                if (!vtp || !vtp->lengthEmittable()) return nullptr;
+                anyExpr = true;
+            }
+            assocs.push_back(p);
+        }
+        // Where every run is a number the old reckoning is exact, and emitting
+        // expressions for it would only make work for the folder
+        if (assocs.empty() || !anyExpr) return nullptr;
+        // How long each name's run is, and the whole they add up to
+        std::vector<AstNodeExpr*> widths;
+        AstNodeExpr* totalp = nullptr;
+        for (AstVhdlElemAssoc* const ap : assocs) {
+            const int64_t span = elementSpan(ap->valuep(), typep);
+            AstNodeExpr* const wp
+                = span >= 1 ? new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(span)}
+                            : boundsLength(ap->valuep()->vhdlTypep(), flp);
+            if (!wp) {
+                for (AstNodeExpr* const dp : widths) VL_DO_DANGLING(dp->deleteTree(), dp);
+                if (totalp) VL_DO_DANGLING(totalp->deleteTree(), totalp);
+                return nullptr;
+            }
+            widths.push_back(wp);
+            totalp = totalp ? new AstAdd{flp, totalp, wp->cloneTree(false)} : wp->cloneTree(false);
+        }
+        AstNodeExpr* const rhsp = lowerExpr(valuep);
+        if (!rhsp) {
+            for (AstNodeExpr* const dp : widths) VL_DO_DANGLING(dp->deleteTree(), dp);
+            VL_DO_DANGLING(totalp->deleteTree(), totalp);
+            return nullptr;
+        }
+        // The value is read once into a name of its own, as long as the target
+        // asks for, so that a name on the left cannot change what the right
+        // side means part way through
+        AstNodeDType* const tempDTypep = new AstPackArrayDType{
+            flp, VFlagChildDType{}, lowerType(elemp, flp),
+            new AstRange{flp, new AstSub{flp, totalp, new AstConst{flp, AstConst::Signed32{}, 1}},
+                         new AstConst{flp, AstConst::Signed32{}, 0}}};
+        AstVar* const tempp = newTempVar("__Vaggtgt", tempDTypep, flp);
+        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
+        // The leftmost name takes the run at the high end, and each name after
+        // it starts where the one before it ended
+        AstNodeExpr* atp = new AstSub{flp, totalp->cloneTree(false),
+                                      new AstConst{flp, AstConst::Signed32{}, 1}};
+        for (size_t i = 0; i < assocs.size(); ++i) {
+            const int64_t span = elementSpan(assocs[i]->valuep(), typep);
+            AstNodeExpr* const fromp
+                = new AstSelMinus{flp, new AstVarRef{flp, tempp, VAccess::READ},
+                                  atp->cloneTree(false), widths[i]->cloneTree(false)};
+            outp = AstNode::addNextNull(outp, oneTarget(assocs[i]->valuep(), fromp,
+                                                        span == 1 ? elemp : typep, signalAssign,
+                                                        sequential, flp));
+            atp = new AstSub{flp, atp, widths[i]};
+        }
+        VL_DO_DANGLING(atp->deleteTree(), atp);
+        return outp;
+    }
+
     AstNode* lowerAggregateTarget(AstVhdlAggregate* targetp, AstNodeVhdlExpr* valuep,
                                   bool signalAssign, bool sequential, FileLine* flp) {
         VhdlType* const typep = valuep->vhdlTypep();
@@ -15417,6 +15496,12 @@ private:
             || (!isRecord && typep->dimensions() != 1)) {
             unsup(flp, "aggregate target of this type");
             return nullptr;
+        }
+        if (!isRecord && !typep->isConstrainedArray()) {
+            if (AstNode* const outp
+                = aggregateTargetByExpr(targetp, valuep, typep, signalAssign, sequential, flp)) {
+                return outp;
+            }
         }
         AstNodeExpr* const rhsp = lowerExpr(valuep);
         if (!rhsp) return nullptr;
