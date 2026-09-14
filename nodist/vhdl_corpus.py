@@ -67,6 +67,14 @@ NEEDS_LIBRARY = frozenset(('compliance', 'uvvm', 'vunit'))
 EXPECT_RULES = (
     (re.compile(r'/vests/.*/disputed/'), 'skip'),
     (re.compile(r'/vests/vhdl-ams/'), 'skip'),  # VHDL-AMS is a different language
+    # A source VESTS files under "simulator_failure" breaks a rule that only
+    # running can catch -- an integer overflow in a variable, say -- so it is
+    # *analyzed* like any other and fails when it runs.  Reading the parent
+    # directory alone and refusing it is scoring the wrong thing, and scores
+    # it both ways at once: a source this frontend wrongly refuses counts as
+    # a pass.  This measures what a lint run can measure, which is that the
+    # analysis succeeds.
+    (re.compile(r'/vests/.*/non_compliant/simulator_failure/'), 'accept'),
     (re.compile(r'/vests/.*/non_compliant/'), 'reject'),
     (re.compile(r'/vests/.*/compliant/'), 'accept'),
     (re.compile(r'/vests/.*/iofiles/'), 'skip'),
