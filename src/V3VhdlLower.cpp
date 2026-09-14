@@ -4845,6 +4845,31 @@ private:
     // Whether a value of this type is one the back end can carry as a
     // parameter. An array whose element does not pack has none: a parameter
     // holds one value, and such an array is a list of structures.
+    // A constant holding a table of scalars -- "constant POLYS : nat_array :=
+    // (121, 91)" -- is emitted as a parameter rather than as an object. A
+    // constant function may read a parameter and not a variable, so a table
+    // emitted as an object stops the back end folding every bound worked out
+    // from it. Only a run of scalars: a record, a string or an array of
+    // either is a value a parameter cannot carry, and asking for one is an
+    // internal error rather than a refusal.
+    static bool isTableConstant(const VhdlSymbol* symp) {
+        if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return false;
+        const VhdlType* const typep = symp->typep();
+        if (!typep || typep->isError()) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ARRAY) return false;
+        if (basep->indexTypes().size() != 1) return false;
+        if (isStringType(typep)) return false;
+        const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        if (!elemp) return false;
+        switch (elemp->base()->kind()) {
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+        case VhdlTypeKind::FLOATING: return true;
+        default: return false;
+        }
+    }
+
     bool parameterizable(const VhdlType* typep) {
         if (!typep) return true;
         if (typep->base()->kind() != VhdlTypeKind::ARRAY) return true;
@@ -6899,8 +6924,15 @@ private:
         // A constant standing for a generic an instantiation supplied is a
         // parameter, not a variable: a type declared beside it may be as long
         // as it says, and that range has to fold with it (4.9)
-        const VVarType varType
-            = declp->isElabConstant() ? VVarType::LPARAM : VVarType::VAR;
+        // A VHDL constant is a constant, so it is emitted as a parameter
+        // wherever its value folds -- including a table written as an
+        // aggregate. That is what lets the back end run a constant function
+        // over it: a function may read a parameter and not a variable, so a
+        // table emitted as an object stops every bound worked out from it.
+        // Where the value does not fold, the object is demoted below.
+        const VVarType varType = (declp->isElabConstant() || isTableConstant(symp))
+                                     ? VVarType::LPARAM
+                                     : VVarType::VAR;
         AstVar* const varp = newVarOfType(symp, varType, dtypep, flp);
         // What working out its value needed -- a copy of a subprogram made
         // for that one call -- belongs wherever the object ends up, so it is
