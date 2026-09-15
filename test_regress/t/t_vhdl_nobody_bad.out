@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_nobody.vhd:26:20: Call to 'to_int', whose body no design unit read here declares
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_nobody.vhd:27:9: Call to 'note', whose body no design unit read here declares
+%Error: Exiting due to

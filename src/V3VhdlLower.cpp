@@ -10369,6 +10369,23 @@ private:
     // of its own is emitted once per call site with the lengths that call
     // supplies; where a call cannot say them, it is that which is missing,
     // not the subprogram.
+    // A subprogram declared in a package whose body was never analyzed. A
+    // package declaration stands on its own (13.1), so such a design is
+    // legal to analyze and it is elaborating the call that is the error
+    // (12.3) -- which is what GHDL 7.0.0-dev, nvc 1.22.1 and Questa 2025.2
+    // all do. Verilator has no step between the two, so the call is let
+    // through when only linting and refused when a model is being built.
+    bool bodylessCall(VhdlSymbol* symp, FileLine* flp) {
+        if (!symp || symp->bodyp() || symp->hasBody() || symp->isForeign() || symp->predefined()) {
+            return false;
+        }
+        if (!v3Global.opt.lintOnly()) {
+            flp->v3error("Call to '" + symp->name()
+                         + "', whose body no design unit read here declares");
+        }
+        return true;
+    }
+
     std::string whyNotEmitted(VhdlSymbol* symp) {
         if (!symp) return "";
         for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
@@ -10654,6 +10671,7 @@ private:
         // A predefined operator named rather than written: "\"+\"(a, b)", or
         // reached through a generic subprogram bound to one (4.5.3, 6.5.5)
         if (AstNodeExpr* const outp = lowerOperatorCall(symp, nodep, flp)) return outp;
+        if (bodylessCall(symp, flp)) return defaultValueFor(symp->returnTypep(), flp);
         unsup(flp, "call to '" + symp->name() + "'" + whyNotEmitted(symp));
         return nullptr;
     }
@@ -16902,6 +16920,13 @@ private:
             it = m_funcs.find(symp);
         }
         if (it == m_funcs.end() || !VN_IS(it->second, Task)) {
+            if (bodylessCall(symp, flp)) {
+                // Nothing to call, and nothing wrong with the statement
+                // around it: a placeholder keeps it from being reported as
+                // one that could not be lowered
+                return new AstComment{flp,
+                                      "VHDL call to '" + symp->name() + "', which has no body"};
+            }
             unsup(flp, "procedure call to '"
                            + (symp ? symp->name() : std::string{"<name>"}) + "'"
                            + whyNotEmitted(symp));
