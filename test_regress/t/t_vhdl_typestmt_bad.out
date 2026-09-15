@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_typestmt_bad.vhd:25:9: 'small' is a type, and a statement of its own can only be a call to a procedure
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_typestmt_bad.vhd:26:13: 'pair' is a type, and a statement of its own can only be a call to a procedure
+%Error: Exiting due to

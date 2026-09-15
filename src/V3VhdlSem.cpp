@@ -9146,6 +9146,17 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() == VhdlSymKind::TYPE) {
             nodep->prefixp()->vhdlSymp(symp);
+            // A statement of its own can only be a procedure call (10.7), so
+            // a type mark here is not a conversion but a name that cannot be
+            // what the statement needs. Written on its own after a label it
+            // is what an object declaration misplaced among the statements
+            // looks like to the parser.
+            if (wantProc) {
+                err(nodep->fileline(), "'" + symp->name()
+                                           + "' is a type, and a statement of its own can"
+                                             " only be a call to a procedure");
+                return V3VhdlStd::errorType();
+            }
             int operands = 0;
             for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp()) {
                 if (AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
@@ -9208,6 +9219,12 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                     checkArrayValue(asp->actualp(), symp->typep(),
                                     "the conversion to " + symp->typep()->prettyName());
                 }
+            }
+            if (!operands) {
+                err(nodep->fileline(),
+                    "A type conversion has exactly one operand, and this one to "
+                        + symp->typep()->prettyName() + " is given none");
+                return V3VhdlStd::errorType();
             }
             const std::string what = "the conversion to " + symp->typep()->prettyName();
             const VhdlValue val = V3VhdlEval::eval(nodep);
@@ -13440,6 +13457,21 @@ void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) {
     VL_RESTORER(m_procCall);
     m_procCall = true;
     analyzeExpr(nodep->callp(), nullptr);
+    // A statement of its own is a procedure call and nothing else (10.7). A
+    // type mark standing here is a type conversion with no operand, which is
+    // what an object declaration misplaced among the statements looks like
+    // to the parser: "x : some_type;" reads as the label x on a call to
+    // some_type. Saying so names what the reader wrote.
+    AstNodeVhdlExpr* const callp = nodep->callp();
+    VhdlSymbol* symp = callp ? callp->vhdlSymp() : nullptr;
+    if (const AstVhdlCall* const cp = VN_CAST(callp, VhdlCall)) {
+        if (!symp && cp->prefixp()) symp = cp->prefixp()->vhdlSymp();
+    }
+    if (symp && symp->resolved() && symp->resolved()->kind() == VhdlSymKind::TYPE) {
+        err(nodep->fileline(), "'" + symp->name()
+                                   + "' is a type, and a statement of its own can only be"
+                                     " a call to a procedure");
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlNext* nodep) {
