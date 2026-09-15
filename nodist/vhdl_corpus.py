@@ -67,13 +67,22 @@ NEEDS_LIBRARY = frozenset(('compliance', 'uvvm', 'vunit'))
 EXPECT_RULES = (
     (re.compile(r'/vests/.*/disputed/'), 'skip'),
     (re.compile(r'/vests/vhdl-ams/'), 'skip'),  # VHDL-AMS is a different language
-    # A source VESTS files under "simulator_failure" breaks a rule that only
-    # running can catch -- an integer overflow in a variable, say -- so it is
-    # *analyzed* like any other and fails when it runs.  Reading the parent
-    # directory alone and refusing it is scoring the wrong thing, and scores
-    # it both ways at once: a source this frontend wrongly refuses counts as
-    # a pass.  This measures what a lint run can measure, which is that the
-    # analysis succeeds.
+    # Most VESTS sources under "simulator_failure" break a rule that only
+    # running can catch -- an integer overflow in a variable, say -- so they
+    # are *analyzed* like any other source and fail when they run.  Reading
+    # the parent directory alone and refusing them scores the wrong thing,
+    # and scores it both ways at once: a source this frontend wrongly refuses
+    # would count as a pass.
+    #
+    # Four of them are not like that, and the directory name is simply wrong
+    # about them: the error is one an analyzer does see.  GHDL's own runner
+    # says so -- non_compliant.exp has each of the four commented out with
+    # "detected during analysis" -- and running them through the references
+    # agrees: GHDL 7.0.0-dev, nvc 1.22.1 and Questa 2025.2 refuse tc1227,
+    # tc1707, tc1708 and tc1725 between them by a majority each.  They are
+    # named here rather than derived, because what makes them different is a
+    # fact about each source and not about where it sits.
+    (re.compile(r'/vests/.*/simulator_failure/tc(1227|1707|1708|1725)\.vhd$'), 'reject'),
     (re.compile(r'/vests/.*/non_compliant/simulator_failure/'), 'accept'),
     (re.compile(r'/vests/.*/non_compliant/'), 'reject'),
     (re.compile(r'/vests/.*/compliant/'), 'accept'),
