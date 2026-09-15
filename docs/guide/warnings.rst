@@ -1192,6 +1192,14 @@ List Of Warnings
    Ignoring this warning will only suppress the lint check; it will
    simulate correctly (i.e. hang due to the infinite loop).
 
+   In VHDL, also warns that a process has no sensitivity list and never
+   waits -- neither in its own statements nor in any procedure it calls --
+   so that it would loop for ever at the start of the simulation without
+   letting time pass (IEEE 1076-2008 11.3). Other simulators hang on such a
+   process; Verilator runs it once instead, which is rarely what was meant.
+   A process that ends the run with ``std.env.stop`` or ``std.env.finish``
+   is not reported.
+
 
 .. option:: INITIALDLY
 

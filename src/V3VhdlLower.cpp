@@ -12757,11 +12757,54 @@ private:
     // become edge-triggered, or every register would be re-evaluated whenever
     // any of its inputs changed and the speed the project exists for is lost.
     // Whether anything in these statements suspends the process
+    // A wait written in a procedure the statements call counts as theirs:
+    // the call suspends the process that makes it (10.2), and a process
+    // whose only wait is in one -- a clock generator calling its half-period
+    // procedure -- still suspends, and loops.
     static bool hasWait(AstNode* nodep) {
+        std::set<const AstVhdlSubprogDecl*> visited;
+        return hasWaitIn(nodep, visited);
+    }
+    // Whether the statements may bring the run to an end, or call something
+    // whose body is not here to say: a process with no wait that finishes
+    // the simulation does not loop, and one calling what cannot be seen
+    // may be waiting there. Neither is worth reporting as a loop.
+    static bool mayEndRun(AstNode* nodep) {
         bool found = false;
         for (AstNode* p = nodep; p && !found; p = p->nextp()) {
-            p->foreach([&found](AstNode* subp) {
-                if (VN_IS(subp, VhdlWait)) found = true;
+            p->foreach([&](const AstVhdlProcCall* pcallp) {
+                if (found || !pcallp->callp()) return;
+                VhdlSymbol* const namedp = pcallp->callp()->vhdlSymp();
+                const VhdlSymbol* const symp = namedp ? namedp->resolved() : nullptr;
+                if (!symp) return;
+                // STD.ENV's STOP and FINISH (16.5)
+                if (symp->predefined()) {
+                    if (symp->name() == "stop" || symp->name() == "finish") found = true;
+                    return;
+                }
+                if (!symp->bodyp()) found = true;
+            });
+        }
+        return found;
+    }
+
+    static bool hasWaitIn(AstNode* nodep, std::set<const AstVhdlSubprogDecl*>& visited) {
+        bool found = false;
+        for (AstNode* p = nodep; p && !found; p = p->nextp()) {
+            p->foreach([&](AstNode* subp) {
+                if (found) return;
+                if (VN_IS(subp, VhdlWait)) {
+                    found = true;
+                    return;
+                }
+                const AstVhdlProcCall* const pcallp = VN_CAST(subp, VhdlProcCall);
+                if (!pcallp || !pcallp->callp()) return;
+                VhdlSymbol* const namedp = pcallp->callp()->vhdlSymp();
+                VhdlSymbol* const symp = namedp ? namedp->resolved() : nullptr;
+                AstVhdlSubprogDecl* const declp = symp ? symp->bodyp() : nullptr;
+                if (!declp) return;
+                if (!visited.insert(declp).second) return;
+                if (hasWaitIn(declp->stmtsp(), visited)) found = true;
             });
         }
         return found;
@@ -12875,6 +12918,16 @@ private:
             // a process can usefully do -- run once, and stop the run -- and
             // is not taken for combinational logic, which reading and writing
             // its own variables would otherwise make it.
+            //
+            // It is not what the language says, though: such a process loops
+            // for ever without letting time pass (11.3), and every other
+            // simulator hangs on it. Running it once hides that, so it is
+            // said.
+            if (!mayEndRun(nodep->stmtsp())) {
+                flp->v3warn(INFINITELOOP, "Process has no sensitivity list and never waits, so it"
+                                          " loops for ever at the start of the simulation; it is"
+                                          " run once instead");
+            }
             addStmt(new AstInitial{flp, bodyp});
             return;
         }
