@@ -1678,6 +1678,10 @@ AstNodeVhdlStmt* V3VhdlParse::parseProcess(const std::string& label, bool postpo
     nodep->postponed(postponed);
     if (check(VhdlTokType::LPAREN)) {
         nodep->hasSensList(true);
+        if (peekType() == VhdlTokType::KWD_ALL && here()->language() < V3LangCode::L1076_2008) {
+            here()->v3error("Before VHDL-2008 a process names the signals it is sensitive to;"
+                            " 'all' is not one");
+        }
         if (check(VhdlTokType::KWD_ALL)) {
             nodep->sensAll(true);  // VHDL-2008
         } else {
