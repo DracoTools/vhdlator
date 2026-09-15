@@ -192,6 +192,7 @@ public:
         VARHIDDEN,      // Hiding variable
         VHDLBOUNDS,     // VHDL value outside the range its subtype allows
         VHDLELABORDER,  // VHDL use of a body not yet elaborated
+        VHDLGENERIC,    // VHDL generic with no value taken as one, to lint with
         VHDLSHARED,     // VHDL shared variable of a type not protected
         VHDLUNBOUND,    // VHDL component instance with no entity bound to it
         WAITCONST,      // Wait condition is constant
@@ -219,43 +220,47 @@ public:
         : m_e(static_cast<en>(_e)) {}  // Need () or GCC 4.8 false warning
     constexpr operator en() const VL_MT_SAFE { return m_e; }
     const char* ascii() const VL_MT_SAFE {
-        static const char* const names[] = {
-            // Leading spaces indicate it can't be disabled.
-            " MIN", " INFO", " FATAL", " FATALMANY", " FATALSRC", " ERROR", " FIRST_NAMED",
-            // Boolean
-            " I_CELLDEFINE", " I_COVERAGE", " I_DEF_NETTYPE_WIRE", " I_LINT", " I_STYLE",
-            " I_TIMING", " I_TRACING",
-            // Errors
-            "CONTASSINIT", "CONSTWRITTEN", "LIFETIME", "NEEDTIMINGOPT", "NOTIMING", "PORTSHORT",
-            "TASKNSVAR", "UNSUPPORTED",
-            // Warnings
-            " EC_FIRST_WARN", "ALWCOMBORDER", "ALWNEVER", "ASCRANGE", "ASSIGNDLY", "ASSIGNEQEXPR",
-            "ASSIGNIN", "BADSTDPRAGMA", "BADVLTPRAGMA", "BLKANDNBLK", "BLKLOOPINIT", "BLKSEQ",
-            "BSSPACE", "CASEINCOMPLETE", "CASEOVERLAP", "CASEWITHX", "CASEX", "CASTCONST",
-            "CDCRSTLOGIC", "CLKDATA", "CMPCONST", "COLONPLUS", "COMBDLY", "CONSTRAINTIGN",
-            "CONTASSREG", "COVERIGN", "DECLFILENAME", "DEFOVERRIDE", "DEFPARAM", "DEPRECATED",
-            "ENCAPSULATED", "ENDLABEL", "ENUMITEMWIDTH", "ENUMVALUE", "EOFNEWLINE", "FINALDLY",
-            "FSMMULTI", "FUNCTIMECTL", "FUTURE", "GENCLK", "GENUNNAMED", "HIERBLOCK", "HIERPARAM",
-            "IEEEMAYDEPRECATE", "IFDEPTH", "IGNOREDRETURN", "IMPERFECTSCH", "IMPLICIT",
-            "IMPLICITSTATIC", "IMPORTSTAR", "IMPURE", "INCABSPATH", "INFINITELOOP", "INITIALDLY",
-            "INSECURE", "INSIDETRUE", "LATCH", "LITENDIAN", "MINTYPMAXDLY", "MISINDENT", "MODDUP",
-            "MODMISSING", "MULTIDRIVEN", "MULTIDRIVENPROC", "MULTITOP", "NEWERSTD", "NOEFFECT",
-            "NOLATCH", "NONSTD", "NORETURN", "NOTREDOP", "NULLPORT", "PARAMNODEFAULT",
-            "PINCONNECTEMPTY", "PINMISSING", "PINNOCONNECT", "PINNOTFOUND", "PKGNODECL",
-            "PREPROCZERO", "PROCASSINIT", "PROCASSWIRE", "PROFOUTOFDATE", "PROTECTED",
-            "PROTOTYPEMIS", "RANDC", "REALCVT", "REDEFMACRO", "RISEFALLDLY", "SELRANGE",
-            "SHORTREAL", "SIDEEFFECT", "SIMILARNAME", "SPECIFYIGN", "SPLITVAR", "STATICVAR",
-            "STMTDLY", "SUPERNFIRST", "SYMRSVDWORD", "SYNCASYNCNET", "TICKCOUNT", "TIMESCALEMOD",
-            "UNDRIVEN", "UNOPT", "UNOPTFLAT", "UNOPTTHREADS", "UNPACKED", "UNSATCONSTR",
-            "UNSIGNED", "UNUSED", "UNUSEDGENVAR", "UNUSEDLOOP", "UNUSEDPARAM", "UNUSEDSIGNAL",
-            "USERERROR", "USERFATAL", "USERINFO", "USERWARN", "VARHIDDEN", "VHDLBOUNDS",
-            "VHDLELABORDER", "VHDLSHARED", "VHDLUNBOUND", "WAITCONST", "WIDTH", "WIDTHCONCAT",
-            "WIDTHEXPAND", "WIDTHTRUNC", "WIDTHXZEXPAND", "ZERODLY", "ZEROREPL", " MAX"};
+        static const char* const names[]
+            = {// Leading spaces indicate it can't be disabled.
+               " MIN", " INFO", " FATAL", " FATALMANY", " FATALSRC", " ERROR", " FIRST_NAMED",
+               // Boolean
+               " I_CELLDEFINE", " I_COVERAGE", " I_DEF_NETTYPE_WIRE", " I_LINT", " I_STYLE",
+               " I_TIMING", " I_TRACING",
+               // Errors
+               "CONTASSINIT", "CONSTWRITTEN", "LIFETIME", "NEEDTIMINGOPT", "NOTIMING", "PORTSHORT",
+               "TASKNSVAR", "UNSUPPORTED",
+               // Warnings
+               " EC_FIRST_WARN", "ALWCOMBORDER", "ALWNEVER", "ASCRANGE", "ASSIGNDLY",
+               "ASSIGNEQEXPR", "ASSIGNIN", "BADSTDPRAGMA", "BADVLTPRAGMA", "BLKANDNBLK",
+               "BLKLOOPINIT", "BLKSEQ", "BSSPACE", "CASEINCOMPLETE", "CASEOVERLAP", "CASEWITHX",
+               "CASEX", "CASTCONST", "CDCRSTLOGIC", "CLKDATA", "CMPCONST", "COLONPLUS", "COMBDLY",
+               "CONSTRAINTIGN", "CONTASSREG", "COVERIGN", "DECLFILENAME", "DEFOVERRIDE",
+               "DEFPARAM", "DEPRECATED", "ENCAPSULATED", "ENDLABEL", "ENUMITEMWIDTH", "ENUMVALUE",
+               "EOFNEWLINE", "FINALDLY", "FSMMULTI", "FUNCTIMECTL", "FUTURE", "GENCLK",
+               "GENUNNAMED", "HIERBLOCK", "HIERPARAM", "IEEEMAYDEPRECATE", "IFDEPTH",
+               "IGNOREDRETURN", "IMPERFECTSCH", "IMPLICIT", "IMPLICITSTATIC", "IMPORTSTAR",
+               "IMPURE", "INCABSPATH", "INFINITELOOP", "INITIALDLY", "INSECURE", "INSIDETRUE",
+               "LATCH", "LITENDIAN", "MINTYPMAXDLY", "MISINDENT", "MODDUP", "MODMISSING",
+               "MULTIDRIVEN", "MULTIDRIVENPROC", "MULTITOP", "NEWERSTD", "NOEFFECT", "NOLATCH",
+               "NONSTD", "NORETURN", "NOTREDOP", "NULLPORT", "PARAMNODEFAULT", "PINCONNECTEMPTY",
+               "PINMISSING", "PINNOCONNECT", "PINNOTFOUND", "PKGNODECL", "PREPROCZERO",
+               "PROCASSINIT", "PROCASSWIRE", "PROFOUTOFDATE", "PROTECTED", "PROTOTYPEMIS", "RANDC",
+               "REALCVT", "REDEFMACRO", "RISEFALLDLY", "SELRANGE", "SHORTREAL", "SIDEEFFECT",
+               "SIMILARNAME", "SPECIFYIGN", "SPLITVAR", "STATICVAR", "STMTDLY", "SUPERNFIRST",
+               "SYMRSVDWORD", "SYNCASYNCNET", "TICKCOUNT", "TIMESCALEMOD", "UNDRIVEN", "UNOPT",
+               "UNOPTFLAT", "UNOPTTHREADS", "UNPACKED", "UNSATCONSTR", "UNSIGNED", "UNUSED",
+               "UNUSEDGENVAR", "UNUSEDLOOP", "UNUSEDPARAM", "UNUSEDSIGNAL", "USERERROR",
+               "USERFATAL", "USERINFO", "USERWARN", "VARHIDDEN", "VHDLBOUNDS", "VHDLELABORDER",
+               "VHDLGENERIC", "VHDLSHARED", "VHDLUNBOUND", "WAITCONST", "WIDTH", "WIDTHCONCAT",
+               "WIDTHEXPAND", "WIDTHTRUNC", "WIDTHXZEXPAND", "ZERODLY", "ZEROREPL", " MAX"};
         return names[m_e];
     }
     // Warnings that default to off
     bool defaultsOff() const VL_MT_SAFE {
-        return (m_e == IMPERFECTSCH || m_e == I_CELLDEFINE || styleError());
+        // VHDLGENERIC off by default: a generic with no default is how VHDL
+        // says the instantiation must choose, so it is the normal shape of a
+        // reusable component and linting one must not stop on it
+        return (m_e == IMPERFECTSCH || m_e == I_CELLDEFINE || m_e == VHDLGENERIC || styleError());
     }
     // Warnings that warn about nasty side effects
     bool dangerous() const VL_MT_SAFE { return (m_e == COMBDLY); }

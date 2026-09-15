@@ -4991,7 +4991,26 @@ private:
                 // A generic is a parameter, so V3Param clones a module per set
                 // of values exactly as VHDL elaboration would
                 AstVar* const varp = newVar(symp, VVarType::GPARAM, flp);
-                if (nodep->defaultp()) varp->valuep(lowerExpr(nodep->defaultp()));
+                if (nodep->defaultp()) {
+                    varp->valuep(lowerExpr(nodep->defaultp()));
+                } else if (v3Global.opt.lintOnly()) {
+                    // A generic with no default is how VHDL says the
+                    // instantiation must choose, so a reusable component
+                    // normally has one. Analyzing such an entity needs no
+                    // value -- GHDL 7.0.0-dev and nvc 1.22.1 both do it --
+                    // but this pipeline elaborates before it can check
+                    // widths, and without a value it stops at the generic
+                    // rather than looking at the architecture at all. One is
+                    // taken so that linting reaches the body. Only while
+                    // linting: a model cannot be built without the real one.
+                    if (AstNodeExpr* const valuep = lintGenericValue(symp->typep(), flp)) {
+                        varp->valuep(valuep);
+                        flp->v3warn(VHDLGENERIC,
+                                    "Generic '" + symp->name()
+                                        + "' has no default, and a value is taken for it so that"
+                                          " linting reaches the architecture");
+                    }
+                }
                 addStmt(varp);
                 return;
             }
@@ -5434,6 +5453,29 @@ private:
         case VhdlTypeKind::ENUM: return !enumIsLogic(typep->base());
         default: return false;
         }
+    }
+
+    // A value to lint a generic with, where the design gives none. One is
+    // preferred over the subtype's own default because a width is usually
+    // written in terms of the generic -- "v(N - 1 downto 0)" -- and INTEGER's
+    // default is its leftmost value, which such a width cannot survive.
+    AstNodeExpr* lintGenericValue(VhdlType* typep, FileLine* flp) {
+        if (!typep || !typep->isScalar()) return nullptr;
+        // Only for the kinds a width is written in terms of. An enumeration
+        // is never one, and its values are as wide as the type rather than
+        // as wide as an integer, so it takes its own default instead.
+        const VhdlTypeKind kind = typep->base()->kind();
+        const bool real = kind == VhdlTypeKind::FLOATING;
+        if (real || kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::PHYSICAL) {
+            const VhdlValue one = real ? VhdlValue::mkReal(1.0) : VhdlValue::mkInt(1);
+            if (V3VhdlEval::inRange(one, typep)) {
+                return real
+                           ? static_cast<AstNodeExpr*>(
+                                 new AstConst{flp, AstConst::RealDouble{}, 1.0})
+                           : static_cast<AstNodeExpr*>(new AstConst{flp, AstConst::Signed32{}, 1});
+            }
+        }
+        return defaultValueFor(typep, flp);
     }
 
     AstNodeExpr* defaultValueFor(VhdlType* typep, FileLine* flp, bool mustHave = false) {

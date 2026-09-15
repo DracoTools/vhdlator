@@ -2734,6 +2734,37 @@ List Of Warnings
    package, move the use into the package body after the body it needs.
 
 
+.. option:: VHDLGENERIC
+
+   Warns that a VHDL generic has no default value and that Verilator has
+   taken one so that a lint run can reach the architecture. Off by default.
+
+   A generic with no default is how VHDL says the instantiation must choose,
+   so it is the normal shape of a reusable component, and other tools
+   analyze such an entity without needing a value. Verilator elaborates
+   before it can check widths, so with no value it would stop at the generic
+   and never look at the architecture at all. Under :vlopt:`--lint-only` a
+   value is therefore assumed -- 1 where the generic's subtype allows it,
+   and the subtype's default otherwise -- and the architecture is checked
+   with it.
+
+   Building a model is unaffected: there the generic must be given a real
+   value, with :vlopt:`-G\<name\>` or by the instantiation.
+
+   Example:
+
+   .. code-block:: vhdl
+
+      entity counter is
+        generic (WIDTH : positive);        -- No default; 1 assumed to lint
+        port (q : out std_logic_vector(WIDTH - 1 downto 0));
+      end entity;
+
+   To resolve this, pass the value the design will use, as in
+   ``verilator --lint-only -GWIDTH=8 counter.vhd``, so that the widths
+   checked are the ones that will be built.
+
+
 .. option:: VHDLSHARED
 
    Warns that a VHDL shared variable, in VHDL-2000 or later, is of an
