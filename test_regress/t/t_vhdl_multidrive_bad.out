@@ -1,0 +1,5 @@
+%Warning-MULTIDRIVEN: t/t_vhdl_multidrive_bad.vhd:21:5: Signal 'i' has 2 drivers, but its subtype names no resolution function
+                      ... For warning description see https://verilator.org/warn/MULTIDRIVEN?v=latest
+                      ... Use "/* verilator lint_off MULTIDRIVEN */" and lint_on around source to disable this message.
+%Warning-MULTIDRIVEN: t/t_vhdl_multidrive_bad.vhd:24:5: Signal 'b' has 3 drivers, but its subtype names no resolution function
+%Error: Exiting due to

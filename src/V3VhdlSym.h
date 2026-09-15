@@ -125,6 +125,9 @@ class VhdlSymbol final {
     // gives it the copy that takes that many values.
     int m_driverCount = 0;
     VhdlSymbol* m_resolverp = nullptr;
+    // A composite whose element subtype names the resolution function: the
+    // drivers are resolved one element at a time rather than whole (14.7.3.2)
+    bool m_resolvePerElement = false;
     AstVhdlSubprogDecl* m_bodyp = nullptr;  // A subprogram's body, for copying
     // Values given by attribute specifications (7.2), by attribute name. The
     // expression stays owned by the specification.
@@ -169,6 +172,8 @@ public:
     void driverCount(int n) { m_driverCount = n; }
     VhdlSymbol* resolverp() const { return m_resolverp; }
     void resolverp(VhdlSymbol* symp) { m_resolverp = symp; }
+    bool resolvePerElement() const { return m_resolvePerElement; }
+    void resolvePerElement(bool flag) { m_resolvePerElement = flag; }
 
     const std::string& foreignName() const { return m_foreignName; }
     void foreignName(const std::string& name) { m_foreignName = name; }

@@ -5223,9 +5223,12 @@ private:
                 addStmt(m_ftaskp ? setp : new AstInitial{flp, setp});
             }
             if (objp->kind() == VhdlObjKind::SIGNAL) {
-                if (isLogicish(symp->typep())) {
+                if (isLogicish(symp->typep()) && !symp->resolvePerElement()) {
                     // One driver of a logic signal resolves to itself, so the
-                    // wiring is only worth building for several
+                    // wiring is only worth building for several. An array
+                    // whose element subtype names a function of the design's
+                    // own is not resolved by the logic tables even though it
+                    // is made of bits, so it is not wired this way.
                     if (isResolvedSignal(symp)) makeResolved(symp, varp, flp);
                 } else if (symp->resolverp()) {
                     // A function of its own is run over the drivers however
@@ -13334,6 +13337,25 @@ private:
             unsup(flp, what);
             return;
         }
+        // Where the function resolves one element at a time, the signal's own
+        // index range says how many times it is run and over which indices
+        // (14.7.3.2), so that range has to be known here
+        const bool perElement = symp->resolvePerElement();
+        VhdlType* const sigTypep = symp->typep();
+        const VhdlType* sigIdxp = nullptr;
+        int64_t elems = 0;
+        if (perElement) {
+            if (!sigTypep || !sigTypep->isConstrainedArray() || sigTypep->dimensions() != 1) {
+                unsup(flp, what);
+                return;
+            }
+            sigIdxp = sigTypep->indexTypes()[0];
+            elems = sigTypep->dimLength(0);
+            if (!sigIdxp || !sigIdxp->bounded() || elems <= 0) {
+                unsup(flp, what);
+                return;
+            }
+        }
         AstNodeFTask* ftaskp = nullptr;
         {
             const auto it = m_funcs.find(resolvep);
@@ -13381,24 +13403,43 @@ private:
         // concatenation: the widths are not known until V3Width, and a
         // concatenation has to know them as it is built.
         const VhdlType* const idxp = paramTypep->indexTypes()[0];
+        // One pass where the function resolves the whole signal, and one per
+        // element where it resolves the elements. The array handed to the
+        // function is filled afresh each pass, so one of it serves them all.
+        const int64_t passes = perElement ? elems : 1;
         AstNode* bodyp = nullptr;
-        for (int i = 0; i < count; ++i) {
-            const int64_t index = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
+        for (int64_t pass = 0; pass < passes; ++pass) {
+            const int64_t at = !perElement            ? 0
+                               : sigIdxp->ascending() ? sigIdxp->left() + pass
+                                                      : sigIdxp->left() - pass;
+            const auto driverValue = [&](int i) -> AstNodeExpr* {
+                AstNodeExpr* const refp = new AstVarRef{flp, drivers[i].valp, VAccess::READ};
+                if (!perElement) return refp;
+                return new AstSelBit{
+                    flp, refp, new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at)}};
+            };
+            for (int i = 0; i < count; ++i) {
+                const int64_t index = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
+                bodyp = AstNode::addNextNull(
+                    bodyp, static_cast<AstNode*>(new AstAssign{
+                               flp,
+                               new AstSelBit{flp, new AstVarRef{flp, arrp, VAccess::WRITE},
+                                             new AstConst{flp, AstConst::Signed32{},
+                                                          static_cast<int32_t>(index)}},
+                               driverValue(i)}));
+            }
+            AstFuncRef* const callp = new AstFuncRef{flp, ftaskp->name(), nullptr};
+            callp->taskp(ftaskp);
+            callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, arrp, VAccess::READ}});
+            AstNodeExpr* targetp = new AstVarRef{flp, netp, VAccess::WRITE};
+            if (perElement) {
+                targetp = new AstSelBit{
+                    flp, targetp,
+                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at)}};
+            }
             bodyp = AstNode::addNextNull(
-                bodyp,
-                static_cast<AstNode*>(new AstAssign{
-                    flp,
-                    new AstSelBit{flp, new AstVarRef{flp, arrp, VAccess::WRITE},
-                                  new AstConst{flp, AstConst::Signed32{},
-                                               static_cast<int32_t>(index)}},
-                    new AstVarRef{flp, drivers[i].valp, VAccess::READ}}));
+                bodyp, static_cast<AstNode*>(new AstAssign{flp, targetp, callp}));
         }
-        AstFuncRef* const callp = new AstFuncRef{flp, ftaskp->name(), nullptr};
-        callp->taskp(ftaskp);
-        callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, arrp, VAccess::READ}});
-        bodyp = AstNode::addNextNull(
-            bodyp, static_cast<AstNode*>(
-                       new AstAssign{flp, new AstVarRef{flp, netp, VAccess::WRITE}, callp}));
         // Whenever any driver changes, which is what the process reads
         addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
         m_drivers.emplace(symp, drivers);

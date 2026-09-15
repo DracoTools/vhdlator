@@ -2055,6 +2055,8 @@ private:
     void analyzeDrivers(AstVhdlArchitecture* archp) VL_MT_DISABLED;
     static bool isLogicValued(const VhdlType* typep) VL_MT_DISABLED;
     static bool driversCombined(const VhdlType* typep, int depth = 0) VL_MT_DISABLED;
+    static VhdlSymbol* elementResolver(const VhdlType* typep) VL_MT_DISABLED;
+    static bool compositeResolved(const VhdlType* typep, int depth = 0) VL_MT_DISABLED;
     void collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbol*>& whole,
                             std::set<const VhdlSymbol*>& partial) VL_MT_DISABLED;
     struct NeedResolve final {
@@ -6319,6 +6321,44 @@ bool VhdlSemVisitor::isLogicValued(const VhdlType* typep) {
     return true;
 }
 
+// The resolution function a composite signal's *elements* name, where the
+// signal's own subtype names none. A signal of such a subtype is resolved:
+// its drivers are resolved one element at a time, and the function is run
+// once per element with that element's values (14.7.3.2). Only a
+// one-dimensional array of a scalar element is answered for, since that is
+// the shape lowering can build the per-element resolution for.
+VhdlSymbol* VhdlSemVisitor::elementResolver(const VhdlType* typep) {
+    if (!typep || typep->resolutionp()) return nullptr;
+    const VhdlType* const basep = typep->base();
+    if (basep->kind() != VhdlTypeKind::ARRAY) return nullptr;
+    if (typep->dimensions() != 1) return nullptr;
+    const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+    if (!elemp || elemp->base()->kind() == VhdlTypeKind::ARRAY
+        || elemp->base()->kind() == VhdlTypeKind::RECORD) {
+        return nullptr;
+    }
+    return elemp->resolutionp();
+}
+
+// Whether every part of a composite is resolved, though not in the shape
+// lowering can build: the signal is legal and must not be reported, and
+// lowering says what it cannot do with it.
+bool VhdlSemVisitor::compositeResolved(const VhdlType* typep, int depth) {
+    if (!typep || depth > 8) return false;
+    if (typep->resolutionp()) return true;
+    const VhdlType* const basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::RECORD) {
+        if (basep->elements().empty()) return false;
+        for (const VhdlSymbol* const elemp : basep->elements()) {
+            if (!compositeResolved(elemp->typep(), depth + 1)) return false;
+        }
+        return true;
+    }
+    if (basep->kind() != VhdlTypeKind::ARRAY) return false;
+    const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+    return compositeResolved(elemp, depth + 1);
+}
+
 // Whether the drivers of such a signal are combined into one value without
 // a resolution function of the design's own being run: the nine logic
 // values resolve natively, and a composite of them resolves element by
@@ -6485,11 +6525,24 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             continue;
         }
         if (!resolvep) {
-            // The one place the language says this must be an error, and the
-            // only way a design can be told its drivers will not be combined
-            err(where[symp], "Signal '" + symp->name() + "' has "
-                                 + std::to_string(pair.second)
-                                 + " drivers, but its subtype names no resolution function");
+            // A composite whose elements are resolved is itself resolved,
+            // one element at a time (14.7.3.2)
+            if (VhdlSymbol* const elemp = elementResolver(typep)) {
+                symp->resolverp(elemp);
+                symp->resolvePerElement(true);
+                m_needResolve.push_back(NeedResolve{symp, elemp, pair.second, where[symp]});
+                continue;
+            }
+            if (compositeResolved(typep)) continue;  // Resolved, but not in a shape we build
+            // Several drivers and nothing to combine them. The language makes
+            // this an error, but of elaboration rather than of analysis, and
+            // GHDL 7.0.0-dev and nvc 1.22.1 both analyze such a design without
+            // complaint; Questa 2025.2 rejects it. Reported as Verilator
+            // reports the same situation in Verilog, so that a design which
+            // never elaborates the second driver is not refused outright.
+            where[symp]->v3warn(MULTIDRIVEN,
+                                "Signal '" + symp->name() + "' has " + std::to_string(pair.second)
+                                    + " drivers, but its subtype names no resolution function");
             continue;
         }
         symp->resolverp(resolvep);
