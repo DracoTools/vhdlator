@@ -8389,7 +8389,10 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                     "An element of this aggregate must be of type " + hintp->prettyName()
                         + ", but this one is of type " + eap->valuep()->vhdlTypep()->prettyName());
             }
-            checkValueInRange(eap->valuep(), hintp, "an element of this aggregate");
+            // An aggregate's elements belong to its element subtype, and an
+            // aggregate that says otherwise says it about itself rather
+            // than about a statement that reaches it (9.3.3.3)
+            checkValueInRange(eap->valuep(), hintp, "an element of this aggregate", true);
             // An element that is itself an array is as long as the element
             // subtype (nvc 1.22.1 and Questa 2025.2; GHDL 7.0.0-dev warns)
             if (hintp == elemTypep && !VN_IS(eap->valuep(), VhdlAggregate)) {
