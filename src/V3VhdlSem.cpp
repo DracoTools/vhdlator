@@ -218,6 +218,30 @@ class VhdlSemVisitor final : public VNVisitor {
         m_errored = true;
     }
 
+    // A generic clause declares constants, and since 2008 types, subprograms
+    // and packages too (6.5.6.1). A signal, a variable or a file is none of
+    // those: an entity is elaborated once per set of generics, and an object
+    // whose value changes while it runs cannot be one of what it is
+    // elaborated with.
+    void rejectGenericObjects(AstNode* genericsp) {
+        for (AstNode* p = genericsp; p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (!ifp) continue;
+            const char* what = nullptr;
+            switch (ifp->kind()) {
+            case VhdlIfaceKind::SIGNAL: what = "signal"; break;
+            case VhdlIfaceKind::VARIABLE: what = "variable"; break;
+            case VhdlIfaceKind::FILE: what = "file"; break;
+            default: break;
+            }
+            if (what) {
+                err(ifp->fileline(), "Generic '" + ifp->prettyName() + "' is declared a " + what
+                                         + ", and a generic clause declares only constants,"
+                                           " types, subprograms and packages");
+            }
+        }
+    }
+
     // A declarative part admits only the items its own clause lists. A
     // process may not declare a signal or a component, and neither may a
     // subprogram: what those regions are for is code, and an object that
@@ -2926,6 +2950,7 @@ void VhdlSemVisitor::visit(AstVhdlComponentDecl* nodep) {
     openPortGenerics(nodep->genericsp(), nodep, innerp);
     openPortGenerics(nodep->portsp(), nodep, innerp);
     m_ifacePos = 0;
+    rejectGenericObjects(nodep->genericsp());
     iterateAndNextNull(nodep->genericsp());
     fillOpenGenericDefaults(innerp);
     m_ifacePos = 0;
@@ -3849,6 +3874,7 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
     }
     if (nodep->headerp()) {
         m_ifacePos = 0;
+        rejectGenericObjects(nodep->headerp()->genericsp());
         iterateAndNextNull(nodep->headerp()->genericsp());
         m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->portsp());
@@ -4405,6 +4431,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             openPortGenerics(entp->genericsp(), entp, unitScopep);
             openPortGenerics(entp->portsp(), entp, unitScopep);
             m_ifacePos = 0;
+            rejectGenericObjects(entp->genericsp());
             iterateAndNextNull(entp->genericsp());
             fillOpenGenericDefaults(unitScopep);
             m_ifacePos = 0;
@@ -4478,6 +4505,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         } else if (AstVhdlPackage* const pkgp = VN_CAST(unitp, VhdlPackage)) {
             // A package's own name is visible inside it (12.1)
             unitScopep->addNamed(lower(unitp->name()), unitScopep);
+            rejectGenericObjects(pkgp->genericsp());
             iterateAndNextNull(pkgp->genericsp());
             if (!m_inSpecialized) rejectUnsharedVariables(pkgp->declsp(), "a package");
             iterateAndNextNull(pkgp->declsp());
@@ -4657,6 +4685,7 @@ void VhdlSemVisitor::visit(AstVhdlPackage* nodep) {
         }
         if (!hasBody) m_nestedPkgsNoBody.insert(nodep);
     }
+    rejectGenericObjects(nodep->genericsp());
     iterateAndNextNull(nodep->genericsp());
     // A package may carry a generic map of its own, which makes it an
     // instance of itself: its generics hold what it gives them (4.7)

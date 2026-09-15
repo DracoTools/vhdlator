@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_genericclass_bad.vhd:11:23: Generic 's' is declared a signal, and a generic clause declares only constants, types, subprograms and packages
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_genericclass_bad.vhd:12:23: Generic 'v' is declared a variable, and a generic clause declares only constants, types, subprograms and packages
+%Error: t/t_vhdl_genericclass_bad.vhd:13:23: Generic 'f' is declared a file, and a generic clause declares only constants, types, subprograms and packages
+%Error: Exiting due to
