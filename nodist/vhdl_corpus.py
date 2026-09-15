@@ -74,15 +74,10 @@ EXPECT_RULES = (
     # and scores it both ways at once: a source this frontend wrongly refuses
     # would count as a pass.
     #
-    # Four of them are not like that, and the directory name is simply wrong
-    # about them: the error is one an analyzer does see.  GHDL's own runner
-    # says so -- non_compliant.exp has each of the four commented out with
-    # "detected during analysis" -- and running them through the references
-    # agrees: GHDL 7.0.0-dev, nvc 1.22.1 and Questa 2025.2 refuse tc1227,
-    # tc1707, tc1708 and tc1725 between them by a majority each.  They are
-    # named here rather than derived, because what makes them different is a
-    # fact about each source and not about where it sits.
-    (re.compile(r'/vests/.*/simulator_failure/tc(1227|1707|1708|1725)\.vhd$'), 'reject'),
+    # Some of them are not like that, and the directory name is simply wrong
+    # about them: the error is one an analyzer does see.  Which ones is not
+    # guessed here -- vests_unrun() below reads it off the corpus's own
+    # runner, which declines to run them.
     (re.compile(r'/vests/.*/non_compliant/simulator_failure/'), 'accept'),
     (re.compile(r'/vests/.*/non_compliant/'), 'reject'),
     (re.compile(r'/vests/.*/compliant/'), 'accept'),
@@ -240,8 +235,54 @@ def ghdl_companions(path):
     return out
 
 
+VESTS_RUN_RE = re.compile(r'^\s*(?:run|build)_[a-z_]*test\s+(\S+\.vhdl?)')
+VESTS_OFF_RE = re.compile(r'^\s*#\s*(?:run|build)_[a-z_]*test\s+(\S+\.vhdl?)')
+_VESTS_OFF = {}
+
+
+def vests_unrun(directory):
+    """Basenames the VESTS manifests in this directory name only to skip.
+
+    A VESTS source is filed under "non_compliant" by the directory it sits
+    in, and nothing else in the corpus says so.  Where its own runner has
+    the entry commented out -- "# detected during analysis", "# error at
+    elaboration", "# no error" -- the corpus is *withdrawing* that claim,
+    and running the references over those 54 sources shows how far the
+    directory name has drifted: a majority of GHDL 7.0.0-dev, nvc 1.22.1
+    and Questa 2025.2 accepts 32 of the 46 under analyzer_failure.  There
+    is no expectation left to score against, so they are not scored, the
+    way a disputed case is not.  A source named on a live line as well is
+    scored: the corpus still asserts something about it.
+    """
+    if directory in _VESTS_OFF:
+        return _VESTS_OFF[directory]
+    live, off = set(), set()
+    try:
+        names = sorted(f for f in os.listdir(directory) if f.endswith('.exp'))
+    except OSError:
+        names = []
+    for name in names:
+        with open(os.path.join(directory, name), encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                match = VESTS_RUN_RE.match(line)
+                if match:
+                    live.add(match.group(1))
+                    continue
+                match = VESTS_OFF_RE.match(line)
+                if match:
+                    off.add(match.group(1))
+    _VESTS_OFF[directory] = off - live
+    return _VESTS_OFF[directory]
+
+
 def expected_outcome(path):
     """Return 'accept', 'reject' or 'skip' for one source."""
+    # Only where the corpus says "must be refused" on the strength of the
+    # directory alone: a compliant case commented out for a dependency its
+    # runner cannot supply is still claimed to be legal.
+    if '/vests/' in path and '/non_compliant/' in path:
+        if os.path.basename(path) in vests_unrun(os.path.dirname(path)):
+            return 'skip'
     for pattern, outcome in EXPECT_RULES:
         if pattern.search(path):
             return outcome
