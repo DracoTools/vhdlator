@@ -12997,7 +12997,20 @@ private:
         }
         if (!lastp || !lastp->condp()) return nullptr;
         clockp = edgeTest(lastp->condp(), rising);
-        return clockp ? ifp : nullptr;
+        if (!clockp) return nullptr;
+        // Lowered as an edge-triggered block, the branch that tests the clock
+        // loses its test: the block only ever runs on that edge or on an
+        // edge that makes one of the branches before it true. That holds for
+        // "rst = '1'" and not for a condition such as "rst = RST_POLAR" or
+        // "not SYNC_RST and rst = '1'", where an event on rst may leave every
+        // earlier branch false and the clock branch would run with no clock
+        // edge. Such a process is lowered as the process it is instead, with
+        // its sensitivity list and its edge test kept.
+        for (AstNode* p = ifp->altsp(); p && p != lastp; p = p->nextp()) {
+            bool high = true;
+            if (!levelTest(VN_AS(p, VhdlAlternative)->condp(), high)) return nullptr;
+        }
+        return ifp;
     }
 
     // The signal an edge test names, or null if the expression is not one
@@ -13053,14 +13066,12 @@ private:
             FileLine* const flp = altp->fileline();
             // An asynchronous reset makes the process run on its own edge too
             bool resetHigh = true;
-            if (AstNodeVhdlExpr* const resetp = levelTest(altp->condp(), resetHigh)) {
-                sentreep->addSensesp(new AstSenItem{
-                    flp, resetHigh ? VEdgeType::ET_POSEDGE : VEdgeType::ET_NEGEDGE,
-                    lowerExpr(resetp)});
-            } else {
-                err(flp, "A clocked process may only test an asynchronous reset before its "
-                         "clock edge, and this condition is not one");
-            }
+            // clockedIf only takes a process whose every such branch is one
+            AstNodeVhdlExpr* const resetp = levelTest(altp->condp(), resetHigh);
+            UASSERT_OBJ(resetp, altp, "Asynchronous branch that is not a level test");
+            sentreep->addSensesp(
+                new AstSenItem{flp, resetHigh ? VEdgeType::ET_POSEDGE : VEdgeType::ET_NEGEDGE,
+                               lowerExpr(resetp)});
             elsep = new AstIf{flp, lowerCondition(altp->condp()),
                               lowerStmts(altp->stmtsp()), elsep};
         }
