@@ -1,9 +1,11 @@
 %Error: t/t_vhdl_strlit_bad.vhd:26:33: Type bit has no character '2', so this literal cannot be of type bit_vector
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: t/t_vhdl_strlit_bad.vhd:27:26: Type bit has no character '_', so this literal cannot be of type arr
-%Error: t/t_vhdl_strlit_bad.vhd:27:26: Expected 5 element(s) for constant 'bad2', but the value has 7
-%Error: t/t_vhdl_strlit_bad.vhd:28:41: Expected 8 element(s) for constant 'bad3', but the value has 0
-%Error: t/t_vhdl_strlit_bad.vhd:29:39: Expected 5 element(s) for signal 'bad4', but the value has 3
-%Error: t/t_vhdl_strlit_bad.vhd:34:10: Expected 5 element(s) for the assignment target, but the value has 2
+%Warning-VHDLBOUNDS: t/t_vhdl_strlit_bad.vhd:27:26: Expected 5 element(s) for constant 'bad2', but the value has 7
+                     ... For warning description see https://verilator.org/warn/VHDLBOUNDS?v=latest
+                     ... Use "/* verilator lint_off VHDLBOUNDS */" and lint_on around source to disable this message.
+%Warning-VHDLBOUNDS: t/t_vhdl_strlit_bad.vhd:28:41: Expected 8 element(s) for constant 'bad3', but the value has 0
+%Warning-VHDLBOUNDS: t/t_vhdl_strlit_bad.vhd:29:39: Expected 5 element(s) for signal 'bad4', but the value has 3
+%Warning-VHDLBOUNDS: t/t_vhdl_strlit_bad.vhd:34:10: Expected 5 element(s) for the assignment target, but the value has 2
 %Error: t/t_vhdl_strlit_bad.vhd:35:10: Type std_ulogic has no character 'z', so this literal cannot be of type std_ulogic_vector
 %Error: Exiting due to

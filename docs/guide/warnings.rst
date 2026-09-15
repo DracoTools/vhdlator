@@ -2681,6 +2681,33 @@ List Of Warnings
    To resolve this, rename the inner or outer variable to an unique name.
 
 
+.. option:: VHDLBOUNDS
+
+   Warns that a VHDL value the analyzer can work out is outside the range
+   its subtype allows: a value assigned to an object that cannot hold it, a
+   negative delay, an array whose length does not match its target, or a
+   subtype whose range constraint leaves its base type's.
+
+   IEEE 1076-2008 makes each of these an error of *execution* -- the
+   assignment raises CONSTRAINT_ERROR when it is reached -- rather than of
+   analysis, and other simulators analyze such a design and fail when it
+   runs. It is a warning here so that a design whose offending statement is
+   never reached still builds, and so that a value which only looks
+   out of range because the analyzer folded further than the standard
+   requires does not refuse the source outright.
+
+   Faulty example:
+
+   .. code-block:: vhdl
+
+      variable v : natural range 1 to 100;
+      ...
+      v := 400;   -- CONSTRAINT_ERROR when this runs
+
+   To resolve this, correct the value or widen the subtype, or disable the
+   warning if the statement is known to be unreachable.
+
+
 .. option:: VHDLELABORDER
 
    Warns that a VHDL declaration uses something whose body has not been

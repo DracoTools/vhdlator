@@ -1,18 +1,20 @@
-%Error: t/t_vhdl_bounds_bad.vhd:22:36: Value 8 is outside the range of constant 'bad_const', which is 0 to 7
-        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_bounds_bad.vhd:23:24: Range 0 to 3 is outside the range of integer, which is 1 to 2147483647
-%Error: t/t_vhdl_bounds_bad.vhd:29:5: Value 0 is outside the range of the index of vec_t, which is 1 to 10
-%Error: t/t_vhdl_bounds_bad.vhd:30:5: Value 11 is outside the range of the index of vec_t, which is 1 to 10
-%Error: t/t_vhdl_bounds_bad.vhd:31:4: Range 1 to 11 is outside the range of integer, which is 1 to 10
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:22:36: Value 8 is outside the range of constant 'bad_const', which is 0 to 7
+                     ... For warning description see https://verilator.org/warn/VHDLBOUNDS?v=latest
+                     ... Use "/* verilator lint_off VHDLBOUNDS */" and lint_on around source to disable this message.
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:23:24: Range 0 to 3 is outside the range of integer, which is 1 to 2147483647
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:29:5: Value 0 is outside the range of the index of vec_t, which is 1 to 10
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:30:5: Value 11 is outside the range of the index of vec_t, which is 1 to 10
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:31:4: Range 1 to 11 is outside the range of integer, which is 1 to 10
 %Error: t/t_vhdl_bounds_bad.vhd:32:4: Slice runs 'downto' but vec_t is indexed 'to'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
 %Error: t/t_vhdl_bounds_bad.vhd:33:8: Aggregate has 3 element(s), but the assignment target needs 10
 %Error: t/t_vhdl_bounds_bad.vhd:34:17: This aggregate gives no value for index 2
 %Error: t/t_vhdl_bounds_bad.vhd:35:17: Index 1 is given a value more than once in this aggregate
-%Error: t/t_vhdl_bounds_bad.vhd:41:10: Value 9 is outside the range of the assignment target, which is 0 to 7
-%Error: t/t_vhdl_bounds_bad.vhd:42:31: Value -1 is outside the range of parameter 1 of 'widen', which is 0 to 7
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:41:10: Value 9 is outside the range of the assignment target, which is 0 to 7
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:42:31: Value -1 is outside the range of parameter 1 of 'widen', which is 0 to 7
 %Error: t/t_vhdl_bounds_bad.vhd:43:5: This case statement has no alternative for value done of state_t
 %Error: t/t_vhdl_bounds_bad.vhd:49:12: Choice 3 is given by more than one alternative of this case statement
-%Error: t/t_vhdl_bounds_bad.vhd:51:14: A timeout may not be negative, but this one is -1000000 fs
+%Warning-VHDLBOUNDS: t/t_vhdl_bounds_bad.vhd:51:14: A timeout may not be negative, but this one is -1000000 fs
 %Error: t/t_vhdl_bounds_bad.vhd:56:16: This waveform element takes effect no later than the one before it, so it would never be seen
 %Error: t/t_vhdl_bounds_bad.vhd:62:13: Dimension 3 of attribute 'length is out of range; vec_t has 1 dimension(s)
 %Error: t/t_vhdl_bounds_bad.vhd:25:3: Function 'widen' is declared but never given a body in this region

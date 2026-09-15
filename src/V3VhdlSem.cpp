@@ -819,8 +819,9 @@ class VhdlSemVisitor final : public VNVisitor {
             return;
         }
         if (!val.known() || V3VhdlEval::inRange(val, typep)) return;
-        err(nodep->fileline(), "Value " + val.prettyName() + " is outside the range of " + what
-                                   + ", which is " + rangeText(typep));
+        nodep->fileline()->v3warn(VHDLBOUNDS, "Value " + val.prettyName()
+                                                  + " is outside the range of " + what
+                                                  + ", which is " + rangeText(typep));
     }
 
     // METHODS - types
@@ -1311,8 +1312,8 @@ class VhdlSemVisitor final : public VNVisitor {
         } else if (typep->low() >= basep->low() && typep->high() <= basep->high()) {
             return;
         }
-        err(flp, "Range " + rangeText(typep) + " is outside the range of "
-                     + basep->prettyName() + ", which is " + rangeText(basep));
+        flp->v3warn(VHDLBOUNDS, "Range " + rangeText(typep) + " is outside the range of "
+                                    + basep->prettyName() + ", which is " + rangeText(basep));
     }
 
     // Build the type a type definition describes (clause 5)
@@ -9229,9 +9230,9 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             const std::string what = "the conversion to " + symp->typep()->prettyName();
             const VhdlValue val = V3VhdlEval::eval(nodep);
             if (val.known() && !V3VhdlEval::inRange(val, symp->typep())) {
-                err(nodep->fileline(), "Value " + val.prettyName()
-                                           + " is outside the range of " + what + ", which is "
-                                           + rangeText(symp->typep()));
+                nodep->fileline()->v3warn(VHDLBOUNDS,
+                                          "Value " + val.prettyName() + " is outside the range of "
+                                              + what + ", which is " + rangeText(symp->typep()));
             }
             // A conversion between closely related array types keeps the
             // operand's length (9.3.6), so "unsigned(v)" is as long as v even
@@ -9746,9 +9747,9 @@ void VhdlSemVisitor::checkDelay(AstNodeVhdlExpr* nodep, const char* what) {
     if (!nodep) return;
     const VhdlValue val = V3VhdlEval::eval(nodep);
     if (!val.isInt() || val.toInt() >= 0) return;
-    err(nodep->fileline(),
-        std::string{"A "} + what + " may not be negative, but this one is "
-            + val.prettyName());
+    nodep->fileline()->v3warn(VHDLBOUNDS, std::string{"A "} + what
+                                              + " may not be negative, but this one is "
+                                              + val.prettyName());
 }
 
 // The elements of a waveform take effect in the order written, so their times
@@ -10528,9 +10529,10 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
             const int64_t want = typep->dimLength(dim);
             const int64_t have = valuep->dimLength(dim);
             if (want == have) continue;
-            err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for "
-                                       + what + dimensionText(dim, typep->dimensions())
-                                       + ", but the value has " + std::to_string(have));
+            nodep->fileline()->v3warn(VHDLBOUNDS,
+                                      "Expected " + std::to_string(want) + " element(s) for "
+                                          + what + dimensionText(dim, typep->dimensions())
+                                          + ", but the value has " + std::to_string(have));
             return;
         }
         return;
@@ -10540,8 +10542,9 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
     if (have < 0) return;
     const int64_t want = typep->dimLength(0);
     if (have == want) return;
-    err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for " + what
-                               + ", but the value has " + std::to_string(have));
+    nodep->fileline()->v3warn(VHDLBOUNDS, "Expected " + std::to_string(want) + " element(s) for "
+                                              + what + ", but the value has "
+                                              + std::to_string(have));
 }
 
 // Which dimension a length mismatch is in, mentioned only where there is

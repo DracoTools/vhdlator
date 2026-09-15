@@ -190,6 +190,7 @@ public:
         USERINFO,       // Elaboration time $info
         USERWARN,       // Elaboration time $warning
         VARHIDDEN,      // Hiding variable
+        VHDLBOUNDS,     // VHDL value outside the range its subtype allows
         VHDLELABORDER,  // VHDL use of a body not yet elaborated
         VHDLSHARED,     // VHDL shared variable of a type not protected
         VHDLUNBOUND,    // VHDL component instance with no entity bound to it
@@ -247,9 +248,9 @@ public:
             "STMTDLY", "SUPERNFIRST", "SYMRSVDWORD", "SYNCASYNCNET", "TICKCOUNT", "TIMESCALEMOD",
             "UNDRIVEN", "UNOPT", "UNOPTFLAT", "UNOPTTHREADS", "UNPACKED", "UNSATCONSTR",
             "UNSIGNED", "UNUSED", "UNUSEDGENVAR", "UNUSEDLOOP", "UNUSEDPARAM", "UNUSEDSIGNAL",
-            "USERERROR", "USERFATAL", "USERINFO", "USERWARN", "VARHIDDEN", "VHDLELABORDER",
-            "VHDLSHARED", "VHDLUNBOUND", "WAITCONST", "WIDTH", "WIDTHCONCAT", "WIDTHEXPAND",
-            "WIDTHTRUNC", "WIDTHXZEXPAND", "ZERODLY", "ZEROREPL", " MAX"};
+            "USERERROR", "USERFATAL", "USERINFO", "USERWARN", "VARHIDDEN", "VHDLBOUNDS",
+            "VHDLELABORDER", "VHDLSHARED", "VHDLUNBOUND", "WAITCONST", "WIDTH", "WIDTHCONCAT",
+            "WIDTHEXPAND", "WIDTHTRUNC", "WIDTHXZEXPAND", "ZERODLY", "ZEROREPL", " MAX"};
         return names[m_e];
     }
     // Warnings that default to off
