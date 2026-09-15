@@ -18872,7 +18872,73 @@ private:
                                          static_cast<int32_t>(index)}};
         VhdlType* const elemTypep
             = valTypep->elementp() ? valTypep->elementp() : valTypep->base()->elementp();
-        return lowerFileScalar(reading, filep->cloneTree(false), elemp, elemTypep, flp);
+        return lowerFileValue(reading, filep->cloneTree(false), elemp, elemTypep, flp);
+    }
+
+    // One value of any type in a file. A record is its elements in the order
+    // they are declared and an array is its elements in index order, each
+    // written as the scalars they are made of: the LRM leaves the
+    // representation to the implementation and asks only that a design
+    // reading its own file back gets what it wrote (5.5.2).
+    AstNode* lowerFileValue(bool reading, AstNodeExpr* filep, AstNodeExpr* valuep,
+                            VhdlType* valTypep, FileLine* flp, int depth = 0) {
+        const VhdlTypeKind kind = valTypep ? valTypep->base()->kind() : VhdlTypeKind::INTEGER;
+        const bool composite = depth <= 8
+                               && (kind == VhdlTypeKind::RECORD
+                                   || (kind == VhdlTypeKind::ARRAY && valTypep
+                                       && !elementPacks(valTypep->base()->elementp())));
+        if (!composite) return lowerFileScalar(reading, filep, valuep, valTypep, flp);
+        // A value written that is not a name cannot be taken apart a piece at
+        // a time, so it is held in a variable of its own first. What is read
+        // into is always a name -- it is the target of the read -- and a
+        // temporary there would take the value and keep it.
+        AstNode* outp = nullptr;
+        AstNodeExpr* basep = valuep;
+        if (!reading && !repeatable(basep)) {
+            AstVar* const holdp = newTempVar("__Vfpart", lowerType(valTypep, flp), flp);
+            outp = new AstAssign{flp, new AstVarRef{flp, holdp, VAccess::WRITE}, basep};
+            basep = new AstVarRef{flp, holdp, VAccess::READ};
+        }
+        if (kind == VhdlTypeKind::RECORD) {
+            for (const VhdlSymbol* const elemp : valTypep->base()->elements()) {
+                if (!elemp || !elemp->typep()) {
+                    VL_DO_DANGLING(basep->deleteTree(), basep);
+                    VL_DO_DANGLING(filep->deleteTree(), filep);
+                    return nullptr;
+                }
+                AstNodeExpr* const memberp = new AstMemberSel{flp, basep->cloneTree(false),
+                                                              VFlagChildDType{}, elemp->name()};
+                AstNode* const partp = lowerFileValue(reading, filep->cloneTree(false), memberp,
+                                                      elemp->typep(), flp, depth + 1);
+                if (!partp) {
+                    VL_DO_DANGLING(basep->deleteTree(), basep);
+                    VL_DO_DANGLING(filep->deleteTree(), filep);
+                    return nullptr;
+                }
+                outp = AstNode::addNextNull(outp, partp);
+            }
+        } else {
+            if (!valTypep->isConstrainedArray() || valTypep->dimensions() != 1
+                || valTypep->dimLength(0) <= 0 || valTypep->dimLength(0) > 4096) {
+                VL_DO_DANGLING(basep->deleteTree(), basep);
+                VL_DO_DANGLING(filep->deleteTree(), filep);
+                unsup(flp, std::string{reading ? "READ" : "WRITE"} + " of a file of this type");
+                return nullptr;
+            }
+            const int64_t count = valTypep->dimLength(0);
+            for (int64_t i = 0; i < count; ++i) {
+                AstNode* const partp = lowerFileElement(reading, filep, basep, valTypep, i, flp);
+                if (!partp) {
+                    VL_DO_DANGLING(basep->deleteTree(), basep);
+                    VL_DO_DANGLING(filep->deleteTree(), filep);
+                    return nullptr;
+                }
+                outp = AstNode::addNextNull(outp, partp);
+            }
+        }
+        VL_DO_DANGLING(basep->deleteTree(), basep);
+        VL_DO_DANGLING(filep->deleteTree(), filep);
+        return outp;
     }
 
     // One value in a file: a CHARACTER is one byte, and anything else that
@@ -19069,14 +19135,9 @@ private:
             }
             return outp;
         }
-        if (valTypep && valTypep->base()->kind() == VhdlTypeKind::RECORD) {
-            VL_DO_DANGLING(filep->deleteTree(), filep);
-            unsup(flp, std::string{reading ? "READ" : "WRITE"} + " of a file of this type");
-            return nullptr;
-        }
         AstNodeExpr* const valuep = lowerExpr(args[1]);
         if (!valuep) return nullptr;
-        return lowerFileScalar(reading, filep, valuep, valTypep, flp);
+        return lowerFileValue(reading, filep, valuep, valTypep, flp);
     }
 
     // Advances posp over an abstract literal (15.5): an optional sign, then
