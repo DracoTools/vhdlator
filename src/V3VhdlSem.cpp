@@ -797,7 +797,13 @@ class VhdlSemVisitor final : public VNVisitor {
     // Complain when a static value cannot belong to the subtype it is given
     // to (5.2.1). Silent whenever either the value or the range is unknown,
     // so that only a certain violation is reported.
-    void checkValueInRange(AstNodeVhdlExpr* nodep, VhdlType* typep, const std::string& what) {
+    // "atAnalysis" where the language requires the value to be in range for
+    // the source to be well-formed at all -- an object's own initial value,
+    // a choice, an index written into a name -- rather than when the
+    // statement holding it is reached (5.2.1, 9.3.3.1, 8.4). Everywhere else
+    // the value is a run-time matter: see VHDLBOUNDS.
+    void checkValueInRange(AstNodeVhdlExpr* nodep, VhdlType* typep, const std::string& what,
+                           bool atAnalysis = false) {
         if (!nodep || !typep || !typep->bounded() || !typep->isScalar()) return;
         // A null range holds no value at all (5.2.1), so every value is
         // outside it and saying so tells no one anything. Code that indexes a
@@ -819,9 +825,13 @@ class VhdlSemVisitor final : public VNVisitor {
             return;
         }
         if (!val.known() || V3VhdlEval::inRange(val, typep)) return;
-        nodep->fileline()->v3warn(VHDLBOUNDS, "Value " + val.prettyName()
-                                                  + " is outside the range of " + what
-                                                  + ", which is " + rangeText(typep));
+        const std::string msg = "Value " + val.prettyName() + " is outside the range of " + what
+                                + ", which is " + rangeText(typep);
+        if (atAnalysis) {
+            err(nodep->fileline(), msg);
+        } else {
+            nodep->fileline()->v3warn(VHDLBOUNDS, msg);
+        }
     }
 
     // METHODS - types
@@ -1312,8 +1322,8 @@ class VhdlSemVisitor final : public VNVisitor {
         } else if (typep->low() >= basep->low() && typep->high() <= basep->high()) {
             return;
         }
-        flp->v3warn(VHDLBOUNDS, "Range " + rangeText(typep) + " is outside the range of "
-                                    + basep->prettyName() + ", which is " + rangeText(basep));
+        err(flp, "Range " + rangeText(typep) + " is outside the range of " + basep->prettyName()
+                     + ", which is " + rangeText(basep));
     }
 
     // Build the type a type definition describes (clause 5)
@@ -2442,7 +2452,7 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             }
         }
         checkValueInRange(nodep->defaultp(), symp->typep(),
-                          std::string{symp->kindName()} + " '" + nodep->name() + "'");
+                          std::string{symp->kindName()} + " '" + nodep->name() + "'", true);
         // A scalar subtype with a null range has no value at all (5.2.1), so
         // none can be given an object of it (nvc 1.22.1 and Questa 2025.2;
         // GHDL 7.0.0-dev warns)
@@ -9850,14 +9860,14 @@ void VhdlSemVisitor::analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) {
     if (AstVhdlRange* const rp = chp->rangep()) {
         analyzeRange(rp, wantp);
         // A range of choices must lie within the subtype it chooses from
-        if (rp->leftp()) checkValueInRange(rp->leftp(), wantp, "this choice");
-        if (rp->rightp()) checkValueInRange(rp->rightp(), wantp, "this choice");
+        if (rp->leftp()) checkValueInRange(rp->leftp(), wantp, "this choice", true);
+        if (rp->rightp()) checkValueInRange(rp->rightp(), wantp, "this choice", true);
         return;
     }
     AstNodeVhdlExpr* const valuep = chp->valuep();
     if (!valuep) return;
     analyzeExpr(valuep, wantp);
-    checkValueInRange(valuep, wantp, "this choice");
+    checkValueInRange(valuep, wantp, "this choice", true);
 }
 
 // One index per dimension, each within its own index range (8.4)
@@ -9869,7 +9879,7 @@ VhdlType* VhdlSemVisitor::analyzeIndexedName(AstVhdlCall* nodep, VhdlType* array
         if (!asp || !asp->actualp()) continue;
         VhdlType* const wantp = dim < indexes.size() ? indexes[dim] : nullptr;
         analyzeExpr(asp->actualp(), wantp);
-        checkValueInRange(asp->actualp(), wantp, "the index of " + arrayp->prettyName());
+        checkValueInRange(asp->actualp(), wantp, "the index of " + arrayp->prettyName(), true);
     }
     if (!indexes.empty() && dim != indexes.size()) {
         err(nodep->fileline(), "Expected " + std::to_string(indexes.size()) + " index(es) for "
@@ -10529,10 +10539,9 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
             const int64_t want = typep->dimLength(dim);
             const int64_t have = valuep->dimLength(dim);
             if (want == have) continue;
-            nodep->fileline()->v3warn(VHDLBOUNDS,
-                                      "Expected " + std::to_string(want) + " element(s) for "
-                                          + what + dimensionText(dim, typep->dimensions())
-                                          + ", but the value has " + std::to_string(have));
+            err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for " + what
+                                       + dimensionText(dim, typep->dimensions())
+                                       + ", but the value has " + std::to_string(have));
             return;
         }
         return;
@@ -10542,9 +10551,8 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
     if (have < 0) return;
     const int64_t want = typep->dimLength(0);
     if (have == want) return;
-    nodep->fileline()->v3warn(VHDLBOUNDS, "Expected " + std::to_string(want) + " element(s) for "
-                                              + what + ", but the value has "
-                                              + std::to_string(have));
+    err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for " + what
+                               + ", but the value has " + std::to_string(have));
 }
 
 // Which dimension a length mismatch is in, mentioned only where there is
