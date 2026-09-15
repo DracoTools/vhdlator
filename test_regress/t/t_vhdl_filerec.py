@@ -16,7 +16,11 @@ test.scenarios('vlt')
 test.top_filename = "t/t_vhdl_filerec.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_filerec"],
+             verilator_flags2=[
+                 "--timing", "--top-module t_vhdl_filerec",
+                 # The files belong beside the model, not in the source tree
+                 "-GOUTDIR=" + "'\"" + test.obj_dir + "\"'"
+             ],
              make_top_shell=False,
              make_main=False)
 

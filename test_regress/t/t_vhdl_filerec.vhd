@@ -6,6 +6,8 @@
 --
 
 entity t_vhdl_filerec is
+    -- Where to put the files, given on the command line
+    generic (OUTDIR : string := ".");
 end entity;
 
 architecture test of t_vhdl_filerec is
@@ -26,17 +28,21 @@ architecture test of t_vhdl_filerec is
     type pair_file is file of pair;
     type pair_vec is array (0 to 1) of pair;
     type pairs_file is file of pair_vec;
+
+    constant REC_NAME  : string := OUTDIR & "/t_vhdl_filerec_rec.bin";
+    constant PAIR_NAME : string := OUTDIR & "/t_vhdl_filerec_pair.bin";
+    constant VEC_NAME  : string := OUTDIR & "/t_vhdl_filerec_vec.bin";
 begin
 
     main : process is
         -- 5.5.2: the representation of a file of any type is the
         -- implementation's own; a design reading its own file back must get
         -- what it wrote
-        file wf  : rec_file open write_mode is "t_vhdl_filerec_rec.bin";
+        file wf  : rec_file open write_mode is REC_NAME;
         file rf  : rec_file;
-        file wp  : pair_file open write_mode is "t_vhdl_filerec_pair.bin";
+        file wp  : pair_file open write_mode is PAIR_NAME;
         file rp  : pair_file;
-        file wv  : pairs_file open write_mode is "t_vhdl_filerec_vec.bin";
+        file wv  : pairs_file open write_mode is VEC_NAME;
         file rv  : pairs_file;
         variable r1, r2 : rec;
         variable p1, p2 : pair;
@@ -55,7 +61,7 @@ begin
         write(wv, v1);
         file_close(wv);
 
-        file_open(rf, "t_vhdl_filerec_rec.bin", read_mode);
+        file_open(rf, REC_NAME, read_mode);
         read(rf, r2);
         assert r2 = r1 report "a record read back as it was written" severity failure;
         read(rf, r2);
@@ -64,12 +70,12 @@ begin
         assert endfile(rf) report "and nothing more" severity failure;
         file_close(rf);
 
-        file_open(rp, "t_vhdl_filerec_pair.bin", read_mode);
+        file_open(rp, PAIR_NAME, read_mode);
         read(rp, p2);
         assert p2 = p1 report "a record holding an array" severity failure;
         file_close(rp);
 
-        file_open(rv, "t_vhdl_filerec_vec.bin", read_mode);
+        file_open(rv, VEC_NAME, read_mode);
         read(rv, v2);
         assert v2 = v1 report "an array of records" severity failure;
         file_close(rv);
