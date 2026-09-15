@@ -12809,10 +12809,30 @@ private:
             // saying it as a list rather than as "@*" is what lets the
             // process run once and then wait, as every process does.
             if (nodep->sensAll() && v3Global.opt.timing().isTrue()) {
-                if (AstSenTree* const readsp = sensitivityOfBody(bodyp, flp)) {
-                    if (sentreep) VL_DO_DANGLING(sentreep->deleteTree(), sentreep);
-                    sentreep = readsp;
+                AstSenTree* readsp = sensitivityOfBody(bodyp, flp);
+                // A signal handed to a procedure is read by the call (10.2),
+                // but where the procedure takes it as a signal the lowered
+                // call names no read of it: the copy made for this call reads
+                // it inside instead. So those are added to what the body reads.
+                if (AstSenTree* const callsp = sensitivityOfCallActuals(nodep->stmtsp(), flp)) {
+                    if (readsp) {
+                        readsp->addSensesp(callsp->sensesp()->unlinkFrBackWithNext());
+                        VL_DO_DANGLING(callsp->deleteTree(), callsp);
+                    } else {
+                        readsp = callsp;
+                    }
                 }
+                if (sentreep) VL_DO_DANGLING(sentreep->deleteTree(), sentreep);
+                if (!readsp) {
+                    // It reads no signal at all, so nothing can ever wake it:
+                    // it runs once when the simulation starts and then waits
+                    // for ever (11.3). Written as "@*" it would be refused,
+                    // there being nothing for the list to be worked out from.
+                    allowInitialDriver(nodep->stmtsp(), false);
+                    addStmt(new AstInitial{flp, bodyp});
+                    return;
+                }
+                sentreep = readsp;
             }
             // Every VHDL process runs once when the simulation starts, before
             // any signal has changed (11.3). Saying so in the sensitivity
@@ -18265,6 +18285,58 @@ private:
         if (varp->isParam() || varp->varType() == VVarType::GENVAR) return false;
         if (varp->isFuncLocal()) return false;
         return true;
+    }
+
+    // The signals the procedure calls among these statements read through
+    // their actuals: each one associated with a formal of mode in or inout
+    // (10.2). What a procedure reads on its own is not the caller's to wait
+    // on, and what it only writes would wake the process on its own drive.
+    AstSenTree* sensitivityOfCallActuals(AstNode* stmtsp, FileLine* flp) {
+        std::vector<const VhdlSymbol*> seen;
+        AstSenItem* itemsp = nullptr;
+        for (AstNode* sp = stmtsp; sp; sp = sp->nextp()) {
+            sp->foreach([&](AstVhdlProcCall* pcallp) {
+                AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+                VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nullptr;
+                VhdlSymbol* const csymp = namedp ? namedp->resolved() : nullptr;
+                AstVhdlSubprogDecl* const declp = csymp ? declOf(csymp) : nullptr;
+                if (!declp) return;
+                std::vector<const AstVhdlIfaceDecl*> formals;
+                for (AstNode* fp = firstParamOf(declp); fp; fp = fp->nextp()) {
+                    formals.push_back(VN_CAST(fp, VhdlIfaceDecl));
+                }
+                size_t pos = 0;
+                for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+                    AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                    if (!asp || !asp->actualp()) continue;
+                    const AstVhdlIfaceDecl* formalp = nullptr;
+                    if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                        for (const AstVhdlIfaceDecl* const one : formals) {
+                            if (one && one->name() == fnamep->name()) formalp = one;
+                        }
+                    } else if (!asp->formalp() && pos < formals.size()) {
+                        formalp = formals[pos];
+                    }
+                    if (!formalp) continue;
+                    if (formalp->mode() == VhdlMode::OUT || formalp->mode() == VhdlMode::BUFFER) {
+                        continue;
+                    }
+                    const VhdlSymbol* const rootp = rootSymOf(asp->actualp());
+                    if (!rootp
+                        || (rootp->kind() != VhdlSymKind::SIGNAL
+                            && rootp->kind() != VhdlSymKind::PORT)) {
+                        continue;
+                    }
+                    if (std::find(seen.begin(), seen.end(), rootp) != seen.end()) continue;
+                    AstNodeExpr* const exprp = lowerExpr(asp->actualp());
+                    if (!exprp) continue;
+                    seen.push_back(rootp);
+                    itemsp = AstNode::addNext(
+                        itemsp, senItemFor(exprp, isOneBitType(typeOfExpr(asp->actualp())), flp));
+                }
+            });
+        }
+        return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
     AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp, bool* anyPartp = nullptr) {
