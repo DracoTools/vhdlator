@@ -9324,11 +9324,38 @@ private:
             return powp;
         }
         case VhdlBinaryOp::CONCAT: {
-            // VHDL concatenates arrays of any element type (9.2.5), and
-            // Verilog's concatenation is over bits. Where the elements do not
-            // pack -- an array of integers, of strings, of unconstrained
-            // arrays -- the result is written out as every element of both
-            // operands in turn instead.
+            // A null array contributes no elements (9.2.5), and there is no
+            // value of no width here to contribute them with: Verilog has no
+            // zero-element array, so an object of a null subtype is given one
+            // element and a concatenation with it comes out one too long.
+            // Dropping the operand is what the language says the result is.
+            {
+                const bool lnull
+                    = nullArrayType(nodep->lhsp() ? nodep->lhsp()->vhdlTypep() : nullptr);
+                const bool rnull
+                    = nullArrayType(nodep->rhsp() ? nodep->rhsp()->vhdlTypep() : nullptr);
+                // Both null leaves a null result, which has no representation
+                // here either, so that one is left as it was
+                if (lnull != rnull) {
+                    AstNodeExpr* const keepp = lnull ? rhsp : lhsp;
+                    AstNodeExpr* const dropp = lnull ? lhsp : rhsp;
+                    const AstNodeVhdlExpr* const keptp = lnull ? nodep->rhsp() : nodep->lhsp();
+                    VL_DO_DANGLING(dropp->deleteTree(), dropp);
+                    // "e & null" is still an array of one element, not the
+                    // element (9.2.5). Its bits are the element's, so what it
+                    // needs is the result's own type rather than a wrapper.
+                    VhdlType* const keptTypep = keptp ? keptp->vhdlTypep() : nullptr;
+                    if (keptTypep && keptTypep->base()->kind() != VhdlTypeKind::ARRAY) {
+                        // "e & null" is an array of one element, not the
+                        // element itself (9.2.5). Written as the pattern of
+                        // one member it is, so that its type comes from where
+                        // it is assigned -- the concatenation's own type is
+                        // the unconstrained array and says no length.
+                        return new AstPattern{flp, new AstPatMember{flp, keepp, nullptr, nullptr}};
+                    }
+                    return keepp;
+                }
+            }
             VhdlType* const rtypep = nodep->vhdlTypep();
             const VhdlType* elemp = nullptr;
             if (rtypep && rtypep->base()->kind() == VhdlTypeKind::ARRAY) {
@@ -10257,6 +10284,17 @@ private:
 
     // The concatenation of two arrays whose elements do not pack, written
     // out element by element as an assignment pattern (9.2.5)
+    // An array subtype with no elements at all: "v(1 to 0)". Its length is
+    // known and is zero, which no lowered type here can hold (9.2.5)
+    static bool nullArrayType(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!typep->isConstrainedArray()) return false;
+        for (size_t dim = 0; dim < typep->dimensions(); ++dim) {
+            if (typep->dimLength(dim) == 0) return true;
+        }
+        return false;
+    }
+
     AstNodeExpr* unpackedConcat(AstVhdlBinary* nodep, AstNodeExpr* lhsp, AstNodeExpr* rhsp,
                                 FileLine* flp) {
         // Both operands are asked about before either is taken apart: what
