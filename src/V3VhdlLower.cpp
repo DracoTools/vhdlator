@@ -11960,7 +11960,27 @@ private:
     // postponed assertion sees the values the step ended with, not the ones
     // it passed through.
     AstNode* concurrentProcess(AstNode* bodyp, bool postponed, FileLine* flp) {
-        if (postponed) return new AstAlwaysPostponed{flp, bodyp};
+        if (postponed) {
+            // A postponed process runs after the last delta cycle of the time
+            // step, and it is an error for one to schedule a transaction that
+            // would start another (11.3). An assignment it makes with no
+            // delay can therefore take effect where it is written: there is
+            // no later delta for it to be seen in. Verilator's postponed
+            // region holds no non-blocking assignment of its own, so this is
+            // also the only shape the scheduler accepts here.
+            AstAlwaysPostponed* const postp = new AstAlwaysPostponed{flp, bodyp};
+            std::vector<AstAssignDly*> dlys;
+            postp->foreach([&dlys](AstAssignDly* dlyp) {
+                if (!dlyp->timingControlp()) dlys.push_back(dlyp);  // "after" keeps its delay
+            });
+            for (AstAssignDly* const dlyp : dlys) {
+                AstNodeExpr* const lhsp = dlyp->lhsp()->unlinkFrBack();
+                AstNodeExpr* const rhsp = dlyp->rhsp()->unlinkFrBack();
+                dlyp->replaceWith(new AstAssign{dlyp->fileline(), lhsp, rhsp});
+                VL_DO_DANGLING(dlyp->deleteTree(), dlyp);
+            }
+            return postp;
+        }
         // A concurrent statement runs once at the start and again whenever
         // what it reads changes (11.6). One that reads nothing -- an
         // assertion about a generic, say -- therefore runs exactly once.
