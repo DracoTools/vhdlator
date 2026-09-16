@@ -17074,8 +17074,10 @@ private:
             // Passing such a signal by value would compile and quietly throw
             // the drives away, which is worse than saying so
             if (drivesSignalParam(symp)) {
-                unsup(flp, "call to '" + symp->name()
-                               + "', whose signal parameter is not a signal this call can name");
+                unsup(flp, "call to '" + symp->name() + "'"
+                               + (m_sigCopyWhy.empty()
+                                      ? std::string{", which names no signal of this design"}
+                                      : m_sigCopyWhy));
                 return nullptr;
             }
         }
@@ -17481,10 +17483,17 @@ private:
     // assignment inside it drives that signal, and the formal's history
     // attributes answer from that signal's record. The actuals that are not
     // signals are left in `passed` for the caller to hand over as usual.
+    // Why the last signalCopyFor gave up, for the message the caller makes
+    std::string m_sigCopyWhy;
+
     AstNodeFTask* signalCopyFor(VhdlSymbol* symp, AstVhdlCall* callp,
                                 std::vector<AstVhdlExprPair>& passed) {
+        m_sigCopyWhy.clear();
         AstVhdlSubprogDecl* const declp = declOf(symp);
-        if (!declp || !declp->hasBody()) return nullptr;
+        if (!declp || !declp->hasBody()) {
+            m_sigCopyWhy = ", whose body is not here";
+            return nullptr;
+        }
         // The actuals, in formal order
         std::vector<AstVhdlAssoc*> assocs;
         for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
@@ -17533,7 +17542,11 @@ private:
                 // Each element is a signal of the design in its own right, so
                 // the formal gets no object and every reference to one of its
                 // elements lowers to that element's actual
-                if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) return nullptr;
+                if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) {
+                    m_sigCopyWhy = ", whose parameter '" + formals[i]->name()
+                                   + "' is given its elements one at a time and is not a signal";
+                    return nullptr;
+                }
                 std::map<std::string, AstNodeVhdlExpr*> resolved;
                 for (const auto& pair : parts) {
                     AstNodeVhdlExpr* const partp = pair.second;
@@ -17645,12 +17658,25 @@ private:
                 if (rootp && rootp->kind() == VhdlSymKind::SIGNAL && !m_vars.count(rootp)) {
                     pkgSignalVar(const_cast<VhdlSymbol*>(rootp), actualp->fileline());
                 }
-                if (!rootp || !m_vars.count(rootp) || m_drivers.count(rootp)) return nullptr;
+                if (!rootp || !m_vars.count(rootp)) {
+                    m_sigCopyWhy = ", whose parameter '" + formals[i]->name()
+                                   + "' is not given a signal of this design";
+                    return nullptr;
+                }
+                if (m_drivers.count(rootp)) {
+                    m_sigCopyWhy = ", whose parameter '" + formals[i]->name()
+                                   + "' is given part of a signal that has several drivers";
+                    return nullptr;
+                }
                 if (!staticSelectKey(actualp, path)) {
                     // One element of an array signal, at an index the call
                     // works out: the copy takes the index as a parameter
                     std::vector<AstNodeVhdlExpr*> idxExprps;
-                    if (!dynamicElementOf(actualp, rootp, idxExprps)) return nullptr;
+                    if (!dynamicElementOf(actualp, rootp, idxExprps)) {
+                        m_sigCopyWhy = ", where which part of a signal '" + formals[i]->name()
+                                       + "' is given is not decided here";
+                        return nullptr;
+                    }
                     DynSigBind dyn;
                     dyn.arrayp = m_vars[rootp];
                     for (size_t d = 0; d < idxExprps.size(); ++d) {
@@ -17676,13 +17702,21 @@ private:
             if (drvIt != m_drivers.end()) {
                 const VhdlSymbol* const signalp = actualSymp->resolved();
                 const int idx = m_driverUsed[signalp];
-                if (idx >= static_cast<int>(drvIt->second.size())) return nullptr;
+                if (idx >= static_cast<int>(drvIt->second.size())) {
+                    m_sigCopyWhy = ", where the signal '" + formals[i]->name()
+                                   + "' is given has no driver left for this call";
+                    return nullptr;
+                }
                 // Only where the drivers resolve as the logic values do. One
                 // combined by a function of the design's own holds a value
                 // and nothing to say whether it drives at all, and a copy
                 // that wrote to it would drive from the moment it was
                 // elaborated rather than when the call was made.
-                if (!drvIt->second[idx].enp) return nullptr;
+                if (!drvIt->second[idx].enp) {
+                    m_sigCopyWhy = ", where the signal '" + formals[i]->name()
+                                   + "' is given is resolved by a function of the design's own";
+                    return nullptr;
+                }
                 DrvBind db;
                 db.signalp = signalp;
                 db.idx = idx;
@@ -17702,6 +17736,7 @@ private:
             key += "|" + std::to_string(reinterpret_cast<uintptr_t>(varIt->second));
         }
         if (bind.empty() && exprBind.empty() && elemBind.empty() && dynBind.empty()) {
+            m_sigCopyWhy = ", which no signal of this design reached";
             return nullptr;
         }
         auto copyIt = m_signalCopies.find(key);
@@ -17745,7 +17780,14 @@ private:
                     m_vars[ifp->vhdlSymp()] = it->second;
                 }
             }
-            if (!taskp) return nullptr;
+            if (!taskp) {
+                // Most often a parameter with no length even here, which is
+                // what whyNotEmitted names
+                const std::string why = whyNotEmitted(symp);
+                m_sigCopyWhy
+                    = why.empty() ? std::string{", whose body could not be lowered here"} : why;
+                return nullptr;
+            }
             copyIt = m_signalCopies.emplace(key, taskp).first;
         }
         return copyIt->second;
