@@ -192,9 +192,17 @@ def ghdl_expectations(directory):
                 segments.setdefault(word, set()).add(segment)
                 if word not in order:
                     order.append(word)
-                # A source named both ways must be refused: the failing use
-                # is the one the suite is checking
-                if outcome == 'reject' or table.get(word) != 'reject':
+                # A source the script names both ways is asserting two
+                # different things about it, and which one holds depends on
+                # what the library already held when it was reached:
+                # "analyze_failure ent.vhdl" before its package exists and
+                # "analyze ent.vhdl" after it does are both true. One run of
+                # one file cannot reproduce both, so there is no single
+                # expectation to score against and it is not scored -- the
+                # way a disputed case is not.
+                if word in table and table[word] != outcome:
+                    table[word] = 'skip'
+                elif table.get(word) != 'skip':
                     table[word] = outcome
     # Some of these tests write their own sources before analyzing them --
     # "cp pkga_v1.vhdl pkga.vhdl", or a sed that patches one. The checkout
@@ -435,24 +443,89 @@ def run_group(command, timeout, cwd=None):
     return stdout, proc.returncode
 
 
+# A design unit a source names but that no library holds is reported as
+# missing whatever the frontend makes of the language, so a multi-file design
+# analyzed one file at a time is scored on its file list rather than on
+# VHDL.  GHDL's own testsuite says its order in a script and that is followed
+# exactly; everywhere else the unit is looked for beside the source, which is
+# what every reference is given.  Only an unambiguous answer is taken: where
+# two files in the directory declare a unit of the name, which one was meant
+# is a real question and the source keeps its honest "not found".
+UNIT_DECL_RE = re.compile(
+    r'^[ \t]*(?:package(?![ \t]+body\b)|entity|context|configuration)[ \t]+(\w+)',
+    re.IGNORECASE | re.MULTILINE)
+MISSING_UNIT_RE = re.compile(r"Design unit '(?:[^'.]*\.)?([^'.]+)' not found")
+_UNIT_INDEX = {}
+
+
+def unit_index(directory):
+    """Map each unit name declared in this directory to the files declaring it."""
+    if directory in _UNIT_INDEX:
+        return _UNIT_INDEX[directory]
+    index = {}
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(('.vhd', '.vhdl')):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for match in UNIT_DECL_RE.finditer(text):
+            index.setdefault(match.group(1).lower(), []).append(path)
+    _UNIT_INDEX[directory] = index
+    return index
+
+
+def missing_companions(path, output, already):
+    """Files beside this source that declare the design units it could not find."""
+    index = unit_index(os.path.dirname(path))
+    out = []
+    for name in dict.fromkeys(MISSING_UNIT_RE.findall(output)):
+        found = [other for other in index.get(name.lower(), [])
+                 if other != path and other not in already and other not in out]
+        # One answer only, and only a file the corpus expects to be accepted:
+        # one that is there to be refused would report its errors as this
+        # source's
+        if len(found) == 1 and expected_outcome(found[0]) == 'accept':
+            out.append(found[0])
+    return out
+
+
 def run_one(args):
     """Run Verilator over one source. Returns a Result."""
     verilator, flags, timeout, path = args
     expected = expected_outcome(path)
-    command = ([verilator] + flags + extra_flags(path) +
-               (ghdl_companions(path) if '/ghdl/testsuite/' in path else []) + [path])
+    companions = ghdl_companions(path) if '/ghdl/testsuite/' in path else []
     start = time.time()
-    try:
-        stdout, returncode = run_group(command, timeout)
-        output = stdout.decode('utf-8', errors='replace')
-        ok = returncode == 0
-        diagnosed = any(
-            line.startswith('%Error') or line.startswith('%Warning')
-            for line in output.splitlines())
-    except subprocess.TimeoutExpired:
-        return Result(path, False, time.time() - start, 'TIMEOUT', expected, False)
-    except OSError as exc:
-        return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected, False)
+    # A source that names a design unit nothing supplied is re-run with the
+    # files beside it that declare what it asked for, since one of a design's
+    # files is not a design.  A companion may need one of its own, so this
+    # goes round until nothing new is found.
+    for _ in range(5):
+        command = [verilator] + flags + extra_flags(path) + companions + [path]
+        try:
+            stdout, returncode = run_group(command, timeout)
+            output = stdout.decode('utf-8', errors='replace')
+            ok = returncode == 0
+            diagnosed = any(
+                line.startswith('%Error') or line.startswith('%Warning')
+                for line in output.splitlines())
+        except subprocess.TimeoutExpired:
+            return Result(path, False, time.time() - start, 'TIMEOUT', expected, False)
+        except OSError as exc:
+            return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected, False)
+        if ok or 'not found, needed by' not in output:
+            break
+        more = missing_companions(path, output, companions)
+        if not more:
+            break
+        companions = companions + more
 
     message = ''
     if not ok:
