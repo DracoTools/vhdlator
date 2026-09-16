@@ -28,6 +28,14 @@ architecture tb of t_vhdl_elemcon is
   constant listed : arg_t(0 to 1) := ("1010", "0101");
   -- A null array of such a type has no elements to measure at all
   constant empty : arg_t(0 downto 1) := (others => two);
+
+  -- Where the object's own subtype leaves the index open as well, the value
+  -- says how long both of them are. Taking only the index from it and
+  -- leaving the element as the type declared it gives an object whose
+  -- elements are the wrong length -- nvc 1.22.1, GHDL 7.0.0-dev and Questa
+  -- 2025.2 all measure this one as four.
+  constant sized : arg_t(1 downto 0)(3 downto 0) := (others => "1100");
+  constant fromvalue : arg_t := sized;
 begin
 
   process is
@@ -36,6 +44,9 @@ begin
     assert filled(2)'length = 2 report "filled length" severity failure;
     assert listed(1) = "0101" report "listed" severity failure;
     assert empty'length = 0 report "empty" severity failure;
+    assert fromvalue'length = 2 report "fromvalue count" severity failure;
+    assert fromvalue(0)'length = 4 report "fromvalue element" severity failure;
+    assert fromvalue(1) = "1100" report "fromvalue value" severity failure;
     report "*-* All Finished *-*";
     stop;
   end process;

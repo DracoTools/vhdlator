@@ -10310,7 +10310,9 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
         outp->clearIndexTypes();
         for (VhdlType* const idxp : valueTypep->indexTypes()) outp->addIndexType(idxp);
         outp->unconstrained(false);
-        return outp;
+        // The element may be left open where the index is not, and it is the
+        // value that says how long it is, exactly as the index was (5.3.2.2)
+        return constrainElementFromValue(outp, valuep, flp);
     }
     // Otherwise the value's length decides, starting at the index subtype's
     // own left bound (9.3.3.3). A value of more than one dimension says how
@@ -10348,7 +10350,8 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
     outp->clearIndexTypes();
     for (VhdlType* const idxp : newIndexes) outp->addIndexType(idxp);
     outp->unconstrained(false);
-    return outp;
+    // As above: measuring the index says nothing about the element
+    return constrainElementFromValue(outp, valuep, flp);
 }
 
 // The element of an array whose index is constrained but whose element is not
@@ -10526,6 +10529,21 @@ bool VhdlSemVisitor::reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& units
             if (!symp || !declp->defaultp()) return;
             VhdlType* const declaredp = symp->typep();
             if (!declaredp || declaredp->lengthEmittable()) return;
+            // This runs once the whole design has been analyzed, and all it
+            // can put right afterwards is the names that read the object.
+            // An index settled here is carried by the name itself, so that
+            // is safe; an element is not, because "v(i)" and "v(i)'length"
+            // were read off the element the declaration had and are already
+            // built. Such a declaration is left as it stood, and lowering
+            // says it cannot be emitted -- which is the honest answer, and
+            // better than emitting an object whose elements are the wrong
+            // length.
+            const VhdlType* const hadElemp
+                = declaredp->elementp() ? declaredp->elementp() : declaredp->base()->elementp();
+            if (hadElemp && hadElemp->base()->kind() == VhdlTypeKind::ARRAY
+                && !hadElemp->lengthEmittable()) {
+                return;
+            }
             VhdlType* const newp
                 = constrainFromValue(declaredp, declp->defaultp(), declp->fileline());
             if (!newp || newp == declaredp || !newp->lengthEmittable()) return;
