@@ -42,6 +42,13 @@ architecture rtl of t is
   attribute atd of f1 : function is "ABCDEFGHIJ";
   attribute ata of f1 : function is "ABCDEFGHIJ";
   -- "of all" gives it to every function this region declares (7.2)
+  -- Two types sharing a literal. The specification names the designator,
+  -- so both of them are given the attribute; a read has to say which one it
+  -- means, and its signature is what says so (4.5.3, 7.2, 8.6).
+  type state_t is (idle, active);
+  type level_t is (idle, busy);
+  attribute code : integer;
+  attribute code of idle : literal is 7;
   attribute atall : a1;
   attribute atall of all : function is af1(2);
 begin
@@ -67,6 +74,10 @@ begin
     assert v = 22 report "all: f1" severity failure;
     v := f2'atall(2);
     assert v = 22 report "all: f2" severity failure;
+    -- Where the name is overloaded, the signature says which declaration
+    -- the attribute is asked of; without it the name is ambiguous
+    assert idle [return state_t]'code = 7 report "state_t idle" severity failure;
+    assert idle [return level_t]'code = 7 report "level_t idle" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

@@ -8376,11 +8376,50 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         if (userAttr) {
             std::vector<VhdlSymbol*> prefs;
             lookup(parts.back(), prefs);
+            std::vector<VhdlSymbol*> bearers;
             for (VhdlSymbol* const psymp : prefs) {
-                if (!psymp->resolved()->userAttr(attrName)) continue;
-                nodep->prefixp()->vhdlSymp(psymp);
+                if (psymp->resolved()->userAttr(attrName)) bearers.push_back(psymp);
+            }
+            // "idle [return controller_state]'encoding": where the name is
+            // overloaded, a signature says which declaration is meant, and
+            // each of them may have been given the attribute separately
+            // (4.5.3, 8.6)
+            if (bearers.size() > 1 && nodep->signaturep()) {
+                std::vector<VhdlType*> wantParams;
+                for (AstNode* p = nodep->signaturep()->paramTypesp(); p; p = p->nextp()) {
+                    wantParams.push_back(resolveTypeMark(VN_AS(p, NodeVhdlExpr)));
+                }
+                VhdlType* const wantReturnp
+                    = nodep->signaturep()->returnTypep()
+                          ? resolveTypeMark(nodep->signaturep()->returnTypep())
+                          : nullptr;
+                std::vector<VhdlSymbol*> matched;
+                for (VhdlSymbol* const candp : bearers) {
+                    const VhdlSymbol* const realp = candp->resolved();
+                    if (realp->paramTypes().size() != wantParams.size()) continue;
+                    bool ok = true;
+                    for (size_t i = 0; i < wantParams.size() && ok; ++i) {
+                        const VhdlType* const havep = realp->paramTypes()[i];
+                        if (!havep || !wantParams[i] || havep->base() != wantParams[i]->base()) {
+                            ok = false;
+                        }
+                    }
+                    if (ok && wantReturnp) {
+                        // An enumeration literal answers with the type it
+                        // belongs to, which is what its signature names
+                        const VhdlType* const havep
+                            = realp->returnTypep() ? realp->returnTypep() : realp->typep();
+                        ok = havep && havep->base() == wantReturnp->base();
+                    }
+                    if (ok) matched.push_back(candp);
+                }
+                if (matched.size() == 1) bearers.swap(matched);
+            }
+            // Where more than one bears it and nothing chooses between them,
+            // the name is ambiguous and saying so is the right answer
+            if (bearers.size() == 1) {
+                nodep->prefixp()->vhdlSymp(bearers[0]);
                 prefixIsBearer = true;
-                break;
             }
         }
     }
