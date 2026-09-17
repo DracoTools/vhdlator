@@ -109,6 +109,7 @@ static bool vhdlSlicedFormal(const AstNodeVhdlExpr* formalp, std::string& root);
 class VhdlSemVisitor final : public VNVisitor {
     // STATE
     VhdlScope* m_scopep = nullptr;  // Region being filled
+    std::string m_genLabel;  // Label of the generate whose body is being filled
     VhdlScope* m_rootp = nullptr;  // Outermost region, holding library names
     std::map<std::string, VhdlScope*> m_libs;  // Library name -> its region
     std::map<std::string, VhdlScope*> m_unitScopes;  // "lib.unit" -> its region
@@ -212,6 +213,15 @@ class VhdlSemVisitor final : public VNVisitor {
         return m_scopep;
     }
     void popScope() { m_scopep = m_scopep->parentp(); }
+
+    // A labelled construct is a declarative region, and its label names that
+    // region: "p.v" reads the variable v of the process labelled p. Only from
+    // inside it -- this form of expanded name is allowed within the construct
+    // itself and nowhere else (8.3).
+    static VhdlScope* nameEnclosing(VhdlScope* scopep, const std::string& name) {
+        if (!name.empty()) scopep->addNamed(lower(name), scopep);
+        return scopep;
+    }
 
     void err(FileLine* flp, const std::string& msg) {
         flp->v3error(msg);
@@ -3462,7 +3472,7 @@ void VhdlSemVisitor::visit(AstVhdlProcess* nodep) {
         analyzeExpr(VN_AS(sp, NodeVhdlExpr), nullptr);
         checkSensitivityName(VN_AS(sp, NodeVhdlExpr));
     }
-    pushScope(nodep->name().empty() ? "process" : nodep->name());
+    nameEnclosing(pushScope(nodep->name().empty() ? "process" : nodep->name()), nodep->name());
     rejectDecls(nodep->declsp(), "a process");
     iterateAndNextNull(nodep->declsp());
     // The labels of its statements are declared in the process's own
@@ -3857,16 +3867,12 @@ const VhdlSymbol* VhdlSemVisitor::nonStaticIndex(AstNodeVhdlExpr* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
-    // The maps are written outside the block's own region, since they name
-    // what is visible where the block appears (11.2)
-    if (nodep->headerp()) {
-        analyzeAssociations(nodep->headerp()->genericMapp(), nullptr, true);
-        analyzeAssociations(nodep->headerp()->portMapp(), nullptr);
-    }
     // The guard expression names what is visible where the block appears; the
     // GUARD signal it declares is visible only inside (11.2)
     if (nodep->guardp()) analyzeCondition(nodep->guardp());
-    pushScope(nodep->name().empty() ? "block" : nodep->name());
+    VhdlScope* const outerp = m_scopep;
+    VhdlScope* const innerp
+        = nameEnclosing(pushScope(nodep->name().empty() ? "block" : nodep->name()), nodep->name());
     if (nodep->guardp()) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::SIGNAL, "guard", nodep);
         symp->typep(V3VhdlStd::booleanType());
@@ -3879,6 +3885,16 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
         iterateAndNextNull(nodep->headerp()->genericsp());
         m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->portsp());
+        // The maps are written outside the block's own region, since they
+        // name what is visible where the block appears (11.2). The formals
+        // they name are the block's own generics and ports, declared just
+        // above, and it is the formal's subtype that says what an actual
+        // written as a literal means -- "b => '0'" gives the BIT '0' where
+        // the generic b is a BIT (6.5.7.1).
+        m_scopep = outerp;
+        analyzeAssociations(nodep->headerp()->genericMapp(), innerp, true);
+        analyzeAssociations(nodep->headerp()->portMapp(), innerp);
+        m_scopep = innerp;
         // A block is elaborated where it stands, so a port left unconstrained
         // simply takes the subtype of the one actual it is ever given
         constrainBlockPorts(nodep->headerp());
@@ -3998,7 +4014,11 @@ void VhdlSemVisitor::visit(AstVhdlGenerate* nodep) {
             }
         }
     }
-    pushScope(nodep->name().empty() ? "generate" : nodep->name());
+    nameEnclosing(pushScope(nodep->name().empty() ? "generate" : nodep->name()), nodep->name());
+    // What a generate declares belongs to its body, so the generate's own
+    // label is the prefix that reaches it (8.3, 11.8)
+    VL_RESTORER_COPY(m_genLabel);
+    m_genLabel = nodep->name();
     if (nodep->kind() == VhdlLoopKind::FOR) {
         VhdlSymbol* const symp = VhdlSymTab::newSymbol(VhdlSymKind::GENERATE_PARAMETER,
                                                        nodep->paramName(), nodep);
@@ -4018,7 +4038,11 @@ void VhdlSemVisitor::visit(AstVhdlGenerateBody* nodep) {
     for (AstNode* p = nodep->choicesp(); p; p = p->nextp()) {
         analyzeChoice(VN_AS(p, VhdlChoice), m_genSelTypep);
     }
-    pushScope(nodep->name().empty() ? "generate body" : nodep->name());
+    VhdlScope* const bodyp = pushScope(nodep->name().empty() ? "generate body" : nodep->name());
+    nameEnclosing(bodyp, nodep->name());
+    // An alternative of its own name keeps it; otherwise the generate's
+    // label names this region
+    if (nodep->name().empty()) nameEnclosing(bodyp, m_genLabel);
     if (!m_inSpecialized) rejectUnsharedVariables(nodep->declsp(), "a generate statement");
     iterateAndNextNull(nodep->declsp());
     iterateAndNextNull(nodep->stmtsp());
@@ -4457,6 +4481,12 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
             m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
             libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
+            // An entity's own name is a prefix for what it declares, and
+            // only for that: "e.s" for a signal the architecture declares is
+            // what Questa 2025.2 takes and nvc 1.22.1 and GHDL 7.0.0-dev
+            // both refuse, though 8.3 allows it. The architecture names this
+            // region too, by copying what the entity named.
+            nameEnclosing(unitScopep, unitp->name());
         } else if (AstVhdlArchitecture* const archp = VN_CAST(unitp, VhdlArchitecture)) {
             // An architecture continues its entity's declarative region
             // (3.3, 12.1), so a port is directly visible in it -- and hides
@@ -4491,6 +4521,8 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 m_archUnits[lib + "." + parts.back()] = archp;
                 m_archByKey[lib + "." + parts.back() + "(" + lower(archp->name()) + ")"] = archp;
             }
+            // The architecture's own name is a prefix for what it declares
+            nameEnclosing(unitScopep, archp->name());
             if (!m_inSpecialized) rejectUnsharedVariables(archp->declsp(), "an architecture");
             VL_RESTORER(m_archScopep);
             VL_RESTORER(m_archEntityScopep);
