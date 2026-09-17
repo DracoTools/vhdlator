@@ -362,6 +362,18 @@ public:
     // Resolution (6.3)
     VhdlSymbol* resolutionp() const { return m_resolutionp; }
     void resolutionp(VhdlSymbol* symp) { m_resolutionp = symp; }
+
+    // Which of the two vector types the 1993 and 2008 editions of
+    // STD_LOGIC_1164 disagree about this is: 0 for neither, 1 for the
+    // unresolved STD_ULOGIC_VECTOR and 2 for the resolved STD_LOGIC_VECTOR.
+    // 2008 makes the second a subtype of the first, so they share a base and
+    // only the resolution tells them apart; 1993 declares two types. A
+    // constrained subtype of either keeps the resolution it was given (6.3),
+    // so this answers for "std_logic_vector(7 downto 0)" as well.
+    int logicVectorFlavour() const {
+        if (base()->name() != "std_ulogic_vector") return 0;
+        return m_resolutionp ? 2 : 1;
+    }
     bool isResolved() const { return m_resolutionp != nullptr; }
 
     // For diagnostics

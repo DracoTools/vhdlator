@@ -2156,6 +2156,7 @@ private:
         std::string chars;
     };
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
+    int flavourOf(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
     static void dropUninstantiated(std::vector<VhdlSymbol*>& found) VL_MT_DISABLED;
     VhdlType* attrTypeQuiet(AstVhdlAttrName* nodep) VL_MT_DISABLED;
     static bool scopeEncloses(const VhdlScope* outerp, const VhdlScope* innerp) VL_MT_DISABLED;
@@ -7245,6 +7246,23 @@ static VhdlSymbol* aliasRoot(VhdlSymbol* symp) {
     return symp;
 }
 
+// Which of the two vector types an actual could be, where every reading of it
+// agrees. Zero where it is neither, or where the readings disagree and the
+// question is not this one.
+int VhdlSemVisitor::flavourOf(AstNodeVhdlExpr* nodep) {
+    if (!nodep) return 0;
+    CandSet cands;
+    candidateTypes(nodep, cands);
+    int found = 0;
+    for (const VhdlType* const typep : cands.types) {
+        const int flavour = typep ? typep->logicVectorFlavour() : 0;
+        if (!flavour) continue;
+        if (found && found != flavour) return 0;
+        found = flavour;
+    }
+    return found;
+}
+
 VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>& cands,
                                VhdlType* wantp, const std::string& what) {
     // An alias and what it aliases are one declaration, not two: aliasing a
@@ -7376,6 +7394,40 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
             if (typesMatch(resultp, wantp)) narrowed.push_back(symp);
         }
         if (!narrowed.empty()) cands.swap(narrowed);
+    }
+    // Before 2008, STD_LOGIC_VECTOR is a type of its own rather than a subtype
+    // of STD_ULOGIC_VECTOR, so of two candidates separated only by that,
+    // exactly one is applicable at all. Against the 2008 package Verilator
+    // ships both are, so the actual's own type mark is what says which was
+    // meant -- which is the answer 1993 would have reached by itself.
+    if (cands.size() > 1 && v3Global.opt.vhdlStd() < V3LangCode::L1076_2008) {
+        if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            std::vector<VhdlSymbol*> exact;
+            for (VhdlSymbol* const symp : cands) {
+                bool spelledSame = true;
+                size_t pos = 0;
+                for (AstNode* argp = callp->argsp(); argp; argp = argp->nextp(), ++pos) {
+                    const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
+                    if (!asp || !asp->actualp()) continue;
+                    const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                    const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
+                    if (at < 0 || at >= static_cast<int>(symp->paramTypes().size())) continue;
+                    const VhdlType* const actualp = asp->actualp()->vhdlTypep();
+                    const VhdlType* const formalp = symp->paramTypes()[at];
+                    const int offered = formalp ? formalp->logicVectorFlavour() : 0;
+                    if (!offered) continue;
+                    // The actual has not been analyzed yet -- which reading
+                    // of it is meant is what this is deciding -- so it is
+                    // asked what types it could have, the way an operand is
+                    const int wanted
+                        = actualp ? actualp->logicVectorFlavour() : flavourOf(asp->actualp());
+                    if (!wanted) continue;
+                    if (wanted != offered) spelledSame = false;
+                }
+                if (spelledSame) exact.push_back(symp);
+            }
+            if (exact.size() == 1) cands.swap(exact);
+        }
     }
     if (cands.size() > 1) {
         // Several interpretations remain. Where the context names a type,

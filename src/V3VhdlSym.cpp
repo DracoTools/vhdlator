@@ -159,6 +159,23 @@ const char* VhdlSymbol::kindName() const {
     return "declaration";  // LCOV_EXCL_LINE
 }
 
+// STD_LOGIC_VECTOR and STD_ULOGIC_VECTOR are one type and a subtype of it in
+// the 2008 edition of STD_LOGIC_1164, which is the edition Verilator ships,
+// and two distinct types in the 1993 one.  So a pre-2008 design may declare a
+// subprogram over each -- VESTS' util_pk_test declares ALL_POSSIBLE_VALUES
+// three times, over BIT_VECTOR and both of these -- and against the shipped
+// package the last two have the same profile.  They are held apart here
+// rather than by shipping a second edition of the package, which would mean
+// maintaining a copy of a standard IEEE publishes only for 2008.
+static bool separateBeforeVhdl2008(const VhdlType* ap, const VhdlType* bp) {
+    if (!ap || !bp || ap == bp) return false;
+    if (v3Global.opt.vhdlStd() >= V3LangCode::L1076_2008) return false;
+    if (ap->base() != bp->base()) return false;  // Already told apart
+    const int aFlavour = ap->logicVectorFlavour();
+    const int bFlavour = bp->logicVectorFlavour();
+    return aFlavour && bFlavour && aFlavour != bFlavour;
+}
+
 bool VhdlSymbol::homographOf(const VhdlSymbol* otherp) const {
     if (m_name != otherp->name()) return false;
     // Only overloadables escape hiding, and only when their signatures differ
@@ -176,12 +193,14 @@ bool VhdlSymbol::homographOf(const VhdlSymbol* otherp) const {
         const VhdlType* const ap = m_paramTypes[i];
         const VhdlType* const bp = otherp->paramTypes()[i];
         if (ap && bp && ap->base() != bp->base()) return false;
+        if (separateBeforeVhdl2008(ap, bp)) return false;
     }
     // A function's result type is part of its signature (12.3)
     if (m_returnTypep && otherp->returnTypep()
         && m_returnTypep->base() != otherp->returnTypep()->base()) {
         return false;
     }
+    if (separateBeforeVhdl2008(m_returnTypep, otherp->returnTypep())) return false;
     return true;
 }
 
