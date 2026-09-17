@@ -863,6 +863,26 @@ private:
                     if (!idx.isInt()) return VhdlValue{};
                     return whole.element(idx.toInt());
                 }
+                // Text is held as text rather than element by element, and
+                // the index is the attribute's own subtype's: "attribute a :
+                // string (10 downto 1)" puts the first character at 10
+                if (nodep->argp() && whole.isStr()) {
+                    const VhdlValue idx = eval(nodep->argp());
+                    if (!idx.isInt()) return VhdlValue{};
+                    const VhdlType* const atp = attrp->typep();
+                    int64_t left = 1;
+                    bool ascending = true;
+                    if (atp && !atp->indexTypes().empty() && atp->indexTypes()[0]
+                        && atp->indexTypes()[0]->bounded()) {
+                        left = atp->indexTypes()[0]->left();
+                        ascending = atp->indexTypes()[0]->ascending();
+                    }
+                    const int64_t off = ascending ? idx.toInt() - left : left - idx.toInt();
+                    const std::string text = whole.toStr();
+                    if (off < 0 || static_cast<size_t>(off) >= text.size()) return VhdlValue{};
+                    return VhdlValue::mkInt(static_cast<unsigned char>(text[off]),
+                                            V3VhdlStd::characterType());
+                }
                 return whole;
             }
         }

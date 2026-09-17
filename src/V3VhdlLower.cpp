@@ -165,6 +165,9 @@ class VhdlLowerVisitor final {
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::set<std::string> m_instantiated;  // Modules something else builds one of
     std::set<std::string> m_knownEntities;  // "lib.entity" of every entity there is
+    // The generics each entity declares, in order, for a binding indication
+    // whose generic map is positional
+    std::map<std::string, std::vector<std::string>> m_entityGenericNames;
     // The loops being lowered, innermost last. A labelled exit or next names
     // a loop that need not be the innermost (10.11, 10.12), which Verilator's
     // break and continue cannot express, so those become a jump out of a
@@ -1087,14 +1090,29 @@ private:
         return isStringType(typep) ? typep : nullptr;
     }
 
-    // An index into a STRING, brought back to where Verilator counts from
+    // Whether a STRING's own range runs upwards. "string (10 downto 1)" is a
+    // subtype like any other, and its first character is the one at 10.
+    static bool stringAscending(const VhdlType* typep) {
+        if (!typep) return true;
+        const std::vector<VhdlType*>& indexes = typep->indexTypes();
+        if (indexes.empty() || !indexes[0] || !indexes[0]->bounded()) return true;
+        return indexes[0]->ascending();
+    }
+
+    // An index into a STRING, brought back to where Verilator counts from.
+    // Verilator's string counts up from zero whichever way the subtype runs,
+    // so a descending one counts back from its left bound.
     static AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
         typep = stringBehind(typep);
         if (!typep) return indexp;
-        const int64_t low = stringLow(typep);
-        if (low == 0) return indexp;
+        const int64_t left = stringLow(typep);
+        if (!stringAscending(typep)) {
+            return new AstSub{
+                flp, new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left)}, indexp};
+        }
+        if (left == 0) return indexp;
         return new AstSub{flp, indexp,
-                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(low)}};
+                          new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left)}};
     }
 
     // Whether an operand is a literal with a Z in it. Z is the one metavalue
@@ -6363,9 +6381,21 @@ private:
         AstNodeExpr* const outp = lowerExpr(valuep);
         // "obj'attr(i)" is one element of the value the attribute holds, not
         // the whole of it (7.2, 8.4); the analyzer has already given this
-        // name the element's type
+        // name the element's type. The index is the attribute's own subtype's
+        // -- "attribute a : string (10 downto 1)" puts the first character
+        // at 10 -- so it is brought back the same way any other index is.
         if (outp && nodep->argp()) {
-            if (AstNodeExpr* const indexp = lowerExpr(nodep->argp())) {
+            if (AstNodeExpr* indexp = lowerExpr(nodep->argp())) {
+                const VhdlSymbol* const attrp
+                    = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+                const VhdlType* const attrTypep = attrp ? attrp->typep() : nullptr;
+                indexp = stringIndex(attrTypep, indexp, nodep->fileline());
+                // The value an attribute holds is an expression, not an
+                // object, and a character of text is taken from one by
+                // asking for it rather than by selecting a bit
+                if (attrTypep && isStringType(attrTypep)) {
+                    return new AstGetcN{nodep->fileline(), outp, indexp};
+                }
                 return new AstSelBit{nodep->fileline(), outp, indexp};
             }
         }
@@ -14910,13 +14940,20 @@ private:
                 // wrote (6.5.7.1)
                 AstPin* pinp = lowerAssoc(VN_AS(p, VhdlAssoc), ++bindPos);
                 // Written positionally, the Nth association is the Nth
-                // generic, which the component named; giving the pin that
-                // name is what lets it take the place of the default the
-                // component would otherwise have handed over (7.3.2.2)
-                if (pinp && pinp->name().empty() && compDeclp) {
-                    int at = 0;
-                    for (AstNode* gp = compDeclp->genericsp(); gp; gp = gp->nextp()) {
-                        if (++at == bindPos) pinp->name(VN_AS(gp, VhdlIfaceDecl)->name());
+                // generic of the *entity*, which is what this map associates
+                // -- the component may name its own by other names (7.3.2.2)
+                if (pinp && pinp->name().empty()) {
+                    const std::string entLib
+                        = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+                    const auto genIt = m_entityGenericNames.find(entLib + "." + modName);
+                    if (genIt != m_entityGenericNames.end()
+                        && bindPos <= static_cast<int>(genIt->second.size())) {
+                        pinp->name(genIt->second[bindPos - 1]);
+                    } else if (compDeclp) {
+                        int at = 0;
+                        for (AstNode* gp = compDeclp->genericsp(); gp; gp = gp->nextp()) {
+                            if (++at == bindPos) pinp->name(VN_AS(gp, VhdlIfaceDecl)->name());
+                        }
                     }
                 }
                 if (pinp && !pinNamed(paramsp, pinp->name())) {
@@ -14963,6 +15000,10 @@ private:
                 for (AstNode* p = compp->genericsp(); p; p = p->nextp()) {
                     const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
                     if (!ifp->defaultp() || pinNamed(paramsp, ifp->name())) continue;
+                    // Where a binding indication gives the entity's generics,
+                    // the component's are not passed on: they are what the
+                    // binding's own actuals read (7.3.2.2)
+                    if (bindGenericNames.count(ifp->name())) continue;
                     AstNodeExpr* const valuep = lowerExpr(ifp->defaultp());
                     if (!valuep) continue;
                     paramsp = AstNode::addNextNull(
@@ -21477,7 +21518,13 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Which architecture each entity is built from has to be settled before
     // any of them is lowered, since an instance asks for it by name
     std::map<std::string, AstVhdlArchitecture*> builtArch;
-    for (const auto& pair : entities) m_knownEntities.insert(pair.first);
+    for (const auto& pair : entities) {
+        m_knownEntities.insert(pair.first);
+        std::vector<std::string>& names = m_entityGenericNames[pair.first];
+        for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
+            names.push_back(VN_AS(gp, VhdlIfaceDecl)->name());
+        }
+    }
     // A module the other frontend read is a design unit as much as an entity
     // is: a VHDL architecture may instantiate a Verilog module through a
     // component of the same name, and that component is bound

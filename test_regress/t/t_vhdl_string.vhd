@@ -44,6 +44,7 @@ begin
     constant mixed : string(1 to 4) := ('a', 'b', nul, 'c');
     variable words : name_array := ("one ", "two ", "tre ");
     variable run : string(1 to 12);
+    variable down : string (10 downto 1) := "ABCDEFGHIJ";
   begin
     assert img(y) = "0101" report "img" severity failure;
 
@@ -87,6 +88,15 @@ begin
     assert words(2) = "tre " report "words 2" severity failure;
     words(1) := "four";
     assert words(1) = "four" report "words written" severity failure;
+
+    -- A STRING subtype indexes the way its own range runs. Verilator counts
+    -- text up from zero whichever way the subtype runs, so a descending one
+    -- reads back from its left bound (5.3.2.1).
+    assert down(10) = 'A' report "descending left" severity failure;
+    assert down(1) = 'J' report "descending right" severity failure;
+    assert down(7) = 'D' report "descending middle" severity failure;
+    down(1) := 'z';
+    assert down = "ABCDEFGHIz" report "descending written" severity failure;
 
     report "*-* All Finished *-*";
     stop;

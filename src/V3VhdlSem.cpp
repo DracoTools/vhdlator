@@ -937,6 +937,55 @@ class VhdlSemVisitor final : public VNVisitor {
         return nullptr;
     }
 
+    // What a generic subprogram left as "is <>" stands for: the subprogram of
+    // that name visible where the instance is written (6.5.6.3). Which of
+    // several overloads is meant is decided by the formal's own profile, read
+    // with each generic type replaced by the type this instance chose for it.
+    // Null where none is visible, which leaves the copy to resolve the name
+    // itself the way it always did.
+    VhdlSymbol* defaultSubprogramFor(AstVhdlIfaceDecl* formalp,
+                                     const std::map<std::string, VhdlType*>& chosen) {
+        const VhdlSymbol* const wantp
+            = formalp->profilep() ? formalp->profilep()->vhdlSymp() : nullptr;
+        if (!wantp) return nullptr;
+        const auto asChosen = [&](const VhdlType* typep) -> const VhdlType* {
+            if (!typep) return nullptr;
+            const auto it = chosen.find(typep->base()->name());
+            return it == chosen.end() ? typep->base() : it->second->base();
+        };
+        std::vector<VhdlSymbol*> found;
+        lookup(formalp->name(), found);
+        VhdlSymbol* bestp = nullptr;
+        int best = -1;
+        for (VhdlSymbol* const symp : found) {
+            VhdlSymbol* const rootp = symp->resolved();
+            if (rootp->kind() != wantp->kind()) continue;
+            if (rootp->paramTypes().size() != wantp->paramTypes().size()) continue;
+            int score = 0;
+            bool fits = true;
+            for (size_t i = 0; i < rootp->paramTypes().size() && fits; ++i) {
+                const VhdlType* const ap = rootp->paramTypes()[i];
+                const VhdlType* const bp = asChosen(wantp->paramTypes()[i]);
+                if (!ap || !bp) continue;
+                if (ap->base() == bp) {
+                    ++score;
+                } else {
+                    fits = false;
+                }
+            }
+            const VhdlType* const arp = rootp->returnTypep();
+            const VhdlType* const brp = asChosen(wantp->returnTypep());
+            if (!arp != !brp) fits = false;
+            if (arp && brp && arp->base() != brp) fits = false;
+            if (!fits) continue;
+            if (score > best) {
+                best = score;
+                bestp = rootp;
+            }
+        }
+        return bestp;
+    }
+
     // The type a generic type is given. Usually a type mark, but VHDL-2008
     // lets the actual be any subtype indication, so "T => std_logic_vector(7
     // downto 0)" hands over the constraint as well as the type (6.5.5); the
@@ -2121,6 +2170,7 @@ private:
     void checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void checkPartialAssociations(AstVhdlInstance* nodep) VL_MT_DISABLED;
     static const VhdlSymbol* notLocallyStatic(const AstNode* exprsp) VL_MT_DISABLED;
+    static bool lengthIsLocallyStatic(const AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
     void checkSelectorStatic(const AstNodeVhdlExpr* exprp, const std::string& what) VL_MT_DISABLED;
     void checkGenericAssociations(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     static void dumpScope(const VhdlScope* scopep, const std::string& indent) VL_MT_DISABLED;
@@ -3266,18 +3316,35 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
     // One that says "others" or "all" is the last for its attribute and class
     // in its declarative part (7.2)
     const std::string closedKey = cvtToHex(m_scopep) + " " + nodep->name() + " " + cls;
-    if (m_attrSpecsClosed.count(closedKey) && !m_inSpecialized) {
+    // A specification written after one that said "all" or "others" is
+    // already wrong for that reason alone; the value that one gave is not a
+    // second mistake to report
+    const bool afterClosed = m_attrSpecsClosed.count(closedKey) != 0;
+    if (afterClosed && !m_inSpecialized) {
         err(nodep->fileline(), "An attribute specification that says 'others' or 'all' is the"
                                " last for attribute '"
                                    + nodep->name() + "' of class " + cls
                                    + " in its declarative part");
     }
-    if (specp->all() || specp->others()) {
-        m_attrSpecsClosed.insert(closedKey);
-        return;
-    }
     const bool ofUnit
         = cls == "entity" || cls == "architecture" || cls == "package" || cls == "configuration";
+    if (specp->all() || specp->others()) {
+        m_attrSpecsClosed.insert(closedKey);
+        // "of all" gives the attribute to every named entity of that class
+        // declared in this region, and "of others" to those an earlier
+        // specification for the same attribute did not name (7.2)
+        if (!ofUnit) {
+            for (const auto& pair : m_scopep->direct()) {
+                VhdlSymbol* const symp = pair.second->resolved();
+                if (!entityClassMatches(cls, symp->kind())) continue;
+                if (cls == "type" && VN_IS(symp->declp(), VhdlSubtypeDecl)) continue;
+                if (cls == "subtype" && VN_IS(symp->declp(), VhdlTypeDecl)) continue;
+                if (symp->userAttr(nodep->name())) continue;
+                symp->userAttr(nodep->name(), nodep->valuep());
+            }
+        }
+        return;
+    }
     for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
         AstNodeVhdlExpr* const namep = VN_AS(p, NodeVhdlExpr);
         std::vector<std::string> parts;
@@ -3380,8 +3447,12 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
             VhdlSymbol* const realp = symp->resolved();
             if (!entityClassMatches(cls, realp->kind())) continue;
             if (realp->userAttr(nodep->name())) {
-                err(nodep->fileline(), "Attribute '" + nodep->name() + "' is already given a "
-                                       "value for '" + parts.back() + "'");
+                if (!afterClosed) {
+                    err(nodep->fileline(), "Attribute '" + nodep->name()
+                                               + "' is already given a "
+                                                 "value for '"
+                                               + parts.back() + "'");
+                }
                 continue;
             }
             realp->userAttr(nodep->name(), nodep->valuep());
@@ -8289,7 +8360,31 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         }
         return V3VhdlStd::stringType();
     }
-    if (!prefixTypep) prefixTypep = analyzeExpr(nodep->prefixp(), nullptr);
+    // A user-defined attribute is asked of whatever was given it, which may
+    // be a subprogram, an enumeration literal, a label or a design unit --
+    // none of which analyzes as an expression (7.2, 16.2). Naming what
+    // carries the attribute is all the attribute needs, so the prefix is
+    // looked up rather than read as a value.
+    bool prefixIsBearer = false;
+    if (!prefixTypep && !parts.empty()) {
+        bool userAttr = false;
+        std::vector<VhdlSymbol*> attrs;
+        lookup(attrName, attrs);
+        for (const VhdlSymbol* const asymp : attrs) {
+            if (asymp->resolved()->kind() == VhdlSymKind::ATTRIBUTE) userAttr = true;
+        }
+        if (userAttr) {
+            std::vector<VhdlSymbol*> prefs;
+            lookup(parts.back(), prefs);
+            for (VhdlSymbol* const psymp : prefs) {
+                if (!psymp->resolved()->userAttr(attrName)) continue;
+                nodep->prefixp()->vhdlSymp(psymp);
+                prefixIsBearer = true;
+                break;
+            }
+        }
+    }
+    if (!prefixTypep && !prefixIsBearer) prefixTypep = analyzeExpr(nodep->prefixp(), nullptr);
     checkSignalAttrOfOutPort(nodep, attrName);
     // Record what the prefix denotes, so that folding an attribute later does
     // not have to work it out again
@@ -10710,12 +10805,48 @@ bool VhdlSemVisitor::reconstrainDecls(const std::vector<AstNodeVhdlUnit*>& units
     return true;
 }
 
+// Whether a value's own length is settled where the design is written. The
+// matching-elements rule of 5.3.2.2 is a rule about the values, and only
+// where both lengths are locally static can it be answered by reading the
+// source; otherwise it is left to elaboration, which is what nvc 1.22.1 and
+// GHDL 7.0.0-dev both do -- "signal s : std_logic_vector(w downto 0)", with
+// w a function of the design, analyzes and then fails to elaborate.
+bool VhdlSemVisitor::lengthIsLocallyStatic(const AstNodeVhdlExpr* nodep) {
+    const VhdlSymbol* const symp = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+    if (!symp) return true;
+    const AstNode* const declp = symp->declp();
+    const AstVhdlSubtypeInd* sip = nullptr;
+    if (const AstVhdlObjectDecl* const odp = VN_CAST(declp, VhdlObjectDecl)) {
+        sip = odp->subtypep();
+    } else if (const AstVhdlIfaceDecl* const ifp = VN_CAST(declp, VhdlIfaceDecl)) {
+        sip = ifp->subtypep();
+    }
+    // The bounds may be written as a constraint of their own or into the
+    // type mark -- "std_logic_vector(3 downto 0)" is an indexed name until
+    // the mark is known -- so the whole indication is what is read
+    if (!sip) return true;
+    // A call to a function of the design is never locally static (9.4.2),
+    // whether it is written with arguments or as a bare name
+    bool called = false;
+    sip->foreach([&](const AstNodeVhdlExpr* exprp) {
+        if (!VN_IS(exprp, VhdlName) && !VN_IS(exprp, VhdlCall)) return;
+        const VhdlSymbol* const fsymp
+            = exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+        if (fsymp && fsymp->kind() == VhdlSymKind::FUNCTION && !fsymp->predefined()) {
+            called = true;
+        }
+    });
+    if (called) return false;
+    return !notLocallyStatic(sip);
+}
+
 // An array value must have exactly as many elements as the constrained
 // subtype it is given to (5.3.2.2)
 void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
                                      const std::string& what) {
     if (!nodep || !typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return;
     if (!typep->isConstrainedArray()) return;
+    if (!lengthIsLocallyStatic(nodep)) return;
     // In a copy made for one call site the parameter's length is what that
     // call supplied, not something the design wrote, so a call the length
     // rules out is written anyway and guarded: "if v'length = 5 then f(v)"
@@ -12616,14 +12747,46 @@ void VhdlSemVisitor::visit(AstVhdlConfigSpec* nodep) {
     AstVhdlEntitySpec* const specp = nodep->specp();
     AstVhdlBinding* const bindingp = nodep->bindingp();
     if (!specp || !bindingp || !bindingp->unitp()) return;
-    std::vector<std::string> parts;
-    if (!flatten(bindingp->unitp(), parts) || parts.empty()) return;
-    const std::string entity = parts.back();
     std::vector<std::string> names;
     for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
         if (const AstVhdlName* const namep = VN_CAST(p, VhdlName)) names.push_back(namep->name());
     }
-    if (specp->entityClass() == "component" && !names.empty()) {
+    // "labels : component_name" puts the component's name last (7.3.1)
+    const std::string compName
+        = specp->entityClass() == "component" && !names.empty() ? names.back() : "";
+    // What the component itself declares is visible to the actuals of the
+    // binding's generic map: "generic map (g1 => g1 + g1)" is the entity's
+    // formal taking the component's own generic, which holds what the
+    // instance gave it or the default the component declared (3.4.2,
+    // 7.3.2.2). Those names are visible here and nowhere else in the
+    // architecture, so they are looked up in a region of their own.
+    if (bindingp->genericMapp()) {
+        VhdlScope* compScopep = nullptr;
+        if (!compName.empty()) {
+            std::vector<VhdlSymbol*> found;
+            lookup(compName, found);
+            for (const VhdlSymbol* const csymp : found) {
+                if (csymp->resolved()->kind() == VhdlSymKind::COMPONENT) {
+                    compScopep = csymp->resolved()->innerp();
+                }
+            }
+        }
+        VhdlScope* const bindScopep = pushScope("binding");
+        if (compScopep) bindScopep->addUse(compScopep);
+        for (AstNode* p = bindingp->genericMapp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (asp && asp->actualp()) analyzeExpr(asp->actualp(), nullptr);
+        }
+        popScope();
+    }
+    // "use entity work.sub(test)" parses as a name with a parenthesised
+    // suffix, since an architecture name and an index look alike (7.3.2)
+    AstNodeVhdlExpr* unitNamep = bindingp->unitp();
+    if (AstVhdlCall* const callp = VN_CAST(unitNamep, VhdlCall)) unitNamep = callp->prefixp();
+    std::vector<std::string> parts;
+    if (!flatten(unitNamep, parts) || parts.empty()) return;
+    const std::string entity = parts.back();
+    if (!compName.empty()) {
         m_specBindings[names.back()] = entity;
         names.pop_back();
     }
@@ -12748,12 +12911,28 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
     std::vector<VhdlType*> actualTypes;
     std::vector<VhdlScope*> actualPackages;
     std::vector<VhdlSymbol*> actualSubs;
+    std::vector<VhdlSymbol*> defaultSubs(generics.size(), nullptr);
+    // Which type each generic type was given, for reading a subprogram's
+    // profile with the instance's choices put in
+    std::map<std::string, VhdlType*> chosenTypes;
+    for (size_t i = 0; i < generics.size(); ++i) {
+        if (generics[i]->kind() != VhdlIfaceKind::TYPE || !actuals[i]) continue;
+        VhdlType* const typep = resolveTypeActual(actuals[i]);
+        if (typep && !typep->isError()) chosenTypes[generics[i]->name()] = typep;
+    }
     for (size_t i = 0; i < generics.size(); ++i) {
         if (generics[i]->kind() == VhdlIfaceKind::SUBPROGRAM) {
             // A generic subprogram the instance says nothing about is
-            // whatever is visible where the instance is written, which the
-            // copy sees anyway ("is <>", 6.5.5)
-            if (!actuals[i]) continue;
+            // whatever is visible where the instance is written ("is <>",
+            // 6.5.6.3) -- which is not where the entity is written, so the
+            // copy cannot be left to find it on its own
+            if (!actuals[i]) {
+                if (VhdlSymbol* const subp = defaultSubprogramFor(generics[i], chosenTypes)) {
+                    defaultSubs[i] = subp;
+                    actualSubs.push_back(subp);
+                }
+                continue;
+            }
             VhdlSymbol* const subp = resolveSubprogramActual(actuals[i], generics[i]);
             if (!subp) return nullptr;  // Leaves the honest report
             actualSubs.push_back(subp);
@@ -12831,7 +13010,9 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
         for (AstNode* p = entCopyp->genericsp(); p; p = p->nextp(), ++index) {
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             const bool isSub = ifp->kind() == VhdlIfaceKind::SUBPROGRAM;
-            if (isSub && index < actuals.size() && !actuals[index]) ifp->bound(true);
+            if (isSub && index < actuals.size() && !actuals[index] && !defaultSubs[index]) {
+                ifp->bound(true);
+            }
         }
     }
     AstVhdlArchitecture* const archCopyp = archp->cloneTree(false);
@@ -12862,7 +13043,8 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
                 m_boundGenTypes[generics[i]->name()] = actualTypes[nextType++];
             } else if (generics[i]->kind() == VhdlIfaceKind::PACKAGE) {
                 m_boundGenPackages[generics[i]->name()] = actualPackages[nextPkg++];
-            } else if (generics[i]->kind() == VhdlIfaceKind::SUBPROGRAM && actuals[i]) {
+            } else if (generics[i]->kind() == VhdlIfaceKind::SUBPROGRAM
+                       && (actuals[i] || defaultSubs[i])) {
                 m_boundGenSubs[generics[i]->name()] = actualSubs[nextSub++];
             }
         }

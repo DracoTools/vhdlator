@@ -27,17 +27,46 @@ entity t is
   port ( signal pt : in bit );
   attribute at1 : a1;
   attribute at1 of pt : signal is af1(1);
+  -- Text is held as text rather than element by element, and the index is
+  -- the attribute's own subtype's: a descending one puts the first
+  -- character at its left bound
+  subtype s10 is string (10 downto 1);
+  subtype s1t is string (1 to 10);
+  attribute atd : s10;
+  attribute ata : s1t;
 end entity;
 
 architecture rtl of t is
+  function f1 (i : integer) return integer is begin return i + 1; end function;
+  function f2 (i : integer) return integer is begin return i + 2; end function;
+  attribute atd of f1 : function is "ABCDEFGHIJ";
+  attribute ata of f1 : function is "ABCDEFGHIJ";
+  -- "of all" gives it to every function this region declares (7.2)
+  attribute atall : a1;
+  attribute atall of all : function is af1(2);
 begin
   process
     variable v : integer;
+    variable c : character;
   begin
     v := pt'at1(1);
     assert v = 11 report "first element wrong" severity failure;
     v := pt'at1(3);
     assert v = 31 report "third element wrong" severity failure;
+    c := f1'atd(10);
+    assert c = 'A' report "descending left" severity failure;
+    c := f1'atd(1);
+    assert c = 'J' report "descending right" severity failure;
+    c := f1'ata(1);
+    assert c = 'A' report "ascending left" severity failure;
+    c := f1'ata(10);
+    assert c = 'J' report "ascending right" severity failure;
+    assert f1'atd = "ABCDEFGHIJ" report "whole" severity failure;
+    -- Both functions were given the attribute by the one specification
+    v := f1'atall(2);
+    assert v = 22 report "all: f1" severity failure;
+    v := f2'atall(2);
+    assert v = 22 report "all: f2" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;
