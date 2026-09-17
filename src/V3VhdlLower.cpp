@@ -5460,7 +5460,27 @@ private:
     // written in terms of the generic -- "v(N - 1 downto 0)" -- and INTEGER's
     // default is its leftmost value, which such a width cannot survive.
     AstNodeExpr* lintGenericValue(VhdlType* typep, FileLine* flp) {
-        if (!typep || !typep->isScalar()) return nullptr;
+        if (!typep) return nullptr;
+        // An array or a record takes its own default. Only a scalar is worth
+        // preferring one for, and a generic of either kind still has to have
+        // a value to be linted at all -- "generic (name : string)" with no
+        // default is an ordinary entity that GHDL 7.0.0-dev and nvc 1.22.1
+        // both analyze, and only elaborating it without a value is an error.
+        if (!typep->isScalar()) {
+            // A STRING whose length nothing has said is the common shape of
+            // all -- "generic (name : string)" -- and has no default of its
+            // own, since 6.4.2.2 gives one only where the length is known.
+            // Verilator's STRING carries its own length, so an empty one is
+            // a value, and it is only standing in until an instance supplies
+            // the real one.
+            if (isStringType(typep) && !typep->isConstrainedArray()) {
+                return new AstConst{flp, AstConst::String{}, ""};
+            }
+            // "mustHave", since a vector of logic is otherwise left to start
+            // the way Verilator starts one, and a generic with no value at
+            // all is what stops the lint
+            return defaultValueFor(typep, flp, true);
+        }
         // Only for the kinds a width is written in terms of. An enumeration
         // is never one, and its values are as wide as the type rather than
         // as wide as an integer, so it takes its own default instead.

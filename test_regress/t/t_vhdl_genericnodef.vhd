@@ -13,9 +13,16 @@ use ieee.numeric_std.all;
 -- choose, so it is the ordinary shape of a reusable component. GHDL
 -- 7.0.0-dev and nvc 1.22.1 analyze such an entity without a value for it.
 entity t_vhdl_genericnodef is
+-- A generic of a composite type has none either: a STRING whose length
+-- nothing has said has no default of its own (6.4.2.2), and a vector of
+-- logic would otherwise be left to start the way Verilator starts one.
     generic (WIDTH : positive;
              STEP  : integer;
-             NAME  : character);
+             NAME  : character;
+             TITLE : string;
+             TAG   : string(1 to 3);
+             MASK  : std_logic_vector(3 downto 0);
+             SEED  : bit_vector);
     port (clk : in std_logic;
           q   : out std_logic_vector(WIDTH - 1 downto 0));
 end entity;
@@ -31,4 +38,10 @@ begin
     end process;
 
     q <= std_logic_vector(cnt);
+
+    -- Each of the composite generics is read, so linting reaches them
+    assert TITLE'length >= 0 report "title" severity note;
+    assert TAG'length = 3 report "tag" severity note;
+    assert MASK'length = 4 report "mask" severity note;
+    assert SEED'length >= 0 report "seed" severity note;
 end architecture;
