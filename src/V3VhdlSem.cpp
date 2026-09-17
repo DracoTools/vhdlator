@@ -1989,6 +1989,8 @@ private:
     void visit(AstVhdlAttrDecl* nodep) override;
     void visit(AstVhdlAttrSpec* nodep) override;
     void recordUserAttr(AstVhdlAttrSpec* nodep) VL_MT_DISABLED;
+    VhdlSymbol* declareUnitSelf(const std::string& cls, const std::string& name,
+                                const AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     bool parseForeign(const std::string& text, FileLine* flp, std::string& cnamer,
                       bool& dpir);
     void visit(AstVhdlContextItem* nodep) override;
@@ -3213,6 +3215,26 @@ static bool entityClassMatches(const std::string& cls, VhdlSymKind kind) {
     return true;
 }
 
+// A design unit carries what an attribute specification gives it on a symbol
+// of its own name in its own region, which is also how "name'attr" reads it
+// back (7.2). Nothing else declares that name there, so the first
+// specification for the unit is what declares it.
+VhdlSymbol* VhdlSemVisitor::declareUnitSelf(const std::string& cls, const std::string& name,
+                                            const AstNodeVhdlUnit* unitp) {
+    VhdlSymKind kind = VhdlSymKind::PACKAGE;
+    if (cls == "entity") {
+        kind = VhdlSymKind::ENTITY;
+    } else if (cls == "architecture") {
+        kind = VhdlSymKind::ARCHITECTURE;
+    } else if (cls == "configuration") {
+        kind = VhdlSymKind::CONFIGURATION;
+    }
+    VhdlSymbol* const symp
+        = VhdlSymTab::newSymbol(kind, name, const_cast<AstNodeVhdlUnit*>(unitp));
+    declare(symp, unitp->fileline());
+    return symp;
+}
+
 // A user-defined attribute's value belongs to the entity it is given to, and
 // is read back later as "name'attribute" (7.2). It is a static expression, so
 // what is recorded is the expression itself and every use folds it.
@@ -3263,23 +3285,50 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
         // A design unit's attributes are specified in its own declarative
         // part (7.2)
         if (ofUnit) {
+            const AstNodeVhdlUnit* const unitp = VN_CAST(parentOf(nodep), NodeVhdlUnit);
             // A package declared in this region -- an interface package, or
-            // one nested here -- is decorated here like anything else
+            // one nested here -- is decorated here like anything else. The
+            // one this region *is* carries what is given to it on a symbol
+            // of its own name, put there by the first specification.
             std::vector<VhdlSymbol*> local;
             m_scopep->lookupLocal(parts.back(), local);
-            if (!local.empty()) continue;
-            const AstNodeVhdlUnit* const unitp = VN_CAST(parentOf(nodep), NodeVhdlUnit);
+            VhdlSymbol* selfp = nullptr;
+            bool nested = false;
+            for (VhdlSymbol* const symp : local) {
+                if (unitp && symp->resolved()->declp() == unitp) {
+                    selfp = symp->resolved();
+                } else {
+                    nested = true;
+                }
+            }
+            if (nested && !selfp) continue;
             const bool kindOk
                 = unitp
                   && ((cls == "entity" && VN_IS(unitp, VhdlEntity))
                       || (cls == "architecture" && VN_IS(unitp, VhdlArchitecture))
                       || (cls == "package" && VN_IS(unitp, VhdlPackage))
                       || (cls == "configuration" && VN_IS(unitp, VhdlConfiguration)));
-            if (!m_inSpecialized && (!kindOk || lower(unitp->name()) != lower(parts.back()))) {
-                err(namep->fileline(), "An attribute of " + cls + " '" + parts.back()
-                                           + "' is specified in that " + cls
-                                           + "'s own declarative part");
+            if (!kindOk || lower(unitp->name()) != lower(parts.back())) {
+                if (!m_inSpecialized) {
+                    err(namep->fileline(), "An attribute of " + cls + " '" + parts.back()
+                                               + "' is specified in that " + cls
+                                               + "'s own declarative part");
+                }
+                continue;
             }
+            // The unit's own name is what "name'attr" reads it back through
+            // (7.2, 16.2), and nothing else declares that name here
+            if (!selfp) selfp = declareUnitSelf(cls, parts.back(), unitp);
+            if (!selfp) continue;
+            if (selfp->userAttr(nodep->name())) {
+                if (!m_inSpecialized) {
+                    err(nodep->fileline(), "Attribute '" + nodep->name()
+                                               + "' is already given a value for '" + parts.back()
+                                               + "'");
+                }
+                continue;
+            }
+            selfp->userAttr(nodep->name(), nodep->valuep());
             continue;
         }
         std::vector<VhdlSymbol*> found;
@@ -8362,6 +8411,19 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() == VhdlSymKind::ATTRIBUTE) {
             nodep->vhdlSymp(symp);
+            // The prefix names whatever was given the attribute, which may be
+            // a design unit or a label and so need not analyze as an
+            // expression (7.2, 16.2)
+            if (!nodep->prefixp()->vhdlSymp() && !parts.empty()) {
+                std::vector<VhdlSymbol*> prefs;
+                lookup(parts.back(), prefs);
+                for (VhdlSymbol* const psymp : prefs) {
+                    if (psymp->resolved()->userAttr(attr)) {
+                        nodep->prefixp()->vhdlSymp(psymp);
+                        break;
+                    }
+                }
+            }
             VhdlType* const typep = symp->typep();
             // A user-defined attribute holds an ordinary value, so where that
             // value is an array "obj'attr(i)" is one element of it rather
