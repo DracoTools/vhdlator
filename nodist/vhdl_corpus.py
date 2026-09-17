@@ -454,7 +454,14 @@ def run_group(command, timeout, cwd=None):
 UNIT_DECL_RE = re.compile(
     r'^[ \t]*(?:package(?![ \t]+body\b)|entity|context|configuration)[ \t]+(\w+)',
     re.IGNORECASE | re.MULTILINE)
-MISSING_UNIT_RE = re.compile(r"Design unit '(?:[^'.]*\.)?([^'.]+)' not found")
+MISSING_UNIT_RE = re.compile(r"Design unit '([^'.]*)\.([^'.]+)' not found")
+# A component instantiation whose entity nothing supplied reaches the linker
+# rather than the library, and says so in Verilog's words
+MISSING_MODULE_RE = re.compile(r"Cannot find file containing module: '([^']+)'")
+# "build_compliant_test ch_13_fg_13_01.vhd LIBRARY=star_lib" -- a VESTS test
+# analyzed into a library of its own, so the reg4 it declares never competes
+# with the one in work
+VESTS_LIB_RE = re.compile(r'\bLIBRARY=(\w+)')
 _UNIT_INDEX = {}
 
 
@@ -482,18 +489,111 @@ def unit_index(directory):
     return index
 
 
+VESTS_ORDER_RE = re.compile(r'^\s*(?:build|run)_[a-z_]*test\s+(\S+\.vhdl?)')
+_DECLARED_ORDER = {}
+_DECLARED_LIB = {}
+
+
+def declared_order(directory):
+    """The order the corpus itself analyzes this directory's sources in.
+
+    GHDL's testsuite says it in a script.  VESTS says it in the ".exp" list
+    its runner reads, and analyzes the whole of an Ashenden directory into one
+    library without emptying it between tests, so a unit declared twice is the
+    later one from there on -- which is what makes the order the answer to
+    "which of these three files declares the reg4 this test means".
+    """
+    if directory in _DECLARED_ORDER:
+        return _DECLARED_ORDER[directory]
+    order = []
+    libs = _DECLARED_LIB.setdefault(directory, {})
+    if os.path.exists(os.path.join(directory, 'testsuite.sh')):
+        ghdl_expectations(directory)
+        order = [(word, 'work') for word in _GHDL_EXPECT.get(directory, ({}, []))[1]]
+    else:
+        try:
+            names = sorted(name for name in os.listdir(directory) if name.endswith('.exp'))
+        except OSError:
+            names = []
+        for name in names:
+            try:
+                with open(os.path.join(directory, name), encoding='utf-8',
+                          errors='replace') as handle:
+                    for line in handle:
+                        found = VESTS_ORDER_RE.match(line)
+                        if found:
+                            named = VESTS_LIB_RE.search(line)
+                            lib = named.group(1).lower() if named else 'work'
+                            order.append((found.group(1), lib))
+                            libs[found.group(1)] = lib
+            except OSError:
+                continue
+    _DECLARED_ORDER[directory] = order
+    return order
+
+
+def declared_library(path):
+    """The library the corpus last analyzes this source into, 'work' unless it says."""
+    directory = os.path.dirname(path)
+    declared_order(directory)
+    return _DECLARED_LIB.get(directory, {}).get(os.path.basename(path), 'work')
+
+
+def order_choice(path, candidates, want_lib='work'):
+    """Of several files declaring one unit, the one the corpus analyzed last
+    into the library being asked for, before this source.  Re-analyzing a unit
+    replaces it, so the nearest earlier declaration is the one that library
+    holds when this source is read -- and a file the list analyzes twice, once
+    into work and once into a library of its own, is in both."""
+    order = declared_order(os.path.dirname(path))
+    if not order:
+        return None
+    here = os.path.basename(path)
+    limit = max((i for i, (word, _lib) in enumerate(order) if word == here), default=-1)
+    if limit < 0:
+        return None
+    names = {os.path.basename(other): other for other in candidates}
+    best = None
+    best_at = -1
+    for i, (word, lib) in enumerate(order[:limit]):
+        if word in names and lib == want_lib and i > best_at:
+            best, best_at = names[word], i
+    return best if best_at >= 0 else None
+
+
 def missing_companions(path, output, already):
-    """Files beside this source that declare the design units it could not find."""
+    """Files beside this source that declare the design units it could not find.
+
+    Each comes back with the library the corpus analyzes it into, since a
+    source that says "use bv_utilities.bv_arithmetic" wants that package in
+    that library and not in work.
+    """
     index = unit_index(os.path.dirname(path))
     out = []
-    for name in dict.fromkeys(MISSING_UNIT_RE.findall(output)):
+    seen = {os.path.basename(other) for other, _lib in already}
+    wanted = [(lib.lower(), unit) for lib, unit in MISSING_UNIT_RE.findall(output)]
+    wanted += [('', unit) for unit in MISSING_MODULE_RE.findall(output)]
+    for lib, name in dict.fromkeys(wanted):
         found = [other for other in index.get(name.lower(), [])
-                 if other != path and other not in already and other not in out]
-        # One answer only, and only a file the corpus expects to be accepted:
-        # one that is there to be refused would report its errors as this
-        # source's
-        if len(found) == 1 and expected_outcome(found[0]) == 'accept':
-            out.append(found[0])
+                 if other != path and os.path.basename(other) not in seen]
+        # Only a file the corpus expects to be accepted: one that is there to
+        # be refused would report its errors as this source's
+        found = [other for other in found if expected_outcome(other) == 'accept']
+        # The library the source asked for is what says which file was meant,
+        # where the list analyzes one into work and another into a library of
+        # its own. A missing module reaches the linker with no library named,
+        # so it is this source's own.
+        want = lib or declared_library(path)
+        by_order = order_choice(path, found, want)
+        choice = by_order if by_order else (found[0] if len(found) == 1 else None)
+        # Several declare it and no order says which was meant: that is a real
+        # question, and the source keeps its honest "not found"
+        if choice:
+            # It goes in the library it was looked for in, which is not always
+            # the last one the list files it under: ch_13_fg_13_17 is analyzed
+            # into work and then into chips, and is in both from then on
+            out.append((choice, want))
+            seen.add(os.path.basename(choice))
     return out
 
 
@@ -501,14 +601,24 @@ def run_one(args):
     """Run Verilator over one source. Returns a Result."""
     verilator, flags, timeout, path = args
     expected = expected_outcome(path)
-    companions = ghdl_companions(path) if '/ghdl/testsuite/' in path else []
+    companions = [(other, 'work') for other in ghdl_companions(path)
+                  ] if '/ghdl/testsuite/' in path else []
+    target_lib = 'work'
     start = time.time()
     # A source that names a design unit nothing supplied is re-run with the
     # files beside it that declare what it asked for, since one of a design's
     # files is not a design.  A companion may need one of its own, so this
     # goes round until nothing new is found.
     for _ in range(5):
-        command = [verilator] + flags + extra_flags(path) + companions + [path]
+        command = [verilator] + flags + extra_flags(path)
+        if target_lib == 'work' and all(lib == 'work' for _other, lib in companions):
+            command += [other for other, _lib in companions] + [path]
+        else:
+            # "-work" applies to the files that follow it, so each source goes
+            # in beside the library the corpus analyzes it into
+            for other, lib in companions:
+                command += ['-work', lib, other]
+            command += ['-work', target_lib, path]
         try:
             stdout, returncode = run_group(command, timeout)
             output = stdout.decode('utf-8', errors='replace')
@@ -520,12 +630,17 @@ def run_one(args):
             return Result(path, False, time.time() - start, 'TIMEOUT', expected, False)
         except OSError as exc:
             return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected, False)
-        if ok or 'not found, needed by' not in output:
+        if ok or ('not found, needed by' not in output
+                  and 'Cannot find file containing module' not in output):
             break
         more = missing_companions(path, output, companions)
         if not more:
             break
         companions = companions + more
+        # Where a companion belongs to a library of its own, this source does
+        # too: it is the corpus that files them, not the run
+        if any(lib != 'work' for _other, lib in more):
+            target_lib = declared_library(path)
 
     message = ''
     if not ok:
