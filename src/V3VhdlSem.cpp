@@ -2248,6 +2248,9 @@ private:
                                 const std::string& chars) VL_MT_DISABLED;
     // Where every operand is universal, nothing asks for a conversion, so the
     // universal operator is the one meant (9.3.2). Narrows in place.
+    static void keepContextMatches(std::vector<VhdlSymbol*>& cands,
+                                   const std::vector<VhdlSymbol*>& others,
+                                   const VhdlType* wantp) VL_MT_DISABLED;
     static void preferUniversal(std::vector<VhdlSymbol*>& cands,
                                 const std::vector<const CandSet*>& operands) VL_MT_DISABLED;
 };
@@ -7363,6 +7366,29 @@ bool VhdlSemVisitor::allUniversal(const CandSet& cands) {
     return true;
 }
 
+// Ranking overloads by how little conversion their operands need is a
+// tie-break between interpretations the context allows, not a filter that
+// overrides it. Where the context asks for a type that only a lower-ranked
+// candidate returns, that candidate is the one meant (12.5): "n1 := abs 10"
+// with n1 of a type a user-defined "abs" returns is that operator, even
+// though the predefined one fits the literal without converting it.
+void VhdlSemVisitor::keepContextMatches(std::vector<VhdlSymbol*>& cands,
+                                        const std::vector<VhdlSymbol*>& others,
+                                        const VhdlType* wantp) {
+    if (!wantp || wantp->isError() || wantp->isUniversal() || wantp->isGenericFormal()) return;
+    if (others.empty()) return;
+    for (const VhdlSymbol* const symp : cands) {
+        if (symp->returnTypep() && symp->returnTypep()->base() == wantp->base()) return;
+    }
+    std::vector<VhdlSymbol*> fits;
+    for (VhdlSymbol* const symp : others) {
+        if (symp->returnTypep() && symp->returnTypep()->base() == wantp->base()) {
+            fits.push_back(symp);
+        }
+    }
+    if (!fits.empty()) cands.swap(fits);
+}
+
 void VhdlSemVisitor::preferUniversal(std::vector<VhdlSymbol*>& cands,
                                      const std::vector<const CandSet*>& operands) {
     if (cands.size() < 2) return;
@@ -7883,6 +7909,7 @@ VhdlType* VhdlSemVisitor::analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) {
         (exactMatch(ocands, symp->paramTypes()[0]) ? exact : loose).push_back(symp);
     }
     std::vector<VhdlSymbol*> cands = exact.empty() ? loose : exact;
+    if (!exact.empty()) keepContextMatches(cands, loose, wantp);
     preferUniversal(cands, {&ocands});
     if (!ocands.types.empty() && ocands.types[0] && ocands.types[0]->isError()) {
         return V3VhdlStd::errorType();
@@ -7939,6 +7966,7 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
     // "2 * 500 ns" apart: the universal "*" fits both operands exactly, while
     // the INTEGER one would have to convert the literal (9.3.2).
     std::vector<VhdlSymbol*> cands;
+    std::vector<VhdlSymbol*> runnersUp;  // Applicable, but ranked lower
     int best = -1;
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() != VhdlSymKind::FUNCTION) continue;
@@ -7949,10 +7977,16 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
                           + (exactMatch(rcands, symp->paramTypes()[1]) ? 1 : 0);
         if (score > best) {
             best = score;
+            for (VhdlSymbol* const oldp : cands) runnersUp.push_back(oldp);
             cands.clear();
         }
-        if (score == best) cands.push_back(symp);
+        if (score == best) {
+            cands.push_back(symp);
+        } else {
+            runnersUp.push_back(symp);
+        }
     }
+    keepContextMatches(cands, runnersUp, wantp);
     // A universal real scaled by a universal integer is a universal real,
     // which becomes no named type a context asks for: nvc 1.22.1 and GHDL
     // 7.0.0-dev both refuse "constant r : real := 1000.0 / 100" and take
