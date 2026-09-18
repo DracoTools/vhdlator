@@ -491,6 +491,22 @@ private:
                 if (!asp || !asp->actualp()) continue;
                 const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
                 AstNodeExpr* onep = nullptr;
+                // "f(x, open)" or "f(by => open)" leaves the parameter to its
+                // own default (6.5.7.1). Standing the default here rather
+                // than leaving the argument out keeps the positions of the
+                // arguments that follow.
+                if (asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) {
+                    AstNodeVhdlExpr* const defp
+                        = paramDefaultOf(symp, namep ? namep->name() : "", pos);
+                    if (!defp) {
+                        unsup(asp->fileline(), "a parameter left open with no default");
+                        continue;
+                    }
+                    onep = lowerExpr(defp);
+                    if (!onep) continue;
+                    refp->addArgsp(new AstArg{asp->fileline(), namep ? namep->name() : "", onep});
+                    continue;
+                }
                 // A written parameter given an object of a fixed length is
                 // handed the carrier made for it just before the call
                 const auto cit = m_argCarrier.find(asp);
@@ -570,6 +586,60 @@ private:
             }
         }
         addCaptureArgs(refp, symp, refp->fileline());
+    }
+
+    // The default of the parameter an "open" actual stands for, found from
+    // the call it is written in (6.5.7.1)
+    AstNodeVhdlExpr* openDefaultFor(AstNodeVhdlExpr* nodep) {
+        AstNode* upp = nodep->backp();
+        AstVhdlAssoc* asp = nullptr;
+        for (int depth = 0; upp && !asp && depth < 8; ++depth) {
+            asp = VN_CAST(upp, VhdlAssoc);
+            if (!asp) upp = upp->backp();
+        }
+        if (!asp) return nullptr;
+        AstNode* listp = asp;
+        while (listp->backp() && listp->backp()->nextp() == listp) listp = listp->backp();
+        AstNode* const ownerp = listp->backp();
+        const VhdlSymbol* symp = nullptr;
+        // A procedure call holds its arguments in the call it wraps, so this
+        // is the one node either way
+        if (const AstVhdlCall* const callp = VN_CAST(ownerp, VhdlCall)) {
+            symp = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        }
+        if (!symp) return nullptr;
+        size_t pos = 0;
+        for (AstNode* p = listp; p && p != asp; p = p->nextp()) ++pos;
+        const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+        return paramDefaultOf(symp, namep ? namep->name() : "", pos);
+    }
+
+    // The default a parameter was declared with, named or in order (4.2.2.1)
+    static AstNodeVhdlExpr* paramDefaultOf(const VhdlSymbol* symp, const std::string& name,
+                                           size_t pos) {
+        if (!symp) return nullptr;
+        const AstVhdlSubprogDecl* const declp
+            = VN_CAST(symp->resolved()->declp(), VhdlSubprogDecl);
+        if (!declp) return nullptr;
+        size_t at = pos;
+        if (!name.empty()) {
+            const int found = symp->resolved()->paramIndex(name);
+            if (found < 0) return nullptr;
+            at = static_cast<size_t>(found);
+        }
+        // A generic subprogram keeps its generics ahead of its parameters
+        size_t skip = static_cast<size_t>(declp->genericCount());
+        size_t i = 0;
+        for (AstNode* pp = declp->paramsp(); pp; pp = pp->nextp()) {
+            if (skip) {
+                --skip;
+                continue;
+            }
+            AstVhdlIfaceDecl* const ifp = VN_CAST(pp, VhdlIfaceDecl);
+            if (i++ != at) continue;
+            return ifp ? ifp->defaultp() : nullptr;
+        }
+        return nullptr;
     }
 
     // The parameter of the copy a call reaches, named or in order
@@ -5804,6 +5874,11 @@ private:
         }
         if (AstVhdlExternalName* const p = VN_CAST(nodep, VhdlExternalName)) {
             return lowerExternalName(p, false);
+        }
+        // "f(x, open)" leaves that parameter to its own default (6.5.7.1),
+        // which is the value wherever the actual is read
+        if (VN_IS(nodep, VhdlOpen)) {
+            if (AstNodeVhdlExpr* const defp = openDefaultFor(nodep)) return lowerExpr(defp);
         }
         unsup(flp, std::string{"expression "} + nodep->typeName());
         return nullptr;
