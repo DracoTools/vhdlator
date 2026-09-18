@@ -688,6 +688,41 @@ private:
         newp->addStmtsp(new AstAssign{
             flp, new AstVarRef{flp, datap, VAccess::WRITE},
             new AstNewDynamic{flp, new AstVarRef{flp, nArgp, VAccess::READ}, nullptr}});
+        // An object an allocator makes starts at its subtype's own default
+        // value (5.4.1, 6.4.2.2), which for a TIME or an INTEGER subtype is
+        // its leftmost value rather than zero. A dynamic array starts its
+        // elements at zero, so anything else is filled in.
+        if (elemp) {
+            AstNodeExpr* const defp = defaultValueFor(elemp, flp);
+            const AstConst* const constp = VN_CAST(defp, Const);
+            if (defp && !(constp && constp->num().isEqZero())) {
+                AstVar* const iVarp = new AstVar{flp, VVarType::BLOCKTEMP, "__Vfill",
+                                                 VFlagChildDType{}, newIntDType(flp)};
+                iVarp->funcLocal(true);
+                iVarp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+                iVarp->usedLoopIdx(true);
+                newp->addStmtsp(iVarp);
+                newp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, iVarp, VAccess::WRITE},
+                                              new AstConst{flp, AstConst::Signed32{}, 0}});
+                AstLoop* const loopp = new AstLoop{flp};
+                loopp->addStmtsp(
+                    new AstLoopTest{flp, loopp,
+                                    new AstLtS{flp, new AstVarRef{flp, iVarp, VAccess::READ},
+                                               new AstVarRef{flp, nArgp, VAccess::READ}}});
+                loopp->addStmtsp(
+                    new AstAssign{flp,
+                                  new AstSelBit{flp, new AstVarRef{flp, datap, VAccess::WRITE},
+                                                new AstVarRef{flp, iVarp, VAccess::READ}},
+                                  defp});
+                loopp->addContsp(
+                    new AstAssign{flp, new AstVarRef{flp, iVarp, VAccess::WRITE},
+                                  new AstAdd{flp, new AstVarRef{flp, iVarp, VAccess::READ},
+                                             new AstConst{flp, AstConst::Signed32{}, 1}}});
+                newp->addStmtsp(loopp);
+            } else if (defp) {
+                VL_DO_DANGLING(defp->deleteTree(), defp);
+            }
+        }
         newp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, leftp, VAccess::WRITE},
                                       new AstVarRef{flp, lArgp, VAccess::READ}});
         newp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, dirp, VAccess::WRITE},
@@ -9179,6 +9214,11 @@ private:
                 return new AstConst{flp, AstConst::BitTrue{}};
             }
         }
+        // What an access value points at carries its own bounds too, and is
+        // compared the same way: the same length, then element by element
+        if (nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE) {
+            if (AstNodeExpr* const outp = dynAccessEqual(nodep, flp)) return outp;
+        }
         // Comparing values that carry their own bounds is a length and then
         // an element at a time, which a function of the type does (9.2.3).
         // numeric_std's own "=" is not that one: it compares what the two
@@ -9416,6 +9456,19 @@ private:
             return powp;
         }
         case VhdlBinaryOp::CONCAT: {
+            // What an access value points at carries its own bounds, and a
+            // concatenation of two such values has a length only running
+            // decides. Saying so is better than handing the back end a value
+            // with no width.
+            {
+                const DynAccess* dynp = nullptr;
+                if (dynAccessObj(nodep->lhsp(), dynp) || dynAccessObj(nodep->rhsp(), dynp)) {
+                    VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                    VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                    unsup(flp, "concatenation of what an access value points at");
+                    return nullptr;
+                }
+            }
             // A null array contributes no elements (9.2.5), and there is no
             // value of no width here to contribute them with: Verilog has no
             // zero-element array, so an object of a null subtype is given one
@@ -16551,6 +16604,91 @@ private:
                       new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
                                     new AstConst{flp, AstConst::Signed32{}, 0}}));
         return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+    }
+
+    // The element an array literal has at one offset, as a value of the
+    // element type. A string or bit string literal is its characters, and
+    // each character names a literal of that type (9.3.2, 15.8).
+    AstNodeExpr* literalElement(const std::string& text, int64_t k, const VhdlType* elemTypep,
+                                FileLine* flp) {
+        if (k < 0 || static_cast<size_t>(k) >= text.size() || !elemTypep) return nullptr;
+        const std::string want = std::string{"'"} + text[static_cast<size_t>(k)] + "'";
+        VhdlType* const etp = const_cast<VhdlType*>(elemTypep);
+        for (const VhdlSymbol* const litp : elemTypep->base()->literals()) {
+            if (litp->name() != want) continue;
+            return lowerValue(VhdlValue::mkInt(litp->position(), etp), etp, flp);
+        }
+        return nullptr;
+    }
+
+    // Comparing what an access value points at with an array value. The
+    // object carries its own bounds, so the two are equal when they are the
+    // same length and every element matches (9.2.3). Null where this is not
+    // that comparison, or where the other side is not of a length the text
+    // fixes -- an honest refusal is better than half an answer.
+    AstNodeExpr* dynAccessEqual(AstVhdlBinary* nodep, FileLine* flp) {
+        const DynAccess* dynp = nullptr;
+        AstNodeVhdlExpr* objNodep = dynAccessObj(nodep->lhsp(), dynp);
+        AstNodeVhdlExpr* otherp = nodep->rhsp();
+        if (!objNodep) {
+            objNodep = dynAccessObj(nodep->rhsp(), dynp);
+            otherp = nodep->lhsp();
+        }
+        if (!objNodep || !dynp || !otherp) return nullptr;
+        const VhdlType* const otypep = otherp->vhdlTypep();
+        if (!otypep || otypep->base()->kind() != VhdlTypeKind::ARRAY
+            || otypep->base()->indexTypes().size() != 1) {
+            return nullptr;
+        }
+        // A literal takes its type from the context, which here says nothing
+        // about how long: the literal is as long as its characters (9.3.2),
+        // and each of them names a literal of the element type
+        std::string text;
+        if (!otypep->isConstrainedArray()) {
+            const VhdlValue val = V3VhdlEval::eval(otherp);
+            if (!val.isStr()) return nullptr;
+            text = val.toStr();
+        } else if (!VN_IS(otherp, VhdlName) && !VN_IS(otherp, VhdlSelected)) {
+            // Anything but an object named outright is read a place at a
+            // time by the copy path, which reports for itself where it
+            // cannot -- and an honest "not this comparison" belongs here
+            return nullptr;
+        }
+        const int64_t count
+            = text.empty() ? otypep->dimLength(0) : static_cast<int64_t>(text.size());
+        if (count < 0 || count > 1024) return nullptr;
+        const VhdlType* const elemTypep
+            = otypep->elementp() ? otypep->elementp() : otypep->base()->elementp();
+        AstNodeExpr* const objp = lowerExpr(objNodep);
+        if (!objp) return nullptr;
+        if (!repeatable(objp)) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            return nullptr;
+        }
+        AstNodeExpr* outp
+            = new AstEq{flp, dynLength(dynp, objp, flp),
+                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)}};
+        for (int64_t k = 0; k < count; ++k) {
+            AstNodeExpr* const elemp
+                = new AstSelBit{flp, memberOf(objp->cloneTree(false), dynp->datap->name(), flp),
+                                new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(k)}};
+            AstNodeExpr* const rhsElemp
+                = text.empty()
+                      ? dynSourceElem(
+                            otherp,
+                            new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(k)}, flp)
+                      : literalElement(text, k, elemTypep, flp);
+            if (!rhsElemp) {
+                VL_DO_DANGLING(elemp->deleteTree(), elemp);
+                VL_DO_DANGLING(outp->deleteTree(), outp);
+                VL_DO_DANGLING(objp->deleteTree(), objp);
+                return nullptr;
+            }
+            outp = new AstLogAnd{flp, outp, new AstEq{flp, elemp, rhsElemp}};
+        }
+        VL_DO_DANGLING(objp->deleteTree(), objp);
+        if (nodep->op() == VhdlBinaryOp::NE) return new AstLogNot{flp, outp};
+        return outp;
     }
 
     // One element of the value being copied into an array an access value
