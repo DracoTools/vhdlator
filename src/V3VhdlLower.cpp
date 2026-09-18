@@ -11431,6 +11431,37 @@ private:
         return true;
     }
 
+    // The values a range covers, where the text fixes both ends. A range may
+    // be written out -- "3 to 6" -- or as a subtype mark, which stands for
+    // that subtype's own range (5.3.2.1, 16.2.4). False where it is neither.
+    static bool staticRange(const AstVhdlRange* rp, int64_t& low, int64_t& high,
+                            VhdlType*& typep) {
+        if (!rp) return false;
+        if (rp->leftp() && rp->rightp()) {
+            const VhdlValue lo = V3VhdlEval::eval(rp->leftp());
+            const VhdlValue hi = V3VhdlEval::eval(rp->rightp());
+            if (!lo.isInt() || !hi.isInt()) return false;
+            low = rp->dir() == VhdlDir::TO ? lo.toInt() : hi.toInt();
+            high = rp->dir() == VhdlDir::TO ? hi.toInt() : lo.toInt();
+            typep = lo.typep();
+            return true;
+        }
+        const AstVhdlAttrName* const attrp = VN_CAST(rp->attrp(), VhdlAttrName);
+        if (!attrp || (attrp->name() != "range" && attrp->name() != "reverse_range")) {
+            return false;
+        }
+        const VhdlSymbol* const symp = attrp->prefixp() ? attrp->prefixp()->vhdlSymp() : nullptr;
+        VhdlType* const markp = symp && symp->resolved()->kind() == VhdlSymKind::TYPE
+                                    ? symp->resolved()->typep()
+                                    : (attrp->prefixp() ? attrp->prefixp()->vhdlTypep() : nullptr);
+        if (!markp || !markp->bounded()) return false;
+        if (markp->base()->kind() == VhdlTypeKind::ARRAY) return false;
+        low = markp->low();
+        high = markp->high();
+        typep = markp;
+        return true;
+    }
+
     AstNodeExpr* lowerAggregate(AstVhdlAggregate* nodep) {
         FileLine* const flp = nodep->fileline();
         VhdlType* const typep = nodep->vhdlTypep();
@@ -16704,10 +16735,109 @@ private:
         return outp;
     }
 
+    // Whether any choice of this case covers more values than listing them
+    // one by one can stand. A subtype of INTEGER reaches two billion, and
+    // "when too_high =>" is an ordinary thing to write (10.9).
+    static bool caseWantsChain(AstVhdlCase* nodep) {
+        if (nodep->matching()) return false;  // "case?" matches bit patterns
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            for (AstNode* cp = VN_AS(p, VhdlAlternative)->choicesp(); cp; cp = cp->nextp()) {
+                const AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                if (chp->isOthers() || !chp->rangep()) continue;
+                int64_t low = 0;
+                int64_t high = 0;
+                VhdlType* typep = nullptr;
+                if (!staticRange(chp->rangep(), low, high, typep)) continue;
+                if (high - low > 4096) return true;
+            }
+        }
+        return false;
+    }
+
+    // A case whose choices span too many values to list becomes an if-chain
+    // over comparisons: the selector is worked out once into a temporary and
+    // each alternative asks whether it lies in that alternative's choices.
+    AstNode* lowerCaseAsChain(AstVhdlCase* nodep, AstNodeExpr* exprp, FileLine* flp) {
+        VhdlType* const selTypep = nodep->exprp()->vhdlTypep();
+        const bool sgn = isSignedType(selTypep);
+        AstVar* const selp = newTempVar("__Vcasesel", lowerType(selTypep, flp), flp);
+        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, selp, VAccess::WRITE}, exprp};
+        const auto sel = [&]() { return new AstVarRef{flp, selp, VAccess::READ}; };
+        AstIf* firstp = nullptr;
+        AstIf* lastp = nullptr;
+        AstNode* othersp = nullptr;
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            AstVhdlAlternative* const altp = VN_AS(p, VhdlAlternative);
+            AstNodeExpr* condp = nullptr;
+            bool others = false;
+            for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
+                AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                if (chp->isOthers()) {
+                    others = true;
+                    continue;
+                }
+                AstNodeExpr* thisp = nullptr;
+                if (AstVhdlRange* const rp = chp->rangep()) {
+                    int64_t low = 0;
+                    int64_t high = 0;
+                    VhdlType* typep = nullptr;
+                    if (!staticRange(rp, low, high, typep)) {
+                        unsup(chp->fileline(), "non-static range choice");
+                        continue;
+                    }
+                    AstNodeExpr* const lop
+                        = lowerValue(VhdlValue::mkInt(low, typep), typep, chp->fileline());
+                    AstNodeExpr* const hip
+                        = lowerValue(VhdlValue::mkInt(high, typep), typep, chp->fileline());
+                    if (!lop || !hip) continue;
+                    AstNodeExpr* const gep
+                        = sgn ? static_cast<AstNodeExpr*>(new AstGteS{flp, sel(), lop})
+                              : static_cast<AstNodeExpr*>(new AstGte{flp, sel(), lop});
+                    AstNodeExpr* const lep
+                        = sgn ? static_cast<AstNodeExpr*>(new AstLteS{flp, sel(), hip})
+                              : static_cast<AstNodeExpr*>(new AstLte{flp, sel(), hip});
+                    thisp = new AstLogAnd{flp, gep, lep};
+                } else if (chp->valuep()) {
+                    if (AstNodeExpr* const cvp = lowerExpr(chp->valuep())) {
+                        thisp = new AstEq{flp, sel(), cvp};
+                    }
+                }
+                if (!thisp) continue;
+                condp = condp ? static_cast<AstNodeExpr*>(new AstLogOr{flp, condp, thisp}) : thisp;
+            }
+            AstNode* const stmtsp = lowerStmts(altp->stmtsp());
+            if (others) {
+                othersp = stmtsp;
+                continue;
+            }
+            if (!condp) {
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                continue;
+            }
+            AstIf* const ifp = new AstIf{flp, condp, stmtsp};
+            if (lastp) {
+                lastp->addElsesp(ifp);
+            } else {
+                firstp = ifp;
+            }
+            lastp = ifp;
+        }
+        if (othersp) {
+            if (lastp) {
+                lastp->addElsesp(othersp);
+            } else {
+                return AstNode::addNext(outp, othersp);
+            }
+        }
+        if (!firstp) return outp;
+        return AstNode::addNext(outp, static_cast<AstNode*>(firstp));
+    }
+
     AstNode* lowerCase(AstVhdlCase* nodep) {
         FileLine* const flp = nodep->fileline();
         AstNodeExpr* const exprp = lowerExpr(nodep->exprp());
         if (!exprp) return nullptr;
+        if (caseWantsChain(nodep)) return lowerCaseAsChain(nodep, exprp, flp);
         AstCaseItem* itemsp = nullptr;
         // A choice may name 'Z', or '-' in a matching case, and those reach
         // the emitted case as the Verilog values they stand for. Verilator
@@ -16735,14 +16865,14 @@ private:
                 }
                 if (AstVhdlRange* const rp = chp->rangep()) {
                     // Verilator's case has no ranges, so each value is listed
-                    const VhdlValue lo = V3VhdlEval::eval(rp->leftp());
-                    const VhdlValue hi = V3VhdlEval::eval(rp->rightp());
-                    if (!lo.isInt() || !hi.isInt()) {
+                    int64_t low = 0;
+                    int64_t high = 0;
+                    VhdlType* valTypep = nullptr;
+                    if (!staticRange(rp, low, high, valTypep)) {
                         unsup(chp->fileline(), "non-static range choice");
                         continue;
                     }
-                    const int64_t low = rp->dir() == VhdlDir::TO ? lo.toInt() : hi.toInt();
-                    const int64_t high = rp->dir() == VhdlDir::TO ? hi.toInt() : lo.toInt();
+                    const VhdlValue lo = VhdlValue::mkInt(low, valTypep);
                     if (high - low > 4096) {
                         unsup(chp->fileline(), "range choice covering many values");
                         continue;

@@ -2104,6 +2104,9 @@ private:
     VhdlType* loopParamType(const RangeInfo& info, FileLine* flp,
                             AstVhdlRange* rangep = nullptr) VL_MT_DISABLED;
     void analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) VL_MT_DISABLED;
+    const VhdlType* discreteMarkOf(AstNodeVhdlExpr* namep) VL_MT_DISABLED;
+    bool markAsRange(AstNodeVhdl* holderp) VL_MT_DISABLED;
+    bool prefixTakesRange(AstNodeVhdlExpr* prefixp) VL_MT_DISABLED;
     VhdlType* analyzeIndexedName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
     VhdlType* analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
     int64_t staticLength(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
@@ -9396,6 +9399,11 @@ void VhdlSemVisitor::checkIndexablePrefix(const AstVhdlCall* nodep) {
 VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // "prefix ( ... )" is a function call, an indexed name, a slice or a type
     // conversion, and only now can we tell which (8.1)
+    // A lone discrete subtype mark inside the parentheses is a range, which
+    // makes this a slice or an index constraint (5.3.2.1, 8.5) -- but only
+    // where the prefix is something a range applies to. A subprogram handed
+    // a type mark is a mistake, and says so better as one.
+    if (prefixTakesRange(nodep->prefixp())) markAsRange(nodep->argsp());
     std::vector<std::string> parts;
     std::vector<VhdlSymbol*> found;
     const bool namedPrefix = flatten(nodep->prefixp(), parts) && !parts.empty();
@@ -10167,8 +10175,10 @@ bool VhdlSemVisitor::indexedCallWouldFit(const AstNodeVhdlExpr* nodep, const Vhd
 }
 
 void VhdlSemVisitor::analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) {
-    // A choice is a value, a discrete range or "others" (9.3.3.1)
+    // A choice is a value, a discrete range or "others" (9.3.3.1), and a
+    // discrete range may be written as a subtype mark
     if (!chp || chp->isOthers()) return;
+    if (chp->valuep()) markAsRange(chp->exprp());
     if (AstVhdlRange* const rp = chp->rangep()) {
         analyzeRange(rp, wantp);
         // A range of choices must lie within the subtype it chooses from
@@ -10180,6 +10190,85 @@ void VhdlSemVisitor::analyzeChoice(AstVhdlChoice* chp, VhdlType* wantp) {
     if (!valuep) return;
     analyzeExpr(valuep, wantp);
     checkValueInRange(valuep, wantp, "this choice", true);
+}
+
+// Whether a name denotes a discrete subtype and nothing else. Written where
+// a range belongs, such a name is that subtype's range (5.3.2.1): "v(fld)"
+// is "v(fld'range)" and "when fld =>" covers every value of it.
+const VhdlType* VhdlSemVisitor::discreteMarkOf(AstNodeVhdlExpr* namep) {
+    if (!namep) return nullptr;
+    if (!VN_IS(namep, VhdlName) && !VN_IS(namep, VhdlSelected)) return nullptr;
+    std::vector<std::string> parts;
+    if (!flatten(namep, parts) || parts.empty()) return nullptr;
+    std::vector<VhdlSymbol*> found;
+    lookup(parts.back(), found);
+    if (found.empty()) return nullptr;
+    const VhdlType* typep = nullptr;
+    for (const VhdlSymbol* const symp : found) {
+        // Anything else of that name, and the name is not simply the subtype
+        if (symp->resolved()->kind() != VhdlSymKind::TYPE) return nullptr;
+        if (!typep) typep = symp->resolved()->typep();
+    }
+    // Not whether the bounds fold: "mark'RANGE" says what it says whether or
+    // not the text settles it, and a subtype whose bounds an instance decides
+    // is exactly the case this is written for
+    if (!typep) return nullptr;
+    switch (typep->base()->kind()) {
+    case VhdlTypeKind::INTEGER:
+    case VhdlTypeKind::ENUM:
+    case VhdlTypeKind::PHYSICAL: return typep;
+    default: return nullptr;
+    }
+}
+
+// Whether a range may be written after this prefix: an array object, an array
+// type mark, or an access to one. A prefix that is not a name at all -- one
+// index or slice applied to another -- is already an array by construction.
+bool VhdlSemVisitor::prefixTakesRange(AstNodeVhdlExpr* prefixp) {
+    if (!prefixp) return false;
+    if (!VN_IS(prefixp, VhdlName) && !VN_IS(prefixp, VhdlSelected)) return true;
+    std::vector<std::string> parts;
+    if (!flatten(prefixp, parts) || parts.empty()) return true;
+    std::vector<VhdlSymbol*> found;
+    lookup(parts.back(), found);
+    if (found.empty()) return false;
+    for (const VhdlSymbol* const symp : found) {
+        const VhdlSymbol* const realp = symp->resolved();
+        if (realp->kind() == VhdlSymKind::FUNCTION || realp->kind() == VhdlSymKind::PROCEDURE) {
+            continue;
+        }
+        const VhdlType* typep = realp->typep();
+        if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS
+            && typep->base()->designatedp()) {
+            typep = typep->base()->designatedp();
+        }
+        if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY) return true;
+    }
+    return false;
+}
+
+// Rewrite a lone subtype mark into the range it stands for, so that every
+// reading of a range serves it. The parser cannot tell an index from a slice,
+// nor a choice that is a value from one that is a range, so the mark arrives
+// as an ordinary expression. Returns true where it rewrote something.
+bool VhdlSemVisitor::markAsRange(AstNodeVhdl* holderp) {
+    AstVhdlAssoc* const asp = VN_CAST(holderp, VhdlAssoc);
+    if (asp && (asp->nextp() || asp->formalp())) return false;
+    AstNodeVhdlExpr* const namep = asp ? asp->actualp() : VN_CAST(holderp, NodeVhdlExpr);
+    if (!namep || !discreteMarkOf(namep)) return false;
+    // Written as "mark'RANGE", which is what it means and what every reading
+    // of a range already knows how to answer. The node standing in the tree
+    // is replaced first, since the mark may be that node itself.
+    FileLine* const flp = namep->fileline();
+    AstVhdlRange* const rangep = new AstVhdlRange{flp, static_cast<AstNodeVhdlExpr*>(nullptr)};
+    holderp->replaceWith(rangep);
+    AstNodeVhdlExpr* markp = namep;
+    if (asp) {
+        markp = namep->unlinkFrBack();
+        VL_DO_DANGLING(asp->deleteTree(), asp);
+    }
+    rangep->attrp(new AstVhdlAttrName{flp, markp, "range"});
+    return true;
 }
 
 // One index per dimension, each within its own index range (8.4)
