@@ -144,6 +144,10 @@ class VhdlLowerVisitor final {
         AstVar* valp = nullptr;
         AstVar* enp = nullptr;
         AstVar* weakp = nullptr;  // Driving, but only until something forces
+        // Whether this driver is connected at all. Only a guarded signal has
+        // one that can be turned off, by a null transaction or by its guard
+        // going false (10.5.2.2); null for every other signal.
+        AstVar* connp = nullptr;
     };
     std::map<const VhdlSymbol*, std::vector<VhdlDriver>> m_drivers;
     std::map<const VhdlSymbol*, int> m_driverCount;
@@ -5425,7 +5429,8 @@ private:
                 addStmt(m_ftaskp ? setp : new AstInitial{flp, setp});
             }
             if (objp->kind() == VhdlObjKind::SIGNAL) {
-                if (isLogicish(symp->typep()) && !symp->resolvePerElement()) {
+                if (isLogicish(symp->typep()) && !symp->resolvePerElement()
+                    && !(guardedSignal(symp) && symp->resolverNullp())) {
                     // One driver of a logic signal resolves to itself, so the
                     // wiring is only worth building for several. An array
                     // whose element subtype names a function of the design's
@@ -5433,6 +5438,10 @@ private:
                     // is made of bits, so it is not wired this way.
                     if (isResolvedSignal(symp)) makeResolved(symp, varp, flp);
                 } else if (symp->resolverp()) {
+                    // A guarded signal goes through its own function however
+                    // few drivers it has and whatever its type: only the
+                    // function says what no drivers at all amount to, and a
+                    // driver of one can be turned off (14.7.3.2)
                     // A function of its own is run over the drivers however
                     // many there are: with one it may still change the value
                     // it is given (6.5.2)
@@ -13931,6 +13940,19 @@ private:
         // One variable per driver, each starting where the declaration says
         // the signal does: a driver contributes a value from the beginning,
         // even before the process that owns it has run (14.7.2)
+        // A guarded signal's drivers can be turned off, and when every one of
+        // them is the function is called with no drivers at all (14.7.3.2).
+        // The copy that takes none was made during analysis; without it there
+        // is nothing to call, and the drivers stay connected as before.
+        VhdlSymbol* const nullResolvep = guardedSignal(symp) ? symp->resolverNullp() : nullptr;
+        AstNodeFTask* nullFtaskp = nullptr;
+        if (nullResolvep && !perElement) {
+            const auto it = m_funcs.find(nullResolvep);
+            nullFtaskp = it != m_funcs.end() && callableHere(it->second)
+                             ? it->second
+                             : emitOnDemand(nullResolvep);
+            if (nullFtaskp && !VN_IS(nullFtaskp, Func)) nullFtaskp = nullptr;
+        }
         std::vector<VhdlDriver> drivers;
         for (int i = 0; i < count; ++i) {
             VhdlDriver drv;
@@ -13941,13 +13963,28 @@ private:
             addStmt(drv.valp);
             drv.valp->valuep(initp ? initp->cloneTree(false)
                                    : defaultValueFor(symp->typep(), flp));
+            if (nullFtaskp) {
+                // Connected until something turns it off, which is what a
+                // driver that has never been given a null transaction is
+                drv.connp = new AstVar{
+                    flp, VVarType::VAR,
+                    "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name() + "__conn",
+                    VFlagChildDType{}, new AstBasicDType{flp, VBasicDTypeKwd::BIT}};
+                drv.connp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                addStmt(drv.connp);
+                drv.connp->valuep(new AstConst{flp, AstConst::BitTrue{}});
+            }
             drivers.push_back(drv);
         }
         // The array the function is given, of exactly the type its parameter
         // was specialized to, so the two agree without any conversion
-        AstVar* const arrp = new AstVar{flp, VVarType::VAR,
-                                        "__Vres__" + m_prefix + symp->name(), VFlagChildDType{},
-                                        lowerType(paramTypep, flp)};
+        // Filled afresh by whichever arm of the resolution needs it, so a
+        // run that does not fill it does not read it either: not a latch,
+        // however the shape reads to the back end
+        FileLine* const aflp = new FileLine{flp};
+        aflp->warnOff(V3ErrorCode::LATCH, true);
+        AstVar* const arrp = new AstVar{aflp, VVarType::VAR, "__Vres__" + m_prefix + symp->name(),
+                                        VFlagChildDType{}, lowerType(paramTypep, flp)};
         addStmt(arrp);
         // Filled one element at a time, in the order the parameter's own
         // index range runs, so that a function which looks at s'left sees the
@@ -13992,8 +14029,41 @@ private:
             bodyp = AstNode::addNextNull(
                 bodyp, static_cast<AstNode*>(new AstAssign{flp, targetp, callp}));
         }
+        // With every driver turned off the signal takes what the function
+        // makes of no drivers at all, which is a call of its own (14.7.3.2)
+        if (nullFtaskp && bodyp) {
+            AstNodeExpr* anyp = nullptr;
+            for (const VhdlDriver& drv : drivers) {
+                if (!drv.connp) continue;
+                AstNodeExpr* const refp = new AstVarRef{flp, drv.connp, VAccess::READ};
+                anyp = anyp ? new AstOr{flp, anyp, refp} : refp;
+            }
+            if (anyp) {
+                AstVar* const nonep
+                    = new AstVar{flp, VVarType::VAR, "__Vresnone__" + m_prefix + symp->name(),
+                                 VFlagChildDType{}, lowerType(nullResolvep->paramTypes()[0], flp)};
+                addStmt(nonep);
+                AstFuncRef* const callp = new AstFuncRef{flp, nullFtaskp->name(), nullptr};
+                callp->taskp(nullFtaskp);
+                callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, nonep, VAccess::READ}});
+                AstNode* const offp
+                    = new AstAssign{flp, new AstVarRef{flp, netp, VAccess::WRITE}, callp};
+                // The two arms answer the same question two ways, and the
+                // array handed to the function is filled only by the one
+                // that uses it: nothing is held from a previous run, so
+                // this is no latch however it reads
+                FileLine* const iflp = new FileLine{flp};
+                iflp->warnOff(V3ErrorCode::LATCH, true);
+                bodyp = new AstIf{iflp, anyp, bodyp, offp};
+            }
+        }
         // Whenever any driver changes, which is what the process reads
-        addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
+        FileLine* const wflp = new FileLine{flp};
+        // Where the drivers can be turned off the block has two arms, and
+        // the array handed to the function is filled only by the arm that
+        // uses it. Nothing is held from a previous run, so it is no latch.
+        if (nullFtaskp) wflp->warnOff(V3ErrorCode::LATCH, true);
+        addStmt(new AstAlways{wflp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
         m_drivers.emplace(symp, drivers);
     }
 
@@ -14205,6 +14275,27 @@ private:
         return &it->second[idx];
     }
 
+    // The driver of a guarded signal, which is the only kind that can be
+    // turned off (10.5.2.2). Null for every other signal.
+    const VhdlDriver* disconnectableDriver(AstNodeVhdlExpr* targetp) {
+        const VhdlDriver* const drvp = driverFor(targetp);
+        return drvp && drvp->connp ? drvp : nullptr;
+    }
+
+    // Turning a driver off, or back on. A null transaction turns it off and
+    // every other transaction turns it on, each at the time the waveform
+    // says (10.5.2.2).
+    static AstNode* connectStmt(const VhdlDriver* drvp, bool on, AstNode* delayp, bool sequential,
+                                FileLine* flp) {
+        AstNodeExpr* const valp
+            = on ? new AstConst{flp, AstConst::BitTrue{}}
+                 : static_cast<AstNodeExpr*>(new AstConst{flp, AstConst::BitFalse{}});
+        AstNodeExpr* const refp = new AstVarRef{flp, drvp->connp, VAccess::WRITE};
+        AstNode* const dp = delayp ? delayp->cloneTree(false) : nullptr;
+        return sequential ? static_cast<AstNode*>(new AstAssignDly{flp, refp, valp, dp})
+                          : static_cast<AstNode*>(new AstAssignW{flp, refp, valp, dp});
+    }
+
     AstNode* driveResolved(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* targetp,
                            AstNodeExpr* valuep, AstNode* delayp, bool sequential,
                            FileLine* flp) {
@@ -14232,10 +14323,14 @@ private:
         if (!drv.enp) {
             // Resolved by a function of its own: the driver holds only a
             // value, and the function decides what they add up to
-            return sequential ? static_cast<AstNode*>(
-                       new AstAssignDly{flp, valLhsp, valuep, delayp})
-                              : static_cast<AstNode*>(
-                                  new AstAssignW{flp, valLhsp, valuep, delayp});
+            AstNode* const outp
+                = sequential
+                      ? static_cast<AstNode*>(new AstAssignDly{flp, valLhsp, valuep, delayp})
+                      : static_cast<AstNode*>(new AstAssignW{flp, valLhsp, valuep, delayp});
+            // A transaction that carries a value connects the driver again,
+            // whether or not it was ever turned off (10.5.2.2)
+            if (!drv.connp) return outp;
+            return AstNode::addNext(outp, connectStmt(&drv, true, delayp, sequential, flp));
         }
         AstNodeExpr* const enp = driveFlagOf(nodep, false, flp);
         AstNodeExpr* const weakp = driveFlagOf(nodep, true, flp);
@@ -14291,6 +14386,18 @@ private:
         AstNodeExpr* prevDelayp = nullptr;
         AstNode* marksp = nullptr;
         for (AstVhdlWaveform* p = wavesp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
+            if (!p->valuep()) {
+                // "null" as an element of a waveform turns the driver off at
+                // that element's own time (10.5.2.2)
+                if (!p->nullTxn() || !drvp || !drvp->connp) continue;
+                AstNodeExpr* const offAfterp = p->afterp() ? lowerExpr(p->afterp()) : nullptr;
+                AstNode* const offDelayp
+                    = offAfterp ? new AstDelay{flp, offAfterp, false} : nullptr;
+                stmtsp
+                    = AstNode::addNextNull(stmtsp, connectStmt(drvp, false, offDelayp, true, flp));
+                if (offDelayp) VL_DO_DANGLING(offDelayp->deleteTree(), offDelayp);
+                continue;
+            }
             if (keyp) m_vars[keyp] = drvp->valp;
             AstNodeExpr* const onep = lowerDriveTarget(targetp);
             if (keyp) m_vars[keyp] = savedp;
@@ -14302,6 +14409,11 @@ private:
             AstNode* const delayp = afterp ? new AstDelay{flp, afterp, false} : nullptr;
             stmtsp = AstNode::addNextNull(
                 stmtsp, static_cast<AstNode*>(new AstAssignDly{flp, onep, valuep, delayp}));
+            // A transaction that carries a value connects the driver again,
+            // at the time that element is delivered (10.5.2.2)
+            if (drvp && drvp->connp) {
+                stmtsp = AstNode::addNextNull(stmtsp, connectStmt(drvp, true, delayp, true, flp));
+            }
             if (drvp && drvp->enp) {
                 // Whether this element drives at all, and how strongly,
                 // arrives with it: a waveform may hand the signal over to
@@ -14384,8 +14496,18 @@ private:
             // One process that schedules them all, in order, which is what
             // the concurrent form is defined to be (11.6)
             AstNodeExpr* readsp = nullptr;
-            AstNode* const stmtsp = waveformStmts(nodep->targetp(), nodep->wavesp(), readsp, flp);
+            AstNode* stmtsp = waveformStmts(nodep->targetp(), nodep->wavesp(), readsp, flp);
             if (!stmtsp) return;
+            // "s <= guarded w" schedules the waveform only while GUARD is
+            // true, and turns its driver off when GUARD goes false (11.6)
+            if (const VhdlDriver* const gdrvp = nodep->guarded() && m_guardVarp
+                                                    ? disconnectableDriver(nodep->targetp())
+                                                    : nullptr) {
+                stmtsp = new AstIf{flp, new AstVarRef{flp, m_guardVarp, VAccess::READ}, stmtsp,
+                                   connectStmt(gdrvp, false, nullptr, true, flp)};
+                AstNodeExpr* const guardp = new AstVarRef{flp, m_guardVarp, VAccess::READ};
+                readsp = readsp ? new AstConcat{flp, readsp, guardp} : guardp;
+            }
             emitWaveformProcess(stmtsp, readsp, flp);
             return;
         }
@@ -14433,6 +14555,13 @@ private:
         }
         if (!rhsp) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            // A concurrent "s <= null" turns the driver off and nothing else
+            if (nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
+                && nodep->wavesp()->nullTxn()) {
+                if (const VhdlDriver* const drvp = disconnectableDriver(nodep->targetp())) {
+                    addStmt(connectStmt(drvp, false, nullptr, false, flp));
+                }
+            }
             return;
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
@@ -14443,12 +14572,24 @@ private:
             // before that delta -- which is what a testbench does at time
             // zero -- the signal is still what its own default says, and a
             // continuous assignment had already made it the driven value.
-            AstNodeExpr* const readsp = rhsp->cloneTree(false);
-            if (AstNode* const outp
-                = driveResolved(nodep, nodep->targetp(), rhsp, delayp, true, flp)) {
+            AstNodeExpr* readsp = rhsp->cloneTree(false);
+            if (AstNode* outp = driveResolved(nodep, nodep->targetp(), rhsp, delayp, true, flp)) {
                 AstNode* const markp
                     = transactionMark(nodep->targetp(), delayp, true, rhsp, flp);
-                emitWaveformProcess(AstNode::addNextNull(outp, markp), readsp, flp);
+                outp = AstNode::addNextNull(outp, markp);
+                // "s <= guarded w" drives only while GUARD is true, and turns
+                // its driver off when GUARD goes false (11.6, 10.5.2.2). The
+                // process therefore reads GUARD as well as the value.
+                const VhdlDriver* const drvp = nodep->guarded() && m_guardVarp
+                                                   ? disconnectableDriver(nodep->targetp())
+                                                   : nullptr;
+                if (drvp) {
+                    outp = new AstIf{flp, new AstVarRef{flp, m_guardVarp, VAccess::READ}, outp,
+                                     connectStmt(drvp, false, nullptr, true, flp)};
+                    readsp = new AstConcat{flp, readsp,
+                                           new AstVarRef{flp, m_guardVarp, VAccess::READ}};
+                }
+                emitWaveformProcess(outp, readsp, flp);
             } else {
                 VL_DO_DANGLING(readsp->deleteTree(), readsp);
             }
@@ -16014,7 +16155,21 @@ private:
 
     AstNode* lowerSeqWaveform(AstVhdlSigAssign* nodep, AstVhdlWaveform* wfp, bool sequential) {
         FileLine* const flp = nodep->fileline();
-        if (!wfp || !wfp->valuep()) return nullptr;
+        if (!wfp) return nullptr;
+        if (!wfp->valuep()) {
+            // "s <= null" turns this driver off; "s <= unaffected" leaves it
+            // exactly as it was, which is nothing to emit at all (10.5.2.2)
+            if (!wfp->nullTxn()) return nullptr;
+            const VhdlDriver* const drvp = disconnectableDriver(nodep->targetp());
+            if (!drvp) return nullptr;
+            AstNode* delayp = nullptr;
+            if (wfp->afterp() && v3Global.opt.timing().isTrue()) {
+                delayp = new AstDelay{flp, lowerExpr(wfp->afterp()), false};
+            }
+            AstNode* const outp = connectStmt(drvp, false, delayp, sequential, flp);
+            if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+            return outp;
+        }
         // "s <= a after t1, b after t2" schedules each element at its own
         // time (10.5.2.2). Each becomes a delayed assignment of its own,
         // which is right as long as the times increase, as the language
@@ -18332,8 +18487,13 @@ private:
             }
             // A signal several processes drive is not refused: the copy is
             // made for this call, so the driver the caller owns is known
-            // here and is the one an assignment inside it writes
-            const auto drvIt = m_drivers.find(actualSymp->resolved());
+            // here and is the one an assignment inside it writes. Only a
+            // formal the call can write needs one at all: a signal parameter
+            // of mode "in" is read and never driven (4.2.2.3), and the call
+            // is no driver of it.
+            const auto drvIt = formals[i]->mode() == VhdlMode::IN
+                                   ? m_drivers.end()
+                                   : m_drivers.find(actualSymp->resolved());
             if (drvIt != m_drivers.end()) {
                 const VhdlSymbol* const signalp = actualSymp->resolved();
                 const int idx = m_driverUsed[signalp];

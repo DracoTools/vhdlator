@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -6635,6 +6636,19 @@ void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbo
     });
 }
 
+// Which kind of guarded signal this is, if it is one: only a signal declared
+// BUS or REGISTER has a driver that can be turned off (4.3.1.2, 10.5.2.2)
+static VhdlSignalKind guardedKindOf(const VhdlSymbol* symp) {
+    if (!symp) return VhdlSignalKind::NONE;
+    if (const AstVhdlObjectDecl* const odp = VN_CAST(symp->declp(), VhdlObjectDecl)) {
+        return odp->signalKind();
+    }
+    if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
+        return ifp->signalKind();
+    }
+    return VhdlSignalKind::NONE;
+}
+
 void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::map<const VhdlSymbol*, int> counts;
     std::map<const VhdlSymbol*, FileLine*> where;
@@ -6749,7 +6763,11 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
         }
         symp->resolverp(resolvep);
         // The nine-value logic types resolve natively, so their resolution
-        // function is never run and must not be copied per driver count
+        // function is never run and must not be copied per driver count.
+        // That is as true of a guarded one: what the IEEE function makes of
+        // no drivers at all is 'Z', which is what the tables give an
+        // undriven signal anyway, and copying the function would only put
+        // its body through lowering for nothing.
         if (!isLogicValued(typep)) {
             m_needResolve.push_back(NeedResolve{symp, resolvep, pair.second, where[symp]});
         }
@@ -6763,12 +6781,36 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
 void VhdlSemVisitor::specializeResolvers() {
     // One copy per function and driver count, however many signals want it
     std::map<std::pair<const VhdlSymbol*, int>, VhdlSymbol*> made;
+    // Whether each function's parameter was unconstrained when it was first
+    // seen. It has to be remembered: specializing one of them settles the
+    // parameter's bounds, and a second signal resolved by the same function
+    // would then look like one written against a fixed size and be left
+    // without a copy of its own.
+    std::map<const VhdlSymbol*, bool> openParam;
     for (const NeedResolve& need : m_needResolve) {
         VhdlSymbol* const resolvep = need.resolvep;
         if (resolvep->paramTypes().size() != 1) continue;
         VhdlType* const paramp = resolvep->paramTypes()[0];
         if (!paramp || paramp->base()->kind() != VhdlTypeKind::ARRAY) continue;
-        if (paramp->isConstrainedArray()) continue;  // Already a fixed size
+        const auto openIt = openParam.emplace(resolvep, !paramp->isConstrainedArray()).first;
+        if (!openIt->second) continue;  // Written against a fixed size
+        // A copy already made serves every signal that wants the same one,
+        // and it is taken before the body is looked at: the body of a
+        // specialized subprogram is no longer where it was, so a second
+        // signal would otherwise find nothing to copy and go without
+        const auto cached = [&](int count) -> VhdlSymbol* {
+            const auto it = made.find(std::make_pair(resolvep, count));
+            return it == made.end() ? nullptr : it->second;
+        };
+        const bool wantNull = guardedKindOf(need.symp) != VhdlSignalKind::NONE;
+        if (VhdlSymbol* const havep = cached(need.count)) {
+            VhdlSymbol* const haveNullp = wantNull ? cached(0) : nullptr;
+            if (!wantNull || haveNullp) {
+                need.symp->resolverp(havep);
+                if (haveNullp) need.symp->resolverNullp(haveNullp);
+                continue;
+            }
+        }
         const auto madeIt = made.find(std::make_pair(resolvep, need.count));
         if (madeIt != made.end()) {
             need.symp->resolverp(madeIt->second);
@@ -6782,25 +6824,49 @@ void VhdlSemVisitor::specializeResolvers() {
         // subtype starts: a function written against "array (positive range
         // <>)" is entitled to find its first driver at 1, and one written
         // against NATURAL at 0 (5.2.1)
-        VhdlType* const argp = cloneSubtype(paramp->base(), need.flp);
-        const std::vector<VhdlType*>& baseIdx = paramp->base()->indexTypes();
-        VhdlType* const baseIdxp = baseIdx.empty() ? nullptr : baseIdx[0];
-        const bool asc = !baseIdxp || baseIdxp->ascending();
-        const int64_t left = (baseIdxp && baseIdxp->bounded()) ? baseIdxp->left() : 0;
-        VhdlType* const idxp = VhdlSymTab::newType(
-            baseIdxp ? baseIdxp->kind() : VhdlTypeKind::INTEGER, "", need.flp);
-        idxp->base(baseIdxp ? baseIdxp->base() : V3VhdlStd::integerType()->base());
-        idxp->setBounds(left, asc ? left + need.count - 1 : left - need.count + 1, asc);
-        argp->clearIndexTypes();
-        argp->addIndexType(idxp);
-        argp->unconstrained(false);
-        const std::string name
-            = resolvep->name() + "__V" + std::to_string(need.count) + "drv";
-        std::vector<VhdlType*> actualTypes{argp};
-        if (VhdlSymbol* const newp
-            = specializeSubprogram(bodyp, regionp, actualTypes, name)) {
-            need.symp->resolverp(newp);
-            made.emplace(std::make_pair(resolvep, need.count), newp);
+        const auto copyFor = [&](int count) -> VhdlSymbol* {
+            const auto it = made.find(std::make_pair(resolvep, count));
+            if (it != made.end()) return it->second;
+            VhdlType* const argp = cloneSubtype(paramp->base(), need.flp);
+            const std::vector<VhdlType*>& baseIdx = paramp->base()->indexTypes();
+            VhdlType* const baseIdxp = baseIdx.empty() ? nullptr : baseIdx[0];
+            const bool asc = !baseIdxp || baseIdxp->ascending();
+            const int64_t left = (baseIdxp && baseIdxp->bounded()) ? baseIdxp->left() : 0;
+            VhdlType* const idxp = VhdlSymTab::newType(
+                baseIdxp ? baseIdxp->kind() : VhdlTypeKind::INTEGER, "", need.flp);
+            idxp->base(baseIdxp ? baseIdxp->base() : V3VhdlStd::integerType()->base());
+            // No drivers leaves a null range, which is what a null array is.
+            // Both of its bounds still have to be values of the index type,
+            // and an unconstrained index starts at INTEGER'LOW, so stepping
+            // one below that would leave the type altogether.
+            int64_t lo = left;
+            int64_t hi = asc ? left + count - 1 : left - count + 1;
+            if (count == 0) {
+                if (asc && left <= std::numeric_limits<int32_t>::min()) {
+                    lo = left + 1;
+                    hi = left;
+                } else if (!asc && left >= std::numeric_limits<int32_t>::max()) {
+                    lo = left - 1;
+                    hi = left;
+                }
+            }
+            idxp->setBounds(lo, hi, asc);
+            argp->clearIndexTypes();
+            argp->addIndexType(idxp);
+            argp->unconstrained(false);
+            const std::string name = resolvep->name() + "__V" + std::to_string(count) + "drv";
+            std::vector<VhdlType*> actualTypes{argp};
+            VhdlSymbol* const newp = specializeSubprogram(bodyp, regionp, actualTypes, name);
+            if (newp) made.emplace(std::make_pair(resolvep, count), newp);
+            return newp;
+        };
+        if (VhdlSymbol* const newp = copyFor(need.count)) need.symp->resolverp(newp);
+        // A guarded signal's drivers may all be disconnected at once, and the
+        // function is then called with no drivers at all (14.7.3.2). That
+        // copy is made here, where the other one is, rather than at the point
+        // it is needed, which is long after analysis is over.
+        if (wantNull) {
+            if (VhdlSymbol* const nullp = copyFor(0)) need.symp->resolverNullp(nullp);
         }
     }
 }

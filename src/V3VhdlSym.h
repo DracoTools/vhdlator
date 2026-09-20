@@ -125,6 +125,10 @@ class VhdlSymbol final {
     // gives it the copy that takes that many values.
     int m_driverCount = 0;
     VhdlSymbol* m_resolverp = nullptr;
+    // The same function for *no* drivers at all, which is what a guarded
+    // signal needs when every one of its drivers is disconnected: the
+    // resolution function is then called with a null array (14.7.3.2)
+    VhdlSymbol* m_resolverNullp = nullptr;
     // A composite whose element subtype names the resolution function: the
     // drivers are resolved one element at a time rather than whole (14.7.3.2)
     bool m_resolvePerElement = false;
@@ -172,6 +176,8 @@ public:
     void driverCount(int n) { m_driverCount = n; }
     VhdlSymbol* resolverp() const { return m_resolverp; }
     void resolverp(VhdlSymbol* symp) { m_resolverp = symp; }
+    VhdlSymbol* resolverNullp() const { return m_resolverNullp; }
+    void resolverNullp(VhdlSymbol* symp) { m_resolverNullp = symp; }
     bool resolvePerElement() const { return m_resolvePerElement; }
     void resolvePerElement(bool flag) { m_resolvePerElement = flag; }
 
