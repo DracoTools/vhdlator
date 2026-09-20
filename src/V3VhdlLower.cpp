@@ -5038,6 +5038,17 @@ private:
         AstVar* everp = nullptr;  // Set once a transaction has happened at all
     };
     std::map<const VhdlSymbol*, VhdlActive> m_actives;
+    // A port whose transactions this module needs but cannot see: activity
+    // does not cross a port association by itself, since a transaction that
+    // leaves the value alone is no event (14.7.3). The bit that marks them
+    // becomes a port of its own, which the instance connects to the actual's
+    // own. Module name -> [(port, the port carrying its transactions)].
+    std::map<std::string, std::vector<std::pair<std::string, std::string>>> m_actPorts;
+    // The same the other way: what this side does to a port of mode "out"
+    // has to reach the actual, and a transaction that leaves the value alone
+    // would otherwise be invisible there too
+    std::map<std::string, std::vector<std::pair<std::string, std::string>>> m_actOutPorts;
+    int m_portNum = 0;  // The module's last port number, for one added later
     std::set<const VhdlSymbol*> m_needActive;  // Signals an active attribute names
     // The signal "S delayed by T", one per signal and delay it is asked for
     std::map<std::pair<const VhdlSymbol*, int64_t>, AstVar*> m_delayeds;
@@ -6909,13 +6920,41 @@ private:
         m_ftaskp = nullptr;
         VhdlActive ac;
         const std::string base = "__Vact" + std::to_string(++m_nameNum) + "__" + symp->name();
+        // A port of mode "in" is written from outside, and so are its
+        // transactions: what the actual does to it is not visible here at
+        // all where the value does not change. The bit that marks a
+        // transaction is therefore a port too, and the instance connects it.
+        bool asPort = false;
+        bool outward = false;
+        if (symp->kind() == VhdlSymKind::PORT && m_modp) {
+            if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
+                asPort = true;
+                // What the design outside does to the port arrives here; what
+                // this side does to it has to reach the actual the same way
+                outward = ifp->mode() != VhdlMode::IN;
+            }
+        }
         // Every driver of the signal marks the same bit, and a concurrent
         // assignment marks it from two blocks -- once to start and once
         // to react -- so it is written from more than one place by
         // construction, which is not a finding about the design
         FileLine* const mflp = new FileLine{flp};
         mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
-        ac.togglep = newTempVar(base + "__trans", newLogicDType(mflp, 1), mflp);
+        if (asPort) {
+            ac.togglep = new AstVar{mflp, VVarType::VAR, "__Vactport__" + symp->name(),
+                                    VFlagChildDType{}, newLogicDType(mflp, 1)};
+            const VDirection dir = outward ? VDirection::OUTPUT : VDirection::INPUT;
+            ac.togglep->direction(dir);
+            ac.togglep->declDirection(dir);
+            ac.togglep->ansi(true);
+            addStmt(ac.togglep);
+            addStmt(new AstPort{mflp, ++m_portNum, ac.togglep->name()});
+            if (outward) ac.togglep->valuep(new AstConst{mflp, AstConst::BitTrue{}});
+            (outward ? m_actOutPorts : m_actPorts)[m_modp->name()].emplace_back(
+                symp->name(), ac.togglep->name());
+        } else {
+            ac.togglep = newTempVar(base + "__trans", newLogicDType(mflp, 1), mflp);
+        }
         ac.prevp = newTempVar(base + "__prev", newLogicDType(flp, 1), flp);
         ac.timep = newTempVar(base + "__time",
                               new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
@@ -6926,7 +6965,7 @@ private:
         // calls a description that depends on it erroneous, but nvc
         // 1.22.1 and GHDL 7.0.0-dev agree on '1', and a testbench that
         // reads it before the first transaction should see what they see
-        ac.togglep->valuep(new AstConst{flp, AstConst::BitTrue{}});
+        if (!asPort) ac.togglep->valuep(new AstConst{flp, AstConst::BitTrue{}});
         ac.prevp->valuep(new AstConst{flp, AstConst::BitTrue{}});
         ac.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
         AstNode* stmtsp = new AstAssignDly{flp,
@@ -15625,8 +15664,90 @@ private:
         // can carry: elaboration works each out over what this instance
         // hands that generic, and the number goes over as a parameter
         paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
+        pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
         m_instantiated.insert(modName);
         addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
+    }
+
+    // The transactions of each actual whose port asks for them. A transaction
+    // that leaves the value alone is no event, so nothing about it crosses a
+    // port association by itself: the bit that marks one is carried over a
+    // port of its own (14.7.3, 16.2).
+    AstPin* activityPins(const std::string& modName, AstVhdlInstance* nodep, int* pinNump,
+                         FileLine* flp) {
+        const auto it = m_actPorts.find(modName);
+        const auto outIt = m_actOutPorts.find(modName);
+        if (it == m_actPorts.end() && outIt == m_actOutPorts.end()) return nullptr;
+        const std::string entLib
+            = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+        const auto portIt = m_entityPortNames.find(entLib + "." + modName);
+        std::vector<std::pair<std::string, std::string>> wants;
+        const size_t inward = it == m_actPorts.end() ? 0 : it->second.size();
+        if (it != m_actPorts.end()) wants = it->second;
+        if (outIt != m_actOutPorts.end()) {
+            wants.insert(wants.end(), outIt->second.begin(), outIt->second.end());
+        }
+        AstPin* outp = nullptr;
+        size_t which = 0;
+        for (const auto& want : wants) {
+            const bool outward = which++ >= inward;
+            // Which association names that port: by name where it was
+            // written, and by the entity's own port order otherwise
+            AstVhdlAssoc* foundp = nullptr;
+            size_t at = 0;
+            for (AstNode* p = nodep->portMapp(); p; p = p->nextp(), ++at) {
+                AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->actualp()) continue;
+                std::string formal;
+                if (AstVhdlCall* const convp = VN_CAST(asp->formalp(), VhdlCall)) {
+                    // "f(port) => actual" names the port inside the conversion
+                    formal = formalNamed(convp->argsp());
+                } else if (asp->formalp()) {
+                    std::vector<std::string> fparts;
+                    if (flattenName(asp->formalp(), fparts) && !fparts.empty()) {
+                        formal = fparts.back();
+                    }
+                } else if (portIt != m_entityPortNames.end() && at < portIt->second.size()) {
+                    formal = portIt->second[at];
+                }
+                if (formal == want.first) {
+                    foundp = asp;
+                    break;
+                }
+            }
+            if (!foundp || foundp->isOpen() || VN_IS(foundp->actualp(), VhdlOpen)) continue;
+            const VhdlSymbol* const actSymp = rootSymOf(foundp->actualp());
+            if (!actSymp) continue;
+            VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(actSymp->resolved());
+            makeActiveFor(keyp, flp);
+            const auto acIt = m_actives.find(keyp);
+            if (acIt == m_actives.end() || !acIt->second.togglep) continue;
+            if (!outward) {
+                outp = AstNode::addNextNull(
+                    outp, new AstPin{flp, ++*pinNump, want.second,
+                                     new AstVarRef{flp, acIt->second.togglep, VAccess::READ}});
+                continue;
+            }
+            // Coming the other way, what the instance marks is carried into a
+            // signal of this module and marks the actual in turn: the actual
+            // has transactions of its own as well, so the two are not the
+            // same bit
+            FileLine* const mflp = new FileLine{flp};
+            mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            AstVar* const fromp
+                = newTempVar("__Vactfrom__" + want.first, newLogicDType(mflp, 1), mflp);
+            fromp->valuep(new AstConst{mflp, AstConst::BitTrue{}});
+            outp = AstNode::addNextNull(outp,
+                                        new AstPin{flp, ++*pinNump, want.second,
+                                                   new AstVarRef{flp, fromp, VAccess::WRITE}});
+            AstNode* const flipp = new AstAssignDly{
+                mflp, new AstVarRef{mflp, acIt->second.togglep, VAccess::WRITE},
+                new AstLogNot{mflp, new AstVarRef{mflp, acIt->second.togglep, VAccess::READ}}};
+            AstSenTree* const senp = new AstSenTree{
+                mflp, senItemFor(new AstVarRef{mflp, fromp, VAccess::READ}, true, mflp)};
+            addStmt(new AstAlways{mflp, VAlwaysKwd::ALWAYS, senp, flipp});
+        }
+        return outp;
     }
 
     // What this instance hands the entity's generics, as values elaboration
@@ -22092,6 +22213,7 @@ private:
             addStmt(new AstPort{dgp->fileline(), ++pinNum, dgp->name()});
         }
         m_dataGenericVarps.clear();
+        m_portNum = pinNum;
         // An entity may have a statement part of its own, whose statements
         // are passive: an assertion that holds for every instance of it,
         // whatever architecture is bound (3.2.4)
