@@ -165,9 +165,10 @@ class VhdlLowerVisitor final {
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::set<std::string> m_instantiated;  // Modules something else builds one of
     std::set<std::string> m_knownEntities;  // "lib.entity" of every entity there is
-    // The generics each entity declares, in order, for a binding indication
-    // whose generic map is positional
+    // The generics and the ports each entity declares, in order, for a
+    // binding indication whose maps are written positionally
     std::map<std::string, std::vector<std::string>> m_entityGenericNames;
+    std::map<std::string, std::vector<std::string>> m_entityPortNames;
     // The loops being lowered, innermost last. A labelled exit or next names
     // a loop that need not be the innermost (10.11, 10.12), which Verilator's
     // break and continue cannot express, so those become a jump out of a
@@ -194,6 +195,12 @@ class VhdlLowerVisitor final {
         std::map<std::string, CfgScope> blocks;  // Block or generate label -> its own
     };
     std::map<std::string, CfgScope> m_cfgScopes;  // "lib.entity" -> what configures it
+    // A configuration is a unit of its own, and two of them may configure one
+    // entity differently (3.4). An instance that names one -- "uut :
+    // configuration work.lt" -- gets a module built from that configuration's
+    // own bindings, so the two do not overwrite each other.
+    std::map<std::string, CfgScope> m_cfgScopeByCfg;  // "lib.config" -> what it says
+    std::set<std::string> m_cfgInstanced;  // "lib.config" some instance names
     const CfgScope* m_cfgScopep = nullptr;  // The one for the block being lowered
     // "lib.configuration" -> the entity and architecture it names (3.4)
     std::map<std::string, std::pair<std::string, std::string>> m_configOf;
@@ -12328,12 +12335,55 @@ private:
         }
     }
 
+    // Whether a lowered body reads a signal, so that something can ever wake
+    // it. A generic or a generate parameter is fixed by elaboration, and what
+    // the statement writes is not something it reads.
+    static bool readsAnySignal(AstNode* bodyp) {
+        std::set<const AstNode*> writtenp;
+        bodyp->foreach([&writtenp](const AstNodeAssign* asgp) {
+            for (const AstNode* np = asgp->lhsp(); np;) {
+                if (VN_IS(np, VarRef)) {
+                    writtenp.insert(np);
+                    break;
+                }
+                if (const AstMemberSel* const memp = VN_CAST(np, MemberSel)) {
+                    np = memp->fromp();
+                } else if (const AstStructSel* const strp = VN_CAST(np, StructSel)) {
+                    np = strp->fromp();
+                } else if (const AstSelBit* const bitp = VN_CAST(np, SelBit)) {
+                    np = bitp->fromp();
+                } else if (const AstSelExtract* const extp = VN_CAST(np, SelExtract)) {
+                    np = extp->fromp();
+                } else if (const AstSel* const selp = VN_CAST(np, Sel)) {
+                    np = selp->fromp();
+                } else {
+                    break;
+                }
+            }
+        });
+        bool reads = false;
+        bodyp->foreach([&reads, &writtenp](const AstVarRef* refp) {
+            if (!refp->access().isReadOrRW()) return;
+            if (writtenp.count(refp)) return;
+            const AstVar* const varp = refp->varp();
+            if (varp && (varp->isParam() || varp->varType() == VVarType::GENVAR)) return;
+            reads = true;
+        });
+        return reads;
+    }
+
     // The process a concurrent statement is. A postponed one runs only once
     // the signals have settled for that time step, after the last delta
     // cycle (11.3), which is what Verilator's postponed region is -- so a
     // postponed assertion sees the values the step ended with, not the ones
     // it passed through.
     AstNode* concurrentProcess(AstNode* bodyp, bool postponed, FileLine* flp) {
+        // A concurrent statement that reads no signal runs exactly once
+        // (11.6), postponed or not -- "postponed assert width < 128" reads
+        // only a generic. Made a process it would wait on nothing, and a
+        // block with nothing to wait on is not something the scheduler can
+        // be handed.
+        if (postponed && !readsAnySignal(bodyp)) return new AstInitial{flp, bodyp};
         if (postponed) {
             // A postponed process runs after the last delta cycle of the time
             // step, and it is an error for one to schedule a transaction that
@@ -14682,6 +14732,11 @@ private:
         return entName + "__a" + archName;
     }
 
+    // The module an entity built for one named configuration goes by (3.4)
+    static std::string cfgModName(const std::string& entName, const std::string& cfgName) {
+        return entName + "__c" + cfgName;
+    }
+
     // An instance binds to the entity of the same name, which is VHDL's
     // default binding rule (7.3.3)
     void lowerInstance(AstVhdlInstance* nodep) {
@@ -14706,6 +14761,24 @@ private:
             return;
         }
         std::string modName = parts.back();
+        // "uut : configuration work.c" names a configuration, which made both
+        // choices already: the entity and the architecture (3.4, 11.7). The
+        // module built for that configuration carries its own bindings.
+        if (nodep->kind() == "configuration") {
+            const std::string here
+                = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+            const std::string cfgLib
+                = parts.size() > 1 ? VString::downcase(parts[parts.size() - 2]) : here;
+            std::string cfgKey = cfgLib + "." + modName;
+            if (!m_configOf.count(cfgKey)) cfgKey = "work." + modName;
+            const auto cfgIt = m_configOf.find(cfgKey);
+            if (cfgIt == m_configOf.end()) {
+                unsup(flp, "instance of a configuration '" + modName + "' that was not analyzed");
+                return;
+            }
+            modName = cfgModName(cfgIt->second.first, modName);
+            archName.clear();
+        }
         // A configuration specification may have said which entity this
         // component or instance is built from (7.3)
         const std::string label = nodep->label();
@@ -14779,12 +14852,24 @@ private:
         std::map<std::string, std::vector<std::string>> renamed;  // Component port -> entity's
         bool anyRenamed = false;
         if (bindingp && bindingp->portMapp()) {
-            for (AstNode* p = bindingp->portMapp(); p; p = p->nextp()) {
+            // Written positionally, the Nth association names the Nth port of
+            // the entity, whose names need not be the component's (7.3.2.2)
+            const std::string entLib
+                = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+            const auto portIt = m_entityPortNames.find(entLib + "." + modName);
+            size_t at = 0;
+            for (AstNode* p = bindingp->portMapp(); p; p = p->nextp(), ++at) {
                 const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
-                if (!asp || !asp->formalp() || !asp->actualp()) continue;
+                if (!asp || !asp->actualp()) continue;
                 std::vector<std::string> fparts;
                 std::vector<std::string> aparts;
-                if (!flattenName(asp->formalp(), fparts) || fparts.empty()) continue;
+                if (asp->formalp()) {
+                    if (!flattenName(asp->formalp(), fparts) || fparts.empty()) continue;
+                } else if (portIt != m_entityPortNames.end() && at < portIt->second.size()) {
+                    fparts.push_back(portIt->second[at]);
+                } else {
+                    continue;
+                }
                 if (asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) continue;
                 if (!flattenName(asp->actualp(), aparts) || aparts.empty()) {
                     unsup(flp, "binding indication whose actual is not a port name");
@@ -21567,7 +21652,7 @@ private:
 
     // The module an entity and its architecture become
     void lowerEntity(AstVhdlEntity* entp, AstVhdlArchitecture* archp,
-                     const std::string& asName = "") {
+                     const std::string& asName = "", const CfgScope* cfgScopep = nullptr) {
         FileLine* const flp = entp->fileline();
         const std::string libname = entp->libname().empty() ? "work" : entp->libname();
         m_modp = new AstModule{flp, asName.empty() ? entp->name() : asName, libname};
@@ -21620,7 +21705,10 @@ private:
         m_bindings.clear();
         m_instanceBindings.clear();
         m_bindingMaps.clear();
-        {
+        if (cfgScopep) {
+            // Built for one named configuration, which says what it says
+            m_cfgScopep = cfgScopep;
+        } else {
             // What a configuration declaration said about this entity
             const auto scopeIt = m_cfgScopes.find(libname + "." + entp->name());
             m_cfgScopep = scopeIt == m_cfgScopes.end() ? nullptr : &scopeIt->second;
@@ -21919,6 +22007,24 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         m_configOf[lib + "." + cfgp->name()]
             = {parts.back(), topArchitectureOf(cfgp->blockConfigp())};
     }
+    // Which configurations an instance names, so that a module is built for
+    // each of them and two configurations of one entity keep their own
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        const std::string lib = unitp->libname().empty() ? "work" : unitp->libname();
+        unitp->foreach([&](AstVhdlInstance* instp) {
+            if (instp->kind() != "configuration") return;
+            std::vector<std::string> parts;
+            AstNodeVhdlExpr* namep = instp->unitp();
+            if (AstVhdlCall* const callp = VN_CAST(namep, VhdlCall)) namep = callp->prefixp();
+            if (!flattenName(namep, parts) || parts.empty()) return;
+            const std::string cfgLib = parts.size() > 1 ? parts[parts.size() - 2] : lib;
+            if (m_configOf.count(VString::downcase(cfgLib) + "." + parts.back())) {
+                m_cfgInstanced.insert(VString::downcase(cfgLib) + "." + parts.back());
+            } else if (m_configOf.count("work." + parts.back())) {
+                m_cfgInstanced.insert("work." + parts.back());
+            }
+        });
+    }
     // An entity and an architecture become one module, so pair them up
     // first. VHDL's default binding takes the architecture analyzed last
     // (7.3.3), which is what keeping the newest one gives.
@@ -21967,6 +22073,8 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             if (cfgp->blockConfigp()) {
                 buildCfgScope(cfgp->blockConfigp()->itemsp(), m_cfgScopes[lib + "." + parts.back()],
                               lib);
+                buildCfgScope(cfgp->blockConfigp()->itemsp(),
+                              m_cfgScopeByCfg[lib + "." + VString::downcase(cfgp->name())], lib);
             }
             continue;
         }
@@ -21980,6 +22088,10 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         std::vector<std::string>& names = m_entityGenericNames[pair.first];
         for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
             names.push_back(VN_AS(gp, VhdlIfaceDecl)->name());
+        }
+        std::vector<std::string>& ports = m_entityPortNames[pair.first];
+        for (AstNode* pp = pair.second->portsp(); pp; pp = pp->nextp()) {
+            ports.push_back(VN_AS(pp, VhdlIfaceDecl)->name());
         }
     }
     // A module the other frontend read is a design unit as much as an entity
@@ -22048,6 +22160,23 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         // an instance of one of those copies instead (6.5.5)
         if (hasUnboundGeneric(entities[key])) continue;
         lowerEntity(entities[key], builtArch[key]);
+        // One module per configuration an instance names, each carrying that
+        // configuration's own bindings (3.4, 11.7)
+        for (const std::string& cfgKey : m_cfgInstanced) {
+            const auto ofIt = m_configOf.find(cfgKey);
+            if (ofIt == m_configOf.end()) continue;
+            const std::string cfgLib = cfgKey.substr(0, cfgKey.find('.'));
+            if (cfgLib + "." + ofIt->second.first != key) continue;
+            const std::string cfgName = cfgKey.substr(cfgKey.find('.') + 1);
+            AstVhdlArchitecture* archForCfgp = builtArch[key];
+            const auto namedIt = namedArchs.find(key + "." + ofIt->second.second);
+            if (!ofIt->second.second.empty() && namedIt != namedArchs.end()) {
+                archForCfgp = namedIt->second;
+            }
+            const auto scopeIt = m_cfgScopeByCfg.find(cfgKey);
+            lowerEntity(entities[key], archForCfgp, cfgModName(entities[key]->name(), cfgName),
+                        scopeIt == m_cfgScopeByCfg.end() ? nullptr : &scopeIt->second);
+        }
         const auto alsoIt = alsoBuild.find(key);
         if (alsoIt == alsoBuild.end()) continue;
         for (const std::string& wanted : alsoIt->second) {
