@@ -5309,10 +5309,14 @@ private:
                             mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
                         }
                     }
-                    AstNode* const openp = new AstAssign{
+                    AstNode* openp = new AstAssign{
                         flp, new AstVarRef{flp, varp, VAccess::WRITE},
-                        new AstFOpen{flp, namep,
-                                     new AstConst{flp, AstConst::String{}, mode}}};
+                        new AstFOpen{flp, namep, new AstConst{flp, AstConst::String{}, mode}}};
+                    // A declaration names no status, so a file that will not
+                    // open is an error rather than an empty one (5.5.2)
+                    AstNodeExpr* const fdp = new AstVarRef{flp, varp, VAccess::READ};
+                    openp = AstNode::addNext(openp, fileOpenCheck(fdp, namep, mode, flp));
+                    VL_DO_DANGLING(fdp->deleteTree(), fdp);
                     // A file of a subprogram is opened again on every call.
                     // Anywhere else -- an architecture, a block, a process --
                     // the declaration is elaborated once before the design
@@ -20593,6 +20597,26 @@ private:
 
     // FILE_OPEN in both its forms (5.5.2). The open kind decides the mode,
     // and the status form reports whether the file was there.
+    // Opening a file may fail, and where the caller asked for no status it
+    // is an error that ends the run (5.5.2): the file object would otherwise
+    // be read as though it were empty, and a testbench that reads nothing
+    // reports whatever it was initialised with. Both references stop here.
+    // Takes ownership of neither reference: each is cloned.
+    AstNode* fileOpenCheck(AstNodeExpr* fdp, AstNodeExpr* namep, const std::string& mode,
+                           FileLine* flp) {
+        const std::string what = mode == "r" ? "reading" : (mode == "w" ? "writing" : "appending");
+        const std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
+                                   + std::to_string(flp->firstColumn())
+                                   + ":@%0t:(report failure): cannot open file '%s' for " + what;
+        AstNodeExpr* argsp = new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
+        argsp = AstNode::addNext(argsp, namep->cloneTree(false));
+        AstNode* actionp = new AstDisplay{flp, VDisplayType::DT_DISPLAY, format, nullptr, argsp};
+        actionp = AstNode::addNext(actionp, static_cast<AstNode*>(new AstStop{flp, true}));
+        return new AstIf{
+            flp, new AstEq{flp, fdp->cloneTree(false), new AstConst{flp, AstConst::Signed32{}, 0}},
+            actionp, nullptr};
+    }
+
     AstNode* lowerFileOpen(std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
         size_t first = 0;
         AstNodeVhdlExpr* statusp = nullptr;
@@ -20631,6 +20655,8 @@ private:
                                     new AstConst{flp, AstConst::WidthedValue{}, 2, 0},
                                     new AstConst{flp, AstConst::WidthedValue{}, 2, 2}}}));
             }
+        } else {
+            outp = AstNode::addNext(outp, fileOpenCheck(filep, namep, mode, flp));
         }
         return outp;
     }
