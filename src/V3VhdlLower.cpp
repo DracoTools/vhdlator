@@ -17559,7 +17559,24 @@ private:
         // round to the first and "n <= right" is true again. Such a loop ends
         // by recognising its last iteration instead. Every other loop keeps
         // the ordinary shape, which is what Verilator's unroller looks for.
-        const bool endTest = rangep->base()->kind() == VhdlTypeKind::ENUM;
+        //
+        // A loop that ends at the last value its *type* holds wraps the same
+        // way, for the same reason: "for i in INTEGER'HIGH to INTEGER'HIGH"
+        // runs once, and stepping past that value gives INTEGER'LOW, which is
+        // below the limit again. Only a bound written as a number can be
+        // recognised here; one that arrives with an instance keeps the
+        // ordinary shape, since making every such loop end-tested would cost
+        // the unroller far more than this case is worth.
+        bool atExtreme = false;
+        if (const AstConst* const constp = VN_CAST(limitp, Const)) {
+            const VhdlType* const basep = rangep->base();
+            if (basep && basep->bounded() && basep->kind() != VhdlTypeKind::ENUM
+                && !constp->isWide()) {
+                const int64_t lim = static_cast<int64_t>(constp->toSInt());
+                atExtreme = ascending ? lim >= basep->high() : lim <= basep->low();
+            }
+        }
+        const bool endTest = rangep->base()->kind() == VhdlTypeKind::ENUM || atExtreme;
         // Whether the range runs at all, which is asked once, before the
         // first iteration: a null range runs none (10.10). Where the
         // direction arrives with the instance, both ways are written out and
