@@ -14029,32 +14029,100 @@ private:
             bodyp = AstNode::addNextNull(
                 bodyp, static_cast<AstNode*>(new AstAssign{flp, targetp, callp}));
         }
-        // With every driver turned off the signal takes what the function
-        // makes of no drivers at all, which is a call of its own (14.7.3.2)
-        if (nullFtaskp && bodyp) {
-            AstNodeExpr* anyp = nullptr;
-            for (const VhdlDriver& drv : drivers) {
-                if (!drv.connp) continue;
-                AstNodeExpr* const refp = new AstVarRef{flp, drv.connp, VAccess::READ};
-                anyp = anyp ? new AstOr{flp, anyp, refp} : refp;
+        // A guarded signal is resolved over the drivers that are still
+        // connected, and any one of them may be turned off on its own
+        // (14.7.3.2). The values of the connected ones are packed into the
+        // front of the array, in driver order, and the copy of the function
+        // that takes that many is the one called.
+        if (nullFtaskp && bodyp && drivers[0].connp) {
+            AstNode* packp = nullptr;
+            AstVar* const nVarp = newTempVar("__Vconn", newIntDType(flp), flp);
+            packp = new AstAssign{flp, new AstVarRef{flp, nVarp, VAccess::WRITE},
+                                  new AstConst{flp, AstConst::Signed32{}, 0}};
+            const auto atSlot = [&](AstVar* arrVarp, AstNodeExpr* posp, const VhdlType* itp,
+                                    VAccess access) -> AstNodeExpr* {
+                AstNodeExpr* const basep
+                    = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(itp->left())};
+                AstNodeExpr* const idxExprp
+                    = itp->ascending() ? static_cast<AstNodeExpr*>(new AstAdd{flp, basep, posp})
+                                       : static_cast<AstNodeExpr*>(new AstSub{flp, basep, posp});
+                return new AstSelBit{flp, new AstVarRef{flp, arrVarp, access}, idxExprp};
+            };
+            for (int i = 0; i < count; ++i) {
+                AstNode* const onep = new AstAssign{
+                    flp,
+                    atSlot(arrp, new AstVarRef{flp, nVarp, VAccess::READ}, idxp, VAccess::WRITE),
+                    new AstVarRef{flp, drivers[i].valp, VAccess::READ}};
+                AstNode* const bumpp
+                    = new AstAssign{flp, new AstVarRef{flp, nVarp, VAccess::WRITE},
+                                    new AstAdd{flp, new AstVarRef{flp, nVarp, VAccess::READ},
+                                               new AstConst{flp, AstConst::Signed32{}, 1}}};
+                packp = AstNode::addNext(
+                    packp, static_cast<AstNode*>(
+                               new AstIf{flp, new AstVarRef{flp, drivers[i].connp, VAccess::READ},
+                                         AstNode::addNext(onep, bumpp)}));
             }
-            if (anyp) {
-                AstVar* const nonep
-                    = new AstVar{flp, VVarType::VAR, "__Vresnone__" + m_prefix + symp->name(),
-                                 VFlagChildDType{}, lowerType(nullResolvep->paramTypes()[0], flp)};
-                addStmt(nonep);
-                AstFuncRef* const callp = new AstFuncRef{flp, nullFtaskp->name(), nullptr};
-                callp->taskp(nullFtaskp);
-                callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, nonep, VAccess::READ}});
-                AstNode* const offp
-                    = new AstAssign{flp, new AstVarRef{flp, netp, VAccess::WRITE}, callp};
-                // The two arms answer the same question two ways, and the
-                // array handed to the function is filled only by the one
-                // that uses it: nothing is held from a previous run, so
-                // this is no latch however it reads
-                FileLine* const iflp = new FileLine{flp};
-                iflp->warnOff(V3ErrorCode::LATCH, true);
-                bodyp = new AstIf{iflp, anyp, bodyp, offp};
+            // One call per number of connected drivers, chosen by that number
+            AstNode* chainp = nullptr;
+            for (int k = 0; k <= count; ++k) {
+                VhdlSymbol* const ksymp
+                    = k == count ? symp->resolverp() : symp->resolverForCount(k);
+                AstNodeFTask* kftaskp = nullptr;
+                if (ksymp) {
+                    const auto it = m_funcs.find(ksymp);
+                    kftaskp = it != m_funcs.end() && callableHere(it->second)
+                                  ? it->second
+                                  : emitOnDemand(ksymp);
+                    if (kftaskp && !VN_IS(kftaskp, Func)) kftaskp = nullptr;
+                }
+                if (!kftaskp) {
+                    if (chainp) VL_DO_DANGLING(chainp->deleteTree(), chainp);
+                    chainp = nullptr;
+                    break;
+                }
+                // The array of exactly that length, filled from the front of
+                // the packed one
+                AstNode* stmtsp = nullptr;
+                AstNodeExpr* argRefp = nullptr;
+                if (k == count) {
+                    argRefp = new AstVarRef{flp, arrp, VAccess::READ};
+                } else {
+                    VhdlType* const kParamp = ksymp->paramTypes()[0];
+                    AstVar* const kArrp
+                        = newTempVar("__Vres" + std::to_string(k), lowerType(kParamp, flp), flp);
+                    const VhdlType* const kIdxp = kParamp->indexTypes()[0];
+                    for (int j = 0; j < k; ++j) {
+                        AstNodeExpr* const posp = new AstConst{flp, AstConst::Signed32{}, j};
+                        stmtsp = AstNode::addNextNull(
+                            stmtsp,
+                            static_cast<AstNode*>(new AstAssign{
+                                flp, atSlot(kArrp, posp->cloneTree(false), kIdxp, VAccess::WRITE),
+                                atSlot(arrp, posp, idxp, VAccess::READ)}));
+                    }
+                    argRefp = new AstVarRef{flp, kArrp, VAccess::READ};
+                }
+                AstFuncRef* const kcallp = new AstFuncRef{flp, kftaskp->name(), nullptr};
+                kcallp->taskp(kftaskp);
+                kcallp->addArgsp(new AstArg{flp, "", argRefp});
+                stmtsp = AstNode::addNextNull(
+                    stmtsp, static_cast<AstNode*>(new AstAssign{
+                                flp, new AstVarRef{flp, netp, VAccess::WRITE}, kcallp}));
+                if (k == 0) {
+                    chainp = stmtsp;
+                } else {
+                    FileLine* const kflp = new FileLine{flp};
+                    kflp->warnOff(V3ErrorCode::LATCH, true);
+                    chainp = new AstIf{kflp,
+                                       new AstEq{kflp, new AstVarRef{kflp, nVarp, VAccess::READ},
+                                                 new AstConst{kflp, AstConst::Signed32{}, k}},
+                                       stmtsp, chainp};
+                }
+            }
+            if (chainp) {
+                VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
+                bodyp = AstNode::addNext(packp, chainp);
+            } else {
+                VL_DO_DANGLING(packp->deleteTree(), packp);
             }
         }
         // Whenever any driver changes, which is what the process reads
@@ -14273,6 +14341,17 @@ private:
         const int idx = bIt != m_bindDrivers.end() ? bIt->second.idx : m_driverUsed[signalp];
         if (idx >= static_cast<int>(it->second.size())) return nullptr;
         return &it->second[idx];
+    }
+
+    // The GUARD a guarded assignment reads: the one its block declares, or,
+    // where the block has none, a signal of the design declared with that
+    // name, which analysis resolved (11.6, 4.3.1.2)
+    AstVar* guardVarFor(AstVhdlSigAssign* nodep) {
+        if (m_guardVarp) return m_guardVarp;
+        VhdlSymbol* const symp = nodep->guardSymp();
+        if (!symp) return nullptr;
+        const auto it = m_vars.find(symp->resolved());
+        return it == m_vars.end() ? nullptr : it->second;
     }
 
     // The driver of a guarded signal, which is the only kind that can be
@@ -14500,12 +14579,22 @@ private:
             if (!stmtsp) return;
             // "s <= guarded w" schedules the waveform only while GUARD is
             // true, and turns its driver off when GUARD goes false (11.6)
-            if (const VhdlDriver* const gdrvp = nodep->guarded() && m_guardVarp
+            if (const VhdlDriver* const gdrvp = nodep->guarded() && guardVarFor(nodep)
                                                     ? disconnectableDriver(nodep->targetp())
                                                     : nullptr) {
-                stmtsp = new AstIf{flp, new AstVarRef{flp, m_guardVarp, VAccess::READ}, stmtsp,
-                                   connectStmt(gdrvp, false, nullptr, true, flp)};
-                AstNodeExpr* const guardp = new AstVarRef{flp, m_guardVarp, VAccess::READ};
+                // Two statements rather than one with two arms: the
+                // waveform carries a delay and turning the driver off does
+                // not, and one "if" whose arms both write the same bit is
+                // merged into a single delayed assignment of the guard
+                stmtsp = new AstIf{flp, new AstVarRef{flp, guardVarFor(nodep), VAccess::READ},
+                                   stmtsp};
+                stmtsp = AstNode::addNext(
+                    stmtsp,
+                    static_cast<AstNode*>(new AstIf{
+                        flp,
+                        new AstLogNot{flp, new AstVarRef{flp, guardVarFor(nodep), VAccess::READ}},
+                        connectStmt(gdrvp, false, nullptr, true, flp)}));
+                AstNodeExpr* const guardp = new AstVarRef{flp, guardVarFor(nodep), VAccess::READ};
                 readsp = readsp ? new AstConcat{flp, readsp, guardp} : guardp;
             }
             emitWaveformProcess(stmtsp, readsp, flp);
@@ -14580,14 +14669,14 @@ private:
                 // "s <= guarded w" drives only while GUARD is true, and turns
                 // its driver off when GUARD goes false (11.6, 10.5.2.2). The
                 // process therefore reads GUARD as well as the value.
-                const VhdlDriver* const drvp = nodep->guarded() && m_guardVarp
+                const VhdlDriver* const drvp = nodep->guarded() && guardVarFor(nodep)
                                                    ? disconnectableDriver(nodep->targetp())
                                                    : nullptr;
                 if (drvp) {
-                    outp = new AstIf{flp, new AstVarRef{flp, m_guardVarp, VAccess::READ}, outp,
-                                     connectStmt(drvp, false, nullptr, true, flp)};
+                    outp = new AstIf{flp, new AstVarRef{flp, guardVarFor(nodep), VAccess::READ},
+                                     outp, connectStmt(drvp, false, nullptr, true, flp)};
                     readsp = new AstConcat{flp, readsp,
-                                           new AstVarRef{flp, m_guardVarp, VAccess::READ}};
+                                           new AstVarRef{flp, guardVarFor(nodep), VAccess::READ}};
                 }
                 emitWaveformProcess(outp, readsp, flp);
             } else {
@@ -14599,8 +14688,9 @@ private:
             // "s <= guarded w" drives only while GUARD is true; when it goes
             // false the driver is turned off, which for a signal with one
             // driver leaves it holding its last value (11.6)
-            if (!m_guardVarp) {
-                unsup(flp, "guarded assignment outside a guarded block");
+            AstVar* const guardp = guardVarFor(nodep);
+            if (!guardp) {
+                unsup(flp, "guarded assignment with no GUARD in sight");
                 VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
                 VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
                 return;
@@ -14616,7 +14706,7 @@ private:
             AstNode* const drivep = AstNode::addNextNull(
                 assignp, transactionMark(nodep->targetp(), delayp, true, nullptr, gflp));
             AstNode* const stmtsp
-                = new AstIf{gflp, new AstVarRef{gflp, m_guardVarp, VAccess::READ}, drivep};
+                = new AstIf{gflp, new AstVarRef{gflp, guardp, VAccess::READ}, drivep};
             addStmt(concurrentProcess(stmtsp, nodep->postponed(), gflp));
             return;
         }

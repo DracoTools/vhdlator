@@ -1327,6 +1327,11 @@ class AstVhdlSigAssign final : public AstNodeVhdlStmt {
     const VhdlAssignKind m_kind;
     VhdlDelayKind m_delay = VhdlDelayKind::NONE;
     bool m_guarded = false;  // Concurrent form written "guarded"
+    // The GUARD the guarded form reads: the one a guarded block declares,
+    // or an explicitly declared signal of that name where the block has no
+    // guard expression of its own (11.6, 4.3.1.2). Resolved during analysis,
+    // since the assignment does not name it.
+    VhdlSymbol* m_guardSymp = nullptr;
     bool m_postponed = false;
     bool m_matching = false;  // VHDL-2008 "with ... select?"
     bool m_force = false;  // VHDL-2008 force assignment
@@ -1345,6 +1350,8 @@ public:
     void delay(VhdlDelayKind kind) { m_delay = kind; }
     bool guarded() const { return m_guarded; }
     void guarded(bool flag) { m_guarded = flag; }
+    VhdlSymbol* guardSymp() const { return m_guardSymp; }
+    void guardSymp(VhdlSymbol* symp) { m_guardSymp = symp; }
     bool postponed() const { return m_postponed; }
     void postponed(bool flag) { m_postponed = flag; }
     bool matching() const { return m_matching; }

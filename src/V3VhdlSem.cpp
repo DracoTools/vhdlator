@@ -6805,9 +6805,18 @@ void VhdlSemVisitor::specializeResolvers() {
         const bool wantNull = guardedKindOf(need.symp) != VhdlSignalKind::NONE;
         if (VhdlSymbol* const havep = cached(need.count)) {
             VhdlSymbol* const haveNullp = wantNull ? cached(0) : nullptr;
-            if (!wantNull || haveNullp) {
+            bool haveAll = !wantNull || haveNullp;
+            if (haveAll && wantNull && need.count <= 8) {
+                for (int k = 0; k <= need.count; ++k) haveAll = haveAll && cached(k);
+            }
+            if (haveAll) {
                 need.symp->resolverp(havep);
                 if (haveNullp) need.symp->resolverNullp(haveNullp);
+                if (wantNull && need.count <= 8) {
+                    for (int k = 0; k <= need.count; ++k) {
+                        need.symp->resolverForCount(k, cached(k));
+                    }
+                }
                 continue;
             }
         }
@@ -6866,6 +6875,16 @@ void VhdlSemVisitor::specializeResolvers() {
         // copy is made here, where the other one is, rather than at the point
         // it is needed, which is long after analysis is over.
         if (wantNull) {
+            // A guarded signal is resolved over the drivers that are still
+            // connected, and any of them may be turned off on its own, so
+            // there has to be a copy for every number of them (14.7.3.2).
+            // Beyond a handful of drivers this is more copies than it is
+            // worth, and such a signal keeps the whole-count copy alone.
+            if (need.count <= 8) {
+                for (int k = 0; k <= need.count; ++k) {
+                    if (VhdlSymbol* const kp = copyFor(k)) need.symp->resolverForCount(k, kp);
+                }
+            }
             if (VhdlSymbol* const nullp = copyFor(0)) need.symp->resolverNullp(nullp);
         }
     }
@@ -11423,6 +11442,21 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
     if (wantp && (!targetp || targetp->isError())) targetp = wantp;
     checkAssignTarget(nodep->targetp(), true);
     checkNullWaveforms(nodep);
+    // "s <= guarded w" reads the GUARD visible where it is written, which a
+    // guarded block declares for itself and which may otherwise be a signal
+    // of the design declared with that name (11.6, 4.3.1.2). The assignment
+    // does not name it, so it is looked up here and carried to lowering.
+    if (nodep->guarded() && m_scopep) {
+        std::vector<VhdlSymbol*> found;
+        m_scopep->lookup("guard", found);
+        for (VhdlSymbol* const symp : found) {
+            if (symp->kind() != VhdlSymKind::SIGNAL && symp->kind() != VhdlSymKind::PORT) {
+                continue;
+            }
+            nodep->guardSymp(symp);
+            break;
+        }
+    }
     // Every waveform element is of the target's type (10.5.2.2)
     for (AstNode* wp = nodep->wavesp(); wp; wp = wp->nextp()) {
         AstVhdlWaveform* const wfp = VN_AS(wp, VhdlWaveform);
