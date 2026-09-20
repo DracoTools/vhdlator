@@ -1161,6 +1161,10 @@ private:
         const VhdlType* const basep = typep->base();
         if (basep->kind() != VhdlTypeKind::ARRAY) return false;
         if (basep->indexTypes().size() != 1) return false;
+        // One row of a multidimensional aggregate is a grouping of indices,
+        // not a value of a type of its own (9.3.3.3), so a row of an array
+        // of CHARACTER is not text however much it looks like it
+        if (typep->aggRow() || basep->aggRow()) return false;
         const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
         const VhdlType* const charp = V3VhdlStd::characterType();
         return elemp && charp && elemp->base() == charp->base();
@@ -9637,6 +9641,13 @@ private:
                     // needs is the result's own type rather than a wrapper.
                     VhdlType* const keptTypep = keptp ? keptp->vhdlTypep() : nullptr;
                     if (keptTypep && keptTypep->base()->kind() != VhdlTypeKind::ARRAY) {
+                        // Where the result is text, the array of one
+                        // character that is left is that character written
+                        // as a string of one: a pattern is no value a string
+                        // can be given
+                        if (isStringType(nodep->vhdlTypep())) {
+                            return new AstSFormatF{flp, "%c", false, keepp};
+                        }
                         // "e & null" is an array of one element, not the
                         // element itself (9.2.5). Written as the pattern of
                         // one member it is, so that its type comes from where
@@ -12594,6 +12605,10 @@ private:
         }
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->argsp() || callp->argsp()->nextp()) return false;
+        // A call written on a signal is an index or a slice of it (8.1), and
+        // that is a signal name too: "p => s(0 to 3)" associates the port
+        // with part of s, with nothing in between (6.5.7.1)
+        if (isSignalActual(callp->prefixp())) return true;
         const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
         const AstNodeVhdlExpr* const argp
             = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
@@ -16005,8 +16020,10 @@ private:
             delayp = new AstDelay{flp, lowerExpr(wfp->afterp()), false};
         }
         if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {
+            AstNode* const outp
+                = lowerAggregateTarget(aggp, wfp->valuep(), true, sequential, flp, delayp);
             if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
-            return lowerAggregateTarget(aggp, wfp->valuep(), true, sequential, flp);
+            return outp;
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             AstNodeExpr* const valuep
@@ -16041,7 +16058,7 @@ private:
     // apply, and the caller then does the reckoning in numbers as before.
     AstNode* aggregateTargetByExpr(AstVhdlAggregate* targetp, AstNodeVhdlExpr* valuep,
                                    VhdlType* typep, bool signalAssign, bool sequential,
-                                   FileLine* flp) {
+                                   FileLine* flp, AstNode* delayp) {
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : typep->base()->elementp();
         if (!elemp || !elementPacks(elemp) || isStringType(typep)) return nullptr;
         // Every name in the target, in order, and how long a run each stands
@@ -16104,7 +16121,7 @@ private:
                                   atp->cloneTree(false), widths[i]->cloneTree(false)};
             outp = AstNode::addNextNull(outp, oneTarget(assocs[i]->valuep(), fromp,
                                                         span == 1 ? elemp : typep, signalAssign,
-                                                        sequential, flp));
+                                                        sequential, flp, delayp));
             atp = new AstSub{flp, atp, widths[i]};
         }
         VL_DO_DANGLING(atp->deleteTree(), atp);
@@ -16112,7 +16129,8 @@ private:
     }
 
     AstNode* lowerAggregateTarget(AstVhdlAggregate* targetp, AstNodeVhdlExpr* valuep,
-                                  bool signalAssign, bool sequential, FileLine* flp) {
+                                  bool signalAssign, bool sequential, FileLine* flp,
+                                  AstNode* delayp = nullptr) {
         VhdlType* const typep = valuep->vhdlTypep();
         const bool isRecord = typep && typep->base()->kind() == VhdlTypeKind::RECORD;
         if (!typep || (!isRecord && typep->base()->kind() != VhdlTypeKind::ARRAY)
@@ -16121,8 +16139,8 @@ private:
             return nullptr;
         }
         if (!isRecord && !typep->isConstrainedArray()) {
-            if (AstNode* const outp
-                = aggregateTargetByExpr(targetp, valuep, typep, signalAssign, sequential, flp)) {
+            if (AstNode* const outp = aggregateTargetByExpr(targetp, valuep, typep, signalAssign,
+                                                            sequential, flp, delayp)) {
                 return outp;
             }
         }
@@ -16165,7 +16183,7 @@ private:
         AstNode* const outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
         return AstNode::addNextNull(
             outp, spreadAggregate(targetp, new AstVarRef{flp, tempp, VAccess::READ}, typep,
-                                  signalAssign, sequential, flp));
+                                  signalAssign, sequential, flp, delayp));
     }
 
     // Each name the aggregate lists takes the part of "srcp" that stands in
@@ -16173,7 +16191,7 @@ private:
     // is given is spread over the names inside it in turn (10.6.2).
     // Takes ownership of srcp.
     AstNode* spreadAggregate(AstVhdlAggregate* targetp, AstNodeExpr* srcp, VhdlType* typep,
-                             bool signalAssign, bool sequential, FileLine* flp) {
+                             bool signalAssign, bool sequential, FileLine* flp, AstNode* delayp) {
         const bool isRecord = typep && typep->base()->kind() == VhdlTypeKind::RECORD;
         if (!typep || (!isRecord && typep->base()->kind() != VhdlTypeKind::ARRAY)
             || (!isRecord && typep->dimensions() != 1)) {
@@ -16200,9 +16218,8 @@ private:
                     = new AstMemberSel{flp, srcp->cloneTree(false), VFlagChildDType{},
                                        elems[i]->name()};
                 outp = AstNode::addNextNull(outp,
-                                            oneTarget(byPos[i]->valuep(), fromp,
-                                                      elems[i]->typep(), signalAssign,
-                                                      sequential, flp));
+                                            oneTarget(byPos[i]->valuep(), fromp, elems[i]->typep(),
+                                                      signalAssign, sequential, flp, delayp));
             }
             VL_DO_DANGLING(srcp->deleteTree(), srcp);
             return outp;
@@ -16268,9 +16285,9 @@ private:
             used += span;
             // A name that stands for one element takes the element's type; a
             // name that stands for a run of them takes the array's own
-            outp = AstNode::addNextNull(
-                outp, oneTarget(assocs[i]->valuep(), fromp, span == 1 ? elemp : typep,
-                                signalAssign, sequential, flp));
+            outp = AstNode::addNextNull(outp, oneTarget(assocs[i]->valuep(), fromp,
+                                                        span == 1 ? elemp : typep, signalAssign,
+                                                        sequential, flp, delayp));
         }
         VL_DO_DANGLING(srcp->deleteTree(), srcp);
         if (length >= 0 && used != length) {
@@ -16282,16 +16299,16 @@ private:
 
     // One name of an aggregate target, which may be an aggregate itself
     AstNode* oneTarget(AstNodeVhdlExpr* namep, AstNodeExpr* fromp, VhdlType* typep,
-                       bool signalAssign, bool sequential, FileLine* flp) {
+                       bool signalAssign, bool sequential, FileLine* flp, AstNode* delayp) {
         if (AstVhdlAggregate* const aggp = VN_CAST(namep, VhdlAggregate)) {
-            return spreadAggregate(aggp, fromp, typep, signalAssign, sequential, flp);
+            return spreadAggregate(aggp, fromp, typep, signalAssign, sequential, flp, delayp);
         }
         AstNodeExpr* const onep = lowerExpr(namep);
         if (!onep) {
             VL_DO_DANGLING(fromp->deleteTree(), fromp);
             return nullptr;
         }
-        return assignOf(onep, fromp, signalAssign, sequential, flp);
+        return assignOf(onep, fromp, signalAssign, sequential, flp, delayp);
     }
 
     // Which element of the record each association of the target names
@@ -16374,11 +16391,16 @@ private:
         return true;
     }
 
+    // Every name of an aggregate target is written after the same delay,
+    // since the one waveform the statement writes is delivered to all of
+    // them at once (10.5.2.2). The delay stays the caller's; each
+    // assignment takes a copy of it.
     static AstNode* assignOf(AstNodeExpr* lhsp, AstNodeExpr* rhsp, bool signalAssign,
-                             bool sequential, FileLine* flp) {
+                             bool sequential, FileLine* flp, AstNode* delayp = nullptr) {
         if (!signalAssign) return new AstAssign{flp, lhsp, rhsp};
-        if (sequential) return new AstAssignDly{flp, lhsp, rhsp};
-        return new AstAssignW{flp, lhsp, rhsp};
+        AstNode* const dp = delayp ? delayp->cloneTree(false) : nullptr;
+        if (sequential) return new AstAssignDly{flp, lhsp, rhsp, dp};
+        return new AstAssignW{flp, lhsp, rhsp, dp};
     }
 
     // "s(1 to 5) := t" and "s(3) := c" write part of a STRING. Verilator's

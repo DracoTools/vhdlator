@@ -100,6 +100,12 @@ class VhdlType final {
     std::vector<VhdlType*> m_indexTypes;
     VhdlType* m_elementp = nullptr;
     bool m_unconstrained = false;  // Array with an unconstrained index
+    // One row of a multidimensional aggregate. VHDL gives such a row no type
+    // of its own -- the parentheses group indices, they do not make a value
+    // (9.3.3.3) -- so the array made to check and lower a row must not be
+    // taken for a type the language has, STRING above all: a row of an array
+    // of CHARACTER is a row, not text.
+    bool m_aggRow = false;
     // Which dimensions the "<>" was written for, one bit each. An array may
     // leave one dimension open and constrain another -- "array (t_two, t_enum)"
     // constrains both, yet t_two's bounds name a generic -- so knowing only
@@ -295,6 +301,8 @@ public:
     void elementp(VhdlType* typep) { m_elementp = typep; }
     bool unconstrained() const { return m_unconstrained; }
     void unconstrained(bool flag) { m_unconstrained = flag; }
+    bool aggRow() const { return m_aggRow; }
+    void aggRow(bool flag) { m_aggRow = flag; }
     // Whether this dimension is the one nothing constrained
     bool dimOpen(size_t dim) const {
         if (!m_unconstrained) return false;

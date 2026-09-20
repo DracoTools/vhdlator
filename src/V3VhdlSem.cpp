@@ -8693,6 +8693,7 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             for (size_t i = 1; i < idx.size(); ++i) subp->addIndexType(idx[i]);
             subp->elementp(wantp->base()->elementp());
             subp->unconstrained(!constrained);
+            subp->aggRow(true);
             elemTypep = subp;
         }
         // Every choice is an index value or a range of them (9.3.3.3). What
@@ -11155,6 +11156,7 @@ void VhdlSemVisitor::checkAggregate(AstVhdlAggregate* nodep, VhdlType* typep,
         }
         rowp->elementp(typep->elementp() ? typep->elementp() : typep->base()->elementp());
         rowp->unconstrained(false);
+        rowp->aggRow(true);
         int64_t rows = 0;
         for (AstNode* elemp = nodep->elemsp(); elemp; elemp = elemp->nextp()) {
             AstVhdlElemAssoc* const eap = VN_AS(elemp, VhdlElemAssoc);
