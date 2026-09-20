@@ -6603,18 +6603,56 @@ private:
         if (found != m_shadows.end()) return &found->second;
         const auto varIt = m_vars.find(symp);
         if (varIt == m_vars.end()) return nullptr;
-        AstVar* const sigp = varIt->second;
         VhdlShadow sh;
-        const std::string base = "__Vsig" + std::to_string(++m_nameNum) + "__" + symp->name();
+        if (!buildShadow(varIt->second, symp->typep(), symp->name(), flp, sh)) return nullptr;
+        return &m_shadows.emplace(symp, sh).first->second;
+    }
+
+    // The history of a signal an attribute made rather than the design:
+    // "clk'DELAYED(t)'LAST_EVENT" asks about the delayed signal's own past,
+    // which is kept exactly as the signal's own is (16.2)
+    std::map<const AstVar*, VhdlShadow> m_varShadows;
+    const VhdlShadow* shadowForVar(AstVar* sigp, VhdlType* typep, FileLine* flp) {
+        if (!sigp || !typep) return nullptr;
+        const auto found = m_varShadows.find(sigp);
+        if (found != m_varShadows.end()) return &found->second;
+        VhdlShadow sh;
+        if (!buildShadow(sigp, typep, sigp->name(), flp, sh)) return nullptr;
+        return &m_varShadows.emplace(sigp, sh).first->second;
+    }
+
+    // An attribute asked of a signal another attribute made. Only 'DELAYED
+    // gives back a signal of the prefix's own type that is emitted as a
+    // variable of its own, which is what a history can be kept against.
+    const VhdlShadow* shadowOfImplicit(AstNodeVhdlExpr* prefixp, FileLine* flp) {
+        AstVhdlAttrName* const innerp = VN_CAST(prefixp, VhdlAttrName);
+        if (!innerp || innerp->name() != "delayed") return nullptr;
+        AstNodeExpr* const basep = lowerAttr(innerp);
+        if (!basep) return nullptr;
+        AstVarRef* const refp = VN_CAST(basep, VarRef);
+        AstVar* const sigp = refp ? refp->varp() : nullptr;
+        VL_DO_DANGLING(basep->deleteTree(), basep);
+        if (!sigp) return nullptr;
+        VhdlType* typep = innerp->vhdlTypep();
+        if (!typep && innerp->prefixp()) typep = innerp->prefixp()->vhdlTypep();
+        return shadowForVar(sigp, typep, flp);
+    }
+
+    // The variables that keep one signal's past, and the block that fills
+    // them. Shared by a signal of the design and by one an attribute made.
+    bool buildShadow(AstVar* sigp, VhdlType* typep, const std::string& name, FileLine* flp,
+                     VhdlShadow& sh) {
+        if (!sigp || !typep) return false;
+        const std::string base = "__Vsig" + std::to_string(++m_nameNum) + "__" + name;
         // These belong to the module: a block assigns them, and a
         // non-blocking assignment may not target an automatic variable
         VL_RESTORER(m_ftaskp);
         VL_RESTORER(m_toShadows);
         m_ftaskp = nullptr;
         m_toShadows = true;
-        AstNodeDType* const valDTypep = lowerType(symp->typep(), flp);
+        AstNodeDType* const valDTypep = lowerType(typep, flp);
         sh.prevp = newTempVar(base + "__prev", valDTypep, flp);
-        sh.lastp = newTempVar(base + "__last", lowerType(symp->typep(), flp), flp);
+        sh.lastp = newTempVar(base + "__last", lowerType(typep, flp), flp);
         sh.timep = newTempVar(base + "__time",
                               new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
                                                 VNumRange{63, 0}, -1},
@@ -6628,9 +6666,8 @@ private:
         // was given one, and the type's default where it was not (6.4.2.3).
         AstNodeExpr* const startp
             = sigp->valuep() ? VN_CAST(sigp->valuep()->cloneTree(false), NodeExpr) : nullptr;
-        sh.prevp->valuep(startp ? startp : defaultValueFor(symp->typep(), flp));
-        sh.lastp->valuep(startp ? startp->cloneTree(false)
-                                : defaultValueFor(symp->typep(), flp));
+        sh.prevp->valuep(startp ? startp : defaultValueFor(typep, flp));
+        sh.lastp->valuep(startp ? startp->cloneTree(false) : defaultValueFor(typep, flp));
         sh.everp->valuep(new AstConst{flp, AstConst::BitFalse{}});
         AstNode* stmtsp = new AstAssignDly{
             flp, new AstVarRef{flp, sh.lastp, VAccess::WRITE},
@@ -6656,7 +6693,7 @@ private:
         AstAlways* const alwaysp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp};
         m_shadowsp = AstNode::addNextNull(m_shadowsp, static_cast<AstNode*>(alwaysp));
         m_historied.insert(sigp);
-        return &m_shadows.emplace(symp, sh).first->second;
+        return true;
     }
 
     // A signal something forces is driven from two places: its drivers, and
@@ -7129,7 +7166,8 @@ private:
             }
             return steadyForOf(activeOf(acp, flp), acp->timep, acp->everp, argp, flp);
         }
-        const VhdlShadow* const shp = shadowFor(prefixp, flp);
+        const VhdlShadow* shp = shadowFor(prefixp, flp);
+        if (!shp) shp = shadowOfImplicit(prefixp, flp);
         if (!shp) return nullptr;
         if (attr == "delayed") return delayedOf(prefixp, shp, argp, flp);
         if (attr == "last_value") {
