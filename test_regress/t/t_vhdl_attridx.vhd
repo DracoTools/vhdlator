@@ -49,6 +49,10 @@ architecture rtl of t is
   type level_t is (idle, busy);
   attribute code : integer;
   attribute code of idle : literal is 7;
+  -- A character literal is a literal like any other, and is named as one in
+  -- a specification and reached through the region that declares it (15.6)
+  type twovalue is ('0', '1');
+  attribute code of '1' : literal is 9;
   attribute atall : a1;
   attribute atall of all : function is af1(2);
 begin
@@ -78,6 +82,9 @@ begin
     -- the attribute is asked of; without it the name is ambiguous
     assert idle [return state_t]'code = 7 report "state_t idle" severity failure;
     assert idle [return level_t]'code = 7 report "level_t idle" severity failure;
+    -- Named through the region that declares it, which is the form the
+    -- language gives a character literal with an attribute
+    assert rtl.'1''code = 9 report "character literal" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

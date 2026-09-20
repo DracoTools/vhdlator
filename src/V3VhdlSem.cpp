@@ -3405,7 +3405,10 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
             continue;
         }
         std::vector<VhdlSymbol*> found;
-        lookup(parts.back(), found);
+        {
+            const AstVhdlName* const litp = VN_CAST(namep, VhdlName);
+            lookup(litp && litp->isChar() ? vhdlCharLitName(parts.back()) : parts.back(), found);
+        }
         // It names something declared already (7.2). Only the classes the
         // symbol table holds by simple name are asked: a label is declared
         // by the statement it labels, which follows.
@@ -8096,8 +8099,14 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
             scopep = nextp;
         }
         if (viaScope && scopep) {
+            // A character literal is held under the key a character literal
+            // gets, which is not the text it is written as (15.6)
+            const AstVhdlName* const sufNamep = VN_CAST(nodep->suffixp(), VhdlName);
+            const std::string key = sufNamep && sufNamep->isChar()
+                                        ? vhdlCharLitName(sufNamep->name())
+                                        : parts.back();
             std::vector<VhdlSymbol*> found;
-            scopep->lookupLocal(parts.back(), found);
+            scopep->lookupLocal(key, found);
             if (!found.empty()) {
                 std::vector<VhdlSymbol*> objects;
                 for (VhdlSymbol* const symp : found) {
@@ -8411,8 +8420,17 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
             if (asymp->resolved()->kind() == VhdlSymKind::ATTRIBUTE) userAttr = true;
         }
         if (userAttr) {
+            // An expanded name says for itself what it denotes -- "p.'1''a",
+            // where the literal is declared inside the process p -- and a
+            // selected name is read as one without being taken for a value
+            if (VN_IS(nodep->prefixp(), VhdlSelected) && !nodep->prefixp()->vhdlSymp()) {
+                analyzeExpr(nodep->prefixp(), nullptr);
+            }
+            if (VhdlSymbol* const psymp = nodep->prefixp()->vhdlSymp()) {
+                if (psymp->resolved()->userAttr(attrName)) prefixIsBearer = true;
+            }
             std::vector<VhdlSymbol*> prefs;
-            lookup(parts.back(), prefs);
+            if (!prefixIsBearer) lookup(parts.back(), prefs);
             std::vector<VhdlSymbol*> bearers;
             for (VhdlSymbol* const psymp : prefs) {
                 if (psymp->resolved()->userAttr(attrName)) bearers.push_back(psymp);

@@ -1358,7 +1358,13 @@ AstVhdlEntitySpec* V3VhdlParse::parseEntitySpec(bool componentForm) {
             AstNodeVhdlExpr* namep = nullptr;
             if (peekType() == VhdlTokType::STRING_LIT
                 || peekType() == VhdlTokType::CHARACTER_LIT) {
-                namep = new AstVhdlName{here(), consume().text};
+                const bool isChar = peekType() == VhdlTokType::CHARACTER_LIT;
+                AstVhdlName* const litp = new AstVhdlName{here(), consume().text};
+                // A character literal is held under the key a character
+                // literal gets, not under the character itself (15.6)
+                litp->isChar(isChar);
+                litp->isOperator(!isChar);
+                namep = litp;
             } else {
                 namep = parseName();
             }
