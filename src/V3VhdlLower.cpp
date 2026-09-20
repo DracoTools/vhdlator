@@ -9257,17 +9257,26 @@ private:
         const VhdlType* const elemp
             = ltypep->elementp() ? ltypep->elementp() : ltypep->base()->elementp();
         if (!elemp) return nullptr;
-        // Only where the array does not lower to a packed vector: one that
-        // does is already compared correctly as a number
-        if (!VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp), UnpackArrayDType)) {
-            return nullptr;
-        }
         const VhdlType* const lidxp = ltypep->indexTypes()[0];
         const VhdlType* const ridxp = rtypep->indexTypes()[0];
         if (!lidxp || !ridxp || !lidxp->bounded() || !ridxp->bounded()) return nullptr;
         const int64_t la = lidxp->length();
         const int64_t lb = ridxp->length();
         if (la < 0 || lb < 0 || la > 4096 || lb > 4096) return nullptr;
+        // An array that lowers to a packed vector is compared correctly as a
+        // number, but only against one of its own length: the back end pads
+        // the shorter operand, and a padded comparison is arithmetic where
+        // the language asks for lexicographic order. Thirty-two zeros are
+        // *greater* than sixteen, because the first sixteen are equal and
+        // then one operand runs out (5.2.6), which no numeric comparison of
+        // the two will ever say.
+        // ... and numeric_std's own comparisons are not the array operators
+        // at all: they compare what the two operands are worth, so an
+        // eight-bit three is less than a four-bit four (16.5)
+        if (la != lb && isNumericVector(ltypep) && isNumericVector(rtypep)) return nullptr;
+        if (la == lb && !VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp), UnpackArrayDType)) {
+            return nullptr;
+        }
         AstNodeExpr* lhsp = lowerExpr(nodep->lhsp());
         AstNodeExpr* rhsp = lhsp ? lowerExpr(nodep->rhsp()) : nullptr;
         if (!rhsp) {
