@@ -41,23 +41,42 @@ namespace {
 // information" as X. Verilator then treats X exactly as it does in Verilog.
 enum class LogicVal : uint8_t { ZERO, ONE, X, Z };
 
+// The character a literal of an enumeration is written with, or nul where
+// the literal is an identifier rather than a character literal
+char enumLitChar(const VhdlSymbol* litp) {
+    const std::string& name = litp->name();
+    if (name.size() != 3 || name.front() != '\'' || name.back() != '\'') return '\0';
+    return name[1];
+}
+
 // Whether an enumeration is one of the logic types -- BIT, STD_ULOGIC and
 // anything else declared the same way -- and so lowers to a single bit rather
 // than to a numbered enumeration. Recognising it by shape rather than by name
 // means a user's own nine-value type behaves like the IEEE one.
+//
+// The shape has to be the whole of it. A type of three or four values written
+// with the same characters, such as the ('Z','0','1','X') that fifty-three of
+// the corpus's sources declare, is *not* that type: it has values of its own
+// which a source may assign and compare, and folding them onto one bit loses
+// every one but '0' and '1' -- silently, since a two-state model has nowhere
+// to keep the others. Such a type is a numbered enumeration like any other,
+// where each of its values stays distinct. Only the two shapes the standard
+// itself declares are logic, and their positions are fixed, so a type written
+// ('1','0') is not BIT however much it looks like it.
 bool enumIsLogic(const VhdlType* typep) {
     if (!typep || typep->base()->kind() != VhdlTypeKind::ENUM) return false;
     const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
-    if (lits.size() < 2 || lits.size() > 9) return false;
-    bool sawZero = false;
-    bool sawOne = false;
-    for (const VhdlSymbol* const litp : lits) {
-        const std::string& name = litp->name();
-        if (name.size() != 3 || name.front() != '\'' || name.back() != '\'') return false;
-        if (name[1] == '0') sawZero = true;
-        if (name[1] == '1') sawOne = true;
+    if (lits.size() == 2) {  // BIT
+        return enumLitChar(lits[0]) == '0' && enumLitChar(lits[1]) == '1';
     }
-    return sawZero && sawOne;
+    if (lits.size() == 9) {  // STD_ULOGIC
+        static const char* const stdUlogic = "UX01ZWLH-";
+        for (size_t i = 0; i < lits.size(); ++i) {
+            if (enumLitChar(lits[i]) != stdUlogic[i]) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 // What one literal of such a type means
@@ -19073,7 +19092,7 @@ private:
             AstNodeExpr* sensp = nullptr;
             bool oneBit = isOneBitVar(varp);
             if (partp) {
-                sensp = shadowOfPart(partp->cloneTree(false), flp);
+                sensp = shadowOfPart(partp->cloneTree(false), varp, flp);
                 oneBit = VN_IS(partp, SelBit) ? isOneBitVar(varp) : false;
                 if (sensp && anyPartp) *anyPartp = true;
             }
@@ -19111,21 +19130,38 @@ private:
     // A signal of the module that follows part of another, so that what a
     // statement waits on changes exactly when the part it reads does.
     // Takes ownership of partp.
-    AstNodeExpr* shadowOfPart(AstNodeExpr* partp, FileLine* flp) {
+    AstNodeExpr* shadowOfPart(AstNodeExpr* partp, const AstVar* varp, FileLine* flp) {
         if (!m_modp) {
             VL_DO_DANGLING(partp->deleteTree(), partp);
             return nullptr;
         }
-        // As wide as the part it follows, which its fixed indices say
+        // As wide as the part it follows, which its fixed indices say -- and
+        // one index of an array is one *element* of it, which is only one bit
+        // where the element is. An element of an enumeration wider than a bit
+        // would otherwise be followed by its lowest bit alone, and a change
+        // that leaves that bit alone would never be seen.
+        const AstNodeDType* const dtp = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+        const AstPackArrayDType* const packp = VN_CAST(dtp, PackArrayDType);
+        AstNodeDType* const elemp
+            = packp && packp->childDTypep() ? packp->childDTypep()->cloneTree(false) : nullptr;
         int bits = 1;
         if (const AstSelExtract* const extp = VN_CAST(partp, SelExtract)) {
             const int left = VN_AS(extp->leftp(), Const)->toSInt();
             const int right = VN_AS(extp->rightp(), Const)->toSInt();
             bits = (left > right ? left - right : right - left) + 1;
         }
+        AstNodeDType* sensDTypep = nullptr;
+        if (!elemp) {
+            sensDTypep = newLogicDType(flp, bits);
+        } else if (bits == 1) {
+            sensDTypep = elemp;
+        } else {
+            sensDTypep = new AstPackArrayDType{flp, VFlagChildDType{}, elemp,
+                                               new AstRange{flp, bits - 1, 0}};
+        }
         AstVar* const tempp
             = new AstVar{flp, VVarType::VAR, "__Vsens" + std::to_string(++m_tempNum),
-                         VFlagChildDType{}, newLogicDType(flp, bits)};
+                         VFlagChildDType{}, sensDTypep};
         m_modp->addStmtsp(tempp);
         FileLine* const cflp = new FileLine{flp};
         cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
