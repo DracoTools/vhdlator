@@ -20414,9 +20414,13 @@ private:
         }
         AstNode* actionp
             = new AstDisplay{flp, VDisplayType::DT_DISPLAY, format, nullptr, argsp};
-        if (severity >= 2) {
-            actionp = AstNode::addNext(actionp,
-                                       static_cast<AstNode*>(new AstStop{flp, severity >= 3}));
+        // What severity ends the run is the tool's to choose (10.3), and both
+        // references choose FAILURE: nvc 1.22.1 and GHDL 7.0.0-dev each print
+        // an ERROR and carry on. A testbench reports a recoverable mismatch
+        // at ERROR and expects to reach its own summary, so stopping there
+        // would cut the run short of the verdict it was written to give.
+        if (severity >= 3) {
+            actionp = AstNode::addNext(actionp, static_cast<AstNode*>(new AstStop{flp, true}));
         }
         if (nodep->isReport() || !nodep->condp()) return actionp;
         return new AstIf{flp, new AstLogNot{flp, lowerCondition(nodep->condp())}, actionp,
