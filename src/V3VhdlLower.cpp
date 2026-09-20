@@ -1141,9 +1141,22 @@ private:
     }
 
     // Whether a type is STRING, or a subtype of it
+    // A STRING, or any other one-dimensional array of CHARACTER. A design
+    // that writes "type t is array (1 to 8) of character" means text as much
+    // as STRING does, and a string literal given to one is its characters
+    // rather than a vector of bits (5.3.2, 16.3). The type path and the
+    // value path must agree on this, or an object is emitted as text and
+    // filled with a vector.
     static bool isStringType(const VhdlType* typep) {
+        if (!typep) return false;
         const VhdlType* const strp = V3VhdlStd::stringType();
-        return typep && strp && typep->base() == strp->base();
+        if (strp && typep->base() == strp->base()) return true;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ARRAY) return false;
+        if (basep->indexTypes().size() != 1) return false;
+        const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        const VhdlType* const charp = V3VhdlStd::characterType();
+        return elemp && charp && elemp->base() == charp->base();
     }
 
     // An array indexed by a logic type -- "array (STD_ULOGIC) of X", which is
@@ -1210,6 +1223,11 @@ private:
     static AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
         typep = stringBehind(typep);
         if (!typep) return indexp;
+        // The index may be of a narrow type -- an array of CHARACTER may be
+        // indexed by a CHARACTER, which is eight bits -- and the arithmetic
+        // below is done at an INTEGER's width
+        indexp = new AstCast{flp, indexp, VFlagChildDType{},
+                             new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED}};
         const int64_t left = stringLow(typep);
         if (!stringAscending(typep)) {
             return new AstSub{
@@ -4876,11 +4894,8 @@ private:
     // A string of '0'/'1' characters as the vector it stands for
     AstNodeExpr* lowerBitString(const std::string& bits, VhdlType* typep, FileLine* flp) {
         if (bits.empty()) return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
-        // A STRING is text, not a vector
-        if (typep && V3VhdlStd::stringType()
-            && typep->base() == V3VhdlStd::stringType()->base()) {
-            return new AstConst{flp, AstConst::String{}, bits};
-        }
+        // Text is text, not a vector
+        if (isStringType(typep)) return new AstConst{flp, AstConst::String{}, bits};
         V3Number num{flp, static_cast<int>(bits.size()), 0};
         num.setAllBits0();
         for (size_t i = 0; i < bits.size(); ++i) {
@@ -5150,23 +5165,34 @@ private:
         // concurrent statement, so it is a variable with a direction rather
         // than Verilog's PORT, which is a net
         AstVar* const varp = newVar(symp, VVarType::VAR, flp);
+        // An INOUT of a logic type is a port two sides may drive, which is
+        // Verilog's inout and is resolved as a tristate. One of any other
+        // type is not: a signal of an unresolved type has exactly one driver
+        // (6.4.2.3), so what VHDL means there is a port the design drives and
+        // reads -- which is what BUFFER is, and what an emitted output is.
+        // Marking it inout would hand it to the tristate resolution, which
+        // drives it to zero where nothing else does and so throws away the
+        // default the port was declared with.
+        const bool triPort
+            = (nodep->mode() == VhdlMode::INOUT || nodep->mode() == VhdlMode::LINKAGE)
+              && allLogic(symp->typep()) && isResolvedType(symp->typep());
         switch (nodep->mode()) {
         case VhdlMode::IN: varp->direction(VDirection::INPUT); break;
         case VhdlMode::OUT: varp->direction(VDirection::OUTPUT); break;
         case VhdlMode::BUFFER: varp->direction(VDirection::OUTPUT); break;
-        case VhdlMode::INOUT: varp->direction(VDirection::INOUT); break;
-        case VhdlMode::LINKAGE: varp->direction(VDirection::INOUT); break;
+        case VhdlMode::INOUT:
+        case VhdlMode::LINKAGE:
+            varp->direction(triPort ? VDirection::INOUT : VDirection::OUTPUT);
+            break;
         }
         varp->declDirection(varp->direction());
-        if (varp->direction() == VDirection::INOUT && allLogic(symp->typep())) {
-            m_triPorts.insert(varp);
-        }
+        if (triPort) m_triPorts.insert(varp);
         varp->ansi(true);
         // A port's default value is what an input takes when the instance
         // leaves it open, and what an output's driver starts at (6.5.6.3).
-        // An inout may not carry one in the emitted code.
-        if (nodep->defaultp() && nodep->mode() != VhdlMode::INOUT
-            && nodep->mode() != VhdlMode::LINKAGE) {
+        // A tristate one may not carry it: there the initial value is a
+        // driver, and this frontend's own value would join the resolution.
+        if (nodep->defaultp() && !triPort) {
             varp->valuep(lowerExpr(nodep->defaultp()));
         } else if (!nodep->defaultp()
                    && (nodep->mode() == VhdlMode::OUT || nodep->mode() == VhdlMode::BUFFER)
@@ -21112,6 +21138,27 @@ private:
     // are resolved as nets, so only those lose a drive written inside a
     // subprogram; one made of integers keeps it, and turning it off with a
     // 'Z' it cannot hold would lose what the other elements are worth.
+    // Whether a type carries a resolution function, so that two drivers of
+    // it have an answer (6.4.2.3). BIT and STD_ULOGIC have none, and a port
+    // of one has exactly one driver however it is written -- which is why
+    // only a resolved one is modelled as a tristate here.
+    static bool isResolvedType(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8) return false;
+        if (typep->resolutionp() || typep->base()->resolutionp()) return true;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::ARRAY) {
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : basep->elementp();
+            return isResolvedType(elemp, depth + 1);
+        }
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            for (const VhdlSymbol* const ep : basep->elements()) {
+                if (isResolvedType(ep->typep(), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
     static bool allLogic(const VhdlType* typep, int depth = 0) {
         if (!typep || depth > 8) return false;
         if (isLogicish(typep)) return true;
