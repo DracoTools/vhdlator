@@ -15201,6 +15201,17 @@ private:
                     // the component's are not passed on: they are what the
                     // binding's own actuals read (7.3.2.2)
                     if (bindGenericNames.count(ifp->name())) continue;
+                    // One that travels as data is a port of the module, not
+                    // a parameter, so its default is connected as a port
+                    const VhdlSymbol* const gsymp = ifp->vhdlSymp();
+                    if (gsymp && m_dataGenerics.count(gsymp->resolved())) {
+                        if (pinNamed(pinsp, ifp->name())) continue;
+                        if (AstNodeExpr* const dvp = lowerExpr(ifp->defaultp())) {
+                            pinsp = AstNode::addNextNull(
+                                pinsp, new AstPin{flp, ++pinNum, ifp->name(), dvp});
+                        }
+                        continue;
+                    }
                     AstNodeExpr* const valuep = lowerExpr(ifp->defaultp());
                     if (!valuep) continue;
                     paramsp = AstNode::addNextNull(
@@ -21709,6 +21720,20 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         const AstVhdlName* const namep = VN_CAST(np, VhdlName);
         return namep ? namep->name() : "";
     };
+    // A generic of a type that is not one value the back end can carry --
+    // an array of records holding a REAL, say -- travels as data whatever
+    // the instance hands it, since there is no parameter to fold it into.
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([&](AstVhdlIfaceDecl* ifp) {
+            if (ifp->kind() != VhdlIfaceKind::CONSTANT) return;
+            VhdlSymbol* const gsymp = ifp->vhdlSymp();
+            if (!gsymp || parameterizable(gsymp->resolved()->typep())) return;
+            if (!VN_IS(parentOf(ifp), VhdlEntity) && !VN_IS(parentOf(ifp), VhdlComponentDecl)) {
+                return;
+            }
+            m_dataGenerics.insert(gsymp->resolved());
+        });
+    }
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         unitp->foreach([&](AstVhdlInstance* instp) {
             for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
