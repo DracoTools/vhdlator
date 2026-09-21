@@ -4731,6 +4731,17 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     = m_unitScopes.find(lib + "." + parts.back() + "(" + arch + ")");
                 if (archIt != m_unitScopes.end()) m_scopep->addUse(archIt->second);
             }
+            // A use clause written inside a block configuration is a
+            // declarative item of that configuration's own region, and what
+            // it makes visible is what the binding indications after it name
+            // (3.4.2, 12.4)
+            unitp->foreach([this](AstVhdlBlockConfig* bcp) {
+                for (AstNode* up = bcp->usesp(); up; up = up->nextp()) {
+                    if (AstVhdlContextItem* const cip = VN_CAST(up, VhdlContextItem)) {
+                        applyContextItem(cip);
+                    }
+                }
+            });
             if (!m_inSpecialized && !parts.empty()) checkConfiguration(cfgp, lib, parts.back());
             unitp->foreach([this, &lib](AstVhdlBinding* bindp) {
                 // What the component itself declares is visible to the
