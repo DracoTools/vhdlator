@@ -47,6 +47,10 @@ begin
 
 end architecture;
 
+-- The configuration is what this design is elaborated through: named as the
+-- top, it says what "socket" is built from. Elaborate the entity instead and
+-- the component is unbound, since nothing else names an entity "socket" --
+-- which is what nvc 1.22.1 answers too.
 configuration t_vhdl_cfggen_cfg of t_vhdl_cfggen is
   for tb
     for inst : socket use entity work.t_vhdl_cfggen_sub(rtl)

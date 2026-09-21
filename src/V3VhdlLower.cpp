@@ -5058,9 +5058,14 @@ private:
     std::set<const AstVar*> m_actToggles;  // The bits that mark a transaction
     // The files a subprogram declares, which are closed when it returns
     std::vector<AstVar*> m_ftaskFiles;
-    // Whether a configuration declaration binds this entity's instances, so
-    // that the module built from it, and not this one, is what elaborates
-    bool m_cfgElsewhere = false;
+    // The entity a configuration declaration named as the design's top
+    // configures, as "lib.entity". Only that one reads a configuration it
+    // was not handed directly.
+    std::string m_cfgTopEntity;
+    // Whether a configuration declaration configures the entity being built
+    // while this build is not going through it -- the plain module made
+    // beside the configuration's own
+    bool m_cfgBesideThis = false;
     // "entity.port" for each port whose transactions the design outside asks
     // for. An entity is lowered before the architecture instantiating it, so
     // what that architecture wants has to be known before either is lowered.
@@ -15261,14 +15266,6 @@ private:
                 if (cCompIt != m_cfgScopep->comps.end()) cfgBindp = &cCompIt->second;
             }
         }
-        // A configuration declaration that this elaboration did not go
-        // through only answers where default binding cannot: an entity of the
-        // component's own name outranks it (7.3.3)
-        if (cfgBindp && m_cfgElsewhere) {
-            const std::string dfltLib
-                = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
-            if (m_knownEntities.count(dfltLib + "." + modName)) cfgBindp = nullptr;
-        }
         if (cfgBindp) {
             if (cfgBindp->entity.empty()) {
                 // "use open" leaves the instance deliberately unbound, so
@@ -15759,12 +15756,12 @@ private:
                       : nullptr;
             const std::string entLib = m_modp ? m_modp->libname() : "work";
             if (declp && !m_knownEntities.count(entLib + "." + modName)) {
-                // Where a configuration declaration binds this entity's
-                // instances, the module built from that configuration is the
-                // one a design elaborates; this plain one is built beside it
-                // and its unbound components are not a finding about the
-                // design, they are the reason the configuration was written
-                if (!m_cfgElsewhere) {
+                // A configuration declaration configures this entity, and
+                // the module built from *it* is what a design elaborates.
+                // This plain one is made beside it, and the components it
+                // leaves unbound are the reason that configuration exists
+                // rather than a finding about the design.
+                if (!m_cfgBesideThis) {
                     flp->v3warn(VHDLUNBOUND, "Component instance '"
                                                  + (label.empty() ? modName : label)
                                                  + "' has no entity bound to it: no entity '"
@@ -22391,22 +22388,23 @@ private:
         m_bindings.clear();
         m_instanceBindings.clear();
         m_bindingMaps.clear();
-        m_cfgElsewhere = false;
+        m_cfgBesideThis = false;
         if (cfgScopep) {
             // Built for one named configuration, which says what it says
             m_cfgScopep = cfgScopep;
         } else {
-            // What a configuration declaration said about this entity. It
-            // is a design unit of its own, though, and what it says applies
-            // to the hierarchy elaborated *through it*: a design that
-            // elaborates the entity binds by the rules of 7.3.3 instead,
-            // which is what nvc 1.22.1 and GHDL 7.0.0-dev both do. So it is
-            // read here only where default binding has no answer, which
-            // keeps a design whose components exist only in a configuration
-            // working whichever unit is named as the top.
-            const auto scopeIt = m_cfgScopes.find(libname + "." + entp->name());
+            // What a configuration declaration said about this entity, and
+            // only where the design is elaborated *through* that
+            // configuration. A configuration declaration is a design unit of
+            // its own, and what it says applies to the hierarchy built from
+            // it; a design that elaborates the entity binds by the rules of
+            // 7.3.3 instead, which is what nvc 1.22.1, GHDL 7.0.0-dev and
+            // Questa 2025.1 all do -- down to leaving a component with no
+            // entity of its name unbound, and its ports at their defaults.
+            const std::string key = libname + "." + entp->name();
+            const auto scopeIt = key == m_cfgTopEntity ? m_cfgScopes.find(key) : m_cfgScopes.end();
             m_cfgScopep = scopeIt == m_cfgScopes.end() ? nullptr : &scopeIt->second;
-            m_cfgElsewhere = m_cfgScopep != nullptr;
+            m_cfgBesideThis = !m_cfgScopep && m_cfgScopes.count(key) != 0;
         }
         m_prefix.clear();
         m_stmtsp = nullptr;
@@ -22834,6 +22832,11 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             if (!v3Global.opt.topModule().empty()
                 && VString::downcase(v3Global.opt.topModule()) == cfgp->name()) {
                 v3Global.opt.topModule(parts.back());
+                // What that entity is built from is this configuration's to
+                // say, since the design is elaborated through it. No other
+                // entity's is: a configuration declaration applies to the
+                // hierarchy elaborated through it and to nothing else (3.4).
+                m_cfgTopEntity = lib + "." + parts.back();
             }
             // The outermost block configuration is the architecture's; what
             // it holds configures the architecture's own statements, and the

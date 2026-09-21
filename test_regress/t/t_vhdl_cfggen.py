@@ -16,7 +16,7 @@ test.top_filename = "t/t_vhdl_cfggen.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
              verilator_flags2=[
-                 "--timing", "--top-module t_vhdl_cfggen"
+                 "--timing", "--top-module t_vhdl_cfggen_cfg"
              ],
              make_top_shell=False,
              make_main=False)
