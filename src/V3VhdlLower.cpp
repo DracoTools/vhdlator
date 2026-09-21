@@ -6620,6 +6620,57 @@ private:
                 if (attrTypep && isStringType(attrTypep)) {
                     return new AstGetcN{nodep->fileline(), outp, indexp};
                 }
+                // Any other array is a packed vector here, whose leftmost
+                // element is its most significant bit, and the value is an
+                // expression with no range of its own to index by. So the
+                // array's own index is brought back to a bit position rather
+                // than used as one: where the attribute's type is
+                // unconstrained the length comes from the value it was given
+                // and the leftmost index from the index subtype (8.4, 9.3.3.3).
+                // The name may not have been resolved to the attribute
+                // itself, in which case the value's own type says the same
+                const VhdlType* const arrTypep = attrTypep ? attrTypep : valuep->vhdlTypep();
+                if (arrTypep && !isStringType(arrTypep)
+                    && arrTypep->base()->kind() == VhdlTypeKind::ARRAY) {
+                    const VhdlValue val = V3VhdlEval::eval(valuep);
+                    int64_t len = val.isStr()     ? static_cast<int64_t>(val.toStr().size())
+                                  : val.isArray() ? static_cast<int64_t>(val.elements())
+                                                  : 0;
+                    // A positional aggregate says how long it is itself,
+                    // whether or not its elements fold (9.3.3.3)
+                    if (!len) {
+                        if (const AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate)) {
+                            int64_t count = 0;
+                            bool positional = true;
+                            for (AstNode* ep = aggp->elemsp(); ep; ep = ep->nextp()) {
+                                const AstVhdlElemAssoc* const eap = VN_CAST(ep, VhdlElemAssoc);
+                                if (!eap || eap->choicesp()) {
+                                    positional = false;
+                                    break;
+                                }
+                                ++count;
+                            }
+                            if (positional) len = count;
+                        }
+                    }
+                    const std::vector<VhdlType*>& idxs = arrTypep->indexTypes();
+                    const VhdlType* const ixp = idxs.empty() ? nullptr : idxs[0];
+                    const bool ascending = !ixp || ixp->ascending();
+                    const int64_t left = ixp && ixp->bounded() ? ixp->left() : 0;
+                    if (len > 0 && len <= (1 << 20)) {
+                        FileLine* const iflp = nodep->fileline();
+                        // Ascending, the leftmost index is the highest bit;
+                        // descending, the rightmost index is bit zero
+                        const int64_t anchor = ascending ? left + len - 1 : left - len + 1;
+                        AstNodeExpr* const anchorp = new AstConst{iflp, AstConst::Signed32{},
+                                                                  static_cast<int32_t>(anchor)};
+                        AstNodeExpr* const posp
+                            = ascending
+                                  ? static_cast<AstNodeExpr*>(new AstSub{iflp, anchorp, indexp})
+                                  : static_cast<AstNodeExpr*>(new AstSub{iflp, indexp, anchorp});
+                        return new AstSelBit{iflp, outp, posp};
+                    }
+                }
                 return new AstSelBit{nodep->fileline(), outp, indexp};
             }
         }
