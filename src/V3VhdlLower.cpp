@@ -4891,9 +4891,14 @@ private:
         }
         if (basep && basep->kind() == VhdlTypeKind::PHYSICAL) {
             // A physical value is counted in its primary unit, which for
-            // TIME is the femtosecond -- far more than 32 bits holds
-            return new AstConst{flp, AstConst::Unsized64{},
-                                static_cast<uint64_t>(val.toInt())};
+            // TIME is the femtosecond -- far more than 32 bits holds. It is
+            // signed: a physical type runs from its own LOW, which is
+            // negative, and "-0.01 ns" read as an unsigned sixty-four bits
+            // is the largest value there is rather than a small negative one.
+            V3Number num{flp, 64, 0};
+            num.setQuad(static_cast<uint64_t>(val.toInt()));
+            num.isSigned(true);
+            return new AstConst{flp, num};
         }
         // A value that does not fit in thirty-two bits, or one of a type whose
         // own range does not, is written out as sixty-four (5.2.3)
