@@ -22749,6 +22749,18 @@ private:
         m_prefix.clear();
         m_stmtsp = nullptr;
         m_processNum = 0;
+        // Every bound hoisted out of this entity is declared here, whether or
+        // not the emitted code ends up reading it: an instance hands one
+        // value per hoisted bound, and a value with no parameter to land on
+        // is not a pin anything can bind
+        {
+            const auto hoistIt = m_hoists.find(entp->name());
+            if (hoistIt != m_hoists.end()) {
+                for (const VhdlHoistedBound& hoist : hoistIt->second) {
+                    hoistVar(hoist.name, flp);
+                }
+            }
+        }
         int pinNum = 0;
         m_dataGenericVarps.clear();
         for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
@@ -23041,6 +23053,16 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Which bounds are written in terms of one of those. Done once for the
     // whole design, so that an instance lowered before its entity finds the
     // same names the entity will declare.
+    // The architectures of each entity, so that what they declare is asked
+    // about alongside the entity's own ports: both become one module
+    std::map<std::string, std::vector<AstVhdlArchitecture*>> archsOf;
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        AstVhdlArchitecture* const archp = VN_CAST(unitp, VhdlArchitecture);
+        if (!archp) continue;
+        std::vector<std::string> parts;
+        if (!flattenName(archp->entityNamep(), parts) || parts.empty()) continue;
+        archsOf[parts.back()].push_back(archp);
+    }
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity);
         if (!entp) continue;
@@ -23073,6 +23095,30 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             if (!typep) continue;
             for (const VhdlType* const idxp : typep->indexTypes()) {
                 if (idxp && idxp->boundsp()) hoistIn(idxp->boundsp());
+            }
+        }
+        // An object the architecture declares is constrained the same way a
+        // port is, and its bounds have to be numbers by the time the emitted
+        // code declares it -- "variable data : std_logic_vector(h.p_len - 1
+        // downto 0)", where h is a generic record a verification library
+        // built. Only declarations: a loop's range or a slice's needs no
+        // number, and reads the generic itself perfectly well.
+        for (AstVhdlArchitecture* const archp : archsOf[entp->name()]) {
+            AstNode* const partsp[]
+                = {static_cast<AstNode*>(archp->declsp()), static_cast<AstNode*>(archp->stmtsp())};
+            const auto hoistDecls = [&](AstVhdlObjectDecl* declp) {
+                hoistIn(declp->subtypep());
+                const VhdlSymbol* const symp = declp->vhdlSymp();
+                const VhdlType* const typep = symp ? symp->typep() : nullptr;
+                if (!typep) return;
+                for (const VhdlType* const idxp : typep->indexTypes()) {
+                    if (idxp && idxp->boundsp()) hoistIn(idxp->boundsp());
+                }
+            };
+            // Each of these is the head of a list of siblings, and foreach
+            // walks a node's children, not the ones written after it
+            for (AstNode* const headp : partsp) {
+                for (AstNode* p = headp; p; p = p->nextp()) p->foreach(hoistDecls);
             }
         }
         if (!hoists.empty()) m_hoists.emplace(entp->name(), std::move(hoists));
