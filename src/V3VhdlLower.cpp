@@ -519,6 +519,10 @@ private:
             for (AstNode* p = callp->argsp(); p; p = p->nextp(), ++pos) {
                 AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                 if (!asp || !asp->actualp()) continue;
+                // An association that named a part of a formal is no
+                // argument of its own: the one object made for that formal
+                // is handed over in place of all of them
+                if (m_argSkip.count(asp)) continue;
                 const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
                 AstNodeExpr* onep = nullptr;
                 // "f(x, open)" or "f(by => open)" leaves the parameter to its
@@ -614,6 +618,15 @@ private:
                 }
                 refp->addArgsp(new AstArg{aflp, namep ? namep->name() : "", onep});
             }
+        }
+        const auto elemIt = m_callElemArgs.find(callp);
+        if (elemIt != m_callElemArgs.end()) {
+            for (const auto& pair : elemIt->second) {
+                refp->addArgsp(
+                    new AstArg{refp->fileline(), pair.first,
+                               new AstVarRef{refp->fileline(), pair.second, VAccess::READ}});
+            }
+            m_callElemArgs.erase(elemIt);
         }
         addCaptureArgs(refp, symp, refp->fileline());
     }
@@ -18289,7 +18302,8 @@ private:
         // anyway (4.2.2.3).
         AstNode* prep = nullptr;
         AstNode* postp = nullptr;
-        if (!dynOutRoundTrip(symp, callp, prep, postp, flp)) {
+        if (!elemPartRoundTrip(symp, callp, prep, postp, flp)
+            || !dynOutRoundTrip(symp, callp, prep, postp, flp)) {
             VL_DO_DANGLING(refp->deleteTree(), refp);
             if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
             if (postp) VL_DO_DANGLING(postp->deleteTree(), postp);
@@ -18514,6 +18528,202 @@ private:
     // subtype fixes its length, a carrier is made for the call, filled from
     // that object, and copied back into it when the call returns. The call
     // then names the carrier rather than the object.
+    // A call may cover one formal with several associations, each naming a
+    // part of it: "p(v.a => x, v.b => y)", "p(v(1) => a, v(2) => b)" and the
+    // multidimensional and nested spellings of the same (6.5.7.1). The
+    // parameter is one object however the call was written, so one is made
+    // for it here: the parts that are read are filled before the call, and
+    // the parts the body writes are copied back to their actuals after.
+    // The leftmost name of a formal part, which is the parameter it names
+    static std::string formalRootName(const AstNodeVhdlExpr* nodep) {
+        while (nodep) {
+            if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) return namep->name();
+            if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+                nodep = selp->prefixp();
+                continue;
+            }
+            if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+                nodep = callp->prefixp();
+                continue;
+            }
+            break;
+        }
+        return "";
+    }
+
+    // The parameter of that name, as the body knows it. A formal part is
+    // matched to a parameter by name rather than resolved to a symbol, so
+    // the declaration is where the parameter itself is found.
+    static VhdlSymbol* paramSymNamed(const VhdlSymbol* symp, const std::string& name) {
+        AstVhdlSubprogDecl* const declp = declOf(const_cast<VhdlSymbol*>(symp));
+        if (!declp) return nullptr;
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
+            AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (ifp && ifp->name() == name) return ifp->vhdlSymp();
+        }
+        return nullptr;
+    }
+
+    // The part of an object a formal part names, built on that object. The
+    // formal's own names were never resolved as an expression -- a formal
+    // part is matched to a parameter by name -- so the selection is made
+    // from the way it is written: an element of a record by its name, and
+    // an element of an array by an index the call has to settle (6.5.7.1).
+    // Whether that selection can be made at all, asked before any of it is
+    // emitted: a part this cannot build leaves the whole call as it was
+    static bool partIsBuildable(const AstNodeVhdlExpr* formalp) {
+        for (const AstNodeVhdlExpr* np = formalp; np;) {
+            if (VN_IS(np, VhdlName)) return true;
+            if (const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected)) {
+                if (!VN_IS(selp->suffixp(), VhdlName)) return false;
+                np = selp->prefixp();
+                continue;
+            }
+            const AstVhdlCall* const callp = VN_CAST(np, VhdlCall);
+            if (!callp || !callp->argsp()) return false;
+            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                AstNodeVhdlExpr* const valp
+                    = asp ? asp->actualp() : VN_CAST(const_cast<AstNode*>(ap), NodeVhdlExpr);
+                if (!valp || !V3VhdlEval::eval(valp).isInt()) return false;
+            }
+            np = callp->prefixp();
+        }
+        return false;
+    }
+
+    AstNodeExpr* partOfVar(AstVar* varp, const AstNodeVhdlExpr* formalp, VAccess access,
+                           FileLine* flp) {
+        std::vector<const AstNodeVhdlExpr*> chain;
+        for (const AstNodeVhdlExpr* np = formalp; np;) {
+            if (VN_IS(np, VhdlName)) break;
+            chain.push_back(np);
+            if (const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected)) {
+                np = selp->prefixp();
+                continue;
+            }
+            if (const AstVhdlCall* const callp = VN_CAST(np, VhdlCall)) {
+                np = callp->prefixp();
+                continue;
+            }
+            return nullptr;
+        }
+        AstNodeExpr* outp = new AstVarRef{flp, varp, access};
+        for (size_t i = chain.size(); i-- > 0;) {
+            const AstNodeVhdlExpr* const np = chain[i];
+            if (const AstVhdlSelected* const selp = VN_CAST(np, VhdlSelected)) {
+                const AstVhdlName* const suffixp = VN_CAST(selp->suffixp(), VhdlName);
+                if (!suffixp) {
+                    VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;
+                }
+                outp = new AstMemberSel{flp, outp, VFlagChildDType{}, suffixp->name()};
+                continue;
+            }
+            const AstVhdlCall* const callp = VN_CAST(np, VhdlCall);
+            if (!callp || !callp->argsp()) {
+                VL_DO_DANGLING(outp->deleteTree(), outp);
+                return nullptr;
+            }
+            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                AstNodeVhdlExpr* const valp
+                    = asp ? asp->actualp() : VN_CAST(const_cast<AstNode*>(ap), NodeVhdlExpr);
+                const VhdlValue at = valp ? V3VhdlEval::eval(valp) : VhdlValue{};
+                if (!at.isInt()) {
+                    VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;
+                }
+                outp = new AstSelBit{
+                    flp, outp,
+                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at.toInt())}};
+            }
+        }
+        return outp;
+    }
+
+    bool elemPartRoundTrip(const VhdlSymbol* symp, AstVhdlCall* callp, AstNode*& prep,
+                           AstNode*& postp, FileLine* flp) {
+        if (!callp || !symp) return true;
+        std::vector<VhdlSymbol*> order;
+        std::map<VhdlSymbol*, std::vector<AstVhdlAssoc*>> parts;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->formalp() || !asp->actualp()) continue;
+            // A formal written as a plain name is the whole of the parameter
+            if (VN_IS(asp->formalp(), VhdlName)) continue;
+            // So is one written as a slice of itself: "f(a(3 downto 0) => x)"
+            // associates the whole of it, and says how long it is (6.5.7.1)
+            if (const AstVhdlCall* const slicep = VN_CAST(asp->formalp(), VhdlCall)) {
+                if (slicep->argsp() && VN_IS(slicep->argsp(), VhdlRange)) continue;
+            }
+            // A conversion function on the formal is not a part of it either
+            if (!VN_IS(asp->formalp(), VhdlSelected) && !VN_IS(asp->formalp(), VhdlCall)) {
+                continue;
+            }
+            const std::string rootName = formalRootName(asp->formalp());
+            VhdlSymbol* const rootp = rootName.empty() ? nullptr : paramSymNamed(symp, rootName);
+            if (!rootp) return true;  // Not a shape that can be taken apart
+            VhdlSymbol* const keyp = rootp->resolved();
+            if (!parts.count(keyp)) order.push_back(keyp);
+            parts[keyp].push_back(asp);
+        }
+        if (order.empty()) return true;
+        // Every part of every formal has to be one this can build, before
+        // any of it is emitted: backing out halfway would leave the call
+        // with some of its parts filled and no object to hand over
+        for (const auto& pair : parts) {
+            for (AstVhdlAssoc* const asp : pair.second) {
+                if (!partIsBuildable(asp->formalp())) return true;  // Left as it was
+            }
+        }
+        for (VhdlSymbol* const paramp : order) {
+            const AstVhdlIfaceDecl* const declp = VN_CAST(paramp->declp(), VhdlIfaceDecl);
+            if (!declp || !paramp->typep()) return false;
+            AstNodeDType* const dtypep = lowerType(paramp->typep(), flp);
+            if (!dtypep) return false;
+            AstVar* const tmpp = newTempVar(
+                "__Velem" + std::to_string(++m_nameNum) + "__" + paramp->name(), dtypep, flp);
+            const bool reads = declp->mode() != VhdlMode::OUT;
+            const bool writes = declp->mode() != VhdlMode::IN;
+            for (AstVhdlAssoc* const asp : parts[paramp]) {
+                FileLine* const aflp = asp->fileline();
+                // The part of that object this association names
+                AstNodeExpr* const wrp
+                    = reads ? partOfVar(tmpp, asp->formalp(), VAccess::WRITE, aflp) : nullptr;
+                AstNodeExpr* const rdp
+                    = writes ? partOfVar(tmpp, asp->formalp(), VAccess::READ, aflp) : nullptr;
+                if ((reads && !wrp) || (writes && !rdp)) {
+                    if (wrp) VL_DO_DANGLING(wrp->deleteTree(), wrp);
+                    if (rdp) VL_DO_DANGLING(rdp->deleteTree(), rdp);
+                    return false;
+                }
+                if (reads) {
+                    AstNodeExpr* const fromp = lowerExpr(asp->actualp());
+                    if (!fromp) {
+                        VL_DO_DANGLING(wrp->deleteTree(), wrp);
+                        if (rdp) VL_DO_DANGLING(rdp->deleteTree(), rdp);
+                        return false;
+                    }
+                    prep = AstNode::addNextNull(
+                        prep, static_cast<AstNode*>(new AstAssign{aflp, wrp, fromp}));
+                }
+                if (writes) {
+                    AstNodeExpr* const top = lowerDriveTarget(asp->actualp());
+                    if (!top) {
+                        VL_DO_DANGLING(rdp->deleteTree(), rdp);
+                        return false;
+                    }
+                    postp = AstNode::addNextNull(
+                        postp, static_cast<AstNode*>(new AstAssign{aflp, top, rdp}));
+                }
+                m_argSkip.insert(asp);
+            }
+            m_callElemArgs[callp].emplace_back(paramp->name(), tmpp);
+        }
+        return true;
+    }
+
     bool dynOutRoundTrip(const VhdlSymbol* symp, AstVhdlCall* callp, AstNode*& prep,
                          AstNode*& postp, FileLine* flp) {
         if (!symp || !callp) return true;
@@ -21508,6 +21718,12 @@ private:
     // one -- "drive(r.y, 3)" -- which has no variable of its own to stand
     // for it, so the actual's own name is lowered again at each reference
     std::map<const AstNode*, AstVar*> m_argCarrier;  // Assoc -> its call's carrier
+    // A call may cover one formal with several associations, each naming a
+    // part of it. Those associations are not arguments of their own, and the
+    // one object made for the call is handed over in their place.
+    std::set<const AstNode*> m_argSkip;  // Associations that are not arguments
+    // Call -> the objects made for the formals its associations took apart
+    std::map<const AstNode*, std::vector<std::pair<std::string, AstVar*>>> m_callElemArgs;
     std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_bindExprs;
     // The subtype the actual has, worked out at the call site where the
     // bindings that lead to the object are still in reach. A copy that calls
