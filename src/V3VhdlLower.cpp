@@ -5764,7 +5764,21 @@ private:
                 // start out that long, or assigning to an element of it
                 // writes nothing at all. Every character starts at
                 // CHARACTER'LEFT, which is NUL (6.4.2.3).
-                if (!typep->isConstrainedArray()) return nullptr;
+                if (!typep->isConstrainedArray()) {
+                    // A length that only elaboration fixes -- a string whose
+                    // bounds name a generic -- is that many characters just
+                    // the same, with the count left as the expression it was
+                    // written as for V3Param to settle. Without this such a
+                    // string starts empty, and everything it says about
+                    // itself -- 'RIGHT, 'LENGTH, 'RANGE -- is the empty
+                    // string's answer.
+                    if (AstNodeExpr* const slenp = boundsLength(typep, flp)) {
+                        return new AstReplicateN{
+                            flp, new AstConst{flp, AstConst::String{}, std::string(1, '\0')},
+                            slenp};
+                    }
+                    return nullptr;
+                }
                 const std::vector<VhdlType*>& sindexes = typep->indexTypes();
                 if (sindexes.size() != 1 || !sindexes[0] || !sindexes[0]->bounded()) {
                     return nullptr;
