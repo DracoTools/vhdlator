@@ -2767,7 +2767,11 @@ void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
     // Parameters live in the subprogram's own region, but their types are
     // named in the enclosing one, so resolve them before pushing
     VhdlScope* const outerp = m_scopep;
-    VhdlScope* const innerp = pushScope(nodep->name());
+    // A subprogram body is a named construct, so from inside it one of its
+    // own declarations may be named in full: "f.v" is the v declared in f
+    // (8.3). Only from inside, which is what naming the region in itself
+    // gives, since a region is searched for outwards.
+    VhdlScope* const innerp = nameEnclosing(pushScope(nodep->name()), nodep->name());
     // A copy made for one call site may have been given the values that call
     // site passes, so that lengths depending on them fold (see specialize())
     std::vector<VhdlValue> specValues;
