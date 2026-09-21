@@ -9928,16 +9928,20 @@ private:
     // literal, whose length is its own text and for a bit string the count
     // written in front of it -- from the characters it stands for
     static int staticArrayLength(AstNodeVhdlExpr* nodep, const VhdlType* typep) {
-        if (const int w = vectorWidth(typep)) return w;
+        // A string or bit string literal is as long as the characters it
+        // stands for, and that is asked first: the subtype the context gave
+        // it may be the whole type an operand belongs to rather than the
+        // length the operand has. Read off the subtype instead, "11"
+        // compared with a two-element slice of a six-element type measures
+        // six, and the comparison is answered "not the same length" before
+        // it is ever made (9.3.2).
         const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
-        if (!litp
-            || (litp->kind() != VhdlLitKind::STRING
-                && litp->kind() != VhdlLitKind::BITSTRING)) {
-            return 0;
+        if (litp && (litp->kind() == VhdlLitKind::STRING || litp->kind() == VhdlLitKind::BITSTRING)
+            && typep && typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            const VhdlValue val = V3VhdlEval::eval(nodep);
+            if (val.isStr()) return static_cast<int>(val.toStr().size());
         }
-        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return 0;
-        const VhdlValue val = V3VhdlEval::eval(nodep);
-        return val.isStr() ? static_cast<int>(val.toStr().size()) : 0;
+        return vectorWidth(typep);
     }
 
     static int vectorWidth(const VhdlType* typep) {
