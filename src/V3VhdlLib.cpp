@@ -272,6 +272,19 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, name));
         });
 
+        // The libraries this unit's own library clauses name. A selected name
+        // rooted at one of them reaches a design unit for certain, since
+        // nothing else can be declared in a library.
+        std::set<std::string> namedLibs;
+        for (AstNode* itemp = unitp->contextp(); itemp; itemp = itemp->nextp()) {
+            const AstVhdlContextItem* const cip = VN_AS(itemp, VhdlContextItem);
+            if (cip->kind() != VhdlContextKind::LIBRARY) continue;
+            for (AstNode* np = cip->namesp(); np; np = np->nextp()) {
+                if (const AstVhdlName* const nmp = VN_CAST(np, VhdlName)) {
+                    namedLibs.insert(lower(nmp->name()));
+                }
+            }
+        }
         // "ieee.numeric_bit.to_unsigned(x, 8)" names a package no context
         // clause need mention (12.3), and it has to be analyzed first
         unitp->foreach([&](const AstVhdlSelected* selp) {
@@ -282,8 +295,18 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             if (innerp != selp) return;  // Only the innermost
             const AstVhdlName* const libp = VN_CAST(selp->prefixp(), VhdlName);
             const AstVhdlName* const pkgp = VN_CAST(selp->suffixp(), VhdlName);
-            if (!libp || !pkgp || !isPredefinedLib(libp->name())) return;
-            unit.softDependsOn.push_back(primaryKey(lower(libp->name()), pkgp->name()));
+            if (!libp || !pkgp) return;
+            if (isPredefinedLib(libp->name())) {
+                // Read on demand, so its absence here says nothing
+                unit.softDependsOn.push_back(primaryKey(lower(libp->name()), pkgp->name()));
+            } else if (namedLibs.count(lower(libp->name()))) {
+                // "alias e is qsim.qsim_types.token_type" needs qsim.qsim_types
+                // as much as a use clause would, and if it is not there the
+                // design unit is missing -- which is worth saying here, since
+                // otherwise the alias denotes nothing and the first use of it
+                // reports something else entirely
+                unit.dependsOn.push_back(primaryKey(lower(libp->name()), pkgp->name()));
+            }
         });
 
         s_firstWritten.emplace(unit.key, unitp->fileline());

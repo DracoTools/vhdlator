@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_libdep_bad.vhd:15:1: Design unit 'absent.missing_pkg' not found, needed by 'work.t_vhdl_libdep_bad_pkg'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_libdep_bad.vhd:15:1: Design unit 'absent.other_pkg' not found, needed by 'work.t_vhdl_libdep_bad_pkg'
+%Error: t/t_vhdl_libdep_bad.vhd:17:32: Cannot find 'other_pkg' in this context
+%Error: Exiting due to

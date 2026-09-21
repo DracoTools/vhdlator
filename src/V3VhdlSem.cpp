@@ -382,7 +382,10 @@ class VhdlSemVisitor final : public VNVisitor {
         if (found.empty()) {
             err(namep->fileline(), std::string{"Cannot find "} + what + " '" + parts.back() + "'");
         } else {
-            err(namep->fileline(), "'" + parts.back() + "' is a " + found[0]->kindName()
+            const std::string& kind = found[0]->kindName();
+            const bool vowel
+                = !kind.empty() && std::string{"aeiou"}.find(kind[0]) != std::string::npos;
+            err(namep->fileline(), "'" + parts.back() + "' is a" + (vowel ? "n " : " ") + kind
                                        + ", but a " + what + " is required here");
         }
         return nullptr;
