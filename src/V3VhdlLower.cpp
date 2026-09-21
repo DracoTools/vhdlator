@@ -5056,6 +5056,8 @@ private:
     int m_portNum = 0;  // The module's last port number, for one added later
     std::set<const VhdlSymbol*> m_needActive;  // Signals an active attribute names
     std::set<const AstVar*> m_actToggles;  // The bits that mark a transaction
+    // The files a subprogram declares, which are closed when it returns
+    std::vector<AstVar*> m_ftaskFiles;
     // Whether a configuration declaration binds this entity's instances, so
     // that the module built from it, and not this one, is what elaborates
     bool m_cfgElsewhere = false;
@@ -5352,6 +5354,11 @@ private:
                     // loose among the module's statements, which is not a
                     // place a statement may stand at all.
                     addStmt(m_ftaskp ? openp : new AstInitial{flp, openp});
+                    // A file object is closed when its scope is left
+                    // (5.5.2), and a subprogram's scope is left when it
+                    // returns. Without that, what a procedure wrote is still
+                    // held when the next one opens the same name to read it.
+                    if (m_ftaskp) m_ftaskFiles.push_back(varp);
                 }
                 return;
             }
@@ -21763,6 +21770,7 @@ private:
         // (12.1), which a separate C++ function cannot. Each such reference
         // becomes a parameter of the inner subprogram, passed at every call.
         VL_RESTORER_COPY(m_captureOf);
+        VL_RESTORER_CLEAR(m_ftaskFiles);
         for (AstNode* p = nodep->declsp(); p; p = p->nextp()) {
             // Planned as each is reached, not all at once: what a nested
             // subprogram can name is what was declared before it, and those
@@ -21773,6 +21781,24 @@ private:
             lowerDecl(p);
         }
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
+        // Each file this subprogram declared is closed as its scope is left
+        // (5.5.2): at the end of the body, and before every return that
+        // leaves it earlier
+        if (!m_ftaskFiles.empty()) {
+            const auto closes = [&]() -> AstNode* {
+                AstNode* outp = nullptr;
+                for (size_t i = m_ftaskFiles.size(); i-- > 0;) {
+                    outp = AstNode::addNextNull(
+                        outp, static_cast<AstNode*>(new AstFClose{
+                                  flp, new AstVarRef{flp, m_ftaskFiles[i], VAccess::READ}}));
+                }
+                return outp;
+            };
+            std::vector<AstNodeStmt*> returns;
+            ftaskp->foreach([&](AstReturn* retp) { returns.push_back(retp); });
+            for (AstNodeStmt* const retp : returns) retp->addHereThisAsNext(closes());
+            ftaskp->addStmtsp(closes());
+        }
         for (const auto& pair : savedCaps) {
             if (pair.second) {
                 m_vars[pair.first] = pair.second;
