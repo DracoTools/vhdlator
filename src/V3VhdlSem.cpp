@@ -4733,7 +4733,21 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 }
                 const auto archIt
                     = m_unitScopes.find(lib + "." + parts.back() + "(" + arch + ")");
-                if (archIt != m_unitScopes.end()) m_scopep->addUse(archIt->second);
+                if (archIt != m_unitScopes.end()) {
+                    // A block configuration's region is nested in the region
+                    // of the block it configures (12.1), so everything
+                    // visible where the architecture ends is visible here --
+                    // including what the architecture's and its entity's
+                    // context clauses made potentially visible. Adding the
+                    // architecture's region alone would pass on only what it
+                    // declares itself, since potential visibility does not
+                    // travel through a use clause (12.4), so the regions it
+                    // is enclosed by and the ones they use are added too.
+                    for (VhdlScope* sp = archIt->second; sp; sp = sp->parentp()) {
+                        m_scopep->addUse(sp);
+                        for (VhdlScope* const usedp : sp->uses()) m_scopep->addUse(usedp);
+                    }
+                }
             }
             // A use clause written inside a block configuration is a
             // declarative item of that configuration's own region, and what
