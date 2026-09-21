@@ -2347,6 +2347,10 @@ class ConstVisitor final : public VNVisitor {
         AstNodeAssign* const nextp = VN_CAST(nodep->nextp(), NodeAssign);
         if (!nextp) return false;
         if (nodep->type() != nextp->type()) return false;
+        // Each assignment schedules an update of its own at its own time, so
+        // two that carry a delay are not one assignment of both parts: merging
+        // them would deliver the second at the first's time.
+        if (nodep->timingControlp() || nextp->timingControlp()) return false;
         const AstSel* const sel2p = VN_CAST(nextp->lhsp(), Sel);
         if (!sel2p) return false;
         AstVarRef* const varref1p = VN_CAST(sel1p->fromp(), VarRef);
