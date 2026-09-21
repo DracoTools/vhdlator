@@ -15972,13 +15972,23 @@ private:
             } else if (!asp->formalp() && position < ports.size()) {
                 formalp = ports[position];
             }
-            if (!formalp || !formalp->defaultp()) continue;
+            if (!formalp) continue;
             if (formalp->mode() != VhdlMode::OUT && formalp->mode() != VhdlMode::BUFFER
                 && formalp->mode() != VhdlMode::INOUT) {
                 continue;
             }
             AstNodeExpr* const targetp = lowerDriveTarget(asp->actualp());
-            AstNodeExpr* const valuep = targetp ? lowerExpr(formalp->defaultp()) : nullptr;
+            // Each actual associated with a formal of an unbound instance
+            // takes that formal's default value (12.4.3), and a port with no
+            // default of its own has the one its subtype gives -- which is
+            // the leftmost value of it (6.4.2.3), not whatever the actual
+            // happened to start at.
+            AstNodeExpr* valuep = nullptr;
+            if (targetp) {
+                valuep = formalp->defaultp()   ? lowerExpr(formalp->defaultp())
+                         : formalp->vhdlSymp() ? defaultValueFor(formalp->vhdlSymp()->typep(), flp)
+                                               : nullptr;
+            }
             if (!targetp || !valuep) {
                 if (targetp) VL_DO_DANGLING(targetp->deleteTree(), targetp);
                 continue;

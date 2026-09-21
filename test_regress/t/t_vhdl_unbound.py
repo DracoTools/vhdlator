@@ -11,13 +11,13 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# A component instance no entity is bound to: nothing is elaborated for it,
-# and what an "out" formal would have driven takes that formal's default
-# (7.3.3, 12.4.3).
+# An unbound instance gives each actual the formal default value.
 test.top_filename = "t/t_vhdl_unbound.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "-Wno-VHDLUNBOUND", "--top-module t_vhdl_unbound"],
+             verilator_flags2=[
+                 "--timing", "--top-module t_vhdl_unbound"
+             ],
              make_top_shell=False,
              make_main=False)
 
