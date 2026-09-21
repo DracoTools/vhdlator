@@ -29,6 +29,27 @@ begin
   o <= 99;
 end architecture;
 
+-- Two architectures of one entity. Elaborating the entity takes the one
+-- analyzed last (7.3.3); only a configuration names the other.
+entity t_vhdl_cfgtop_two is
+  port (o : out integer);
+end entity;
+
+architecture first of t_vhdl_cfgtop_two is
+begin
+  o <= 1;
+end architecture;
+
+architecture last of t_vhdl_cfgtop_two is
+begin
+  o <= 2;
+end architecture;
+
+configuration t_vhdl_cfgtop_two_cfg of t_vhdl_cfgtop_two is
+  for first
+  end for;
+end;
+
 use std.env.all;
 
 entity t_vhdl_cfgtop is
@@ -43,7 +64,11 @@ architecture tb of t_vhdl_cfgtop is
   signal src : integer := 5;
   signal direct : integer := 0;
   signal gen : integer := 0;
+  signal which : integer := 0;
 begin
+
+  -- Instantiated directly, so the architecture is the one analyzed last
+  two: entity work.t_vhdl_cfgtop_two port map (o => which);
 
   k: block
   begin
@@ -60,6 +85,9 @@ begin
       report "the instance took a configuration this elaboration did not go through: "
         & integer'image(direct) severity failure;
     assert gen = 5 report "the generated instance got " & integer'image(gen)
+      severity failure;
+    assert which = 2
+      report "the architecture analyzed last was not taken: " & integer'image(which)
       severity failure;
     report "*-* All Finished *-*" severity note;
     stop(0);

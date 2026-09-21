@@ -12,11 +12,11 @@ import vltest_bootstrap
 test.scenarios('vlt')
 
 # A configuration declaration chooses which architecture an entity is built
-# from. The default binding would take the other one, so this only passes if
-# the configuration is honoured.
+# from, for the design elaborated through it. Named as the top, it picks the
+# first architecture; the default binding would take the one analyzed last.
 test.top_filename = "t/t_vhdl_config.vhd"
 
-test.compile(make_top_shell=False, make_main=False, verilator_flags2=["--exe", test.pli_filename])
+test.compile(make_top_shell=False, make_main=False, verilator_flags2=["--exe", test.pli_filename, "--top-module pick"])
 
 test.execute()
 

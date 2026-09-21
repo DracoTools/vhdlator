@@ -22877,7 +22877,11 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     }
     for (const std::string& key : order) {
         AstVhdlArchitecture* archp = nullptr;
-        const auto pickIt = chosen.find(key);
+        // Which architecture a configuration names is that configuration's
+        // to say, and only where the design is elaborated through it (3.4).
+        // Elaborating the entity takes the most recently analyzed one
+        // instead (7.3.3), which is what "archs" holds.
+        const auto pickIt = key == m_cfgTopEntity ? chosen.find(key) : chosen.end();
         if (pickIt != chosen.end()) {
             const auto namedIt = namedArchs.find(key + "." + pickIt->second);
             if (namedIt != namedArchs.end()) archp = namedIt->second;
