@@ -38,6 +38,7 @@
 #include "V3Global.h"
 #include "V3VhdlStd.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -173,6 +174,39 @@ bool compareValues(const VhdlValue& lhs, const VhdlValue& rhs, int& out) {
         return true;
     }
     if (lhs.isStr() || rhs.isStr()) return false;
+    // An array is compared element by element in index order, and where every
+    // element they share is equal the shorter of the two is the lesser
+    // (5.2.6). Without this the fall-through below read a composite as an
+    // integer, which is zero for both, so any two arrays folded to equal.
+    if (lhs.isArray() && rhs.isArray()) {
+        const size_t shared = std::min(lhs.elements(), rhs.elements());
+        for (size_t i = 0; i < shared; ++i) {
+            int sub = 0;
+            if (!compareValues(lhs.elementAt(i), rhs.elementAt(i), sub)) return false;
+            if (sub != 0) {
+                out = sub;
+                return true;
+            }
+        }
+        out = lhs.elements() < rhs.elements() ? -1 : (lhs.elements() > rhs.elements() ? 1 : 0);
+        return true;
+    }
+    // A record has equality and nothing else (5.2.6), so an unequal pair only
+    // has to be said to be unequal
+    if (lhs.isRecord() && rhs.isRecord()) {
+        if (lhs.elements() != rhs.elements()) return false;
+        for (size_t i = 0; i < lhs.elements(); ++i) {
+            int sub = 0;
+            if (!compareValues(lhs.elementAt(i), rhs.elementAt(i), sub)) return false;
+            if (sub != 0) {
+                out = 1;
+                return true;
+            }
+        }
+        out = 0;
+        return true;
+    }
+    if (lhs.isComposite() || rhs.isComposite()) return false;
     if (lhs.isReal() || rhs.isReal()) {
         const double l = lhs.toReal();
         const double r = rhs.toReal();
