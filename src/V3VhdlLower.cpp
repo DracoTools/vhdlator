@@ -14673,6 +14673,47 @@ private:
             emitWaveformProcess(outp, readsp, flp);
             return;
         }
+        // The same again, where the selector says which waveform is
+        // scheduled. Without this the alternatives are folded into one
+        // expression and the delay each carries is dropped, so every value
+        // arrived at once.
+        if (nodep->kind() == VhdlAssignKind::SELECTED && anyWaveformDelay(nodep)
+            && nodep->selectorp()) {
+            if (!v3Global.opt.timing().isTrue()) {
+                unsup(flp, "waveform with more than one element without --timing");
+                return;
+            }
+            std::vector<AstVhdlAlternative*> alts;
+            for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+                alts.push_back(VN_AS(p, VhdlAlternative));
+            }
+            AstNode* outp = nullptr;
+            AstNodeExpr* readsp = nullptr;
+            for (size_t i = alts.size(); i-- > 0;) {
+                AstNode* const bodyp
+                    = waveformStmts(nodep->targetp(), alts[i]->wavesp(), readsp, flp);
+                if (!bodyp) return;
+                AstNodeExpr* testp
+                    = choiceTest(alts[i]->choicesp(), nodep->selectorp(), nodep->matching());
+                // The choices name every value the selector can take (11.6),
+                // so the last of them is what is left when none of the
+                // others matched, and testing it as well would make a latch
+                if (testp && !outp) VL_DO_DANGLING(testp->deleteTree(), testp);
+                if (!testp || !outp) {
+                    outp = bodyp;
+                    continue;
+                }
+                outp = new AstIf{alts[i]->fileline(), testp, bodyp, outp};
+            }
+            if (!outp) return;
+            // The process runs when the selector changes as well as when
+            // anything a waveform reads does
+            if (AstNodeExpr* const selReadp = lowerExpr(nodep->selectorp())) {
+                readsp = readsp ? new AstConcat{flp, readsp, selReadp} : selReadp;
+            }
+            emitWaveformProcess(outp, readsp, flp);
+            return;
+        }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         if (!lhsp) return;
         AstNodeExpr* rhsp = nullptr;
