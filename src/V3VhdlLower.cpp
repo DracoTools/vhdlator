@@ -5051,6 +5051,9 @@ private:
     int m_portNum = 0;  // The module's last port number, for one added later
     std::set<const VhdlSymbol*> m_needActive;  // Signals an active attribute names
     std::set<const AstVar*> m_actToggles;  // The bits that mark a transaction
+    // Whether a configuration declaration binds this entity's instances, so
+    // that the module built from it, and not this one, is what elaborates
+    bool m_cfgElsewhere = false;
     // "entity.port" for each port whose transactions the design outside asks
     // for. An entity is lowered before the architecture instantiating it, so
     // what that architecture wants has to be known before either is lowered.
@@ -15177,6 +15180,14 @@ private:
                 if (cCompIt != m_cfgScopep->comps.end()) cfgBindp = &cCompIt->second;
             }
         }
+        // A configuration declaration that this elaboration did not go
+        // through only answers where default binding cannot: an entity of the
+        // component's own name outranks it (7.3.3)
+        if (cfgBindp && m_cfgElsewhere) {
+            const std::string dfltLib
+                = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+            if (m_knownEntities.count(dfltLib + "." + modName)) cfgBindp = nullptr;
+        }
         if (cfgBindp) {
             if (cfgBindp->entity.empty()) {
                 // "use open" leaves the instance deliberately unbound, so
@@ -15667,11 +15678,17 @@ private:
                       : nullptr;
             const std::string entLib = m_modp ? m_modp->libname() : "work";
             if (declp && !m_knownEntities.count(entLib + "." + modName)) {
-                flp->v3warn(VHDLUNBOUND,
-                            "Component instance '"
-                                + (label.empty() ? modName : label)
-                                + "' has no entity bound to it: no entity '" + modName
-                                + "' was analyzed");
+                // Where a configuration declaration binds this entity's
+                // instances, the module built from that configuration is the
+                // one a design elaborates; this plain one is built beside it
+                // and its unbound components are not a finding about the
+                // design, they are the reason the configuration was written
+                if (!m_cfgElsewhere) {
+                    flp->v3warn(VHDLUNBOUND, "Component instance '"
+                                                 + (label.empty() ? modName : label)
+                                                 + "' has no entity bound to it: no entity '"
+                                                 + modName + "' was analyzed");
+                }
                 lowerUnboundInstance(nodep, declp, flp);
                 return;
             }
@@ -22274,13 +22291,22 @@ private:
         m_bindings.clear();
         m_instanceBindings.clear();
         m_bindingMaps.clear();
+        m_cfgElsewhere = false;
         if (cfgScopep) {
             // Built for one named configuration, which says what it says
             m_cfgScopep = cfgScopep;
         } else {
-            // What a configuration declaration said about this entity
+            // What a configuration declaration said about this entity. It
+            // is a design unit of its own, though, and what it says applies
+            // to the hierarchy elaborated *through it*: a design that
+            // elaborates the entity binds by the rules of 7.3.3 instead,
+            // which is what nvc 1.22.1 and GHDL 7.0.0-dev both do. So it is
+            // read here only where default binding has no answer, which
+            // keeps a design whose components exist only in a configuration
+            // working whichever unit is named as the top.
             const auto scopeIt = m_cfgScopes.find(libname + "." + entp->name());
             m_cfgScopep = scopeIt == m_cfgScopes.end() ? nullptr : &scopeIt->second;
+            m_cfgElsewhere = m_cfgScopep != nullptr;
         }
         m_prefix.clear();
         m_stmtsp = nullptr;
