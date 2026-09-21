@@ -18303,6 +18303,7 @@ private:
         AstNode* prep = nullptr;
         AstNode* postp = nullptr;
         if (!elemPartRoundTrip(symp, callp, prep, postp, flp)
+            || !convRoundTrip(symp, callp, prep, postp, flp)
             || !dynOutRoundTrip(symp, callp, prep, postp, flp)) {
             VL_DO_DANGLING(refp->deleteTree(), refp);
             if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
@@ -18719,6 +18720,119 @@ private:
                 }
                 m_argSkip.insert(asp);
             }
+            m_callElemArgs[callp].emplace_back(paramp->name(), tmpp);
+        }
+        return true;
+    }
+
+    // The parameter a conversion written on the formal is applied to, as in
+    // "f(p) => a" (6.5.7.1). What tells it apart from an index or a slice of
+    // the parameter is which of the two names is the parameter: the one the
+    // conversion is applied to is, and the one applying it is not.
+    static VhdlSymbol* convertedFormalParam(const VhdlSymbol* symp,
+                                            const AstNodeVhdlExpr* formalp) {
+        const AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
+        if (VN_IS(callp->argsp(), VhdlRange)) return nullptr;
+        const AstVhdlName* const prefixp = VN_CAST(callp->prefixp(), VhdlName);
+        if (!prefixp || paramSymNamed(symp, prefixp->name())) return nullptr;
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        const AstNode* const argp
+            = asp ? static_cast<const AstNode*>(asp->actualp()) : callp->argsp();
+        const AstVhdlName* const innerp = VN_CAST(argp, VhdlName);
+        VhdlSymbol* const rawp = innerp ? paramSymNamed(symp, innerp->name()) : nullptr;
+        return rawp ? rawp->resolved() : nullptr;
+    }
+
+    // What the actual names, through any conversion written on it: the value
+    // that comes back out of the parameter is assigned to this, not to the
+    // conversion (6.5.7.1)
+    static AstNodeVhdlExpr* actualDesignator(AstNodeVhdlExpr* nodep) {
+        while (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            // Which subprogram a call names is settled on the call itself; a
+            // type mark carries it on the prefix
+            const VhdlSymbol* const prefixSymp = callp->prefixp() && callp->prefixp()->vhdlSymp()
+                                                     ? callp->prefixp()->vhdlSymp()
+                                                     : callp->vhdlSymp();
+            const VhdlSymbol* const namedp = prefixSymp ? prefixSymp->resolved() : nullptr;
+            if (!namedp
+                || (namedp->kind() != VhdlSymKind::TYPE
+                    && namedp->kind() != VhdlSymKind::FUNCTION)) {
+                break;
+            }
+            if (!callp->argsp() || callp->argsp()->nextp()) break;
+            AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            AstNodeVhdlExpr* const argp
+                = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+            if (!argp) break;
+            nodep = argp;
+        }
+        return nodep;
+    }
+
+    // The conversion on the formal, applied to the object the call made for
+    // the parameter
+    AstNodeExpr* applyFormalConv(const AstNodeVhdlExpr* formalp, AstVar* tmpp, FileLine* flp) {
+        const AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+        VhdlSymbol* const prefixSymp
+            = callp && callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+        VhdlSymbol* const namedp = prefixSymp ? prefixSymp->resolved() : nullptr;
+        if (!namedp || namedp->kind() != VhdlSymKind::FUNCTION) return nullptr;
+        auto it = m_funcs.find(namedp);
+        if ((it == m_funcs.end() || !callableHere(it->second)) && emitOnDemand(namedp)) {
+            it = m_funcs.find(namedp);
+        }
+        if (it == m_funcs.end() || !VN_IS(it->second, Func)) return nullptr;
+        AstFuncRef* const refp = new AstFuncRef{
+            flp, it->second->name(), new AstArg{flp, "", new AstVarRef{flp, tmpp, VAccess::READ}}};
+        refp->taskp(it->second);
+        return refp;
+    }
+
+    // A conversion written on the formal, "f(p) => a": the parameter is an
+    // object of its own, and what comes back out of it reaches the actual
+    // through the conversion (6.5.7.1). The actual may carry a conversion of
+    // its own, "f(p) => g(a)", which is an ordinary call on the way in and is
+    // looked through to find what to assign on the way back.
+    bool convRoundTrip(const VhdlSymbol* symp, AstVhdlCall* callp, AstNode*& prep, AstNode*& postp,
+                       FileLine* flp) {
+        if (!callp || !symp) return true;
+        std::vector<AstVhdlAssoc*> convs;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->formalp() || !asp->actualp()) continue;
+            if (convertedFormalParam(symp, asp->formalp())) convs.push_back(asp);
+        }
+        for (AstVhdlAssoc* const asp : convs) {
+            VhdlSymbol* const paramp = convertedFormalParam(symp, asp->formalp());
+            const AstVhdlIfaceDecl* const declp = VN_CAST(paramp->declp(), VhdlIfaceDecl);
+            if (!declp || !paramp->typep()) return false;
+            AstNodeDType* const dtypep = lowerType(paramp->typep(), flp);
+            if (!dtypep) return false;
+            FileLine* const aflp = asp->fileline();
+            AstVar* const tmpp = newTempVar(
+                "__Vconv" + std::to_string(++m_nameNum) + "__" + paramp->name(), dtypep, flp);
+            if (declp->mode() != VhdlMode::OUT) {
+                AstNodeExpr* const fromp = lowerExpr(asp->actualp());
+                if (!fromp) return false;
+                prep = AstNode::addNextNull(
+                    prep, static_cast<AstNode*>(new AstAssign{
+                              aflp, new AstVarRef{aflp, tmpp, VAccess::WRITE}, fromp}));
+            }
+            if (declp->mode() != VhdlMode::IN) {
+                AstNodeExpr* const outp = applyFormalConv(asp->formalp(), tmpp, aflp);
+                AstNodeExpr* const top
+                    = outp ? lowerDriveTarget(actualDesignator(asp->actualp())) : nullptr;
+                if (!outp || !top) {
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    unsup(flp, "conversion written on the formal '" + paramp->name()
+                                   + "' of a call to '" + symp->name() + "'");
+                    return false;
+                }
+                postp = AstNode::addNextNull(
+                    postp, static_cast<AstNode*>(new AstAssign{aflp, top, outp}));
+            }
+            m_argSkip.insert(asp);
             m_callElemArgs[callp].emplace_back(paramp->name(), tmpp);
         }
         return true;

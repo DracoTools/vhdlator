@@ -2196,9 +2196,11 @@ private:
     VhdlType* analyzeUnary(AstVhdlUnary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) VL_MT_DISABLED;
+    void resolveFormalConv(AstVhdlCall* convp, VhdlType* formalTypep,
+                           VhdlType* actualTypep) VL_MT_DISABLED;
     static bool bindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
-                            std::vector<int>& formalOf,
-                            std::vector<std::string>* elemOf = nullptr) VL_MT_DISABLED;
+                            std::vector<int>& formalOf, std::vector<std::string>* elemOf = nullptr,
+                            std::vector<AstVhdlCall*>* convOf = nullptr) VL_MT_DISABLED;
     VhdlType* analyzeSelected(AstVhdlSelected* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* wantp) VL_MT_DISABLED;
     VhdlType* analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wantp) VL_MT_DISABLED;
@@ -5712,8 +5714,8 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
 // every call site has a static width.
 
 bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
-                     std::vector<int>& formalOf,
-                     std::vector<std::string>* elemOf = nullptr) VL_MT_DISABLED;
+                     std::vector<int>& formalOf, std::vector<std::string>* elemOf = nullptr,
+                     std::vector<AstVhdlCall*>* convOf = nullptr) VL_MT_DISABLED;
 // The subtype an actual must have: the parameter's own, or, where the formal
 // part names one element of it, that element's (6.5.7.1)
 VhdlType* vhdlFormalTypeAt(const VhdlSymbol* symp, int idx,
@@ -6050,7 +6052,8 @@ private:
         const size_t nparams = symp->paramTypes().size();
         std::vector<int> formalOf;
         std::vector<std::string> elemOf;
-        if (!vhdlBindActuals(symp, assocs, formalOf, &elemOf)) return;
+        std::vector<AstVhdlCall*> convOf;
+        if (!vhdlBindActuals(symp, assocs, formalOf, &elemOf, &convOf)) return;
         std::vector<AstVhdlAssoc*> byFormal(nparams, nullptr);
         // A formal whose elements the call names one at a time has no actual
         // of its own; its subtype is the one its elements' actuals make up
@@ -6063,6 +6066,13 @@ private:
         for (size_t k = 0; k < assocs.size(); ++k) {
             const int f = formalOf[k];
             if (f < 0 || static_cast<size_t>(f) >= nparams) return;
+            // A conversion on the formal makes the actual a value of its own
+            // type, which says nothing about the parameter: the copy is made
+            // for the subtype the parameter was declared with (6.5.7.1)
+            if (convOf[k]) {
+                individualFixed.insert(f);
+                continue;
+            }
             if (!elemOf[k].empty()) {
                 VhdlType* const recTypep = symp->paramTypes()[f];
                 if (!recTypep) return;
@@ -6455,9 +6465,12 @@ const AstNodeVhdlExpr* actualThroughConversions(const AstNodeVhdlExpr* nodep) {
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nodep;
         // A call whose prefix names a type or a function is a conversion; one
-        // whose prefix names an object is an index or a slice (8.1)
-        const VhdlSymbol* const prefixp
-            = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+        // whose prefix names an object is an index or a slice (8.1). Which
+        // subprogram a call names is settled on the call itself, and a type
+        // mark carries it on the prefix, so either may hold it
+        const VhdlSymbol* const prefixp = callp->prefixp() && callp->prefixp()->vhdlSymp()
+                                              ? callp->prefixp()->vhdlSymp()
+                                              : callp->vhdlSymp();
         const VhdlSymbol* const namedp = prefixp ? prefixp->resolved() : nullptr;
         if (!namedp
             || (namedp->kind() != VhdlSymKind::TYPE
@@ -7408,11 +7421,12 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
             if (usable) {
                 std::vector<int> formalOf;
                 std::vector<std::string> elemOf;
+                std::vector<AstVhdlCall*> convOf;
                 for (VhdlSymbol* const symp : found) {
-                    if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
+                    if (!bindActuals(symp, assocs, formalOf, &elemOf, &convOf)) continue;
                     bool fits = true;
                     for (size_t i = 0; i < argCands.size() && fits; ++i) {
-                        if (formalOf[i] < 0) continue;
+                        if (formalOf[i] < 0 || convOf[i]) continue;
                         if (!anyMatches(argCands[i],
                                         vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]))) {
                             fits = false;
@@ -9081,6 +9095,14 @@ void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, boo
         if (std::find(order.begin(), order.end(), root) == order.end()) order.push_back(root);
     }
     for (const std::string& root : order) {
+        // A conversion written on the formal, "f(p) => a", gathers under the
+        // name of the conversion rather than of a parameter: it is not a
+        // part of the formal at all, and the association stands as written
+        bool isParam = cands.empty();
+        for (const VhdlSymbol* const candp : cands) {
+            if (candp->resolved()->paramIndex(root) >= 0) isParam = true;
+        }
+        if (!isParam) continue;
         bool writable = false;
         for (const VhdlSymbol* const candp : cands) {
             if (!formalIsReadOnly(candp->resolved(), root)) writable = true;
@@ -9149,11 +9171,10 @@ void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, boo
     }
 }
 
-bool VhdlSemVisitor::bindActuals(const VhdlSymbol* symp,
-                                 const std::vector<AstVhdlAssoc*>& assocs,
-                                 std::vector<int>& formalOf,
-                                 std::vector<std::string>* elemOf) {
-    return vhdlBindActuals(symp, assocs, formalOf, elemOf);
+bool VhdlSemVisitor::bindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
+                                 std::vector<int>& formalOf, std::vector<std::string>* elemOf,
+                                 std::vector<AstVhdlCall*>* convOf) {
+    return vhdlBindActuals(symp, assocs, formalOf, elemOf, convOf);
 }
 
 // One element of a record type, by name
@@ -9354,14 +9375,35 @@ static bool vhdlSlicedFormal(const AstNodeVhdlExpr* formalp, std::string& root) 
     return true;
 }
 
+// A conversion written on the formal, "f(p) => a", which converts the value
+// on its way out to the actual (6.5.7.1). What makes it a conversion rather
+// than an index or a slice of the formal is which of the two names is the
+// parameter: the one it is applied to is, and the one applying it is not.
+static AstVhdlCall* vhdlConvertedFormal(const VhdlSymbol* symp, AstNodeVhdlExpr* formalp,
+                                        std::string& root) {
+    AstVhdlCall* const callp = VN_CAST(formalp, VhdlCall);
+    if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
+    const AstVhdlName* const prefixp = VN_CAST(callp->prefixp(), VhdlName);
+    if (!prefixp || symp->paramIndex(prefixp->name()) >= 0) return nullptr;
+    const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+    const AstNodeVhdlExpr* const argp
+        = asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+    const AstVhdlName* const innerp = VN_CAST(argp, VhdlName);
+    if (!innerp || symp->paramIndex(innerp->name()) < 0) return nullptr;
+    root = innerp->name();
+    return callp;
+}
+
 // Which formal each actual of a call names: positional up to the first named
 // one, by name after that, and a formal with a default may be left out
 // (6.5.7.1). False where the call cannot be read that way at all.
 bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
-                     std::vector<int>& formalOf, std::vector<std::string>* elemOf) {
+                     std::vector<int>& formalOf, std::vector<std::string>* elemOf,
+                     std::vector<AstVhdlCall*>* convOf) {
     const size_t formals = symp->paramTypes().size();
     formalOf.assign(assocs.size(), -1);
     if (elemOf) elemOf->assign(assocs.size(), std::string{});
+    if (convOf) convOf->assign(assocs.size(), nullptr);
     std::vector<bool> filled(formals, false);
     // A formal whose elements are associated one at a time is named once per
     // element, and each of its elements exactly once (6.5.7.1)
@@ -9379,6 +9421,19 @@ bool vhdlBindActuals(const VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& a
             continue;
         }
         named = true;
+        std::string convRoot;
+        if (!formalNamep) {
+            // A conversion on the formal leaves the formal itself wholly
+            // associated: what it converts is the value going out
+            if (AstVhdlCall* const convp = vhdlConvertedFormal(symp, asp->formalp(), convRoot)) {
+                const int idx = symp->paramIndex(convRoot);
+                if (idx < 0 || filled[idx] || individual.count(idx)) return false;
+                formalOf[i] = idx;
+                filled[idx] = true;
+                if (convOf) (*convOf)[i] = convp;
+                continue;
+            }
+        }
         std::string sliceRoot;
         if (!formalNamep && vhdlSlicedFormal(asp->formalp(), sliceRoot)) {
             const int idx = symp->paramIndex(sliceRoot);
@@ -9670,6 +9725,35 @@ void VhdlSemVisitor::checkIndexablePrefix(const AstVhdlCall* nodep) {
     err(prefp->fileline(), std::string{"The prefix of "} + what
                                + " is a name or a function call, and a type conversion"
                                  " is neither");
+}
+
+// The conversion a formal part is written with, "f(p) => a". It is never
+// resolved as an expression -- a formal part's names are not looked up in
+// the caller's region -- so the one function it can mean is found here: the
+// one taking what the parameter holds and giving what the actual is
+// (6.5.7.1). Left alone where several would fit, which is not this to decide.
+void VhdlSemVisitor::resolveFormalConv(AstVhdlCall* convp, VhdlType* formalTypep,
+                                       VhdlType* actualTypep) {
+    AstVhdlName* const prefixp = convp ? VN_CAST(convp->prefixp(), VhdlName) : nullptr;
+    if (!prefixp || prefixp->vhdlSymp()) return;
+    std::vector<VhdlSymbol*> found;
+    lookup(prefixp->name(), found);
+    VhdlSymbol* bestp = nullptr;
+    for (VhdlSymbol* const candp : found) {
+        VhdlSymbol* const fp = candp->resolved();
+        if (fp->kind() == VhdlSymKind::TYPE) {
+            if (actualTypep && !typesMatch(fp->typep(), actualTypep)) continue;
+        } else if (fp->kind() == VhdlSymKind::FUNCTION) {
+            if (fp->paramTypes().size() != 1) continue;
+            if (formalTypep && !typesMatch(fp->paramTypes()[0], formalTypep)) continue;
+            if (actualTypep && !typesMatch(fp->returnTypep(), actualTypep)) continue;
+        } else {
+            continue;
+        }
+        if (bestp && bestp != fp) return;  // Several would fit
+        bestp = fp;
+    }
+    if (bestp) prefixp->vhdlSymp(bestp);
 }
 
 VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
@@ -9970,6 +10054,7 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                              // were written with a generic type's name
     std::vector<int> formalOf;
     std::vector<std::string> elemOf;
+    std::vector<AstVhdlCall*> convOf;
     int best = -1;
     // Resolution is bidirectional: a subprogram overloads on its result as
     // well as on its arguments (12.5). So a candidate whose result is the
@@ -9987,12 +10072,15 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         const VhdlSymKind kind = symp->resolved()->kind();
         if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
         if (anyRange) continue;
-        if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
+        if (!bindActuals(symp, assocs, formalOf, &elemOf, &convOf)) continue;
         bool ok = true;
         int score = 0;
         int viaGeneric = 0;
         for (size_t i = 0; i < argCands.size() && ok; ++i) {
-            if (formalOf[i] < 0) continue;
+            // A conversion on the formal converts between the two, so the
+            // actual is not of the parameter's type and has nothing to be
+            // measured against here (6.5.7.1)
+            if (formalOf[i] < 0 || convOf[i]) continue;
             VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
             if (!anyMatches(argCands[i], paramp)) ok = false;
             if (exactMatch(argCands[i], paramp)) ++score;
@@ -10078,14 +10166,14 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         for (VhdlSymbol* const symp : found) {
             const VhdlSymKind kind = symp->resolved()->kind();
             if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
-            if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
+            if (!bindActuals(symp, assocs, formalOf, &elemOf, &convOf)) continue;
             ++arityOk;
             if (arityOk > 1) {
                 detail.clear();
                 break;
             }
             for (size_t i = 0; i < argCands.size(); ++i) {
-                if (formalOf[i] < 0) continue;
+                if (formalOf[i] < 0 || convOf[i]) continue;
                 VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
                 if (anyMatches(argCands[i], paramp)) continue;
                 detail = ": argument '" + symp->paramName(formalOf[i]) + elemOf[i] + "' expects "
@@ -10113,8 +10201,8 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
                 for (VhdlSymbol* const symp : found) {
                     const VhdlSymKind kind = symp->resolved()->kind();
                     if (kind != VhdlSymKind::FUNCTION && kind != VhdlSymKind::PROCEDURE) continue;
-                    if (!bindActuals(symp, assocs, formalOf, &elemOf)) continue;
-                    if (formalOf[i] < 0) continue;
+                    if (!bindActuals(symp, assocs, formalOf, &elemOf, &convOf)) continue;
+                    if (formalOf[i] < 0 || convOf[i]) continue;
                     VhdlType* const paramp = vhdlFormalTypeAt(symp, formalOf[i], elemOf[i]);
                     if (anyMatches(argCands[i], paramp)) {
                         anyOk = true;
@@ -10157,9 +10245,25 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         = pick(nodep, cands, wantp,
                "subprogram '" + (parts.empty() ? std::string{"<name>"} : parts.back()) + "'");
     // The chosen signature now settles every actual
-    if (nodep->vhdlSymp() && bindActuals(nodep->vhdlSymp(), assocs, formalOf, &elemOf)) {
+    if (nodep->vhdlSymp() && bindActuals(nodep->vhdlSymp(), assocs, formalOf, &elemOf, &convOf)) {
         for (size_t i = 0; i < assocs.size(); ++i) {
             if (!assocs[i] || !assocs[i]->actualp() || formalOf[i] < 0) continue;
+            // A conversion on the formal stands between the two, so the
+            // actual is of its own type rather than the parameter's: it is
+            // what the conversion gives that the actual is assigned, and
+            // what the actual gives that goes in (6.5.7.1)
+            if (convOf[i]) {
+                analyzeExpr(assocs[i]->actualp(), nullptr);
+                // What the conversion gives is assigned to the actual
+                // *designator*: where the actual carries a conversion of its
+                // own it is what that is applied to, not the conversion
+                const AstNodeVhdlExpr* const destp
+                    = actualThroughConversions(assocs[i]->actualp());
+                resolveFormalConv(convOf[i],
+                                  vhdlFormalTypeAt(nodep->vhdlSymp(), formalOf[i], elemOf[i]),
+                                  destp ? destp->vhdlTypep() : nullptr);
+                continue;
+            }
             VhdlType* const paramp = vhdlFormalTypeAt(nodep->vhdlSymp(), formalOf[i], elemOf[i]);
             analyzeExpr(assocs[i]->actualp(), paramp);
             if (elemOf[i].empty()) {
