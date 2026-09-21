@@ -1813,6 +1813,7 @@ public:
     void checkSequentialForm(const AstNode* nodep, VhdlAssignKind kind) VL_MT_DISABLED;
     bool conflictingPotentials(const std::vector<VhdlSymbol*>& found) const VL_MT_DISABLED;
     void checkConfigSpecs(const AstNode* declsp, const AstNode* stmtsp) VL_MT_DISABLED;
+    void checkBindingGenerics(const AstVhdlBinding* bindp, const std::string& lib) VL_MT_DISABLED;
     void checkConfiguration(const AstVhdlConfiguration* cfgp, const std::string& lib,
                             const std::string& ent) VL_MT_DISABLED;
     std::string signalNamedIn(const AstNode* exprsp, const AstNode* stmtp) VL_MT_DISABLED;
@@ -4726,7 +4727,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 if (archIt != m_unitScopes.end()) m_scopep->addUse(archIt->second);
             }
             if (!m_inSpecialized && !parts.empty()) checkConfiguration(cfgp, lib, parts.back());
-            unitp->foreach([this](AstVhdlBinding* bindp) {
+            unitp->foreach([this, &lib](AstVhdlBinding* bindp) {
                 // What the component itself declares is visible to the
                 // actuals of a binding's generic map: "generic map (g1 => g1
                 // + g1)" is the entity's formal taking the component's own
@@ -4762,6 +4763,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
                     if (asp && asp->actualp()) analyzeExpr(asp->actualp(), nullptr);
                 }
+                checkBindingGenerics(bindp, lib);
                 // Not the port map: its actuals name the *component's*
                 // ports, which live in the component's own region and say
                 // which of the entity's ports each one becomes (7.3.2.2)
@@ -9349,6 +9351,40 @@ static std::string blockSpecName(const AstVhdlBlockConfig* bcp) {
 // an architecture of the entity, one within it a block or a generate
 // statement of the region it stands in, and one within a component
 // configuration the architecture the binding names.
+// A binding indication's generic map is an association list whose formals are
+// the *entity's* generics (7.3.2.2). A formal that names none of them is an
+// error, and one only analysis can find: whether the binding is ever
+// elaborated depends on which unit a design is built from, and the rule holds
+// either way.
+void VhdlSemVisitor::checkBindingGenerics(const AstVhdlBinding* bindp, const std::string& lib) {
+    if (!bindp->genericMapp() || bindp->kind() != "entity") return;
+    const AstNodeVhdlExpr* unitp = bindp->unitp();
+    if (const AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) unitp = callp->prefixp();
+    std::vector<std::string> parts;
+    if (!flatten(unitp, parts) || parts.empty()) return;
+    const std::string useLib = parts.size() > 1 ? lower(parts[0]) : lib;
+    const auto unitIt = m_primaryUnits.find(useLib + "." + lower(parts.back()));
+    const AstVhdlEntity* const entp
+        = unitIt == m_primaryUnits.end() ? nullptr : VN_CAST(unitIt->second, VhdlEntity);
+    if (!entp) return;  // Not analyzed here: nothing to check it against
+    std::set<std::string> generics;
+    for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
+        if (const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl)) {
+            generics.insert(lower(ifp->name()));
+        }
+    }
+    for (AstNode* p = bindp->genericMapp(); p; p = p->nextp()) {
+        const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+        if (!asp || !asp->formalp()) continue;  // Written by position
+        std::vector<std::string> fparts;
+        if (!flatten(asp->formalp(), fparts) || fparts.empty()) continue;
+        const std::string formal = lower(fparts.back());
+        if (generics.count(formal)) continue;
+        err(asp->fileline(), "Generic map of a binding indication names '" + fparts.back()
+                                 + "', which entity '" + entp->name() + "' has no generic of");
+    }
+}
+
 void VhdlSemVisitor::checkConfiguration(const AstVhdlConfiguration* cfgp, const std::string& lib,
                                         const std::string& ent) {
     const AstVhdlBlockConfig* const bcp = cfgp->blockConfigp();

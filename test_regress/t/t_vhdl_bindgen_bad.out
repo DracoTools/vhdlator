@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_bindgen_bad.vhd:39:22: Generic map of a binding indication names 'widht', which entity 't_vhdl_bindgen_bad_sub' has no generic of
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to
