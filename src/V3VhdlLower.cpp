@@ -5050,6 +5050,10 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> m_actOutPorts;
     int m_portNum = 0;  // The module's last port number, for one added later
     std::set<const VhdlSymbol*> m_needActive;  // Signals an active attribute names
+    // "entity.port" for each port whose transactions the design outside asks
+    // for. An entity is lowered before the architecture instantiating it, so
+    // what that architecture wants has to be known before either is lowered.
+    std::set<std::string> m_wantActiveOut;
     // The signal "S delayed by T", one per signal and delay it is asked for
     std::map<std::pair<const VhdlSymbol*, int64_t>, AstVar*> m_delayeds;
     // Whether anything in the design delivers a signal transaction at a time
@@ -15740,6 +15744,16 @@ private:
             outp = AstNode::addNextNull(outp,
                                         new AstPin{flp, ++*pinNump, want.second,
                                                    new AstVarRef{flp, fromp, VAccess::WRITE}});
+            if (acIt->first->driverCount() <= 1) {
+                // The instance is the only driver, so the actual's
+                // transactions are the port's. A port association makes the
+                // two one signal (6.5.6.3), so the mark has to arrive in the
+                // same cycle the transaction does rather than a delta later.
+                addStmt(new AstAlways{
+                    new AstAssignW{mflp, new AstVarRef{mflp, acIt->second.togglep, VAccess::WRITE},
+                                   new AstVarRef{mflp, fromp, VAccess::READ}}});
+                continue;
+            }
             AstNode* const flipp = new AstAssignDly{
                 mflp, new AstVarRef{mflp, acIt->second.togglep, VAccess::WRITE},
                 new AstLogNot{mflp, new AstVarRef{mflp, acIt->second.togglep, VAccess::READ}}};
@@ -22177,6 +22191,16 @@ private:
         m_needActive.clear();
         m_delayeds.clear();
         collectActive(entp->declsp());
+        // A port this entity drives carries its transactions out to the
+        // actual, where the architecture instantiating it asked for them
+        for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (!ifp || ifp->mode() == VhdlMode::IN) continue;
+            if (!m_wantActiveOut.count(entp->name() + "." + ifp->name())) continue;
+            if (const VhdlSymbol* const symp = ifp->vhdlSymp()) {
+                m_needActive.insert(symp->resolved());
+            }
+        }
         if (archp) {
             collectActive(archp->declsp());
             collectActive(archp->stmtsp());
@@ -22337,6 +22361,57 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         const AstVhdlName* const namep = VN_CAST(np, VhdlName);
         return namep ? namep->name() : "";
     };
+    // Which of an entity's ports the design outside asks the transactions of.
+    // The actual an instance drives is marked from a companion bit the port
+    // carries out, and that bit is made when the entity is lowered -- which
+    // happens before the architecture holding the instance is (14.7.3.4).
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        AstVhdlArchitecture* const archp = VN_CAST(unitp, VhdlArchitecture);
+        if (!archp) continue;
+        std::set<const VhdlSymbol*> wanted;
+        archp->foreach([&](AstVhdlAttrName* attrp) {
+            const std::string& attr = attrp->name();
+            if (attr != "active" && attr != "last_active" && attr != "transaction"
+                && attr != "quiet") {
+                return;
+            }
+            if (const VhdlSymbol* const symp = rootSymOf(attrp->prefixp())) {
+                wanted.insert(symp->resolved());
+            }
+        });
+        if (wanted.empty()) continue;
+        archp->foreach([&](AstVhdlInstance* instp) {
+            const std::string ent = boundName(instp);
+            if (ent.empty()) return;
+            const auto entIt = entityByName.find(ent);
+            size_t at = 0;
+            for (AstNode* p = instp->portMapp(); p; p = p->nextp(), ++at) {
+                AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->actualp()) continue;
+                const VhdlSymbol* const actSymp = rootSymOf(asp->actualp());
+                if (!actSymp || !wanted.count(actSymp->resolved())) continue;
+                std::string formal;
+                if (AstVhdlCall* const convp = VN_CAST(asp->formalp(), VhdlCall)) {
+                    // "f(port) => actual" names the port inside the conversion
+                    formal = formalNamed(convp->argsp());
+                } else if (asp->formalp()) {
+                    std::vector<std::string> fparts;
+                    if (flattenName(asp->formalp(), fparts) && !fparts.empty()) {
+                        formal = fparts.back();
+                    }
+                } else if (entIt != entityByName.end()) {
+                    // Written by position, so the entity's own order says
+                    // which port this is
+                    size_t n = 0;
+                    for (AstNode* q = entIt->second->portsp(); q; q = q->nextp(), ++n) {
+                        const AstVhdlIfaceDecl* const ifp = VN_CAST(q, VhdlIfaceDecl);
+                        if (n == at && ifp) formal = ifp->name();
+                    }
+                }
+                if (!formal.empty()) m_wantActiveOut.insert(ent + "." + formal);
+            }
+        });
+    }
     // A generic of a type that is not one value the back end can carry --
     // an array of records holding a REAL, say -- travels as data whatever
     // the instance hands it, since there is no parameter to fold it into.
