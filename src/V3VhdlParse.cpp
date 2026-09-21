@@ -2923,7 +2923,41 @@ AstNodeVhdlExpr* V3VhdlParse::parseNameSuffixes(AstNodeVhdlExpr* prefixp) {
             }
             AstVhdlAttrName* const attrp = new AstVhdlAttrName{flp, prefixp, attr};
             if (check(VhdlTokType::LPAREN)) {
-                attrp->argp(parseExpression());
+                // An attribute designator takes at most one expression (8.6).
+                // What follows may instead be an index list or a discrete
+                // range, and then the attribute name is the *prefix* of an
+                // indexed or slice name over the value it denotes (8.4, 8.5)
+                // -- "pt'at(2 to 4)" and "pt'at(2, 3)".
+                if (looksLikeRange()) {
+                    AstVhdlCall* const slicep = new AstVhdlCall{flp, attrp};
+                    if (AstNodeVhdl* const rangep = parseDiscreteRange()) {
+                        slicep->addArgsp(rangep);
+                    }
+                    expect(VhdlTokType::RPAREN, "')' to close the name");
+                    prefixp = slicep;
+                    continue;
+                }
+                AstNodeVhdlExpr* const firstp = parseExpression();
+                if (peekType() == VhdlTokType::COMMA) {
+                    AstVhdlCall* const idxp = new AstVhdlCall{flp, attrp};
+                    idxp->addArgsp(new AstVhdlAssoc{flp, nullptr, firstp});
+                    while (check(VhdlTokType::COMMA)) {
+                        FileLine* const aflp = here();
+                        if (looksLikeRange()) {
+                            if (AstNodeVhdl* const rangep = parseDiscreteRange()) {
+                                idxp->addArgsp(rangep);
+                            }
+                            continue;
+                        }
+                        AstNodeVhdlExpr* const nextp = parseExpression();
+                        if (!nextp) break;
+                        idxp->addArgsp(new AstVhdlAssoc{aflp, nullptr, nextp});
+                    }
+                    expect(VhdlTokType::RPAREN, "')' to close the name");
+                    prefixp = idxp;
+                    continue;
+                }
+                attrp->argp(firstp);
                 expect(VhdlTokType::RPAREN, "')' after the attribute argument");
             }
             prefixp = attrp;
