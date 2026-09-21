@@ -5050,6 +5050,7 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> m_actOutPorts;
     int m_portNum = 0;  // The module's last port number, for one added later
     std::set<const VhdlSymbol*> m_needActive;  // Signals an active attribute names
+    std::set<const AstVar*> m_actToggles;  // The bits that mark a transaction
     // "entity.port" for each port whose transactions the design outside asks
     // for. An entity is lowered before the architecture instantiating it, so
     // what that architecture wants has to be known before either is lowered.
@@ -6988,6 +6989,7 @@ private:
             m_shadowsp,
             static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp}));
         m_historied.insert(varIt->second);
+        m_actToggles.insert(ac.togglep);
         m_actives.emplace(symp, ac);
     }
 
@@ -7004,6 +7006,23 @@ private:
     // The extra assignment that says a driver of this signal has assigned,
     // whatever it assigned. It carries the same delay as the assignment it
     // accompanies, since a transaction happens when the value is delivered.
+    // "t <= not t", the statement that marks a transaction, reads the very
+    // bit it writes. That read is bookkeeping and not something the design
+    // named, so a statement carrying it must not be woken by it -- which
+    // would be a process that runs again for every mark it makes. A design
+    // that names S'TRANSACTION itself still waits on the bit, since that
+    // read stands outside any assignment to it.
+    bool isToggleFlipRead(const AstVarRef* refp) const {
+        if (!refp->varp() || !m_actToggles.count(refp->varp())) return false;
+        for (const AstNode* np = refp->backp(); np; np = np->backp()) {
+            const AstNodeAssign* const asgp = VN_CAST(np, NodeAssign);
+            if (!asgp) continue;
+            const AstVarRef* const lhsp = VN_CAST(asgp->lhsp(), VarRef);
+            return lhsp && lhsp->varp() == refp->varp();
+        }
+        return false;
+    }
+
     AstNode* transactionMark(const AstNode* targetp, AstNode* delayp, bool sequential,
                              const AstNode* readsp, FileLine* flp) {
         if (m_actives.empty()) return nullptr;
@@ -12529,9 +12548,10 @@ private:
             }
         });
         bool reads = false;
-        bodyp->foreach([&reads, &writtenp](const AstVarRef* refp) {
+        bodyp->foreach([&](const AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             if (writtenp.count(refp)) return;
+            if (isToggleFlipRead(refp)) return;
             // A generic or a generate parameter has its value fixed by
             // elaboration and never changes afterwards, so a statement that
             // reads nothing else still runs exactly once
@@ -12551,9 +12571,10 @@ private:
                 knownp.insert(pair.second);
             }
         }
-        bodyp->foreach([&allKnown, &writtenp](const AstVarRef* refp) {
+        bodyp->foreach([&](const AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             if (writtenp.count(refp)) return;
+            if (isToggleFlipRead(refp)) return;
             if (!nameableRead(refp->varp())) allKnown = false;
         });
         // A statement that assigns a signal has to be written so that
@@ -19518,6 +19539,7 @@ private:
             if (const AstNodeAssign* const asgp = VN_CAST(refp->backp(), NodeAssign)) {
                 if (asgp->lhsp() == refp) return;
             }
+            if (isToggleFlipRead(refp)) return;
             AstVar* const varp = refp->varp();
             if (!nameableRead(varp)) return;
             // Only a signal held as one value can be shadowed a part at a
@@ -22229,6 +22251,7 @@ private:
         // declarations are lowered, since it decides what they become
         if (archp) countDrivers(archp->stmtsp());
         m_actives.clear();
+        m_actToggles.clear();
         m_needActive.clear();
         m_delayeds.clear();
         collectActive(entp->declsp());
