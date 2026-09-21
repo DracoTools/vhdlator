@@ -30,6 +30,14 @@ architecture tb of t_vhdl_activeinst is
     port (q : out integer := 0);
   end component;
 
+  -- A component bound to an entity of another name: what the instance writes
+  -- names the component, and only the binding says which entity has to carry
+  -- its transactions out (7.3.2)
+  component other_name is
+    port (q : out integer := 0);
+  end component;
+  for named : other_name use entity work.t_vhdl_activeinst_child(rtl);
+
   function twice (x : integer) return integer is
   begin
     return x * 2;
@@ -37,6 +45,7 @@ architecture tb of t_vhdl_activeinst is
 
   signal direct : integer := 0;
   signal conv : integer := 0;
+  signal bound : integer := 0;
 begin
 
   plain: t_vhdl_activeinst_child port map (q => direct);
@@ -48,6 +57,7 @@ begin
   -- the formal, so it misses the repeated value at 2 ns; GHDL 7.0.0-dev and
   -- Questa 2025.1 both carry the transaction, which is what 6.5.6.3 asks for.
   shaped: t_vhdl_activeinst_child port map (twice(q) => conv);
+  named: other_name port map (q => bound);
 
   main: process is
   begin
@@ -57,11 +67,15 @@ begin
       severity failure;
     assert conv'active report "the converted actual saw no transaction at 0 ns"
       severity failure;
+    assert bound'active report "the bound actual saw no transaction at 0 ns"
+      severity failure;
 
     wait for 1 ns;
     assert not direct'active report "the plain actual was active between writes"
       severity failure;
     assert not conv'active report "the converted actual was active between writes"
+      severity failure;
+    assert not bound'active report "the bound actual was active between writes"
       severity failure;
 
     -- 2 ns: the same value again, so a transaction and no event
@@ -70,6 +84,8 @@ begin
       severity failure;
     assert conv'active report "the converted actual missed the repeated value"
       severity failure;
+    assert bound'active report "the bound actual missed the repeated value"
+      severity failure;
     assert not direct'event report "a repeated value was an event" severity failure;
 
     -- 4 ns: a new value, so both
@@ -77,6 +93,8 @@ begin
     assert direct'active report "the plain actual missed the new value"
       severity failure;
     assert conv'active report "the converted actual missed the new value"
+      severity failure;
+    assert bound'active report "the bound actual missed the new value"
       severity failure;
     assert direct = 4 report "the plain actual holds " & integer'image(direct)
       severity failure;

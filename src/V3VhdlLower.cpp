@@ -22365,6 +22365,15 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // The actual an instance drives is marked from a companion bit the port
     // carries out, and that bit is made when the entity is lowered -- which
     // happens before the architecture holding the instance is (14.7.3.4).
+    // The last identifier of a name, which for "work.e(a)" is the entity.
+    // An architecture name and an index look alike, so "entity work.e(a)"
+    // parses as a call and the entity is its prefix (7.3.2).
+    const auto lastIdent = [this](AstNodeVhdlExpr* np) -> std::string {
+        if (AstVhdlCall* const callp = VN_CAST(np, VhdlCall)) np = callp->prefixp();
+        std::vector<std::string> parts;
+        if (!flattenName(np, parts) || parts.empty()) return "";
+        return parts.back();
+    };
     for (AstNodeVhdlUnit* const unitp : unitsp) {
         AstVhdlArchitecture* const archp = VN_CAST(unitp, VhdlArchitecture);
         if (!archp) continue;
@@ -22380,6 +22389,14 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             }
         });
         if (wanted.empty()) continue;
+        // An instance names its *component*, which a binding indication may
+        // bind to an entity of another name (7.3.2). Every entity a binding
+        // in this architecture names is a candidate for what it reaches.
+        std::vector<std::string> alsoBound;
+        archp->foreach([&](AstVhdlBinding* bindp) {
+            const std::string n = lastIdent(bindp->unitp());
+            if (!n.empty()) alsoBound.push_back(n);
+        });
         archp->foreach([&](AstVhdlInstance* instp) {
             const std::string ent = boundName(instp);
             if (ent.empty()) return;
@@ -22408,7 +22425,11 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                         if (n == at && ifp) formal = ifp->name();
                     }
                 }
-                if (!formal.empty()) m_wantActiveOut.insert(ent + "." + formal);
+                if (formal.empty()) continue;
+                m_wantActiveOut.insert(ent + "." + formal);
+                for (const std::string& alt : alsoBound) {
+                    m_wantActiveOut.insert(alt + "." + formal);
+                }
             }
         });
     }
