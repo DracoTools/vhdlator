@@ -3152,6 +3152,10 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         // value of its own
         objectAlias = false;
     }
+    // An alias of an object is not overloadable, so it is a homograph of
+    // anything else of that name and hides it (12.3). Recorded on the symbol
+    // because visibility is asked about long after this.
+    symp->objectAlias(objectAlias);
     // Only an alias of an object has a subtype of its own (6.6.1)
     if (!objectAlias && nodep->subtypep() && !m_inSpecialized) {
         err(nodep->subtypep()->fileline(), "Only an alias of an object is given a subtype, and '"

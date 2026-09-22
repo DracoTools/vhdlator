@@ -120,6 +120,7 @@ class VhdlSymbol final {
     // instead of having a body here. The string says which, and which ABI.
     std::string m_foreignName;
     bool m_foreignDpi = false;  // Bound with the DPI-C ABI, not VHPIDIRECT
+    bool m_objectAlias = false;  // An alias of an object, which is not overloadable
     // A signal driven from more than one place is resolved (6.5.2). Analysis
     // counts the drivers and, where the subtype names a resolution function,
     // gives it the copy that takes that many values.
@@ -211,6 +212,8 @@ public:
 
     VhdlSymbol* aliasp() const { return m_aliasp; }
     void aliasp(VhdlSymbol* symp) { m_aliasp = symp; }
+    bool objectAlias() const { return m_objectAlias; }
+    void objectAlias(bool flag) { m_objectAlias = flag; }
     // An alias is transparent: it denotes whatever it was declared for (6.6.1)
     // What the name finally denotes. An alias may name another alias, so the
     // chain is followed to its end -- with a depth guard, since a malformed
@@ -279,8 +282,15 @@ public:
     // A subprogram or enumeration literal may share its name with others, and
     // so may an alias of one (6.6.2)
     bool isOverloadable() const {
+        // An alias is overloadable only where what it denotes is. An alias
+        // of a subprogram or of an enumeration literal shares its designator
+        // with the others; an alias of an object is a homograph of anything
+        // of that name, and hides it (6.6.1, 12.3) -- which is what lets a
+        // design alias something STANDARD already declares, "alias ff is f"
+        // beside the format-feed character literal FF.
+        if (m_kind == VhdlSymKind::ALIAS) return !m_objectAlias;
         return m_kind == VhdlSymKind::FUNCTION || m_kind == VhdlSymKind::PROCEDURE
-               || m_kind == VhdlSymKind::ENUM_LITERAL || m_kind == VhdlSymKind::ALIAS;
+               || m_kind == VhdlSymKind::ENUM_LITERAL;
     }
     // Something an expression can read
     bool isObject() const {
