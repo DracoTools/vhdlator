@@ -15128,8 +15128,13 @@ private:
         auto it = m_configOf.find(cfgLib + "." + out.entity);
         if (it == m_configOf.end()) it = m_configOf.find(lib + "." + out.entity);
         if (it == m_configOf.end()) return false;
-        out.entity = it->second.first;
-        out.arch = it->second.second;
+        // The configuration made both choices already, and carries bindings
+        // of its own for what the architecture instantiates. Naming the
+        // entity here would take the first choice and throw the rest away,
+        // leaving the instances inside it bound by default -- so the module
+        // built for the configuration is what this binds to (3.4, 11.7).
+        out.entity = cfgModName(it->second.first, out.entity);
+        out.arch.clear();
         return true;
     }
     // Which instances of the block a component configuration speaks for
@@ -23224,6 +23229,23 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 m_cfgInstanced.insert("work." + parts.back());
             }
         });
+        // A binding indication may name a configuration too -- "use
+        // configuration work.c" -- and that configuration's own bindings are
+        // what the bound instance is built with, so it needs a module of its
+        // own exactly as an instance naming it does (3.4, 7.3.2)
+        unitp->foreach([&](AstVhdlBinding* bindp) {
+            if (bindp->kind() != "configuration" || !bindp->unitp()) return;
+            std::vector<std::string> parts;
+            AstNodeVhdlExpr* namep = bindp->unitp();
+            if (AstVhdlCall* const callp = VN_CAST(namep, VhdlCall)) namep = callp->prefixp();
+            if (!flattenName(namep, parts) || parts.empty()) return;
+            const std::string cfgLib = parts.size() > 1 ? parts[parts.size() - 2] : lib;
+            if (m_configOf.count(VString::downcase(cfgLib) + "." + parts.back())) {
+                m_cfgInstanced.insert(VString::downcase(cfgLib) + "." + parts.back());
+            } else if (m_configOf.count("work." + parts.back())) {
+                m_cfgInstanced.insert("work." + parts.back());
+            }
+        });
     }
     // An entity and an architecture become one module, so pair them up
     // first. VHDL's default binding takes the architecture analyzed last
@@ -23288,6 +23310,18 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Which architecture each entity is built from has to be settled before
     // any of them is lowered, since an instance asks for it by name
     std::map<std::string, AstVhdlArchitecture*> builtArch;
+    // The module built for a configuration answers to a name of its own, and
+    // a binding indication that names the configuration binds to it, so it
+    // counts as an analyzed unit as much as the entity does
+    for (const std::string& cfgKey : m_cfgInstanced) {
+        const auto ofIt = m_configOf.find(cfgKey);
+        if (ofIt == m_configOf.end()) continue;
+        const std::string cfgLib = cfgKey.substr(0, cfgKey.find('.'));
+        const std::string cfgName = cfgKey.substr(cfgKey.find('.') + 1);
+        const std::string modName = cfgModName(ofIt->second.first, cfgName);
+        m_knownEntities.insert(cfgLib + "." + modName);
+        m_knownEntities.insert("work." + modName);
+    }
     for (const auto& pair : entities) {
         m_knownEntities.insert(pair.first);
         std::vector<std::string>& names = m_entityGenericNames[pair.first];
