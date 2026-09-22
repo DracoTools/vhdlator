@@ -5259,8 +5259,17 @@ private:
         case VhdlMode::OUT: varp->direction(VDirection::OUTPUT); break;
         case VhdlMode::BUFFER: varp->direction(VDirection::OUTPUT); break;
         case VhdlMode::INOUT:
-        case VhdlMode::LINKAGE:
             varp->direction(triPort ? VDirection::INOUT : VDirection::OUTPUT);
+            break;
+        case VhdlMode::LINKAGE:
+            // A linkage port is there to be connected and nothing more: the
+            // design neither reads it nor drives it, which is why reading
+            // one is refused except as the actual of another linkage port
+            // (6.5.6.3). An input drives nothing, so the actual keeps
+            // whatever it was -- and a linkage formal may perfectly well be
+            // associated with an input of the enclosing entity, which is
+            // what emitting it as an output made illegal.
+            varp->direction(triPort ? VDirection::INOUT : VDirection::INPUT);
             break;
         }
         varp->declDirection(varp->direction());
