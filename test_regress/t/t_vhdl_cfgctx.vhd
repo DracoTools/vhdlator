@@ -22,7 +22,7 @@ architecture rtl of t_vhdl_cfgctx_sub is
 begin
   check : process
   begin
-    assert got = 55 report "bad generic from the inherited context" severity error;
+    assert got = 55 report "bad generic from the inherited context" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

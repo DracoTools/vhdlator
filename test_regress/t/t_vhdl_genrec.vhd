@@ -76,7 +76,7 @@ begin
     variable data : std_logic_vector(h.p_len - 1 downto 0);
   begin
     wait for 10 ns;
-    assert data'length = 12 report "bad width from the generic record" severity error;
+    assert data'length = 12 report "bad width from the generic record" severity failure;
     data := (others => '0');
     data(11) := '1';
     tx <= data(11);
@@ -101,9 +101,9 @@ begin
   check : process
   begin
     wait for 2 ns;
-    assert idle = '1' report "bad idle state from the generic record" severity error;
+    assert idle = '1' report "bad idle state from the generic record" severity failure;
     wait for 20 ns;
-    assert chan = '1' report "bad driven value" severity error;
+    assert chan = '1' report "bad driven value" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

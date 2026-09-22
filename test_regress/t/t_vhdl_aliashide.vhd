@@ -44,12 +44,12 @@ begin
     alias sc is bump [real return real];
   begin
     ff := x"000fff000fff";
-    assert f = x"000fff000fff" report "bad write through an object alias" severity error;
-    assert fh = x"000fff00" report "bad read through a slice alias" severity error;
-    assert sc(2) = 3 report "bad integer overload of an aliased subprogram" severity error;
-    assert sc(2.0) = 2.5 report "bad real overload of an aliased subprogram" severity error;
+    assert f = x"000fff000fff" report "bad write through an object alias" severity failure;
+    assert fh = x"000fff00" report "bad read through a slice alias" severity failure;
+    assert sc(2) = 3 report "bad integer overload of an aliased subprogram" severity failure;
+    assert sc(2.0) = 2.5 report "bad real overload of an aliased subprogram" severity failure;
     -- The character literal is still reachable where nothing hides it
-    assert character'pos(character'val(12)) = 12 report "bad character" severity error;
+    assert character'pos(character'val(12)) = 12 report "bad character" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

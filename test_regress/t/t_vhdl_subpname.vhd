@@ -28,8 +28,8 @@ begin
       return v * scale.factor;
     end function;
   begin
-    assert ('1' + '1') = 102 report "bad operator body" severity error;
-    assert scale(4) = 12 report "bad function body" severity error;
+    assert ('1' + '1') = 102 report "bad operator body" severity failure;
+    assert scale(4) = 12 report "bad function body" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

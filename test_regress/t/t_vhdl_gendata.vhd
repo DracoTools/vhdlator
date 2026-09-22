@@ -41,10 +41,10 @@ architecture rtl of t_vhdl_gendata_sub is
 begin
   ck : process
   begin
-    assert gc.int = 1234 report "bad integer element" severity error;
-    assert gc.ch = 'a' report "bad character element" severity error;
-    assert gc.re = 0.25 report "bad real element" severity error;
-    assert gn = 9 report "bad scalar generic beside it" severity error;
+    assert gc.int = 1234 report "bad integer element" severity failure;
+    assert gc.ch = 'a' report "bad character element" severity failure;
+    assert gc.re = 0.25 report "bad real element" severity failure;
+    assert gn = 9 report "bad scalar generic beside it" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

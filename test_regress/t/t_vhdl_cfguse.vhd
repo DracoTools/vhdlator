@@ -23,8 +23,8 @@ architecture rtl of t_vhdl_cfguse_sub is
 begin
   check : process
   begin
-    assert got = 42 report "bad generic from the use clause" severity error;
-    assert also = 7 report "bad generic from the component" severity error;
+    assert got = 42 report "bad generic from the use clause" severity failure;
+    assert also = 7 report "bad generic from the component" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;

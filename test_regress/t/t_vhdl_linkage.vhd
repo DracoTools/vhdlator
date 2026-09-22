@@ -59,7 +59,7 @@ begin
   check : process
   begin
     wait for 10 ns;
-    assert b = 8 report "bad value past a linkage association" severity error;
+    assert b = 8 report "bad value past a linkage association" severity failure;
     report "*-* All Finished *-*";
     std.env.stop;
     wait;
