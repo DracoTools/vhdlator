@@ -1203,6 +1203,9 @@ class AstVhdlInstance final : public AstNodeVhdlStmt {
     // The generics of the unit, likewise, so that a positional generic map
     // reaches the one the design wrote rather than one carrying its bounds
     std::vector<std::string> m_formalGenerics;
+    // The same generics as symbols, so that a positional association can be
+    // asked what it reaches and not only what it is called
+    std::vector<VhdlSymbol*> m_formalGenericSyms;
     // Where the entity had a generic type, the copy made for this instance.
     // Kept beside the written name rather than replacing it, so that a
     // configuration specification naming the component still finds it.
@@ -1220,6 +1223,8 @@ public:
     void formalPorts(const std::vector<std::string>& names) { m_formalPorts = names; }
     const std::vector<std::string>& formalGenerics() const { return m_formalGenerics; }
     void formalGenerics(const std::vector<std::string>& names) { m_formalGenerics = names; }
+    const std::vector<VhdlSymbol*>& formalGenericSyms() const { return m_formalGenericSyms; }
+    void formalGenericSyms(const std::vector<VhdlSymbol*>& syms) { m_formalGenericSyms = syms; }
     std::string specModule() const { return m_specModule; }
     void specModule(const std::string& name) { m_specModule = name; }
     std::string archName() const { return m_archName; }

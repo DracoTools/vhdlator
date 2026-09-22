@@ -12758,14 +12758,19 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
         // bounds has no place in the clause and is skipped, so a positional
         // generic map reaches what the design wrote.
         std::map<int, std::string> genByPosition;
+        std::map<int, VhdlSymbol*> genSymByPosition;
         for (const auto& pair : unitScopep->direct()) {
-            const VhdlSymbol* const symp = pair.second;
+            VhdlSymbol* const symp = pair.second;
             if (symp->kind() != VhdlSymKind::GENERIC || symp->position() < 0) continue;
             genByPosition[symp->position()] = symp->name();
+            genSymByPosition[symp->position()] = symp;
         }
         std::vector<std::string> genNames;
+        std::vector<VhdlSymbol*> genSyms;
         for (const auto& pair : genByPosition) genNames.push_back(pair.second);
+        for (const auto& pair : genSymByPosition) genSyms.push_back(pair.second);
         nodep->formalGenerics(genNames);
+        nodep->formalGenericSyms(genSyms);
     }
     // An entity with a generic type is copied per type the design gives it,
     // and this instance is of the copy rather than of the original (6.5.5)

@@ -191,6 +191,10 @@ class VhdlLowerVisitor final {
     // The generics and the ports each entity declares, in order, for a
     // binding indication whose maps are written positionally
     std::map<std::string, std::vector<std::string>> m_entityGenericNames;
+    // The generics of each entity that travel as data, by the entity's name.
+    // A binding indication associates the entity's generics rather than the
+    // component's, and names them where a positional map gives no symbol.
+    std::map<std::string, std::set<std::string>> m_dataGenericNamesOf;
     std::map<std::string, std::vector<std::string>> m_entityPortNames;
     // The loops being lowered, innermost last. A labelled exit or next names
     // a loop that need not be the innermost (10.11, 10.12), which Verilator's
@@ -5166,6 +5170,11 @@ private:
 
     bool parameterizable(const VhdlType* typep) {
         if (!typep) return true;
+        // A record the back end cannot pack is not a value it can carry as a
+        // parameter either: a REAL has no packed form, so a record holding
+        // one is data however the instance writes the association. The array
+        // case below says the same thing about an array of such records.
+        if (typep->base()->kind() == VhdlTypeKind::RECORD) return recordPacks(typep);
         if (typep->base()->kind() != VhdlTypeKind::ARRAY) return true;
         if (isStringType(typep)) return true;
         const VhdlType* const elemp
@@ -15648,29 +15657,37 @@ private:
             // A generic carrying another's bounds stands ahead of it in the
             // clause but has no place in it, so a positional association is
             // given the name of the generic it actually reaches (6.5.7.1)
+            const VhdlSymbol* posSymp = nullptr;
             if (!asp->formalp()) {
                 if (genPosition < nodep->formalGenerics().size()) {
                     pinp->name(nodep->formalGenerics()[genPosition]);
                 }
+                if (genPosition < nodep->formalGenericSyms().size()) {
+                    posSymp = nodep->formalGenericSyms()[genPosition];
+                }
                 ++genPosition;
             }
             // A generic nothing can fold was lowered as an input, so what is
-            // written for it is a port association and not a parameter one
+            // written for it is a port association and not a parameter one.
+            // Written by position the association names no formal, so the
+            // generic it reaches is the one the unit declares at that place
+            // -- without which an instance hands a parameter pin to a
+            // generic the entity lowered as data, and the two disagree.
             const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
-            const VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
-            if (gsymp && m_dataGenerics.count(gsymp->resolved())) {
-                // Joined by the name written for it, which is what a named
-                // association gives -- and only a named one is ever marked
-                pinsp = AstNode::addNext(pinsp, pinp);
-                continue;
-            }
+            const VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : posSymp;
             // A binding's generic map associates the *entity's* generics,
             // where this one associates the *component's* (7.3.2.2). Where a
             // binding gives one, it is what the entity is elaborated with,
             // and what is written here is the component's own -- read by the
-            // binding's actuals rather than passed on.
+            // binding's actuals rather than passed on. Asked before the
+            // generic's own kind, since a component generic the binding
+            // consumes names nothing in the module this instantiates.
             if (bindingp && bindingp->genericMapp() && bindGenericNames.count(pinp->name())) {
                 VL_DO_DANGLING(pinp->deleteTree(), pinp);
+                continue;
+            }
+            if (gsymp && m_dataGenerics.count(gsymp->resolved())) {
+                pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }
             paramsp = AstNode::addNext(paramsp, pinp);
@@ -15758,7 +15775,17 @@ private:
                         }
                     }
                 }
-                if (pinp && !pinNamed(paramsp, pinp->name())) {
+                // A generic of the entity that travels as data takes a
+                // port association here too, exactly as it does at the
+                // instance: the binding supplies the entity's generics, and
+                // one lowered as an input is not a parameter to override.
+                const bool bindData = pinp && m_dataGenericNamesOf.count(modName)
+                                      && m_dataGenericNamesOf[modName].count(pinp->name());
+                if (bindData && !pinNamed(pinsp, pinp->name())) {
+                    pinsp = AstNode::addNext(pinsp, pinp);
+                } else if (bindData) {
+                    VL_DO_DANGLING(pinp->deleteTree(), pinp);
+                } else if (pinp && !pinNamed(paramsp, pinp->name())) {
                     paramsp = AstNode::addNext(paramsp, pinp);
                 } else if (pinp) {
                     VL_DO_DANGLING(pinp->deleteTree(), pinp);
@@ -23058,6 +23085,18 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 }
             }
         });
+    }
+    // The same answer keyed by the entity's name, for a binding indication:
+    // it associates the entity's own generics, and written by position it
+    // names none of them, so the name resolved from the entity's order is
+    // all there is to ask about.
+    for (const auto& pair : entityByName) {
+        for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(gp, VhdlIfaceDecl);
+            if (ifp && ifp->vhdlSymp() && m_dataGenerics.count(ifp->vhdlSymp()->resolved())) {
+                m_dataGenericNamesOf[pair.first].insert(ifp->name());
+            }
+        }
     }
     // Which bounds are written in terms of one of those. Done once for the
     // whole design, so that an instance lowered before its entity finds the
