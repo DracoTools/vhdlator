@@ -732,6 +732,11 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
         V3EmitV::verilogForTree(senItemp, ss);
         ss << ")";
         std::string desc = VString::quoteBackslash(ss.str());
+        // The description is emitted as a C++ string literal, so a double
+        // quote in the Verilog it echoes -- a string literal in the sensed
+        // expression, as in 'wait (s == "text")' -- has to be escaped, after
+        // the backslashes and not before, or the escape is escaped in turn
+        desc = VString::quoteAny(desc, '"', '\\');
         desc = VString::replaceSubstr(desc, "\n", "\\n");
         addDebug(i, desc);
     }

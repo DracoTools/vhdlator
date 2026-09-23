@@ -673,11 +673,16 @@ class TimingControlVisitor final : public VNVisitor {
     AstCExpr* createEventDescription(AstSenTree* const sentreep) const {
         if (!sentreep->user2p()) {
             std::stringstream ss;
-            ss << '"';
             V3EmitV::verilogForTree(sentreep, ss);
-            ss << '"';
+            // The description is emitted as a C++ string literal, so a
+            // backslash or a double quote in the Verilog it echoes -- a
+            // string literal in the sensed expression, as in
+            // 'wait (s == "text")' -- has to be escaped. Quotes after
+            // backslashes, or the escape added here is escaped in turn.
+            std::string inner = VString::quoteBackslash(ss.str());
+            inner = VString::quoteAny(inner, '"', '\\');
             // possibly a multiline string
-            std::string comment = ss.str();
+            std::string comment = '"' + inner + '"';
             std::replace(comment.begin(), comment.end(), '\n', ' ');
             AstCExpr* const commentp = new AstCExpr{sentreep->fileline(), comment};
             commentp->dtypeSetString();
