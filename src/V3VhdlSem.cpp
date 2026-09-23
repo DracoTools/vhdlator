@@ -10155,7 +10155,36 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         }
         cands.swap(keep);
     }
-    if (cands.empty()) {
+    // A name that resolved as a call may still be the other reading. "f(i)",
+    // where every parameter of f has a default, is a call handing i to the
+    // first parameter and equally the defaulted call's result indexed by i
+    // (4.2.2.1, 8.4); both are legal text, so the context decides between
+    // them exactly as it decides between two overloads. Where what the call
+    // gives back is not what the context asks for, and what indexing the
+    // result gives back is, the second reading is the one meant.
+    bool indexedFits = false;
+    if (!cands.empty() && wantp && !wantp->isError()) {
+        for (VhdlSymbol* const symp : found) {
+            VhdlSymbol* const fp = symp->resolved();
+            if (fp->kind() != VhdlSymKind::FUNCTION) continue;
+            if (!fp->paramTypes().empty() && !allParamsDefaulted(fp)) continue;
+            VhdlType* const retp = fp->returnTypep();
+            if (!retp || retp->base()->kind() != VhdlTypeKind::ARRAY) continue;
+            const VhdlType* const elemp
+                = retp->elementp() ? retp->elementp() : retp->base()->elementp();
+            if (elemp && elemp->base() == wantp->base()) indexedFits = true;
+        }
+    }
+    // Where both readings give what the context asks for, 12.5 read strictly
+    // makes the name ambiguous, and GHDL 7.0.0-dev refuses it on exactly that
+    // ground. That reading cannot be taken here: OSVVM writes
+    // "GetAlertCount(...)" beside a GetAlertCount with every parameter
+    // defaulted returning an array, and refusing it costs OSVVM 20 files,
+    // every one of VUnit's 68 testbenches and the whole compliance set. nvc
+    // 1.22.1 and Questa 25.1std accept such a design, and a corpus that must
+    // be accepted outranks one reference refusing. So the call wins wherever
+    // it fits, and the indexed reading is taken only where nothing else does.
+    if (cands.empty() || (indexedFits && bestFits == 0)) {
         // A function whose parameters all have defaults may be called by
         // naming it (4.2.2.1), and then a following parenthesis indexes the
         // result rather than passing arguments: "cfg.get_val(3)" where
