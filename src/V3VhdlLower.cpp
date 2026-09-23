@@ -3351,10 +3351,15 @@ private:
             typep = asLongAsp;
         }
         // A string literal is as long as its own text and no longer (9.3.2),
-        // whatever type the context gave it
+        // and a bit string literal as long as its base and any length written
+        // in front make it (15.8) -- whatever type the context gave either
         {
             const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
-            if (litp && litp->kind() == VhdlLitKind::STRING) typep = nullptr;
+            if (litp
+                && (litp->kind() == VhdlLitKind::STRING
+                    || litp->kind() == VhdlLitKind::BITSTRING)) {
+                typep = nullptr;
+            }
         }
         // A signal-class formal names the caller's own signal (4.2.2.3), so
         // how long it is is the signal's business, not the open subtype the
@@ -3417,7 +3422,16 @@ private:
         }
         if (!typep || !typep->isConstrainedArray()) {
             const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
-            if (!litp || litp->kind() != VhdlLitKind::STRING) return nullptr;
+            // A bit string literal is a literal of an array of a character
+            // type just as a string literal is (15.8), so it goes into a
+            // carrier the same way. The scanner has already written it out in
+            // ones and zeros and applied any length given in front of it, so
+            // its text is its elements here as much as a string literal's is.
+            if (!litp
+                || (litp->kind() != VhdlLitKind::STRING
+                    && litp->kind() != VhdlLitKind::BITSTRING)) {
+                return nullptr;
+            }
             // A literal of no elements has nothing to copy across
             if (litp->text().empty()) {
                 AstNodeFTask* const nullFuncp = dynNullFunc(carrierTypep, flp);
