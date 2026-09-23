@@ -5635,6 +5635,46 @@ bool VhdlSemVisitor::returnsACall(AstNode* stmtsp) {
     return false;
 }
 
+// Whether two array subtypes hold as many elements as each other, though
+// neither says how many as a number here. Two writings of the same range do,
+// and so do a range and its reverse: "0 to n-1" and "n-1 downto 0" are as
+// long as each other whatever n turns out to be. Anything else settles
+// nothing, and the caller treats it as a disagreement.
+static bool sameUnfoldedSpan(const VhdlType* ap, const VhdlType* bp) {
+    if (!ap || !bp) return false;
+    if (ap == bp) return true;
+    if (ap->indexTypes().empty() || ap->indexTypes().size() != bp->indexTypes().size()) {
+        return false;
+    }
+    for (size_t i = 0; i < ap->indexTypes().size(); ++i) {
+        const VhdlType* const aip = ap->indexTypes()[i];
+        const VhdlType* const bip = bp->indexTypes()[i];
+        if (!aip || !bip) return false;
+        if (aip->bounded() && bip->bounded()) {
+            if (aip->length() != bip->length()) return false;
+            continue;
+        }
+        const AstVhdlRange* const arp = VN_CAST(aip->boundsp(), VhdlRange);
+        const AstVhdlRange* const brp = VN_CAST(bip->boundsp(), VhdlRange);
+        if (!arp || !brp || arp->dirUnknown() || brp->dirUnknown()) return false;
+        if (!arp->leftp() || !arp->rightp() || !brp->leftp() || !brp->rightp()) return false;
+        // A range and its reverse run between the same two bounds, so the
+        // ends are matched crosswise where the two run opposite ways
+        const bool reversed = arp->dir() != brp->dir();
+        const AstNode* const leftp = reversed ? brp->rightp() : brp->leftp();
+        const AstNode* const rightp = reversed ? brp->leftp() : brp->rightp();
+        if (!arp->leftp()->sameTree(leftp) || !arp->rightp()->sameTree(rightp)) return false;
+    }
+    // An element that is itself an array has to agree too, since the value is
+    // only as long as its elements make it
+    const VhdlType* const aep = ap->elementp() ? ap->elementp() : ap->base()->elementp();
+    const VhdlType* const bep = bp->elementp() ? bp->elementp() : bp->base()->elementp();
+    if (aep && bep && aep->base()->kind() == VhdlTypeKind::ARRAY) {
+        return sameUnfoldedSpan(aep, bep);
+    }
+    return true;
+}
+
 // The type of the first return statement that has a length of its own
 void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep,
                                       bool skipZero, bool& sawOpen, bool& sawUnfolded) {
@@ -5679,7 +5719,13 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
                 // whichever path ran, so it carries its bounds.
                 if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY && !folds) {
                     sawUnfolded = true;
-                    if (foundp) {
+                    // Two paths whose lengths are both written rather than
+                    // folded can still be shown to agree with each other,
+                    // which is what UVVM's normalize_and_check asks: it fills
+                    // one of two arrays as long as each other, "0 to
+                    // target'length - 1" or "target'length - 1 downto 0", and
+                    // returns whichever runs the way the value does
+                    if (foundp && !sameUnfoldedSpan(foundp, typep)) {
                         foundp = nullptr;
                         disagreep = true;
                         return;
