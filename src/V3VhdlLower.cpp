@@ -22170,7 +22170,18 @@ private:
             varp->funcLocal(true);
             // A parameter with a default value may be left out of a call
             // (4.2.2.1), which is what an initial value on the port means here
-            if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
+            if (ifp->defaultp()) {
+                AstNodeExpr* initp = nullptr;
+                // A parameter of an unconstrained type is handed a value
+                // carrying its own bounds, and its default is a value like
+                // any other: "v : bit_vector := "1010"" leaves the elements
+                // to the default where the call names none
+                if (dyn && !isDynValue(ifp->defaultp())) {
+                    initp = asDynCarrier(ifp->defaultp(), psymp->typep(), flp);
+                }
+                if (!initp) initp = lowerExpr(ifp->defaultp());
+                varp->valuep(initp);
+            }
             // A copy of a subprogram shares its formals' symbols with the
             // original, so the mapping is overwritten rather than added to;
             // the caller puts back what was there
