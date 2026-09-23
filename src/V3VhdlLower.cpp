@@ -10385,6 +10385,13 @@ private:
                 // them before Verilator's fixed-width form can be used.
                 if (!VN_IS(leftp, Const) || !VN_IS(rightp, Const)) {
                     if (sliceSpanKnown(rp)) {
+                        // Elements that do not pack have no bits for a part
+                        // select to cut, so such a slice is copied out
+                        // element by element instead
+                        if (AstNodeExpr* const cpyp
+                            = unpackedSlice(rp, prefixTypep, fromp, leftp, rightp, flp)) {
+                            return cpyp;
+                        }
                         if (AstNodeExpr* const selp
                             = indexedSlice(rp, fromp, leftp, rightp, flp)) {
                             return selp;
@@ -10832,6 +10839,62 @@ private:
             if (typep->dimLength(dim) == 0) return true;
         }
         return false;
+    }
+
+    // How many elements lie between a slice's ends, where that is a number
+    // here rather than something only the elaboration or the run settles.
+    // Zero where it is not.
+    int64_t constSliceSpan(AstVhdlRange* rp) {
+        if (!rp || !rp->leftp() || !rp->rightp()) return 0;
+        LinearForm span;
+        linearAdd(span, rp->leftp(), 1, 0);
+        linearAdd(span, rp->rightp(), -1, 0);
+        bool ok = span.ok;
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0) ok = false;
+        }
+        const int64_t sign = rp->dir() == VhdlDir::DOWNTO ? 1 : -1;
+        const int64_t out = ok ? sign * span.konst + 1 : 0;
+        span.clear();
+        return out > 0 && out <= 4096 ? out : 0;
+    }
+
+    // A slice of elements that do not pack has no bit range for an indexed
+    // part select to cut, so it is written out one element at a time, as an
+    // assignment pattern -- the same way concatenation of such arrays is.
+    // The elements are taken from the end the slice names outwards, which
+    // puts them in the slice's own order however the object is numbered
+    // (8.5). The ends themselves need not be numbers: only how many elements
+    // lie between them has to be, which is what lets "a(i to i + 3)" work.
+    AstNodeExpr* unpackedSlice(AstVhdlRange* rp, const VhdlType* objTypep, AstNodeExpr* fromp,
+                               AstNodeExpr* leftp, AstNodeExpr* rightp, FileLine* flp) {
+        if (!objTypep || objTypep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        const VhdlType* const elemp = objTypep->base()->elementp();
+        if (!elemp || elementPacks(elemp) || isStringType(objTypep)) return nullptr;
+        const int64_t span = constSliceSpan(rp);
+        if (!span) return nullptr;
+        // The object is read once per element and the bound is worked out
+        // once per element, so neither may be something that could answer
+        // differently the second time
+        if (!repeatable(fromp) || !leftp->isPure()) return nullptr;
+        const bool downto = rp->dir() == VhdlDir::DOWNTO;
+        AstNode* outp = nullptr;
+        for (int64_t k = 0; k < span; ++k) {
+            AstNodeExpr* idxp = leftp->cloneTree(false);
+            if (k) {
+                AstNodeExpr* const stepp
+                    = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(k)};
+                idxp = downto ? static_cast<AstNodeExpr*>(new AstSub{flp, idxp, stepp})
+                              : static_cast<AstNodeExpr*>(new AstAdd{flp, idxp, stepp});
+            }
+            outp = AstNode::addNextNull(
+                outp, new AstPatMember{flp, new AstSelBit{flp, fromp->cloneTree(false), idxp},
+                                       nullptr, nullptr});
+        }
+        VL_DO_DANGLING(fromp->deleteTree(), fromp);
+        VL_DO_DANGLING(leftp->deleteTree(), leftp);
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        return new AstPattern{flp, outp};
     }
 
     AstNodeExpr* unpackedConcat(AstVhdlBinary* nodep, AstNodeExpr* lhsp, AstNodeExpr* rhsp,
