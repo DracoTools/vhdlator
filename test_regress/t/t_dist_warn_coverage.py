@@ -102,7 +102,6 @@ for s in [
         'Unsupported: Public functions with return > 64 bits wide.',
         'Unsupported: Replication to form',
         'Unsupported: Size-changing cast on non-basic data type',
-        'Unsupported: Slice of non-constant bounds',
         'Unsupported: Using --protect-ids with public function',
         'Unsupported: Verilog 1995 gate primitive:',
         'Unsupported: [] dimensions',

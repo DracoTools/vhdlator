@@ -1,0 +1,6 @@
+%Error-UNSUPPORTED: t/t_select_bad_nonconst_slice.v:17:14: Unsupported: Slice of non-constant bounds
+                                                         : ... note: In instance 't'
+   17 |       v = arr[i*4 +: 4];
+      |              ^
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error: Exiting due to

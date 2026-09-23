@@ -572,6 +572,12 @@ class WidthSelVisitor final : public VNVisitor {
                 VL_DO_DANGLING(pushDeletep(nodep), nodep);
             } else {
                 nodep->v3warn(E_UNSUPPORTED, "Unsupported: Slice of non-constant bounds");
+                // Recover by stripping a dimension, as the bad-extract case
+                // below does. Leaving the select in place makes V3Width fail
+                // "AstSelPlus should disappear after widthSel", so the user
+                // is handed an internal error instead of the message above.
+                nodep->replaceWith(fromp);
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
             }
         } else if (VN_IS(ddtypep, BasicDType) || VN_IS(ddtypep, PackArrayDType)
                    || (VN_IS(ddtypep, NodeUOrStructDType)
