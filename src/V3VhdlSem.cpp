@@ -5817,7 +5817,8 @@ class VhdlSpecVisitor final : public VNVisitor {
     // the copy is made for. One object per pair, so that two calls supplying
     // the same element share a copy instead of each asking for its own.
     std::map<std::pair<const VhdlType*, const VhdlType*>, VhdlType*> m_elemSpecs;
-    int m_count = 0;
+    int m_count = 0;  // Copies made, for naming them apart
+    std::map<const VhdlSymbol*, int> m_copiesOf;  // Copies asked of each original
     bool m_madeOne = false;
 
     VL_UNCOPYABLE(VhdlSpecVisitor);
@@ -6447,8 +6448,14 @@ private:
         // the value.
         if (inProtectedType(bodyp) && boundsNameGeneric(actualTypes)) return;
         // A copy per call site is bounded by the source; a copy per *value*
-        // could not be, if a recursive call kept folding to a new one
-        if (m_count > 4096) return;
+        // could not be, if a recursive call kept folding to a new one. Such a
+        // recursion makes its copies of one subprogram -- a copy is never
+        // copied again, so every copy it makes names the same original -- and
+        // that is what is counted. Counting every copy of every subprogram
+        // instead stops a large design that is doing nothing wrong: UVVM's
+        // libraries together ask for more than 4096, and every call past the
+        // limit was left unspecialized and refused.
+        if (++m_copiesOf[symp] > 4096) return;
         const std::string name = symp->name() + "__V" + std::to_string(++m_count);
         // The copy's own body is analyzed before it is made, so the frame is
         // in place from here: a call it makes to what it is a copy of is the
