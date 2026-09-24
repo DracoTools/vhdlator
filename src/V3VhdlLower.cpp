@@ -5502,6 +5502,14 @@ private:
             } else {
                 varp->valuep(defaultValueFor(symp->typep(), flp));
             }
+            // A constant elaboration settles is a parameter only where its
+            // value folds: one given what an impure function returns --
+            // "(new_queue, new_queue)", two handles a verification library
+            // allocates -- is an object given its value once. A bound that
+            // names it reads its subtype, which is as static either way.
+            if (varp->varType() == VVarType::LPARAM && !valueFolds(varp->valuep())) {
+                varp->varType(VVarType::VAR);
+            }
             addStmt(varp);
             if (fillp) {
                 // How many characters, worked out into an object of its own:
