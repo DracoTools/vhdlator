@@ -307,6 +307,62 @@ class SliceVisitor final : public VNVisitor {
         VL_DO_DANGLING(nodep->deleteTree(), nodep);
     }
 
+    // Whether the VlUnpacked holding each type pairs their elements position
+    // by position the way the language does, which is from the left: the
+    // same count and direction in every dimension
+    static bool sameLayout(const AstNodeDType* ap, const AstNodeDType* bp) {
+        ap = ap->skipRefp();
+        bp = bp->skipRefp();
+        const AstUnpackArrayDType* const aarrp = VN_CAST(ap, UnpackArrayDType);
+        const AstUnpackArrayDType* const barrp = VN_CAST(bp, UnpackArrayDType);
+        if (!aarrp || !barrp) return !aarrp && !barrp;
+        return aarrp->rangep()->elementsConst() == barrp->rangep()->elementsConst()
+               && aarrp->rangep()->ascending() == barrp->rangep()->ascending()
+               && sameLayout(aarrp->subDTypep(), barrp->subDTypep());
+    }
+    // Whether the types differ only in the direction of the outer dimension,
+    // which a reversed copy of the whole array puts right
+    static bool reversedLayout(const AstNodeDType* ap, const AstNodeDType* bp) {
+        const AstUnpackArrayDType* const aarrp = VN_CAST(ap->skipRefp(), UnpackArrayDType);
+        const AstUnpackArrayDType* const barrp = VN_CAST(bp->skipRefp(), UnpackArrayDType);
+        return aarrp && barrp
+               && aarrp->rangep()->elementsConst() == barrp->rangep()->elementsConst()
+               && aarrp->rangep()->ascending() != barrp->rangep()->ascending()
+               && sameLayout(aarrp->subDTypep(), barrp->subDTypep());
+    }
+    // An operand that is an array in storage, as cloneAndSel selects from
+    static bool wholeArray(const AstNode* nodep) {
+        return VN_IS(nodep, NodeVarRef) || VN_IS(nodep, NodeSel) || VN_IS(nodep, CMethodHard)
+               || VN_IS(nodep, MemberSel) || VN_IS(nodep, StructSel);
+    }
+    // The operand's array with the outer dimension reversed, laid out as dtypep
+    static AstNodeExpr* reversedCopy(AstNodeExpr* nodep, AstNodeDType* dtypep) {
+        FileLine* const flp = nodep->fileline();
+        AstCExpr* const revp
+            = nodep->isPure() ? new AstCExpr{flp, AstCExpr::Pure{}} : new AstCExpr{flp};
+        revp->add("VL_PACK_REVERSED(");
+        revp->add(nodep);
+        revp->add(")");
+        revp->dtypep(dtypep);
+        return revp;
+    }
+    // Whether an assignment's value can be copied whole into an array of
+    // dtypep, reversed first where that puts it right
+    static bool copiesWhole(AstNodeExpr* rhsp, const AstNodeDType* dtypep, bool& reverse) {
+        reverse = false;
+        if (VN_IS(rhsp, InitArray)) return true;  // Made for the target, index by index
+        if (const AstCond* const condp = VN_CAST(rhsp, Cond)) {
+            bool thenReverse;
+            bool elseReverse;
+            return copiesWhole(condp->thenp(), dtypep, thenReverse)
+                   && copiesWhole(condp->elsep(), dtypep, elseReverse) && !thenReverse
+                   && !elseReverse;
+        }
+        if (sameLayout(dtypep, rhsp->dtypep())) return true;
+        reverse = wholeArray(rhsp) && reversedLayout(dtypep, rhsp->dtypep());
+        return reverse;
+    }
+
     bool assignOptimize(AstNodeAssign* nodep) {
         // Return true if did optimization
         AstNodeDType* const dtp = nodep->lhsp()->dtypep()->skipRefp();
@@ -324,10 +380,19 @@ class SliceVisitor final : public VNVisitor {
             return false;
         }
 
-        // Skip optimization if array is too large
+        // Skip optimization if array is too large. Left whole, VlUnpacked
+        // copies position by position, which is the language's pairing from
+        // the left only when both sides run the same way: past the limit
+        // 'up = dn' assigned up[0] from dn[0] rather than from dn[299].
         const int elements = arrayp->rangep()->elementsConst();
         const int elementLimit = v3Global.opt.fSliceElementLimit();
-        if (elements > elementLimit && elementLimit > 0) {
+        bool reverse = false;
+        if (elements > elementLimit && elementLimit > 0
+            && copiesWhole(nodep->rhsp(), arrayp, reverse)) {
+            if (reverse) {
+                AstNodeExpr* const rhsp = nodep->rhsp()->unlinkFrBack();
+                nodep->rhsp(reversedCopy(rhsp, nodep->lhsp()->dtypep()));
+            }
             ++m_statSliceElementSkips;
             m_okInitArray = true;  // VL_RESTORER in visit(AstNodeAssign)
             return false;
