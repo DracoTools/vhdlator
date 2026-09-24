@@ -454,6 +454,7 @@ def run_group(command, timeout, cwd=None):
 UNIT_DECL_RE = re.compile(
     r'^[ \t]*(?:package(?![ \t]+body\b)|entity|context|configuration)[ \t]+(\w+)',
     re.IGNORECASE | re.MULTILINE)
+BODY_DECL_RE = re.compile(r'^[ \t]*package[ \t]+body[ \t]+(\w+)', re.IGNORECASE | re.MULTILINE)
 MISSING_UNIT_RE = re.compile(r"Design unit '([^'.]*)\.([^'.]+)' not found")
 # A component instantiation whose entity nothing supplied reaches the linker
 # rather than the library, and says so in Verilog's words
@@ -486,6 +487,33 @@ def unit_index(directory):
         for match in UNIT_DECL_RE.finditer(text):
             index.setdefault(match.group(1).lower(), []).append(path)
     _UNIT_INDEX[directory] = index
+    return index
+
+
+_BODY_INDEX = {}
+
+
+def body_index(directory):
+    """Map each package name whose body is in this directory to the files holding it."""
+    if directory in _BODY_INDEX:
+        return _BODY_INDEX[directory]
+    index = {}
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(('.vhd', '.vhdl')):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for match in BODY_DECL_RE.finditer(text):
+            index.setdefault(match.group(1).lower(), []).append(path)
+    _BODY_INDEX[directory] = index
     return index
 
 
@@ -594,6 +622,22 @@ def missing_companions(path, output, already):
             # into work and then into chips, and is in both from then on
             out.append((choice, want))
             seen.add(os.path.basename(choice))
+            # A package's body is part of the design as much as the package:
+            # without it every subprogram the package declares has nothing
+            # to run, and a source calling one is refused for a file the
+            # corpus analyzes but the census left out (VESTS' bv_arithmetic)
+            # Several files may give one package a body, as several may
+            # declare it, and the same order decides which one was meant; the
+            # declaration's own file needs none beside it
+            bodies = [body for body in body_index(os.path.dirname(path)).get(name.lower(), [])
+                      if body != path and os.path.basename(body) not in seen
+                      and expected_outcome(body) == 'accept']
+            if choice in body_index(os.path.dirname(path)).get(name.lower(), []):
+                bodies = []
+            body = order_choice(path, bodies, want) or (bodies[0] if len(bodies) == 1 else None)
+            if body:
+                out.append((body, want))
+                seen.add(os.path.basename(body))
     return out
 
 
