@@ -938,6 +938,7 @@ class ConstVisitor final : public VNVisitor {
     const AstAttrOf* m_attrp = nullptr;  // Current attribute
     VDouble0 m_statBitOpReduction;  // Ops reduced in ConstBitOpTreeVisitor
     VDouble0 m_statConcatMerge;  // Concat merges
+    VDouble0 m_statConcatChain;  // Concatenations of constants folded whole
     VDouble0 m_statCondExprRedundant;  // Conditional repeated expressions
     VDouble0 m_statIfCondExprRedundant;  // Conditional repeated expressions
     const bool m_globalPass;  // ConstVisitor invoked as a global pass
@@ -3359,6 +3360,62 @@ class ConstVisitor final : public VNVisitor {
         m_hasJumpDelay = true;
         iterateChildren(nodep);
     }
+    // Fold a concatenation whose every term is a constant in one step. The
+    // rules fold a concatenation a pair at a time from the leaves up, and each
+    // step copies all that has been folded so far, so a chain of n terms costs
+    // time and memory quadratic in n -- the intermediate constants are kept
+    // until the pass ends. A 16384-word ROM image written as one concatenation
+    // took 53 s and 1.1 GB. Done from the top of the chain, before its terms
+    // are visited, each term's bits are placed exactly once. Only what the
+    // pairwise rule would fold is folded here: predictable concatenations of
+    // sized logic constants.
+    bool foldConcatChain(AstConcat* nodep) {
+        if (!nodep->width()) return false;
+        // Where the parent is a concatenation too, it folds this one with it
+        if (const AstConcat* const upp = VN_CAST(nodep->backp(), Concat)) {
+            if (upp->lhsp() == nodep || upp->rhsp() == nodep) return false;
+        }
+        // The terms, least significant first. A chain is as deep as it has
+        // terms, so it is walked without recursing.
+        std::vector<AstConst*> terms;
+        std::vector<AstNode*> stack{nodep};
+        size_t concats = 0;
+        int width = 0;
+        while (!stack.empty()) {
+            AstNode* const itemp = stack.back();
+            stack.pop_back();
+            if (AstConcat* const concatp = VN_CAST(itemp, Concat)) {
+                if (!concatp->isPredictOptimizable()) return false;
+                ++concats;
+                stack.push_back(concatp->lhsp());
+                stack.push_back(concatp->rhsp());
+                continue;
+            }
+            AstConst* const constp = VN_CAST(itemp, Const);
+            // An unsized term is left to the rule, which warns about it
+            if (!constp || constp->num().isOpaque() || !constp->num().sized()) return false;
+            terms.push_back(constp);
+            width += constp->widthMinV();
+        }
+        // A single pair is the rule's own case
+        if (concats < 2 || width != nodep->widthMinV()) return false;
+        V3Number numv{nodep, nodep->widthMinV(), 0};
+        int obit = 0;
+        for (AstConst* const constp : terms) {
+            const V3Number termv = constNumV(constp);
+            numv.opSelInto(termv, obit, termv.width());
+            obit += termv.width();
+        }
+        UINFO(4, "CONCATCHAIN " << terms.size() << " terms -> " << numv.width() << " bits");
+        ++m_statConcatChain;
+        VL_DO_DANGLING(replaceNum(nodep, toNumC(nodep, numv)), nodep);
+        return true;
+    }
+    void visit(AstConcat* nodep) override {
+        if (foldConcatChain(nodep)) return;
+        iterateChildren(nodep);
+        visitGen(nodep);
+    }
     void visit(AstNodeVarRef* nodep) override {
         iterateChildren(nodep);
         UASSERT_OBJ(nodep->varp(), nodep, "Not linked");
@@ -4260,6 +4317,7 @@ class ConstVisitor final : public VNVisitor {
     // clang-format off
     TREE_SKIP_VISIT("ArraySel");
     TREE_SKIP_VISIT("CAwait");
+    TREE_SKIP_VISIT("Concat");
 
     //-----
     //  "AstNODETYPE {             # bracket not paren
@@ -4675,6 +4733,7 @@ public:
         V3Stats::addStatSum("Optimizations, If cond redundant expressions",
                             m_statIfCondExprRedundant);
         V3Stats::addStatSum("Optimizations, Concat merges", m_statConcatMerge);
+        V3Stats::addStatSum("Optimizations, Const concat chains", m_statConcatChain);
     }
 
     AstNode* mainAcceptEdit(AstNode* nodep) {
