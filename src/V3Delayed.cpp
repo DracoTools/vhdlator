@@ -443,10 +443,21 @@ class DelayedVisitor final : public VNVisitor {
             return Scheme::ShadowVar;
         }
 
-        // In a suspendable of fork, we must use the unique flag scheme, TODO: why?
-        if (vscpInfo.m_inSuspOrFork) return Scheme::FlagUnique;
-
         const bool isIntegralOrPacked = dtypep->isIntegralOrPacked();
+
+        // In a suspendable or fork, we must use the unique flag scheme, TODO: why?
+        // Except where the NBA is in a loop: a unique flag holds one value
+        // per NBA, so a loop writing different bits of a packed variable
+        // would commit only its last write. The masked shadow scheme has no
+        // 'Pre' copy, which is what cannot follow a suspendable, and commits
+        // every bit written, so it works there too.
+        if (vscpInfo.m_inSuspOrFork) {
+            if (isIntegralOrPacked && vscpInfo.m_inLoop && vscpInfo.m_partial) {
+                return Scheme::ShadowVarMasked;
+            }
+            return Scheme::FlagUnique;
+        }
+
         // Check for mixed usage (this also warns if not OK)
         if (checkMixedUsage(vscp, isIntegralOrPacked)) {
             // If it's a variable updated by both blocking and non-blocking
