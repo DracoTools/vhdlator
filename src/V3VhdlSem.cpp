@@ -6009,6 +6009,13 @@ private:
                 case VhdlSymKind::CONSTANT:
                     if (!refSymp->resolved()->hasValue()) ok = false;
                     break;
+                case VhdlSymKind::SIGNAL:
+                    // A signal parameter of the calling subprogram is one of
+                    // its formals as much as a constant one is: "rid'length"
+                    // over "signal rid : in std_logic_vector" is known only
+                    // in the copy made for that call's signal (4.2.2.3)
+                    if (VN_IS(refSymp->resolved()->declp(), VhdlIfaceDecl)) ok = false;
+                    break;
                 default: break;
                 }
             });
