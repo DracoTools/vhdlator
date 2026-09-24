@@ -17062,6 +17062,94 @@ private:
     // own subtype fixes them: the elements are copied across and the two
     // lengths have to match, which is a check only running can make
     // (10.5.2.1). Anything else is lowered as it stands.
+    // "s(a to b) <= v" in a process, where only running settles a and b:
+    // one scheduled assignment per place, in a loop, since which places the
+    // slice has is only known when it runs, once the lengths are checked
+    // (10.5.2.2). Left to the assignment, the slice was a part select whose
+    // ends are not constants (GHDL's issue2620 clears "dec_vld(i downto 0)").
+    // The value is a carrier, or one value for every place where it is an
+    // aggregate that gives them all the same one.
+    AstNode* runningSliceDrive(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, AstNode* delayp,
+                               FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        VhdlType* const objTypep = callp ? callp->prefixp()->vhdlTypep() : nullptr;
+        if (!rangep || !objTypep || !objTypep->isConstrainedArray() || !valuep) {
+            unsup(flp, "signal assignment to a slice whose ends only running settles");
+            return nullptr;
+        }
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, asc, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            unsup(flp, "signal assignment to a slice whose ends only running settles");
+            return nullptr;
+        }
+        AstNodeExpr* const objp = lowerDriveTarget(callp->prefixp());
+        AstNodeVhdlExpr* const uniformp = uniformAggregateValue(valuep);
+        AstNodeExpr* const elemp = objp && uniformp ? lowerExpr(uniformp) : nullptr;
+        AstNodeExpr* const carrp
+            = objp && !uniformp ? asDynCarrier(valuep, objTypep->base(), flp) : nullptr;
+        if (!objp || !repeatable(objp) || (!elemp && !carrp)) {
+            for (AstNodeExpr* const p : {leftp, rightp, objp, elemp, carrp}) {
+                if (p) VL_DO_DANGLING(p->deleteTree(), p);
+            }
+            unsup(flp, "signal assignment to a slice whose ends only running settles");
+            return nullptr;
+        }
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        AstVar* const lop = newTempVar("__Vsdlo", newIntDType(flp), flp);
+        AstVar* const hip = newTempVar("__Vsdhi", newIntDType(flp), flp);
+        AstVar* const np = newTempVar("__Vsdn", newIntDType(flp), flp);
+        AstVar* const kp = newTempVar("__Vsdk", newIntDType(flp), flp);
+        kp->usedLoopIdx(true);
+        AstNode* outp = new AstAssign{flp, wr(lop, flp), intBound(leftp, flp)};
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAssign{flp, wr(hip, flp), intBound(rightp, flp)}));
+        // How many places, none for a null range
+        AstNodeExpr* const spanp = asc ? new AstSub{flp, rd(hip, flp), rd(lop, flp)}
+                                       : new AstSub{flp, rd(lop, flp), rd(hip, flp)};
+        AstNodeExpr* const placesp = new AstAdd{flp, spanp, num(1)};
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAssign{
+                      flp, wr(np, flp),
+                      new AstCond{flp, new AstLtS{flp, placesp->cloneTree(false), num(0)}, num(0),
+                                  placesp}}));
+        AstVar* cvarp = nullptr;
+        if (carrp) {
+            cvarp = newTempVar("__Vsdcarr", dynCarrierRef(objTypep->base(), flp), flp);
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssign{flp, wr(cvarp, flp), carrp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstIf{
+                          flp, new AstNeq{flp, dynCarrierLength(rd(cvarp, flp), flp), rd(np, flp)},
+                          new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match",
+                                         nullptr, nullptr},
+                          nullptr}));
+        }
+        outp = AstNode::addNext(outp,
+                                static_cast<AstNode*>(new AstAssign{flp, wr(kp, flp), num(0)}));
+        AstNodeExpr* const placep
+            = asc ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lop, flp), rd(kp, flp)})
+                  : new AstSub{flp, rd(lop, flp), rd(kp, flp)};
+        AstNodeExpr* const srcp
+            = elemp ? elemp : new AstSelBit{flp, dynPart(rd(cvarp, flp), "q", flp), rd(kp, flp)};
+        AstLoop* const loopp = new AstLoop{flp};
+        AstNodeExpr* testp = new AstLtS{flp, rd(kp, flp), rd(np, flp)};
+        if (cvarp) {
+            testp = new AstLogAnd{
+                flp, testp, new AstLtS{flp, rd(kp, flp), dynCarrierLength(rd(cvarp, flp), flp)}};
+        }
+        loopp->addStmtsp(new AstLoopTest{flp, loopp, testp});
+        loopp->addStmtsp(new AstAssignDly{flp, new AstSelBit{flp, objp, placep}, srcp,
+                                          delayp ? delayp->cloneTree(false) : nullptr});
+        loopp->addContsp(new AstAssign{flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), num(1)}});
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+    }
+
     AstNodeExpr* lowerDriveValue(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) {
         if (valuep && targetp && isDynValue(valuep) && !isDynObj(targetp)) {
@@ -17154,6 +17242,11 @@ private:
                 = transactionMark(nodep->targetp(), delayp, sequential, valuep, flp);
             return AstNode::addNextNull(
                 driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp), markp);
+        }
+        if (sequential && isRunningSlice(nodep->targetp())) {
+            AstNode* const outp = runningSliceDrive(nodep->targetp(), wfp->valuep(), delayp, flp);
+            if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+            return outp;
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp = lowerDriveValue(nodep->targetp(), wfp->valuep(), flp);
