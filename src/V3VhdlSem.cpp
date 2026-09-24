@@ -6277,6 +6277,27 @@ private:
         return true;
     }
 
+    // Whether every array inside a record says how long it is -- as a number,
+    // or in bounds an instance settles -- in terms a copy can carry. A
+    // verification component's interface port is an unconstrained record
+    // whose elements take their bounds from generics each instance binds
+    // (6.5.6.3); those are lengths, though not numbers here, and a BFM called
+    // with the port is worth a copy for them (5.3.3).
+    static bool recordLengthsTravel(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        for (const VhdlSymbol* const ep : typep->elements()) {
+            const VhdlType* const etp = ep->typep();
+            if (!etp) continue;
+            if (etp->base()->kind() == VhdlTypeKind::ARRAY && !lengthTravels(etp)) return false;
+            if (etp->base()->kind() == VhdlTypeKind::RECORD
+                && !VhdlSemVisitor::fullyConstrainedRecord(etp)
+                && !recordLengthsTravel(etp, depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // How many copies of a subprogram are being made or walked, each inside
     // the one before
     size_t nestedCopies(const VhdlSymbol* symp) const {
@@ -6409,7 +6430,7 @@ private:
             if (symp->paramTypes()[i]
                 && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::RECORD
                 && !VhdlSemVisitor::fullyConstrainedRecord(symp->paramTypes()[i])
-                && !VhdlSemVisitor::fullyConstrainedRecord(typep)) {
+                && !VhdlSemVisitor::fullyConstrainedRecord(typep) && !recordLengthsTravel(typep)) {
                 return;
             }
             actualTypes.push_back(typep);
