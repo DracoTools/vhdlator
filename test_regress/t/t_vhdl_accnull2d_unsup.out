@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_accnull2d_unsup.vhd:20:14: Unsupported: VHDL allocator or dereference of an access to an array of more than one dimension with no bounds of its own cannot be lowered yet
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_accnull2d_unsup.vhd:21:10: Unsupported: VHDL allocator or dereference of an access to an array of more than one dimension with no bounds of its own cannot be lowered yet
+%Error: Exiting due to

@@ -1015,6 +1015,27 @@ private:
     }
     static bool isAccessAll(const AstNodeVhdlExpr* nodep) { return isAccessRead(nodep, false); }
 
+    // Whether an access type points at an array of more than one dimension
+    // whose bounds only an allocation could give it. Nothing here keeps such
+    // bounds, but the type is still a type: its values are null, compared,
+    // assigned and passed about, and only an allocator or a dereference asks
+    // for the object (VESTS tc519 declares such accesses and only ever
+    // compares them with null)
+    static bool opaqueAccess(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ACCESS) return false;
+        const VhdlType* const designatedp = typep->base()->designatedp();
+        return designatedp && designatedp->base()->kind() == VhdlTypeKind::ARRAY
+               && !designatedp->isConstrainedArray()
+               && designatedp->base()->indexTypes().size() > 1;
+    }
+    // Refusing what such an access points at, where something asks for it
+    bool refuseOpaque(const AstNodeVhdlExpr* accp, FileLine* flp) {
+        if (!opaqueAccess(typeOfExpr(accp))) return false;
+        unsup(flp, "allocator or dereference of an access to an array of more than one "
+                   "dimension with no bounds of its own");
+        return true;
+    }
+
     // Whether an array's own bounds ask for more elements than may sensibly
     // be emitted. The same limit lowerArrayType refuses at.
     static bool arrayTooLargeToEmit(const VhdlType* typep) {
@@ -1038,6 +1059,9 @@ private:
         m_accClasses.emplace(basep, classp);
         v3Global.setHasClasses();
         m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        // A handle to nothing it can be dereferenced to: what it points at
+        // has no type here, and anything that asks for it is refused
+        if (opaqueAccess(basep)) return classp;
         VhdlType* const designatedp = basep->designatedp();
         AstVar* const memberp
             = new AstVar{flp, VVarType::MEMBER, "all", VFlagChildDType{},
@@ -8122,6 +8146,7 @@ private:
     // here is an instance of the class the access type became (9.3.7)
     AstNodeExpr* lowerAllocator(AstVhdlAllocator* nodep) {
         FileLine* const flp = nodep->fileline();
+        if (refuseOpaque(nodep, flp)) return nullptr;
         if (dynAccessOfExpr(nodep)) return lowerDynAllocator(nodep, flp);
         AstNew* const newp = new AstNew{flp};
         AstNodeExpr* valuep = nullptr;
@@ -8789,6 +8814,7 @@ private:
         FileLine* const flp = nodep->fileline();
         // "p.all" reads what an access value points at (8.3)
         if (nodep->isAll()) {
+            if (refuseOpaque(nodep->prefixp(), flp)) return nullptr;
             AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
             // What an access to an array that carries its own bounds points
@@ -10447,6 +10473,7 @@ private:
                   && (prefixTypep->base()->kind() == VhdlTypeKind::ARRAY
                       || prefixTypep->base()->kind() == VhdlTypeKind::ACCESS));
         if (indexing) {
+            if (refuseOpaque(nodep->prefixp(), flp)) return nullptr;
             const DynAccess* dynp = nullptr;
             if (AstNodeVhdlExpr* const dynObjp = dynAccessObj(nodep->prefixp(), dynp)) {
                 AstNodeExpr* const objp = lowerExpr(dynObjp);
