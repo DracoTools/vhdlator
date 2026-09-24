@@ -11427,6 +11427,40 @@ private:
         // "to_string(t, unit)" writes a time in that unit (16.3). The unit
         // is a time of its own, so the value is scaled by it and the unit's
         // own name follows.
+        // "to_string(x, "%.3e")" over a REAL formats it as C's fprintf does
+        // with that one conversion specification: e, E, f, F, g or G, with
+        // flags, a width and a precision but no length modifier and no
+        // asterisk (5.2.6). The DIGITS form below takes a number; this one a
+        // string, and it is the argument's type that tells them apart.
+        if (name == "to_string" && args.size() == 2 && symp->predefined() && args[0]->vhdlTypep()
+            && args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::FLOATING
+            && args[1]->vhdlTypep() && isStringType(args[1]->vhdlTypep())) {
+            const VhdlValue fmtv = V3VhdlEval::eval(args[1]);
+            const std::string spec = fmtv.isStr() ? fmtv.toStr() : "";
+            // "%", flags, width, ".precision", one conversion letter
+            size_t pos = 1;
+            bool ok = spec.size() >= 2 && spec[0] == '%';
+            while (ok && pos < spec.size() && (spec[pos] == '-' || spec[pos] == '0')) ++pos;
+            while (ok && pos < spec.size() && std::isdigit(spec[pos])) ++pos;
+            if (ok && pos < spec.size() && spec[pos] == '.') {
+                ++pos;
+                while (pos < spec.size() && std::isdigit(spec[pos])) ++pos;
+            }
+            const char conv = ok && pos + 1 == spec.size() ? spec[pos] : '\0';
+            if (!conv || !std::strchr("eEfFgG", conv)) {
+                unsup(flp, "TO_STRING of a real with a format that is not a static e, f or g "
+                           "conversion");
+                return nullptr;
+            }
+            AstNodeExpr* const valuep = lowerExpr(args[0]);
+            if (!valuep) return nullptr;
+            const char lower = static_cast<char>(std::tolower(conv));
+            AstNodeExpr* const outp
+                = new AstSFormatF{flp, spec.substr(0, pos) + lower, false, valuep};
+            // The capital forms differ only in the letters they print
+            if (conv == lower) return outp;
+            return new AstToUpperN{flp, outp};
+        }
         // "to_string(x, n)" over a REAL is the value rounded to n digits
         // after the point, and to n of 0 is its image (16.3)
         if (name == "to_string" && args.size() == 2 && symp->predefined()
