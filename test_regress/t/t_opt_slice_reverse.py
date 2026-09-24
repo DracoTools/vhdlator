@@ -13,10 +13,10 @@ test.scenarios('simulator')
 
 test.compile(verilator_flags2=['--stats'])
 
-# Left whole: the 13 assignments of arrays past the limit whose sides run
-# the same way or differ only in the outer direction -- up, and each row of
-# u2, o2 and b2
-test.file_grep(test.stats, r'Optimizations, Slice array skips due to size limit\s+(\d+)', 13)
+# Left whole, as one operation each: up, o2 and h2 assigned and compared,
+# the up comparison changed, and the four rows of u2 and of b2, whose inner
+# dimensions differ, assigned and compared; 11 assignments, 12 comparisons
+test.file_grep(test.stats, r'Optimizations, Slice array skips due to size limit\s+(\d+)', 23)
 
 test.execute()
 

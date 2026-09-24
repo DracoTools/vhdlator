@@ -307,28 +307,42 @@ class SliceVisitor final : public VNVisitor {
         VL_DO_DANGLING(nodep->deleteTree(), nodep);
     }
 
+    // Elements over every unpacked dimension, which is what an expansion
+    // writes one term per; stops growing once past any sensible limit
+    static int64_t totalElements(const AstUnpackArrayDType* dtypep) {
+        int64_t total = 1;
+        for (const AstNodeDType* dp = dtypep;
+             const AstUnpackArrayDType* const adp = VN_CAST(dp, UnpackArrayDType);
+             dp = adp->subDTypep()->skipRefp()) {
+            total *= adp->rangep()->elementsConst();
+            if (total > (1 << 30)) break;
+        }
+        return total;
+    }
+
     // Whether the VlUnpacked holding each type pairs their elements position
     // by position the way the language does, which is from the left: the
-    // same count and direction in every dimension
-    static bool sameLayout(const AstNodeDType* ap, const AstNodeDType* bp) {
+    // same count and direction in every dimension. With leafToo, the elements
+    // must also be of one type, as for comparing them in C++.
+    static bool sameLayout(const AstNodeDType* ap, const AstNodeDType* bp, bool leafToo) {
         ap = ap->skipRefp();
         bp = bp->skipRefp();
         const AstUnpackArrayDType* const aarrp = VN_CAST(ap, UnpackArrayDType);
         const AstUnpackArrayDType* const barrp = VN_CAST(bp, UnpackArrayDType);
-        if (!aarrp || !barrp) return !aarrp && !barrp;
+        if (!aarrp || !barrp) return !aarrp && !barrp && (!leafToo || ap->similarDType(bp));
         return aarrp->rangep()->elementsConst() == barrp->rangep()->elementsConst()
                && aarrp->rangep()->ascending() == barrp->rangep()->ascending()
-               && sameLayout(aarrp->subDTypep(), barrp->subDTypep());
+               && sameLayout(aarrp->subDTypep(), barrp->subDTypep(), leafToo);
     }
     // Whether the types differ only in the direction of the outer dimension,
     // which a reversed copy of the whole array puts right
-    static bool reversedLayout(const AstNodeDType* ap, const AstNodeDType* bp) {
+    static bool reversedLayout(const AstNodeDType* ap, const AstNodeDType* bp, bool leafToo) {
         const AstUnpackArrayDType* const aarrp = VN_CAST(ap->skipRefp(), UnpackArrayDType);
         const AstUnpackArrayDType* const barrp = VN_CAST(bp->skipRefp(), UnpackArrayDType);
         return aarrp && barrp
                && aarrp->rangep()->elementsConst() == barrp->rangep()->elementsConst()
                && aarrp->rangep()->ascending() != barrp->rangep()->ascending()
-               && sameLayout(aarrp->subDTypep(), barrp->subDTypep());
+               && sameLayout(aarrp->subDTypep(), barrp->subDTypep(), leafToo);
     }
     // An operand that is an array in storage, as cloneAndSel selects from
     static bool wholeArray(const AstNode* nodep) {
@@ -358,8 +372,8 @@ class SliceVisitor final : public VNVisitor {
                    && copiesWhole(condp->elsep(), dtypep, elseReverse) && !thenReverse
                    && !elseReverse;
         }
-        if (sameLayout(dtypep, rhsp->dtypep())) return true;
-        reverse = wholeArray(rhsp) && reversedLayout(dtypep, rhsp->dtypep());
+        if (sameLayout(dtypep, rhsp->dtypep(), false)) return true;
+        reverse = wholeArray(rhsp) && reversedLayout(dtypep, rhsp->dtypep(), false);
         return reverse;
     }
 
@@ -380,14 +394,18 @@ class SliceVisitor final : public VNVisitor {
             return false;
         }
 
-        // Skip optimization if array is too large. Left whole, VlUnpacked
-        // copies position by position, which is the language's pairing from
-        // the left only when both sides run the same way: past the limit
-        // 'up = dn' assigned up[0] from dn[0] rather than from dn[299].
+        // Skip optimization if array is too large, counting the elements of
+        // every dimension: expanded, each is an assignment, and a 128 by 64
+        // array was 8192 of them. Left whole, VlUnpacked copies position by
+        // position, which is the language's pairing from the left only when
+        // both sides run the same way: past the limit 'up = dn' assigned
+        // up[0] from dn[0] rather than from dn[299].
         const int elements = arrayp->rangep()->elementsConst();
         const int elementLimit = v3Global.opt.fSliceElementLimit();
+        // SystemC arrays keep the outer count, having to be expanded otherwise
+        const int64_t size = hasSc ? elements : totalElements(arrayp);
         bool reverse = false;
-        if (elements > elementLimit && elementLimit > 0
+        if (elementLimit > 0 && size > elementLimit
             && copiesWhole(nodep->rhsp(), arrayp, reverse)) {
             if (reverse) {
                 AstNodeExpr* const rhsp = nodep->rhsp()->unlinkFrBack();
@@ -481,6 +499,37 @@ class SliceVisitor final : public VNVisitor {
         // Only expand if lhs is an unpacked array (we assume type checks already passed)
         const AstNodeDType* const fromDtp = nodep->lhsp()->dtypep()->skipRefp();
         if (const AstUnpackArrayDType* const adtypep = VN_CAST(fromDtp, UnpackArrayDType)) {
+            // Expanded, a comparison is one term per element, of every
+            // dimension: two int [1024][64] arrays compared once gave 14 MB
+            // of C++. Past the limit an assignment is left whole, and so is a
+            // comparison of two stored arrays laid out alike, or alike once
+            // one is reversed, which VlUnpacked makes element by element in
+            // a loop.
+            const int elementLimit = v3Global.opt.fSliceElementLimit();
+            const AstNodeDType* const rhsDtp = nodep->rhsp()->dtypep();
+            if (elementLimit > 0 && totalElements(adtypep) > elementLimit
+                && wholeArray(nodep->lhsp()) && wholeArray(nodep->rhsp())
+                && (sameLayout(adtypep, rhsDtp, true) || reversedLayout(adtypep, rhsDtp, true))) {
+                ++m_statSliceElementSkips;
+                FileLine* const flp = nodep->fileline();
+                const bool equal = VN_IS(nodep, Eq) || VN_IS(nodep, EqCase);
+                const bool reverse = !sameLayout(adtypep, rhsDtp, true);
+                AstNodeExpr* const lhsp = nodep->lhsp()->unlinkFrBack();
+                AstNodeExpr* rhsp = nodep->rhsp()->unlinkFrBack();
+                if (reverse) rhsp = reversedCopy(rhsp, lhsp->dtypep());
+                AstCExpr* const cmpp = lhsp->isPure() && rhsp->isPure()
+                                           ? new AstCExpr{flp, AstCExpr::Pure{}, "("}
+                                           : new AstCExpr{flp, "("};
+                cmpp->add(lhsp);
+                cmpp->add(equal ? " == " : " != ");
+                cmpp->add(rhsp);
+                cmpp->add(")");
+                cmpp->dtypeSetBit();
+                nodep->replaceWith(cmpp);
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
+                iterateChildren(cmpp);
+                return;
+            }
             AstNodeBiop* logp = nullptr;
 
             const int elements = adtypep->rangep()->elementsConst();
