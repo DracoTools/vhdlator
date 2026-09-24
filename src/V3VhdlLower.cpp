@@ -16668,8 +16668,22 @@ private:
     AstNodeExpr* lowerDriveValue(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) {
         if (valuep && targetp && isDynValue(valuep) && !isDynObj(targetp)) {
-            VhdlType* const ttypep = targetp->vhdlTypep();
-            if (ttypep && ttypep->isConstrainedArray()) {
+            VhdlType* ttypep = targetp->vhdlTypep();
+            // A signal-class formal is written with its open subtype, but it
+            // names the signal the call passed, and that is what has a length
+            // (4.2.2.3) -- "ifc.tdata <= d" in a BFM is as long as the port
+            // the VVC handed over
+            if (!ttypep || (!ttypep->isConstrainedArray() && !ttypep->lengthEmittable())) {
+                if (VhdlType* const boundp = boundTypeOf(targetp)) ttypep = boundp;
+            }
+            // A length elaboration settles is as good as a number here, as
+            // it is for a variable: an unconstrained port's element takes its
+            // bounds from generics the instance binds, and a value carrying
+            // its own bounds written into one was emitted as it stood -- a
+            // structure where the port has bits
+            if (ttypep
+                && (ttypep->isConstrainedArray()
+                    || (ttypep->lengthEmittable() && !lengthOnlyRunningDecides(ttypep)))) {
                 if (AstNodeExpr* const outp = dynAsFixed(valuep, ttypep, flp)) return outp;
             }
         }
