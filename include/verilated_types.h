@@ -1500,6 +1500,14 @@ public:
     T_Value& operator[](size_t index) { return m_storage[index]; }
     constexpr const T_Value& operator[](size_t index) const { return m_storage[index]; }
 
+    // An array holding one value in every element, which is what an
+    // initializer made only of a default is
+    static VlUnpacked filled(const T_Value& value) {
+        VlUnpacked result;
+        std::fill(std::begin(result.m_storage), std::end(result.m_storage), value);
+        return result;
+    }
+
     // *this != that, which might be used for change detection/trigger computation, but avoid
     // operator overloading in VlUnpacked for safety in other contexts.
     bool neq(const VlUnpacked<T_Value, N_Depth>& that) const { return neq(*this, that); }

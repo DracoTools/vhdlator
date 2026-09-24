@@ -41,6 +41,26 @@ class EmitCConstInit VL_NOT_FINAL : public EmitCBaseVisitorConst {
     }
 
 protected:
+    // Set while emitting a function body, where an initializer need not be a
+    // constant expression, and so can be a call
+    bool m_fillUniform = false;
+
+    // An array initializer whose default is every element is written as that
+    // default passed to VlUnpacked::filled once the array is long enough that
+    // an element list costs the C++ compiler: VESTS tc988 allocates records of
+    // nine 1024 by 64 arrays, 22 MB of list that g++ took 7.5 GB to read
+    bool emitsFilled(const AstInitArray* nodep) const {
+        if (!m_fillUniform || !nodep->map().empty() || !nodep->defaultp()) return false;
+        uint64_t total = 1;
+        for (const AstNodeDType* dtypep = nodep->dtypep()->skipRefp();
+             const AstUnpackArrayDType* const adtypep = VN_CAST(dtypep, UnpackArrayDType);
+             dtypep = adtypep->subDTypep()->skipRefp()) {
+            total *= adtypep->elementsConst();
+            if (total > 256) return true;
+        }
+        return false;
+    }
+
     // VISITORS
     void visit(AstInitArray* nodep) override {
         VL_RESTORER(m_unpackedWord);
@@ -67,6 +87,13 @@ protected:
             ofp()->putsNoTracking("}");
         } else if (const AstUnpackArrayDType* const dtypep
                    = VN_CAST(nodep->dtypep()->skipRefp(), UnpackArrayDType)) {
+            if (emitsFilled(nodep)) {
+                puts(dtypep->cType("", false, false, false));
+                puts("::filled(");
+                iterateConst(nodep->defaultp());
+                puts(")");
+                return;
+            }
             const uint64_t size = dtypep->elementsConst();
             const uint32_t tabMod = tabModulus(dtypep->subDTypep());
             // Note the double {{ initializer. The first { starts the initializer of the

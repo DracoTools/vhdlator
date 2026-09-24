@@ -404,8 +404,10 @@ public:
         VL_RESTORER(m_cfuncp);
         VL_RESTORER(m_instantiatesOwnProcess);
         VL_RESTORER(m_createdScopeHash);
+        VL_RESTORER(m_fillUniform);
         m_cfuncp = nodep;
         m_instantiatesOwnProcess = false;
+        m_fillUniform = true;
         m_labelNumbers.clear();  // No need to save/restore, all Jumps must be within the function
 
         splitSizeInc(nodep);
@@ -747,7 +749,8 @@ public:
             decind = true;
             if (!VN_IS(nodep->rhsp(), Const)) ofp()->putBreak();
             putns(nodep, "= ");
-            if (unpackDtp && VN_IS(nodep->rhsp(), InitArray)) {
+            const AstInitArray* const initp = VN_CAST(nodep->rhsp(), InitArray);
+            if (unpackDtp && initp && !emitsFilled(initp)) {
                 // Emit "VlUnpacked<type, depth>{{...InitArray...}}"
                 puts(unpackDtp->cType("", false, false, false));
             }
