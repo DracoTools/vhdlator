@@ -8150,7 +8150,15 @@ private:
     AstNodeExpr* lowerAllocator(AstVhdlAllocator* nodep) {
         FileLine* const flp = nodep->fileline();
         if (refuseOpaque(nodep, flp)) return nullptr;
-        if (dynAccessOfExpr(nodep)) return lowerDynAllocator(nodep, flp);
+        // What an access to an unconstrained array points at is made the same
+        // way wherever it stands: as an element of a record another allocator
+        // makes, its "new" had no class to learn (VESTS ch_17_fg_17_11,
+        // "store => new store_array(0 to size - 1)")
+        if (dynAccessOfExpr(nodep)) {
+            AstNodeExpr* const outp = lowerDynAllocator(nodep, flp);
+            AstNew* const dynNewp = VN_CAST(outp, New);
+            return dynNewp ? allocatedValue(nodep, dynNewp, flp) : outp;
+        }
         AstNew* const newp = new AstNew{flp};
         AstNodeExpr* valuep = nullptr;
         if (nodep->valuep()) {
@@ -8181,6 +8189,9 @@ private:
         // else -- the value of another allocation, an actual of a call -- the
         // object is made into a temporary first, and the temporary is the
         // expression's value.
+        return allocatedValue(nodep, newp, flp);
+    }
+    AstNodeExpr* allocatedValue(AstVhdlAllocator* nodep, AstNew* newp, FileLine* flp) {
         if (!allocatorIsAssigned(nodep)) {
             AstNodeDType* const dtypep
                 = nodep->vhdlTypep() ? lowerType(nodep->vhdlTypep(), flp) : nullptr;
