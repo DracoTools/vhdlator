@@ -4555,6 +4555,11 @@ private:
         AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
         AstVar* const bp = dynArg(funcp, "b", dynCarrierRef(typep, flp), flp);
         AstVar* const signdp = dynArg(funcp, "signd", bitDType(flp), flp);
+        // numeric_std and numeric_bit answer a comparison with a null operand
+        // without comparing: the caller says whether that rule applies and
+        // what the answer then is, as the -1, 0 or 1 its test reads
+        AstVar* const nullrulep = dynArg(funcp, "nullrule", bitDType(flp), flp);
+        AstVar* const nullvalp = dynArg(funcp, "nullval", newIntDType(flp), flp);
         AstVar* const lap = newFuncLocal("la", newIntDType(flp), flp);
         AstVar* const lbp = newFuncLocal("lb", newIntDType(flp), flp);
         AstVar* const wp = newFuncLocal("w", newIntDType(flp), flp);
@@ -4609,6 +4614,13 @@ private:
         bodyp = AstNode::addNext(
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(pp, flp), new AstSub{flp, rd(pp, flp), i32(1, flp)}}));
+        // A null answer is never 0, so the comparison below does not run
+        funcp->addStmtsp(
+            new AstIf{flp,
+                      new AstLogAnd{flp, rd(nullrulep, flp),
+                                    new AstLogOr{flp, new AstLtS{flp, rd(lap, flp), i32(1, flp)},
+                                                 new AstLtS{flp, rd(lbp, flp), i32(1, flp)}}},
+                      new AstAssign{flp, out(), rd(nullvalp, flp)}, nullptr});
         funcp->addStmtsp(whileLoop(
             flp,
             new AstLogAnd{flp, new AstGteS{flp, rd(pp, flp), i32(0, flp)},
@@ -9429,7 +9441,12 @@ private:
                 if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
                 return nullptr;
             }
-            AstNodeExpr* const cmpp = call(funcp, {ap, bp, bit(signd)});
+            // A null operand makes all four FALSE, which +1 answers for "<"
+            // and "<=" and -1 for ">" and ">="
+            const bool nullRule = symp && nullAwareComparison(symp);
+            const int nullVal = op == VhdlBinaryOp::GT || op == VhdlBinaryOp::GE ? -1 : 1;
+            AstNodeExpr* const cmpp
+                = call(funcp, {ap, bp, bit(signd), bit(nullRule), i32(nullVal, flp)});
             switch (op) {
             case VhdlBinaryOp::LT: return new AstLtS{flp, cmpp, i32(0, flp)};
             case VhdlBinaryOp::LE: return new AstLteS{flp, cmpp, i32(0, flp)};
@@ -9582,6 +9599,15 @@ private:
             unsup(flp, "user-defined operator \"" + symp->name() + "\"");
             return nullptr;
         }
+        // numeric_std and numeric_bit answer a comparison with a null operand
+        // without comparing anything -- "/=" is TRUE and the other five are
+        // FALSE, each with a warning -- and their _unsigned forms call
+        // through to them. Recognized as intrinsics, the comparisons would
+        // find two empty vectors equal instead.
+        if (symp && isRelational(nodep->op()) && nullAwareComparison(symp)
+            && (staticallyNull(nodep->lhsp()) || staticallyNull(nodep->rhsp()))) {
+            return new AstConst{flp, AstConst::BitTrue{}, nodep->op() == VhdlBinaryOp::NE};
+        }
         // Comparing one value of a logic type with 'U', 'X', 'W' or '-'
         // never holds: this runtime has no metavalues, and those four map
         // onto the one X that cannot occur (see the accepted divergences).
@@ -9637,6 +9663,12 @@ private:
                     argsp->addNext(new AstArg{
                         flp, "",
                         new AstConst{flp, AstConst::BitTrue{}, isSignedType(carrp)}});
+                    // A null operand makes "=" FALSE and "/=" TRUE, which +1
+                    // answers for both
+                    argsp->addNext(new AstArg{
+                        flp, "",
+                        new AstConst{flp, AstConst::BitTrue{}, nullAwareComparison(symp)}});
+                    argsp->addNext(new AstArg{flp, "", i32(1, flp)});
                 }
                 AstFuncRef* const refp = new AstFuncRef{flp, eqp->name(), argsp};
                 refp->taskp(VN_AS(eqp, Func));
@@ -10263,6 +10295,28 @@ private:
     // free to mean something else, and std_logic_unsigned's own unary "-",
     // which returns a value one bit longer than its operand, shows that two
     // operators of the same name over the same type need not agree.
+    static bool isRelational(VhdlBinaryOp op) {
+        return op == VhdlBinaryOp::EQ || op == VhdlBinaryOp::NE || op == VhdlBinaryOp::LT
+               || op == VhdlBinaryOp::LE || op == VhdlBinaryOp::GT || op == VhdlBinaryOp::GE;
+    }
+    // A comparison from one of the IEEE packages whose bodies give a fixed
+    // answer for a null operand. The Synopsys packages are not among them.
+    static bool nullAwareComparison(const VhdlSymbol* symp) {
+        static const std::set<std::string> pkgs{"numeric_std", "numeric_bit",
+                                                "numeric_std_unsigned", "numeric_bit_unsigned"};
+        for (const VhdlScope* scopep = symp->declScopep(); scopep; scopep = scopep->parentp()) {
+            if (pkgs.count(scopep->name())) return true;
+        }
+        return false;
+    }
+    // Whether an operand is an array this can see is null
+    static bool staticallyNull(const AstNodeVhdlExpr* exprp) {
+        const VhdlType* const typep = exprp ? exprp->vhdlTypep() : nullptr;
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!typep->isConstrainedArray() || typep->indexTypes().empty()) return false;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        return idxp && idxp->bounded() && idxp->length() == 0;
+    }
     static bool inArithmeticPackage(const VhdlSymbol* symp) {
         static const std::set<std::string> pkgs{
             "numeric_std",        "numeric_bit",        "numeric_std_unsigned",
@@ -11839,14 +11893,15 @@ private:
                     unsup(flp, "'" + name + "' of a value of no length known here");
                     return nullptr;
                 }
-                AstFuncRef* const refp = new AstFuncRef{
-                    flp, cmpp->name(),
-                    AstNode::addNext(
-                        new AstArg{flp, "", rd(lp, flp)},
-                        AstNode::addNext(new AstArg{flp, "", rd(rp, flp)},
-                                         new AstArg{flp, "",
-                                                    new AstConst{flp, AstConst::BitTrue{},
-                                                                 signd}}))};
+                // MAXIMUM and MINIMUM of a null operand are not a comparison
+                // this answers, so the null rule is off
+                AstNode* const cmpArgsp = new AstArg{flp, "", rd(lp, flp)};
+                cmpArgsp->addNext(new AstArg{flp, "", rd(rp, flp)});
+                cmpArgsp->addNext(
+                    new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, signd}});
+                cmpArgsp->addNext(new AstArg{flp, "", new AstConst{flp, AstConst::BitFalse{}}});
+                cmpArgsp->addNext(new AstArg{flp, "", i32(0, flp)});
+                AstFuncRef* const refp = new AstFuncRef{flp, cmpp->name(), VN_AS(cmpArgsp, Arg)};
                 refp->taskp(VN_AS(cmpp, Func));
                 testp = new AstGtS{flp, refp, i32(0, flp)};
             } else if (ltypep && rtypep && ltypep->base()->kind() == VhdlTypeKind::ARRAY
