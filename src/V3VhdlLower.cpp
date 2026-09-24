@@ -995,6 +995,26 @@ private:
         return arrayTooLargeToEmit(designatedp);
     }
 
+    // Whether an expression reads, whole, what an access to an array that
+    // carries its own bounds points at: "p.all", or "p" itself where a slice
+    // of it dereferences it implicitly (8.3). Such a value carries its bounds
+    // like any other that does. The access value is read from a name, since
+    // each of the elements, the left bound and the direction is a read of it.
+    static bool isAccessRead(const AstNodeVhdlExpr* nodep, bool implicit) {
+        const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected);
+        const AstNodeVhdlExpr* accp = nodep;
+        if (selp && selp->isAll()) {
+            accp = selp->prefixp();
+        } else if (!implicit) {
+            return false;
+        }
+        if (!accp || (!VN_IS(accp, VhdlName) && !VN_IS(accp, VhdlSelected))) return false;
+        const VhdlType* typep = accp->vhdlTypep();
+        if (!typep && accp->vhdlSymp()) typep = accp->vhdlSymp()->typep();
+        return typep && isDynamicAccess(typep->base());
+    }
+    static bool isAccessAll(const AstNodeVhdlExpr* nodep) { return isAccessRead(nodep, false); }
+
     // Whether an array's own bounds ask for more elements than may sensibly
     // be emitted. The same limit lowerArrayType refuses at.
     static bool arrayTooLargeToEmit(const VhdlType* typep) {
@@ -2751,6 +2771,7 @@ private:
     bool isDynValue(const AstNodeVhdlExpr* nodep, int depth = 0) const {
         if (!nodep || depth > 8) return false;
         if (isDynObj(nodep)) return true;
+        if (isAccessAll(nodep)) return true;
         if (dynResultCall(nodep)) return true;
         // A function that may be called with no arguments at all is written
         // as a name and not as a call (4.2.2.1), so what it gives back is
@@ -4235,6 +4256,17 @@ private:
     // declaration wrote.
     VhdlType* dynValueType(AstNodeVhdlExpr* nodep) const {
         if (!nodep) return nullptr;
+        if (isAccessAll(nodep)) return accessCarrierType(VN_AS(nodep, VhdlSelected)->prefixp());
+        // A slice read through an access value is held as what the access
+        // points at, whatever subtype its own ends give it
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            if (VN_IS(callp->argsp(), VhdlRange) && isAccessRead(callp->prefixp(), true)) {
+                const AstNodeVhdlExpr* accp = callp->prefixp();
+                const AstVhdlSelected* const selp = VN_CAST(accp, VhdlSelected);
+                if (selp && selp->isAll()) accp = selp->prefixp();
+                return accessCarrierType(accp);
+            }
+        }
         VhdlType* const typep = nodep->vhdlTypep();
         if (carriedDynamically(typep)) return typep;
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
@@ -8759,6 +8791,14 @@ private:
         if (nodep->isAll()) {
             AstNodeExpr* const fromp = lowerExpr(nodep->prefixp());
             if (!fromp) return nullptr;
+            // What an access to an array that carries its own bounds points
+            // at is a value that carries them, read whole
+            if (isAccessAll(nodep) && repeatable(fromp)) {
+                const DynAccess* const dynp = dynAccessOfExpr(nodep->prefixp());
+                if (dynp) {
+                    return accessCarrier(fromp, dynp, accessCarrierType(nodep->prefixp()), flp);
+                }
+            }
             return derefIfAccess(fromp, nodep->prefixp(), flp);
         }
         VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -9165,8 +9205,10 @@ private:
         AstNodeVhdlExpr* const basep
             = aliasBase(callp->vhdlSymp(), const_cast<AstNodeVhdlExpr*>(callp->prefixp()));
         // A slice of a carrier is another, whether the carrier is a named
-        // object or what a call gave back
-        return isDynObj(basep) || dynResultCall(basep) || parameterlessDynCall(basep);
+        // object or what a call gave back, and so is a slice of what an
+        // access value points at
+        return isDynObj(basep) || dynResultCall(basep) || parameterlessDynCall(basep)
+               || isAccessRead(basep, true);
     }
 
     // A function that may be called with no arguments at all is written as a
@@ -10584,6 +10626,71 @@ private:
         return lowerFuncCall(nodep, flp);
     }
 
+    std::map<std::pair<const VhdlType*, const AstClass*>, AstNodeFTask*> m_dynOfAccessFuncs;
+
+    // What an access value points at, as a value that carries its own
+    // bounds: the object keeps its elements from zero up, its left bound and
+    // which way it runs, which is all a carrier holds. One per type.
+    AstNodeFTask* dynOfAccessFunc(VhdlType* carrp, const DynAccess* dynp, FileLine* origFlp) {
+        const auto key = std::make_pair(static_cast<const VhdlType*>(carrp->base()),
+                                        static_cast<const AstClass*>(dynp->classp));
+        const auto it = m_dynOfAccessFuncs.find(key);
+        if (it != m_dynOfAccessFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp || !dynp->datap->childDTypep()) return nullptr;
+        FileLine* const flp = dynFl(origFlp);
+        AstFunc* const funcp = newDynFunc("__Vdynofacc", carrp, dynCarrierRef(carrp, flp), flp);
+        AstVar* const dp = dynArg(funcp, "d", dynp->datap->childDTypep()->cloneTree(false), flp);
+        AstVar* const lp = dynArg(funcp, "lft", newIntDType(flp), flp);
+        AstVar* const sp = dynArg(funcp, "dir", newIntDType(flp), flp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp), rd(dp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), rd(lp, flp)});
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "dsc", flp),
+            new AstLtS{flp, rd(sp, flp), new AstConst{flp, AstConst::Signed32{}, 0}}});
+        // "left + dir * (length - 1)", the other end of the range
+        funcp->addStmtsp(new AstAssign{
+            flp, dynPart(out(), "rgt", flp),
+            new AstAdd{
+                flp, rd(lp, flp),
+                new AstMul{flp, rd(sp, flp),
+                           new AstSub{flp, new AstMethodCall{flp, rd(dp, flp), "size", nullptr},
+                                      new AstConst{flp, AstConst::Signed32{}, 1}}}}});
+        addHelperFunc(funcp);
+        m_dynOfAccessFuncs.insert_or_assign(key, funcp);
+        return funcp;
+    }
+
+    // The carrier what an access value lowered as objp points at is. Null
+    // where the object is not a name, since it is read three times over.
+    AstNodeExpr* accessCarrier(AstNodeExpr* objp, const DynAccess* dynp, VhdlType* carrp,
+                               FileLine* flp) {
+        AstNodeFTask* const funcp = repeatable(objp) && carrp && carriedDynamically(carrp)
+                                        ? dynOfAccessFunc(carrp, dynp, flp)
+                                        : nullptr;
+        if (!funcp) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            return nullptr;
+        }
+        AstArg* const argsp
+            = new AstArg{flp, "", memberOf(objp->cloneTree(false), dynp->datap->name(), flp)};
+        argsp->addNext(
+            new AstArg{flp, "", memberOf(objp->cloneTree(false), dynp->leftp->name(), flp)});
+        argsp->addNext(new AstArg{flp, "", memberOf(objp, dynp->dirp->name(), flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+    // The carrier type what an access value points at is held as
+    VhdlType* accessCarrierType(const AstNodeVhdlExpr* accp) const {
+        const VhdlType* typep = accp->vhdlTypep();
+        if (!typep && accp->vhdlSymp()) typep = accp->vhdlSymp()->typep();
+        VhdlType* const designatedp = typep ? typep->base()->designatedp() : nullptr;
+        if (!designatedp) return nullptr;
+        return carriedDynamically(designatedp) ? designatedp : designatedp->base();
+    }
+
     // Indexing what an access value points at, where the object carries its
     // own bounds: the index is put onto the elements as they are stored.
     // A slice is a value with bounds of its own, which only an assignment
@@ -10591,10 +10698,39 @@ private:
     // statement that assigns it.
     AstNodeExpr* lowerDynIndex(AstVhdlCall* nodep, const DynAccess* dynp, AstNodeExpr* objp,
                                FileLine* flp) {
-        if (VN_IS(nodep->argsp(), VhdlRange)) {
-            VL_DO_DANGLING(objp->deleteTree(), objp);
-            unsup(flp, "slice of an unconstrained array read through an access value");
-            return nullptr;
+        // A slice of it is a slice of the value it is, which carries its
+        // own bounds (8.5)
+        if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
+            AstNodeVhdlExpr* accNodep = nodep->prefixp();
+            if (AstVhdlSelected* const selp = VN_CAST(accNodep, VhdlSelected)) {
+                if (selp->isAll()) accNodep = selp->prefixp();
+            }
+            VhdlType* const carrp = accessCarrierType(accNodep);
+            AstNodeFTask* const slicep = carrp ? dynSliceFunc(carrp, flp) : nullptr;
+            AstNodeExpr* leftp = nullptr;
+            AstNodeExpr* rightp = nullptr;
+            bool asc = true;
+            bool dirKnown = true;
+            const bool ends = slicep && rangeParts(rp, leftp, rightp, asc, dirKnown) && dirKnown;
+            AstNodeExpr* wholep = nullptr;
+            if (ends) {
+                wholep = accessCarrier(objp, dynp, carrp, flp);  // Takes objp
+            } else {
+                VL_DO_DANGLING(objp->deleteTree(), objp);
+            }
+            if (!wholep) {
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                unsup(flp, "slice of an unconstrained array read through an access value");
+                return nullptr;
+            }
+            AstArg* const argsp = new AstArg{flp, "", wholep};
+            argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+            argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
+            argsp->addNext(new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, !asc}});
+            AstFuncRef* const refp = new AstFuncRef{flp, slicep->name(), argsp};
+            refp->taskp(VN_AS(slicep, Func));
+            return refp;
         }
         if (!repeatable(objp)) {
             VL_DO_DANGLING(objp->deleteTree(), objp);
