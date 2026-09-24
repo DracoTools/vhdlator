@@ -2342,8 +2342,12 @@ public:
 #define VL_KEEP_THIS \
     VlClassRef<std::remove_pointer<decltype(this)>::type> __Vthisref { this }
 
+// Taken and returned by reference: a copy of a VlClassRef counts a reference
+// in and out, and a temporary with a destructor for every dereference in one
+// long expression cost g++ minutes and gigabytes. Deletion waits for
+// VlDeleter::deleteAll, so no object goes during the expression
 template <typename T>  // T typically of type VlClassRef<x>
-inline T VL_NULL_CHECK(T t, const char* filename, int linenum) {
+inline const T& VL_NULL_CHECK(const T& t, const char* filename, int linenum) {
     if (VL_UNLIKELY(!t)) Verilated::nullPointerError(filename, linenum);
     return t;
 }
