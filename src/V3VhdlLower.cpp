@@ -3377,10 +3377,54 @@ private:
         return funcp;
     }
 
+    // A slice whose ends move together -- "accum(count + len - 1 downto
+    // count)" -- has a width, and bounds of its own, though its subtype says
+    // neither, since the ends are not static. As a value that carries its
+    // bounds it is made from the object and the two ends, as a slice whose
+    // width only running settles is: taken from the object's subtype, it
+    // was as long as the whole object (VESTS ch_10_chkmult, where bv_addu
+    // saw eight elements in a slice of four).
+    AstNodeExpr* movingSliceCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep,
+                                    FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        AstVhdlRange* const rp = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rp || !callp->prefixp() || !rp->leftp() || !rp->rightp()) return nullptr;
+        VhdlType* const sliceTypep = nodep->vhdlTypep();
+        VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        if (!sliceTypep || sliceTypep->isConstrainedArray() || !objTypep
+            || !objTypep->isConstrainedArray() || carriedDynamically(objTypep)
+            || constSliceSpan(rp) <= 0) {
+            return nullptr;
+        }
+        VhdlType* const carrp = carrierTypep ? carrierTypep : sliceTypep;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        AstNodeFTask* const funcp = rangeParts(rp, leftp, rightp, asc, dirKnown) && dirKnown
+                                        ? dynOfSliceFunc(carrp, objTypep, asc, flp)
+                                        : nullptr;
+        AstNodeExpr* const fromp = funcp ? lowerExpr(callp->prefixp()) : nullptr;
+        if (!fromp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstArg* const argsp = new AstArg{flp, "", fromp};
+        argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+        argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
     // Whatever an expression is worth, as a value that carries its own bounds
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerExpr(nodep);
+        if (AstNodeExpr* const movingp = movingSliceCarrier(nodep, carrierTypep, flp)) {
+            return movingp;
+        }
         VhdlType* typep = nodep->vhdlTypep();
         // One element of the array standing where an array is wanted, which
         // concatenation allows (9.2.5)
@@ -8514,6 +8558,44 @@ private:
         return ttp ? ttp : typep;
     }
 
+    // Where an alias gives an object that carries its own bounds a range of
+    // its own, the place an index names, counted from the left: "alias op1 :
+    // bit_vector(bv1'length - 1 downto 0) is bv1" makes op1(0) the rightmost
+    // element whatever bounds bv1 arrived with. Counted on bv1's bounds
+    // instead, a slice handed in as "v(4 downto 1)" was read one place off
+    // (VESTS ch_10_chkmult, bv_arithmetic's adder). Null where the alias
+    // writes no range of its own; takes idxp otherwise.
+    AstNodeExpr* aliasPosition(VhdlSymbol* symp, AstNodeExpr*& idxp, FileLine* flp) {
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS || !idxp) return nullptr;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        const AstVhdlSubtypeInd* const subp = declp ? declp->subtypep() : nullptr;
+        const AstVhdlIndexConstraint* const icp
+            = subp ? VN_CAST(subp->constraintp(), VhdlIndexConstraint) : nullptr;
+        AstVhdlRange* rp = icp ? VN_CAST(icp->rangesp(), VhdlRange) : nullptr;
+        // "bit_vector(l downto r)" may also have been read as the type mark
+        // with its range written the way a slice's is
+        if (!rp && subp) {
+            if (const AstVhdlCall* const callp = VN_CAST(subp->typeMarkp(), VhdlCall)) {
+                rp = VN_CAST(callp->argsp(), VhdlRange);
+            }
+        }
+        if (!rp || rp->nextp()) return nullptr;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rp, leftp, rightp, asc, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        AstNodeExpr* const posp
+            = asc ? new AstSub{flp, idxp, leftp} : new AstSub{flp, leftp, idxp};
+        idxp = nullptr;
+        return posp;
+    }
+
     // An index into an alias, put onto the range of what it denotes
     static AstNodeExpr* aliasShift(VhdlSymbol* symp, AstNodeExpr* idxp, FileLine* flp) {
         if (!symp || symp->kind() != VhdlSymKind::ALIAS || !idxp) return idxp;
@@ -10654,6 +10736,15 @@ private:
                 // A value that carries its own bounds is stored from zero,
                 // whatever range it was made with
                 if (dim == 0 && isDynObj(nodep->prefixp())) {
+                    // An alias that gives it a range of its own counts from
+                    // its own left end, which is where the elements are kept
+                    // from (6.6.2)
+                    VhdlSymbol* const aliasSymp
+                        = nodep->prefixp()->vhdlSymp() ? nodep->prefixp()->vhdlSymp() : objSymp;
+                    if (AstNodeExpr* const posp = aliasPosition(aliasSymp, indexp, flp)) {
+                        outp = new AstSelBit{flp, dynPart(outp, "q", flp), posp};
+                        continue;
+                    }
                     outp = dynIndex(outp, indexp, flp);
                     continue;
                 }
