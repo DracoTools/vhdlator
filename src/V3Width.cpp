@@ -1452,6 +1452,14 @@ class WidthVisitor final : public VNVisitor {
         userIterateAndNext(nodep->bitp(), WidthVP{CONTEXT_DET, PRELIM}.p());  // FINAL in AstSel
         userIterateAndNext(nodep->thsp(), WidthVP{CONTEXT_DET, PRELIM}.p());  // FINAL in AstSel
         userIterateAndNext(nodep->attrp(), WidthVP{SELF, BOTH}.p());
+        // An element of a queue or dynamic array becomes a method call, which
+        // is not sized again, so its index is finished here: a cast in it was
+        // otherwise left for the emitter ("q[int'(e)]")
+        const AstNodeDType* const fromDtp
+            = nodep->fromp()->dtypep() ? nodep->fromp()->dtypep()->skipRefp() : nullptr;
+        if (VN_IS(fromDtp, QueueDType) || VN_IS(fromDtp, DynArrayDType)) {
+            userIterateAndNext(nodep->bitp(), WidthVP{SELF, FINAL}.p());
+        }
         AstNode* const selp = V3Width::widthSelNoIterEdit(nodep);
         if (selp != nodep) {
             VL_DANGLING(nodep);
