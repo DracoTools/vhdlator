@@ -1268,6 +1268,15 @@ private:
         return indexes[0]->ascending();
     }
 
+    // An end of a slice, as the INTEGER a helper takes it as. An index may be
+    // of an enumeration, which is only as wide as its positions need
+    // (VESTS tc1140 slices an array indexed by one with two variables).
+    static AstNodeExpr* intBound(AstNodeExpr* boundp, FileLine* flp) {
+        if (VN_IS(boundp, Const)) return boundp;
+        return new AstCast{flp, boundp, VFlagChildDType{},
+                           new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED}};
+    }
+
     // An index into a STRING, brought back to where Verilator counts from.
     // Verilator's string counts up from zero whichever way the subtype runs,
     // so a descending one counts back from its left bound.
@@ -9212,8 +9221,8 @@ private:
             return nullptr;
         }
         AstArg* argsp = new AstArg{flp, "", writep};
-        argsp->addNext(new AstArg{flp, "", leftp});
-        argsp->addNext(new AstArg{flp, "", rightp});
+        argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+        argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
         argsp->addNext(new AstArg{flp, "", carrierp});
         AstTaskRef* const refp = new AstTaskRef{flp, outFuncp->name(), argsp};
         refp->taskp(VN_AS(outFuncp, Task));
@@ -10438,8 +10447,8 @@ private:
                         return nullptr;
                     }
                     AstArg* argsp = new AstArg{flp, "", fromp};
-                    argsp->addNext(new AstArg{flp, "", leftp});
-                    argsp->addNext(new AstArg{flp, "", rightp});
+                    argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+                    argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
                     argsp->addNext(new AstArg{
                         flp, "", new AstConst{flp, AstConst::BitTrue{}, !sliceAsc}});
                     AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
@@ -10485,8 +10494,8 @@ private:
                         if (AstNodeFTask* const cfuncp
                             = dynOfSliceFunc(sliceTypep, objTypep, sliceAsc, flp)) {
                             AstArg* argsp = new AstArg{flp, "", fromp};
-                            argsp->addNext(new AstArg{flp, "", leftp});
-                            argsp->addNext(new AstArg{flp, "", rightp});
+                            argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+                            argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
                             AstFuncRef* const refp
                                 = new AstFuncRef{flp, cfuncp->name(), argsp};
                             refp->taskp(VN_AS(cfuncp, Func));
@@ -18868,8 +18877,8 @@ private:
         // worked out once into names of their own
         AstVar* const lop = newTempVar("__Vrtlo", newIntDType(flp), flp);
         AstVar* const hip = newTempVar("__Vrthi", newIntDType(flp), flp);
-        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(lop, flp), leftp});
-        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(hip, flp), rightp});
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(lop, flp), intBound(leftp, flp)});
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(hip, flp), intBound(rightp, flp)});
         AstVar* const tp = newTempVar("__Vrtcarr", dynCarrierRef(carrierTypep, flp), flp);
         AstArg* inArgsp = new AstArg{flp, "", readp};
         inArgsp->addNext(new AstArg{flp, "", rd(lop, flp)});

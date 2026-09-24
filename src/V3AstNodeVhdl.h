@@ -494,6 +494,10 @@ public:
         this->attrp(attrp);
     }
     ASTGEN_MEMBERS_AstVhdlRange;
+    bool sameNode(const AstNode* samep) const override {
+        const AstVhdlRange* const sp = VN_DBG_AS(samep, VhdlRange);
+        return m_dir == sp->m_dir && m_dirUnknown == sp->m_dirUnknown;
+    }
     VhdlDir dir() const { return m_dir; }
     // A range built to carry bounds that only elaboration knows, where which
     // way round they run is not known here either
@@ -933,6 +937,9 @@ public:
         this->prefixp(prefixp);
     }
     ASTGEN_MEMBERS_AstVhdlAttrName;
+    bool sameNode(const AstNode* samep) const override {
+        return m_attrName == VN_DBG_AS(samep, VhdlAttrName)->m_attrName;
+    }
     std::string name() const override VL_MT_STABLE { return m_attrName; }
     void name(const std::string& name) override { m_attrName = name; }
 };
@@ -951,6 +958,9 @@ public:
         this->rhsp(rhsp);
     }
     ASTGEN_MEMBERS_AstVhdlBinary;
+    bool sameNode(const AstNode* samep) const override {
+        return m_op == VN_DBG_AS(samep, VhdlBinary)->m_op;
+    }
     VhdlBinaryOp op() const { return m_op; }
     void dump(std::ostream& str) const override;
 };
@@ -993,6 +1003,11 @@ public:
         this->subtypep(subtypep);
     }
     ASTGEN_MEMBERS_AstVhdlExternalName;
+    bool sameNode(const AstNode* samep) const override {
+        const AstVhdlExternalName* const sp = VN_DBG_AS(samep, VhdlExternalName);
+        return m_objClass == sp->m_objClass && m_upLevels == sp->m_upLevels
+               && m_absolute == sp->m_absolute && m_package == sp->m_package;
+    }
     std::string objClass() const { return m_objClass; }
     int upLevels() const { return m_upLevels; }
     void upLevels(int n) { m_upLevels = n; }
@@ -1019,6 +1034,12 @@ public:
         , m_kind{kind}
         , m_text{text} {}
     ASTGEN_MEMBERS_AstVhdlLiteral;
+    bool sameNode(const AstNode* samep) const override {
+        const AstVhdlLiteral* const sp = VN_DBG_AS(samep, VhdlLiteral);
+        return m_kind == sp->m_kind && m_text == sp->m_text && m_intVal == sp->m_intVal
+               && m_realVal == sp->m_realVal && m_baseSpec == sp->m_baseSpec
+               && m_signedBitStr == sp->m_signedBitStr;
+    }
     VhdlLitKind kind() const { return m_kind; }
     std::string name() const override VL_MT_STABLE { return m_text; }
     void name(const std::string& name) override { m_text = name; }
@@ -1047,6 +1068,14 @@ public:
         , m_name{name}
         , m_extendedId{extendedId} {}
     ASTGEN_MEMBERS_AstVhdlName;
+    // Two names are one term only if they name one thing: matched by
+    // shape alone, "v(a downto b)" had ends a fixed distance apart
+    bool sameNode(const AstNode* samep) const override {
+        const AstVhdlName* const sp = VN_DBG_AS(samep, VhdlName);
+        return m_name == sp->m_name && m_extendedId == sp->m_extendedId && m_isChar == sp->m_isChar
+               && m_isOperator == sp->m_isOperator
+               && (!vhdlSymp() || !sp->vhdlSymp() || vhdlSymp() == sp->vhdlSymp());
+    }
     std::string name() const override VL_MT_STABLE { return m_name; }
     void name(const std::string& name) override { m_name = name; }
     bool extendedId() const { return m_extendedId; }
@@ -1103,6 +1132,9 @@ public:
         this->lhsp(lhsp);
     }
     ASTGEN_MEMBERS_AstVhdlUnary;
+    bool sameNode(const AstNode* samep) const override {
+        return m_op == VN_DBG_AS(samep, VhdlUnary)->m_op;
+    }
     VhdlUnaryOp op() const { return m_op; }
     void dump(std::ostream& str) const override;
 };
