@@ -526,6 +526,16 @@ public:
         puts(")");
     }
 
+    void visit(AstCvtQueueToUnpacked* nodep) override {
+        const AstUnpackArrayDType* const dtypep
+            = VN_AS(nodep->dtypep()->skipRefp(), UnpackArrayDType);
+        putns(nodep, "VL_CVT_Q_TO_UNPACK<" + cvtToStr(dtypep->elementsConst()) + ">(");
+        iterateAndNextConstNull(nodep->fromp());
+        puts(dtypep->rangep()->ascending() ? ", false, " : ", true, ");
+        putsQuoted(protect(nodep->fileline()->filename()));
+        puts(", " + cvtToStr(nodep->fileline()->lineno()) + ")");
+    }
+
     void visit(AstCvtArrayToPacked* nodep) override {
         AstNodeDType* const fromDtp = nodep->fromp()->dtypep()->skipRefp();
         AstNodeDType* const elemDtp = fromDtp->subDTypep()->skipRefp();

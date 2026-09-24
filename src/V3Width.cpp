@@ -2207,6 +2207,12 @@ class WidthVisitor final : public VNVisitor {
         userIterateAndNext(nodep->fromp(), WidthVP{SELF, BOTH}.p());
         // Type set in constructor
     }
+    void visit(AstCvtQueueToUnpacked* nodep) override {
+        if (nodep->didWidthAndSet()) return;
+        // Opaque returns, so arbitrary
+        userIterateAndNext(nodep->fromp(), WidthVP{SELF, BOTH}.p());
+        // Type set in constructor
+    }
     void visit(AstTimeImport* nodep) override {
         // LHS is a real number in seconds
         // Need to round to time units and precision
@@ -7626,9 +7632,10 @@ class WidthVisitor final : public VNVisitor {
                     iterateCheckSelf(nodep, "Function Argument", pinp, SELF, FINAL);
                 } else if (!portp->basicp() || portp->basicp()->isOpaque()) {
                     // Output args: at return caller = callee, reverse direction.
-                    checkClassAssign(nodep, "Function Argument", pinp, portDTypep,
-                                     portp->direction() == VDirection::OUTPUT);
-                    userIterate(pinp, WidthVP{portDTypep, FINAL, STREAM_USE_ASSIGN}.p());
+                    AstNode* const valuep
+                        = checkClassAssign(nodep, "Function Argument", pinp, portDTypep,
+                                           portp->direction() == VDirection::OUTPUT);
+                    userIterate(valuep, WidthVP{portDTypep, FINAL, STREAM_USE_ASSIGN}.p());
                 } else {
                     iterateCheckAssign(nodep, "Function Argument", pinp, FINAL, portDTypep);
                 }
@@ -9042,8 +9049,9 @@ class WidthVisitor final : public VNVisitor {
                            << rhsDtp->stateDTypeName() << "\n");
         }
     }
-    void checkClassAssign(const AstNode* nodep, const char* side, AstNode* rhsp,
-                          AstNodeDType* const lhsDTypep, bool isOutputArg = false) {
+    // Returns the node that now holds the value: rhsp, or a conversion of it
+    AstNode* checkClassAssign(const AstNode* nodep, const char* side, AstNode* rhsp,
+                              AstNodeDType* const lhsDTypep, bool isOutputArg = false) {
         UASSERT_OBJ(rhsp->dtypep(), rhsp, "Node has no type");
         const AstNodeDType* const lhsRawDTypep = lhsDTypep->skipRefp();
         const AstNodeDType* const rhsRawDTypep = rhsp->dtypep()->skipRefp();
@@ -9055,9 +9063,9 @@ class WidthVisitor final : public VNVisitor {
                     = isOutputArg ? rhsClassRefp->classp() : lhsClassRefp->classp();
                 const AstClass* const srcp
                     = isOutputArg ? lhsClassRefp->classp() : rhsClassRefp->classp();
-                if (isBaseClassRecurse(dstp, srcp)) return;
+                if (isBaseClassRecurse(dstp, srcp)) return rhsp;
             } else if (rhsp->isNull()) {
-                return;
+                return rhsp;
             }
             nodep->v3error(side << " expects a " << lhsClassRefp->prettyTypeName() << ", got "
                                 << rhsRawDTypep->prettyTypeName());
@@ -9072,6 +9080,40 @@ class WidthVisitor final : public VNVisitor {
             relinker.relink(
                 new AstCvtUnpackedToQueue{rhsp->fileline(), VN_AS(rhsp, NodeExpr), lhsDTypep});
         }
+        // The other way, a dynamic array or queue is copied into a fixed-size
+        // array, whose size it must have when it runs (IEEE 1800-2023 7.6).
+        // Left alone, the assignment was expanded element by element from
+        // something that has no fixed elements, and refused as not an array.
+        if (!isOutputArg && VN_IS(lhsRawDTypep, UnpackArrayDType)
+            && (VN_IS(rhsRawDTypep, DynArrayDType) || VN_IS(rhsRawDTypep, QueueDType))) {
+            if (!sameElementLayout(lhsRawDTypep->subDTypep(), rhsRawDTypep->subDTypep())) {
+                rhsp->v3warn(E_UNSUPPORTED, "Unsupported: dynamic array or queue copied into a "
+                                            "fixed-size array of other element types");
+                return rhsp;
+            }
+            VNRelinker relinker;
+            rhsp->unlinkFrBack(&relinker);
+            AstNodeExpr* const newp
+                = new AstCvtQueueToUnpacked{rhsp->fileline(), VN_AS(rhsp, NodeExpr), lhsDTypep};
+            relinker.relink(newp);
+            return newp;
+        }
+        return rhsp;
+    }
+    // Whether elements of these types are held alike in C++ and paired from
+    // the left alike, so that one is copied into the other as it is
+    static bool sameElementLayout(const AstNodeDType* ap, const AstNodeDType* bp) {
+        ap = ap->skipRefp();
+        bp = bp->skipRefp();
+        const AstUnpackArrayDType* const aarrp = VN_CAST(ap, UnpackArrayDType);
+        const AstUnpackArrayDType* const barrp = VN_CAST(bp, UnpackArrayDType);
+        if (aarrp || barrp) {
+            return aarrp && barrp
+                   && aarrp->rangep()->elementsConst() == barrp->rangep()->elementsConst()
+                   && aarrp->rangep()->ascending() == barrp->rangep()->ascending()
+                   && sameElementLayout(aarrp->subDTypep(), barrp->subDTypep());
+        }
+        return ap->cType("", false, false) == bp->cType("", false, false);
     }
     static bool similarDTypeRecurse(const AstNodeDType* const node1p,
                                     const AstNodeDType* const node2p) {
@@ -9234,7 +9276,7 @@ class WidthVisitor final : public VNVisitor {
             }
         }
         // We iterate and size the RHS based on the result of RHS evaluation
-        checkClassAssign(parentp, side, rhsp, lhsDTypep);
+        rhsp = checkClassAssign(parentp, side, rhsp, lhsDTypep);
         const bool lhsStream = (VN_IS(parentp, NodeAssign)
                                 && VN_IS(VN_AS(parentp, NodeAssign)->lhsp(), NodeStream));
         rhsp = iterateCheck(parentp, side, rhsp, ASSIGN, FINAL, lhsDTypep,

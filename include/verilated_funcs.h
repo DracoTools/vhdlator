@@ -265,6 +265,24 @@ inline VlQueue<T> VL_CVT_UNPACK_TO_Q(const VlUnpacked<T, N_Depth>& q) VL_PURE {
     return ret;
 }
 
+// Return an unpacked array from a queue or dynamic array of as many elements,
+// the first of which is the leftmost (IEEE 1800-2023 7.6)
+template <std::size_t N_Depth, typename T, size_t N_MaxSize>
+inline VlUnpacked<T, N_Depth> VL_CVT_Q_TO_UNPACK(const VlQueue<T, N_MaxSize>& q, bool descending,
+                                                 const char* filename, int linenum) VL_MT_SAFE {
+    if (VL_UNLIKELY(q.size() != N_Depth)) {
+        const std::string msg = "Dynamic array or queue of " + std::to_string(q.size())
+                                + " elements assigned to a fixed-size array of "
+                                + std::to_string(N_Depth);
+        VL_FATAL_MT(filename, linenum, "", msg.c_str());
+    }
+    VlUnpacked<T, N_Depth> ret;
+    for (size_t i = 0; i < N_Depth && i < q.size(); ++i) {
+        ret[descending ? N_Depth - 1 - i : i] = q.at(i);
+    }
+    return ret;
+}
+
 // Masked match functions
 inline IData VL_MATCHMASKED_I(int, IData lhs, WDataInP matchp) VL_PURE {
     size_t i = 0;

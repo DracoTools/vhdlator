@@ -1,0 +1,6 @@
+%Error-UNSUPPORTED: t/t_dynarray_to_fixed_unsup.v:15:10: Unsupported: dynamic array or queue copied into a fixed-size array of other element types
+                                                       : ... note: In instance 't'
+   15 |     ff = dd;
+      |          ^~
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error: Exiting due to
