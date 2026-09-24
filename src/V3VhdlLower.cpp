@@ -21956,13 +21956,23 @@ private:
             scale = scaleOfUnit(vtypep, "ns");
             if (scale <= 0) scale = 1;
         }
+        // The number of that unit the value is, as an integer or real
+        // literal (5.2.6): "to_string(1500 ps, ns)" is "1.5 ns", not "1 ns"
+        const auto image = [&](AstNodeExpr* scalep) {
+            AstCExpr* const outp
+                = new AstCExpr{flp, AstCExpr::Pure{}, "VL_VHDL_PHYS_IMAGE(static_cast<int64_t>("};
+            outp->add(valuep);
+            outp->add("), static_cast<int64_t>(");
+            outp->add(scalep);
+            outp->add("))");
+            outp->dtypeSetString();
+            return outp;
+        };
         if (scale > 0) {
             const std::string suffix = unitNameOf(vtypep, scale);
-            AstNodeExpr* const scaledp
-                = new AstDivS{flp, valuep,
-                              new AstConst{flp, AstConst::Unsized64{},
-                                           static_cast<uint64_t>(scale)}};
-            return new AstSFormatF{flp, "%0d " + suffix, false, scaledp};
+            return new AstSFormatF{
+                flp, "%s " + suffix, false,
+                image(new AstConst{flp, AstConst::Unsized64{}, static_cast<uint64_t>(scale)})};
         }
         // The unit is only known while running -- OSVVM reads it from a
         // setting -- so both the scaling and the unit's name are worked
@@ -21985,8 +21995,7 @@ private:
                                                        static_cast<uint64_t>(unit.second)}},
                                 litp, namep};
         }
-        AstNodeExpr* const scaledp = new AstDivS{flp, valuep, unitp};
-        AstSFormatF* const outp = new AstSFormatF{flp, "%0d%s", false, scaledp};
+        AstSFormatF* const outp = new AstSFormatF{flp, "%s%s", false, image(unitp)};
         if (namep) outp->addExprsp(namep);
         return outp;
     }

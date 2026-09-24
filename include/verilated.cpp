@@ -2507,6 +2507,33 @@ std::string VL_VHDL_REAL_IMAGE(double lhs) VL_PURE {
     }
     return out;
 }
+std::string VL_VHDL_PHYS_IMAGE(int64_t value, int64_t scale) VL_PURE {
+    if (scale <= 0) return std::to_string(value);
+    // The magnitude, unsigned so that the most negative value has one
+    const bool neg = value < 0;
+    const uint64_t mag = neg ? 0 - static_cast<uint64_t>(value) : static_cast<uint64_t>(value);
+    const uint64_t unit = static_cast<uint64_t>(scale);
+    const uint64_t whole = mag / unit;
+    const uint64_t rest = mag % unit;
+    const std::string sign = neg ? "-" : "";
+    if (!rest) return sign + std::to_string(whole);
+    // A unit ten, a hundred, a thousand ... times the primary one leaves a
+    // remainder whose digits are the fraction, less its trailing zeros
+    size_t digits = 0;
+    uint64_t power = 1;
+    while (power < unit && digits < 19) {
+        power *= 10;
+        ++digits;
+    }
+    if (power == unit) {
+        std::string frac = std::to_string(rest);
+        frac.insert(0, digits - frac.size(), '0');
+        while (!frac.empty() && frac.back() == '0') frac.pop_back();
+        return sign + std::to_string(whole) + "." + frac;
+    }
+    // MIN and HR do not divide into tens, and the quotient does not end
+    return VL_VHDL_REAL_IMAGE(static_cast<double>(value) / static_cast<double>(scale));
+}
 std::string VL_TO_STRING_W(int words, const WDataInP obj) {
     return VL_SFORMATF_N_NX("'h%0x", 1, VL_VFORMATATTR_UNSIGNED, words * VL_EDATASIZE, obj);
 }
