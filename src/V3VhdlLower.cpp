@@ -2796,6 +2796,7 @@ private:
         if (!nodep || depth > 8) return false;
         if (isDynObj(nodep)) return true;
         if (isAccessAll(nodep)) return true;
+        if (runningRangeAggregate(nodep)) return true;
         if (dynResultCall(nodep)) return true;
         // A function that may be called with no arguments at all is written
         // as a name and not as a call (4.2.2.1), so what it gives back is
@@ -3651,7 +3652,8 @@ private:
 
     // Such a value as one of a subtype that fixes its length
     AstNodeExpr* dynAsFixed(AstNodeVhdlExpr* nodep, VhdlType* fixedTypep, FileLine* flp) {
-        VhdlType* const carrierp = nodep->vhdlTypep();
+        // What it is carried as, which its own subtype need not say
+        VhdlType* const carrierp = dynValueType(nodep) ? dynValueType(nodep) : nodep->vhdlTypep();
         if (!carrierp) return nullptr;
         AstNodeFTask* funcp = dynToFixedFunc(carrierp, fixedTypep, flp);
         // A bound that names a generic is a length even though it is not a
@@ -4281,6 +4283,7 @@ private:
     VhdlType* dynValueType(AstNodeVhdlExpr* nodep) const {
         if (!nodep) return nullptr;
         if (isAccessAll(nodep)) return accessCarrierType(VN_AS(nodep, VhdlSelected)->prefixp());
+        if (runningRangeAggregate(nodep)) return nodep->vhdlTypep()->base();
         // A slice read through an access value is held as what the access
         // points at, whatever subtype its own ends give it
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
@@ -9416,11 +9419,14 @@ private:
         case VhdlBinaryOp::CONCAT: break;
         default: return false;
         }
-        VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
-        VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
         const bool ldyn = isDynValue(nodep->lhsp());
         if (!ldyn && !isDynValue(nodep->rhsp())) return false;
-        return carriedDynamically(ldyn ? ltypep : rtypep);
+        // What the operand is carried as, which is not always the subtype
+        // written on it: an aggregate over a range only running settles has
+        // a subtype of that range
+        AstNodeVhdlExpr* const dynp = ldyn ? nodep->lhsp() : nodep->rhsp();
+        VhdlType* const carrp = dynValueType(dynp);
+        return carriedDynamically(carrp ? carrp : dynp->vhdlTypep());
     }
 
     // A binary operator one of whose operands carries its own bounds. What
@@ -10011,6 +10017,13 @@ private:
                         if (isStringType(nodep->vhdlTypep())) {
                             return new AstSFormatF{flp, "%c", false, keepp};
                         }
+                        // Inside another concatenation it is that element's
+                        // bits, which is all the outer one joins: a pattern
+                        // there is no value (NVC and GHDL agree that
+                        // "(2 downto 3 => '0') & '1' & (1 downto 0 => '0')"
+                        // is "100")
+                        const AstVhdlBinary* const upp = VN_CAST(parentOf(nodep), VhdlBinary);
+                        if (upp && upp->op() == VhdlBinaryOp::CONCAT) return keepp;
                         // "e & null" is an array of one element, not the
                         // element itself (9.2.5). Written as the pattern of
                         // one member it is, so that its type comes from where
@@ -12264,6 +12277,9 @@ private:
             unsup(flp, "aggregate of this type");
             return nullptr;
         }
+        if (runningRangeAggregate(nodep)) {
+            if (AstNodeExpr* const outp = rangeFillCarrier(nodep, typep->base(), flp)) return outp;
+        }
         // An aggregate written entirely positionally, of an element type that
         // packs, is a concatenation: each value contributes its own width, so
         // an element that is itself an array of the aggregate's type spans as
@@ -12545,10 +12561,24 @@ private:
             || (celemp->base()->kind() == VhdlTypeKind::ARRAY && !celemp->lengthEmittable())) {
             return nullptr;
         }
+        AstNodeFTask* convp = dynToFixedFunc(carrp, typep, flp);
+        if (!convp) convp = dynToFixedExprFunc(carrp, typep, flp);
+        AstNodeExpr* const filledp = convp ? rangeFillCarrier(nodep, carrp, flp) : nullptr;
+        if (!filledp) return nullptr;
+        AstFuncRef* const outp = new AstFuncRef{flp, convp->name(), new AstArg{flp, "", filledp}};
+        outp->taskp(VN_AS(convp, Func));
+        return outp;
+    }
+
+    // The value such an aggregate is, carrying the bounds its range gives it:
+    // one value in every place from one end to the other (9.3.3.3)
+    AstNodeExpr* rangeFillCarrier(AstVhdlAggregate* nodep, VhdlType* carrp, FileLine* flp) {
+        AstNodeVhdlExpr* const valuep = uniformAggregateValue(nodep);
+        AstVhdlChoice* const chp = valuep ? nodep->elemsp()->choicesp() : nullptr;
+        AstVhdlRange* const rp = chp ? chp->rangep() : nullptr;
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return nullptr;
         AstNodeFTask* const fillp = dynFillFunc(carrp, flp);
-        AstNodeFTask* convp = fillp ? dynToFixedFunc(carrp, typep, flp) : nullptr;
-        if (fillp && !convp) convp = dynToFixedExprFunc(carrp, typep, flp);
-        if (!convp) return nullptr;
+        if (!fillp) return nullptr;
         AstNodeExpr* const leftp = lowerExpr(rp->leftp());
         AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
         AstNodeExpr* const elemp = rightp ? lowerExpr(valuep) : nullptr;
@@ -12557,16 +12587,41 @@ private:
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return nullptr;
         }
-        AstArg* const argsp = new AstArg{flp, "", leftp};
-        argsp->addNext(new AstArg{flp, "", rightp});
+        AstArg* const argsp = new AstArg{flp, "", intBound(leftp, flp)};
+        argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
         argsp->addNext(new AstArg{
             flp, "", new AstConst{flp, AstConst::BitTrue{}, rp->dir() == VhdlDir::DOWNTO}});
         argsp->addNext(new AstArg{flp, "", elemp});
         AstFuncRef* const filledp = new AstFuncRef{flp, fillp->name(), argsp};
         filledp->taskp(VN_AS(fillp, Func));
-        AstFuncRef* const outp = new AstFuncRef{flp, convp->name(), new AstArg{flp, "", filledp}};
-        outp->taskp(VN_AS(convp, Func));
-        return outp;
+        return filledp;
+    }
+
+    // Whether an aggregate is one value over one range that only running
+    // settles, with no subtype of its own that fixes its length -- standing
+    // as an operand, or returned where the result is unconstrained. Such an
+    // aggregate is a value that carries its own bounds (9.3.3.3); taken for a
+    // replication, its count was not a constant (GHDL's issue3007 returns
+    // "(size - 1 downto 0 => '0')" from a function).
+    bool runningRangeAggregate(const AstNodeVhdlExpr* nodep) const {
+        const AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
+        if (!aggp) return false;
+        const VhdlType* const typep = aggp->vhdlTypep();
+        // A subtype of its own that its range gave it fixes a length only
+        // where the bounds of that range are numbers here
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
+            || typep->base()->indexTypes().size() != 1 || isStringType(typep)) {
+            return false;
+        }
+        if (typep->isConstrainedArray() && !typep->indexTypes().empty() && typep->indexTypes()[0]
+            && typep->indexTypes()[0]->bounded()) {
+            return false;
+        }
+        const AstVhdlElemAssoc* const eap = aggp->elemsp();
+        if (!eap || eap->nextp() || !eap->choicesp() || eap->choicesp()->nextp()) return false;
+        const AstVhdlRange* const rp = eap->choicesp()->rangep();
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return false;
+        return boundsOnlyRunningDecides(rp->leftp()) || boundsOnlyRunningDecides(rp->rightp());
     }
 
     // "(others => v)" where the length is not a number now but is fixed once
@@ -15276,7 +15331,7 @@ private:
         AstNode* delayp = nullptr;
         switch (nodep->kind()) {
         case VhdlAssignKind::SIMPLE:
-            rhsp = waveformValue(nodep->wavesp());
+            rhsp = waveformValue(nodep->wavesp(), nodep->targetp());
             delayp = waveformDelay(nodep->wavesp());
             break;
         case VhdlAssignKind::CONDITIONAL: rhsp = conditionalValue(nodep); break;
@@ -15366,13 +15421,17 @@ private:
         if (markp) addStmt(markp);
     }
 
-    AstNodeExpr* waveformValue(AstVhdlWaveform* wfp) {
+    // What a concurrent assignment gives its target: a value that carries
+    // its own bounds is made one of the target's length on the way, as it is
+    // in a process -- lowered as it stood, the carrier itself was assigned
+    // to the signal (NVC's issue825, "(1 to i => '1') & (i + 1 to 3 => '0')")
+    AstNodeExpr* waveformValue(AstVhdlWaveform* wfp, AstNodeVhdlExpr* targetp) {
         if (!wfp || !wfp->valuep()) return nullptr;
         if (wfp->nextp()) {
             unsup(wfp->fileline(), "concurrent assignment of a multi-element waveform");
             return nullptr;
         }
-        return lowerExpr(wfp->valuep());
+        return lowerDriveValue(targetp, wfp->valuep(), wfp->fileline());
     }
 
     // The delay of a concurrent assignment, if it has one (11.6)
@@ -15395,7 +15454,7 @@ private:
         if (alts.empty()) return nullptr;
         AstNodeExpr* outp = nullptr;
         for (size_t i = alts.size(); i-- > 0;) {
-            AstNodeExpr* const valuep = waveformValue(alts[i]->wavesp());
+            AstNodeExpr* const valuep = waveformValue(alts[i]->wavesp(), nodep->targetp());
             if (!valuep) return nullptr;
             if (!alts[i]->condp()) {
                 outp = valuep;  // The trailing "else"
@@ -15423,7 +15482,7 @@ private:
         AstNodeExpr* outp = nullptr;
         for (size_t i = alts.size(); i-- > 0;) {
             AstVhdlAlternative* const altp = alts[i];
-            AstNodeExpr* const valuep = waveformValue(altp->wavesp());
+            AstNodeExpr* const valuep = waveformValue(altp->wavesp(), nodep->targetp());
             if (!valuep) return nullptr;
             AstNodeExpr* testp = choiceTest(altp->choicesp(), selp, nodep->matching());
             if (!testp) {
