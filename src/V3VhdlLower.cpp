@@ -17619,6 +17619,9 @@ private:
             return recordShapeCopy(tgtp, shapeTypeOf(nodep->targetp()), srcp,
                                    shapeTypeOf(valuep), flp);
         }
+        if (valuep) {
+            if (AstNode* const outp = dynAllToFixed(nodep->targetp(), valuep, flp)) return outp;
+        }
         // A value that carries its own bounds put into an object that has
         // its own: the elements are copied across, and the lengths have to
         // match, which is a check only running can make (10.5.2.1)
@@ -17750,6 +17753,68 @@ private:
             outp, static_cast<AstNode*>(
                       new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
                                     new AstConst{flp, AstConst::Signed32{}, 0}}));
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+    }
+
+    // "v := p.all" where p points at an array that carries its own bounds
+    // and v has a length the text fixes: the lengths are checked, which only
+    // running can do (10.6.2.1), and the elements copied one at a time,
+    // leftmost first. Left to the assignment, what the object holds -- a
+    // queue -- was assigned to a vector (VESTS tc987). Null where this is
+    // not that assignment.
+    AstNode* dynAllToFixed(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        AstVhdlSelected* const selp = VN_CAST(valuep, VhdlSelected);
+        if (!selp || !selp->isAll() || isDynObj(targetp)) return nullptr;
+        const DynAccess* dynp = nullptr;
+        AstNodeVhdlExpr* const objNodep = dynAccessObj(selp, dynp);
+        if (!objNodep || !dynp) return nullptr;
+        const VhdlType* const ttypep = targetp->vhdlTypep();
+        if (!ttypep || !ttypep->isConstrainedArray() || ttypep->dimensions() != 1
+            || ttypep->indexTypes().empty() || !ttypep->indexTypes()[0]
+            || !ttypep->indexTypes()[0]->bounded()) {
+            return nullptr;
+        }
+        const VhdlType* const idxp = ttypep->indexTypes()[0];
+        const int64_t count = idxp->length();
+        if (count < 0 || count > (1 << 30)) return nullptr;
+        AstNodeExpr* const objp = lowerExpr(objNodep);
+        if (!objp) return nullptr;
+        AstNodeExpr* const lhsp = repeatable(objp) ? lowerDriveTarget(targetp) : nullptr;
+        if (!lhsp || !repeatable(lhsp)) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            return nullptr;
+        }
+        const auto num = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        AstVar* const idxVarp = newTempVar("__Vdyni", newIntDType(flp), flp);
+        idxVarp->usedLoopIdx(true);
+        const auto idx = [&]() { return new AstVarRef{flp, idxVarp, VAccess::READ}; };
+        // "assert v'length = p'length", which is what the LRM asks of it
+        AstNode* outp = new AstIf{flp, new AstNeq{flp, dynLength(dynp, objp, flp), num(count)},
+                                  new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                                 "Array lengths do not match", nullptr, nullptr},
+                                  nullptr};
+        AstNodeExpr* const placep
+            = idxp->ascending()
+                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, num(idxp->left()), idx()})
+                  : new AstSub{flp, num(idxp->left()), idx()};
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp,
+                            new AstLogAnd{flp, new AstLtS{flp, idx(), num(count)},
+                                          new AstLtS{flp, idx(), dynLength(dynp, objp, flp)}}});
+        loopp->addStmtsp(new AstAssign{
+            flp, new AstSelBit{flp, lhsp, placep},
+            new AstSelBit{flp, memberOf(objp->cloneTree(false), dynp->datap->name(), flp),
+                          idx()}});
+        loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                       new AstAdd{flp, idx(), num(1)}});
+        VL_DO_DANGLING(objp->deleteTree(), objp);
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(
+                      new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE}, num(0)}));
         return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
     }
 
