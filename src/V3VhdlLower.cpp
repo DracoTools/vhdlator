@@ -21470,6 +21470,98 @@ private:
         return outp;
     }
 
+    // The parts of a READ into a slice whose ends only running settles: the
+    // object it is taken from, how wide that is, its two ends and which way
+    // it runs, and the statements that work out how many places it has
+    struct RunningReadSlice final {
+        AstNodeExpr* objp = nullptr;  // The object, written into
+        int64_t objBits = 0;
+        AstVar* lop = nullptr;  // The left end
+        AstVar* countp = nullptr;  // How many places
+        bool ascending = true;
+        AstNode* setupp = nullptr;
+    };
+    bool runningReadSlice(AstNodeVhdlExpr* targetp, RunningReadSlice& run, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rangep || !callp->prefixp()) return false;
+        const VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        if (!objTypep || !objTypep->isConstrainedArray() || objTypep->dimensions() != 1
+            || objTypep->dimLength(0) <= 0 || objTypep->dimLength(0) > 4096) {
+            return false;
+        }
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, asc, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return false;
+        }
+        AstNodeExpr* const objp = lowerDriveTarget(callp->prefixp());
+        if (!objp || !repeatable(objp)) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (objp) VL_DO_DANGLING(objp->deleteTree(), objp);
+            return false;
+        }
+        run.objp = objp;
+        run.objBits = objTypep->dimLength(0);
+        run.ascending = asc;
+        run.lop = newTempVar("__Vtxtlo", newIntDType(flp), flp);
+        AstVar* const hip = newTempVar("__Vtxthi", newIntDType(flp), flp);
+        run.countp = newTempVar("__Vtxtn", newIntDType(flp), flp);
+        run.setupp = new AstAssign{flp, wr(run.lop, flp), intBound(leftp, flp)};
+        run.setupp = AstNode::addNext(run.setupp, static_cast<AstNode*>(new AstAssign{
+                                                      flp, wr(hip, flp), intBound(rightp, flp)}));
+        // A null range has no places at all
+        AstNodeExpr* const spanp = asc ? new AstSub{flp, rd(hip, flp), rd(run.lop, flp)}
+                                       : new AstSub{flp, rd(run.lop, flp), rd(hip, flp)};
+        AstNodeExpr* const placesp
+            = new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        run.setupp = AstNode::addNext(
+            run.setupp, static_cast<AstNode*>(new AstAssign{
+                            flp, wr(run.countp, flp),
+                            new AstCond{flp,
+                                        new AstLtS{flp, placesp->cloneTree(false),
+                                                   new AstConst{flp, AstConst::Signed32{}, 0}},
+                                        new AstConst{flp, AstConst::Signed32{}, 0}, placesp}}));
+        return true;
+    }
+    // What was read, put into the slice a place at a time, the leftmost from
+    // the most significant of the bits read
+    AstNode* runningReadTake(RunningReadSlice& run, AstNodeExpr* valuep, FileLine* flp) {
+        AstVar* const tmpp
+            = newTempVar("__Vtxtbits", newLogicDType(flp, static_cast<int>(run.objBits)), flp);
+        AstVar* const kp = newTempVar("__Vtxtk", newIntDType(flp), flp);
+        kp->usedLoopIdx(true);
+        AstNode* outp = new AstAssign{flp, wr(tmpp, flp), valuep};
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAssign{
+                      flp, wr(kp, flp), new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstNodeExpr* const placep
+            = run.ascending
+                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(run.lop, flp), rd(kp, flp)})
+                  : new AstSub{flp, rd(run.lop, flp), rd(kp, flp)};
+        // Bit n - 1 - k of what was read, which is where the k-th character went
+        AstNodeExpr* const bitp
+            = new AstSelBit{flp, rd(tmpp, flp),
+                            new AstSub{flp,
+                                       new AstSub{flp, rd(run.countp, flp),
+                                                  new AstConst{flp, AstConst::Signed32{}, 1}},
+                                       rd(kp, flp)}};
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, rd(kp, flp), rd(run.countp, flp)}});
+        loopp->addStmtsp(new AstAssign{flp, new AstSelBit{flp, run.objp, placep}, bitp});
+        loopp->addContsp(new AstAssign{
+            flp, wr(kp, flp),
+            new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        run.objp = nullptr;
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+    }
+
     AstNode* lowerTextioRead(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
                              FileLine* origFlp) {
         if (args.size() < 2 || args.size() > 3) return nullptr;
@@ -21479,7 +21571,7 @@ private:
         flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
         flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
         AstNodeExpr* const linep = lowerExpr(args[0]);
-        AstNodeExpr* const valuep = lowerExpr(args[1]);
+        AstNodeExpr* valuep = lowerExpr(args[1]);
         if (!linep || !valuep) return nullptr;
         VhdlType* const typep = args[1]->vhdlTypep();
 
@@ -21835,12 +21927,35 @@ private:
         // to (16.4). A whitespace-delimited item is the wrong unit here:
         // "1 1 0 0 0 0 1 1" is eight bits, and "11111" read into four leaves
         // the fifth character on the line.
+        // Into a slice whose ends only running settles -- VESTS tc3202 reads
+        // into "bv(1 to 2 * width)" -- as many characters as the slice is long
+        // when it runs, read at the width of the object it is taken from,
+        // and the bits put back one at a time where the object keeps them
+        RunningReadSlice run;
+        if ((isLogicish(typep) || isBitish(typep)) && typep->base()->kind() == VhdlTypeKind::ARRAY
+            && isRunningSlice(args[1]) && runningReadSlice(args[1], run, flp)) {
+            VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            valuep = nullptr;
+        }
+        // A slice whose ends move together -- "v(i to i + 7)" -- has a
+        // width, though its subtype does not say it, and is written into as
+        // the part select it lowers to
+        const bool boundedType = typep->isConstrainedArray() && !typep->indexTypes().empty()
+                                 && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded();
+        int64_t movingSpan = 0;
+        if (!run.objp && !boundedType && typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            if (AstVhdlCall* const callp = VN_CAST(args[1], VhdlCall)) {
+                movingSpan = constSliceSpan(VN_CAST(callp->argsp(), VhdlRange));
+            }
+        }
         if ((isLogicish(typep) || isBitish(typep))
-            && (typep->base()->kind() != VhdlTypeKind::ARRAY
-                || (typep->isConstrainedArray() && !typep->indexTypes().empty()
-                    && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded()))) {
+            && (typep->base()->kind() != VhdlTypeKind::ARRAY || run.objp || boundedType
+                || movingSpan > 0)) {
             const bool scalar = typep->base()->kind() != VhdlTypeKind::ARRAY;
-            const int64_t bits = scalar ? 1 : typep->indexTypes()[0]->length();
+            const int64_t bits = run.objp     ? run.objBits
+                                 : movingSpan ? movingSpan
+                                 : scalar     ? 1
+                                              : typep->indexTypes()[0]->length();
             const int64_t per = name == "hread" ? 4 : (name == "oread" ? 3 : 1);
             const int64_t chars = (bits + per - 1) / per;
             if (bits > 0 && chars > 0 && chars <= 4096) {
@@ -21870,12 +21985,24 @@ private:
                               new AstAssign{flp, new AstVarRef{flp, accp, VAccess::WRITE},
                                             new AstConst{flp, AstConst::String{}, ""}}));
                 outp = AstNode::addNext(outp, static_cast<AstNode*>(setOk(true)));
+                // How many characters: as many as the slice has places, in
+                // this radix, when it is a slice only running measures
+                AstNodeExpr* charsp
+                    = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(chars)};
+                if (run.objp) {
+                    outp = AstNode::addNext(outp, run.setupp);
+                    run.setupp = nullptr;
+                    VL_DO_DANGLING(charsp->deleteTree(), charsp);
+                    charsp = new AstDiv{
+                        flp,
+                        new AstAdd{flp, new AstVarRef{flp, run.countp, VAccess::READ},
+                                   new AstConst{flp, AstConst::Signed32{},
+                                                static_cast<int32_t>(per - 1)}},
+                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(per)}};
+                }
                 AstLoop* const loopp = new AstLoop{flp};
                 loopp->addStmtsp(new AstLoopTest{
-                    flp, loopp,
-                    new AstLtS{flp, new AstVarRef{flp, cntp, VAccess::READ},
-                               new AstConst{flp, AstConst::Signed32{},
-                                            static_cast<int32_t>(chars)}}});
+                    flp, loopp, new AstLtS{flp, new AstVarRef{flp, cntp, VAccess::READ}, charsp}});
                 AstLoop* const skipp = new AstLoop{flp};
                 skipp->addStmtsp(new AstLoopTest{
                     flp, skipp,
@@ -21912,10 +22039,19 @@ private:
                     new AstAdd{flp, new AstVarRef{flp, cntp, VAccess::READ},
                                new AstConst{flp, AstConst::Signed32{}, 1}}});
                 outp = AstNode::addNext(outp, static_cast<AstNode*>(loopp));
-                AstNode* takep = new AstAssign{
-                    flp, valuep,
-                    sizedTo(new AstAtoN{flp, new AstVarRef{flp, accp, VAccess::READ}, fmt},
-                            static_cast<int>(bits), flp)};
+                AstNode* takep = nullptr;
+                if (run.objp) {
+                    takep = runningReadTake(
+                        run,
+                        sizedTo(new AstAtoN{flp, new AstVarRef{flp, accp, VAccess::READ}, fmt},
+                                static_cast<int>(bits), flp),
+                        flp);
+                } else {
+                    takep = new AstAssign{
+                        flp, valuep,
+                        sizedTo(new AstAtoN{flp, new AstVarRef{flp, accp, VAccess::READ}, fmt},
+                                static_cast<int>(bits), flp)};
+                }
                 takep = AstNode::addNext(
                     takep,
                     static_cast<AstNode*>(new AstAssign{
