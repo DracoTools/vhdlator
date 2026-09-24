@@ -12220,6 +12220,10 @@ private:
                         const VhdlValue a = V3VhdlEval::eval(rp->leftp());
                         const VhdlValue b = V3VhdlEval::eval(rp->rightp());
                         if (!a.isInt() || !b.isInt()) {
+                            if (AstNodeExpr* const outp
+                                = rangeFillOfDynamicLength(nodep, typep, flp)) {
+                                return outp;
+                            }
                             unsup(chp->fileline(), "aggregate choice that is not static");
                             return nullptr;
                         }
@@ -12326,6 +12330,58 @@ private:
             if (p->choicesp()) return false;
         }
         return true;
+    }
+
+    // "(lo to hi => v)" given to an object whose subtype fixes its length,
+    // where lo and hi are known only by elaboration or while running. The
+    // aggregate is as long as its range says (9.3.3.3), and that has to be
+    // the object's length, which only running can check (10.5.2.1) -- so it is
+    // built as a value carrying those bounds and converted as any such value
+    // is, check included. Taking it for "others" would fill the object
+    // whatever the range said: NVC's bounds24 writes "(1 to n => '1')" into
+    // three bits with n a thousand, and that is an error, not three ones.
+    AstNodeExpr* rangeFillOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep,
+                                          FileLine* flp) {
+        AstNodeVhdlExpr* const valuep = uniformAggregateValue(nodep);
+        if (!valuep) return nullptr;
+        AstVhdlChoice* const chp = nodep->elemsp()->choicesp();
+        if (!chp || chp->nextp() || chp->isOthers()) return nullptr;
+        AstVhdlRange* const rp = chp->rangep();
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return nullptr;
+        if (!typep || typep->indexTypes().size() != 1) return nullptr;
+        // The value is carried as one of the array's own element type, which
+        // is all a carrier is made per -- so a constrained array type, which
+        // is its own base and has no open one to carry, serves as well: VESTS
+        // tc753 gives "(zero to fifteen => c)" to an "array (15 downto 0)"
+        VhdlType* const carrp = typep->base();
+        if (carrp->indexTypes().size() != 1 || isStringType(carrp)) return nullptr;
+        const VhdlType* const celemp = carrp->elementp();
+        if (!celemp
+            || (celemp->base()->kind() == VhdlTypeKind::ARRAY && !celemp->lengthEmittable())) {
+            return nullptr;
+        }
+        AstNodeFTask* const fillp = dynFillFunc(carrp, flp);
+        AstNodeFTask* convp = fillp ? dynToFixedFunc(carrp, typep, flp) : nullptr;
+        if (fillp && !convp) convp = dynToFixedExprFunc(carrp, typep, flp);
+        if (!convp) return nullptr;
+        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        AstNodeExpr* const elemp = rightp ? lowerExpr(valuep) : nullptr;
+        if (!elemp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstArg* const argsp = new AstArg{flp, "", leftp};
+        argsp->addNext(new AstArg{flp, "", rightp});
+        argsp->addNext(new AstArg{
+            flp, "", new AstConst{flp, AstConst::BitTrue{}, rp->dir() == VhdlDir::DOWNTO}});
+        argsp->addNext(new AstArg{flp, "", elemp});
+        AstFuncRef* const filledp = new AstFuncRef{flp, fillp->name(), argsp};
+        filledp->taskp(VN_AS(fillp, Func));
+        AstFuncRef* const outp = new AstFuncRef{flp, convp->name(), new AstArg{flp, "", filledp}};
+        outp->taskp(VN_AS(convp, Func));
+        return outp;
     }
 
     // "(others => v)" where the length is not a number now but is fixed once
