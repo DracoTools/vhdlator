@@ -5716,7 +5716,18 @@ private:
     // a concatenation, the way a packed record's default is: the parts are
     // constants, so their widths are known before V3Width runs.
     static AstNodeExpr* packedRepeat(AstNodeExpr* elemp, int64_t count, FileLine* flp) {
-        if (count <= 0 || count > 4096) return nullptr;
+        if (count <= 0 || count > (1 << 24)) return nullptr;
+        // Past a few thousand elements the concatenation is thousands of nodes
+        // for one value repeated, and a replication is one: VESTS tc988
+        // allocates a 1024 by 64 array of BOOLEAN, 65536 of them. The source
+        // wrote no replication, so none is warned about as suspect.
+        if (count > 4096) {
+            FileLine* const rflp = new FileLine{flp};
+            rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+            return new AstReplicate{
+                rflp, elemp,
+                new AstConst{rflp, AstConst::Unsized32{}, static_cast<uint32_t>(count)}};
+        }
         AstNodeExpr* outp = elemp;
         for (int64_t i = 1; i < count; ++i) {
             outp = new AstConcat{flp, outp, elemp->cloneTree(false)};
@@ -8076,8 +8087,10 @@ private:
         if (nodep->valuep()) {
             valuep = lowerExpr(nodep->valuep());
         } else if (nodep->subtypep()) {
-            // "new t" gives the designated subtype's default (9.3.7)
-            valuep = defaultValueFor(nodep->subtypep()->vhdlTypep(), flp);
+            // "new t" gives the designated subtype's default (9.3.7). An
+            // object has to have one, so an array of logic -- which is
+            // otherwise left where Verilator starts it -- is asked for it
+            valuep = defaultValueFor(nodep->subtypep()->vhdlTypep(), flp, true);
         }
         if (!valuep) {
             unsup(flp, "allocator for a subtype with no default value");
