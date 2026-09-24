@@ -6273,6 +6273,26 @@ private:
         return true;
     }
 
+    // How many copies of a subprogram are being made or walked, each inside
+    // the one before
+    size_t nestedCopies(const VhdlSymbol* symp) const {
+        size_t count = 0;
+        for (const VhdlSpecFrame& frame : m_within) {
+            if (frame.first == symp) ++count;
+        }
+        return count;
+    }
+
+    // The value a copy is made for, where the call's argument folds to one. A
+    // value outside the formal's subtype is never handed over -- the call
+    // itself is the error (4.2.2.2) -- so no copy made for it can run, and
+    // making one feeds a recursion: the copy for n = 0 of "if n = 0 then ...
+    // else f(n - 1)" asks for f(-1), whose copy asks for f(-2), and so on.
+    static VhdlValue copyValue(const VhdlValue& val, const VhdlType* formalp) {
+        if (!val.isInt() || !V3VhdlEval::inRange(val, formalp)) return VhdlValue{};
+        return val;
+    }
+
     // The copy itself, given what each formal is associated with. An operator
     // the design declared is a subprogram like any other (4.5.2), and its
     // operands are its actuals, so it comes here too.
@@ -6324,8 +6344,8 @@ private:
                 AstNodeVhdlExpr* const defp = paramDefaultOf(symp, i);
                 if (!defp) return;
                 if (byValue) {
-                    const VhdlValue val = V3VhdlEval::eval(defp);
-                    actualValues.push_back(val.isInt() ? val : VhdlValue{});
+                    actualValues.push_back(
+                        copyValue(V3VhdlEval::eval(defp), symp->paramTypes()[i]));
                 }
                 VhdlType* const dtypep
                     = defp->vhdlTypep() ? defp->vhdlTypep() : symp->paramTypes()[i];
@@ -6333,8 +6353,7 @@ private:
                 continue;
             }
             if (byValue) {
-                const VhdlValue val = V3VhdlEval::eval(actp);
-                actualValues.push_back(val.isInt() ? val : VhdlValue{});
+                actualValues.push_back(copyValue(V3VhdlEval::eval(actp), symp->paramTypes()[i]));
             }
             VhdlType* typep = actp->vhdlTypep();
             // A formal named by a slice of itself is as long as that slice
@@ -6392,6 +6411,17 @@ private:
             actualTypes.push_back(typep);
         }
         if (actualTypes.size() != symp->paramTypes().size()) return;
+        // A recursion that folds to a new value at every call has no last
+        // copy, and each copy is made inside the one before it, so the series
+        // ends when the stack does rather than at any count. "f(n + 1)" never
+        // leaves NATURAL, and the branch that would stop it is analyzed as
+        // any other is. Past a depth that leaves the stack room to spare --
+        // each nested copy costs a few kilobytes of it -- the copy is made
+        // for any value instead: the deeper calls reach that one and work out
+        // their answer while running, which is slower and the same answer.
+        if (byValue && nestedCopies(symp) >= 64) {
+            for (VhdlValue& val : actualValues) val = VhdlValue{};
+        }
         // Nothing to specialize on: no parameter has a length to fix, and no
         // value the call passes is known, so the copy would be the original
         if (byValue) {
