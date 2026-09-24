@@ -12848,7 +12848,13 @@ private:
                 unsup(flp, "record aggregate with element '" + elems[i]->name() + "' unset");
                 return nullptr;
             }
-            AstNodeExpr* const memberp = lowerExpr(valuep);
+            // A record given to an element of a record in the other shape --
+            // one a call's own copy returns with an element of a fixed length,
+            // where this element's is carried -- is converted as an
+            // assignment would convert it. Taken as it stood it was a record
+            // of another type, which came out as zero (GHDL's issue646)
+            AstNodeExpr* memberp = recordAsShape(valuep, elems[i]->typep(), flp);
+            if (!memberp) memberp = lowerExpr(valuep);
             if (!memberp) return nullptr;
             if (packed) {
                 outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
