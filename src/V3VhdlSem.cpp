@@ -6059,7 +6059,11 @@ private:
         // nothing here to settle
         if (felemp->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
         if (felemp->isConstrainedArray()) return nullptr;
-        if (!aelemp->isConstrainedArray()) return nullptr;
+        // An element whose bounds name a generic has a length as well, one the
+        // back end folds per instance, and the copy carries it as written just
+        // as it would a whole actual's -- so long as nothing in it names what
+        // only the caller can see
+        if (!aelemp->isConstrainedArray() && !lengthTravels(aelemp)) return nullptr;
         const auto key = std::make_pair(static_cast<const VhdlType*>(formalp),
                                         static_cast<const VhdlType*>(aelemp));
         const auto it = m_elemSpecs.find(key);
