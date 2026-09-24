@@ -11024,6 +11024,21 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
             if (AstVhdlRange* const rp = chp->rangep()) {
                 const RangeInfo info = analyzeRange(rp, indexp);
                 if (!info.left.isInt() || !info.right.isInt()) return nullptr;
+                // A null range names no index at all, and may only be the
+                // one choice of the one association (9.3.3.3), so the
+                // aggregate is a null array of that range. Its two bounds are
+                // not a span to fill: "(v'range => '0')" of a null v written
+                // "0 to -1" is no elements, not the two from -1 to 0.
+                if (info.ascending ? info.left.toInt() > info.right.toInt()
+                                   : info.left.toInt() < info.right.toInt()) {
+                    VhdlType* const nullp = cloneSubtype(typep, nodep->fileline());
+                    VhdlType* const nullIndexp = cloneSubtype(indexp, nodep->fileline());
+                    nullIndexp->setBounds(info.left.toInt(), info.right.toInt(), info.ascending);
+                    nullp->clearIndexTypes();
+                    nullp->addIndexType(nullIndexp);
+                    nullp->unconstrained(false);
+                    return nullp;
+                }
                 lo = std::min(info.left.toInt(), info.right.toInt());
                 hi = std::max(info.left.toInt(), info.right.toInt());
                 // A choice written as a range says which way the aggregate's
