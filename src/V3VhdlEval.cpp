@@ -1369,6 +1369,7 @@ private:
         // The parameters, in order. A generic subprogram keeps its generics
         // ahead of them, and a call associates only the parameters (4.2.1).
         std::vector<AstVhdlIfaceDecl*> parms;
+        std::vector<bool> unheld;
         int skip = declp->genericCount();
         for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
             AstVhdlIfaceDecl* const ip = VN_CAST(p, VhdlIfaceDecl);
@@ -1382,10 +1383,15 @@ private:
                 return VhdlValue{};
             }
             if (ip->mode() != VhdlMode::IN) return VhdlValue{};
-            if (!valueHeld(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr)) {
-                return VhdlValue{};
-            }
+            // At elaboration a parameter of a type not held here -- a string
+            // -- is carried as unknown. Whatever reads it is unknown too, and
+            // a branch on it stops the fold, so what folds is only what does
+            // not depend on it: VUnit's testbenches size their buses from
+            // the literal widths of a record decoded from a string generic.
+            const bool held = valueHeld(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr);
+            if (!held && !m_allowImpure) return VhdlValue{};
             parms.push_back(ip);
+            unheld.push_back(!held);
         }
 
         // The actuals, evaluated where the call was written, before this
@@ -1410,12 +1416,20 @@ private:
                 }
             }
             if (which >= parms.size() || given[which]) return VhdlValue{};
+            if (unheld[which]) {
+                given[which] = true;
+                continue;
+            }
             const VhdlValue val = eval(actualp);
             if (!val.known() && !m_allowImpure) return VhdlValue{};
             args[which] = val;
             given[which] = true;
         }
 
+        // One left out is as unknown as one given
+        for (size_t i = 0; i < parms.size(); ++i) {
+            if (unheld[i]) given[i] = true;
+        }
         // Giving up inside one activation says nothing about the expression
         // that contains the call, so the flag is this call's own
         VL_RESTORER(m_bail);

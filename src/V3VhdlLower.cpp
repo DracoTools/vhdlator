@@ -1956,6 +1956,26 @@ private:
         return reads;
     }
 
+    // Whether a value calls an impure function or allocates: what an
+    // emitted constant cannot be a parameter for (valueFolds)
+    static bool callsImpureOrAllocates(const AstNode* nodep) {
+        bool found = false;
+        nodep->foreach([&](const AstNode* itemp) {
+            if (found) return;
+            if (VN_IS(itemp, VhdlAllocator)) {
+                found = true;
+                return;
+            }
+            const AstNodeVhdlExpr* const exprp = VN_CAST(itemp, NodeVhdlExpr);
+            const VhdlSymbol* const symp
+                = exprp && exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+            if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return;
+            const AstVhdlSubprogDecl* const fdeclp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+            if (fdeclp && fdeclp->isFunction() && !fdeclp->vhdlPure()) found = true;
+        });
+        return found;
+    }
+
     bool boundsOnlyRunningDecides(const AstNode* nodep, int depth = 0) const {
         if (!nodep || depth > 32) return false;
         for (const AstNode* p = nodep; p; p = p->nextp()) {
@@ -2003,6 +2023,12 @@ private:
                 }
                 if (boundsOnlyRunningDecides(attrp->argp(), depth + 1)) return true;
                 continue;
+            }
+            // An element that elaboration worked out is settled, whatever
+            // the rest of the record is: "cfg.data_width" where a call built
+            // cfg and gave that element as a number
+            if (const AstVhdlSelected* const selp = VN_CAST(p, VhdlSelected)) {
+                if (V3VhdlEval::eval(const_cast<AstVhdlSelected*>(selp)).known()) continue;
             }
             if (const AstNodeVhdlExpr* const exprp = VN_CAST(p, NodeVhdlExpr)) {
                 if (const VhdlSymbol* const symp = exprp->vhdlSymp()) {
@@ -2060,6 +2086,23 @@ private:
                         if (declp && declp->defaultp() && !symp->resolved()->hasValue()
                             && !V3VhdlEval::eval(declp->defaultp()).isInt()
                             && mentionsParameter(declp->defaultp())) {
+                            return true;
+                        }
+                        // Nor one no elaboration settles at all: a record a
+                        // call builds that the back end cannot fold is left
+                        // a variable (spreadElabConstants), and what it holds
+                        // is only there once the design runs -- VUnit's
+                        // "array (0 to tb_cfg.transfers - 1)", with transfers
+                        // read out of a string generic
+                        // A constant marked as settled by elaboration whose
+                        // value calls an impure function is demoted to one
+                        // too when it is emitted (valueFolds), so it is asked
+                        // the same question here: "constant n : positive :=
+                        // count" is a number only once the design runs.
+                        if (declp && declp->defaultp() && !symp->resolved()->hasValue()
+                            && !V3VhdlEval::eval(declp->defaultp()).known()
+                            && (!declp->isElabConstant()
+                                || callsImpureOrAllocates(declp->defaultp()))) {
                             return true;
                         }
                         break;
@@ -24293,7 +24336,15 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // instance has none here either, but elaboration gives it
                 // one and V3Param folds it; an expression may still fold in
                 // the back end where nothing here could fold it.
-                const VhdlSymbol* const asymp = asp->actualp()->vhdlSymp();
+                const VhdlSymbol* asymp = asp->actualp()->vhdlSymp();
+                // An element of a record or of an array is part of the
+                // object it names, and it is that object which has a value
+                // or has not: VUnit hands a component "tb_cfg.write_prob",
+                // read out of a string generic while the design runs
+                if ((!asymp || asymp->resolved()->kind() != VhdlSymKind::CONSTANT)
+                    && (VN_IS(asp->actualp(), VhdlSelected) || VN_IS(asp->actualp(), VhdlCall))) {
+                    asymp = baseSymOf(asp->actualp());
+                }
                 if (!asymp) continue;
                 const VhdlSymbol* const constp = asymp->resolved();
                 if (constp->kind() != VhdlSymKind::CONSTANT || constp->hasValue()) continue;
