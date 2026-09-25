@@ -3466,6 +3466,9 @@ private:
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerExpr(nodep);
+        if (AstNodeExpr* const joinedp = aggregateOfArraysCarrier(nodep, carrierTypep, flp)) {
+            return joinedp;
+        }
         if (AstNodeExpr* const movingp = movingSliceCarrier(nodep, carrierTypep, flp)) {
             return movingp;
         }
@@ -4051,6 +4054,47 @@ private:
         addHelperFunc(funcp);
         m_justifyFuncs.insert_or_assign(right, funcp);
         return funcp;
+    }
+
+    // A positional aggregate some of whose elements are arrays of its own
+    // type -- "(x(5 downto 0), y(W - 1 downto 0))" -- is those arrays and
+    // elements one after the other (9.3.3.3), which is what joining them
+    // says: each is made a carrier and they are joined in order. Null where
+    // the aggregate is not of that shape.
+    AstNodeExpr* aggregateOfArraysCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep,
+                                          FileLine* flp) {
+        AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
+        if (!aggp || !carrierTypep || !aggp->elemsp()) return nullptr;
+        std::vector<AstNodeVhdlExpr*> partsp;
+        bool anyArray = false;
+        for (AstNode* p = aggp->elemsp(); p; p = p->nextp()) {
+            AstVhdlElemAssoc* const eap = VN_CAST(p, VhdlElemAssoc);
+            if (!eap || eap->choicesp() || !eap->valuep()) return nullptr;
+            const VhdlType* const ptypep = eap->valuep()->vhdlTypep();
+            if (ptypep && ptypep->base() == carrierTypep->base()) anyArray = true;
+            partsp.push_back(eap->valuep());
+        }
+        if (!anyArray) return nullptr;
+        AstNodeFTask* const catp = dynCatFunc(carrierTypep, flp);
+        if (!catp) return nullptr;
+        AstNodeExpr* accp = nullptr;
+        for (AstNodeVhdlExpr* const partp : partsp) {
+            AstNodeExpr* const onep = asDynCarrier(partp, carrierTypep, flp);
+            if (!onep) {
+                if (accp) VL_DO_DANGLING(accp->deleteTree(), accp);
+                return nullptr;
+            }
+            if (!accp) {
+                accp = onep;
+                continue;
+            }
+            AstArg* const argsp = new AstArg{flp, "", accp};
+            argsp->addNext(new AstArg{flp, "", onep});
+            AstFuncRef* const refp = new AstFuncRef{flp, catp->name(), argsp};
+            refp->taskp(VN_AS(catp, Func));
+            accp = refp;
+        }
+        return accp;
     }
 
     // "a & b" over values that carry their own bounds: as long as the two
@@ -24002,6 +24046,14 @@ private:
                 // on (9.3.6): "return unsigned(f(x))" is as long as f makes
                 // it, which no parameter of this subprogram says
                 AstNodeVhdlExpr* const valuep = throughTypeConversions(retp->valuep());
+                // An aggregate is as long as its elements say and a join as
+                // long as both sides together, which no parameter says either:
+                // "return (x(5 downto 0), y(W - 1 downto 0))" is not as long
+                // as x
+                if (VN_IS(valuep, VhdlAggregate)) return true;
+                if (const AstVhdlBinary* const binp = VN_CAST(valuep, VhdlBinary)) {
+                    if (binp->op() == VhdlBinaryOp::CONCAT) return true;
+                }
                 AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall);
                 const VhdlSymbol* namedp = callp ? callp->vhdlSymp() : nullptr;
                 if (!namedp && callp && callp->prefixp()) namedp = callp->prefixp()->vhdlSymp();
