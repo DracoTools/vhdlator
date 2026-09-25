@@ -20484,6 +20484,29 @@ private:
         }
         return nullptr;
     }
+    // The same as two ends and a direction. A vector emitted by its width
+    // alone -- "logic [31:0]", which is what a copy made with an actual's
+    // length gives a parameter whose range only that length says -- has
+    // them as well, and is indexed by them. False where there are none.
+    static bool emittedBoundsOf(const AstVar* varp, AstNodeExpr*& leftp, AstNodeExpr*& rightp,
+                                bool& ascending, FileLine* flp) {
+        if (const AstRange* const rangep = emittedRangeOf(varp)) {
+            leftp = rangep->leftp()->cloneTree(false);
+            rightp = rangep->rightp()->cloneTree(false);
+            ascending = rangep->ascending();
+            return true;
+        }
+        const AstBasicDType* const bp = varp ? VN_CAST(varp->childDTypep(), BasicDType) : nullptr;
+        if (!bp || !bp->isRanged()) return false;
+        if (bp->rangep()
+            && (!VN_IS(bp->rangep()->leftp(), Const) || !VN_IS(bp->rangep()->rightp(), Const))) {
+            return false;
+        }
+        leftp = i32(bp->left(), flp);
+        rightp = i32(bp->right(), flp);
+        ascending = bp->ascending();
+        return true;
+    }
 
     // A carrier filled from an object of a fixed width, and the copy back
     // into it. The bounds are taken from the object *as it was emitted*
@@ -20662,8 +20685,11 @@ private:
                 = pair.loweredp ? pair.loweredp->cloneTree(false) : lowerExpr(pair.exprp);
             if (!onep) return false;
             AstVar* const objp = VN_IS(onep, VarRef) ? VN_AS(onep, VarRef)->varp() : nullptr;
-            const AstRange* const rangep = emittedRangeOf(objp);
-            if (fvarp && rangep && !isCarrierDType(objp->childDTypep())) {
+            AstNodeExpr* leftp = nullptr;
+            AstNodeExpr* rightp = nullptr;
+            bool ascending = false;
+            if (fvarp && objp && !isCarrierDType(objp->childDTypep())
+                && emittedBoundsOf(objp, leftp, rightp, ascending, flp)) {
                 const VhdlMode mode = pair.formalp ? pair.formalp->mode() : VhdlMode::INOUT;
                 AstVar* const tmpp = newTempVar(
                     "__Vdynsig", fvarp->childDTypep()->cloneTree(false), flp);
@@ -20671,16 +20697,16 @@ private:
                 // still has to be as long as the object it is copied back
                 // into, since that is what says how long the value is
                 *prepp = AstNode::addNextNull(
-                    *prepp, carrierRoundTrip(tmpp, objp, rangep->leftp()->cloneTree(false),
-                                             rangep->rightp()->cloneTree(false),
-                                             rangep->ascending(), true, flp));
+                    *prepp, carrierRoundTrip(tmpp, objp, leftp->cloneTree(false),
+                                             rightp->cloneTree(false), ascending, true, flp));
                 if (postpp && mode != VhdlMode::IN) {
                     *postpp = AstNode::addNextNull(
                         *postpp,
-                        carrierRoundTrip(tmpp, objp, rangep->leftp()->cloneTree(false),
-                                         rangep->rightp()->cloneTree(false),
-                                         rangep->ascending(), false, flp));
+                        carrierRoundTrip(tmpp, objp, leftp->cloneTree(false),
+                                         rightp->cloneTree(false), ascending, false, flp));
                 }
+                VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                VL_DO_DANGLING(rightp->deleteTree(), rightp);
                 VL_DO_DANGLING(onep->deleteTree(), onep);
                 onep = new AstVarRef{flp, tmpp, VAccess::READWRITE};
             }
