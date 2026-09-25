@@ -302,6 +302,15 @@ class InlineCFuncsVisitor final : public VNVisitor {
                 // Can't do it if it's in a different scope, self pointers differ
                 if (callerp->scopep() != calleep->scopep()) continue;
 
+                // A function that is not a method of the class reaches the
+                // class's private members only through what it calls, so what
+                // the inlined body calls has to be public there
+                if (!callerp->isProperMethod()) {
+                    calleep->foreach([](const AstCCall* ccallp) {
+                        if (ccallp->funcp()->declPrivate()) ccallp->funcp()->declPrivate(false);
+                    });
+                }
+
                 // Inline it
                 if (!nInlined) ++m_statFuncsInlined;
                 AstNode* const inlinedp = inlineCall(callerp, callp, calleep, nInlined++);
