@@ -5292,10 +5292,19 @@ private:
     // over the value that instance gives, and the number travels to the
     // module as a parameter of its own. One per bound, named here and read
     // both where the bound is emitted and where the instance is.
+    // One generic map on the way down to the instance a relayed bound
+    // belongs to: each formal, and what the entity above hands it
+    using VhdlHoistLevel = std::vector<std::pair<const VhdlSymbol*, AstNodeVhdlExpr*>>;
     struct VhdlHoistedBound final {
         std::string name;  // The parameter the module gains
         AstNodeVhdlExpr* exprp;  // The bound, as the entity wrote it
+        // Where the bound belongs to an instance further down, the generic
+        // maps between, outermost first; empty for the entity's own bound
+        std::vector<VhdlHoistLevel> via;
     };
+    // The parameter of the enclosing module that hands an instance's hoisted
+    // bound on, by instance and that bound's name
+    std::map<std::pair<const AstVhdlInstance*, std::string>, std::string> m_hoistRelay;
     std::map<const AstNodeVhdlExpr*, std::string> m_hoistName;
     std::map<std::string, std::vector<VhdlHoistedBound>> m_hoists;  // By module name
     std::map<std::string, AstVar*> m_hoistVars;  // Those declared in this module
@@ -6188,6 +6197,14 @@ private:
     AstNodeExpr* lowerExpr(AstNodeVhdlExpr* nodep) {
         if (!nodep) return nullptr;
         FileLine* const flp = nodep->fileline();
+        // A bound hoisted into a parameter of the module is that parameter,
+        // wherever it is read -- a slice in a port map as much as a type
+        if (!m_hoistName.empty() && m_modp) {
+            const auto hoistIt = m_hoistName.find(nodep);
+            if (hoistIt != m_hoistName.end()) {
+                return new AstVarRef{flp, hoistVar(hoistIt->second, flp), VAccess::READ};
+            }
+        }
         // Whatever its shape, an expression the analyzer could fold is a
         // constant. That covers literals, constants, generics with values and
         // every attribute of a static subtype, in one place.
@@ -10975,7 +10992,9 @@ private:
                 // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
                 // writes both ends, so the width has to be recovered from
                 // them before Verilator's fixed-width form can be used.
-                if (!VN_IS(leftp, Const) || !VN_IS(rightp, Const)) {
+                // A parameter is a number to the back end: a bound hoisted
+                // into one cuts the slice as a literal would
+                if (!constOrParam(leftp) || !constOrParam(rightp)) {
                     if (sliceSpanKnown(rp)) {
                         // Elements that do not pack have no bits for a part
                         // select to cut, so such a slice is copied out
@@ -11482,6 +11501,16 @@ private:
             return len > 0 && len <= (1 << 20) ? len : 0;
         }
         return 0;
+    }
+
+    // Whether an expression is a number or a parameter of the module, which
+    // the back end folds as one
+    static bool constOrParam(const AstNodeExpr* nodep) {
+        if (VN_IS(nodep, Const)) return true;
+        const AstVarRef* const refp = VN_CAST(nodep, VarRef);
+        return refp && refp->varp()
+               && (refp->varp()->varType() == VVarType::GPARAM
+                   || refp->varp()->varType() == VVarType::LPARAM);
     }
 
     // "reversed" where the ends were put onto an object numbered the other
@@ -16926,16 +16955,34 @@ private:
             const VhdlValue val = V3VhdlEval::evalElab(asp->actualp());
             if (val.known()) bindings.emplace(gsymp->resolved(), val);
         }
-        if (bindings.empty()) return nullptr;
         AstPin* outp = nullptr;
         for (const VhdlHoistedBound& hoist : it->second) {
-            const VhdlValue val = V3VhdlEval::evalElabWith(hoist.exprp, bindings);
-            if (!val.isInt()) continue;
+            // Through the generic maps between, where the bound belongs to
+            // an instance further down
+            std::map<const VhdlSymbol*, VhdlValue> atp = bindings;
+            for (const VhdlHoistLevel& level : hoist.via) {
+                std::map<const VhdlSymbol*, VhdlValue> nextp;
+                for (const auto& pair : level) {
+                    const VhdlValue val = V3VhdlEval::evalElabWith(pair.second, atp);
+                    if (val.known()) nextp.emplace(pair.first, val);
+                }
+                atp = std::move(nextp);
+            }
+            const VhdlValue val = V3VhdlEval::evalElabWith(hoist.exprp, atp);
             FileLine* const flp = hoist.exprp->fileline();
-            outp = AstNode::addNext(outp,
-                                    new AstPin{flp, ++*pinNump, hoist.name,
-                                               new AstConst{flp, AstConst::Signed32{},
-                                                            static_cast<int32_t>(val.toInt())}});
+            AstNodeExpr* valuep = nullptr;
+            if (val.isInt()) {
+                valuep
+                    = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(val.toInt())};
+            } else {
+                // Handed a generic of the module being lowered, which has no
+                // value until that module is instantiated in turn: the bound
+                // is one of its own parameters, which its instance works out
+                const auto relayIt = m_hoistRelay.find(std::make_pair(nodep, hoist.name));
+                if (relayIt == m_hoistRelay.end()) continue;
+                valuep = new AstVarRef{flp, hoistVar(relayIt->second, flp), VAccess::READ};
+            }
+            outp = AstNode::addNext(outp, new AstPin{flp, ++*pinNump, hoist.name, valuep});
         }
         return outp;
     }
@@ -17242,8 +17289,19 @@ private:
                 outp = blockp;  // The trailing "else"
                 continue;
             }
-            outp = new AstGenIf{alts[i]->fileline(), lowerCondition(alts[i]->condp()), blockp,
-                                outp};
+            // A condition written in terms of a generic that travels as data
+            // was hoisted into a parameter the instance works out
+            AstVhdlGenerateBody* const altp = alts[i];
+            const auto hoistIt = m_hoistName.find(altp->condp());
+            AstNodeExpr* const condp
+                = hoistIt == m_hoistName.end()
+                      ? lowerCondition(altp->condp())
+                      : new AstNeq{altp->fileline(),
+                                   new AstVarRef{altp->fileline(),
+                                                 hoistVar(hoistIt->second, altp->fileline()),
+                                                 VAccess::READ},
+                                   new AstConst{altp->fileline(), AstConst::Signed32{}, 0}};
+            outp = new AstGenIf{altp->fileline(), condp, blockp, outp};
         }
         addStmt(outp);
     }
@@ -24512,7 +24570,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     if (!named) continue;
                     const std::string name = "__Vgb" + std::to_string(++m_hoistNum);
                     m_hoistName.emplace(boundp, name);
-                    hoists.push_back(VhdlHoistedBound{name, boundp});
+                    hoists.push_back(VhdlHoistedBound{name, boundp, {}});
                 }
             });
         };
@@ -24552,8 +24610,87 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             for (AstNode* const headp : partsp) {
                 for (AstNode* p = headp; p; p = p->nextp()) p->foreach(hoistDecls);
             }
+            // An if generate's condition has to be settled before the design
+            // runs as much as a bound does, and one written in terms of a
+            // generic that travels as data is worked out by the instance the
+            // same way: "if m.leaf.len /= 0 generate"
+            const auto hoistCond = [&](AstVhdlGenerateBody* bodyp) {
+                AstNodeVhdlExpr* const condp = bodyp->condp();
+                if (!condp || m_hoistName.count(condp)) return;
+                const VhdlType* const ctypep = condp->vhdlTypep();
+                if (!ctypep || ctypep->base() != V3VhdlStd::booleanType()) return;
+                bool named = false;
+                condp->foreach([&](AstNodeVhdlExpr* refp) {
+                    const VhdlSymbol* const symp = refp->vhdlSymp();
+                    if (symp && m_dataGenerics.count(symp->resolved())) named = true;
+                });
+                if (!named) return;
+                const std::string name = "__Vgb" + std::to_string(++m_hoistNum);
+                m_hoistName.emplace(condp, name);
+                hoists.push_back(VhdlHoistedBound{name, condp, {}});
+            };
+            for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) p->foreach(hoistCond);
+            // A slice in a port map is cut at elaboration too: the back end
+            // wants its width a number -- "d => d(t.len - 1 downto 0)"
+            for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
+                p->foreach([&](AstVhdlInstance* instp) {
+                    for (AstNode* q = instp->portMapp(); q; q = q->nextp()) hoistIn(q);
+                });
+            }
         }
         if (!hoists.empty()) m_hoists.emplace(entp->name(), std::move(hoists));
+    }
+    // A component that hands one of its own data generics, or part of one,
+    // to an instance whose bounds are hoisted cannot work those bounds out:
+    // its generic has no value until it is instantiated in turn, and the
+    // instance's parameter kept its default -- a port one bit wide. So it
+    // hoists them as well, and its own instance works them out through the
+    // generic map in between. VUnit's axi_stream_master hands its monitor
+    // "master.p_monitor", and the monitor hands its protocol checker on.
+    for (int round = 0; round < 8; ++round) {
+        bool grew = false;
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity);
+            if (!entp) continue;
+            for (AstVhdlArchitecture* const archp : archsOf[entp->name()]) {
+                archp->foreach([&](AstVhdlInstance* instp) {
+                    const auto childIt = m_hoists.find(boundName(instp));
+                    if (childIt == m_hoists.end()) return;
+                    VhdlHoistLevel level;
+                    bool namesData = false;
+                    for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
+                        AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                        if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+                        const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+                        const VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+                        if (!gsymp) continue;
+                        level.emplace_back(gsymp->resolved(), asp->actualp());
+                        asp->actualp()->foreach([&](const AstNodeVhdlExpr* refp) {
+                            const VhdlSymbol* const symp = refp->vhdlSymp();
+                            if (symp && m_dataGenerics.count(symp->resolved())) namesData = true;
+                        });
+                    }
+                    if (!namesData) return;
+                    // A copy: the list may grow while it is read, when an
+                    // entity instantiates itself
+                    const std::vector<VhdlHoistedBound> childHoists = childIt->second;
+                    for (const VhdlHoistedBound& hoist : childHoists) {
+                        const auto key = std::make_pair(static_cast<const AstVhdlInstance*>(instp),
+                                                        hoist.name);
+                        if (m_hoistRelay.count(key)) continue;
+                        VhdlHoistedBound relay;
+                        relay.name = "__Vgb" + std::to_string(++m_hoistNum);
+                        relay.exprp = hoist.exprp;
+                        relay.via.push_back(level);
+                        relay.via.insert(relay.via.end(), hoist.via.begin(), hoist.via.end());
+                        m_hoistRelay.emplace(key, relay.name);
+                        m_hoists[entp->name()].push_back(relay);
+                        grew = true;
+                    }
+                });
+            }
+        }
+        if (!grew) break;
     }
     // Whether any signal transaction in the design is delivered at a time of
     // its own. This decides whether a process whose timeout expires has to
