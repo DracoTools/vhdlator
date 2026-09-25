@@ -1099,6 +1099,20 @@ private:
             okr = false;
             return false;
         }
+        // A condition of another type than BOOLEAN goes through the
+        // condition operator (9.2.9): "if x then" over a STD_ULOGIC is true
+        // for '1' and 'H', which are not where TRUE is. A pure function
+        // called with '1' is folded here, and answered FALSE.
+        const VhdlType* const typep = val.typep() ? val.typep()->base() : nullptr;
+        if (typep && typep->kind() == VhdlTypeKind::ENUM) {
+            const std::vector<VhdlSymbol*>& lits = typep->literals();
+            const int64_t pos = val.toInt();
+            if (pos >= 0 && pos < static_cast<int64_t>(lits.size()) && lits[pos]) {
+                const std::string& name = lits[pos]->name();
+                if (name == "'1'" || name == "'H'") return true;
+                if (name == "'0'" || name == "'L'" || name.size() == 3) return false;
+            }
+        }
         return val.toInt() == VAL_TRUE;
     }
 
