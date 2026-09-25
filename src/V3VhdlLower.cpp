@@ -18486,8 +18486,26 @@ private:
         AstVar* const baseVarp = newTempVar("__Vdynbase", newIntDType(flp), flp);
         AstVar* const idxVarp = newTempVar("__Vdyni", newIntDType(flp), flp);
         idxVarp->usedLoopIdx(true);
+        // A value that carries its own bounds and is not read straight out
+        // of an access value -- "p.all := p.all(2 to n) & a", OSVVM's TCover
+        // -- is worked out once into a carrier and copied from there, which
+        // is the temporary the assignment goes through anyway (10.6.2.1)
+        AstVar* srcCarrp = nullptr;
+        AstNode* srcInitp = nullptr;
+        if (isDynValue(valuep) && !uniformAggregateValue(valuep) && !accessSourced(valuep)) {
+            if (VhdlType* const carrp = dynValueType(valuep)) {
+                if (AstNodeExpr* const srcp = lowerExpr(valuep)) {
+                    srcCarrp = newTempVar("__Vdynsrc", dynCarrierRef(carrp, flp), flp);
+                    srcInitp
+                        = new AstAssign{flp, new AstVarRef{flp, srcCarrp, VAccess::WRITE}, srcp};
+                }
+            }
+        }
         AstNodeExpr* const elemp
-            = dynSourceElem(valuep, new AstVarRef{flp, idxVarp, VAccess::READ}, flp);
+            = srcCarrp ? static_cast<AstNodeExpr*>(new AstSelBit{
+                             flp, dynPart(new AstVarRef{flp, srcCarrp, VAccess::READ}, "q", flp),
+                             new AstVarRef{flp, idxVarp, VAccess::READ}})
+                       : dynSourceElem(valuep, new AstVarRef{flp, idxVarp, VAccess::READ}, flp);
         if (!elemp) {
             VL_DO_DANGLING(dstp->deleteTree(), dstp);
             VL_DO_DANGLING(countp->deleteTree(), countp);
@@ -18510,6 +18528,7 @@ private:
                        new AstConst{flp, AstConst::Signed32{}, 1}}});
         AstNode* outp
             = new AstAssign{flp, new AstVarRef{flp, countVarp, VAccess::WRITE}, countp};
+        if (srcInitp) outp = AstNode::addNext(srcInitp, outp);
         outp = AstNode::addNext(
             outp, static_cast<AstNode*>(
                       new AstAssign{flp, new AstVarRef{flp, baseVarp, VAccess::WRITE}, basep}));
@@ -18665,6 +18684,18 @@ private:
         VL_DO_DANGLING(objp->deleteTree(), objp);
         if (nodep->op() == VhdlBinaryOp::NE) return new AstLogNot{flp, outp};
         return outp;
+    }
+
+    // Whether a value is read straight out of what an access value points
+    // at, whole or as a slice, which dynSourceElem reads in place
+    bool accessSourced(AstNodeVhdlExpr* valuep) {
+        const DynAccess* dynp = nullptr;
+        if (AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall)) {
+            if (VN_IS(callp->argsp(), VhdlRange)) {
+                return dynAccessObj(callp->prefixp(), dynp) != nullptr;
+            }
+        }
+        return dynAccessObj(valuep, dynp) != nullptr;
     }
 
     // One element of the value being copied into an array an access value
