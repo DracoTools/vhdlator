@@ -11013,16 +11013,22 @@ private:
                     // the object it is taken from has a length the text or
                     // the elaboration fixes. From here it is a value that
                     // carries its own bounds (8.5).
+                    // The ends were put onto the numbering of what the name
+                    // denotes, so that is the object the helper is written
+                    // for -- not an alias that numbers it the other way
                     VhdlType* const objTypep
-                        = prefixExprp ? prefixExprp->vhdlTypep() : nullptr;
+                        = !shifts.empty() && ownerTypep
+                              ? const_cast<VhdlType*>(ownerTypep)
+                              : (prefixExprp ? prefixExprp->vhdlTypep() : nullptr);
                     VhdlType* const sliceTypep = nodep->vhdlTypep();
-                    // The value made carries the bounds of the object's
-                    // numbering, which a name numbered the other way round
-                    // does not share
-                    if (!m_asTarget && sliceTypep && objTypep && sliceDirKnown && !reversed
+                    // Cut in the object's own direction: a name numbered the
+                    // other way round -- "alias bv_norm : bit_vector(bv'length
+                    // - 1 downto 0) is bv" over an ascending bv -- has its
+                    // elements run the other way in the object's numbering
+                    if (!m_asTarget && sliceTypep && objTypep && sliceDirKnown
                         && isRunningSlice(nodep)) {
                         if (AstNodeFTask* const cfuncp
-                            = dynOfSliceFunc(sliceTypep, objTypep, sliceAsc, flp)) {
+                            = dynOfSliceFunc(sliceTypep, objTypep, objAsc, flp)) {
                             AstArg* argsp = new AstArg{flp, "", fromp};
                             argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
                             argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
