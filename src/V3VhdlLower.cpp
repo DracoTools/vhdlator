@@ -8332,10 +8332,16 @@ private:
     // where its range starts. Takes ownership of both expressions.
     static AstNodeExpr* dynNew(AstNodeExpr* countp, AstNodeExpr* leftp, int dir,
                                FileLine* flp) {
+        return dynNew(countp, leftp, new AstConst{flp, AstConst::Signed32{}, dir}, flp);
+    }
+    // The same where only running knows which way the range runs: dirp is 1
+    // for "to" and -1 for "downto"
+    static AstNodeExpr* dynNew(AstNodeExpr* countp, AstNodeExpr* leftp, AstNodeExpr* dirp,
+                               FileLine* flp) {
         AstNew* const newp = new AstNew{flp};
         newp->addArgsp(new AstArg{flp, "", countp});
         newp->addArgsp(new AstArg{flp, "", leftp});
-        newp->addArgsp(new AstArg{flp, "", new AstConst{flp, AstConst::Signed32{}, dir}});
+        newp->addArgsp(new AstArg{flp, "", dirp});
         return newp;
     }
 
@@ -8404,6 +8410,63 @@ private:
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, objVarp, VAccess::READ}};
     }
 
+    // "new t'(v)" where v carries its own bounds, as a constant of an
+    // unconstrained array given its value by a call does: the object is made
+    // as long as the value, from where its range starts and running the way
+    // it runs, and the elements are copied across in order. The carrier and
+    // the object both hold the elements from the left one up.
+    AstNodeExpr* dynAllocFromCarrier(AstNodeVhdlExpr* valuep, const DynAccess* dynp,
+                                     FileLine* flp) {
+        VhdlType* const carrp = dynValueType(valuep);
+        if (!carrp) {
+            unsup(flp, "allocator for a value whose bounds are not known");
+            return nullptr;
+        }
+        AstNodeExpr* const srcp = lowerExpr(valuep);
+        if (!srcp) return nullptr;
+        AstVar* const srcVarp = newTempVar("__Vdynval", dynCarrierRef(carrp, flp), flp);
+        AstVar* const objVarp
+            = newTempVar("__Vdynobj", new AstClassRefDType{flp, dynp->classp, nullptr}, flp);
+        AstVar* const cntVarp = newTempVar("__Vdyncnt", newIntDType(flp), flp);
+        AstVar* const idxVarp = newTempVar("__Vdynj", newIntDType(flp), flp);
+        idxVarp->usedLoopIdx(true);
+        const auto src = [&]() { return new AstVarRef{flp, srcVarp, VAccess::READ}; };
+        AstNode* stmtsp = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
+        stmtsp = AstNode::addNext(stmtsp, static_cast<AstNode*>(new AstAssign{
+                                              flp, new AstVarRef{flp, cntVarp, VAccess::WRITE},
+                                              dynCarrierLength(src(), flp)}));
+        stmtsp = AstNode::addNext(
+            stmtsp,
+            static_cast<AstNode*>(new AstAssign{
+                flp, new AstVarRef{flp, objVarp, VAccess::WRITE},
+                dynNew(new AstVarRef{flp, cntVarp, VAccess::READ}, dynPart(src(), "lft", flp),
+                       new AstCond{flp, dynPart(src(), "dsc", flp),
+                                   new AstConst{flp, AstConst::Signed32{}, -1},
+                                   new AstConst{flp, AstConst::Signed32{}, 1}},
+                       flp)}));
+        stmtsp = AstNode::addNext(stmtsp, static_cast<AstNode*>(new AstAssign{
+                                              flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                              new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp,
+                            new AstLtS{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                                       new AstVarRef{flp, cntVarp, VAccess::READ}}});
+        loopp->addStmtsp(
+            new AstAssign{flp,
+                          new AstSelBit{flp,
+                                        memberOf(new AstVarRef{flp, objVarp, VAccess::READ},
+                                                 dynp->datap->name(), flp),
+                                        new AstVarRef{flp, idxVarp, VAccess::READ}},
+                          new AstSelBit{flp, dynPart(src(), "q", flp),
+                                        new AstVarRef{flp, idxVarp, VAccess::READ}}});
+        loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                       new AstAdd{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
+                                                  new AstConst{flp, AstConst::Signed32{}, 1}}});
+        stmtsp = AstNode::addNext(stmtsp, static_cast<AstNode*>(loopp));
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, objVarp, VAccess::READ}};
+    }
+
     // "new t'(v)" for an array whose bounds only the value gives: the object
     // is made the size of the value, and the value copied into it. The
     // statements that do so travel with the expression, since an allocator
@@ -8421,6 +8484,8 @@ private:
             // "new t'(l to r => v)": the aggregate says its own range, and
             // the bounds may only be known while running
             if (AstNodeExpr* const outp = dynAllocFromRun(valuep, dynp, flp)) return outp;
+            // A value that carries its own bounds says them while running
+            if (isDynValue(valuep)) return dynAllocFromCarrier(valuep, dynp, flp);
             unsup(flp, "allocator for a value whose bounds are not known");
             return nullptr;
         }
