@@ -134,6 +134,7 @@ class VhdlLowerVisitor final {
     AstNodeFTask* m_ftaskp = nullptr;  // Subprogram being built, if any
     VhdlType* m_retCarrierp = nullptr;  // Its result, where that is a carrier
     VhdlType* m_retFixedp = nullptr;  // Its result, where that has a length
+    VhdlType* m_retCarrier2p = nullptr;  // Its result, where that is held two levels deep
     std::map<const AstNodeFTask*, VhdlType*> m_retTypeOf;  // What each one gives back
     std::map<const VhdlSymbol*, AstNodeFTask*> m_funcs;  // Subprogram -> what it became
     std::set<const VhdlSymbol*> m_emitting;  // Subprograms being emitted, to stop recursion
@@ -551,7 +552,7 @@ private:
                 // made that way
                 if (AstVar* const dyn2p
                     = taskParamAt(refp->taskp(), namep ? namep->name() : "", pos)) {
-                    if (isDyn2Var(dyn2p)
+                    if (isDyn2Var(dyn2p) && !m_argCarrier.count(asp)
                         && !(VN_IS(asp->actualp(), VhdlName) && isDyn2Value(asp->actualp()))) {
                         const int at = symp && namep ? symp->paramIndex(namep->name())
                                                      : static_cast<int>(pos);
@@ -581,7 +582,7 @@ private:
                 }
                 // A value that carries its own bounds, handed to a parameter
                 // whose subtype fixes them, is copied into one of those
-                if (symp && isDynValue(asp->actualp())) {
+                if (!onep && symp && isDynValue(asp->actualp())) {
                     const int at = namep ? symp->paramIndex(namep->name())
                                          : static_cast<int>(pos);
                     VhdlType* const formalp
@@ -2412,6 +2413,62 @@ private:
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
     }
 
+    // The other way about: a value held two levels deep made into one that
+    // carries its own bounds where its elements have a length of their own,
+    // each element checked against it. Null where it cannot be.
+    AstNodeExpr* carrierOfDyn2(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp) {
+        const VhdlSymbol* const namedp = VN_IS(nodep, VhdlName) && nodep->vhdlSymp()
+                                             ? nodep->vhdlSymp()->resolved()
+                                             : nullptr;
+        VhdlType* const vtypep
+            = namedp ? namedp->typep()
+              : dyn2ResultCall(nodep)
+                  ? emittedReturnType(VN_AS(nodep, VhdlCall)->vhdlSymp()->resolved())
+                  : nodep->vhdlTypep();
+        VhdlType* const elemCarrp = vtypep ? openCarriedElement(vtypep) : nullptr;
+        if (!carrierTypep || !elemCarrp) return nullptr;
+        VhdlType* const fixedElemp = carrierTypep->elementp() ? carrierTypep->elementp()
+                                                              : carrierTypep->base()->elementp();
+        if (!fixedElemp || !fixedElemp->isConstrainedArray()
+            || lengthOnlyRunningDecides(fixedElemp)) {
+            return nullptr;
+        }
+        AstNodeFTask* const elemFuncp = dynToFixedFunc(elemCarrp, fixedElemp, flp);
+        if (!elemFuncp) return nullptr;
+        AstNodeExpr* const srcp = asDyn2Carrier(nodep, vtypep, flp);
+        if (!srcp) return nullptr;
+        AstVar* const srcVarp = newTempVar("__Vdyn2c", dyn2CarrierRef(vtypep, flp), flp);
+        AstVar* const tmpp = newTempVar("__Vdyn2v", dynCarrierRef(carrierTypep, flp), flp);
+        AstVar* const kVarp = newTempVar("__Vdyn2k", newIntDType(flp), flp);
+        kVarp->usedLoopIdx(true);
+        const auto sr = [&]() { return new AstVarRef{flp, srcVarp, VAccess::READ}; };
+        const auto tw = [&]() { return new AstVarRef{flp, tmpp, VAccess::WRITE}; };
+        const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        AstNode* stmtsp = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
+        const auto add = [&](AstNode* stmtp) { stmtsp = AstNode::addNext(stmtsp, stmtp); };
+        for (const char* const part : {"lft", "rgt", "dsc"}) {
+            add(new AstAssign{flp, dynPart(tw(), part, flp), dynPart(sr(), part, flp)});
+        }
+        add(new AstAssign{flp, dynPart(tw(), "q", flp),
+                          new AstNewDynamic{flp, dynCarrierLength(sr(), flp), nullptr}});
+        add(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                          new AstConst{flp, AstConst::Signed32{}, 0}});
+        AstFuncRef* const elemRefp = new AstFuncRef{
+            flp, elemFuncp->name(),
+            new AstArg{flp, "", new AstSelBit{flp, dynPart(sr(), "q", flp), k()}}};
+        elemRefp->taskp(VN_AS(elemFuncp, Func));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, k(), dynCarrierLength(sr(), flp)}});
+        loopp->addStmtsp(
+            new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
+        loopp->addContsp(
+            new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                          new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        add(loopp);
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
+    }
+
     // A slice at ends only running settles of an array of fixed length whose
     // elements have a fixed length too, made into a value held two levels
     // deep: the slice's own bounds, and each element in it made a carrier.
@@ -2554,6 +2611,7 @@ private:
             const auto it = m_vars.find(symp);
             return it != m_vars.end() && isDyn2Var(it->second);
         }
+        if (dyn2ResultCall(nodep)) return true;
         if (!isAccessAll(nodep)) return false;
         const AstNodeVhdlExpr* const accp = VN_AS(nodep, VhdlSelected)->prefixp();
         const VhdlType* typep = accp->vhdlTypep();
@@ -2561,12 +2619,24 @@ private:
         return typep && openCarriedElement(typep->base()->designatedp());
     }
 
+    // A call to a function that gives back such a value: nothing about the
+    // call says how long the result or its elements are
+    bool dyn2ResultCall(const AstNodeVhdlExpr* nodep) const {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->vhdlSymp()) return false;
+        const VhdlSymbol* const symp = callp->vhdlSymp()->resolved();
+        if (symp->kind() != VhdlSymKind::FUNCTION || V3VhdlStd::isIntrinsic(symp)) return false;
+        return isDyn2Type(emittedReturnType(symp));
+    }
+
     // Such a value made from one this has: an object held that way as it
     // stands, what an access value points at through the object's own
     // elements and bounds, or an array whose elements have lengths of their
     // own, element by element. Null where the value is none of those.
     AstNodeExpr* asDyn2Carrier(AstNodeVhdlExpr* nodep, VhdlType* arrayTypep, FileLine* flp) {
-        if (isDyn2Value(nodep) && VN_IS(nodep, VhdlName)) return lowerExpr(nodep);
+        if (isDyn2Value(nodep) && (VN_IS(nodep, VhdlName) || dyn2ResultCall(nodep))) {
+            return lowerExpr(nodep);
+        }
         if (isAccessAll(nodep)) {
             const DynAccess* dynp = nullptr;
             AstNodeVhdlExpr* const objNodep = dynAccessObj(nodep, dynp);
@@ -3859,6 +3929,7 @@ private:
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerExpr(nodep);
+        if (isDyn2Value(nodep)) return carrierOfDyn2(nodep, carrierTypep, flp);
         if (AstNodeExpr* const joinedp = aggregateOfArraysCarrier(nodep, carrierTypep, flp)) {
             return joinedp;
         }
@@ -6253,6 +6324,12 @@ private:
                     && symp->typep() && symp->typep()->lengthEmittable()
                     && !lengthOnlyRunningDecides(symp->typep())) {
                     initp = dynAsFixed(objp->defaultp(), symp->typep(), flp);
+                }
+                // A record in the other shape, as an assignment would take it.
+                // An aggregate is built in the object's own shape already.
+                if (!initp
+                    && (VN_IS(objp->defaultp(), VhdlName) || VN_IS(objp->defaultp(), VhdlCall))) {
+                    initp = recordAsShape(objp->defaultp(), symp->typep(), flp);
                 }
                 if (!initp) initp = lowerExpr(objp->defaultp());
                 varp->valuep(initp);
@@ -18133,9 +18210,33 @@ private:
                 const auto rit = m_retTypeOf.find(m_ftaskp);
                 if (rit != m_retTypeOf.end() && rit->second
                     && rit->second->base()->kind() == VhdlTypeKind::ARRAY
-                    && !carriedDynamically(rit->second)) {
+                    && !carriedDynamically(rit->second) && !isDyn2Type(rit->second)) {
                     fixedRetp = rit->second;
                 }
+            }
+            // A record the body built in one shape, where the function gives
+            // it back in the other: "return v" with "v" constrained by the
+            // parameters, some of its elements then bits and not carriers
+            {
+                const auto rit = m_retTypeOf.find(m_ftaskp);
+                if (rit != m_retTypeOf.end() && rit->second && VN_IS(retp->valuep(), VhdlName)
+                    && rit->second->base()->kind() == VhdlTypeKind::RECORD) {
+                    if (AstNodeExpr* const shapedp
+                        = recordAsShape(retp->valuep(), rit->second, flp)) {
+                        return new AstReturn{flp, shapedp};
+                    }
+                }
+            }
+            // What the function gives back is held two levels deep, so the
+            // value is made one of those, bounds and all
+            if (m_retCarrier2p && retp->valuep()) {
+                AstNodeExpr* const carrp = asDyn2Carrier(retp->valuep(), m_retCarrier2p, flp);
+                if (!carrp) {
+                    unsup(flp, "value of a length only running decides copied from this "
+                               "expression");
+                    return nullptr;
+                }
+                return new AstReturn{flp, carrp};
             }
             if (fixedRetp && retp->valuep()
                 && (isDynValue(retp->valuep()) || namesCarrierVar(retp->valuep()))) {
@@ -18428,6 +18529,13 @@ private:
                 && (ttypep->isConstrainedArray()
                     || (ttypep->lengthEmittable() && !lengthOnlyRunningDecides(ttypep)))) {
                 if (AstNodeExpr* const outp = dynAsFixed(valuep, ttypep, flp)) return outp;
+            }
+        }
+        // A record in the other shape: "s <= init_if(...)", where the copy
+        // made for the call carries an element the signal holds as bits
+        if (valuep && targetp && (VN_IS(valuep, VhdlName) || VN_IS(valuep, VhdlCall))) {
+            if (AstNodeExpr* const outp = recordAsShape(valuep, shapeTypeOf(targetp), flp)) {
+                return outp;
             }
         }
         return lowerExpr(valuep);
@@ -19043,7 +19151,10 @@ private:
                 refp->taskp(VN_AS(funcp, Func));
                 valp = refp;
             } else if (!elementCarried(ttp) && elementCarried(stp)) {
-                AstNodeFTask* const funcp = dynToFixedFunc(stp, ttp, flp);
+                // Bounds written against a generic are no number here, and
+                // go in as the expressions they were written as
+                AstNodeFTask* funcp = dynToFixedFunc(stp, ttp, flp);
+                if (!funcp) funcp = dynToFixedExprFunc(stp, ttp, flp);
                 if (!funcp) return recordShapeFail(outp, targetp, holdp, srcp, valp, flp);
                 AstFuncRef* const refp
                     = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", smemp}};
@@ -19153,9 +19264,54 @@ private:
     // The assignment one value stands for, which is what each branch of a
     // conditional or selected variable assignment reduces to
     AstNode* lowerVarValue(AstVhdlVarAssign* nodep, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        AstNode* const outp = lowerVarValueAs(nodep, valuep, flp);
+        // An object that carries its bounds keeps them when it is written
+        // whole: the value's elements go into its places in order, however
+        // the value's own range ran (10.6.2.1). What was built hands the
+        // object a whole carrier, bounds and all, so only its elements are
+        // taken.
+        const AstVhdlName* const namep = VN_CAST(nodep->targetp(), VhdlName);
+        AstAssign* const asgp = VN_CAST(outp, Assign);
+        if (!namep || !asgp || asgp->nextp() || !namesCarrierVar(namep) || isDyn2Value(namep)) {
+            return outp;
+        }
+        AstVarRef* const tgtp = VN_CAST(asgp->lhsp(), VarRef);
+        if (!tgtp || tgtp->varp() != m_vars.at(namep->vhdlSymp()->resolved())) return outp;
+        AstNodeExpr* const srcp = asgp->rhsp()->unlinkFrBack();
+        const AstVar* const varp = tgtp->varp();
+        const AstRefDType* const refp
+            = VN_AS(varp->childDTypep() ? varp->childDTypep() : varp->dtypep(), RefDType);
+        AstVar* const tmpp = newTempVar("__Vdynkeep", refToDType(refp->name(), flp), flp);
+        AstNode* const keepp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, srcp};
+        asgp->lhsp(dynPart(asgp->lhsp()->unlinkFrBack(), "q", flp));
+        asgp->rhsp(dynPart(new AstVarRef{flp, tmpp, VAccess::READ}, "q", flp));
+        return AstNode::addNext(keepp, static_cast<AstNode*>(asgp));
+    }
+    AstNode* lowerVarValueAs(AstVhdlVarAssign* nodep, AstNodeVhdlExpr* valuep, FileLine* flp) {
         if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {
             if (!valuep) return nullptr;
             return lowerAggregateTarget(aggp, valuep, false, false, flp);
+        }
+        // "s := (others => ' ')" into a STRING whose bounds are not numbers
+        // here -- "string(1 to get_len(val))": as many of the character as
+        // the object holds, which it says itself while running, rather than
+        // its bounds worked out again
+        if (valuep && VN_IS(nodep->targetp(), VhdlName) && nodep->targetp()->vhdlTypep()
+            && isStringType(nodep->targetp()->vhdlTypep())
+            && !nodep->targetp()->vhdlTypep()->isConstrainedArray()
+            && !namesCarrierVar(nodep->targetp())) {
+            if (AstNodeVhdlExpr* const onep = uniformAggregateValue(valuep)) {
+                AstNodeExpr* const charp = lowerExpr(onep);
+                AstNodeExpr* const lenOfp = charp ? lowerExpr(nodep->targetp()) : nullptr;
+                AstNodeExpr* const tgtp = lenOfp ? lowerDriveTarget(nodep->targetp()) : nullptr;
+                if (tgtp) {
+                    return new AstAssign{flp, tgtp,
+                                         new AstReplicateN{flp, stringElem(onep, charp, flp),
+                                                           new AstLenN{flp, lenOfp}}};
+                }
+                if (lenOfp) VL_DO_DANGLING(lenOfp->deleteTree(), lenOfp);
+                if (charp) VL_DO_DANGLING(charp->deleteTree(), charp);
+            }
         }
         if (valuep && isStringPart(nodep->targetp())) {
             AstNodeExpr* const fillp = stringPartFill(nodep->targetp(), valuep, flp);
@@ -19170,6 +19326,23 @@ private:
         }
         if (valuep && isDynTarget(nodep->targetp())) {
             return lowerDynCopy(nodep->targetp(), valuep, flp);
+        }
+        // An object held two levels deep, written whole: it keeps its own
+        // bounds and its elements' (10.6.2.1), and takes the value's
+        // elements in order
+        if (valuep && VN_IS(nodep->targetp(), VhdlName) && isDyn2Value(nodep->targetp())) {
+            VhdlType* const ttypep = nodep->targetp()->vhdlSymp()->resolved()->typep();
+            AstNodeExpr* const srcp = asDyn2Carrier(valuep, ttypep, flp);
+            if (!srcp) {
+                unsup(flp, "value of a length only running decides copied from this expression");
+                return nullptr;
+            }
+            AstNodeExpr* const tgtp = lowerDriveTarget(nodep->targetp());
+            if (!tgtp) {
+                VL_DO_DANGLING(srcp->deleteTree(), srcp);
+                return nullptr;
+            }
+            return dyn2ElementsInto(tgtp, srcp, ttypep, flp);
         }
         // One element of an array of elements that carry their own bounds,
         // written: the element is given the value as a carrier
@@ -19243,6 +19416,34 @@ private:
         AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
         if (!lhsp || !rhsp) return nullptr;
         return new AstAssign{flp, lhsp, rhsp};
+    }
+
+    // The elements of one value held two levels deep put into another's
+    // places, one at a time and each element's own elements only, so what
+    // is written into keeps the bounds it has at both levels
+    AstNode* dyn2ElementsInto(AstNodeExpr* tgtp, AstNodeExpr* srcp, VhdlType* typep,
+                              FileLine* flp) {
+        AstVar* const srcVarp = newTempVar("__Vdyn2s", dyn2CarrierRef(typep, flp), flp);
+        AstVar* const kVarp = newTempVar("__Vdyn2k", newIntDType(flp), flp);
+        kVarp->usedLoopIdx(true);
+        const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        const auto src = [&]() { return new AstVarRef{flp, srcVarp, VAccess::READ}; };
+        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(new AstAssign{
+                                          flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                                          new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, k(), dynCarrierLength(src(), flp)}});
+        loopp->addStmtsp(new AstAssign{
+            flp,
+            dynPart(new AstSelBit{flp, dynPart(tgtp->cloneTree(false), "q", flp), k()}, "q", flp),
+            dynPart(new AstSelBit{flp, dynPart(src(), "q", flp), k()}, "q", flp)});
+        loopp->addContsp(
+            new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                          new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        VL_DO_DANGLING(tgtp->deleteTree(), tgtp);
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
     }
 
     // Whether an assignment writes a whole array, or a slice of one, that an
@@ -20834,6 +21035,34 @@ private:
             const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
             const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
             if (at < 0 || at >= static_cast<int>(symp->paramTypes().size())) continue;
+            // A parameter held two levels deep that the call writes, given
+            // what an access value points at: the object is made one of
+            // those for the call, and its elements go back afterwards --
+            // its bounds are the object's and stay as they were
+            if (isDyn2Type(symp->paramTypes()[at]) && paramModeOf(symp, at) != VhdlMode::IN
+                && isAccessAll(asp->actualp())) {
+                const DynAccess* dynp = nullptr;
+                AstNodeVhdlExpr* const objNodep = dynAccessObj(asp->actualp(), dynp);
+                AstNodeExpr* const twop
+                    = objNodep && dynp ? asDyn2Carrier(asp->actualp(), symp->paramTypes()[at], flp)
+                                       : nullptr;
+                AstNodeExpr* const objp = twop ? lowerDriveTarget(objNodep) : nullptr;
+                if (!objp) {
+                    if (twop) VL_DO_DANGLING(twop->deleteTree(), twop);
+                    unsup(flp, "call to '" + symp->name() + "' whose parameter '"
+                                   + symp->paramName(at)
+                                   + "' is written and has no length at this call");
+                    return false;
+                }
+                AstVar* const tp
+                    = newTempVar("__Vdyn2rt", dyn2CarrierRef(symp->paramTypes()[at], flp), flp);
+                prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(tp, flp), twop});
+                postp = AstNode::addNextNull(
+                    postp, new AstAssign{flp, memberOf(objp, dynp->datap->name(), flp),
+                                         dynPart(rd(tp, flp), "q", flp)});
+                m_argCarrier.emplace(asp, tp);
+                continue;
+            }
             // What this call settles about the parameter. The declaration
             // may leave the element open where the actual fixes it, and it
             // is the element that decides whether a value can be carried.
@@ -21488,6 +21717,15 @@ private:
                 const auto ioIt = ios.find(pair.name);
                 if (ioIt != ios.end() && isDyn2Var(ioIt->second)
                     && !(VN_IS(pair.exprp, VhdlName) && isDyn2Value(pair.exprp))) {
+                    // Written, and made one of those before the call to be
+                    // copied back after it (dynOutRoundTrip)
+                    const auto cit = m_argCarrier.find(pair.exprp->backp());
+                    if (cit != m_argCarrier.end()) {
+                        refp->addArgsp(new AstArg{
+                            flp, pair.name, new AstVarRef{flp, cit->second, VAccess::READWRITE}});
+                        m_argCarrier.erase(cit);
+                        continue;
+                    }
                     VhdlType* const ptypep = pair.formalp && pair.formalp->vhdlSymp()
                                                  ? pair.formalp->vhdlSymp()->typep()
                                                  : nullptr;
@@ -24209,9 +24447,8 @@ private:
         // so a function returning one needs no length decided here.
         if (nodep->isFunction()) {
             const VhdlType* const retp = returnType(nodep, symp);
-            if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY
-                && !retp->lengthEmittable() && !isStringType(retp)
-                && !carriedDynamically(retp)) {
+            if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY && !retp->lengthEmittable()
+                && !isStringType(retp) && !carriedDynamically(retp) && !isDyn2Type(retp)) {
                 return nullptr;
             }
             if (retp && retp->base()->kind() == VhdlTypeKind::RECORD
@@ -24227,8 +24464,9 @@ private:
             VhdlType* const rettp = returnType(nodep, symp);
             m_retTypeOf.emplace(funcp, rettp);
             funcp->fvarp(newReturnVar(name,
-                                      carriedDynamically(rettp) ? dynCarrierRef(rettp, flp)
-                                                                : lowerType(rettp, flp),
+                                      isDyn2Type(rettp)           ? dyn2CarrierRef(rettp, flp)
+                                      : carriedDynamically(rettp) ? dynCarrierRef(rettp, flp)
+                                                                  : lowerType(rettp, flp),
                                       flp));
             ftaskp = funcp;
         } else {
@@ -24246,13 +24484,17 @@ private:
         }
         VL_RESTORER(m_ftaskp);
         VL_RESTORER(m_retCarrierp);
+        VL_RESTORER(m_retCarrier2p);
         VL_RESTORER_COPY(m_prefix);
         m_ftaskp = ftaskp;
         m_retCarrierp = nullptr;
+        m_retCarrier2p = nullptr;
         m_retFixedp = nullptr;
         if (nodep->isFunction()) {
             VhdlType* const rtp = returnType(nodep, symp);
-            if (carriedDynamically(rtp)) {
+            if (isDyn2Type(rtp)) {
+                m_retCarrier2p = rtp;
+            } else if (carriedDynamically(rtp)) {
                 m_retCarrierp = rtp;
             } else if (rtp && rtp->base()->kind() == VhdlTypeKind::ARRAY) {
                 m_retFixedp = rtp;
