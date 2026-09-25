@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -8801,6 +8802,72 @@ private:
         return done();
     }
 
+    // A selection from a choice between two values is the same selection
+    // from whichever is chosen, and made that way it counts each by its own
+    // range. The back end hands back a choice between two packed arrays as a
+    // plain vector counted from zero, which an ascending range is not, so
+    // "r'last_value(2)" -- a choice between the value before an event and
+    // the one before that -- read r(5) of "r : std_logic_vector(0 to 7)".
+    // Takes the operands in usedp, which the selection clones.
+    static AstNodeExpr* selectThrough(AstNodeExpr* fromp,
+                                      const std::function<AstNodeExpr*(AstNodeExpr*)>& selectp,
+                                      std::initializer_list<AstNodeExpr*> usedp) {
+        AstNodeExpr* outp = nullptr;
+        if (AstCond* const condp = VN_CAST(fromp, Cond)) {
+            AstNodeExpr* const thenp = condp->thenp()->unlinkFrBack();
+            AstNodeExpr* const elsep = condp->elsep()->unlinkFrBack();
+            AstNodeExpr* const cp = condp->condp()->unlinkFrBack();
+            outp = new AstCond{condp->fileline(), cp, selectThrough(thenp, selectp, {}),
+                               selectThrough(elsep, selectp, {})};
+            VL_DO_DANGLING(condp->deleteTree(), condp);
+        } else {
+            outp = selectp(fromp);
+        }
+        for (AstNodeExpr* const usep : usedp) {
+            if (usep) usep->deleteTree();
+        }
+        return outp;
+    }
+
+    // An attribute giving the value of a name that denotes part of a signal
+    // -- "s'last_value(k)" where the call handed s "w(15 to 19)" -- is that
+    // part of the signal's history, emitted counted from zero with its
+    // leftmost element highest, so an index is put onto that count. Where
+    // the name denotes a whole signal numbered its own way, the history
+    // keeps the signal's numbering and the name's shifts say how to reach it.
+    void attrValueShift(AstNodeVhdlExpr* prefixp, std::vector<IndexShift>& shifts) {
+        const AstVhdlAttrName* const ap = VN_CAST(prefixp, VhdlAttrName);
+        if (!ap || !VN_IS(ap->prefixp(), VhdlName) || !ap->prefixp()->vhdlSymp()) return;
+        const std::string& attr = ap->name();
+        if (attr != "last_value" && attr != "driving_value" && attr != "delayed") return;
+        std::vector<IndexShift> nameShifts;
+        const VhdlType* ignoredp = nullptr;
+        AstNodeVhdlExpr* const namep = ap->prefixp();
+        const bool part = sliceOwner(namep, nameShifts, ignoredp) != namep;
+        if (!part) {
+            for (const IndexShift& shift : nameShifts) shifts.push_back(shift);
+            return;
+        }
+        // The name's own numbering: its subtype where that says one, and the
+        // part it was handed where it does not
+        const VhdlSymbol* const symp = namep->vhdlSymp();
+        const VhdlType* typep = symp->typep();
+        if (!typep || !typep->isConstrainedArray()) typep = boundTypeOf(namep);
+        if (!typep || !typep->isConstrainedArray() || typep->dimensions() != 1) return;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!idxp || !idxp->bounded() || idxp->boundsp() || isStringType(typep)) return;
+        if (!elemp || !elementPacks(elemp)) return;
+        const int64_t width = idxp->length();
+        if (width <= 0) return;
+        IndexShift shift;
+        shift.fromLeft = idxp->left();
+        shift.toLeft = width - 1;
+        shift.step = idxp->ascending() ? -1 : 1;
+        shifts.push_back(shift);
+    }
+
     // "maximum(v)" or "minimum(v)" over a whole array (5.3.2.4)
     AstNodeExpr* lowerArrayExtreme(AstNodeExpr* arrp, const VhdlType* typep, bool wantMax,
                                    FileLine* flp) {
@@ -10786,6 +10853,7 @@ private:
             std::vector<IndexShift> shifts;
             const VhdlType* ownerTypep = prefixTypep;
             AstNodeVhdlExpr* const prefixExprp = sliceOwner(nodep->prefixp(), shifts, ownerTypep);
+            attrValueShift(nodep->prefixp(), shifts);
             AstNodeExpr* fromp = lowerExpr(prefixExprp);
             if (!fromp) return nullptr;
             fromp = derefIfAccess(fromp, prefixExprp, flp);
@@ -10921,7 +10989,13 @@ private:
                         return new AstSelExtract{nflp, fromp, leftp, rightp};
                     }
                 }
-                return new AstSelExtract{flp, fromp, leftp, rightp};
+                return selectThrough(fromp,
+                                     [&](AstNodeExpr* chosenp) {
+                                         return new AstSelExtract{flp, chosenp,
+                                                                  leftp->cloneTree(false),
+                                                                  rightp->cloneTree(false)};
+                                     },
+                                     {leftp, rightp});
             }
             AstNodeExpr* outp = fromp;
             size_t dim = 0;
@@ -10964,7 +11038,12 @@ private:
                                "not a name");
                     return nullptr;
                 }
-                outp = new AstSelBit{flp, outp, indexp};
+                outp = selectThrough(outp,
+                                     [&](AstNodeExpr* chosenp) {
+                                         return new AstSelBit{flp, chosenp,
+                                                              indexp->cloneTree(false)};
+                                     },
+                                     {indexp});
             }
             return outp;
         }

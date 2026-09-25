@@ -2938,6 +2938,18 @@ AstNodeVhdlExpr* V3VhdlParse::parseNameSuffixes(AstNodeVhdlExpr* prefixp) {
                     continue;
                 }
                 AstNodeVhdlExpr* const firstp = parseExpression();
+                // 'LAST_VALUE and 'DRIVING_VALUE take no parameter at all and
+                // are of the prefix's own type, so one expression after them
+                // indexes that value: "s'last_value(k)" (16.2.4, 8.4)
+                const std::string lattr = VString::downcase(attr);
+                if (peekType() != VhdlTokType::COMMA
+                    && (lattr == "last_value" || lattr == "driving_value")) {
+                    AstVhdlCall* const idxp = new AstVhdlCall{flp, attrp};
+                    idxp->addArgsp(new AstVhdlAssoc{flp, nullptr, firstp});
+                    expect(VhdlTokType::RPAREN, "')' to close the name");
+                    prefixp = idxp;
+                    continue;
+                }
                 if (peekType() == VhdlTokType::COMMA) {
                     AstVhdlCall* const idxp = new AstVhdlCall{flp, attrp};
                     idxp->addArgsp(new AstVhdlAssoc{flp, nullptr, firstp});
