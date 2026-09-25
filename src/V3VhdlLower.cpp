@@ -6907,6 +6907,14 @@ private:
             }
             return nullptr;
         }
+        // An indexed or a sliced name has the subtype the index or the slice
+        // gives it (8.4, 8.5), not the one of the object it names a part
+        // of: a formal given "runner(15 to 19)" is five elements long, from
+        // 15, and not the whole of runner
+        if (const AstVhdlCall* const callp = VN_CAST(exprp, VhdlCall)) {
+            VhdlType* const ownp = callp->vhdlTypep();
+            if (ownp && callp->prefixp() && !arrayStillOpen(ownp)) return ownp;
+        }
         VhdlSymbol* symp = exprp->vhdlSymp();
         if (!symp) return exprp->vhdlTypep();
         const auto tIt = m_bindTypes.find(symp);
@@ -8609,20 +8617,6 @@ private:
         return callp->prefixp();
     }
 
-    // Where an alias renumbers, an index that aliasShift has put onto what
-    // the alias denotes is counted the way that object is counted, not the
-    // way the alias is -- a STRING starts where its own range starts, and
-    // "alias revS : string(3 downto 1) is S" would otherwise take three off
-    // an index already brought back to S's own numbering (6.6.2)
-    const VhdlType* aliasIndexType(VhdlSymbol* symp, const VhdlType* typep) const {
-        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return typep;
-        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
-        if (!declp || !declp->targetp()) return typep;
-        if (aliasKeepsRange(symp, declp)) return typep;
-        const VhdlType* const ttp = declp->targetp()->vhdlTypep();
-        return ttp ? ttp : typep;
-    }
-
     // Where an alias gives an object that carries its own bounds a range of
     // its own, the place an index names, counted from the left: "alias op1 :
     // bit_vector(bv1'length - 1 downto 0) is bv1" makes op1(0) the rightmost
@@ -8671,6 +8665,140 @@ private:
         int step = 1;
         if (!aliasMapping(symp, declp, fromLeft, toLeft, step)) return idxp;
         return shiftIndex(idxp, fromLeft, toLeft, step, flp);
+    }
+
+    // How an index is put onto another numbering: "toLeft + step * (i - fromLeft)"
+    struct IndexShift final {
+        int64_t fromLeft = 0;
+        int64_t toLeft = 0;
+        int step = 1;
+    };
+    static AstNodeExpr* applyShifts(const std::vector<IndexShift>& shifts, AstNodeExpr* idxp,
+                                    FileLine* flp) {
+        for (const IndexShift& shift : shifts) {
+            idxp = shiftIndex(idxp, shift.fromLeft, shift.toLeft, shift.step, flp);
+        }
+        return idxp;
+    }
+    // Whether the shifts turn the direction round an odd number of times
+    static bool shiftsReverse(const std::vector<IndexShift>& shifts) {
+        bool reversed = false;
+        for (const IndexShift& shift : shifts) reversed ^= shift.step < 0;
+        return reversed;
+    }
+
+    // How a formal whose own subtype says its bounds numbers against the
+    // actual, element for element from the left (4.2.2.3). False where the
+    // two number alike, or where either is not known here.
+    static bool formalRenumbers(const VhdlType* formalp, const VhdlType* actualp,
+                                IndexShift& shift) {
+        if (!formalp || !actualp || !formalp->isConstrainedArray()
+            || !actualp->isConstrainedArray()) {
+            return false;
+        }
+        if (formalp->dimensions() != 1 || actualp->dimensions() != 1) return false;
+        const VhdlType* const fidx = formalp->indexTypes()[0];
+        const VhdlType* const aidx = actualp->indexTypes()[0];
+        if (!fidx || !aidx || !fidx->bounded() || !aidx->bounded() || fidx->boundsp()
+            || aidx->boundsp()) {
+            return false;
+        }
+        if (fidx->left() == aidx->left() && fidx->ascending() == aidx->ascending()) {
+            return false;
+        }
+        shift.fromLeft = fidx->left();
+        shift.toLeft = aidx->left();
+        shift.step = fidx->ascending() == aidx->ascending() ? 1 : -1;
+        return true;
+    }
+
+    // Where a name denotes a slice of an object -- an alias of one, or a
+    // signal parameter a call bound to one -- the object itself, which is
+    // what an index or a slice of the name selects from, with the shifts
+    // that put an index onto its numbering, in order. A slice keeps the
+    // numbering of what it is taken from (8.5), but its value is emitted
+    // counted from zero, so an index put onto that value named the wrong
+    // element: "alias a is r(15 to 19)" made a(16) the last element, and
+    // VUnit's notify, given runner(15 to 19), wrote event(event'left)
+    // outside the event altogether. A constrained formal or an alias with a
+    // subtype of its own numbers its elements its own way, which a shift
+    // puts back onto what it denotes (4.2.2.3, 6.6.2) -- so a STRING is
+    // counted from where the object's own range starts, and "alias revS :
+    // string(3 downto 1) is S" takes nothing more off an index already
+    // brought back to S's numbering. idxTypep is the subtype the index is
+    // counted with afterwards; it is left alone where nothing was followed.
+    // Where no slice was followed, the name itself is what is lowered, since
+    // it lowers to what it denotes anyway.
+    AstNodeVhdlExpr* sliceOwner(AstNodeVhdlExpr* namep, std::vector<IndexShift>& shifts,
+                                const VhdlType*& idxTypep) {
+        AstNodeVhdlExpr* exprp = namep;
+        bool hopped = false;
+        const auto done = [&]() { return hopped ? exprp : namep; };
+        for (int depth = 0; depth < 16; ++depth) {
+            if (!VN_IS(exprp, VhdlName) || !exprp->vhdlSymp()) return done();
+            VhdlSymbol* const symp = exprp->vhdlSymp();
+            AstNodeVhdlExpr* targetp = nullptr;
+            const VhdlType* targetTypep = nullptr;
+            IndexShift shift;
+            bool shifted = false;
+            if (symp->kind() == VhdlSymKind::ALIAS) {
+                const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+                if (!declp || !declp->targetp()) return done();
+                targetp = declp->targetp();
+                targetTypep = targetp->vhdlTypep();
+                shifted = aliasMapping(symp, declp, shift.fromLeft, shift.toLeft, shift.step);
+            } else {
+                // Every signal formal of the copies being made has its
+                // actual's subtype here, those of a copy further out too:
+                // the signals a copy is bound to are its own, but the
+                // formals of the copy that called it stay bound while it is
+                // made. A generic stood in for by an expression is not one
+                // of them, and keeps the numbering it is lowered with.
+                const auto tIt = m_bindTypes.find(symp);
+                if (tIt == m_bindTypes.end() || !tIt->second) return done();
+                const auto eIt = m_bindExprs.find(symp);
+                const bool boundExpr
+                    = eIt != m_bindExprs.end() && eIt->second && eIt->second != exprp;
+                targetTypep = boundTypeOf(exprp);
+                shifted = formalRenumbers(symp->typep(), targetTypep, shift);
+                // Given a whole signal, the name already lowers to it: only
+                // the numbering may differ
+                if (!boundExpr) {
+                    if (shifted) {
+                        shifts.push_back(shift);
+                        idxTypep = targetTypep;
+                    }
+                    return done();
+                }
+                targetp = eIt->second;
+            }
+            // What the name denotes is a slice: its elements are the
+            // object's own, at the object's own indices
+            AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+            if (callp && callp->prefixp() && VN_IS(callp->argsp(), VhdlRange)
+                && !callp->argsp()->nextp()) {
+                AstNodeVhdlExpr* const ownerp = callp->prefixp();
+                // A value that carries its own bounds is sliced its own way
+                if (isDynObj(ownerp) || dynResultCall(ownerp) || parameterlessDynCall(ownerp)
+                    || isAccessRead(ownerp, true)) {
+                    return done();
+                }
+                if (shifted) shifts.push_back(shift);
+                idxTypep = ownerp->vhdlTypep();
+                exprp = ownerp;
+                hopped = true;
+                continue;
+            }
+            // Another name, or a part of an object that keeps the numbering
+            // its subtype gives it
+            if (shifted) {
+                shifts.push_back(shift);
+                idxTypep = targetTypep;
+            }
+            if (!VN_IS(targetp, VhdlName)) return done();
+            exprp = targetp;
+        }
+        return done();
     }
 
     // "maximum(v)" or "minimum(v)" over a whole array (5.3.2.4)
@@ -10650,11 +10778,14 @@ private:
                 AstNodeExpr* const objp = lowerExpr(dynObjp);
                 return objp ? lowerDynIndex(nodep, dynp, objp, flp) : nullptr;
             }
-            // An alias of a slice numbers its elements its own way, and
-            // aliasShift below puts an index back onto the numbering of what
-            // it denotes -- so it is that object that is indexed, not the
-            // slice, whose own indices start again from its length (6.6.2)
-            AstNodeVhdlExpr* const prefixExprp = aliasBase(objSymp, nodep->prefixp());
+            // A name that denotes a slice -- an alias of one, or a signal
+            // parameter bound to one -- is indexed on the object the slice is
+            // taken from, since the slice's value counts from zero while its
+            // indices are that object's (6.6.2, 8.5); the shifts put an
+            // index onto that numbering
+            std::vector<IndexShift> shifts;
+            const VhdlType* ownerTypep = prefixTypep;
+            AstNodeVhdlExpr* const prefixExprp = sliceOwner(nodep->prefixp(), shifts, ownerTypep);
             AstNodeExpr* fromp = lowerExpr(prefixExprp);
             if (!fromp) return nullptr;
             fromp = derefIfAccess(fromp, prefixExprp, flp);
@@ -10668,8 +10799,14 @@ private:
                     if (!rp->leftp() || !rp->rightp()) unsup(flp, "slice by an attribute range");
                     return nullptr;
                 }
-                leftp = aliasShift(objSymp, leftp, flp);
-                rightp = aliasShift(objSymp, rightp, flp);
+                leftp = applyShifts(shifts, leftp, flp);
+                rightp = applyShifts(shifts, rightp, flp);
+                // A name numbered the other way round from the object it
+                // denotes -- "s : std_logic_vector(0 to 4)" given "d(19
+                // downto 15)" -- has its slices run the other way in the
+                // object's numbering
+                const bool reversed = shiftsReverse(shifts);
+                const bool objAsc = sliceAsc != reversed;
                 // A slice of a value that carries its own bounds is another
                 // such value, made a place at a time (8.5)
                 if (isDynObj(nodep->prefixp()) || dynResultCall(nodep->prefixp())
@@ -10699,9 +10836,8 @@ private:
                     // A slice of a STRING is a substring: Verilator's string
                     // is characters, not bits, so a part select of it means
                     // nothing
-                    const VhdlType* const idxTypep = aliasIndexType(objSymp, prefixTypep);
-                    return new AstSubstrN{flp, fromp, stringIndex(idxTypep, leftp, flp),
-                                          stringIndex(idxTypep, rightp, flp)};
+                    return new AstSubstrN{flp, fromp, stringIndex(ownerTypep, leftp, flp),
+                                          stringIndex(ownerTypep, rightp, flp)};
                 }
                 // A slice whose bounds move together but keep their width --
                 // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
@@ -10713,11 +10849,11 @@ private:
                         // select to cut, so such a slice is copied out
                         // element by element instead
                         if (AstNodeExpr* const cpyp
-                            = unpackedSlice(rp, prefixTypep, fromp, leftp, rightp, flp)) {
+                            = unpackedSlice(rp, ownerTypep, fromp, leftp, rightp, flp, reversed)) {
                             return cpyp;
                         }
                         if (AstNodeExpr* const selp
-                            = indexedSlice(rp, fromp, leftp, rightp, flp)) {
+                            = indexedSlice(rp, fromp, leftp, rightp, flp, reversed)) {
                             return selp;
                         }
                     }
@@ -10729,7 +10865,10 @@ private:
                     VhdlType* const objTypep
                         = prefixExprp ? prefixExprp->vhdlTypep() : nullptr;
                     VhdlType* const sliceTypep = nodep->vhdlTypep();
-                    if (!m_asTarget && sliceTypep && objTypep && sliceDirKnown
+                    // The value made carries the bounds of the object's
+                    // numbering, which a name numbered the other way round
+                    // does not share
+                    if (!m_asTarget && sliceTypep && objTypep && sliceDirKnown && !reversed
                         && isRunningSlice(nodep)) {
                         if (AstNodeFTask* const cfuncp
                             = dynOfSliceFunc(sliceTypep, objTypep, sliceAsc, flp)) {
@@ -10753,10 +10892,10 @@ private:
                         VL_DO_DANGLING(rightp->deleteTree(), rightp);
                         AstNodeExpr* const widthp = new AstConst{flp, AstConst::Unsized32{},
                                                                  static_cast<uint32_t>(span)};
-                        return sliceAsc ? static_cast<AstNodeExpr*>(
-                                              new AstSelPlus{flp, fromp, leftp, widthp})
-                                        : static_cast<AstNodeExpr*>(
-                                              new AstSelMinus{flp, fromp, leftp, widthp});
+                        return objAsc ? static_cast<AstNodeExpr*>(
+                                            new AstSelPlus{flp, fromp, leftp, widthp})
+                                      : static_cast<AstNodeExpr*>(
+                                            new AstSelMinus{flp, fromp, leftp, widthp});
                     }
                 }
                 // A range whose ends run the wrong way round for its
@@ -10774,7 +10913,7 @@ private:
                 if (sliceDirKnown && VN_IS(leftp, Const) && VN_IS(rightp, Const)) {
                     const int32_t l = VN_AS(leftp, Const)->toSInt();
                     const int32_t r = VN_AS(rightp, Const)->toSInt();
-                    if (sliceAsc ? l > r : l < r) {
+                    if (objAsc ? l > r : l < r) {
                         FileLine* const nflp = new FileLine{flp};
                         nflp->warnOff(V3ErrorCode::SELRANGE, true);
                         nflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
@@ -10794,8 +10933,8 @@ private:
                     VL_DO_DANGLING(outp->deleteTree(), outp);
                     return nullptr;
                 }
-                indexp = aliasShift(objSymp, indexp, flp);
-                const VhdlType* const idxTypep = aliasIndexType(objSymp, prefixTypep);
+                if (dim == 0) indexp = applyShifts(shifts, indexp, flp);
+                const VhdlType* const idxTypep = ownerTypep;
                 indexp = stringIndex(idxTypep, indexp, flp);
                 indexp = logicIndex(idxTypep, dim, indexp, flp);
                 // A value that carries its own bounds is stored from zero,
@@ -11202,8 +11341,11 @@ private:
         return 0;
     }
 
+    // "reversed" where the ends were put onto an object numbered the other
+    // way round from the range as written, so that the select runs the
+    // other way
     AstNodeExpr* indexedSlice(AstVhdlRange* rp, AstNodeExpr* fromp, AstNodeExpr* leftp,
-                              AstNodeExpr* rightp, FileLine* flp) {
+                              AstNodeExpr* rightp, FileLine* flp, bool reversed = false) {
         LinearForm span;
         linearAdd(span, rp->leftp(), 1, 0);
         linearAdd(span, rp->rightp(), -1, 0);
@@ -11247,7 +11389,7 @@ private:
                                              static_cast<int32_t>(konst)}};
         }
         // The select counts up from the low end and down from the high one
-        if (downto) {
+        if (downto != reversed) {
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return new AstSelMinus{flp, fromp, leftp, widthp};
         }
@@ -11294,7 +11436,8 @@ private:
     // (8.5). The ends themselves need not be numbers: only how many elements
     // lie between them has to be, which is what lets "a(i to i + 3)" work.
     AstNodeExpr* unpackedSlice(AstVhdlRange* rp, const VhdlType* objTypep, AstNodeExpr* fromp,
-                               AstNodeExpr* leftp, AstNodeExpr* rightp, FileLine* flp) {
+                               AstNodeExpr* leftp, AstNodeExpr* rightp, FileLine* flp,
+                               bool reversed = false) {
         if (!objTypep || objTypep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
         const VhdlType* const elemp = objTypep->base()->elementp();
         if (!elemp || elementPacks(elemp) || isStringType(objTypep)) return nullptr;
@@ -11304,7 +11447,9 @@ private:
         // once per element, so neither may be something that could answer
         // differently the second time
         if (!repeatable(fromp) || !leftp->isPure()) return nullptr;
-        const bool downto = rp->dir() == VhdlDir::DOWNTO;
+        // Stepping the way the object is numbered, which "reversed" says is
+        // the other way round from the range as written
+        const bool downto = (rp->dir() == VhdlDir::DOWNTO) != reversed;
         AstNode* outp = nullptr;
         for (int64_t k = 0; k < span; ++k) {
             AstNodeExpr* idxp = leftp->cloneTree(false);
@@ -19944,8 +20089,10 @@ private:
             }
             // An actual that is itself a formal bound to part of a signal
             // names that part: this call is passing on what it was given,
-            // and the part is a name the copy can lower again (4.2.2.3)
-            for (int depth = 0; actualp && depth < 16; ++depth) {
+            // and the part is a name the copy can lower again (4.2.2.3).
+            // Only the formal's name as a whole: an index or a slice of it
+            // carries the formal's symbol too, but names a part of the part.
+            for (int depth = 0; VN_IS(actualp, VhdlName) && depth < 16; ++depth) {
                 const VhdlSymbol* const asymp = actualp->vhdlSymp();
                 const auto eIt = asymp ? m_bindExprs.find(asymp) : m_bindExprs.end();
                 if (eIt == m_bindExprs.end() || !eIt->second || eIt->second == actualp) break;
@@ -20017,7 +20164,36 @@ private:
                 // of its own, so the actual's name is lowered again wherever
                 // the body refers to it
                 std::string path;
-                const VhdlSymbol* const rootp = actualp ? baseSymOf(actualp) : nullptr;
+                const VhdlSymbol* rootp = actualp ? baseSymOf(actualp) : nullptr;
+                // A part of a formal this copy was itself given part of a
+                // signal for -- "setl(s(12 to 13))" where s is "p(10 to
+                // 19)": the formal goes on into the new copy with what it
+                // stands for, and is lowered there as it is here. The signal
+                // at the end of that is what the checks below are about, and
+                // what it stands for is part of which copy this is: two
+                // copies of the caller given two signals are two callers.
+                std::map<const VhdlSymbol*, AstNodeVhdlExpr*> carried;
+                std::string carryKey;
+                for (int depth = 0; rootp && depth < 16; ++depth) {
+                    const auto cIt = m_bindExprs.find(rootp);
+                    if (cIt == m_bindExprs.end() || !cIt->second) break;
+                    // A subprogram handing part of its own formal to itself
+                    // would bind that formal to part of itself
+                    if (std::any_of(formals.begin(), formals.end(),
+                                    [&](const AstVhdlIfaceDecl* ifp) {
+                                        return ifp->vhdlSymp() == rootp;
+                                    })) {
+                        break;
+                    }
+                    std::string cpath;
+                    if (!staticSelectKey(cIt->second, cpath)) break;
+                    carried.emplace(rootp, cIt->second);
+                    carryKey += "|carry" + std::to_string(reinterpret_cast<uintptr_t>(rootp)) + "="
+                                + cpath;
+                    const VhdlSymbol* const nextp = baseSymOf(cIt->second);
+                    if (nextp == rootp) break;
+                    rootp = nextp;
+                }
                 // A signal a package declares has no variable of this
                 // module's own until something reads it; naming one element
                 // of it is that something
@@ -20038,7 +20214,7 @@ private:
                     // One element of an array signal, at an index the call
                     // works out: the copy takes the index as a parameter
                     std::vector<AstNodeVhdlExpr*> idxExprps;
-                    if (!dynamicElementOf(actualp, rootp, idxExprps)) {
+                    if (!carried.empty() || !dynamicElementOf(actualp, rootp, idxExprps)) {
                         m_sigCopyWhy = ", where which part of a signal '" + formals[i]->name()
                                        + "' is given is not decided here";
                         return nullptr;
@@ -20058,7 +20234,11 @@ private:
                     continue;
                 }
                 exprBind.emplace(formals[i]->vhdlSymp(), actualp);
-                key += "|" + path;
+                for (const auto& pair : carried) exprBind.emplace(pair.first, pair.second);
+                // Which variable the name at the end stands for: a formal of
+                // this copy bound to a whole signal names that signal's
+                key += "|" + path + carryKey + "="
+                       + std::to_string(reinterpret_cast<uintptr_t>(m_vars[rootp]));
                 continue;
             }
             // A signal several processes drive is not refused: the copy is
