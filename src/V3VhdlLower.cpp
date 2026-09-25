@@ -10806,6 +10806,27 @@ private:
         return op == VhdlBinaryOp::EQ || op == VhdlBinaryOp::NE || op == VhdlBinaryOp::LT
                || op == VhdlBinaryOp::LE || op == VhdlBinaryOp::GT || op == VhdlBinaryOp::GE;
     }
+    // Whether a subprogram was declared by one of the packages of the
+    // language or of IEEE that read and write text, whose READ and WRITE are
+    // emitted here rather than compiled from their bodies
+    static bool standardTextPackage(const VhdlSymbol* symp) {
+        static const std::set<std::string> pkgs{"textio",
+                                                "std_logic_1164",
+                                                "std_logic_textio",
+                                                "numeric_std",
+                                                "numeric_bit",
+                                                "numeric_std_unsigned",
+                                                "numeric_bit_unsigned",
+                                                "fixed_generic_pkg",
+                                                "fixed_pkg",
+                                                "float_generic_pkg",
+                                                "float_pkg"};
+        for (const VhdlScope* scopep = symp->declScopep(); scopep; scopep = scopep->parentp()) {
+            if (pkgs.count(scopep->name())) return true;
+        }
+        return false;
+    }
+
     // A comparison from one of the IEEE packages whose bodies give a fixed
     // answer for a null operand. The Synopsys packages are not among them.
     static bool nullAwareComparison(const VhdlSymbol* symp) {
@@ -19398,9 +19419,12 @@ private:
             // std_logic_1164 declares its own WRITE and HWRITE for the logic
             // types, so a textio operation is recognised by what it operates
             // on -- a LINE or a file -- as well as by being predefined
+            // -- but only the language's own packages: OSVVM declares
+            // "read(L : inout line; A : out RandomSeedType)" with a body of
+            // its own, and that body is what such a call runs
             const bool textio
                 = symp->predefined()
-                  || (!args.empty() && args[0]->vhdlTypep()
+                  || (!args.empty() && args[0]->vhdlTypep() && standardTextPackage(symp)
                       && (isLineType(args[0]->vhdlTypep())
                           || args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::FILE));
             if (textio) {
