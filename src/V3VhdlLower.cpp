@@ -2513,6 +2513,83 @@ private:
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
     }
 
+    // An aggregate made a value held two levels deep, element by element.
+    // Positional, or one named choice per element; null for anything else.
+    AstNodeExpr* dyn2OfAggregate(AstNodeVhdlExpr* nodep, VhdlType* arrayTypep, FileLine* flp) {
+        AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
+        VhdlType* const elemCarrp = openCarriedElement(arrayTypep);
+        if (!aggp || !elemCarrp || !aggp->elemsp()) return nullptr;
+        std::vector<std::pair<int64_t, AstNodeVhdlExpr*>> elems;  // Index, value
+        const VhdlType* const idxBasep = arrayTypep->base()->indexTypes().empty()
+                                             ? nullptr
+                                             : arrayTypep->base()->indexTypes()[0];
+        int64_t left = idxBasep && idxBasep->bounded() ? idxBasep->left() : 0;
+        bool asc = !idxBasep || !idxBasep->bounded() || idxBasep->ascending();
+        const VhdlType* const typep = aggp->vhdlTypep();
+        if (typep && typep->isConstrainedArray() && !typep->indexTypes().empty()
+            && typep->indexTypes()[0] && typep->indexTypes()[0]->bounded()) {
+            left = typep->indexTypes()[0]->left();
+            asc = typep->indexTypes()[0]->ascending();
+        }
+        int64_t at = 0;
+        for (AstNode* p = aggp->elemsp(); p; p = p->nextp(), ++at) {
+            AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+            if (!eap->valuep()) return nullptr;
+            if (!eap->choicesp()) {
+                elems.emplace_back(asc ? left + at : left - at, eap->valuep());
+                continue;
+            }
+            AstVhdlChoice* const chp = eap->choicesp();
+            if (chp->nextp() || chp->isOthers() || chp->rangep() || !chp->valuep()) {
+                return nullptr;
+            }
+            const VhdlValue val = V3VhdlEval::eval(chp->valuep());
+            if (!val.isInt()) return nullptr;
+            elems.emplace_back(val.toInt(), eap->valuep());
+        }
+        // Named choices say the bounds themselves: the lowest to the highest
+        const bool named = aggp->elemsp()->choicesp();
+        if (named) {
+            int64_t lo = elems.front().first;
+            int64_t hi = lo;
+            for (const auto& el : elems) {
+                lo = std::min(lo, el.first);
+                hi = std::max(hi, el.first);
+            }
+            if (hi - lo + 1 != static_cast<int64_t>(elems.size())) return nullptr;
+            left = asc ? lo : hi;
+        }
+        std::vector<AstNodeExpr*> values;
+        for (const auto& el : elems) {
+            AstNodeExpr* const valp = asDynCarrier(el.second, elemCarrp, flp, elemCarrp);
+            if (!valp) {
+                for (AstNodeExpr* const vp : values) VL_DO_DANGLING(vp->deleteTree(), vp);
+                return nullptr;
+            }
+            values.push_back(valp);
+        }
+        const int64_t count = static_cast<int64_t>(values.size());
+        const auto num = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        AstVar* const tmpp = newTempVar("__Vdyn2a", dyn2CarrierRef(arrayTypep, flp), flp);
+        const auto tw = [&]() { return new AstVarRef{flp, tmpp, VAccess::WRITE}; };
+        AstNode* stmtsp = new AstAssign{flp, dynPart(tw(), "lft", flp), num(left)};
+        const auto add = [&](AstNode* stmtp) { stmtsp = AstNode::addNext(stmtsp, stmtp); };
+        add(new AstAssign{flp, dynPart(tw(), "rgt", flp),
+                          num(asc ? left + count - 1 : left - count + 1)});
+        add(new AstAssign{flp, dynPart(tw(), "dsc", flp),
+                          new AstConst{flp, AstConst::BitTrue{}, !asc}});
+        add(new AstAssign{flp, dynPart(tw(), "q", flp),
+                          new AstNewDynamic{flp, num(count), nullptr}});
+        for (size_t i = 0; i < elems.size(); ++i) {
+            const int64_t offset = asc ? elems[i].first - left : left - elems[i].first;
+            add(new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), num(offset)},
+                              values[i]});
+        }
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
+    }
+
     // The other way about: a value held two levels deep made into one that
     // carries its own bounds where its elements have a length of their own,
     // each element checked against it. Null where it cannot be.
@@ -2790,6 +2867,11 @@ private:
         if (AstNodeExpr* const slicep = dyn2OfFixedSlice(nodep, arrayTypep, flp)) {
             return slicep;
         }
+        // An aggregate whose elements are aggregates or values of their own
+        // lengths -- "((30, 1030), (35, 1035))" for an array of
+        // integer_vector: each element made a carrier as it stands, and the
+        // array numbered the way an aggregate is (9.3.3.3)
+        if (AstNodeExpr* const aggp = dyn2OfAggregate(nodep, arrayTypep, flp)) return aggp;
         // A value that carries its own bounds and whose elements have a
         // length of their own -- "t_slv_array(x'range)(7 downto 0)": the
         // array's bounds as they are, and each element made a carrier
@@ -20843,6 +20925,27 @@ private:
                         unsup(flp, "loop over the range of a value that is not a name");
                     }
                     if (carrp) VL_DO_DANGLING(carrp->deleteTree(), carrp);
+                } else if ((name == "range" || name == "reverse_range")
+                           && carriedElementRead(attrp->prefixp()) && !attrp->argp()) {
+                    // One element of an array whose elements carry their own
+                    // bounds -- "values(j)'range" -- whose bounds are its own
+                    // and not the array's. Read once per bound, which is
+                    // sound only where reading it has no effect of its own.
+                    AstNodeExpr* const elemp = lowerExpr(attrp->prefixp());
+                    if (elemp && repeatable(elemp)) {
+                        initp = dynCarrierAttr(elemp->cloneTree(false), "left", flp);
+                        limitp = dynCarrierAttr(elemp->cloneTree(false), "right", flp);
+                        ascp = dynCarrierAscending(elemp->cloneTree(false), flp);
+                        VL_DO_DANGLING(elemp->deleteTree(), elemp);
+                        ascending = true;
+                        if (name == "reverse_range") {
+                            std::swap(initp, limitp);
+                            ascp = new AstLogNot{flp, ascp};
+                        }
+                    } else {
+                        if (elemp) VL_DO_DANGLING(elemp->deleteTree(), elemp);
+                        unsup(flp, "loop over the range of a value that is not a name");
+                    }
                 } else if (name == "range" || name == "reverse_range") {
                     int dim = 0;
                     if (attrp->argp()) {
