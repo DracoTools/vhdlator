@@ -130,6 +130,8 @@ class VhdlSemVisitor final : public VNVisitor {
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
     bool m_inPackageBody = false;
+    // An actual given to a unit no VHDL source declares (analyzeAssociations)
+    AstNodeVhdlExpr* m_foreignActualp = nullptr;
     // Names whose own declaration is being analyzed. A declaration's scope
     // begins where it does, so within it the name denotes nothing yet --
     // not the outer object it is about to hide (12.2, 12.3)
@@ -7823,6 +7825,14 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         }
         if (kept.size() == 1) cands.swap(kept);
     }
+    if (cands.size() > 1 && nodep == m_foreignActualp) {
+        std::vector<VhdlSymbol*> kept;
+        for (VhdlSymbol* const symp : cands) {
+            const VhdlType* const typep = symp->typep();
+            if (typep && lower(typep->base()->name()) == "std_ulogic") kept.push_back(symp);
+        }
+        if (kept.size() == 1) cands.swap(kept);
+    }
     if (cands.size() > 1 && m_procCall) {
         std::vector<VhdlSymbol*> kept;
         for (VhdlSymbol* const symp : cands) {
@@ -14614,7 +14624,15 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
             ++position;
             continue;
         }
-        analyzeExpr(asp->actualp(), formalTypep);
+        {
+            // A unit no VHDL source here declares is a Verilog module, whose
+            // ports and parameters are logic: a literal given to one has
+            // nothing in VHDL to decide which '1' it is (pick)
+            VL_RESTORER(m_foreignActualp);
+            m_foreignActualp
+                = !unitScopep && VN_IS(asp->actualp(), VhdlLiteral) ? asp->actualp() : nullptr;
+            analyzeExpr(asp->actualp(), formalTypep);
+        }
         // The actual is of the formal's type (6.5.6.3, 6.5.7.1). A formal of
         // a generic type takes whatever type the instance gives it.
         if (formalTypep && !individual && formalSymp
