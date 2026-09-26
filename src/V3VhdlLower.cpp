@@ -308,6 +308,13 @@ public:
                 if (refp->taskp() && m_helperMod.count(refp->taskp())) ofModule = true;
             });
         }
+        // As does one that takes or makes a carrier the module declares
+        // (dynCarrierRef, an element a generic sizes)
+        if (!ofModule) {
+            funcp->foreach([&](const AstRefDType* refp) {
+                if (m_modCarrierNames.count(refp->name())) ofModule = true;
+            });
+        }
         if (ofModule && m_modp) {
             m_modp->addStmtsp(funcp);
             m_helperMod.emplace(funcp, m_modp);
@@ -2373,6 +2380,42 @@ private:
             && elemp->indexTypes()[0]->bounded()) {
             elemLen = elemp->indexTypes()[0]->length();
         }
+        // An element whose length a generic gives -- "t_slv_array(0 to n -
+        // 1)(G - 1 downto 0)" -- is as long as the instance makes it, and a
+        // structure every module shares cannot say that: it would read the
+        // parameter of an entity no instance elaborates. Such a structure is
+        // the module's own, and each instance's copy of the module has its
+        // own width.
+        if (elemLen < 0 && elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY
+            && elemp->lengthEmittable() && m_modp) {
+            AstNodeDType* elemDTypep = lowerType(elemp, flp);
+            bool readsParam = false;
+            if (elemDTypep) {
+                elemDTypep->foreach([&](const AstNodeVarRef*) { readsParam = true; });
+            }
+            if (readsParam) {
+                std::vector<std::pair<const AstNodeDType*, std::string>>& known
+                    = m_modDynNames[std::make_pair(m_modp, keyp)];
+                const std::string shape = dtypeShapeKey(elemDTypep);
+                for (const auto& pair : known) {
+                    if (dtypeShapeKey(pair.first) == shape) {
+                        VL_DO_DANGLING(elemDTypep->deleteTree(), elemDTypep);
+                        return refToDType(pair.second, flp);
+                    }
+                }
+                const std::string name
+                    = "__Vdyn" + std::to_string(++m_nameNum) + "__" + keyp->name();
+                known.emplace_back(elemDTypep, name);
+                m_modCarrierNames.insert(name);
+                AstStructDType* const structp = newCarrierStruct(name, elemDTypep, flp);
+                AstTypedef* const tdp
+                    = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
+                m_modp->addStmtsp(tdp);
+                m_dtypeDecls.emplace(name, tdp);
+                return refToDType(name, flp);
+            }
+            if (elemDTypep) VL_DO_DANGLING(elemDTypep->deleteTree(), elemDTypep);
+        }
         const auto keyed = std::make_pair(keyp, elemLen);
         const auto found = m_dynNames.find(keyed);
         if (found != m_dynNames.end()) return refToDType(found->second, flp);
@@ -2396,23 +2439,60 @@ private:
         }
         const std::string name = "__Vdyn" + std::to_string(++m_nameNum) + "__" + keyp->name();
         m_dynNames.emplace(keyed, name);
-        AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
-        structp->name(name);
+        AstStructDType* const structp = newCarrierStruct(name, lowerType(elemp, flp), flp);
         AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
         if (unitp) structp->classOrPackagep(unitp);
-        structp->addMembersp(new AstMemberDType{
-            flp, "q", VFlagChildDType{},
-            new AstDynArrayDType{flp, VFlagChildDType{}, lowerType(elemp, flp)}, nullptr});
+        AstTypedef* const tdp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
+        if (unitp) unitp->addStmtsp(tdp);
+        m_dtypeDecls.emplace(name, tdp);
+        return refToDType(name, flp);
+    }
+    std::set<std::string> m_modCarrierNames;  // Those carriers' names
+    // What an element type written with a generic is, as text: its nodes,
+    // their numbers, and which object each reference reads. Two written the
+    // same way are one type, however many times they were lowered.
+    static std::string dtypeShapeKey(const AstNode* nodep) {
+        std::string out;
+        std::function<void(const AstNode*)> walk = [&](const AstNode* np) {
+            for (; np; np = np->nextp()) {
+                out += np->typeName();
+                if (const AstConst* const constp = VN_CAST(np, Const)) {
+                    out += "=" + constp->num().ascii();
+                } else if (const AstNodeVarRef* const refp = VN_CAST(np, NodeVarRef)) {
+                    out += "=" + std::to_string(reinterpret_cast<uintptr_t>(refp->varp()));
+                } else if (const AstBasicDType* const basicp = VN_CAST(np, BasicDType)) {
+                    out += std::string{"="} + basicp->keyword().ascii();
+                }
+                out += "(";
+                walk(np->op1p());
+                walk(np->op2p());
+                walk(np->op3p());
+                walk(np->op4p());
+                out += ")";
+            }
+        };
+        walk(nodep);
+        return out;
+    }
+    // Carriers whose element a generic sizes, per module, by element type
+    std::map<std::pair<const AstNodeModule*, const VhdlType*>,
+             std::vector<std::pair<const AstNodeDType*, std::string>>>
+        m_modDynNames;
+    // The structure itself: the elements, and the bounds they were given
+    static AstStructDType* newCarrierStruct(const std::string& name, AstNodeDType* elemDTypep,
+                                            FileLine* flp) {
+        AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
+        structp->name(name);
+        structp->addMembersp(
+            new AstMemberDType{flp, "q", VFlagChildDType{},
+                               new AstDynArrayDType{flp, VFlagChildDType{}, elemDTypep}, nullptr});
         structp->addMembersp(new AstMemberDType{flp, "lft", VFlagChildDType{},
                                                 newIntDType(flp), nullptr});
         structp->addMembersp(new AstMemberDType{flp, "rgt", VFlagChildDType{},
                                                 newIntDType(flp), nullptr});
         structp->addMembersp(new AstMemberDType{
             flp, "dsc", VFlagChildDType{}, new AstBasicDType{flp, VBasicDTypeKwd::BIT}, nullptr});
-        AstTypedef* const tdp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
-        if (unitp) unitp->addStmtsp(tdp);
-        m_dtypeDecls.emplace(name, tdp);
-        return refToDType(name, flp);
+        return structp;
     }
 
     // A value that carries its own bounds, whose elements have a length of
@@ -2900,22 +2980,79 @@ private:
             if (AstNodeExpr* const outp = dyn2OfCarrier(nodep, arrayTypep, flp)) return outp;
         }
         // An array whose own length and its elements' are fixed: each element
-        // is made a carrier of its own
-        const VhdlType* const typep = nodep->vhdlTypep();
+        // is made a carrier of its own. A formal of this copy given such an
+        // array is held as one, though its declared subtype leaves both open
+        // (the actual's subtype is the one it has, 4.2.2.3)
+        const VhdlType* typep = nodep->vhdlTypep();
+        if (typep && !typep->isConstrainedArray()) {
+            if (const VhdlType* const boundp = boundTypeOf(nodep)) typep = boundp;
+        }
         VhdlType* const elemCarrp = openCarriedElement(arrayTypep);
-        if (!typep || !elemCarrp || typep->dimensions() != 1 || !typep->indexTypes()[0]
-            || !typep->indexTypes()[0]->bounded()) {
+        if (!typep || !elemCarrp || typep->dimensions() != 1 || !typep->indexTypes()[0]) {
             return nullptr;
         }
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        // The array's own range: numbers, or bounds a generic gives, which
+        // fold once the instance is elaborated
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        AstNodeExpr* lftp = nullptr;
+        AstNodeExpr* rgtp = nullptr;
+        bool asc = true;
+        if (idxp->bounded()) {
+            lftp = num(static_cast<int32_t>(idxp->left()));
+            rgtp = num(static_cast<int32_t>(idxp->right()));
+            asc = idxp->ascending();
+        } else {
+            if (AstNodeExpr* const ascExprp = boundsAscendingExpr(idxp, flp)) {
+                VL_DO_DANGLING(ascExprp->deleteTree(), ascExprp);
+                return nullptr;
+            }
+            AstRange* const rangep = boundsRange(idxp, flp);
+            if (!rangep) return nullptr;
+            asc = boundsAscending(idxp);
+            lftp = rangep->leftp()->unlinkFrBack();
+            rgtp = rangep->rightp()->unlinkFrBack();
+            VL_DO_DANGLING(rangep->deleteTree(), rangep);
+        }
+        const auto dropEnds = [&]() {
+            VL_DO_DANGLING(lftp->deleteTree(), lftp);
+            VL_DO_DANGLING(rgtp->deleteTree(), rgtp);
+        };
         VhdlType* const fixedElemp
             = typep->elementp() ? typep->elementp() : typep->base()->elementp();
-        if (!fixedElemp || !fixedElemp->isConstrainedArray()) return nullptr;
-        AstNodeFTask* const elemFuncp = dynOfFixedFunc(elemCarrp, fixedElemp, flp);
-        if (!elemFuncp) return nullptr;
+        if (!fixedElemp || !fixedElemp->lengthEmittable() || fixedElemp->indexTypes().size() != 1
+            || !fixedElemp->indexTypes()[0]) {
+            dropEnds();
+            return nullptr;
+        }
+        // Each element made a carrier by the helper for its length, or --
+        // where a generic gives the length, which no shared helper can take
+        // -- right here, a place at a time
+        AstNodeFTask* const elemFuncp = fixedElemp->isConstrainedArray()
+                                            ? dynOfFixedFunc(elemCarrp, fixedElemp, flp)
+                                            : nullptr;
+        AstRange* elemRangep = nullptr;
+        bool elemAsc = true;
+        if (!elemFuncp) {
+            const VhdlType* const eidxp = fixedElemp->indexTypes()[0];
+            if (AstNodeExpr* const ascExprp = boundsAscendingExpr(eidxp, flp)) {
+                VL_DO_DANGLING(ascExprp->deleteTree(), ascExprp);
+                dropEnds();
+                return nullptr;
+            }
+            elemAsc = boundsAscending(eidxp);
+            elemRangep = anyBoundsRange(eidxp, flp);
+            if (!elemRangep) {
+                dropEnds();
+                return nullptr;
+            }
+        }
         AstNodeExpr* const srcp = lowerExpr(nodep);
-        if (!srcp) return nullptr;
-        const VhdlType* const idxp = typep->indexTypes()[0];
-        const int64_t count = idxp->length();
+        if (!srcp) {
+            dropEnds();
+            if (elemRangep) VL_DO_DANGLING(elemRangep->deleteTree(), elemRangep);
+            return nullptr;
+        }
         AstVar* const srcVarp
             = newTempVar("__Vdyn2s", lowerType(const_cast<VhdlType*>(typep), flp), flp);
         AstVar* const tmpp = newTempVar("__Vdyn2v", dyn2CarrierRef(arrayTypep, flp), flp);
@@ -2923,48 +3060,76 @@ private:
         kVarp->usedLoopIdx(true);
         const auto tw = [&]() { return new AstVarRef{flp, tmpp, VAccess::WRITE}; };
         const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        // "right - left + 1" the way the range runs
+        AstNodeExpr* const countp
+            = new AstAdd{flp,
+                         asc ? new AstSub{flp, rgtp->cloneTree(false), lftp->cloneTree(false)}
+                             : new AstSub{flp, lftp->cloneTree(false), rgtp->cloneTree(false)},
+                         num(1)};
         AstNode* stmtsp = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
         const auto add = [&](AstNode* stmtp) { stmtsp = AstNode::addNext(stmtsp, stmtp); };
-        add(new AstAssign{
-            flp, dynPart(tw(), "lft", flp),
-            new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(idxp->left())}});
-        add(new AstAssign{
-            flp, dynPart(tw(), "rgt", flp),
-            new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(idxp->right())}});
+        add(new AstAssign{flp, dynPart(tw(), "lft", flp), lftp->cloneTree(false)});
+        add(new AstAssign{flp, dynPart(tw(), "rgt", flp), rgtp});
         add(new AstAssign{flp, dynPart(tw(), "dsc", flp),
-                          new AstConst{flp, AstConst::BitTrue{}, !idxp->ascending()}});
-        add(new AstAssign{
-            flp, dynPart(tw(), "q", flp),
-            new AstNewDynamic{flp,
-                              new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)},
-                              nullptr}});
-        add(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
-                          new AstConst{flp, AstConst::Signed32{}, 0}});
-        AstNodeExpr* const atp
-            = idxp->ascending() ? static_cast<AstNodeExpr*>(
-                                      new AstAdd{flp,
-                                                 new AstConst{flp, AstConst::Signed32{},
-                                                              static_cast<int32_t>(idxp->left())},
-                                                 k()})
-                                : new AstSub{flp,
-                                             new AstConst{flp, AstConst::Signed32{},
-                                                          static_cast<int32_t>(idxp->left())},
-                                             k()};
-        AstFuncRef* const elemRefp = new AstFuncRef{
-            flp, elemFuncp->name(),
-            new AstArg{flp, "",
-                       new AstSelBit{flp, new AstVarRef{flp, srcVarp, VAccess::READ}, atp}}};
-        elemRefp->taskp(VN_AS(elemFuncp, Func));
+                          new AstConst{flp, AstConst::BitTrue{}, !asc}});
+        add(new AstAssign{flp, dynPart(tw(), "q", flp),
+                          new AstNewDynamic{flp, countp->cloneTree(false), nullptr}});
+        add(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE}, num(0)});
+        AstNodeExpr* const atp = asc ? static_cast<AstNodeExpr*>(new AstAdd{flp, lftp, k()})
+                                     : new AstSub{flp, lftp, k()};
+        AstNodeExpr* const elemp
+            = new AstSelBit{flp, new AstVarRef{flp, srcVarp, VAccess::READ}, atp};
         AstLoop* const loopp = new AstLoop{flp};
-        loopp->addStmtsp(new AstLoopTest{
-            flp, loopp,
-            new AstLtS{flp, k(),
-                       new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)}}});
-        loopp->addStmtsp(
-            new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
-        loopp->addContsp(
-            new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
-                          new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        loopp->addStmtsp(new AstLoopTest{flp, loopp, new AstLtS{flp, k(), countp}});
+        if (elemFuncp) {
+            AstFuncRef* const elemRefp
+                = new AstFuncRef{flp, elemFuncp->name(), new AstArg{flp, "", elemp}};
+            elemRefp->taskp(VN_AS(elemFuncp, Func));
+            loopp->addStmtsp(
+                new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
+        } else {
+            // The element's bounds, its places counted from its left, and
+            // each place read by its own index
+            AstVar* const ep = newTempVar("__Vdyn2e", lowerType(fixedElemp, flp), flp);
+            AstVar* const cp = newTempVar("__Vdyn2el", dynCarrierRef(elemCarrp, flp), flp);
+            AstVar* const jp = newTempVar("__Vdyn2j", newIntDType(flp), flp);
+            jp->usedLoopIdx(true);
+            AstNodeExpr* const elftp = elemRangep->leftp()->unlinkFrBack();
+            AstNodeExpr* const ergtp = elemRangep->rightp()->unlinkFrBack();
+            VL_DO_DANGLING(elemRangep->deleteTree(), elemRangep);
+            const auto cw = [&]() { return new AstVarRef{flp, cp, VAccess::WRITE}; };
+            const auto cr = [&]() { return new AstVarRef{flp, cp, VAccess::READ}; };
+            const auto j = [&]() { return new AstVarRef{flp, jp, VAccess::READ}; };
+            loopp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, ep, VAccess::WRITE}, elemp});
+            loopp->addStmtsp(new AstAssign{flp, dynPart(cw(), "lft", flp), elftp});
+            loopp->addStmtsp(new AstAssign{flp, dynPart(cw(), "rgt", flp), ergtp});
+            loopp->addStmtsp(new AstAssign{flp, dynPart(cw(), "dsc", flp),
+                                           new AstConst{flp, AstConst::BitTrue{}, !elemAsc}});
+            AstNodeExpr* const spanp
+                = elemAsc ? new AstSub{flp, dynPart(cr(), "rgt", flp), dynPart(cr(), "lft", flp)}
+                          : new AstSub{flp, dynPart(cr(), "lft", flp), dynPart(cr(), "rgt", flp)};
+            loopp->addStmtsp(
+                new AstAssign{flp, dynPart(cw(), "q", flp),
+                              new AstNewDynamic{flp, new AstAdd{flp, spanp, num(1)}, nullptr}});
+            loopp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, jp, VAccess::WRITE}, num(0)});
+            AstLoop* const innerp = new AstLoop{flp};
+            innerp->addStmtsp(
+                new AstLoopTest{flp, innerp, new AstLtS{flp, j(), dynCarrierLength(cr(), flp)}});
+            AstNodeExpr* const eatp
+                = elemAsc
+                      ? static_cast<AstNodeExpr*>(new AstAdd{flp, dynPart(cr(), "lft", flp), j()})
+                      : new AstSub{flp, dynPart(cr(), "lft", flp), j()};
+            innerp->addStmtsp(
+                new AstAssign{flp, new AstSelBit{flp, dynPart(cw(), "q", flp), j()},
+                              new AstSelBit{flp, new AstVarRef{flp, ep, VAccess::READ}, eatp}});
+            innerp->addContsp(new AstAssign{flp, new AstVarRef{flp, jp, VAccess::WRITE},
+                                            new AstAdd{flp, j(), num(1)}});
+            loopp->addStmtsp(innerp);
+            loopp->addStmtsp(
+                new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, cr()});
+        }
+        loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                                       new AstAdd{flp, k(), num(1)}});
         add(loopp);
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
     }
@@ -3610,8 +3775,7 @@ private:
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
         AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
         if (!elemDTypep) return nullptr;
-        const std::string name
-            = "__Vdynfill" + std::to_string(m_dynFillFuncs.size()) + "__" + basep->name();
+        const std::string name = "__Vdynfill" + std::to_string(++m_nameNum) + "__" + basep->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(typep, flp), flp));
@@ -3720,8 +3884,7 @@ private:
         const auto it = m_dynEqFuncs.find(carrierKeyOf(typep));
         if (it != m_dynEqFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
-        const std::string name
-            = "__Vdyneq" + std::to_string(m_dynEqFuncs.size()) + "__" + basep->name();
+        const std::string name = "__Vdyneq" + std::to_string(++m_nameNum) + "__" + basep->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp));
@@ -3786,8 +3949,8 @@ private:
         const auto it = m_dynOfFuncs.find(key);
         if (it != m_dynOfFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
-        const std::string name = "__Vdynof" + std::to_string(m_dynOfFuncs.size()) + "__"
-                                 + carrierTypep->base()->name();
+        const std::string name
+            = "__Vdynof" + std::to_string(++m_nameNum) + "__" + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
@@ -3875,8 +4038,8 @@ private:
             VL_DO_DANGLING(rangep->deleteTree(), rangep);
             return nullptr;
         }
-        const std::string name = "__Vdynofx" + std::to_string(m_dynOfExprFuncs.size()) + "__"
-                                 + carrierTypep->base()->name();
+        const std::string name
+            = "__Vdynofx" + std::to_string(++m_nameNum) + "__" + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
@@ -3978,8 +4141,8 @@ private:
             static_cast<const VhdlType*>(carrierTypep->base()), count);
         const auto it = m_dynOfLitFuncs.find(key);
         if (it != m_dynOfLitFuncs.end() && usableHelper(it->second)) return it->second;
-        const std::string name = "__Vdynlit" + std::to_string(m_dynOfLitFuncs.size()) + "__"
-                                 + carrierTypep->base()->name();
+        const std::string name
+            = "__Vdynlit" + std::to_string(++m_nameNum) + "__" + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
@@ -4054,8 +4217,8 @@ private:
                                                          : carrierTypep->base()->elementp();
         AstNodeDType* const elemDTypep = elemp ? lowerType(elemp, flp) : nullptr;
         if (!elemDTypep) return nullptr;
-        const std::string name = "__Vdynelem" + std::to_string(m_dynElemFuncs.size()) + "__"
-                                 + carrierTypep->base()->name();
+        const std::string name
+            = "__Vdynelem" + std::to_string(++m_nameNum) + "__" + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
@@ -4093,8 +4256,8 @@ private:
         const VhdlType* const key = carrierTypep->base();
         const auto it = m_dynNullFuncs.find(key);
         if (it != m_dynNullFuncs.end() && usableHelper(it->second)) return it->second;
-        const std::string name = "__Vdynnull" + std::to_string(m_dynNullFuncs.size()) + "__"
-                                 + carrierTypep->base()->name();
+        const std::string name
+            = "__Vdynnull" + std::to_string(++m_nameNum) + "__" + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
@@ -4324,8 +4487,8 @@ private:
         const auto it = m_dynToFuncs.find(key);
         if (it != m_dynToFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
-        const std::string name = "__Vdynto" + std::to_string(m_dynToFuncs.size()) + "__"
-                                 + carrierTypep->base()->name();
+        const std::string name
+            = "__Vdynto" + std::to_string(++m_nameNum) + "__" + carrierTypep->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, lowerType(fixedTypep, flp), flp));
@@ -4478,8 +4641,7 @@ private:
         const auto it = m_dynBitsFuncs.find(key);
         if (it != m_dynBitsFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
-        const std::string name = "__Vdynbits" + std::to_string(m_dynBitsFuncs.size()) + "__"
-                                 + basep->name();
+        const std::string name = "__Vdynbits" + std::to_string(++m_nameNum) + "__" + basep->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(typep, flp), flp));
@@ -4550,8 +4712,7 @@ private:
         const auto it = m_dynIntFuncs.find(key);
         if (it != m_dynIntFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
-        const std::string name = "__Vdynint" + std::to_string(m_dynIntFuncs.size()) + "__"
-                                 + basep->name();
+        const std::string name = "__Vdynint" + std::to_string(++m_nameNum) + "__" + basep->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, new AstBasicDType{flp, VBasicDTypeKwd::INTEGER}, flp));
@@ -7555,7 +7716,7 @@ private:
         const auto it = m_valueFuncs.find(basep);
         if (it != m_valueFuncs.end() && usableHelper(it->second)) return it->second;
 
-        const std::string name = "__Vvalue" + std::to_string(m_valueFuncs.size()) + "__"
+        const std::string name = "__Vvalue" + std::to_string(++m_nameNum) + "__"
                                  + VString::downcase(basep->prettyName());
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
@@ -13837,6 +13998,27 @@ private:
                 = carrierTypep ? asDynCarrier(args[1], carrierTypep, flp) : lowerExpr(args[1]);
             if (!secondp) return nullptr;
             const bool signd = isSignedType(args[0]->vhdlTypep());
+            // Two integers that fold before the design runs -- numbers,
+            // parameters, calls of pure functions -- are chosen between as
+            // they stand: reading one twice is the same value, and the answer
+            // folds with them, so "maximum(log2(GC_DATA_WIDTH / 8), 1)" is
+            // still a constant a generic map can be given (UVVM's
+            // C_EMPTY_WIDTH)
+            const auto integral = [](const VhdlType* typep) {
+                if (!typep) return false;
+                const VhdlTypeKind kind = typep->base()->kind();
+                return kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::UNIVERSAL_INTEGER
+                       || kind == VhdlTypeKind::PHYSICAL;
+            };
+            if (!carrierTypep && integral(ltypep) && integral(rtypep) && valueFolds(leftValp)
+                && valueFolds(secondp)) {
+                AstNodeExpr* const testp
+                    = name == "maximum"
+                          ? static_cast<AstNodeExpr*>(new AstGtS{flp, leftValp->cloneTree(false),
+                                                                 secondp->cloneTree(false)})
+                          : new AstLtS{flp, leftValp->cloneTree(false), secondp->cloneTree(false)};
+                return new AstCond{flp, testp, leftValp, secondp};
+            }
             // Each operand is read once and then chosen between: either may
             // be a call, and one made twice is not what the expression says
             AstVar* const lp = extremeTemp(args[0], flp, carrierTypep);
@@ -20106,8 +20288,8 @@ private:
         const auto it = m_recShapeFuncs.find(key);
         if (it != m_recShapeFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
-        const std::string name = "__Vrecshape" + std::to_string(m_recShapeFuncs.size()) + "__"
-                                 + top->base()->name();
+        const std::string name
+            = "__Vrecshape" + std::to_string(++m_nameNum) + "__" + top->base()->name();
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, lowerType(top, flp), flp));
@@ -20446,7 +20628,24 @@ private:
         // is the temporary the assignment goes through anyway (10.6.2.1)
         AstVar* srcCarrp = nullptr;
         AstNode* srcInitp = nullptr;
-        if (isDynValue(valuep) && !uniformAggregateValue(valuep) && !accessSourced(valuep)) {
+        // An object whose elements carry their own bounds -- "new
+        // t_slv_array(0 to n)(7 downto 0)" of an array of
+        // std_logic_vector -- holds a carrier per element, so the value is
+        // made one of those two levels deep and copied a carrier at a time
+        // (UVVM's "v_symbol_array.all := v_normalized_data")
+        const VhdlType* const accTypep
+            = objNodep->vhdlTypep()
+                  ? objNodep->vhdlTypep()
+                  : (objNodep->vhdlSymp() ? objNodep->vhdlSymp()->typep() : nullptr);
+        VhdlType* const desigp = accTypep ? accTypep->base()->designatedp() : nullptr;
+        if (desigp && openCarriedElement(desigp) && !uniformAggregateValue(valuep)
+            && !accessSourced(valuep)) {
+            if (AstNodeExpr* const srcp = asDyn2Carrier(valuep, desigp, flp)) {
+                srcCarrp = newTempVar("__Vdynsrc", dyn2CarrierRef(desigp, flp), flp);
+                srcInitp = new AstAssign{flp, new AstVarRef{flp, srcCarrp, VAccess::WRITE}, srcp};
+            }
+        } else if (isDynValue(valuep) && !uniformAggregateValue(valuep)
+                   && !accessSourced(valuep)) {
             if (VhdlType* const carrp = dynValueType(valuep)) {
                 if (AstNodeExpr* const srcp = lowerExpr(valuep)) {
                     srcCarrp = newTempVar("__Vdynsrc", dynCarrierRef(carrp, flp), flp);
