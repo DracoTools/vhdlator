@@ -18343,6 +18343,22 @@ private:
             const auto it = wanted.find(position);
             if (it != wanted.end()) out.emplace(it->second, asp->actualp());
         }
+        // One the map leaves out is its own default (6.5.6.2):
+        // "awaddr(C_AXI_ADDR_WIDTH - 1 downto 0)" of an instance that sets
+        // only the data width. A default that names another generic is in
+        // the entity's terms again, and is left alone.
+        for (const auto& pair : wanted) {
+            if (out.count(pair.second)) continue;
+            const AstVhdlIfaceDecl* const declp = VN_CAST(pair.second->declp(), VhdlIfaceDecl);
+            AstNodeVhdlExpr* const defp = declp ? declp->defaultp() : nullptr;
+            if (!defp) continue;
+            bool own = false;
+            defp->foreach([&](const AstVhdlName* namep) {
+                const VhdlSymbol* const symp = namep->vhdlSymp();
+                if (symp && symp->kind() == VhdlSymKind::GENERIC) own = true;
+            });
+            if (!own) out.emplace(pair.second, defp);
+        }
         return out;
     }
 
