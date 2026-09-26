@@ -1925,6 +1925,19 @@ class TristateVisitor final : public TristateBaseVisitor {
         return !varp->isNet() && !varp->isIO();
     }
 
+    // A force or a release inside a task is left alone, as every statement
+    // of a task was before tasks were looked into; elsewhere it is what it
+    // was
+    void visit(AstAssignForce* nodep) override {
+        if (m_inTask) return;
+        iterateChildren(nodep);
+        checkUnhandled(nodep);
+    }
+    void visit(AstRelease* nodep) override {
+        if (m_inTask) return;
+        iterateChildren(nodep);
+        checkUnhandled(nodep);
+    }
     void visit(AstAssignW* nodep) override { visitAssign(nodep); }
     void visit(AstAssign* nodep) override { visitAssign(nodep); }
     void visit(AstAssignDly* nodep) override { visitAssign(nodep); }
@@ -1946,6 +1959,10 @@ class TristateVisitor final : public TristateBaseVisitor {
     }
 
     void visitCaseEq(AstNodeBiop* nodep, bool neq) {
+        // Inside a task only the drives are this pass's concern: a comparison
+        // there reads the enable of whatever it compares, which may be
+        // another module's, and no comparison in a task was rewritten before
+        if (m_inTask) return;
         if (m_graphing) {
             iterateChildren(nodep);
         } else {
@@ -2009,6 +2026,7 @@ class TristateVisitor final : public TristateBaseVisitor {
         }
     }
     void visitEqNeqWild(AstNodeBiop* nodep) {
+        if (m_inTask) return;  // As visitCaseEq
         if (!VN_IS(nodep->rhsp(), Const) && nodep->rhsp()->dtypep()->isFourstate()) {
             nodep->v3warn(E_UNSUPPORTED,
                           "Unsupported: RHS of ==? or !=? is fourstate but not a constant");
@@ -2027,6 +2045,7 @@ class TristateVisitor final : public TristateBaseVisitor {
     void visit(AstNeqWild* nodep) override { visitEqNeqWild(nodep); }
 
     void visit(AstCountBits* nodep) override {
+        if (m_inTask) return;  // As visitCaseEq
         std::array<bool, 3> dropop;
         dropop[0] = VN_IS(nodep->rhsp(), Const) && VN_AS(nodep->rhsp(), Const)->num().isAnyZ();
         dropop[1] = VN_IS(nodep->thsp(), Const) && VN_AS(nodep->thsp(), Const)->num().isAnyZ();
