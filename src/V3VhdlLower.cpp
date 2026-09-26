@@ -15019,15 +15019,6 @@ private:
             AstNodeExpr* memberp = recordAsShape(valuep, elems[i]->typep(), flp);
             if (!memberp) memberp = lowerExpr(valuep);
             if (!memberp) return nullptr;
-            {
-                int d = 0;
-                for (AstNode* q = memberp; q && VN_IS(q, Concat); q = VN_AS(q, Concat)->lhsp())
-                    ++d;
-                if (d > 1000)
-                    fprintf(stderr, "DBGCAT %s depth %d value %s at %s\n",
-                            elems[i]->name().c_str(), d, valuep->typeName(),
-                            valuep->fileline()->ascii().c_str());
-            }
             if (packed) {
                 outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
             } else {
@@ -19661,12 +19652,12 @@ private:
         if (!callp) return nullptr;
         VhdlType* ttypep = targetp->vhdlTypep();
         if (!ttypep || ttypep->base()->kind() != VhdlTypeKind::RECORD) return nullptr;
-        if (std::any_of(ttypep->elements().begin(), ttypep->elements().end(),
-                        [](const VhdlSymbol* elemp) {
-                            return elemp && elemp->typep()
-                                   && elemp->typep()->base()->kind() == VhdlTypeKind::ARRAY
-                                   && elemp->typep()->unconstrained();
-                        })) {
+        const std::vector<VhdlSymbol*>& telems = ttypep->elements();
+        if (std::any_of(telems.begin(), telems.end(), [](const VhdlSymbol* elemp) {
+                return elemp && elemp->typep()
+                       && elemp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                       && elemp->typep()->unconstrained();
+            })) {
             if (VhdlType* const boundp = boundTypeOf(targetp)) ttypep = boundp;
         }
         if (recordMayCarry(ttypep) && recordCarriesElement(ttypep)) return nullptr;
@@ -19796,14 +19787,15 @@ private:
             // A signal-class formal is written with its open record type, and
             // the signal the call passed is the shape it has
             VhdlType* shapep = shapeTypeOf(targetp);
-            if (shapep && shapep->base()->kind() == VhdlTypeKind::RECORD
-                && std::any_of(shapep->elements().begin(), shapep->elements().end(),
-                               [](const VhdlSymbol* elemp) {
-                                   return elemp && elemp->typep()
-                                          && elemp->typep()->base()->kind() == VhdlTypeKind::ARRAY
-                                          && elemp->typep()->unconstrained();
-                               })) {
-                if (VhdlType* const boundp = boundTypeOf(targetp)) shapep = boundp;
+            if (shapep && shapep->base()->kind() == VhdlTypeKind::RECORD) {
+                const std::vector<VhdlSymbol*>& selems = shapep->elements();
+                if (std::any_of(selems.begin(), selems.end(), [](const VhdlSymbol* elemp) {
+                        return elemp && elemp->typep()
+                               && elemp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                               && elemp->typep()->unconstrained();
+                    })) {
+                    if (VhdlType* const boundp = boundTypeOf(targetp)) shapep = boundp;
+                }
             }
             if (AstNodeExpr* const outp = recordAsShape(valuep, shapep, flp)) return outp;
         }
