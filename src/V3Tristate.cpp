@@ -487,6 +487,25 @@ class TristateVisitor final : public TristateBaseVisitor {
     // it assigns no high impedance and so drives all it writes
     std::unordered_map<const AstNodeAssign*, AstNodeExpr*> m_procEnables;
     std::unordered_set<const AstVar*> m_taskVars;  // What that task declares
+    std::unordered_map<const AstVar*, bool> m_ownedHere;  // Var -> in m_modp
+    // Whether a task's statement leaves this variable out of the
+    // resolution. A task's own variables and arguments are not the module's
+    // -- nor are a static task's, which were moved out of it into the
+    // module. Nor does a task take part in the resolution of what another
+    // module, a package, owns: that is not resolved here, and a task writing
+    // it goes on writing it as a variable, as it did.
+    bool taskLeaves(AstVar* varp) {
+        if (!m_inTask) return false;
+        return m_taskVars.count(varp) || varp->isFuncLocal() || varp->isFuncLocalSticky()
+               || !ownedHere(varp);
+    }
+    bool ownedHere(AstVar* varp) {
+        const auto it = m_ownedHere.find(varp);
+        if (it != m_ownedHere.end()) return it->second;
+        const bool owned = findParentModule(varp) == m_modp;
+        m_ownedHere.emplace(varp, owned);
+        return owned;
+    }
     bool m_processedIfaces = false;  // Interface modules already processed (interfaces-first pass)
     VStrength m_currentStrength = VStrength::STRONG;  // Current strength of assignment,
                                                       // Used only on LHS of assignment
@@ -1760,6 +1779,26 @@ class TristateVisitor final : public TristateBaseVisitor {
         VL_RESTORER(m_currentStrength);
         VL_RESTORER(m_currentDelayp);
         if (VN_IS(nodep->rhsp(), CReset)) return;
+        // What a task assigns and leaves out of the resolution is no concern
+        // of this pass at all, as nothing in a task was before
+        if (m_inTask) {
+            const AstNode* lhsp = nodep->lhsp();
+            while (lhsp && !VN_IS(lhsp, NodeVarRef)) {
+                if (const AstNodeSel* const selp = VN_CAST(lhsp, NodeSel)) {
+                    lhsp = selp->fromp();
+                } else if (const AstSel* const sp = VN_CAST(lhsp, Sel)) {
+                    lhsp = sp->fromp();
+                } else if (const AstMemberSel* const mp = VN_CAST(lhsp, MemberSel)) {
+                    lhsp = mp->fromp();
+                } else if (const AstStructSel* const ssp = VN_CAST(lhsp, StructSel)) {
+                    lhsp = ssp->fromp();
+                } else {
+                    break;
+                }
+            }
+            const AstNodeVarRef* const refp = VN_CAST(lhsp, NodeVarRef);
+            if (!refp || taskLeaves(refp->varp())) return;
+        }
         if (AstAssignW* const assignWp = VN_CAST(nodep, AssignW)) {
             m_currentDelayp = VN_CAST(assignWp->timingControlp(), Delay);
         }
@@ -2346,13 +2385,7 @@ class TristateVisitor final : public TristateBaseVisitor {
     void handleNodeVarRef(AstNodeVarRef* nodep) {
         UINFO(9, dbgState() << nodep);
         UASSERT_OBJ(nodep->varp(), nodep, "Unlinked");
-        // A task's own variables and arguments are not the module's -- nor
-        // are a static task's, which were moved out of it into the module
-        if (m_inTask
-            && (m_taskVars.count(nodep->varp()) || nodep->varp()->isFuncLocal()
-                || nodep->varp()->isFuncLocalSticky())) {
-            return;
-        }
+        if (taskLeaves(nodep->varp())) return;
         if (m_graphing) {
             if (nodep->access().isWriteOrRW()) associateLogic(nodep, nodep->varp());
             if (nodep->access().isReadOrRW()) associateLogic(nodep->varp(), nodep);
@@ -2488,6 +2521,7 @@ class TristateVisitor final : public TristateBaseVisitor {
             if (pair.second) pushDeletep(pair.second);
         }
         m_procEnables.clear();
+        m_ownedHere.clear();
 
         m_tgraph.clearAndCheck();  // Recursion not supported
     }
