@@ -96,6 +96,8 @@ class AstNodeFTask VL_NOT_FINAL : public AstNode {
     string m_cname;  // Name of task if DPI import
     string m_dpiCDecl;  // Custom DPI-C function declaration
     string m_ifacePortName;  // Interface port name for out-of-block definition (IEEE 25.8)
+    // Tasks copied from one source subprogram share this (V3Task inlining cost)
+    string m_inlineFamily;
     uint64_t m_dpiOpenParent = 0;  // DPI import open array, if !=0, how many callees
     bool m_taskPublic : 1;  // Public task
     bool m_classMethod : 1;  // Class method
@@ -188,6 +190,8 @@ public:
     void isExternDef(bool flag) { m_isExternDef = flag; }
     const string& ifacePortName() const { return m_ifacePortName; }
     void ifacePortName(const string& name) { m_ifacePortName = name; }
+    const string& inlineFamily() const { return m_inlineFamily; }
+    void inlineFamily(const string& family) { m_inlineFamily = family; }
     bool prototype() const { return m_prototype; }
     void prototype(bool flag) { m_prototype = flag; }
     bool dpiExport() const { return m_dpiExport; }

@@ -119,6 +119,8 @@ class TaskStateVisitor final : public VNVisitor {
     V3Graph m_callGraph;  // Task call graph
     // Emitted size of one inlined copy of each task, 1 if it is not inlined
     std::unordered_map<const TaskFTaskVertex*, uint64_t> m_inlinedSizes;
+    // Calls of each family of tasks (AstNodeFTask::inlineFamily) together
+    std::unordered_map<std::string, uint64_t> m_familyCalls;
     VDouble0 m_statCostNoInline;  // Statistic tracking
     TaskBaseVertex* m_curVxp;  // Current vertex we're adding to
     std::vector<AstInitialAutomatic*> m_initialps;  // Initial blocks to move
@@ -246,8 +248,18 @@ private:
             size = satAdd(size, satMul(static_cast<uint64_t>(edge.weight()), each));
         }
         stack.pop_back();
+        // Copies of one source subprogram -- one per call site, when a front
+        // end specializes each call -- each have a single call site, but
+        // inlining them all is writing the one subprogram out once per call
+        // of it, so they are costed by the calls of the family together
+        const std::string& family = vtxp->nodep()->inlineFamily();
         uint64_t callSites = 0;
-        for (V3GraphEdge& edge : vtxp->inEdges()) callSites += edge.weight();
+        if (!family.empty()) {
+            const auto it = m_familyCalls.find(family);
+            if (it != m_familyCalls.end()) callSites = it->second;
+        } else {
+            for (V3GraphEdge& edge : vtxp->inEdges()) callSites += edge.weight();
+        }
         // One call site never duplicates anything, so it is always worth inlining
         if (!vtxp->noInline() && callSites > 1 && canDeclineInline(vtxp->nodep())
             && size > limit / callSites) {
@@ -291,6 +303,12 @@ private:
         // Then decline whatever costs too much to write out at every call site
         const int mult = v3Global.opt.inlineTaskMult();
         if (mult < 1) return;  // Unbounded inlining
+        for (V3GraphVertex& vtx : m_callGraph.vertices()) {
+            const TaskFTaskVertex* const ftVtxp = vtx.cast<TaskFTaskVertex>();
+            if (!ftVtxp || ftVtxp->nodep()->inlineFamily().empty()) continue;
+            uint64_t& calls = m_familyCalls[ftVtxp->nodep()->inlineFamily()];
+            for (const V3GraphEdge& edge : vtx.inEdges()) calls += edge.weight();
+        }
         const uint64_t limit = static_cast<uint64_t>(mult);
         std::vector<const TaskFTaskVertex*> stack;
         for (V3GraphVertex& vtx : m_callGraph.vertices()) {
