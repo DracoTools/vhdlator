@@ -16862,6 +16862,11 @@ private:
         if (!declaredInPackage(symp) || guardedSignal(symp) || symp->resolvePerElement()) {
             return false;
         }
+        // Where the declaration itself is: a region can answer "a package"
+        // for a signal of an architecture that also declares a package
+        // instance, and such a signal has drivers of its own (makeResolved)
+        bool decided = false;
+        if (!declaredInPackageAst(symp, decided) || !decided) return false;
         const VhdlType* const typep = symp->typep();
         if (!typep || !isLogicish(typep)) return false;
         const VhdlType* const basep = typep->base();
