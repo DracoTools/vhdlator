@@ -3554,6 +3554,22 @@ private:
         return false;
     }
 
+    // What the helpers for a carrier are kept by: the array's base type, as
+    // the carrier structure is -- and, for an array whose elements are arrays
+    // of a length of their own, that length too, since words of eight bits
+    // and of sixteen are two structures and one helper cannot take both
+    std::map<std::pair<const VhdlType*, int64_t>, const VhdlType*> m_carrierKeys;
+    const VhdlType* carrierKeyOf(const VhdlType* typep) {
+        const VhdlType* const basep = typep->base();
+        const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        if (!elemp || elemp->base()->kind() != VhdlTypeKind::ARRAY || !elemp->isConstrainedArray()
+            || elemp->indexTypes().size() != 1 || !elemp->indexTypes()[0]
+            || !elemp->indexTypes()[0]->bounded()) {
+            return basep;
+        }
+        const auto key = std::make_pair(basep, elemp->indexTypes()[0]->length());
+        return m_carrierKeys.emplace(key, typep).first->second;
+    }
     std::map<const VhdlType*, AstNodeFTask*> m_dynEqFuncs;
     std::map<const VhdlType*, AstNodeFTask*> m_dynFillFuncs;
     std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynOfFuncs;
@@ -3567,7 +3583,7 @@ private:
     // nothing else knows them (9.3.3.3)
     AstNodeFTask* dynFillFunc(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
-        const auto it = m_dynFillFuncs.find(basep);
+        const auto it = m_dynFillFuncs.find(carrierKeyOf(typep));
         if (it != m_dynFillFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
@@ -3629,7 +3645,7 @@ private:
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         funcp->addStmtsp(loopp);
         addHelperFunc(funcp);
-        m_dynFillFuncs.insert_or_assign(basep, funcp);
+        m_dynFillFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -3680,7 +3696,7 @@ private:
 
     AstNodeFTask* dynEqFunc(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
-        const auto it = m_dynEqFuncs.find(basep);
+        const auto it = m_dynEqFuncs.find(carrierKeyOf(typep));
         if (it != m_dynEqFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const std::string name
@@ -3731,7 +3747,7 @@ private:
         funcp->addStmtsp(loopp);
         funcp->addStmtsp(ret(true));
         addHelperFunc(funcp);
-        m_dynEqFuncs.insert_or_assign(basep, funcp);
+        m_dynEqFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -4771,7 +4787,7 @@ private:
     AstNodeFTask* dynCatFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
-        const auto it = m_dynCatFuncs.find(basep);
+        const auto it = m_dynCatFuncs.find(carrierKeyOf(typep));
         if (it != m_dynCatFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         VhdlType* const idxp
@@ -4832,7 +4848,7 @@ private:
                 whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
         }
         addHelperFunc(funcp);
-        m_dynCatFuncs.insert_or_assign(basep, funcp);
+        m_dynCatFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -4844,7 +4860,7 @@ private:
     AstNodeFTask* dynTextFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
-        const auto it = m_dynTextFuncs.find(basep);
+        const auto it = m_dynTextFuncs.find(carrierKeyOf(typep));
         if (it != m_dynTextFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         const VhdlType* const elemp = basep->elementp();
@@ -4878,7 +4894,7 @@ private:
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
         addHelperFunc(funcp);
-        m_dynTextFuncs.insert_or_assign(basep, funcp);
+        m_dynTextFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -4993,8 +5009,7 @@ private:
     // and each element inverted (9.2.2)
     AstNodeFTask* dynNotFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
-        VhdlType* const basep = typep->base();
-        const auto it = m_dynNotFuncs.find(basep);
+        const auto it = m_dynNotFuncs.find(carrierKeyOf(typep));
         if (it != m_dynNotFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdynnot", typep, dynCarrierRef(typep, flp), flp);
@@ -5021,7 +5036,7 @@ private:
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
         addHelperFunc(funcp);
-        m_dynNotFuncs.insert_or_assign(basep, funcp);
+        m_dynNotFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -5252,7 +5267,7 @@ private:
     AstNodeFTask* dynShiftFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
         VhdlType* const basep = typep->base();
-        const auto it = m_dynShiftFuncs.find(basep);
+        const auto it = m_dynShiftFuncs.find(carrierKeyOf(typep));
         if (it != m_dynShiftFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
@@ -5320,7 +5335,7 @@ private:
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
         addHelperFunc(funcp);
-        m_dynShiftFuncs.insert_or_assign(basep, funcp);
+        m_dynShiftFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -5350,8 +5365,7 @@ private:
     // side is an integer, and "wsel" says which of the three (16.5).
     AstNodeFTask* dynAddFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
-        VhdlType* const basep = typep->base();
-        const auto it = m_dynAddFuncs.find(basep);
+        const auto it = m_dynAddFuncs.find(carrierKeyOf(typep));
         if (it != m_dynAddFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdynadd", typep, dynCarrierRef(typep, flp), flp);
@@ -5417,7 +5431,7 @@ private:
                        flp, wr(pp, flp), new AstAdd{flp, rd(pp, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(pp, flp), rd(wp, flp)}, bodyp));
         addHelperFunc(funcp);
-        m_dynAddFuncs.insert_or_assign(basep, funcp);
+        m_dynAddFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -5430,8 +5444,7 @@ private:
     // once the sign bit is flipped (9.2.3).
     AstNodeFTask* dynCmpFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
-        VhdlType* const basep = typep->base();
-        const auto it = m_dynCmpFuncs.find(basep);
+        const auto it = m_dynCmpFuncs.find(carrierKeyOf(typep));
         if (it != m_dynCmpFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp
@@ -5512,7 +5525,7 @@ private:
                           new AstEq{flp, outr(), i32(0, flp)}},
             bodyp));
         addHelperFunc(funcp);
-        m_dynCmpFuncs.insert_or_assign(basep, funcp);
+        m_dynCmpFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -5526,8 +5539,7 @@ private:
     // two vectors by bit position and reads them as numbers.
     AstNodeFTask* dynLexCmpFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
-        VhdlType* const basep = typep->base();
-        const auto it = m_dynLexFuncs.find(basep);
+        const auto it = m_dynLexFuncs.find(carrierKeyOf(typep));
         if (it != m_dynLexFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp
@@ -5584,7 +5596,7 @@ private:
                                 new AstAssign{flp, out(), i32(-1, flp)}, nullptr}},
             nullptr});
         addHelperFunc(funcp);
-        m_dynLexFuncs.insert_or_assign(basep, funcp);
+        m_dynLexFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -5596,8 +5608,7 @@ private:
     // place of the quotient is one bit and no division is needed to find it.
     AstNodeFTask* dynDivFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
-        VhdlType* const basep = typep->base();
-        const auto it = m_dynDivFuncs.find(basep);
+        const auto it = m_dynDivFuncs.find(carrierKeyOf(typep));
         if (it != m_dynDivFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdyndiv", typep, dynCarrierRef(typep, flp), flp);
@@ -5670,7 +5681,7 @@ private:
         funcp->addStmtsp(new AstIf{
             flp, new AstLteS{flp, rd(vp, flp), i32(0, flp)}, zerop, loopsp});
         addHelperFunc(funcp);
-        m_dynDivFuncs.insert_or_assign(basep, funcp);
+        m_dynDivFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -10563,8 +10574,7 @@ private:
     // are is not known until it runs, so this is a loop.
     AstNodeFTask* dynSliceFunc(VhdlType* typep, FileLine* origFlp) {
         FileLine* const flp = dynFl(origFlp);
-        VhdlType* const basep = typep->base();
-        const auto it = m_dynSliceFuncs.find(basep);
+        const auto it = m_dynSliceFuncs.find(carrierKeyOf(typep));
         if (it != m_dynSliceFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
         AstFunc* const funcp
@@ -10602,7 +10612,7 @@ private:
                        flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
         addHelperFunc(funcp);
-        m_dynSliceFuncs.insert_or_assign(basep, funcp);
+        m_dynSliceFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
     }
 
@@ -22206,6 +22216,45 @@ private:
         if (bind.empty() && exprBind.empty() && elemBind.empty() && dynBind.empty()) {
             m_sigCopyWhy = ", which no signal of this design reached";
             return nullptr;
+        }
+        // A value parameter whose type leaves the element open is emitted
+        // with the element this call supplies -- words of eight bits in one
+        // call, of sixteen in the next -- so two such calls on the same
+        // signal cannot share one copy
+        for (size_t i = 0; i < formals.size(); ++i) {
+            if (formals[i]->kind() == VhdlIfaceKind::SIGNAL || !formals[i]->vhdlSymp()) continue;
+            const VhdlType* const ftypep = formals[i]->vhdlSymp()->typep();
+            if (!ftypep || ftypep->base()->kind() != VhdlTypeKind::ARRAY) continue;
+            const VhdlType* const felemp
+                = ftypep->elementp() ? ftypep->elementp() : ftypep->base()->elementp();
+            if (!felemp || felemp->base()->kind() != VhdlTypeKind::ARRAY
+                || felemp->isConstrainedArray()) {
+                continue;
+            }
+            AstNodeVhdlExpr* actualp = nullptr;
+            size_t pos = 0;
+            for (AstVhdlAssoc* const asp : assocs) {
+                const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                if (namep ? namep->name() == formals[i]->name() : pos == i) {
+                    actualp = asp->actualp();
+                }
+                ++pos;
+            }
+            // What the lowering takes the actual to be, which a slice of a
+            // carried parameter says better than its own subtype does
+            const VhdlType* atypep
+                = actualp && isDynValue(actualp) ? dynValueType(actualp) : nullptr;
+            if (!atypep && actualp) atypep = boundTypeOf(actualp);
+            if (!atypep && actualp) atypep = actualp->vhdlTypep();
+            const VhdlType* const aelemp
+                = atypep ? (atypep->elementp() ? atypep->elementp() : atypep->base()->elementp())
+                         : nullptr;
+            key += "|v" + formals[i]->name() + "=";
+            if (aelemp && aelemp->isConstrainedArray() && aelemp->dimensions() == 1) {
+                key += std::to_string(aelemp->dimLength(0));
+            } else {
+                key += std::to_string(reinterpret_cast<uintptr_t>(aelemp));
+            }
         }
         auto copyIt = m_signalCopies.find(key);
         if (copyIt == m_signalCopies.end()) {
