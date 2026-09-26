@@ -2147,6 +2147,8 @@ private:
     int64_t aggregateLength(AstVhdlAggregate* nodep) VL_MT_DISABLED;
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
     VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
+    static bool sameElementLengths(const VhdlType* ap, const VhdlType* bp) VL_MT_DISABLED;
+    VhdlType* literalSubtype(AstNodeVhdlExpr* valuep, VhdlType* typep) VL_MT_DISABLED;
     void checkCompositeElements(VhdlType* typep, FileLine* flp) VL_MT_DISABLED;
     bool checkAssignedType(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
     static bool indexedCallWouldFit(const AstNodeVhdlExpr* nodep, const VhdlType* valuep,
@@ -11088,7 +11090,79 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
     outp->clearIndexTypes();
     outp->addIndexType(newIndexp);
     outp->unconstrained(false);
+    // An element subtype the type leaves open is the one its elements have
+    // (9.3.3.3): "(0 => (v_min, v_max))" of an array of arrays of UNSIGNED
+    // is an array of one array of two 128-bit values. Only where every
+    // element is one value of the same fully constrained subtype.
+    const VhdlType* const elemp
+        = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+    if (elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY && !elemp->lengthEmittable()) {
+        VhdlType* commonp = nullptr;
+        bool agree = true;
+        for (AstNode* p = nodep->elemsp(); p && agree; p = p->nextp()) {
+            const AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+            VhdlType* vtypep = eap->valuep() ? eap->valuep()->vhdlTypep() : nullptr;
+            // A string or bit string literal is as long as what it stands
+            // for, indexed from the left of the index subtype (9.3.2)
+            if (vtypep && !vtypep->isConstrainedArray()) {
+                if (VhdlType* const ownp = literalSubtype(eap->valuep(), vtypep)) vtypep = ownp;
+            }
+            if (!vtypep || vtypep->base() != elemp->base() || !vtypep->isConstrainedArray()
+                || !vtypep->lengthEmittable() || vtypep->dimensions() != 1
+                || (!eap->choicesp() && elementSpan(eap->valuep(), typep) != 1)) {
+                agree = false;
+            } else if (!commonp) {
+                commonp = vtypep;
+            } else if (commonp->dimLength(0) != vtypep->dimLength(0)
+                       || !sameElementLengths(commonp, vtypep)) {
+                agree = false;
+            }
+        }
+        if (agree && commonp) outp->elementp(commonp);
+    }
     return outp;
+}
+
+// The subtype a string or bit string literal has where its context leaves the
+// length open: as many elements as it stands for, from the left bound of the
+// index subtype and in its direction (9.3.2). Null where it is no such literal.
+VhdlType* VhdlSemVisitor::literalSubtype(AstNodeVhdlExpr* valuep, VhdlType* typep) {
+    const AstVhdlLiteral* const litp = VN_CAST(valuep, VhdlLiteral);
+    if (!litp || (litp->kind() != VhdlLitKind::STRING && litp->kind() != VhdlLitKind::BITSTRING)) {
+        return nullptr;
+    }
+    if (typep->base()->kind() != VhdlTypeKind::ARRAY || typep->base()->indexTypes().size() != 1) {
+        return nullptr;
+    }
+    VhdlType* const indexp = typep->base()->indexTypes()[0];
+    if (!indexp || !indexp->bounded()) return nullptr;
+    const VhdlValue val = V3VhdlEval::eval(valuep);
+    if (!val.isStr() || val.toStr().empty()) return nullptr;
+    const int64_t count = static_cast<int64_t>(val.toStr().size());
+    const int64_t left = indexp->left();
+    const bool ascending = indexp->ascending();
+    VhdlType* const outp = cloneSubtype(typep, valuep->fileline());
+    VhdlType* const newIndexp = cloneSubtype(indexp, valuep->fileline());
+    newIndexp->setBounds(left, ascending ? left + count - 1 : left - count + 1, ascending);
+    outp->clearIndexTypes();
+    outp->addIndexType(newIndexp);
+    outp->unconstrained(false);
+    return outp;
+}
+
+// Whether two array subtypes' elements, and theirs in turn, are as long as
+// each other
+bool VhdlSemVisitor::sameElementLengths(const VhdlType* ap, const VhdlType* bp) {
+    const VhdlType* const aep = ap->elementp() ? ap->elementp() : ap->base()->elementp();
+    const VhdlType* const bep = bp->elementp() ? bp->elementp() : bp->base()->elementp();
+    if (!aep || !bep) return aep == bep;
+    if (aep->base()->kind() != VhdlTypeKind::ARRAY) return true;
+    if (!aep->isConstrainedArray() || !bep->isConstrainedArray()) return false;
+    if (aep->dimensions() != bep->dimensions()) return false;
+    for (size_t dim = 0; dim < aep->dimensions(); ++dim) {
+        if (aep->dimLength(dim) != bep->dimLength(dim)) return false;
+    }
+    return sameElementLengths(aep, bep);
 }
 
 // How many elements an aggregate has, or -1 where "others" or a non-static
