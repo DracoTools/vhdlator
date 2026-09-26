@@ -18721,8 +18721,332 @@ private:
         return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
     }
 
+    // Which elements of the record a call to a pure function gives back are
+    // high impedance whatever else it does -- UVVM's init_*_if_signals build
+    // a record of 'Z' for the fields the other side of a bus drives, and
+    // return it. Read from the body with the call's own arguments: element
+    // assignments to the one object returned, and "if"s whose condition
+    // those arguments settle. False where the body is anything else.
+    // Whether a value is high impedance as it is written: 'Z', a string of
+    // them, or what driveOfLiteral says. Read from the text, since inside a
+    // body no call has been made for, a literal need not have a type yet.
+    static bool writtenHighZ(AstNodeVhdlExpr* valp) {
+        if (const AstVhdlLiteral* const litp = VN_CAST(valp, VhdlLiteral)) {
+            if (litp->kind() == VhdlLitKind::CHARACTER) {
+                const std::string& t = litp->name();
+                return t == "'Z'" || t == "'z'" || t == "Z" || t == "z";
+            }
+            if (litp->kind() == VhdlLitKind::STRING && !litp->name().empty()) {
+                for (const char c : litp->name()) {
+                    if (c != 'Z' && c != 'z') return false;
+                }
+                return true;
+            }
+        }
+        return driveOfLiteral(valp) == VhdlDrive::OFF;
+    }
+    bool zElementsOfCall(AstVhdlCall* callp, std::set<std::string>& zElems) {
+        const VhdlSymbol* const symp = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (!symp || symp->kind() != VhdlSymKind::FUNCTION || symp->predefined()) return false;
+        AstVhdlSubprogDecl* const declp = symp->bodyp();
+        if (!declp || !declp->vhdlPure() || declp->genericCount()) return false;
+        // The formals, in order, and what this call gives each
+        std::vector<AstVhdlIfaceDecl*> formals;
+        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+            if (AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl)) formals.push_back(ifp);
+        }
+        std::map<const VhdlSymbol*, AstNodeVhdlExpr*> actuals;
+        size_t pos = 0;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp(), ++pos) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp()) continue;
+            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+            for (size_t i = 0; i < formals.size(); ++i) {
+                if (namep ? formals[i]->name() == namep->name() : i == pos) {
+                    if (formals[i]->vhdlSymp()) actuals[formals[i]->vhdlSymp()] = asp->actualp();
+                }
+            }
+        }
+        for (AstVhdlIfaceDecl* const ifp : formals) {
+            if (ifp->vhdlSymp() && !actuals.count(ifp->vhdlSymp()) && ifp->defaultp()) {
+                actuals[ifp->vhdlSymp()] = ifp->defaultp();
+            }
+        }
+        // A condition the arguments settle: a formal, "not" one, or one that
+        // folds by itself
+        const std::function<int(AstNodeVhdlExpr*)> condOf = [&](AstNodeVhdlExpr* condp) -> int {
+            if (AstVhdlUnary* const up = VN_CAST(condp, VhdlUnary)) {
+                if (up->op() == VhdlUnaryOp::NOT) {
+                    const int inner = condOf(up->lhsp());
+                    return inner < 0 ? -1 : !inner;
+                }
+            }
+            AstNodeVhdlExpr* evalp = condp;
+            if (const AstVhdlName* const namep = VN_CAST(condp, VhdlName)) {
+                const VhdlSymbol* const csymp
+                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                const auto it = csymp ? actuals.find(csymp) : actuals.end();
+                if (it != actuals.end()) evalp = it->second;
+            }
+            const VhdlValue val = V3VhdlEval::eval(evalp);
+            return val.isInt() ? (val.toInt() != 0) : -1;
+        };
+        const VhdlSymbol* objp = nullptr;
+        bool ok = true;
+        bool returned = false;
+        // The elements high impedance on the way through a list of statements
+        const std::function<void(AstNode*, std::set<std::string>&)> scan =
+            [&](AstNode* stmtsp, std::set<std::string>& zs) {
+                for (AstNode* p = stmtsp; p && ok && !returned; p = p->nextp()) {
+                    if (AstVhdlVarAssign* const asgp = VN_CAST(p, VhdlVarAssign)) {
+                        AstVhdlSelected* const selp = VN_CAST(asgp->targetp(), VhdlSelected);
+                        const VhdlSymbol* const tsymp
+                            = selp && selp->prefixp() && selp->prefixp()->vhdlSymp()
+                                  ? selp->prefixp()->vhdlSymp()->resolved()
+                                  : nullptr;
+                        if (!tsymp || !VN_IS(selp->prefixp(), VhdlName) || !selp->suffixp()
+                            || asgp->kind() != VhdlAssignKind::SIMPLE) {
+                            ok = false;
+                            return;
+                        }
+                        if (objp && objp != tsymp) {
+                            ok = false;
+                            return;
+                        }
+                        objp = tsymp;
+                        AstNodeVhdlExpr* valp = asgp->valuep();
+                        if (AstNodeVhdlExpr* const onep = uniformAggregateValue(valp)) {
+                            valp = onep;
+                        }
+                        const std::string& elemName = selp->suffixp()->name();
+                        if (writtenHighZ(valp)) {
+                            zs.insert(elemName);
+                        } else {
+                            zs.erase(elemName);
+                        }
+                    } else if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
+                        // Every path that can be taken: the alternatives up
+                        // to the first whose condition surely holds, and
+                        // falling through where none surely does. What they
+                        // all agree on is what is known.
+                        std::vector<std::set<std::string>> paths;
+                        bool covered = false;
+                        for (AstNode* ap = ifp->altsp(); ap && ok; ap = ap->nextp()) {
+                            AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
+                            const int holds = altp->condp() ? condOf(altp->condp()) : 1;
+                            if (holds == 0) continue;
+                            std::set<std::string> branch = zs;
+                            scan(altp->stmtsp(), branch);
+                            paths.push_back(branch);
+                            if (holds == 1) {
+                                covered = true;
+                                break;
+                            }
+                        }
+                        if (!covered) paths.push_back(zs);
+                        std::set<std::string> common = paths.front();
+                        for (const std::set<std::string>& path : paths) {
+                            std::set<std::string> both;
+                            for (const std::string& n : common) {
+                                if (path.count(n)) both.insert(n);
+                            }
+                            common = both;
+                        }
+                        zs = common;
+                        // A return inside a branch ends the scan there
+                        if (returned) return;
+                    } else if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
+                        // An aggregate given back as it stands: its own
+                        // elements say which are high impedance
+                        if (AstVhdlAggregate* const aggp
+                            = VN_CAST(retp->valuep(), VhdlAggregate)) {
+                            const VhdlType* const rtp = symp->returnTypep();
+                            if (!rtp || rtp->base()->kind() != VhdlTypeKind::RECORD) {
+                                ok = false;
+                                return;
+                            }
+                            const std::vector<VhdlSymbol*>& relems = rtp->base()->elements();
+                            std::set<std::string> named;
+                            AstNodeVhdlExpr* othersp = nullptr;
+                            size_t at = 0;
+                            const auto note = [&](const std::string& name, AstNodeVhdlExpr* valp) {
+                                named.insert(name);
+                                if (AstNodeVhdlExpr* const onep = uniformAggregateValue(valp)) {
+                                    valp = onep;
+                                }
+                                if (writtenHighZ(valp)) {
+                                    zs.insert(name);
+                                } else {
+                                    zs.erase(name);
+                                }
+                            };
+                            for (AstNode* ep = aggp->elemsp(); ep; ep = ep->nextp(), ++at) {
+                                AstVhdlElemAssoc* const eap = VN_AS(ep, VhdlElemAssoc);
+                                if (!eap->choicesp()) {
+                                    if (at < relems.size())
+                                        note(relems[at]->name(), eap->valuep());
+                                    continue;
+                                }
+                                for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+                                    AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                                    if (chp->isOthers()) {
+                                        othersp = eap->valuep();
+                                    } else if (const AstVhdlName* const cnamep
+                                               = VN_CAST(chp->valuep(), VhdlName)) {
+                                        note(cnamep->name(), eap->valuep());
+                                    }
+                                }
+                            }
+                            if (othersp) {
+                                for (const VhdlSymbol* const ep : relems) {
+                                    if (!named.count(ep->name())) note(ep->name(), othersp);
+                                }
+                            }
+                            returned = true;
+                            return;
+                        }
+                        const AstVhdlName* const namep = VN_CAST(retp->valuep(), VhdlName);
+                        const VhdlSymbol* const rsymp
+                            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                        if (!rsymp || (objp && objp != rsymp)) {
+                            ok = false;
+                            return;
+                        }
+                        objp = rsymp;
+                        returned = true;
+                        return;
+                    } else if (!VN_IS(p, VhdlNull)) {
+                        ok = false;
+                        return;
+                    }
+                }
+            };
+        std::set<std::string> zs;
+        scan(declp->stmtsp(), zs);
+        if (!ok || !returned || zs.empty()) return false;
+        zElems = zs;
+        return true;
+    }
+
+    // "s <= f(...)", where s is a record signal and f gives back some of its
+    // elements high impedance: the elements the call leaves 'Z' are driven
+    // 'Z', which is what lets whatever else drives them be heard (14.7.3.2).
+    // A value worked out while running carries no 'Z' of its own here, so
+    // the rest are taken from the call and those are written as constants.
+    AstNodeExpr* zRecordDriveValue(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
+                                   FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(valuep, VhdlCall);
+        if (!callp) return nullptr;
+        VhdlType* ttypep = targetp->vhdlTypep();
+        if (!ttypep || ttypep->base()->kind() != VhdlTypeKind::RECORD) return nullptr;
+        if (std::any_of(ttypep->elements().begin(), ttypep->elements().end(),
+                        [](const VhdlSymbol* elemp) {
+                            return elemp && elemp->typep()
+                                   && elemp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                                   && elemp->typep()->unconstrained();
+                        })) {
+            if (VhdlType* const boundp = boundTypeOf(targetp)) ttypep = boundp;
+        }
+        if (recordMayCarry(ttypep) && recordCarriesElement(ttypep)) return nullptr;
+        std::set<std::string> zElems;
+        if (!zElementsOfCall(callp, zElems)) return nullptr;
+        const std::vector<VhdlSymbol*>& elems = ttypep->elements();
+        // Each high impedance element as wide as the signal's own
+        std::vector<AstNodeExpr*> zs(elems.size(), nullptr);
+        bool anyFill = false;
+        const auto cleanup = [&]() {
+            for (AstNodeExpr* const zp : zs) {
+                if (zp) VL_DO_DANGLING(zp->deleteTree(), zp);
+            }
+        };
+        for (size_t i = 0; i < elems.size(); ++i) {
+            if (!zElems.count(elems[i]->name())) continue;
+            VhdlType* const etp = elems[i]->typep();
+            if (!etp) return cleanup(), nullptr;
+            if (isLogicish(etp) && etp->base()->kind() != VhdlTypeKind::ARRAY) {
+                zs[i] = newLogicConst(flp, LogicVal::Z);
+                continue;
+            }
+            const VhdlType* const leafp
+                = etp->elementp() ? etp->elementp() : etp->base()->elementp();
+            if (etp->base()->kind() != VhdlTypeKind::ARRAY || !leafp || !isLogicish(leafp)
+                || etp->indexTypes().size() != 1) {
+                return cleanup(), nullptr;
+            }
+            if (etp->isConstrainedArray() && etp->indexTypes()[0]->bounded()) {
+                const int64_t width = etp->indexTypes()[0]->length();
+                if (width <= 0) return cleanup(), nullptr;
+                V3Number num{flp, static_cast<int>(width), 0};
+                num.setAllBitsZ();
+                zs[i] = new AstConst{flp, num};
+                continue;
+            }
+            if (AstNodeExpr* const countp = boundsLength(etp, flp)) {
+                FileLine* const rflp = new FileLine{flp};
+                rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+                zs[i] = new AstReplicate{rflp, newLogicConst(flp, LogicVal::Z), countp};
+                continue;
+            }
+            // Nothing here says how wide it is -- a port whose record type
+            // leaves the element open takes it from what the instance
+            // connects -- so it fills whatever the member is, which a
+            // member of a pattern can say and a concatenation cannot
+            zs[i] = new AstConst{flp, AstConst::StringToParse{}, "'z"};
+            anyFill = true;
+        }
+        AstNodeExpr* const callValp = lowerExpr(valuep);
+        if (!callValp) return cleanup(), nullptr;
+        // What the call gives back may hold an element as a carrier where
+        // the signal holds bits, and is converted as an assignment would
+        VhdlType* const havep = shapeTypeOf(valuep);
+        const std::vector<VhdlSymbol*>* const helemsp
+            = havep && havep->base() == ttypep->base() ? &havep->elements() : nullptr;
+        // An assignment pattern names each member, and serves a packed
+        // structure as well as an unpacked one
+        const bool packed = recordPacks(ttypep) && !anyFill;
+        AstNodeExpr* outp = nullptr;
+        AstNode* itemsp = nullptr;
+        for (size_t i = 0; i < elems.size(); ++i) {
+            AstNodeExpr* memberp = zs[i];
+            if (!memberp) {
+                memberp = dynPart(callValp->cloneTree(false), elems[i]->name(), flp);
+                VhdlType* const stp
+                    = helemsp && i < helemsp->size() ? (*helemsp)[i]->typep() : nullptr;
+                if (stp && carriedIn(havep, stp) && !carriedIn(ttypep, elems[i]->typep())) {
+                    AstNodeFTask* funcp = dynToFixedFunc(stp, elems[i]->typep(), flp);
+                    if (!funcp) funcp = dynToFixedExprFunc(stp, elems[i]->typep(), flp);
+                    if (!funcp) {
+                        VL_DO_DANGLING(memberp->deleteTree(), memberp);
+                        if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                        if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
+                        VL_DO_DANGLING(callValp->deleteTree(), callValp);
+                        return cleanup(), nullptr;
+                    }
+                    AstFuncRef* const refp
+                        = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", memberp}};
+                    refp->taskp(VN_AS(funcp, Func));
+                    memberp = refp;
+                }
+            }
+            zs[i] = nullptr;
+            if (packed) {
+                outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
+            } else {
+                itemsp = AstNode::addNextNull(
+                    itemsp,
+                    new AstPatMember{flp, memberp, new AstText{flp, elems[i]->name()}, nullptr});
+            }
+        }
+        VL_DO_DANGLING(callValp->deleteTree(), callValp);
+        if (packed) return outp;
+        return itemsp ? new AstPattern{flp, itemsp} : nullptr;
+    }
+
     AstNodeExpr* lowerDriveValue(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) {
+        if (valuep && targetp) {
+            if (AstNodeExpr* const outp = zRecordDriveValue(targetp, valuep, flp)) return outp;
+        }
         if (valuep && targetp && isDynValue(valuep) && !isDynObj(targetp)) {
             VhdlType* ttypep = targetp->vhdlTypep();
             // A signal-class formal is written with its open subtype, but it
