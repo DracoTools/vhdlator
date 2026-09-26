@@ -8501,17 +8501,33 @@ private:
         return lowerExpr(nodep->prefixp());
     }
 
-
     // The signal attributes of 16.2.4, answered from what shadowFor and
     // makeActive keep
     // The name a signal-class formal stands for, where a call bound it to
     // part of a signal rather than to a whole one -- "drive(r.y)" -- so that
     // what is asked of the formal is asked of the actual instead
+    // -- and the name an alias of a signal denotes (6.6.2): "alias
+    // trigger : std_logic is global_trigger(C_VVC)" has the history of that
+    // element. Only where the alias cannot number it differently: one given
+    // an array subtype of its own may renumber what it denotes.
     AstNodeVhdlExpr* boundNameOf(AstNodeVhdlExpr* prefixp) {
         VhdlSymbol* const symp = prefixp ? prefixp->vhdlSymp() : nullptr;
         if (!symp) return prefixp;
         for (int depth = 0; depth < 16; ++depth) {
-            const auto it = m_bindExprs.find(prefixp->vhdlSymp());
+            VhdlSymbol* const namedp = prefixp->vhdlSymp();
+            const AstVhdlAliasDecl* const aliasp = VN_IS(prefixp, VhdlName)
+                                                           && namedp->kind() == VhdlSymKind::ALIAS
+                                                           && namedp->objectAlias()
+                                                       ? VN_CAST(namedp->declp(), VhdlAliasDecl)
+                                                       : nullptr;
+            if (aliasp && aliasp->targetp() && aliasp->targetp() != prefixp
+                && (!aliasp->subtypep() || !aliasp->subtypep()->vhdlTypep()
+                    || aliasp->subtypep()->vhdlTypep()->base()->kind() != VhdlTypeKind::ARRAY)) {
+                prefixp = aliasp->targetp();
+                if (!prefixp->vhdlSymp()) break;
+                continue;
+            }
+            const auto it = m_bindExprs.find(namedp);
             if (it == m_bindExprs.end() || !it->second || it->second == prefixp) break;
             prefixp = it->second;
             if (!prefixp->vhdlSymp()) break;
@@ -17900,7 +17916,27 @@ private:
         size_t genPosition = 0;  // Which generic a positional association names
         for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
-            AstPin* const pinp = lowerAssoc(asp, ++pinNum);
+            // An actual with no length of its own -- "(others => 'Z')" -- is
+            // as long as the generic, whose subtype may be written with an
+            // earlier generic of the same unit: "GC_DEFAULT_LINE_VALUE :
+            // std_logic_vector(GC_DATA_WIDTH - 1 downto 0)" (6.5.6.2). This
+            // map says what that one is here, as it does for a port.
+            const VhdlSymbol* formalSymp = nullptr;
+            if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                formalSymp = fnamep->vhdlSymp();
+            } else if (!asp->formalp() && genPosition < nodep->formalGenericSyms().size()) {
+                formalSymp = nodep->formalGenericSyms()[genPosition];
+            }
+            AstPin* pinp = nullptr;
+            {
+                VL_RESTORER_COPY(m_bindExprs);
+                if (formalSymp && formalSymp->typep()) {
+                    for (const auto& pair : genericStandIns(nodep, formalSymp->typep())) {
+                        m_bindExprs[pair.first] = pair.second;
+                    }
+                }
+                pinp = lowerAssoc(asp, ++pinNum);
+            }
             if (!pinp) continue;
             // A generic carrying another's bounds stands ahead of it in the
             // clause but has no place in it, so a positional association is
