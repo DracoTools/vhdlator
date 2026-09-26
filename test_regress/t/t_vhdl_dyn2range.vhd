@@ -22,6 +22,8 @@ package t_vhdl_dyn2range_pkg is
   type t_slv_array is array (natural range <>) of std_logic_vector;
   procedure chk(signal clk : in std_logic; constant exp : in t_slv_array;
                 constant len, left, w : natural; constant asc, easc : boolean);
+  procedure chk2(constant exp : in t_slv_array; signal clk : in std_logic;
+                 constant len, left, w : natural; constant asc, easc : boolean);
 end package;
 
 package body t_vhdl_dyn2range_pkg is
@@ -36,6 +38,11 @@ package body t_vhdl_dyn2range_pkg is
       report "outer " & integer'image(v'length) & " " & integer'image(v'left) severity failure;
     assert v(v'low)'length = w and v(v'low)'ascending = easc severity failure;
     assert v(v'right) = exp(exp'right) severity failure;
+  end procedure;
+  procedure chk2(constant exp : in t_slv_array; signal clk : in std_logic;
+                 constant len, left, w : natural; constant asc, easc : boolean) is
+  begin
+    chk(clk, exp, len, left, w, asc, easc);
   end procedure;
 end package body;
 
@@ -79,6 +86,9 @@ begin
     chk(clk, a, 4, 0, 16, true, false);
     chk(clk, d, 3, 5, 8, false, true);
     chk(clk, a(1 to n), 2, 1, 16, true, false);
+    chk2(a(1 to n), clk, 2, 1, 16, true, false);
+    chk2(get(0, 3, wv), clk, 4, 0, 12, true, false);
+    chk2(d, clk, 3, 5, 8, false, true);
     report "*-* All Finished *-*";
     wait;
   end process;

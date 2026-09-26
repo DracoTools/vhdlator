@@ -6494,10 +6494,35 @@ private:
             // -- or, for a range taken from a value that carries its own
             // bounds, "t_slv_array(exp_data_array'range)", what that value
             // says while running (UVVM's axistream_expect)
-            AstNodeExpr* const ascExprp = boundsAscendingExpr(idxp, flp);
+            // -- read from the value itself where the declaration writes
+            // the range as that value's: what analysis made of the range
+            // need not say which way it runs
+            AstNodeExpr* outerDscp = nullptr;
+            if (objp->subtypep()) {
+                const AstVhdlCall* const markp = VN_CAST(objp->subtypep()->typeMarkp(), VhdlCall);
+                const AstVhdlCall* const firstp = markp && VN_IS(markp->prefixp(), VhdlCall)
+                                                      ? VN_AS(markp->prefixp(), VhdlCall)
+                                                      : markp;
+                const AstVhdlRange* const orangep
+                    = firstp ? VN_CAST(firstp->argsp(), VhdlRange) : nullptr;
+                AstVhdlAttrName* const oattrp
+                    = orangep ? VN_CAST(orangep->attrp(), VhdlAttrName) : nullptr;
+                if (oattrp && oattrp->prefixp()
+                    && (oattrp->name() == "range" || oattrp->name() == "reverse_range")
+                    && isDynValue(oattrp->prefixp())) {
+                    if (AstNodeExpr* const cp = lowerExpr(oattrp->prefixp())) {
+                        outerDscp = dynPart(cp, "dsc", flp);
+                        if (oattrp->name() == "reverse_range") {
+                            outerDscp = new AstNot{flp, outerDscp};
+                        }
+                    }
+                }
+            }
+            AstNodeExpr* const ascExprp = outerDscp ? nullptr : boundsAscendingExpr(idxp, flp);
             later(new AstAssign{flp, dynPart(vw(), "dsc", flp),
-                                ascExprp ? static_cast<AstNodeExpr*>(new AstNot{flp, ascExprp})
-                                         : new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+                                outerDscp  ? outerDscp
+                                : ascExprp ? static_cast<AstNodeExpr*>(new AstNot{flp, ascExprp})
+                                           : new AstConst{flp, AstConst::BitTrue{}, !ascending}});
             if (!hasValue) {
                 // "right - left + 1", or the other way round, elements --
                 // whichever way the range was just found to run
