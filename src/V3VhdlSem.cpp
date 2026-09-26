@@ -3159,7 +3159,11 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     // an expression would be wrong.
     bool objectAlias = !nodep->signaturep();
     if (symp->aliasp()) {
-        objectAlias = objectAlias && symp->aliasp()->resolved()->isObject();
+        // An alias of an object alias denotes that object too (6.6.2)
+        const VhdlSymbol* const targetp = symp->aliasp()->resolved();
+        objectAlias = objectAlias
+                      && (targetp->isObject()
+                          || (targetp->kind() == VhdlSymKind::ALIAS && targetp->objectAlias()));
     } else if (!found.empty()) {
         // An overloaded name: a subprogram or a literal, which denotes no
         // value of its own

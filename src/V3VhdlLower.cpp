@@ -25725,15 +25725,33 @@ private:
         // What this subprogram declares itself is not captured
         std::set<const VhdlSymbol*> ownp;
         collectOwnSymbols(nodep, ownp);
-        nodep->foreach([&](AstNodeVhdlExpr* exprp) {
-            VhdlSymbol* const usedp = exprp->vhdlSymp();
-            if (!usedp) return;
+        std::function<void(VhdlSymbol*, int)> consider = [&](VhdlSymbol* usedp, int depth) {
             VhdlSymbol* const rootp = usedp->resolved();
             if (ownp.count(rootp)) return;
+            // An alias is lowered as what it denotes (6.6), so what the nested
+            // subprogram reaches through one -- "alias wanted_idx : integer is
+            // command.gen_integer_array(0)" of the enclosing procedure -- is
+            // the objects its name is written with
+            if (rootp->kind() == VhdlSymKind::ALIAS) {
+                if (depth > 8) return;
+                if (rootp->aliasp()) consider(rootp->aliasp(), depth + 1);
+                const AstVhdlAliasDecl* const declp = VN_CAST(rootp->declp(), VhdlAliasDecl);
+                if (declp && declp->targetp()) {
+                    declp->targetp()->foreach([&](AstNodeVhdlExpr* targetExprp) {
+                        if (targetExprp->vhdlSymp()) {
+                            consider(targetExprp->vhdlSymp(), depth + 1);
+                        }
+                    });
+                }
+                return;
+            }
             const auto it = m_vars.find(rootp);
             if (it == m_vars.end() || !it->second || !it->second->isFuncLocal()) return;
             if (!seen.insert(rootp).second) return;
             captures.push_back(rootp);
+        };
+        nodep->foreach([&](AstNodeVhdlExpr* exprp) {
+            if (exprp->vhdlSymp()) consider(exprp->vhdlSymp(), 0);
         });
         // A nested subprogram that calls one of its siblings has to hand on
         // what that one reaches out for as well. The sibling's extra
