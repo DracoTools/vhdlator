@@ -26577,6 +26577,14 @@ private:
         // A VHDL subprogram's variables are created anew on each call (4.3),
         // which is what an automatic lifetime means
         ftaskp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        // Every copy of one subprogram -- made for a call's lengths, or for
+        // the signal a call passes -- is written where the original was, and
+        // they are costed together when deciding what to inline (V3Task)
+        {
+            const FileLine* const dflp = nodep->fileline();
+            ftaskp->inlineFamily(dflp->filename() + ":" + std::to_string(dflp->lineno()) + ":"
+                                 + std::to_string(dflp->firstColumn()));
+        }
         // A subprogram declared in a protected type body is one of its
         // methods, and reaches the object's own variables (5.6.2)
         if (m_protClassp) ftaskp->classMethod(true);
