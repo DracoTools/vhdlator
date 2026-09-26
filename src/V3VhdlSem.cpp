@@ -1726,6 +1726,17 @@ public:
         if (ak == VhdlTypeKind::INCOMPLETE || bk == VhdlTypeKind::INCOMPLETE) return true;
         if (ak == VhdlTypeKind::ARRAY && bk == VhdlTypeKind::ARRAY) {
             if (abp->indexTypes().size() != bbp->indexTypes().size()) return false;
+            // Before VHDL-2008 the index types have to be the same or
+            // closely related too (LRM-93 7.3.5); VHDL-2008 dropped that
+            // (9.3.6). nvc 1.22.1 keeps it in 2008 as well; GHDL 7.0.0-dev
+            // and Questa 25.1std do not.
+            if (v3Global.opt.vhdlStd() < V3LangCode::L1076_2008) {
+                for (size_t i = 0; i < abp->indexTypes().size(); ++i) {
+                    if (!closelyRelated(abp->indexTypes()[i], bbp->indexTypes()[i], depth + 1)) {
+                        return false;
+                    }
+                }
+            }
             return closelyRelated(abp->elementp(), bbp->elementp(), depth + 1);
         }
         return false;
