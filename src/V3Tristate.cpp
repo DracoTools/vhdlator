@@ -482,6 +482,11 @@ class TristateVisitor final : public TristateBaseVisitor {
     bool m_alhs = false;  // On LHS of assignment
     bool m_inStaticInit = false;  // Under a variable's initial value
     bool m_inAlias = false;  // Inside alias statement
+    bool m_inTask = false;  // Inside a task's body
+    // What each procedural assignment drives, of what it assigns; none where
+    // it assigns no high impedance and so drives all it writes
+    std::unordered_map<const AstNodeAssign*, AstNodeExpr*> m_procEnables;
+    std::unordered_set<const AstVar*> m_taskVars;  // What that task declares
     bool m_processedIfaces = false;  // Interface modules already processed (interfaces-first pass)
     VStrength m_currentStrength = VStrength::STRONG;  // Current strength of assignment,
                                                       // Used only on LHS of assignment
@@ -874,6 +879,43 @@ class TristateVisitor final : public TristateBaseVisitor {
         }
     }
 
+    static bool packedDType(const AstNodeDType* dtypep) {
+        if (!dtypep) return false;
+        dtypep = dtypep->skipRefp();
+        if (VN_IS(dtypep, BasicDType) || VN_IS(dtypep, PackArrayDType)) return true;
+        if (const AstNodeUOrStructDType* const sp = VN_CAST(dtypep, NodeUOrStructDType)) {
+            return sp->packed();
+        }
+        return false;
+    }
+    // The process -- or task -- whose procedural assignment writes this
+    // reference, and that assignment; null where it is written otherwise
+    // (a continuous assignment, a port, an argument)
+    static AstNode* procDriverOf(AstNodeVarRef* refp, AstNodeAssign*& asgpr) {
+        AstNode* np = refp;
+        AstNode* childp = nullptr;
+        while (np && !VN_IS(np, NodeAssign)) {
+            childp = np;
+            np = np->backp();
+            // Only up through the target's own selections
+            if (np && np->op1p() != childp && np->op2p() != childp && np->op3p() != childp
+                && np->op4p() != childp) {
+                return nullptr;
+            }
+        }
+        AstNodeAssign* const asgp = VN_CAST(np, NodeAssign);
+        if (!asgp || VN_IS(asgp, AssignW) || asgp->lhsp() != childp) return nullptr;
+        if (asgp->timingControlp()) return nullptr;
+        for (AstNode* upp = asgp->backp(); upp; upp = upp->backp()) {
+            if (VN_IS(upp, NodeProcedure) || VN_IS(upp, NodeFTask)) {
+                asgpr = asgp;
+                return upp;
+            }
+            if (VN_IS(upp, NodeModule)) break;
+        }
+        return nullptr;
+    }
+
     void aggregateTriSameStrength(AstNodeModule* nodep, AstVar* const varp, AstVar* const envarp,
                                   RefStrengthVec::iterator beginStrength,
                                   RefStrengthVec::iterator endStrength) {
@@ -883,8 +925,75 @@ class TristateVisitor final : public TristateBaseVisitor {
         AstNodeExpr* orp = nullptr;
         AstNodeExpr* enp = nullptr;
 
+        // A process -- or a task, whose statements run in the process that
+        // calls it -- is one driver of what it assigns, however many
+        // statements assign it: each writes that driver's value and says
+        // what of it now drives, and a later statement replaces what an
+        // earlier one drove. Taking each statement for a driver of its own,
+        // driving for ever what it drove once, left "s[1] <= 1" driving
+        // after "s <= 2'b0z" had released it.
+        std::map<AstNode*, std::pair<AstVar*, AstVar*>> procDrivers;  // Process -> out, en
+        // Only a value held as bits: an unpacked one is combined another way
+        const bool packedVar = packedDType(varp->dtypep());
+        for (auto it = beginStrength; it != endStrength; it++) {
+            AstNodeVarRef* const refp = it->m_varrefp;
+            AstNodeAssign* asgp = nullptr;
+            AstNode* const procp = packedVar ? procDriverOf(refp, asgp) : nullptr;
+            if (!procp || it->m_delayp) continue;
+            auto pit = procDrivers.find(procp);
+            if (pit == procDrivers.end()) {
+                AstVar* const outp = new AstVar{varp->fileline(), VVarType::MODULETEMP,
+                                                varp->name() + "__out" + cvtToStr(m_unique),
+                                                varp};  // 2-state ok; sep enable
+                outp->setDfgTriLowered();
+                nodep->addStmtsp(outp);
+                AstVar* const enVarp
+                    = new AstVar{varp->fileline(), VVarType::MODULETEMP,
+                                 varp->name() + "__en" + cvtToStr(m_unique++), envarp};
+                enVarp->setDfgTriLowered();
+                nodep->addStmtsp(enVarp);
+                pit = procDrivers.emplace(procp, std::make_pair(outp, enVarp)).first;
+                FileLine* const fl = refp->fileline();
+                AstNodeExpr* const andp = new AstAnd{fl, new AstVarRef{fl, outp, VAccess::READ},
+                                                     new AstVarRef{fl, enVarp, VAccess::READ}};
+                orp = (!orp) ? andp : new AstOr{fl, orp, andp};
+                AstNodeExpr* const ref3p = new AstVarRef{fl, enVarp, VAccess::READ};
+                enp = (!enp) ? ref3p : new AstOr{fl, enp, ref3p};
+            }
+            AstVar* const outp = pit->second.first;
+            AstVar* const enVarp = pit->second.second;
+            refp->varp(outp);
+            // What of it this statement drives, written the way the statement
+            // writes the value: the same selection of the enable
+            AstNodeExpr* const enLhsp = asgp->lhsp()->cloneTree(false);
+            enLhsp->foreach([&](AstNodeVarRef* crefp) {
+                if (crefp->varp() == outp) crefp->varp(enVarp);
+            });
+            enLhsp->foreach([](AstNode* np) { np->user1p(nullptr); });
+            const auto eit = m_procEnables.find(asgp);
+            AstNodeExpr* const enRhsp = eit != m_procEnables.end() && eit->second
+                                            ? eit->second->cloneTree(false)
+                                            : newAllZerosOrOnes(asgp->lhsp(), true);
+            FileLine* const fl = asgp->fileline();
+            AstNodeAssign* const enAsgp
+                = VN_IS(asgp, AssignDly)
+                      ? static_cast<AstNodeAssign*>(new AstAssignDly{fl, enLhsp, enRhsp})
+                      : static_cast<AstNodeAssign*>(new AstAssign{fl, enLhsp, enRhsp});
+            enAsgp->user2Or(U2_NONGRAPH | U2_GRAPHING);
+            asgp->addNextHere(enAsgp);
+            // The statement-wide enable the reference was given is not used
+            if (AstNode* const oldEnp = refp->user1p()) {
+                refp->user1p(nullptr);
+                if (!oldEnp->backp()) pushDeletep(oldEnp);
+            }
+        }
+
         for (auto it = beginStrength; it != endStrength; it++) {
             AstNodeVarRef* refp = it->m_varrefp;
+            {
+                AstNodeAssign* asgp = nullptr;
+                if (packedVar && !it->m_delayp && procDriverOf(refp, asgp)) continue;
+            }
 
             // create the new lhs driver for this var
             AstVar* const newLhsp = new AstVar{varp->fileline(), VVarType::MODULETEMP,
@@ -1692,6 +1801,11 @@ class TristateVisitor final : public TristateBaseVisitor {
             iterateAndNextNull(nodep->rhsp());
             UINFO(9, dbgState() << nodep);
             UINFOTREE(9, nodep, "", "assign");
+            // What a procedural assignment drives, as it assigns it: kept
+            // for the one driver of the process it is in (procDriverOf)
+            if (!VN_IS(nodep, AssignW) && nodep->rhsp()->user1p()) {
+                m_procEnables[nodep] = VN_AS(nodep->rhsp()->user1p(), NodeExpr)->cloneTree(false);
+            }
             // if the rhsp of this assign statement has an output enable driver,
             // then propagate the corresponding output enable assign statement.
             // down the lvalue tree by recursion for eventual attachment to
@@ -2232,6 +2346,13 @@ class TristateVisitor final : public TristateBaseVisitor {
     void handleNodeVarRef(AstNodeVarRef* nodep) {
         UINFO(9, dbgState() << nodep);
         UASSERT_OBJ(nodep->varp(), nodep, "Unlinked");
+        // A task's own variables and arguments are not the module's -- nor
+        // are a static task's, which were moved out of it into the module
+        if (m_inTask
+            && (m_taskVars.count(nodep->varp()) || nodep->varp()->isFuncLocal()
+                || nodep->varp()->isFuncLocalSticky())) {
+            return;
+        }
         if (m_graphing) {
             if (nodep->access().isWriteOrRW()) associateLogic(nodep, nodep->varp());
             if (nodep->access().isReadOrRW()) associateLogic(nodep->varp(), nodep);
@@ -2363,6 +2484,10 @@ class TristateVisitor final : public TristateBaseVisitor {
         iterateChildren(nodep);
         // Insert new logic for all tristates
         insertTristates(nodep);
+        for (const auto& pair : m_procEnables) {
+            if (pair.second) pushDeletep(pair.second);
+        }
+        m_procEnables.clear();
 
         m_tgraph.clearAndCheck();  // Recursion not supported
     }
@@ -2371,7 +2496,22 @@ class TristateVisitor final : public TristateBaseVisitor {
         // don't deal with classes
     }
     void visit(AstNodeFTask* nodep) override {
-        // don't deal with functions
+        // A task's body drives the module's variables as a process does: a
+        // high-impedance value it writes to a variable that is also driven
+        // elsewhere, or that is an inout's actual, takes part in the
+        // resolution exactly as the same statement in the process calling
+        // the task would. What the task declares for itself is no net of
+        // the module, and is left alone. Functions are not dealt with.
+        if (!VN_IS(nodep, Task) || nodep->dpiImport() || nodep->dpiExport()) return;
+        VL_RESTORER(m_inTask);
+        VL_RESTORER_CLEAR(m_taskVars);
+        m_inTask = true;
+        // Its arguments and variables, wherever in it they are declared: an
+        // inout argument is no port of the module
+        nodep->foreach([&](const AstVar* varp) { m_taskVars.insert(varp); });
+        for (AstNode* stmtp = nodep->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+            if (!VN_IS(stmtp, Var)) iterate(stmtp);
+        }
     }
 
     void visit(AstCaseItem* nodep) override {
