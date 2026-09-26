@@ -2390,10 +2390,23 @@ private:
         if (elemLen < 0 && elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY
             && elemp->lengthEmittable() && m_modp) {
             AstNodeDType* elemDTypep = lowerType(elemp, flp);
+            // Parameters only: a subprogram's own object in the width is no
+            // generic, and the module has no place for it either
             bool readsParam = false;
+            bool readsOther = false;
             if (elemDTypep) {
-                elemDTypep->foreach([&](const AstNodeVarRef*) { readsParam = true; });
+                elemDTypep->foreach([&](const AstNodeVarRef* refp) {
+                    const AstVar* const rvarp = refp->varp();
+                    if (rvarp
+                        && (rvarp->varType() == VVarType::GPARAM
+                            || rvarp->varType() == VVarType::LPARAM)) {
+                        readsParam = true;
+                    } else {
+                        readsOther = true;
+                    }
+                });
             }
+            if (readsOther) readsParam = false;
             if (readsParam) {
                 std::vector<std::pair<const AstNodeDType*, std::string>>& known
                     = m_modDynNames[std::make_pair(m_modp, keyp)];
@@ -6478,14 +6491,20 @@ private:
             VL_DO_DANGLING(rangep->deleteTree(), rangep);
             later(new AstAssign{flp, dynPart(vw(), "lft", flp), intBound(leftp, flp)});
             later(new AstAssign{flp, dynPart(vw(), "rgt", flp), intBound(rightp, flp)});
+            // -- or, for a range taken from a value that carries its own
+            // bounds, "t_slv_array(exp_data_array'range)", what that value
+            // says while running (UVVM's axistream_expect)
+            AstNodeExpr* const ascExprp = boundsAscendingExpr(idxp, flp);
             later(new AstAssign{flp, dynPart(vw(), "dsc", flp),
-                                new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+                                ascExprp ? static_cast<AstNodeExpr*>(new AstNot{flp, ascExprp})
+                                         : new AstConst{flp, AstConst::BitTrue{}, !ascending}});
             if (!hasValue) {
-                // "right - left + 1", or the other way round, elements
-                AstNodeExpr* const spanp
-                    = ascending
-                          ? new AstSub{flp, dynPart(vr(), "rgt", flp), dynPart(vr(), "lft", flp)}
-                          : new AstSub{flp, dynPart(vr(), "lft", flp), dynPart(vr(), "rgt", flp)};
+                // "right - left + 1", or the other way round, elements --
+                // whichever way the range was just found to run
+                AstNodeExpr* const spanp = new AstCond{
+                    flp, dynPart(vr(), "dsc", flp),
+                    new AstSub{flp, dynPart(vr(), "lft", flp), dynPart(vr(), "rgt", flp)},
+                    new AstSub{flp, dynPart(vr(), "rgt", flp), dynPart(vr(), "lft", flp)}};
                 later(new AstAssign{
                     flp, dynPart(vw(), "q", flp),
                     new AstNewDynamic{
@@ -6497,7 +6516,41 @@ private:
                 VhdlType* const elemp = openCarriedElement(typep);
                 const VhdlType* const eidxp
                     = elemp && !elemp->indexTypes().empty() ? elemp->indexTypes()[0] : nullptr;
-                AstRange* erangep = eidxp ? anyBoundsRange(eidxp, flp) : nullptr;
+                // An element range written as the range of a value that
+                // carries its own bounds -- "exp(exp'low)'range" -- is that
+                // value's, read while running. The subtype analysis gave
+                // the element may be the actual's, written in the terms of
+                // whatever made it: a function's result subtype names the
+                // function's own parameters.
+                AstVar* eSrcp = nullptr;
+                bool eReversed = false;
+                if (objp->subtypep()) {
+                    AstVhdlCall* const outerp = VN_CAST(objp->subtypep()->typeMarkp(), VhdlCall);
+                    const AstVhdlRange* const wrangep
+                        = outerp && VN_IS(outerp->prefixp(), VhdlCall)
+                              ? VN_CAST(outerp->argsp(), VhdlRange)
+                              : nullptr;
+                    AstVhdlAttrName* const wattrp
+                        = wrangep ? VN_CAST(wrangep->attrp(), VhdlAttrName) : nullptr;
+                    if (wattrp && wattrp->prefixp()
+                        && (wattrp->name() == "range" || wattrp->name() == "reverse_range")
+                        && isDynValue(wattrp->prefixp())) {
+                        VhdlType* const ctypep = dynValueType(wattrp->prefixp());
+                        AstNodeExpr* const cp = ctypep ? lowerExpr(wattrp->prefixp()) : nullptr;
+                        if (cp) {
+                            eSrcp = newTempVar("__Vdyn2er", dynCarrierRef(ctypep, flp), flp);
+                            later(
+                                new AstAssign{flp, new AstVarRef{flp, eSrcp, VAccess::WRITE}, cp});
+                            eReversed = wattrp->name() == "reverse_range";
+                        }
+                    }
+                }
+                const auto esr = [&]() { return new AstVarRef{flp, eSrcp, VAccess::READ}; };
+                AstRange* erangep
+                    = eSrcp   ? new AstRange{flp, dynPart(esr(), eReversed ? "rgt" : "lft", flp),
+                                             dynPart(esr(), eReversed ? "lft" : "rgt", flp)}
+                      : eidxp ? anyBoundsRange(eidxp, flp)
+                              : nullptr;
                 bool eascending
                     = eidxp && (eidxp->bounded() ? eidxp->ascending() : boundsAscending(eidxp));
                 if (!erangep && objp->subtypep()) {
@@ -6532,8 +6585,15 @@ private:
                         = new AstArg{flp, "", intBound(erangep->leftp()->unlinkFrBack(), flp)};
                     argsp->addNext(
                         new AstArg{flp, "", intBound(erangep->rightp()->unlinkFrBack(), flp)});
-                    argsp->addNext(
-                        new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, !eascending}});
+                    AstNodeExpr* const eAscExprp
+                        = eSrcp ? nullptr : boundsAscendingExpr(eidxp, flp);
+                    AstNodeExpr* const eDscp
+                        = eSrcp ? (eReversed ? static_cast<AstNodeExpr*>(
+                                                   new AstNot{flp, dynPart(esr(), "dsc", flp)})
+                                             : dynPart(esr(), "dsc", flp))
+                          : eAscExprp ? static_cast<AstNodeExpr*>(new AstNot{flp, eAscExprp})
+                                      : new AstConst{flp, AstConst::BitTrue{}, !eascending};
+                    argsp->addNext(new AstArg{flp, "", eDscp});
                     argsp->addNext(new AstArg{flp, "", defp});
                     VL_DO_DANGLING(erangep->deleteTree(), erangep);
                     AstFuncRef* const filledp = new AstFuncRef{flp, fillp->name(), argsp};
@@ -8076,6 +8136,15 @@ private:
         // of: a formal given "runner(15 to 19)" is five elements long, from
         // 15, and not the whole of runner
         if (const AstVhdlCall* const callp = VN_CAST(exprp, VhdlCall)) {
+            // What a function gives back has the subtype its declaration
+            // says, not the one of the object its body returns: that one is
+            // written in the function's own parameters -- "t_slv_array(lo to
+            // hi)(w - 1 downto 0)" -- which name nothing outside it
+            const VhdlSymbol* const fsymp
+                = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+            if (fsymp && fsymp->kind() == VhdlSymKind::FUNCTION) {
+                return fsymp->returnTypep() ? fsymp->returnTypep() : callp->vhdlTypep();
+            }
             VhdlType* const ownp = callp->vhdlTypep();
             if (ownp && callp->prefixp() && !arrayStillOpen(ownp)) return ownp;
         }
