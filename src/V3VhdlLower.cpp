@@ -1724,6 +1724,22 @@ private:
         return new AstAdd{flp, diffp, new AstConst{flp, AstConst::Signed32{}, 1}};
     }
 
+    // How many places an object whose length is "lenp" is declared with. A
+    // null range has none (5.3.2.1), but it is declared with the ends it was
+    // written with, and Verilog counts the places between them either way
+    // round: "(G - 1 downto 0)" of an instance given 0 is "[-1:0]", two of
+    // them, "2 - length". A value made for such an object, or taken as a
+    // slice with those ends, has as many.
+    static AstNodeExpr* declaredPlaces(AstNodeExpr* lenp, FileLine* flp) {
+        if (const AstConst* const constp = VN_CAST(lenp, Const)) {
+            if (constp->toSInt() > 0) return lenp;
+        }
+        return new AstCond{
+            flp, new AstGtS{flp, lenp, new AstConst{flp, AstConst::Signed32{}, 0}},
+            lenp->cloneTree(false),
+            new AstSub{flp, new AstConst{flp, AstConst::Signed32{}, 2}, lenp->cloneTree(false)}};
+    }
+
     // Whether every element of a record can live inside a packed structure.
     // One that cannot -- a real, a string, an unpacked array, an access value
     // -- makes the whole record unpacked.
@@ -11140,6 +11156,68 @@ private:
         return outp;
     }
 
+    // "=" or "/=" of two operands lowered to the same kind of value
+    AstNodeExpr* arrayEquality(AstVhdlBinary* nodep, AstNodeExpr* lhsp, AstNodeExpr* rhsp,
+                               bool equal, FileLine* flp) {
+        // A matching operator lets one side say which places it does not
+        // care about, and "-" is how it says so (9.2.3)
+        if (nodep->op() == VhdlBinaryOp::MATCH_EQ || nodep->op() == VhdlBinaryOp::MATCH_NE) {
+            const std::string lpat = dontCareOf(nodep->lhsp());
+            const std::string rpat = dontCareOf(nodep->rhsp());
+            const std::string& pat = !rpat.empty() ? rpat : lpat;
+            if (!pat.empty()) return maskedMatch(lhsp, rhsp, pat, equal, flp);
+        }
+        // A logic literal with a Z in it is compared exactly: "s = 'Z'"
+        // is true when s is 'Z' (9.2.3), where Verilog's "==" answers X.
+        if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
+            return equal ? static_cast<AstNodeExpr*>(new AstEqCase{flp, lhsp, rhsp})
+                         : static_cast<AstNodeExpr*>(new AstNeqCase{flp, lhsp, rhsp});
+        }
+        return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, lhsp, rhsp})
+                     : static_cast<AstNodeExpr*>(new AstNeq{flp, lhsp, rhsp});
+    }
+
+    // "" or x"": a literal of no elements
+    static bool emptyLiteral(AstNodeVhdlExpr* nodep) {
+        const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
+        if (!litp
+            || (litp->kind() != VhdlLitKind::STRING && litp->kind() != VhdlLitKind::BITSTRING)) {
+            return false;
+        }
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        return val.isStr() && val.toStr().empty();
+    }
+
+    // The length of a one-dimensional array whose bounds the elaboration
+    // settles, as an expression of numbers and parameters that folds per
+    // instance. Null where it is anything else, or not an array of bits.
+    AstNodeExpr* elaboratedLength(const VhdlType* typep, FileLine* flp) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY || typep->dimensions() != 1
+            || isStringType(typep)) {
+            return nullptr;
+        }
+        AstNodeExpr* const lenp = boundsLength(typep, flp);
+        if (!lenp) return nullptr;
+        bool elaborated = true;
+        lenp->foreach([&](const AstNode* np) {
+            if (const AstVarRef* const refp = VN_CAST(np, VarRef)) {
+                if (!refp->varp()
+                    || (refp->varp()->varType() != VVarType::GPARAM
+                        && refp->varp()->varType() != VVarType::LPARAM)) {
+                    elaborated = false;
+                }
+            } else if (!VN_IS(np, Const) && !VN_IS(np, Add) && !VN_IS(np, Sub) && !VN_IS(np, Mul)
+                       && !VN_IS(np, Cond) && !VN_IS(np, LteS)) {
+                elaborated = false;
+            }
+        });
+        if (!elaborated) {
+            VL_DO_DANGLING(lenp->deleteTree(), lenp);
+            return nullptr;
+        }
+        return lenp;
+    }
+
     AstNodeExpr* lowerBinary(AstVhdlBinary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
@@ -11346,24 +11424,39 @@ private:
                     VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
                     return new AstConst{flp, AstConst::BitTrue{}, !equal};
                 }
+                // Where a generic decides a length, it is the same answer,
+                // known once the instance is: "w = x"1f"" of a "(GC_WIDTH - 1
+                // downto 0)" is false in an instance given 4, or 0
+                // -- and two null arrays are equal, whatever the places an
+                // object declared with null ends has here hold
+                if ((!lw || !rw) && !(isNumericVector(ltypep) && isNumericVector(rtypep))) {
+                    const auto lengthOf
+                        = [&](int known, AstNodeVhdlExpr* opp, const VhdlType* typep) {
+                              if (known) return i32(known, flp);
+                              if (emptyLiteral(opp)) return i32(0, flp);
+                              return elaboratedLength(typep, flp);
+                          };
+                    AstNodeExpr* const llenp = lengthOf(lw, nodep->lhsp(), ltypep);
+                    AstNodeExpr* const rlenp
+                        = llenp ? lengthOf(rw, nodep->rhsp(), rtypep) : nullptr;
+                    if (llenp && rlenp) {
+                        // The widths differ in exactly the instances where
+                        // the comparison is not the one that is made
+                        FileLine* const cflp = new FileLine{flp};
+                        cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                        AstNodeExpr* const somep
+                            = new AstGtS{cflp, llenp->cloneTree(false), i32(0, cflp)};
+                        return new AstCond{
+                            cflp, new AstEq{cflp, llenp, rlenp},
+                            new AstCond{cflp, somep, arrayEquality(nodep, lhsp, rhsp, equal, cflp),
+                                        new AstConst{cflp, AstConst::BitTrue{}, equal}},
+                            new AstConst{cflp, AstConst::BitTrue{}, !equal}};
+                    }
+                    if (llenp) VL_DO_DANGLING(llenp->deleteTree(), llenp);
+                }
             }
-            // A matching operator lets one side say which places it does not
-            // care about, and "-" is how it says so (9.2.3)
-            if (nodep->op() == VhdlBinaryOp::MATCH_EQ
-                || nodep->op() == VhdlBinaryOp::MATCH_NE) {
-                const std::string lpat = dontCareOf(nodep->lhsp());
-                const std::string rpat = dontCareOf(nodep->rhsp());
-                const std::string& pat = !rpat.empty() ? rpat : lpat;
-                if (!pat.empty()) return maskedMatch(lhsp, rhsp, pat, equal, flp);
-            }
-            // A logic literal with a Z in it is compared exactly: "s = 'Z'"
-            // is true when s is 'Z' (9.2.3), where Verilog's "==" answers X.
-            if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
-                return equal ? static_cast<AstNodeExpr*>(new AstEqCase{flp, lhsp, rhsp})
-                             : static_cast<AstNodeExpr*>(new AstNeqCase{flp, lhsp, rhsp});
-            }
-            return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, lhsp, rhsp})
-                         : static_cast<AstNodeExpr*>(new AstNeq{flp, lhsp, rhsp});
+            return arrayEquality(nodep, lhsp, rhsp, equal, flp);
         }
         case VhdlBinaryOp::LT:
         case VhdlBinaryOp::MATCH_LT:
@@ -12634,10 +12727,24 @@ private:
         if (!widthp) {
             if (konst < 1 || konst > (1 << 20)) return nullptr;
             widthp = new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(konst)};
-        } else if (konst != 0) {
-            widthp = new AstAdd{flp, widthp,
-                                new AstConst{flp, AstConst::Signed32{},
-                                             static_cast<int32_t>(konst)}};
+        } else {
+            if (konst != 0) {
+                widthp = new AstAdd{
+                    flp, widthp,
+                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(konst)}};
+            }
+            // A generic may make it a null slice, "(GC_USER_WIDTH - 1 downto
+            // 0)" of an instance given 0: no elements (5.2.1), which a part
+            // select cannot have. It takes as many places as an object
+            // declared with those ends has, and what it selects is a value
+            // of nothing, as the constant null slice below is: the back
+            // end's word about those places is no finding.
+            FileLine* const nflp = new FileLine{flp};
+            nflp->warnOff(V3ErrorCode::SELRANGE, true);
+            nflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+            nflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+            flp = nflp;
+            widthp = declaredPlaces(widthp, flp);
         }
         // The select counts up from the low end and down from the high one
         if (downto != reversed) {
@@ -14326,7 +14433,7 @@ private:
                 // that elaboration makes empty repeats the value no times --
                 // which is a legal VHDL aggregate, not a suspect replication
                 rflp->warnOff(V3ErrorCode::ZEROREPL, true);
-                return new AstReplicate{rflp, valuep, countp};
+                return new AstReplicate{rflp, valuep, declaredPlaces(countp, rflp)};
             }
         }
         // Where the length is not known here at all, the one value stands for
@@ -19126,7 +19233,8 @@ private:
             if (AstNodeExpr* const countp = boundsLength(etp, flp)) {
                 FileLine* const rflp = new FileLine{flp};
                 rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
-                zs[i] = new AstReplicate{rflp, newLogicConst(flp, LogicVal::Z), countp};
+                zs[i] = new AstReplicate{rflp, newLogicConst(flp, LogicVal::Z),
+                                         declaredPlaces(countp, rflp)};
                 continue;
             }
             // Nothing here says how wide it is -- a port whose record type
