@@ -2820,6 +2820,11 @@ private:
         if (isDyn2Value(nodep) && (VN_IS(nodep, VhdlName) || dyn2ResultCall(nodep))) {
             return lowerExpr(nodep);
         }
+        // A slice of one is another, with the bounds it was written with
+        // (8.5): "data_array(0 to v_numBytes - 1)"
+        if (isSlice(nodep) && isDyn2Value(VN_AS(nodep, VhdlCall)->prefixp())) {
+            return lowerExpr(nodep);
+        }
         if (isAccessAll(nodep)) {
             const DynAccess* dynp = nullptr;
             AstNodeVhdlExpr* const objNodep = dynAccessObj(nodep, dynp);
@@ -10567,19 +10572,28 @@ private:
 
 
     std::map<const VhdlType*, AstNodeFTask*> m_dynSliceFuncs;
+    std::map<const VhdlType*, AstNodeFTask*> m_dyn2SliceFuncs;
 
     // A slice of a value that carries its own bounds is another such value:
     // it has the bounds the slice was written with, and its elements are the
     // ones of the whole that those bounds pick out (8.5). Which places those
-    // are is not known until it runs, so this is a loop.
-    AstNodeFTask* dynSliceFunc(VhdlType* typep, FileLine* origFlp) {
+    // are is not known until it runs, so this is a loop. Held two levels
+    // deep ("two"), the elements picked out are carriers themselves, and
+    // the structure is the one kept by the element's type (dyn2CarrierRef).
+    AstNodeFTask* dynSliceFunc(VhdlType* typep, FileLine* origFlp, bool two = false) {
         FileLine* const flp = dynFl(origFlp);
-        const auto it = m_dynSliceFuncs.find(carrierKeyOf(typep));
-        if (it != m_dynSliceFuncs.end() && usableHelper(it->second)) return it->second;
+        const VhdlType* const elemp = two ? openCarriedElement(typep) : nullptr;
+        if (two && !elemp) return nullptr;
+        std::map<const VhdlType*, AstNodeFTask*>& funcs = two ? m_dyn2SliceFuncs : m_dynSliceFuncs;
+        const VhdlType* const keyp = two ? elemp->base() : carrierKeyOf(typep);
+        const auto it = funcs.find(keyp);
+        if (it != funcs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
+        const auto carrier
+            = [&]() { return two ? dyn2CarrierRef(typep, flp) : dynCarrierRef(typep, flp); };
         AstFunc* const funcp
-            = newDynFunc("__Vdynslice", typep, dynCarrierRef(typep, flp), flp);
-        AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
+            = newDynFunc(two ? "__Vdyn2slice" : "__Vdynslice", typep, carrier(), flp);
+        AstVar* const cp = dynArg(funcp, "c", carrier(), flp);
         AstVar* const lp = dynArg(funcp, "l", newIntDType(flp), flp);
         AstVar* const rp = dynArg(funcp, "r", newIntDType(flp), flp);
         AstVar* const dp = dynArg(funcp, "d", bitDType(flp), flp);
@@ -10612,7 +10626,7 @@ private:
                        flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}, bodyp));
         addHelperFunc(funcp);
-        m_dynSliceFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
+        funcs.insert_or_assign(keyp, funcp);
         return funcp;
     }
 
@@ -11995,7 +12009,9 @@ private:
                                                 ? dynValueType(nodep->prefixp())
                                                 : nodep->prefixp()->vhdlTypep();
                     AstNodeFTask* const funcp
-                        = carrp && sliceDirKnown ? dynSliceFunc(carrp, flp) : nullptr;
+                        = carrp && sliceDirKnown
+                              ? dynSliceFunc(carrp, flp, isDyn2Value(nodep->prefixp()))
+                              : nullptr;
                     if (!funcp) {
                         VL_DO_DANGLING(fromp->deleteTree(), fromp);
                         VL_DO_DANGLING(leftp->deleteTree(), leftp);
