@@ -7458,11 +7458,33 @@ private:
             // bounds, so the attribute reads them from the value
             if (isDynValue(nodep->prefixp())) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
-                AstNodeExpr* const carrp = lowerExpr(nodep->prefixp());
+                AstNodeExpr* carrp = lowerExpr(nodep->prefixp());
                 if (!carrp) return nullptr;
                 // 'HIGH and 'LOW read the carrier twice over -- which end is
                 // which depends on the direction -- so those need something
-                // that can be named again; the rest read it once
+                // that can be named again; the rest read it once. What a
+                // call gives back is kept once in an object of its carrier
+                // type: "ints(n)'low"
+                if ((attr == "high" || attr == "low") && !repeatable(carrp)
+                    && dynResultCall(nodep->prefixp()) && nodep->prefixp()->vhdlSymp()) {
+                    VhdlType* const rtypep
+                        = emittedReturnType(nodep->prefixp()->vhdlSymp()->resolved());
+                    AstNodeDType* const carrDTypep
+                        = !rtypep                      ? nullptr
+                          : isDyn2Type(rtypep)         ? dyn2CarrierRef(rtypep, flp)
+                          : carriedDynamically(rtypep) ? dynCarrierRef(rtypep, flp)
+                                                       : nullptr;
+                    if (carrDTypep) {
+                        AstVar* const tmpp = newTempVar("__Vdynres", carrDTypep, flp);
+                        AstNode* const setp
+                            = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, carrp};
+                        AstNodeExpr* const attrp
+                            = dynCarrierAttr(new AstVarRef{flp, tmpp, VAccess::READ}, attr, flp);
+                        if (attrp) return new AstExprStmt{flp, setp, attrp};
+                        VL_DO_DANGLING(setp->deleteTree(), setp);
+                        return nullptr;
+                    }
+                }
                 if ((attr == "high" || attr == "low") && !repeatable(carrp)) {
                     VL_DO_DANGLING(carrp->deleteTree(), carrp);
                     unsup(flp, "'" + attr + " of a value whose length only running decides");
