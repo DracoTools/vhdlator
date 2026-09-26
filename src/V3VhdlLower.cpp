@@ -7928,7 +7928,49 @@ private:
         return symp;
     }
 
+    // An external name of a signal (8.7) denotes a signal of another
+    // module, reached by a hierarchical reference, with no variable here to
+    // keep a history of. A copy of it that the reference drives is kept
+    // instead, and its history is the signal's: it changes when the signal
+    // does. The external name is the prefix itself, or what an alias of it,
+    // or a signal formal bound to one, stands for.
+    std::map<const AstVhdlExternalName*, VhdlShadow> m_extShadows;
+    AstVhdlExternalName* externalSignalOf(AstNodeVhdlExpr* prefixp) {
+        if (AstVhdlExternalName* const extp = VN_CAST(prefixp, VhdlExternalName)) {
+            return extp->objClass() == "signal" ? extp : nullptr;
+        }
+        if (!VN_IS(prefixp, VhdlName)) return nullptr;
+        VhdlSymbol* const symp = boundSignal(const_cast<VhdlSymbol*>(rootSymOf(prefixp)));
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return nullptr;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        AstVhdlExternalName* const extp
+            = declp ? VN_CAST(declp->targetp(), VhdlExternalName) : nullptr;
+        return extp && extp->objClass() == "signal" ? extp : nullptr;
+    }
+    const VhdlShadow* shadowOfExternal(AstVhdlExternalName* extp, FileLine* flp) {
+        const auto found = m_extShadows.find(extp);
+        if (found != m_extShadows.end()) return &found->second;
+        VhdlType* const typep = extp->subtypep() ? extp->subtypep()->vhdlTypep() : nullptr;
+        if (!typep) return nullptr;
+        VL_RESTORER(m_ftaskp);
+        VL_RESTORER(m_toShadows);
+        m_ftaskp = nullptr;
+        m_toShadows = true;
+        AstNodeExpr* const refp = lowerExternalName(extp, false);
+        if (!refp) return nullptr;
+        AstVar* const copyp
+            = newTempVar("__Vext" + std::to_string(++m_nameNum), lowerType(typep, flp), flp);
+        addStmt(
+            new AstAlways{new AstAssignW{flp, new AstVarRef{flp, copyp, VAccess::WRITE}, refp}});
+        VhdlShadow sh;
+        if (!buildShadow(copyp, typep, copyp->name(), flp, sh)) return nullptr;
+        return &m_extShadows.emplace(extp, sh).first->second;
+    }
+
     const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
+        if (AstVhdlExternalName* const extp = externalSignalOf(prefixp)) {
+            return shadowOfExternal(extp, flp);
+        }
         // "r.f'event" and "v(2)'event" ask about part of a signal, and it is
         // the whole signal whose history is kept -- the part is read out of
         // it afterwards
@@ -22256,6 +22298,17 @@ private:
                         if (!staticSelectKey(pair.second, path)) return nullptr;
                         key += "|" + pair.first + "=" + path;
                     }
+                    continue;
+                }
+            }
+            // An external name of a signal (8.7) -- or an alias of one --
+            // read through a formal of mode "in": the formal stands for the
+            // name, which the copy lowers again, and whose history is kept
+            // of a copy of the signal here (shadowOfExternal)
+            if (const AstVhdlExternalName* const extp = VN_CAST(actualp, VhdlExternalName)) {
+                if (extp->objClass() == "signal" && formals[i]->mode() == VhdlMode::IN) {
+                    exprBind.emplace(formals[i]->vhdlSymp(), actualp);
+                    key += "|ext" + std::to_string(reinterpret_cast<uintptr_t>(extp));
                     continue;
                 }
             }
