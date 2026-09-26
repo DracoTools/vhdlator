@@ -150,6 +150,17 @@ class VhdlLowerVisitor final {
         // one that can be turned off, by a null transaction or by its guard
         // going false (10.5.2.2); null for every other signal.
         AstVar* connp = nullptr;
+        // A signal a package declares has drivers in every module that
+        // drives it, and they are resolved where the package is (see
+        // makePkgDriver). Such a driver says per element whether it drives,
+        // how strongly, and whether what it holds is a metavalue, so enp and
+        // weakp are as wide as the signal; null for every other driver.
+        AstVar* xp = nullptr;
+        AstVar* slotp = nullptr;  // Which of the package's drivers this is
+        // The elements a delayed assignment or an association has written
+        // into the variables above; an assignment that takes effect now
+        // goes to the package directly (see driveResolved)
+        AstVar* latep = nullptr;
     };
     std::map<const VhdlSymbol*, std::vector<VhdlDriver>> m_drivers;
     std::map<const VhdlSymbol*, int> m_driverCount;
@@ -15880,7 +15891,16 @@ private:
                 // of a conversion can be asked
                 addStmt(new AstAlways{
                     new AstAssignW{cflp, new AstVarRef{cflp, sdrv.enp, VAccess::WRITE},
-                                   new AstConst{cflp, AstConst::WidthedValue{}, 1, 1}}});
+                                   sdrv.xp ? new AstConst{cflp, AstConst::StringToParse{}, "'1"}
+                                           : new AstConst{cflp, AstConst::WidthedValue{}, 1, 1}}});
+                if (sdrv.xp) {
+                    for (AstVar* const varp : {sdrv.weakp, sdrv.xp, sdrv.latep}) {
+                        addStmt(new AstAlways{
+                            new AstAssignW{cflp, new AstVarRef{cflp, varp, VAccess::WRITE},
+                                           new AstConst{cflp, AstConst::StringToParse{},
+                                                        varp == sdrv.latep ? "'1" : "'0"}}});
+                    }
+                }
             }
             ++m_driverUsed[sigp];
         } else {
@@ -16623,8 +16643,7 @@ private:
 
     // Every signal one concurrent statement assigns. A process counts once
     // however many assignments it holds, because a process is one driver.
-    static void collectDriven(AstNode* nodep, std::set<const VhdlSymbol*>& out,
-                              bool follow = false) {
+    void collectDriven(AstNode* nodep, std::set<const VhdlSymbol*>& out, bool follow = false) {
         if (!nodep) return;
         if (const AstVhdlAssoc* const asp = VN_CAST(nodep, VhdlAssoc)) {
             // An instance's out port is a driver of the signal associated
@@ -16634,8 +16653,8 @@ private:
                 // association with the signal inside it (6.5.7.1)
                 AstNodeVhdlExpr* const innerp = actualSignal(asp->actualp());
                 AstNodeVhdlExpr* const namedp = innerp ? innerp : asp->actualp();
-                if (const VhdlSymbol* const symp = rootSymOf(namedp)) {
-                    if (VN_IS(namedp, VhdlName)) {
+                if (const VhdlSymbol* const symp = pkgAliasBase(rootSymOf(namedp))) {
+                    if (VN_IS(namedp, VhdlName) || pkgResolved(symp)) {
                         out.insert(symp);
                     } else {
                         s_partialDriven.insert(symp);
@@ -16672,8 +16691,11 @@ private:
                     }
                     if (!formalp || formalp->kind() != VhdlIfaceKind::SIGNAL) continue;
                     if (formalp->mode() == VhdlMode::IN) continue;
-                    if (const VhdlSymbol* const symp = rootSymOf(asp->actualp())) {
-                        if (VN_IS(asp->actualp(), VhdlName)) {
+                    if (const VhdlSymbol* const symp = pkgAliasBase(rootSymOf(asp->actualp()))) {
+                        // A package's signal is resolved element by element
+                        // wherever it is driven from (makePkgDriver), so a
+                        // part of it is a driver like the whole
+                        if (VN_IS(asp->actualp(), VhdlName) || pkgResolved(symp)) {
                             out.insert(symp);
                         } else {
                             s_partialDriven.insert(symp);
@@ -16683,13 +16705,13 @@ private:
             }
         }
         if (const AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
-            if (const VhdlSymbol* const symp = rootSymOf(asgp->targetp())) {
+            if (const VhdlSymbol* const symp = pkgAliasBase(rootSymOf(asgp->targetp()))) {
                 // A driver belongs to the longest static prefix of the name
                 // (14.7.2), so assigning one element of an array signal from
                 // here and another from there is not two drivers of the
                 // signal. Only a whole-signal assignment is counted, and a
                 // partial one takes the signal out of resolution altogether.
-                if (VN_IS(asgp->targetp(), VhdlName)) {
+                if (VN_IS(asgp->targetp(), VhdlName) || pkgResolved(symp)) {
                     out.insert(symp);
                 } else {
                     s_partialDriven.insert(symp);
@@ -16722,7 +16744,20 @@ private:
     // Whether an assignment to this name goes through a driver of its own:
     // a resolved signal, or a formal a call bound to one driver of one
     bool drivenThroughDriver(const VhdlSymbol* symp) const {
-        return symp && (m_drivers.count(symp) || m_bindDrivers.count(symp));
+        if (!symp) return false;
+        if (m_bindDrivers.count(symp)) return true;
+        symp = pkgAliasBase(symp);
+        const auto it = m_drivers.find(symp);
+        if (it == m_drivers.end()) return false;
+        // A package's signal whose drivers here are all spoken for -- a
+        // statement the count did not see -- is written as the one object
+        // it was before it had drivers
+        if (pkgResolved(symp)) {
+            const auto usedIt = m_driverUsed.find(symp);
+            const int used = usedIt == m_driverUsed.end() ? 0 : usedIt->second;
+            if (used >= static_cast<int>(it->second.size())) return false;
+        }
+        return true;
     }
 
     // Whether this signal needs resolving, and can be
@@ -16798,6 +16833,409 @@ private:
         }
         VL_DO_DANGLING(forcingp->deleteTree(), forcingp);
         m_drivers.emplace(symp, drivers);
+    }
+
+    // A signal a package declares is one signal of the design (6.4.2.3), and
+    // every process of every module that assigns it -- itself, or through a
+    // procedure it calls -- is a driver of it (14.7.2). Those drivers are in
+    // modules the package cannot name, and how many there are is known only
+    // once the design is elaborated: an entity instantiated twice has two of
+    // each. So each driver joins the package's drivers when it starts (an
+    // initial block of its module), and hands over what it holds whenever
+    // that changes; the signal is what they all add up to, resolved the way
+    // the logic values resolve (16.8.2.1 std_logic_1164's table). A signal
+    // of a resolved logic type, or a one-dimensional array of one, is
+    // resolved this way; anything else keeps the single object it was.
+    struct PkgRegistry final {
+        AstVar* valsp = nullptr;  // What each driver holds
+        AstVar* ensp = nullptr;  // Per element: driving at all
+        AstVar* weaksp = nullptr;  // Per element: driving weakly
+        AstVar* xsp = nullptr;  // Per element: a metavalue
+        AstVar* countp = nullptr;
+        AstFunc* newp = nullptr;  // Makes room for one more driver
+        AstFunc* putp = nullptr;  // Takes one driver's value, gives the resolution
+    };
+    std::map<const VhdlSymbol*, PkgRegistry> m_pkgRegs;
+
+    bool pkgResolved(const VhdlSymbol* symp) const {
+        if (!symp || symp->kind() != VhdlSymKind::SIGNAL) return false;
+        if (!declaredInPackage(symp) || guardedSignal(symp) || symp->resolvePerElement()) {
+            return false;
+        }
+        const VhdlType* const typep = symp->typep();
+        if (!typep || !isLogicish(typep)) return false;
+        const VhdlType* const basep = typep->base();
+        const auto resolvedByTable = [](const VhdlType* tp) {
+            // std_logic_1164's own function; a function of the design's own
+            // says what drivers add up to in its own way
+            return tp && tp->resolutionp() && tp->resolutionp()->name() == "resolved";
+        };
+        if (basep->kind() == VhdlTypeKind::ENUM) return resolvedByTable(typep);
+        if (typep->dimensions() != 1) return false;
+        const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        // std_logic_vector is "(resolved) std_ulogic_vector": the function
+        // is written on the array and resolves each element (6.3)
+        return (resolvedByTable(typep) || resolvedByTable(elemp)) && typep->isConstrainedArray();
+    }
+
+    // The package's signal an alias -- or an alias of an alias -- names
+    // part or all of, where it names one this resolves (pkgResolved);
+    // otherwise what it was given. Driving through an alias is driving the
+    // object it denotes (6.6.2).
+    const VhdlSymbol* pkgAliasBase(const VhdlSymbol* symp) const {
+        const VhdlSymbol* curp = symp;
+        for (int depth = 0; curp && curp->kind() == VhdlSymKind::ALIAS && depth < 32; ++depth) {
+            const AstVhdlAliasDecl* const declp = VN_CAST(curp->declp(), VhdlAliasDecl);
+            if (!declp || !declp->targetp()) return symp;
+            curp = rootSymOf(declp->targetp());
+        }
+        return curp && curp != symp && pkgResolved(curp) ? curp : symp;
+    }
+
+    // The logic values a value is made of, left to right, where it folds
+    static bool logicCharsOf(AstNodeVhdlExpr* nodep, std::string& out) {
+        if (!nodep) return false;
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        const VhdlType* const typep = nodep->vhdlTypep();
+        if (val.isStr()) {
+            out = val.toStr();
+            if (out.empty()) return false;
+            for (const char c : out) {
+                if (!std::strchr("UX01ZWLH-uxzwlh", c)) return false;
+            }
+            return true;
+        }
+        if (val.isInt() && typep && enumIsLogic(typep->base())) {
+            const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
+            const int64_t pos = val.toInt();
+            if (pos < 0 || pos >= static_cast<int64_t>(lits.size())) return false;
+            const std::string& name = lits[pos]->name();
+            if (name.size() != 3) return false;
+            out = std::string(1, name[1]);
+            return true;
+        }
+        return false;
+    }
+    // One of a driver's element flags for a value: 'e' driving at all, 'w'
+    // weakly, 'x' a metavalue. A value that does not fold drives every
+    // element, forcingly, with a known value.
+    static AstNodeExpr* driveMaskOf(AstNodeVhdlExpr* valuep, char which, FileLine* flp) {
+        std::string chars;
+        if (!logicCharsOf(valuep, chars)) {
+            return new AstConst{flp, AstConst::StringToParse{}, which == 'e' ? "'1" : "'0"};
+        }
+        std::string bits;
+        for (char c : chars) {
+            c = static_cast<char>(std::toupper(c));
+            bool set = false;
+            if (which == 'e') set = c != 'Z';
+            if (which == 'w') set = c == 'L' || c == 'H' || c == 'W';
+            if (which == 'x') set = c == 'U' || c == 'X' || c == 'W' || c == '-';
+            bits += set ? '1' : '0';
+        }
+        const std::string text = std::to_string(bits.size()) + "'b" + bits;
+        return new AstConst{flp, AstConst::StringToParse{}, text.c_str()};
+    }
+    // The same over the alternatives of a conditional or selected assignment
+    AstNodeExpr* driveMaskFor(AstVhdlSigAssign* nodep, char which, FileLine* flp) {
+        const auto leafp = [&](AstVhdlWaveform* wfp) -> AstNodeExpr* {
+            return driveMaskOf(wfp ? wfp->valuep() : nullptr, which, flp);
+        };
+        if (nodep->kind() == VhdlAssignKind::SIMPLE) return leafp(nodep->wavesp());
+        std::vector<AstVhdlAlternative*> alts;
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            alts.push_back(VN_AS(p, VhdlAlternative));
+        }
+        AstNodeExpr* outp = nullptr;
+        for (size_t i = alts.size(); i-- > 0;) {
+            AstNodeExpr* const valuep = leafp(alts[i]->wavesp());
+            AstNodeExpr* testp = nullptr;
+            if (nodep->kind() == VhdlAssignKind::CONDITIONAL) {
+                if (alts[i]->condp()) testp = lowerCondition(alts[i]->condp());
+            } else {
+                testp = choiceTest(alts[i]->choicesp(), nodep->selectorp(), nodep->matching());
+            }
+            if (!testp || !outp) {
+                if (testp) VL_DO_DANGLING(testp->deleteTree(), testp);
+                if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                outp = valuep;
+                continue;
+            }
+            outp = new AstCond{flp, testp, valuep, outp};
+        }
+        return outp ? outp : driveMaskOf(nullptr, which, flp);
+    }
+
+    // The package's side of a signal's drivers, made once for the design
+    PkgRegistry& pkgRegistry(VhdlSymbol* symp, FileLine* flp) {
+        PkgRegistry& reg = m_pkgRegs[symp];
+        if (reg.putp) return reg;
+        AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
+        const std::string base = "__Vpdrv__" + pkgObjectName(symp);
+        const auto dynOf = [&](const char* suffix) {
+            AstVar* const varp = new AstVar{
+                flp, VVarType::VAR, base + suffix, VFlagChildDType{},
+                new AstDynArrayDType{flp, VFlagChildDType{}, lowerType(symp->typep(), flp)}};
+            varp->lifetime(VLifetime::STATIC_EXPLICIT);
+            varp->trace(false);
+            unitp->addStmtsp(varp);
+            return varp;
+        };
+        reg.valsp = dynOf("__vals");
+        reg.ensp = dynOf("__ens");
+        reg.weaksp = dynOf("__weaks");
+        reg.xsp = dynOf("__xs");
+        reg.countp = new AstVar{flp, VVarType::VAR, base + "__count", VFlagChildDType{},
+                                newIntDType(flp)};
+        reg.countp->lifetime(VLifetime::STATIC_EXPLICIT);
+        reg.countp->trace(false);
+        reg.countp->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+        unitp->addStmtsp(reg.countp);
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        const std::vector<AstVar*> arrays{reg.valsp, reg.ensp, reg.weaksp, reg.xsp};
+        {
+            // Room for one more, holding what the driver starts with; its
+            // index is the new driver's
+            const std::string name = base + "__new";
+            AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            funcp->fvarp(newReturnVar(name, newIntDType(flp), flp));
+            std::vector<AstVar*> starts;
+            for (const char* const pname : {"v", "e", "w", "x"}) {
+                AstVar* const argp = new AstVar{flp, VVarType::PORT, pname, VFlagChildDType{},
+                                                lowerType(symp->typep(), flp)};
+                argp->direction(VDirection::INPUT);
+                argp->declDirection(VDirection::INPUT);
+                argp->funcLocal(true);
+                argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+                argp->trace(false);
+                funcp->addStmtsp(argp);
+                starts.push_back(argp);
+            }
+            for (size_t k = 0; k < arrays.size(); ++k) {
+                AstVar* const arrp = arrays[k];
+                funcp->addStmtsp(new AstAssign{
+                    flp, wr(arrp, flp),
+                    new AstNewDynamic{flp, new AstAdd{flp, rd(reg.countp, flp), num(1)},
+                                      rd(arrp, flp)}});
+                funcp->addStmtsp(
+                    new AstAssign{flp, new AstSelBit{flp, wr(arrp, flp), rd(reg.countp, flp)},
+                                  rd(starts[k], flp)});
+            }
+            funcp->addStmtsp(
+                new AstAssign{flp, wr(VN_AS(funcp->fvarp(), Var), flp), rd(reg.countp, flp)});
+            funcp->addStmtsp(new AstAssign{flp, wr(reg.countp, flp),
+                                           new AstAdd{flp, rd(reg.countp, flp), num(1)}});
+            unitp->addStmtsp(funcp);
+            reg.newp = funcp;
+        }
+        {
+            const std::string name = base + "__put";
+            AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            AstVar* const retp = newReturnVar(name, lowerType(symp->typep(), flp), flp);
+            funcp->fvarp(retp);
+            const auto port = [&](const std::string& pname, AstNodeDType* dtypep) {
+                AstVar* const argp
+                    = new AstVar{flp, VVarType::PORT, pname, VFlagChildDType{}, dtypep};
+                argp->direction(VDirection::INPUT);
+                argp->declDirection(VDirection::INPUT);
+                argp->funcLocal(true);
+                argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+                argp->trace(false);
+                funcp->addStmtsp(argp);
+                return argp;
+            };
+            AstVar* const slotp = port("slot", newIntDType(flp));
+            std::vector<AstVar*> ins;
+            for (const char* const pname : {"v", "e", "w", "x"}) {
+                ins.push_back(port(pname, lowerType(symp->typep(), flp)));
+            }
+            // Which elements of those this driver has just given
+            AstVar* const maskp = port("m", lowerType(symp->typep(), flp));
+            const auto local = [&](const std::string& lname, AstNodeDType* dtypep) {
+                AstVar* const varp = newFuncLocal(lname, dtypep, flp);
+                funcp->addStmtsp(varp);
+                return varp;
+            };
+            // Per element: some forcing driver holds a 1, a 0, a metavalue;
+            // and the same of the weak ones
+            std::map<std::string, AstVar*> acc;
+            for (const char* const lname :
+                 {"s1", "s0", "sx", "w1", "w0", "wx", "st", "wk", "any"}) {
+                acc[lname] = local(lname, lowerType(symp->typep(), flp));
+            }
+            AstVar* const ip = local("i", newIntDType(flp));
+            ip->usedLoopIdx(true);
+            for (size_t k = 0; k < arrays.size(); ++k) {
+                funcp->addStmtsp(new AstAssign{
+                    flp, new AstSelBit{flp, wr(arrays[k], flp), rd(slotp, flp)},
+                    new AstOr{flp,
+                              new AstAnd{flp,
+                                         new AstSelBit{flp, rd(arrays[k], flp), rd(slotp, flp)},
+                                         new AstNot{flp, rd(maskp, flp)}},
+                              new AstAnd{flp, rd(ins[k], flp), rd(maskp, flp)}}});
+            }
+            for (const char* const lname : {"s1", "s0", "sx", "w1", "w0", "wx"}) {
+                funcp->addStmtsp(new AstAssign{
+                    flp, wr(acc[lname], flp), new AstConst{flp, AstConst::StringToParse{}, "'0"}});
+            }
+            funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), num(0)});
+            const auto at
+                = [&](AstVar* arrp) { return new AstSelBit{flp, rd(arrp, flp), rd(ip, flp)}; };
+            const auto orIn = [&](const std::string& lname, AstNodeExpr* termp) {
+                return new AstAssign{flp, wr(acc[lname], flp),
+                                     new AstOr{flp, rd(acc[lname], flp), termp}};
+            };
+            AstLoop* const loopp = new AstLoop{flp};
+            loopp->addStmtsp(
+                new AstLoopTest{flp, loopp, new AstLtS{flp, rd(ip, flp), rd(reg.countp, flp)}});
+            loopp->addStmtsp(
+                new AstAssign{flp, wr(acc["st"], flp),
+                              new AstAnd{flp, at(reg.ensp), new AstNot{flp, at(reg.weaksp)}}});
+            loopp->addStmtsp(new AstAssign{flp, wr(acc["wk"], flp),
+                                           new AstAnd{flp, at(reg.ensp), at(reg.weaksp)}});
+            for (const char* const grp : {"s", "w"}) {
+                AstVar* const onp = acc[std::string{grp[0] == 's' ? "st" : "wk"}];
+                const std::string g{grp};
+                loopp->addStmtsp(orIn(g + "x", new AstAnd{flp, rd(onp, flp), at(reg.xsp)}));
+                loopp->addStmtsp(orIn(
+                    g + "1",
+                    new AstAnd{flp, new AstAnd{flp, rd(onp, flp), new AstNot{flp, at(reg.xsp)}},
+                               at(reg.valsp)}));
+                loopp->addStmtsp(orIn(
+                    g + "0",
+                    new AstAnd{flp, new AstAnd{flp, rd(onp, flp), new AstNot{flp, at(reg.xsp)}},
+                               new AstNot{flp, at(reg.valsp)}}));
+            }
+            loopp->addStmtsp(
+                new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), num(1)}});
+            funcp->addStmtsp(loopp);
+            // Where anything forces, the forcing drivers decide: a metavalue
+            // among them, or a 0 and a 1 together, is an 'X'. Where nothing
+            // does, the weak ones decide the same way, and with no driver at
+            // all the element is 'Z'. A value here has two states, so a
+            // metavalue reads as 1 -- never as the '0' a barrier waits for --
+            // and 'Z' as 0, which is what the rest of the design reads.
+            funcp->addStmtsp(new AstAssign{
+                flp, wr(acc["any"], flp),
+                new AstOr{flp, new AstOr{flp, rd(acc["s1"], flp), rd(acc["s0"], flp)},
+                          rd(acc["sx"], flp)}});
+            funcp->addStmtsp(new AstAssign{
+                flp, wr(retp, flp),
+                new AstOr{flp,
+                          new AstAnd{flp, rd(acc["any"], flp),
+                                     new AstOr{flp, rd(acc["sx"], flp), rd(acc["s1"], flp)}},
+                          new AstAnd{flp, new AstNot{flp, rd(acc["any"], flp)},
+                                     new AstOr{flp, rd(acc["wx"], flp), rd(acc["w1"], flp)}}}});
+            unitp->addStmtsp(funcp);
+            reg.putp = funcp;
+        }
+        return reg;
+    }
+
+    // "If this driver is not one of the package's yet, it joins, holding
+    // what it starts with"
+    AstNode* pkgJoinStmt(const VhdlDriver& drv, const PkgRegistry& reg, FileLine* flp) {
+        AstArg* const argsp = new AstArg{flp, "", rd(drv.valp, flp)};
+        for (AstVar* const varp : {drv.enp, drv.weakp, drv.xp}) {
+            argsp->addNext(new AstArg{flp, "", rd(varp, flp)});
+        }
+        AstFuncRef* const newRefp = new AstFuncRef{flp, reg.newp->name(), argsp};
+        newRefp->taskp(reg.newp);
+        return new AstIf{
+            flp, new AstLtS{flp, rd(drv.slotp, flp), new AstConst{flp, AstConst::Signed32{}, 0}},
+            new AstAssign{flp, wr(drv.slotp, flp), newRefp}};
+    }
+
+    // One more driver of a package's signal in this module: what it holds,
+    // and a process that hands that to the package whenever it changes. It
+    // is a driver from the start, holding the signal's default (14.7.2), so
+    // it joins the package's drivers at time zero whether or not it has
+    // assigned anything yet: a barrier every party drives waits for the
+    // ones that have not arrived.
+    void makePkgDriver(VhdlSymbol* symp, FileLine* flp) {
+        PkgRegistry& reg = pkgRegistry(symp, flp);
+        AstVar* const sigp = pkgSignalVar(symp, flp);
+        // Written from every module one of its drivers is in, by
+        // construction, so that finding is about how this is emitted
+        if (!sigp->fileline()->warnIsOff(V3ErrorCode::MULTIDRIVEN)) {
+            FileLine* const sflp = new FileLine{sigp->fileline()};
+            sflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            sigp->fileline(sflp);
+        }
+        std::vector<VhdlDriver>& drivers = m_drivers[symp];
+        FileLine* const dflp = new FileLine{flp};
+        dflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        const std::string base
+            = "__Vpdrv" + std::to_string(drivers.size()) + "__" + m_prefix + symp->name();
+        const AstVhdlObjectDecl* const declp = VN_CAST(symp->declp(), VhdlObjectDecl);
+        AstNodeVhdlExpr* const defp = declp ? declp->defaultp() : nullptr;
+        VhdlDriver drv;
+        const auto mk = [&](const char* suffix, AstNodeExpr* initp) {
+            AstVar* const varp = new AstVar{dflp, VVarType::VAR, base + suffix, VFlagChildDType{},
+                                            lowerType(symp->typep(), flp)};
+            varp->trace(false);
+            if (initp) varp->valuep(initp);
+            addStmt(varp);
+            return varp;
+        };
+        AstNodeExpr* valInitp = nullptr;
+        if (defp) valInitp = lowerExpr(defp);
+        if (!valInitp) valInitp = defaultValueFor(symp->typep(), flp);
+        drv.valp = mk("__val", valInitp);
+        drv.enp = mk("__en", driveMaskOf(defp, 'e', flp));
+        drv.weakp = mk("__weak", driveMaskOf(defp, 'w', flp));
+        // No initializer is a default of 'U' for every element (6.4.2.3)
+        drv.xp = mk("__x", defp ? driveMaskOf(defp, 'x', flp)
+                                : new AstConst{flp, AstConst::StringToParse{}, "'1"});
+        drv.latep = mk("__late", new AstConst{flp, AstConst::StringToParse{}, "'0"});
+        drv.slotp = new AstVar{dflp, VVarType::VAR, base + "__slot", VFlagChildDType{},
+                               newIntDType(flp)};
+        drv.slotp->trace(false);
+        drv.slotp->valuep(new AstConst{flp, AstConst::Signed32{}, -1});
+        addStmt(drv.slotp);
+        const auto bodyp = [&]() -> AstNode* {
+            AstNode* const stmtsp = pkgJoinStmt(drv, reg, dflp);
+            AstArg* const argsp = new AstArg{dflp, "", rd(drv.slotp, dflp)};
+            for (AstVar* const varp : {drv.valp, drv.enp, drv.weakp, drv.xp, drv.latep}) {
+                argsp->addNext(new AstArg{dflp, "", rd(varp, dflp)});
+            }
+            AstFuncRef* const putRefp = new AstFuncRef{dflp, reg.putp->name(), argsp};
+            putRefp->taskp(reg.putp);
+            // Every write of the signal is scheduled, like the ones the
+            // drives themselves make (see driveResolved)
+            stmtsp->addNext(new AstAssignDly{dflp, wr(sigp, dflp), putRefp});
+            return stmtsp;
+        };
+        AstSenTree* const senp = new AstSenTree{
+            dflp, new AstSenItem{dflp, VEdgeType::ET_CHANGED, rd(drv.valp, dflp)}};
+        for (AstVar* const varp : {drv.enp, drv.weakp, drv.xp, drv.latep}) {
+            senp->addSensesp(new AstSenItem{dflp, VEdgeType::ET_CHANGED, rd(varp, dflp)});
+        }
+        addStmt(new AstAlways{dflp, VAlwaysKwd::ALWAYS, senp, bodyp()});
+        addStmt(new AstInitial{dflp, bodyp()});
+        drivers.push_back(drv);
+    }
+
+    // The drivers this architecture's statements are of the package's
+    // signals, counted as for a signal of its own
+    void makePkgDrivers(FileLine* flp) {
+        for (const auto& pair : m_driverCount) {
+            VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
+            if (!pkgResolved(symp)) continue;
+            for (int k = 0; k < pair.second; ++k) makePkgDriver(symp, flp);
+        }
+    }
+
+    // While a drive into one of a signal's drivers is lowered, every name
+    // that stands for the signal -- the signal itself, a formal bound to
+    // it, an alias -- stands for that driver's variable instead
+    void swapSignalVar(AstVar* fromp, AstVar* top) {
+        if (!fromp || !top || fromp == top) return;
+        for (auto& pair : m_vars) {
+            if (pair.second == fromp) pair.second = top;
+        }
     }
 
     // A signal whose subtype names a resolution function of its own. The
@@ -17236,7 +17674,16 @@ private:
             // drives at all; this one always does, and forcingly
             addStmt(new AstInitial{
                 flp, new AstAssign{flp, new AstVarRef{flp, drv.enp, VAccess::WRITE},
-                                   new AstConst{flp, AstConst::WidthedValue{}, 1, 1}}});
+                                   drv.xp ? new AstConst{flp, AstConst::StringToParse{}, "'1"}
+                                          : new AstConst{flp, AstConst::WidthedValue{}, 1, 1}}});
+            if (drv.xp) {
+                for (AstVar* const varp : {drv.weakp, drv.xp, drv.latep}) {
+                    addStmt(new AstInitial{
+                        flp, new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE},
+                                           new AstConst{flp, AstConst::StringToParse{},
+                                                        varp == drv.latep ? "'1" : "'0"}}});
+                }
+            }
         }
         return keyp;
     }
@@ -17256,19 +17703,51 @@ private:
     // The driver an assignment to this name writes, where the signal has one
     // of its own. Null where it has none, which is the ordinary case of a
     // signal one place drives.
-    const VhdlDriver* driverFor(AstNodeVhdlExpr* targetp) {
+    const VhdlDriver* driverFor(AstNodeVhdlExpr* targetp, const VhdlSymbol** signalpp = nullptr) {
         const VhdlSymbol* const symp = rootSymOf(targetp);
         if (!symp) return nullptr;
         // Inside a copy made for a call, the name is the formal's and the
         // driver is the one the caller owns
         const auto bIt = m_bindDrivers.find(symp);
         const VhdlSymbol* const signalp
-            = bIt != m_bindDrivers.end() ? bIt->second.signalp : symp;
+            = bIt != m_bindDrivers.end() ? bIt->second.signalp : pkgAliasBase(symp);
         const auto it = m_drivers.find(signalp);
         if (it == m_drivers.end()) return nullptr;
         const int idx = bIt != m_bindDrivers.end() ? bIt->second.idx : m_driverUsed[signalp];
         if (idx >= static_cast<int>(it->second.size())) return nullptr;
+        if (signalpp) *signalpp = signalp;
         return &it->second[idx];
+    }
+
+    // The target of a drive, lowered against one of the driver's own
+    // variables rather than the signal. Every name standing for the signal
+    // -- a formal a call bound to it, the name of a formal bound to part of
+    // it, the signal itself -- stands for that variable while this is done.
+    AstNodeExpr* driverTarget(AstNodeVhdlExpr* targetp, const VhdlSymbol* signalp,
+                              AstVar* drvVarp) {
+        VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(rootSymOf(targetp));
+        const auto sigIt = signalp ? m_vars.find(const_cast<VhdlSymbol*>(signalp)) : m_vars.end();
+        AstVar* const sigVarp = sigIt == m_vars.end() ? nullptr : sigIt->second;
+        std::vector<std::pair<VarMap::key_type, AstVar*>> saved;
+        if (sigVarp) {
+            for (auto& pair : m_vars) {
+                if (pair.second != sigVarp) continue;
+                saved.emplace_back(pair.first, pair.second);
+                pair.second = drvVarp;
+            }
+        }
+        const auto keyIt = m_vars.find(keyp);
+        const bool hadKey = keyIt != m_vars.end();
+        AstVar* const savedKeyp = hadKey ? keyIt->second : nullptr;
+        m_vars[keyp] = drvVarp;
+        AstNodeExpr* const outp = lowerDriveTarget(targetp);
+        if (hadKey) {
+            m_vars[keyp] = savedKeyp;
+        } else {
+            m_vars.erase(keyp);
+        }
+        for (const auto& pair : saved) m_vars[pair.first] = pair.second;
+        return outp;
     }
 
     // The GUARD a guarded assignment reads: the one its block declares, or,
@@ -17306,8 +17785,8 @@ private:
     AstNode* driveResolved(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* targetp,
                            AstNodeExpr* valuep, AstNode* delayp, bool sequential,
                            FileLine* flp) {
-        const VhdlSymbol* const symp = rootSymOf(targetp);
-        const VhdlDriver* const drvp = driverFor(targetp);
+        const VhdlSymbol* signalp = nullptr;
+        const VhdlDriver* const drvp = driverFor(targetp, &signalp);
         if (!drvp) {
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
             unsup(flp, "assignment to a resolved signal from here");
@@ -17316,14 +17795,89 @@ private:
         const VhdlDriver& drv = *drvp;
         // Lowering the target against each of the two says how a slice or an
         // index of the signal maps onto them, without repeating the work here
-        VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
-        AstVar* const savedp = m_vars[keyp];
-        m_vars[keyp] = drv.valp;
-        AstNodeExpr* const valLhsp = lowerDriveTarget(targetp);
-        m_vars[keyp] = savedp;
+        AstNodeExpr* const valLhsp = driverTarget(targetp, signalp, drv.valp);
         if (!valLhsp) {
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
             return nullptr;
+        }
+        if (drv.xp && sequential && !delayp) {
+            // A driver of a package's signal, given a value now: the package
+            // takes it at once and the signal is scheduled with what all the
+            // drivers add up to, so it lands in this delta as the assignment
+            // does (14.7.3.4) -- the process that hands it over is resolved
+            // before a "wait for 0 ns" of its own resumes. What this driver
+            // already holds is the package's copy of it, which includes what
+            // earlier assignments in this delta gave it. The driver's own
+            // variables are left alone: they carry what arrives later, and
+            // a change to them would hand the package that again.
+            VhdlSymbol* const sigp = const_cast<VhdlSymbol*>(signalp);
+            PkgRegistry& reg = pkgRegistry(sigp, flp);
+            AstVar* const pkgSigp = pkgSignalVar(sigp, flp);
+            const std::vector<std::pair<AstVar*, AstVar*>> parts{{drv.valp, reg.valsp},
+                                                                 {drv.enp, reg.ensp},
+                                                                 {drv.weakp, reg.weaksp},
+                                                                 {drv.xp, reg.xsp}};
+            std::vector<AstVar*> tmps;
+            for (size_t k = 0; k < parts.size(); ++k) {
+                tmps.push_back(newTempVar("__Vpdrvt", lowerType(sigp->typep(), flp), flp));
+            }
+            AstNode* outp = pkgJoinStmt(drv, reg, flp);
+            for (size_t k = 0; k < parts.size(); ++k) {
+                outp->addNext(new AstAssign{
+                    flp, wr(tmps[k], flp),
+                    new AstSelBit{flp, rd(parts[k].second, flp), rd(drv.slotp, flp)}});
+            }
+            // The value goes in first, so the flags below read nothing it
+            // has not been given yet
+            AstNodeExpr* const tmpLhsp = driverTarget(targetp, signalp, tmps[0]);
+            if (!tmpLhsp) {
+                VL_DO_DANGLING(valLhsp->deleteTree(), valLhsp);
+                VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                VL_DO_DANGLING(outp->deleteTree(), outp);
+                return nullptr;
+            }
+            VL_DO_DANGLING(valLhsp->deleteTree(), valLhsp);
+            outp->addNext(new AstAssign{flp, tmpLhsp, valuep});
+            const char flagOf[] = {'e', 'w', 'x'};
+            for (size_t k = 1; k < parts.size(); ++k) {
+                if (AstNodeExpr* const lhsp = driverTarget(targetp, signalp, tmps[k])) {
+                    outp->addNext(
+                        new AstAssign{flp, lhsp, driveMaskFor(nodep, flagOf[k - 1], flp)});
+                }
+            }
+            AstArg* const argsp = new AstArg{flp, "", rd(drv.slotp, flp)};
+            for (AstVar* const tmpp : tmps) argsp->addNext(new AstArg{flp, "", rd(tmpp, flp)});
+            argsp->addNext(
+                new AstArg{flp, "", new AstConst{flp, AstConst::StringToParse{}, "'1"}});
+            AstFuncRef* const putRefp = new AstFuncRef{flp, reg.putp->name(), argsp};
+            putRefp->taskp(reg.putp);
+            FileLine* const mflp = new FileLine{flp};
+            mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            outp->addNext(new AstAssignDly{mflp, wr(pkgSigp, mflp), putRefp});
+            return outp;
+        }
+        if (drv.xp) {
+            // A driver of a package's signal says per element what it
+            // drives, so the flags go where the value goes
+            AstNode* outp = nullptr;
+            const auto one = [&](AstNodeExpr* lhsp, AstNodeExpr* rhsp, AstNode* dlyp) {
+                AstNode* const stmtp
+                    = sequential ? static_cast<AstNode*>(new AstAssignDly{flp, lhsp, rhsp, dlyp})
+                                 : static_cast<AstNode*>(new AstAssignW{flp, lhsp, rhsp, dlyp});
+                outp = AstNode::addNextNull(outp, stmtp);
+            };
+            one(valLhsp, valuep, delayp);
+            const std::vector<std::pair<AstVar*, char>> flags{
+                {drv.enp, 'e'}, {drv.weakp, 'w'}, {drv.xp, 'x'}, {drv.latep, 'l'}};
+            for (const auto& pair : flags) {
+                AstNodeExpr* const lhsp = driverTarget(targetp, signalp, pair.first);
+                if (!lhsp) continue;
+                one(lhsp,
+                    pair.second == 'l' ? new AstConst{flp, AstConst::StringToParse{}, "'1"}
+                                       : driveMaskFor(nodep, pair.second, flp),
+                    delayp ? delayp->cloneTree(false) : nullptr);
+            }
+            return outp;
         }
         // The enable and the weak flag are one bit whatever the signal's
         // width, so they are written directly rather than through the target
@@ -17381,9 +17935,8 @@ private:
         // Where the signal has a driver of its own, each element of the
         // waveform is delivered into that driver rather than into the signal
         // itself, and says with it whether the driver drives at all (14.7.2)
-        const VhdlDriver* const drvp = driverFor(targetp);
-        VhdlSymbol* const keyp = drvp ? const_cast<VhdlSymbol*>(rootSymOf(targetp)) : nullptr;
-        AstVar* const savedp = keyp ? m_vars[keyp] : nullptr;
+        const VhdlSymbol* signalp = nullptr;
+        const VhdlDriver* const drvp = driverFor(targetp, &signalp);
         // A transaction happens when each element is delivered, and the bit
         // that records it flips *then* rather than now: a delayed assignment
         // of "not t" reads t as it stands when the assignment is made, so
@@ -17405,9 +17958,8 @@ private:
                 if (offDelayp) VL_DO_DANGLING(offDelayp->deleteTree(), offDelayp);
                 continue;
             }
-            if (keyp) m_vars[keyp] = drvp->valp;
-            AstNodeExpr* const onep = lowerDriveTarget(targetp);
-            if (keyp) m_vars[keyp] = savedp;
+            AstNodeExpr* const onep
+                = drvp ? driverTarget(targetp, signalp, drvp->valp) : lowerDriveTarget(targetp);
             AstNodeExpr* const valuep = lowerExpr(p->valuep());
             if (!onep || !valuep) return nullptr;
             readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
@@ -17421,7 +17973,22 @@ private:
             if (drvp && drvp->connp) {
                 stmtsp = AstNode::addNextNull(stmtsp, connectStmt(drvp, true, delayp, true, flp));
             }
-            if (drvp && drvp->enp) {
+            if (drvp && drvp->xp) {
+                // Per element, for a driver of a package's signal
+                const std::vector<std::pair<AstVar*, char>> flags{
+                    {drvp->enp, 'e'}, {drvp->weakp, 'w'}, {drvp->xp, 'x'}, {drvp->latep, 'l'}};
+                for (const auto& pair : flags) {
+                    AstNodeExpr* const lhsp = driverTarget(targetp, signalp, pair.first);
+                    if (!lhsp) continue;
+                    stmtsp = AstNode::addNextNull(
+                        stmtsp,
+                        static_cast<AstNode*>(new AstAssignDly{
+                            flp, lhsp,
+                            pair.second == 'l' ? new AstConst{flp, AstConst::StringToParse{}, "'1"}
+                                               : driveMaskOf(p->valuep(), pair.second, flp),
+                            delayp ? delayp->cloneTree(false) : nullptr}));
+                }
+            } else if (drvp && drvp->enp) {
                 // Whether this element drives at all, and how strongly,
                 // arrives with it: a waveform may hand the signal over to
                 // its other drivers part way through (16.8.2)
@@ -22844,10 +23411,41 @@ private:
                                    + "' is not given a signal of this design";
                     return nullptr;
                 }
-                if (m_drivers.count(rootp)) {
+                // A part of a package's signal is driven through a driver
+                // of the caller's like the whole of it (makePkgDriver): the
+                // one the caller owns, or the one its own caller handed it
+                const VhdlSymbol* partSigp = nullptr;
+                int partIdx = 0;
+                if (formals[i]->mode() != VhdlMode::IN) {
+                    const auto outerIt = m_bindDrivers.find(rootp);
+                    if (outerIt != m_bindDrivers.end()) {
+                        partSigp = outerIt->second.signalp;
+                        partIdx = outerIt->second.idx;
+                    } else if (m_drivers.count(rootp)) {
+                        partSigp = rootp;
+                        partIdx = m_driverUsed[rootp];
+                    }
+                }
+                if (partSigp && !pkgResolved(partSigp)) partSigp = nullptr;
+                if (partSigp) {
+                    const auto dIt = m_drivers.find(partSigp);
+                    if (dIt == m_drivers.end()
+                        || partIdx >= static_cast<int>(dIt->second.size())) {
+                        partSigp = nullptr;
+                    }
+                }
+                if (!partSigp && m_drivers.count(rootp) && !pkgResolved(rootp)) {
                     m_sigCopyWhy = ", whose parameter '" + formals[i]->name()
                                    + "' is given part of a signal that has several drivers";
                     return nullptr;
+                }
+                if (partSigp) {
+                    DrvBind db;
+                    db.signalp = partSigp;
+                    db.idx = partIdx;
+                    drvBind.emplace(formals[i]->vhdlSymp(), db);
+                    key += "|drv" + std::to_string(reinterpret_cast<uintptr_t>(partSigp)) + "#"
+                           + std::to_string(partIdx);
                 }
                 if (!staticSelectKey(actualp, path)) {
                     // One element of an array signal, at an index the call
@@ -22886,12 +23484,34 @@ private:
             // formal the call can write needs one at all: a signal parameter
             // of mode "in" is read and never driven (4.2.2.3), and the call
             // is no driver of it.
-            const auto drvIt = formals[i]->mode() == VhdlMode::IN
-                                   ? m_drivers.end()
-                                   : m_drivers.find(actualSymp->resolved());
+            // Inside a copy made for a caller's driver, a formal passed on
+            // whole stands for that same driver: the process is the one that
+            // made the outermost call (4.2.2.3)
+            const auto outerIt = m_bindDrivers.find(actualSymp->resolved());
+            const bool passedOn = outerIt != m_bindDrivers.end();
+            const VhdlSymbol* const drivenp
+                = passedOn ? outerIt->second.signalp : actualSymp->resolved();
+            auto drvIt
+                = formals[i]->mode() == VhdlMode::IN ? m_drivers.end() : m_drivers.find(drivenp);
             if (drvIt != m_drivers.end()) {
-                const VhdlSymbol* const signalp = actualSymp->resolved();
-                const int idx = m_driverUsed[signalp];
+                const int idx = passedOn ? outerIt->second.idx : m_driverUsed[drivenp];
+                // Where that is not a driver this can bind, the formal names
+                // the signal, as it did before drivers were passed on
+                if (passedOn
+                    && (idx >= static_cast<int>(drvIt->second.size())
+                        || !drvIt->second[idx].enp)) {
+                    drvIt = m_drivers.end();
+                }
+                // A package's signal whose drivers here are all spoken for
+                // is the one object it was
+                if (!passedOn && pkgResolved(drivenp)
+                    && idx >= static_cast<int>(drvIt->second.size())) {
+                    drvIt = m_drivers.end();
+                }
+            }
+            if (drvIt != m_drivers.end()) {
+                const VhdlSymbol* const signalp = drivenp;
+                const int idx = passedOn ? outerIt->second.idx : m_driverUsed[signalp];
                 if (idx >= static_cast<int>(drvIt->second.size())) {
                     m_sigCopyWhy = ", where the signal '" + formals[i]->name()
                                    + "' is given has no driver left for this call";
@@ -26810,6 +27430,7 @@ private:
         if (archp) {
             for (AstNode* p = archp->declsp(); p; p = p->nextp()) lowerDecl(p);
         }
+        makePkgDrivers(flp);
         // Every signal now has its variable, so the transaction bits that
         // the statements will mark can be made
         makeActives(flp);
