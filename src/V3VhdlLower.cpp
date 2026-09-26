@@ -6852,7 +6852,21 @@ private:
             if (varp->varType() == VVarType::LPARAM && !valueFolds(varp->valuep())) {
                 varp->varType(VVarType::VAR);
             }
+            // A subprogram's declarations are elaborated in order on every
+            // call (14.6), so one may read what the one before it was just
+            // given: "constant r : range_t := get_range(code); variable v :
+            // string(r'range) := (others => NUL)" in VUnit's string decode.
+            // A variable's initial value is worked out on entry, before any
+            // of that, so a value that does not fold is given where it is
+            // declared instead.
+            AstNode* setLaterp = nullptr;
+            if (m_ftaskp && varp->varType() == VVarType::VAR && varp->valuep()
+                && !valueFolds(varp->valuep())) {
+                AstNodeExpr* const valp = VN_AS(varp->valuep(), NodeExpr)->unlinkFrBack();
+                setLaterp = new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, valp};
+            }
             addStmt(varp);
+            if (setLaterp) addStmt(setLaterp);
             if (fillp) {
                 // How many characters, worked out into an object of its own:
                 // asked for inside the fill, a call is a value the back end
@@ -26687,6 +26701,15 @@ private:
             case VhdlMode::INOUT:
             case VhdlMode::BUFFER: varp->direction(VDirection::INOUT); break;
             default: varp->direction(VDirection::INPUT); break;
+            }
+            // An unconstrained STRING of mode out still has the bounds of its
+            // actual (4.2.2.3): "result'length" is how long the caller's
+            // variable is. Held as text, an output starts empty and would say
+            // 0, so it goes in with the actual's value, which is where its
+            // length is. VUnit's string decode sizes what it copies that way.
+            if (ifp->mode() == VhdlMode::OUT && isStringType(psymp->typep())
+                && !psymp->typep()->isConstrainedArray()) {
+                varp->direction(VDirection::INOUT);
             }
             // A parameter of a protected type must be a variable of mode
             // inout (4.2.2.3), but what is passed is the object itself, not a
