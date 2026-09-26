@@ -11912,13 +11912,28 @@ private:
                          : static_cast<AstNodeExpr*>(new AstModDiv{flp, lhsp, rhsp});
         case VhdlBinaryOp::MOD:
             if (!signd) return new AstModDiv{flp, lhsp, rhsp};
-            // mod takes the sign of its right operand, so bias the remainder
-            // back into range: ((a rem b) + b) rem b
-            return new AstModDivS{
-                flp,
-                new AstAdd{flp, new AstModDivS{flp, lhsp, rhsp->cloneTree(false)},
-                           rhsp->cloneTree(false)},
-                rhsp};
+            // mod takes the sign of its right operand (9.2.7): a remainder
+            // of the other sign moves by one divisor. Only then -- "(a rem
+            // b) + b" for every remainder overflows when a and b are both
+            // large, and VUnit's "hash mod 2147483562" came out negative.
+            // SIGNED vectors keep the form sized to them.
+            if (!isIntegerType(ltypep) || !isIntegerType(rtypep)) {
+                return new AstModDivS{flp,
+                                      new AstAdd{flp,
+                                                 new AstModDivS{flp, lhsp, rhsp->cloneTree(false)},
+                                                 rhsp->cloneTree(false)},
+                                      rhsp};
+            }
+            {
+                AstNodeExpr* const remp = new AstModDivS{flp, lhsp, rhsp->cloneTree(false)};
+                const auto zero = [&]() { return new AstConst{flp, AstConst::Signed32{}, 0}; };
+                AstNodeExpr* const otherSignp = new AstLogAnd{
+                    flp, new AstNeq{flp, remp->cloneTree(false), zero()},
+                    new AstNeq{flp, new AstLtS{flp, remp->cloneTree(false), zero()},
+                               new AstLtS{flp, rhsp->cloneTree(false), zero()}}};
+                return new AstCond{flp, otherSignp, new AstAdd{flp, remp->cloneTree(false), rhsp},
+                                   remp};
+            }
         case VhdlBinaryOp::POW: {
             if (real) return new AstPowD{flp, lhsp, rhsp};
             // "**" on INTEGER gives an INTEGER (9.2.8). Saying so here rather

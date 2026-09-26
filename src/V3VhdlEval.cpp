@@ -168,6 +168,10 @@ VhdlValue mkBool(bool v) { return VhdlValue::mkInt(v ? VAL_TRUE : VAL_FALSE, V3V
 // Compare two values of the same type, giving -1, 0 or 1, or false if the
 // comparison cannot be made
 bool compareValues(const VhdlValue& lhs, const VhdlValue& rhs, int& out) {
+    // An element nothing could work out -- what an impure function gives,
+    // in "(ref => get(8))" -- compares with nothing: read as an integer it
+    // was zero, and a record holding one folded to unequal
+    if (!lhs.known() || !rhs.known()) return false;
     if (lhs.isStr() && rhs.isStr()) {
         const int cmp = lhs.toStr().compare(rhs.toStr());
         out = cmp < 0 ? -1 : (cmp > 0 ? 1 : 0);

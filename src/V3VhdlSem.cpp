@@ -5586,7 +5586,12 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
         bool disagreep = false;
         bool sawOpen = false;
         bool sawUnfolded = false;
-        findReturnedType(copyp->stmtsp(), foundp, disagreep, true, sawOpen, sawUnfolded);
+        // A null return is skipped as a guard that the call's lengths rule
+        // out -- except for text, which is held as long as it is, so a ""
+        // that a path does return is a length like any other: VUnit's
+        // get_running_test_case gives "" or a name (run/src/runner_pkg.vhd)
+        const bool isText = newSymp->returnTypep()->base() == V3VhdlStd::stringType()->base();
+        findReturnedType(copyp->stmtsp(), foundp, disagreep, !isText, sawOpen, sawUnfolded);
         if (!foundp && !disagreep && !sawOpen) {
             findReturnedType(copyp->stmtsp(), foundp, disagreep, false, sawOpen, sawUnfolded);
         }
