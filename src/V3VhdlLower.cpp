@@ -12706,6 +12706,12 @@ private:
             return new AstRToIRoundS{flp, valuep};
         }
         if (toKind == VhdlTypeKind::ARRAY) {
+            // An array whose elements do not pack is the same elements in
+            // another array type -- "integer_vector(v)" over a
+            // t_natural_vector -- and not a number to reinterpret
+            const VhdlType* const telemp
+                = top->elementp() ? top->elementp() : top->base()->elementp();
+            if (telemp && !elementPacks(telemp)) return valuep;
             // unsigned(x), signed(x) and std_logic_vector(x) reinterpret the
             // same bits; only the signedness changes
             if (isSignedType(top)) return new AstSigned{flp, valuep};
@@ -13297,6 +13303,34 @@ private:
             if (args.size() < 2) return nullptr;
             const VhdlValue widthVal = V3VhdlEval::eval(args[1]);
             AstNodeExpr* sized = firstp;
+            // A value that carries its own bounds, resized to a width that is
+            // a number: made that long as a carrier, then taken out of it --
+            // a cast has no bits of a carrier to cut. "resize(min_value +
+            // rand(n), length)" in a copy of UVVM's random generator made for
+            // a call that says the length
+            if (widthVal.isInt() && name == "resize" && isDynValue(args[0]) && resultp
+                && resultp->isConstrainedArray() && !carriedDynamically(resultp)) {
+                VhdlType* const carrp
+                    = dynValueType(args[0]) ? dynValueType(args[0]) : args[0]->vhdlTypep();
+                AstNodeFTask* const rszp
+                    = carrp ? dynResizeFunc(carrp, isSignedType(resultp), flp) : nullptr;
+                AstNodeFTask* const tofp = rszp ? dynToFixedFunc(carrp, resultp, flp) : nullptr;
+                if (tofp) {
+                    FileLine* const wflp = dynFl(flp);
+                    AstFuncRef* const refp = new AstFuncRef{
+                        wflp, rszp->name(),
+                        AstNode::addNext(
+                            new AstArg{wflp, "", firstp},
+                            new AstArg{wflp, "",
+                                       new AstConst{wflp, AstConst::Signed32{},
+                                                    static_cast<int32_t>(widthVal.toInt())}})};
+                    refp->taskp(VN_AS(rszp, Func));
+                    AstFuncRef* const outp
+                        = new AstFuncRef{wflp, tofp->name(), new AstArg{wflp, "", refp}};
+                    outp->taskp(VN_AS(tofp, Func));
+                    return outp;
+                }
+            }
             if (widthVal.isInt()) {
                 const int want = static_cast<int>(widthVal.toInt());
                 // RESIZE fills what the result is short with the operand's
@@ -25064,6 +25098,7 @@ private:
         VL_RESTORER(m_ftaskp);
         VL_RESTORER(m_retCarrierp);
         VL_RESTORER(m_retCarrier2p);
+        VL_RESTORER(m_retFixedp);
         VL_RESTORER_COPY(m_prefix);
         m_ftaskp = ftaskp;
         m_retCarrierp = nullptr;
