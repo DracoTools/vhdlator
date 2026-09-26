@@ -2044,6 +2044,22 @@ private:
     void visit(AstVhdlPackage* nodep) override;
     void visit(AstVhdlPackageBody* nodep) override;
     void bindOwnGenerics(AstVhdlPackage* nodep, VhdlScope* outerp) VL_MT_DISABLED;
+    // A package's or package body's own declarations, in order. Its types,
+    // subtypes and objects elaborate with the package, when a shared
+    // variable it declared holds its initial value (14.4.2); a subprogram
+    // runs later, when it may not.
+    void visitSubprogDecl(AstVhdlSubprogDecl* nodep) VL_MT_DISABLED;
+    void iteratePackageDecls(AstNode* declsp) {
+        const bool saved = V3VhdlEval::s_sharedInitValues;
+        for (AstNode* p = declsp; p;) {
+            AstNode* const nextp = p->nextp();
+            V3VhdlEval::s_sharedInitValues
+                = VN_IS(p, VhdlTypeDecl) || VN_IS(p, VhdlSubtypeDecl) || VN_IS(p, VhdlObjectDecl);
+            iterate(p);
+            p = nextp;
+        }
+        V3VhdlEval::s_sharedInitValues = saved;
+    }
     void visit(AstVhdlPackageInst* nodep) override;
     void visit(AstVhdlSubprogInst* nodep) override;
 
@@ -2607,6 +2623,12 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
                 if (elab.isComposite()) symp->elabValue(elab);
             }
         }
+        // A shared variable of a package holds its initial value while the
+        // rest of the package elaborates (iteratePackageDecls)
+        if (kind == VhdlSymKind::SHARED_VARIABLE && V3VhdlEval::s_sharedInitValues) {
+            const VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            if (val.known()) symp->elabValue(val);
+        }
     } else if (kind == VhdlSymKind::CONSTANT) {
         // A constant declared with no value in a package declaration is
         // deferred; its value comes with the package body (6.4.2.2)
@@ -2776,6 +2798,14 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
 }
 
 void VhdlSemVisitor::visit(AstVhdlSubprogDecl* nodep) {
+    // A subprogram runs after the package has elaborated, when a shared
+    // variable may hold anything (iteratePackageDecls)
+    const bool savedSharedInit = V3VhdlEval::s_sharedInitValues;
+    V3VhdlEval::s_sharedInitValues = false;
+    visitSubprogDecl(nodep);
+    V3VhdlEval::s_sharedInitValues = savedSharedInit;
+}
+void VhdlSemVisitor::visitSubprogDecl(AstVhdlSubprogDecl* nodep) {
     VhdlSymbol* const symp = VhdlSymTab::newSymbol(
         nodep->isFunction() ? VhdlSymKind::FUNCTION : VhdlSymKind::PROCEDURE, nodep->name(),
         nodep);
@@ -4708,7 +4738,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             rejectGenericObjects(pkgp->genericsp());
             iterateAndNextNull(pkgp->genericsp());
             if (!m_inSpecialized) rejectUnsharedVariables(pkgp->declsp(), "a package");
-            iterateAndNextNull(pkgp->declsp());
+            iteratePackageDecls(pkgp->declsp());
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
             m_primaryUnits[lib + "." + lower(unitp->name())] = unitp;
             libScope(lib)->addNamed(lower(unitp->name()), unitScopep);
@@ -4741,7 +4771,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             VL_RESTORER(m_inPackageBody);
             m_inPackageBody = true;
             if (!m_inSpecialized) rejectUnsharedVariables(bodyp->declsp(), "a package body");
-            iterateAndNextNull(bodyp->declsp());
+            iteratePackageDecls(bodyp->declsp());
         } else if (AstVhdlConfiguration* const cfgp = VN_CAST(unitp, VhdlConfiguration)) {
             // A binding indication may carry generic and port maps of its
             // own. Their actuals name what the configured architecture
@@ -4916,7 +4946,7 @@ void VhdlSemVisitor::visit(AstVhdlPackage* nodep) {
     // A package may carry a generic map of its own, which makes it an
     // instance of itself: its generics hold what it gives them (4.7)
     if (nodep->genericMapp()) bindOwnGenerics(nodep, outerp);
-    iterateAndNextNull(nodep->declsp());
+    iteratePackageDecls(nodep->declsp());
     m_scopep = outerp;
     outerp->addNamed(lower(nodep->name()), innerp);
     VhdlSymbol* const symp
@@ -4973,7 +5003,7 @@ void VhdlSemVisitor::visit(AstVhdlPackageBody* nodep) {
     m_inPackageBody = true;
     VhdlScope* const outerp = m_scopep;
     m_scopep = pkgScopep;
-    iterateAndNextNull(nodep->declsp());
+    iteratePackageDecls(nodep->declsp());
     m_scopep = outerp;
 }
 

@@ -56,6 +56,13 @@ public:
     // reason is left in *errp for the caller to report.
     static VhdlValue eval(AstNodeVhdlExpr* nodep, std::string* errp = nullptr) VL_MT_DISABLED;
 
+    // While a package's own declarations elaborate, a shared variable it
+    // declared earlier holds its initial value and nothing else (14.4.2),
+    // so a bound written with it -- UVVM's "(0 to
+    // shared_spec_cov_config.max_requirement_lines)" -- is that value.
+    // Anywhere else a shared variable's value is whatever running made it.
+    static bool s_sharedInitValues;
+
     // Whether the back end can fold an expression to a value, which it does
     // by running what it names. Being static is not the same question: a
     // call on a pure function of the design folds, and one that builds a

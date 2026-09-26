@@ -373,6 +373,8 @@ private:
             // A parameter has a value only in a copy of a subprogram made for
             // one call site, which is where the call's own values were fixed
             return symp->value();
+        case VhdlSymKind::SHARED_VARIABLE:
+            return V3VhdlEval::s_sharedInitValues ? symp->elabValue() : VhdlValue{};
         case VhdlSymKind::FUNCTION:
             // A function taking no parameters is called by writing its name
             // with no argument list at all (4.2.2.1)
@@ -1517,6 +1519,8 @@ private:
 
 //######################################################################
 // Entry points
+
+bool V3VhdlEval::s_sharedInitValues = false;
 
 VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
     VhdlEvaluator evaluator{errp};
