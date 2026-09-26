@@ -1077,8 +1077,9 @@ private:
             return false;
         }
         const AstNodeVhdlExpr* accp = callp->prefixp();
-        // An object held two levels deep, indexed
+        // An object held two levels deep, or a call giving one back, indexed
         if (VN_IS(accp, VhdlName) && isDyn2Value(accp)) return true;
+        if (dyn2ResultCall(accp)) return true;
         if (const AstVhdlSelected* const selp = VN_CAST(accp, VhdlSelected)) {
             if (selp->isAll()) accp = selp->prefixp();
         }
@@ -5281,6 +5282,9 @@ private:
             const AstNodeVhdlExpr* accp = VN_AS(nodep, VhdlCall)->prefixp();
             if (VN_IS(accp, VhdlName) && isDyn2Value(accp)) {
                 return openCarriedElement(accp->vhdlSymp()->resolved()->typep());
+            }
+            if (dyn2ResultCall(accp)) {
+                return openCarriedElement(emittedReturnType(accp->vhdlSymp()->resolved()));
             }
             if (const AstVhdlSelected* const selp = VN_CAST(accp, VhdlSelected)) {
                 if (selp->isAll()) accp = selp->prefixp();
@@ -12548,6 +12552,27 @@ private:
                 // read
                 if (dim == 0 && VN_IS(nodep->prefixp(), VhdlCall)
                     && dynResultCall(nodep->prefixp())) {
+                    // -- which is what it is: kept once in an object of the
+                    // result's own carrier type, and indexed as that
+                    // ("mk(len)(2)")
+                    const VhdlSymbol* const fsymp = nodep->prefixp()->vhdlSymp()
+                                                        ? nodep->prefixp()->vhdlSymp()->resolved()
+                                                        : nullptr;
+                    VhdlType* const rtypep = fsymp ? emittedReturnType(fsymp) : nullptr;
+                    AstNodeDType* const carrDTypep
+                        = !rtypep                      ? nullptr
+                          : isDyn2Type(rtypep)         ? dyn2CarrierRef(rtypep, flp)
+                          : carriedDynamically(rtypep) ? dynCarrierRef(rtypep, flp)
+                                                       : nullptr;
+                    if (carrDTypep) {
+                        AstVar* const tmpp = newTempVar("__Vdynres", carrDTypep, flp);
+                        AstNode* const setp
+                            = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, outp};
+                        outp = new AstExprStmt{
+                            flp, setp,
+                            dynIndex(new AstVarRef{flp, tmpp, VAccess::READ}, indexp, flp)};
+                        continue;
+                    }
                     VL_DO_DANGLING(indexp->deleteTree(), indexp);
                     VL_DO_DANGLING(outp->deleteTree(), outp);
                     unsup(flp, "index of a value whose length only running decides and that is "
@@ -13877,11 +13902,25 @@ private:
                 // carries its own bounds is not one of these: nothing it is
                 // given to has a width to take, so the bits are built below
                 // with the length the call names.
+                // Cast to it outright, as RESIZE is just above: the value
+                // may be compared or joined rather than assigned, and an
+                // assignment's own width check sees an integer otherwise
+                // ("v := std_logic_vector(to_unsigned(n, G))")
                 FileLine* const cflp = new FileLine{flp};
                 cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
                 cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
                 flp = cflp;
-                sized = firstp;
+                AstNodeDType* const wantp = lowerType(resultp, flp);
+                // The integer is worked out at its own width first: widened
+                // by the cast, "n + 1" would be asked to be the result's
+                // width itself
+                sized = wantp ? static_cast<AstNodeExpr*>(new AstCast{
+                                    flp,
+                                    new AstCastSize{
+                                        flp, firstp,
+                                        new AstConst{flp, AstConst::Unsized32{}, VL_IDATASIZE}},
+                                    VFlagChildDType{}, wantp})
+                              : firstp;
             } else if (name == "resize" && resultp && carriedDynamically(resultp)) {
                 // What RESIZE is handed is a vector, not a number, so the
                 // result is built out of its elements.  Reading it as a

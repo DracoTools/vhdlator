@@ -4,62 +4,85 @@
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
 -- SPDX-License-Identifier: CC0-1.0
 --
--- "f(i)", where every parameter of f has a default, is two legal readings of
--- one piece of text: a call handing i to the first parameter, and the
--- defaulted call f with its result indexed by i (4.2.2.1, 8.4). Which is
--- meant is settled the way any other overloading is -- by what the context
--- asks for.
 
-package callindexpkg is
-  type intvec is array (natural range <>) of integer;
-  subtype six is intvec (1 to 6);
-  -- Reads both ways wherever it is written with one parenthesis
-  function pick (a, b : integer := 3) return six;
+-- An element of what a call gives back, where the result carries its own
+-- bounds: "mk(len)(2)". Every part of such a value -- its elements, its left
+-- bound, its direction -- is a separate read of it, so it was refused as
+-- anything but a name. It is now worked out once and indexed as the object
+-- that keeps it.
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+package t_vhdl_callindex_pkg is
+  type t_slv_array is array (natural range <>) of std_logic_vector;
 end package;
 
-package body callindexpkg is
-  function pick (a, b : integer := 3) return six is
-  begin
-    if a = 3 and b = 3 then
-      return (1, 2, 3, 4, 5, 6);
-    elsif a = 3 then
-      return (11, 22, 33, 44, 55, 66);
-    else
-      return (111, 222, 333, 444, 555, 666);
-    end if;
-  end function;
-end package body;
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.t_vhdl_callindex_pkg.all;
 
-use work.callindexpkg.all;
+entity t_vhdl_callindex_sub is
+  generic (G : natural);
+end entity;
+
+architecture a of t_vhdl_callindex_sub is
+begin
+  process
+    variable calls : natural := 0;
+    -- Words a generic sizes
+    impure function mk(n : natural) return t_slv_array is
+      variable r : t_slv_array(0 to n - 1)(G - 1 downto 0);
+    begin
+      calls := calls + 1;
+      for i in r'range loop
+        r(i) := std_logic_vector(to_unsigned(i + 1, G));
+      end loop;
+      return r;
+    end function;
+    -- Words the call sizes: held two levels deep
+    function words(n, w : natural) return t_slv_array is
+      variable r : t_slv_array(1 to n)(w - 1 downto 0);
+    begin
+      for i in r'range loop
+        r(i) := std_logic_vector(to_unsigned(16 * i, w));
+      end loop;
+      return r;
+    end function;
+    -- Integers, counted downwards
+    function ints(n : natural) return integer_vector is
+      variable r : integer_vector(n downto 1);
+    begin
+      for i in r'range loop
+        r(i) := i * 10;
+      end loop;
+      return r;
+    end function;
+    variable len : natural := 3;
+    variable w : natural := 12;
+  begin
+    assert mk(len)(2) = std_logic_vector(to_unsigned(3, G)) severity failure;
+    -- The call is made once for the one element read
+    assert calls = 1 severity failure;
+    assert words(len, w)(2) = x"020" severity failure;
+    assert ints(len)(3) = 30 and ints(len)(1) = 10 severity failure;
+    wait;
+  end process;
+end architecture;
 
 entity t_vhdl_callindex is
 end entity;
 
-architecture rtl of t_vhdl_callindex is
+architecture a of t_vhdl_callindex is
 begin
-  check : process
-    variable q : intvec (1 to 4);
-    variable v : six;
+  u8 : entity work.t_vhdl_callindex_sub generic map (G => 8);
+  u12 : entity work.t_vhdl_callindex_sub generic map (G => 12);
+
+  process
   begin
-    -- An integer is wanted, so these index the result of "pick" called with
-    -- both parameters defaulted -- they are not calls passing 1, 2, 3
-    q(1) := pick(1);
-    q(2) := pick(2);
-    q(3) := pick(6);
-    q(4) := pick(3);
-    assert q = (1, 2, 6, 3) report "bad index of a defaulted call" severity failure;
-    -- Where the array is what is wanted, the very same text is the call
-    v := pick(1);
-    assert v = (111, 222, 333, 444, 555, 666) report "bad call with one argument"
-      severity failure;
-    v := pick;
-    assert v = (1, 2, 3, 4, 5, 6) report "bad call with every parameter defaulted"
-      severity failure;
-    -- And a call written with both arguments is never the other reading
-    v := pick(3, 9);
-    assert v = (11, 22, 33, 44, 55, 66) report "bad call with two arguments" severity failure;
+    wait for 1 ns;
     report "*-* All Finished *-*";
-    std.env.stop;
     wait;
   end process;
 end architecture;

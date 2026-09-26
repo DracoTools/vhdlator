@@ -11,7 +11,7 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# The context decides between a call and an index of a defaulted call.
+# An element of what a call gives back, where the result carries its own bounds
 test.top_filename = "t/t_vhdl_callindex.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
