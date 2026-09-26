@@ -72,8 +72,10 @@ begin
     assert clk_1'last_event = 5 ns and clk_1'last_value = '0' severity failure;
     check_stable(clk_1, 3 ns, true, '0');
     check_clock(clk_1, 8 ns, false, '0');
-    wait until clk_1'event;
-    assert now = 20 ns and clk_1 = '0' severity failure;
+    -- With a timeout, the wait is on the signal's event and no longer on
+    -- its history alone, which changes a cycle after it (GHDL's issue2542)
+    wait until clk_1'event for 50 ns;
+    assert now = 20 ns and clk_1 = '0' report time'image(now) severity failure;
     check_clock(clk_1, 0 ns, true, '1');
     report "*-* All Finished *-*";
     wait;

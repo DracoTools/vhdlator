@@ -8108,9 +8108,13 @@ private:
             = declp ? VN_CAST(declp->targetp(), VhdlExternalName) : nullptr;
         return extp && extp->objClass() == "signal" ? extp : nullptr;
     }
-    const VhdlShadow* shadowOfExternal(AstVhdlExternalName* extp, FileLine* flp) {
-        const auto found = m_extShadows.find(extp);
-        if (found != m_extShadows.end()) return &found->second;
+    // The copy of such a signal kept in this module, driven by the reference
+    // into the other one. Made once per external name; making it is also
+    // what has the name looked up when the design is linked, so one naming
+    // nothing is an error whether or not anything reads it (14.4.2)
+    AstVar* externalCopyOf(AstVhdlExternalName* extp, FileLine* flp) {
+        const auto found = m_extCopies.find(extp);
+        if (found != m_extCopies.end()) return found->second;
         VhdlType* const typep = extp->subtypep() ? extp->subtypep()->vhdlTypep() : nullptr;
         if (!typep) return nullptr;
         VL_RESTORER(m_ftaskp);
@@ -8123,10 +8127,20 @@ private:
             = newTempVar("__Vext" + std::to_string(++m_nameNum), lowerType(typep, flp), flp);
         addStmt(
             new AstAlways{new AstAssignW{flp, new AstVarRef{flp, copyp, VAccess::WRITE}, refp}});
+        m_extCopies.emplace(extp, copyp);
+        return copyp;
+    }
+    const VhdlShadow* shadowOfExternal(AstVhdlExternalName* extp, FileLine* flp) {
+        const auto found = m_extShadows.find(extp);
+        if (found != m_extShadows.end()) return &found->second;
+        VhdlType* const typep = extp->subtypep() ? extp->subtypep()->vhdlTypep() : nullptr;
+        AstVar* const copyp = typep ? externalCopyOf(extp, flp) : nullptr;
+        if (!copyp) return nullptr;
         VhdlShadow sh;
         if (!buildShadow(copyp, typep, copyp->name(), flp, sh)) return nullptr;
         return &m_extShadows.emplace(extp, sh).first->second;
     }
+    std::map<const AstVhdlExternalName*, AstVar*> m_extCopies;  // What shadowOfExternal reads
 
     const VhdlShadow* shadowFor(AstNodeVhdlExpr* prefixp, FileLine* flp) {
         if (AstVhdlExternalName* const extp = externalSignalOf(prefixp)) {
@@ -8545,6 +8559,17 @@ private:
     }
 
     AstNodeExpr* eventOf(AstNodeVhdlExpr* prefixp, const VhdlShadow* shp, FileLine* flp) {
+        // A signal of another module is compared as the copy of it kept here
+        // is: a process waiting on the event waits on that copy, which
+        // changes in the same cycle as the signal, where the reference into
+        // the other module is nothing it can wait on
+        if (AstVhdlExternalName* const extp = externalSignalOf(prefixp)) {
+            const auto it = m_extCopies.find(extp);
+            if (it != m_extCopies.end()) {
+                return new AstNeq{flp, new AstVarRef{flp, it->second, VAccess::READ},
+                                  shadowPart(prefixp, shp->prevp, flp)};
+            }
+        }
         AstNodeExpr* const nowp = lowerExpr(prefixp);
         if (!nowp) return nullptr;
         return new AstNeq{flp, nowp, shadowPart(prefixp, shp->prevp, flp)};
@@ -14622,8 +14647,102 @@ private:
     // the instance is elaborated -- a port or signal whose width comes from a
     // generic. One value repeated as many times as the range is long, which
     // V3Param settles along with the range itself.
+    // "(0 => '1', others => '0')" where a generic gives the length: the
+    // others value repeated over the object's places, and each element a
+    // choice names put in at its place, which is counted from the right end
+    // the way the range runs. Elements of one bit each, and choices that
+    // are numbers; null otherwise.
+    AstNodeExpr* namedOthersOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep,
+                                            FileLine* flp) {
+        if (typep->indexTypes().size() != 1 || !typep->indexTypes()[0]) return nullptr;
+        AstVhdlRange* const rangep = VN_CAST(typep->indexTypes()[0]->boundsp(), VhdlRange);
+        if (!rangep || !rangep->leftp() || !rangep->rightp() || rangep->dirUnknown()) {
+            return nullptr;
+        }
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!elemp || !elementPacks(elemp)) return nullptr;
+        {
+            AstNodeDType* const edtp = lowerType(const_cast<VhdlType*>(elemp), flp);
+            const AstBasicDType* const basicp = VN_CAST(edtp, BasicDType);
+            const bool oneBit = basicp && !basicp->rangep()
+                                && (basicp->keyword() == VBasicDTypeKwd::LOGIC
+                                    || basicp->keyword() == VBasicDTypeKwd::BIT);
+            if (edtp) VL_DO_DANGLING(edtp->deleteTree(), edtp);
+            if (!oneBit) return nullptr;
+        }
+        std::vector<std::pair<int64_t, AstNodeVhdlExpr*>> named;
+        AstNodeVhdlExpr* othersp = nullptr;
+        for (AstVhdlElemAssoc* eap = nodep->elemsp(); eap;
+             eap = VN_AS(eap->nextp(), VhdlElemAssoc)) {
+            AstVhdlChoice* const chp = eap->choicesp();
+            if (!chp || chp->nextp() || othersp) return nullptr;
+            if (chp->isOthers()) {
+                othersp = eap->valuep();
+                continue;
+            }
+            if (chp->rangep() || !chp->valuep()) return nullptr;
+            const VhdlValue at = V3VhdlEval::eval(chp->valuep());
+            if (!at.isInt()) return nullptr;
+            named.emplace_back(at.toInt(), eap->valuep());
+        }
+        if (!othersp || named.empty()) return nullptr;
+        const bool ascending = rangep->dir() == VhdlDir::TO;
+        AstNodeExpr* const lenp = boundsLength(typep, flp);
+        AstNodeExpr* const rightp = lenp ? lowerBound(rangep->rightp()) : nullptr;
+        AstNodeExpr* const fillp = rightp ? lowerExpr(othersp) : nullptr;
+        if (!fillp) {
+            if (lenp) VL_DO_DANGLING(lenp->deleteTree(), lenp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        // What the source wrote is no replication, and a place count of one
+        // repeats the zeros before a single bit no times
+        FileLine* const rflp = new FileLine{flp};
+        rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+        rflp->warnOff(V3ErrorCode::ZEROREPL, true);
+        rflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        rflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        AstNodeExpr* const placesp = declaredPlaces(lenp, rflp);
+        // One bit at the bottom of as many places as the object has
+        const auto atBottom = [&](AstNodeExpr* bitp) -> AstNodeExpr* {
+            return new AstConcat{
+                rflp,
+                new AstReplicate{rflp, new AstConst{rflp, AstConst::BitFalse{}},
+                                 new AstSub{rflp, placesp->cloneTree(false),
+                                            new AstConst{rflp, AstConst::Signed32{}, 1}}},
+                bitp};
+        };
+        AstNodeExpr* outp = new AstReplicate{rflp, fillp, placesp->cloneTree(false)};
+        for (const auto& pair : named) {
+            AstNodeExpr* const valuep = lowerExpr(pair.second);
+            if (!valuep) {
+                VL_DO_DANGLING(outp->deleteTree(), outp);
+                VL_DO_DANGLING(placesp->deleteTree(), placesp);
+                VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return nullptr;
+            }
+            AstNodeExpr* const idxp
+                = new AstConst{rflp, AstConst::Signed32{}, static_cast<int32_t>(pair.first)};
+            AstNodeExpr* const posp
+                = ascending
+                      ? static_cast<AstNodeExpr*>(new AstSub{rflp, rightp->cloneTree(false), idxp})
+                      : new AstSub{rflp, idxp, rightp->cloneTree(false)};
+            AstNodeExpr* const maskp = new AstShiftL{
+                rflp, atBottom(new AstConst{rflp, AstConst::BitTrue{}}), posp->cloneTree(false)};
+            AstNodeExpr* const bitp = new AstShiftL{rflp, atBottom(valuep), posp};
+            outp = new AstOr{rflp, new AstAnd{rflp, outp, new AstNot{rflp, maskp}}, bitp};
+        }
+        VL_DO_DANGLING(placesp->deleteTree(), placesp);
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        return outp;
+    }
+
     AstNodeExpr* othersOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp,
                                        int64_t knownCount = 0) {
+        if (nodep->elemsp() && nodep->elemsp()->nextp()) {
+            return namedOthersOfDynamicLength(nodep, typep, flp);
+        }
         // Where the range has already been folded, the repetition count is
         // that number rather than an expression to work it out again
         AstVhdlElemAssoc* const firstp = nodep->elemsp();
@@ -22504,8 +22623,9 @@ private:
             // read through a formal of mode "in": the formal stands for the
             // name, which the copy lowers again, and whose history is kept
             // of a copy of the signal here (shadowOfExternal)
-            if (const AstVhdlExternalName* const extp = VN_CAST(actualp, VhdlExternalName)) {
+            if (AstVhdlExternalName* const extp = VN_CAST(actualp, VhdlExternalName)) {
                 if (extp->objClass() == "signal" && formals[i]->mode() == VhdlMode::IN) {
+                    externalCopyOf(extp, actualp->fileline());
                     exprBind.emplace(formals[i]->vhdlSymp(), actualp);
                     key += "|ext" + std::to_string(reinterpret_cast<uintptr_t>(extp));
                     continue;
