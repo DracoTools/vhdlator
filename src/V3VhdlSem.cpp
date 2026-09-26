@@ -4358,7 +4358,10 @@ void VhdlSemVisitor::applyContextItem(AstVhdlContextItem* ctxp) {
         if (ctxp->kind() == VhdlContextKind::LIBRARY) {
             const AstVhdlName* const lnp = VN_CAST(exprp, VhdlName);
             if (lnp) {
-                m_scopep->addNamed(lnp->name(), libScope(lnp->name()));
+                // "library work;" names the working library, whatever it is
+                // called (13.2)
+                const std::string lib = lower(lnp->name());
+                m_scopep->addNamed(lnp->name(), libScope(lib == "work" ? m_libname : lib));
                 declareLibrary(lnp->name());
             }
             continue;

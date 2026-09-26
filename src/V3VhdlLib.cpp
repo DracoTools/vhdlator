@@ -305,7 +305,10 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
                 // design unit is missing -- which is worth saying here, since
                 // otherwise the alias denotes nothing and the first use of it
                 // reports something else entirely
-                unit.dependsOn.push_back(primaryKey(lower(libp->name()), pkgp->name()));
+                // "library work;" names the working library, whatever it is
+                // called (13.2)
+                const std::string lib = lower(libp->name());
+                unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, pkgp->name()));
             }
         });
 
