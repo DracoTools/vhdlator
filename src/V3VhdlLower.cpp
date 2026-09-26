@@ -10749,8 +10749,25 @@ private:
             return nullptr;
         }
         AstNodeExpr* const writep = lowerDriveTarget(callp->prefixp());
-        AstNodeExpr* const carrierp
-            = writep ? asDynCarrier(valuep, carrp, flp, carrp) : nullptr;
+        AstNodeExpr* carrierp = nullptr;
+        // "(others => '0')" has no length of its own: it is as long as the
+        // slice (9.3.3.3), so it is made with the slice's own bounds
+        if (AstNodeVhdlExpr* const uniformp = writep ? uniformAggregateValue(valuep) : nullptr) {
+            AstNodeFTask* const fillFuncp = dynFillFunc(carrp, flp);
+            AstNodeExpr* const fillp = fillFuncp ? lowerExpr(uniformp) : nullptr;
+            if (fillp) {
+                AstArg* const fargsp = new AstArg{flp, "", intBound(leftp->cloneTree(false), flp)};
+                fargsp->addNext(new AstArg{flp, "", intBound(rightp->cloneTree(false), flp)});
+                fargsp->addNext(
+                    new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+                fargsp->addNext(new AstArg{flp, "", fillp});
+                AstFuncRef* const frefp = new AstFuncRef{flp, fillFuncp->name(), fargsp};
+                frefp->taskp(VN_AS(fillFuncp, Func));
+                carrierp = frefp;
+            }
+        } else if (writep) {
+            carrierp = asDynCarrier(valuep, carrp, flp, carrp);
+        }
         if (!carrierp) {
             VL_DO_DANGLING(leftp->deleteTree(), leftp);
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
