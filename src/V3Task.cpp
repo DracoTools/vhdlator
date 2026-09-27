@@ -755,6 +755,22 @@ class TaskVisitor final : public VNVisitor {
                 AstAssign* const postassp = connectPortMakeOutAssign(portp, pinp, newvscp, false);
                 // Put assignment BEHIND of all other statements
                 beginp->addNext(postassp);
+            } else if (!inlineTask && portp->isNonOutput() && VN_IS(pinp, SliceSel)) {
+                // A slice of an unpacked array is no C++ value: V3Slice expands
+                // it only where it is assigned. An input of a call kept out of
+                // line -- a class method's -- is given it through a temporary,
+                // as an inlined call's input is.
+                AstVarScope* const newvscp
+                    = createVarScope(portp, namePrefix + "__" + portp->shortName());
+                AstAssign* const preassp = connectPortMakeInAssign(pinp, newvscp, false);
+                pinp->replaceWith(new AstVarRef{newvscp->fileline(), newvscp, VAccess::READ});
+                pushDeletep(pinp);  // Cloned by connectPortMakeInAssign
+                // Put assignment in FRONT of the call
+                if (AstNode* const afterp = beginp->nextp()) {
+                    afterp->unlinkFrBackWithNext();
+                    AstNode::addNext<AstNode, AstNode>(preassp, afterp);
+                }
+                beginp->addNext(preassp);
             } else if (inlineTask && portp->isNonOutput()) {
                 // Make input variable
                 AstVarScope* const newvscp
