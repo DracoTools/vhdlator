@@ -3406,8 +3406,53 @@ private:
             outp, static_cast<AstNode*>(new AstAssign{
                       flp, dynPart(ref(), "q", flp),
                       new AstNewDynamic{flp, countp, nullptr}}));
+        // Every element starts at its subtype's default (6.4.2.2), and new[]
+        // makes them zero: an INTEGER_VECTOR only running sizes started as
+        // zeros, not INTEGER'LEFT. UVVM's coverage database compares the
+        // bins it loads -- whose unused values are INTEGER'LEFT -- with
+        // those it made, and none matched.
+        if (AstNode* const fillp = dynDefaultFill(protop, typep, flp)) {
+            outp = AstNode::addNext(outp, fillp);
+        }
         VL_DO_DANGLING(protop->deleteTree(), protop);
         return outp;
+    }
+
+    // The loop that gives each element of a newly made carrier its default,
+    // or null where that default is what new[] already gives. A logic
+    // element starts as Verilator starts it, as in an array of fixed length,
+    // and an element that carries bounds of its own has none to write.
+    AstNode* dynDefaultFill(AstNodeExpr* protop, const VhdlType* typep, FileLine* flp) {
+        VhdlType* const elemTypep
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!elemTypep || enumIsLogic(elemTypep->base()) || elementCarried(elemTypep)) {
+            return nullptr;
+        }
+        if (elemTypep->base()->kind() == VhdlTypeKind::RECORD && recordCarriesElement(elemTypep)) {
+            return nullptr;
+        }
+        AstNodeExpr* const defp = defaultValueFor(elemTypep, flp);
+        if (!defp) return nullptr;
+        if (const AstConst* const constp = VN_CAST(defp, Const)) {
+            if (constp->num().isEqZero()) {
+                VL_DO_DANGLING(defp->deleteTree(), defp);
+                return nullptr;
+            }
+        }
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        AstVar* const idxVarp = newTempVar("__Vdfi", newIntDType(flp), flp);
+        idxVarp->usedLoopIdx(true);
+        const auto idx = [&]() { return new AstVarRef{flp, idxVarp, VAccess::READ}; };
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp, new AstLtS{flp, idx(), dynCarrierLength(protop->cloneTree(false), flp)}});
+        loopp->addStmtsp(new AstAssign{
+            flp, new AstSelBit{flp, dynPart(protop->cloneTree(false), "q", flp), idx()}, defp});
+        loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
+                                       new AstAdd{flp, idx(), num(1)}});
+        AstNode* const outp
+            = new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE}, num(0)};
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
     }
 
     // Put a value into a carrier. Another carrier is copied whole; a value
@@ -24043,6 +24088,15 @@ private:
     // it was written with reports as unconstrained wherever it is asked.
     AstNode* carrierRoundTrip(AstVar* tmpp, AstVar* objp, AstNodeExpr* leftp,
                               AstNodeExpr* rightp, bool ascending, bool fill, FileLine* flp) {
+        return carrierRoundTripOn(tmpp, new AstVarRef{flp, objp, VAccess::READ}, leftp, rightp,
+                                  ascending, fill, flp);
+    }
+    // The same for an object named by an expression -- an element of a
+    // record, "v_result.channel_value(w - 1 downto 0)" in UVVM's avalon_st
+    // VVC -- which is read or written in place each time. Takes the
+    // expression, which must be repeatable.
+    AstNode* carrierRoundTripOn(AstVar* tmpp, AstNodeExpr* objTemplp, AstNodeExpr* leftp,
+                                AstNodeExpr* rightp, bool ascending, bool fill, FileLine* flp) {
         AstVar* const np = newTempVar("__Vdynn", newIntDType(flp), flp);
         AstVar* const kp = newTempVar("__Vdynk", newIntDType(flp), flp);
         const auto wrc = [&]() { return new AstVarRef{flp, tmpp, VAccess::WRITE}; };
@@ -24077,9 +24131,10 @@ private:
                   new AstAdd{flp, leftp->cloneTree(false), rd(kp, flp)})
                         : static_cast<AstNodeExpr*>(
                             new AstSub{flp, leftp->cloneTree(false), rd(kp, flp)});
-        AstNodeExpr* const objElemp
-            = new AstSelBit{flp, new AstVarRef{flp, objp, fill ? VAccess::READ : VAccess::WRITE},
-                            atp};
+        AstNodeExpr* const objUsep = objTemplp->cloneTree(false);
+        if (!fill) objUsep->foreach([](AstVarRef* vrefp) { vrefp->access(VAccess::WRITE); });
+        VL_DO_DANGLING(objTemplp->deleteTree(), objTemplp);
+        AstNodeExpr* const objElemp = new AstSelBit{flp, objUsep, atp};
         AstNodeExpr* const carElemp = new AstSelBit{
             flp, dynPart(fill ? wrc() : rdc(), "q", flp), rd(kp, flp)};
         AstNode* bodyp = fill ? new AstAssign{flp, carElemp, objElemp}
@@ -24101,7 +24156,7 @@ private:
 
     // The ends of the slice a call passes, worked out once into names of
     // their own: they are read four times over, twice each way
-    bool sliceEndsOf(AstNodeVhdlExpr* actualp, AstVar*& objp, AstVar*& lop, AstVar*& hip,
+    bool sliceEndsOf(AstNodeVhdlExpr* actualp, AstNodeExpr*& objp, AstVar*& lop, AstVar*& hip,
                      bool& ascending, AstNode** prepp, FileLine* flp) {
         AstVhdlCall* const callp = VN_CAST(actualp, VhdlCall);
         AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
@@ -24116,18 +24171,25 @@ private:
             return false;
         }
         AstNodeExpr* const basep = lowerExpr(callp->prefixp());
-        AstVarRef* refp = VN_CAST(basep, VarRef);
+        // The object is a variable, or an element of a record one -- named
+        // by selections that can be written again for the copy back
+        AstNodeExpr* rootp = basep;
+        while (rootp && (VN_IS(rootp, StructSel) || VN_IS(rootp, MemberSel))) {
+            rootp = VN_IS(rootp, StructSel) ? VN_AS(rootp, StructSel)->fromp()
+                                            : VN_AS(rootp, MemberSel)->fromp();
+        }
+        AstVarRef* refp = VN_CAST(rootp, VarRef);
         // A slice of something that carries its own bounds is a value of its
         // own already, and its places are not the object's
         if (refp && isCarrierDType(refp->varp()->childDTypep())) refp = nullptr;
+        if (refp && basep != refp && isCarrierDType(basep->dtypep())) refp = nullptr;
         if (!refp) {
             VL_DO_DANGLING(leftp->deleteTree(), leftp);
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
             if (basep) VL_DO_DANGLING(basep->deleteTree(), basep);
             return false;
         }
-        objp = refp->varp();
-        VL_DO_DANGLING(basep->deleteTree(), basep);
+        objp = basep;
         lop = newTempVar("__Vdynlf", newIntDType(flp), flp);
         hip = newTempVar("__Vdynrg", newIntDType(flp), flp);
         *prepp = AstNode::addNextNull(*prepp, new AstAssign{flp, wr(lop, flp), leftp});
@@ -24168,6 +24230,34 @@ private:
                     VhdlType* const ptypep = pair.formalp && pair.formalp->vhdlSymp()
                                                  ? pair.formalp->vhdlSymp()->typep()
                                                  : nullptr;
+                    // Written, and given what an access value points at --
+                    // "data_array => v_data_array_ptr.all" in UVVM's
+                    // avalon_st VVC: the object is made one of those for the
+                    // call and its elements go back afterwards, its bounds
+                    // staying the object's, as a call without a copy does
+                    // (addCallArgs)
+                    if (ptypep && postpp && pair.formalp && pair.formalp->mode() != VhdlMode::IN
+                        && isAccessAll(pair.exprp)) {
+                        const DynAccess* dynp = nullptr;
+                        AstNodeVhdlExpr* const objNodep = dynAccessObj(pair.exprp, dynp);
+                        AstNodeExpr* const twop
+                            = objNodep && dynp ? asDyn2Carrier(pair.exprp, ptypep, flp) : nullptr;
+                        AstNodeExpr* const objp = twop ? lowerDriveTarget(objNodep) : nullptr;
+                        if (objp) {
+                            AstVar* const tp
+                                = newTempVar("__Vdyn2rt", dyn2CarrierRef(ptypep, flp), flp);
+                            *prepp = AstNode::addNextNull(*prepp,
+                                                          new AstAssign{flp, wr(tp, flp), twop});
+                            *postpp = AstNode::addNextNull(
+                                *postpp,
+                                new AstAssign{flp, memberOf(objp, dynp->datap->name(), flp),
+                                              dynPart(rd(tp, flp), "q", flp)});
+                            refp->addArgsp(new AstArg{flp, pair.name,
+                                                      new AstVarRef{flp, tp, VAccess::READWRITE}});
+                            continue;
+                        }
+                        if (twop) VL_DO_DANGLING(twop->deleteTree(), twop);
+                    }
                     // Written, and given an object carried one level deep:
                     // the call's own copy of it comes back afterwards
                     if (ptypep && postpp && pair.formalp && pair.formalp->mode() != VhdlMode::IN) {
@@ -24210,23 +24300,23 @@ private:
             // A slice: the object it is taken from has places of its own,
             // and the ends are worked out here into names
             if (fvarp && isSlice(pair.exprp)) {
-                AstVar* objp = nullptr;
+                AstNodeExpr* objp = nullptr;
                 AstVar* lop = nullptr;
                 AstVar* hip = nullptr;
                 bool ascending = true;
                 if (sliceEndsOf(pair.exprp, objp, lop, hip, ascending, prepp, flp)) {
                     const VhdlMode mode
                         = pair.formalp ? pair.formalp->mode() : VhdlMode::INOUT;
-                    AstVar* const tmpp = newTempVar(
-                        "__Vdynsig", fvarp->childDTypep()->cloneTree(false), flp);
-                    *prepp = AstNode::addNextNull(
-                        *prepp, carrierRoundTrip(tmpp, objp, rd(lop, flp), rd(hip, flp),
-                                                 ascending, true, flp));
+                    AstVar* const tmpp
+                        = newTempVar("__Vdynsig", fvarp->childDTypep()->cloneTree(false), flp);
                     if (postpp && mode != VhdlMode::IN) {
                         *postpp = AstNode::addNextNull(
-                            *postpp, carrierRoundTrip(tmpp, objp, rd(lop, flp),
-                                                      rd(hip, flp), ascending, false, flp));
+                            *postpp, carrierRoundTripOn(tmpp, objp->cloneTree(false), rd(lop, flp),
+                                                        rd(hip, flp), ascending, false, flp));
                     }
+                    *prepp = AstNode::addNextNull(
+                        *prepp, carrierRoundTripOn(tmpp, objp, rd(lop, flp), rd(hip, flp),
+                                                   ascending, true, flp));
                     refp->addArgsp(new AstArg{
                         flp, pair.name, new AstVarRef{flp, tmpp, VAccess::READWRITE}});
                     continue;
@@ -25206,6 +25296,16 @@ private:
         }
         AstNodeExpr* const valuep = lowerExpr(args[1]);
         if (!valuep) return nullptr;
+        // An enumeration is written as its literal -- BOOLEAN as "true", not
+        // as its position (16.4). UVVM's coverage database is written this
+        // way and read back with READ of a BOOLEAN, which wants the word.
+        if (radix.empty() && args[1]->vhdlTypep()
+            && args[1]->vhdlTypep()->base() != V3VhdlStd::bitType()) {
+            if (AstNodeExpr* const imagep = enumImage(valuep, args[1]->vhdlTypep(), flp, false)) {
+                return new AstAssign{flp, linep,
+                                     new AstConcatN{flp, linep->cloneTree(false), imagep}};
+            }
+        }
         const std::string format
             = radix.empty() ? formatFor(args[1]->vhdlTypep()) : radix;
         AstNodeExpr* textp = new AstSFormatF{flp, format, false, valuep};
@@ -27236,13 +27336,31 @@ private:
     }
     std::set<const AstVar*> m_triPorts;  // Ports a net's resolution decides
 
+    // The variable an assignment writes, through selections of every kind:
+    // those this lowering makes too -- "ifc.tkeep(i)" is a bit selected from
+    // a member -- which the back end's own walk, run after they are gone,
+    // does not look through
+    static AstVarRef* lvalueVarRef(AstNode* nodep) {
+        for (int depth = 0; nodep && depth < 64; ++depth) {
+            if (AstNodePreSel* const selp = VN_CAST(nodep, NodePreSel)) {
+                nodep = selp->fromp();
+                continue;
+            }
+            if (AstMemberSel* const selp = VN_CAST(nodep, MemberSel)) {
+                nodep = selp->fromp();
+                continue;
+            }
+            return VN_CAST(AstNodeVarRef::varRefLValueRecurse(nodep), VarRef);
+        }
+        return nullptr;
+    }
+
     void redirectPortDrives(AstNodeFTask* ftaskp) {
         if (!m_modp) return;
         std::vector<AstNodeAssign*> asgps;
         ftaskp->foreach([&](AstNodeAssign* asgp) {
             if (!VN_IS(asgp, AssignDly) && !VN_IS(asgp, AssignW)) return;
-            AstVarRef* const refp
-                = VN_CAST(AstNodeVarRef::varRefLValueRecurse(asgp->lhsp()), VarRef);
+            AstVarRef* const refp = lvalueVarRef(asgp->lhsp());
             if (!refp || !refp->varp()) return;
             const AstVar* const varp = refp->varp();
             if (varp->isFuncLocal() || !varp->isIO()) return;
@@ -27252,8 +27370,7 @@ private:
         });
         for (AstNodeAssign* const asgp : asgps) {
             FileLine* const flp = asgp->fileline();
-            AstVarRef* const refp
-                = VN_AS(AstNodeVarRef::varRefLValueRecurse(asgp->lhsp()), VarRef);
+            AstVarRef* const refp = lvalueVarRef(asgp->lhsp());
             const auto drv = subDriverFor(refp->varp(), flp);
             refp->varp(drv.first);
             AstNode* const delayp = asgp->timingControlp();
