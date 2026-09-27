@@ -8446,6 +8446,28 @@ private:
             && m_vars.at(symp)->isFuncLocal()) {
             return nullptr;
         }
+        // An element of a record signal has a history of its own: when it
+        // last changed, and what it was before, are not the record's
+        // (16.2.4). Kept whole, "r.txen'last_event" answered with the last
+        // change of any element -- UVVM's check_stable on a GMII interface's
+        // txen saw every byte of txd as an event on it (gmii_bfm_tb)
+        std::string partPath;
+        if (recordElementPath(prefixp, partPath)) {
+            const auto key = std::make_pair(static_cast<const VhdlSymbol*>(symp), partPath);
+            const auto pIt = m_partShadows.find(key);
+            if (pIt != m_partShadows.end()) return &pIt->second;
+            // The element's own subtype, which says its length: the name's
+            // type may be the element type's base, which says none
+            VhdlType* const ptypep = recordElementType(prefixp);
+            AstVar* const copyp
+                = ptypep && ptypep->lengthEmittable() ? partCopyOf(prefixp, ptypep, flp) : nullptr;
+            VhdlShadow sh;
+            if (copyp && buildShadow(copyp, ptypep, copyp->name(), flp, sh)) {
+                m_partShadowVars.insert(sh.prevp);
+                m_partShadowVars.insert(sh.lastp);
+                return &m_partShadows.emplace(key, sh).first->second;
+            }
+        }
         const auto found = m_shadows.find(symp);
         if (found != m_shadows.end()) return &found->second;
         const auto varIt = m_vars.find(symp);
@@ -8454,6 +8476,65 @@ private:
         if (!buildShadow(varIt->second, symp->typep(), symp->name(), flp, sh)) return nullptr;
         return &m_shadows.emplace(symp, sh).first->second;
     }
+
+    // "r.a.b": the names of the elements a record signal's element is
+    // reached through, where that is all the name is
+    static bool recordElementPath(const AstNodeVhdlExpr* prefixp, std::string& path) {
+        path.clear();
+        const AstNodeVhdlExpr* curp = prefixp;
+        for (int depth = 0; depth < 16; ++depth) {
+            const AstVhdlSelected* const selp = VN_CAST(curp, VhdlSelected);
+            if (!selp) break;
+            if (selp->isAll() || !selp->prefixp()) return false;
+            const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+            if (!sufp) return false;
+            const VhdlType* const ptp = selp->prefixp()->vhdlTypep();
+            if (!ptp || ptp->base()->kind() != VhdlTypeKind::RECORD) return false;
+            path = "." + sufp->name() + path;
+            curp = selp->prefixp();
+        }
+        return !path.empty() && VN_IS(curp, VhdlName);
+    }
+
+    // The subtype a record's element was declared with, found through the
+    // record's own (sub)type: the name's type may be the element type's
+    // base, which says no length
+    static VhdlType* recordElementType(AstNodeVhdlExpr* prefixp) {
+        AstVhdlSelected* const selp = VN_CAST(prefixp, VhdlSelected);
+        const AstVhdlName* const sufp = selp ? VN_CAST(selp->suffixp(), VhdlName) : nullptr;
+        if (!sufp || !selp->prefixp()) return prefixp->vhdlTypep();
+        const VhdlType* rtp = VN_IS(selp->prefixp(), VhdlSelected)
+                                  ? recordElementType(selp->prefixp())
+                                  : typeOfExpr(selp->prefixp());
+        if (!rtp) return prefixp->vhdlTypep();
+        for (const VhdlType* const tp : std::vector<const VhdlType*>{rtp, rtp->base()}) {
+            for (const VhdlSymbol* const elemp : tp->elements()) {
+                if (elemp && elemp->name() == sufp->name() && elemp->typep()
+                    && elemp->typep()->lengthEmittable()) {
+                    return elemp->typep();
+                }
+            }
+        }
+        return prefixp->vhdlTypep();
+    }
+
+    // A copy of an element of a signal, kept up to date with it, for a
+    // history of that element to be kept against
+    AstVar* partCopyOf(AstNodeVhdlExpr* prefixp, VhdlType* typep, FileLine* flp) {
+        VL_RESTORER(m_ftaskp);
+        VL_RESTORER(m_toShadows);
+        m_ftaskp = nullptr;
+        m_toShadows = true;
+        AstNodeExpr* const readp = lowerExpr(prefixp);
+        if (!readp) return nullptr;
+        AstVar* const copyp
+            = newTempVar("__Vpart" + std::to_string(++m_nameNum), lowerType(typep, flp), flp);
+        addStmt(
+            new AstAlways{new AstAssignW{flp, new AstVarRef{flp, copyp, VAccess::WRITE}, readp}});
+        return copyp;
+    }
+    std::map<std::pair<const VhdlSymbol*, std::string>, VhdlShadow> m_partShadows;
+    std::set<const AstVar*> m_partShadowVars;  // The history variables of those
 
     // The history of a signal an attribute made rather than the design:
     // "clk'DELAYED(t)'LAST_EVENT" asks about the delayed signal's own past,
@@ -8829,7 +8910,8 @@ private:
     // itself is indexed.
     AstNodeExpr* shadowPart(AstNodeVhdlExpr* prefixp, AstVar* shadowVarp, FileLine* flp) {
         VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(prefixp));
-        if (!rootp || VN_IS(prefixp, VhdlName)) {
+        // A history kept of the element itself is that element already
+        if (!rootp || VN_IS(prefixp, VhdlName) || m_partShadowVars.count(shadowVarp)) {
             return new AstVarRef{flp, shadowVarp, VAccess::READ};
         }
         const auto prevIt = m_vars.find(rootp);
@@ -11502,6 +11584,18 @@ private:
         return carriedDynamically(carrp ? carrp : dynp->vhdlTypep());
     }
 
+    // One operand a physical value and the other an integer, in either order
+    static bool physicalByInteger(const VhdlType* ltypep, const VhdlType* rtypep) {
+        if (!ltypep || !rtypep) return false;
+        const VhdlTypeKind lk = ltypep->base()->kind();
+        const VhdlTypeKind rk = rtypep->base()->kind();
+        const auto isInt = [](VhdlTypeKind k) {
+            return k == VhdlTypeKind::INTEGER || k == VhdlTypeKind::UNIVERSAL_INTEGER;
+        };
+        return (lk == VhdlTypeKind::PHYSICAL && isInt(rk))
+               || (isInt(lk) && rk == VhdlTypeKind::PHYSICAL);
+    }
+
     // A binary operator one of whose operands carries its own bounds. What
     // it gives back carries its bounds too, since nothing here settled a
     // length any more than the operand had one.
@@ -12104,10 +12198,24 @@ private:
                         : static_cast<AstNodeExpr*>(new AstSub{flp, lhsp, rhsp});
         case VhdlBinaryOp::MUL:
             if (real) return new AstMulD{flp, lhsp, rhsp};
+            if (physicalByInteger(ltypep, rtypep)) {
+                FileLine* const wflp = dynFl(flp);
+                return signd ? static_cast<AstNodeExpr*>(new AstMulS{wflp, lhsp, rhsp})
+                             : static_cast<AstNodeExpr*>(new AstMul{wflp, lhsp, rhsp});
+            }
             return signd ? static_cast<AstNodeExpr*>(new AstMulS{flp, lhsp, rhsp})
                          : static_cast<AstNodeExpr*>(new AstMul{flp, lhsp, rhsp});
         case VhdlBinaryOp::DIV:
             if (real) return new AstDivD{flp, lhsp, rhsp};
+            // A physical value and an INTEGER are of two widths here, TIME
+            // the wider, and the product or quotient is a physical value:
+            // the INTEGER is widened as it should be, and that is not worth
+            // a warning ("wait for period / 2")
+            if (physicalByInteger(ltypep, rtypep)) {
+                FileLine* const wflp = dynFl(flp);
+                return signd ? static_cast<AstNodeExpr*>(new AstDivS{wflp, lhsp, rhsp})
+                             : static_cast<AstNodeExpr*>(new AstDiv{wflp, lhsp, rhsp});
+            }
             // One physical value divided by another is a universal integer
             // (9.2.8), and as wide as an integer is here, not as TIME
             if (ltypep && rtypep && ltypep->base()->kind() == VhdlTypeKind::PHYSICAL
@@ -13565,6 +13673,20 @@ private:
         return outp;
     }
 
+    // Whether a lowered value is one of the carrier structures: a variable
+    // declared as one, or a call of a function that gives one back
+    static bool loweredIsCarrier(const AstNodeExpr* exprp) {
+        if (const AstVarRef* const refp = VN_CAST(exprp, VarRef)) {
+            return refp->varp() && isCarrierDType(refp->varp()->childDTypep());
+        }
+        if (const AstFuncRef* const frefp = VN_CAST(exprp, FuncRef)) {
+            const AstFunc* const funcp = VN_CAST(frefp->taskp(), Func);
+            const AstVar* const retp = funcp ? VN_CAST(funcp->fvarp(), Var) : nullptr;
+            return retp && isCarrierDType(retp->childDTypep());
+        }
+        return false;
+    }
+
     // A type conversion between closely related types (9.3.6). Between
     // arrays of the same length it is a no-op on the bits; between numeric
     // types it may round.
@@ -14253,6 +14375,36 @@ private:
                         new AstConst{flp, AstConst::Unsized32{},
                                      static_cast<uint32_t>(want)}};
                 }
+            } else if (name == "resize" && resultp && !carriedDynamically(resultp)
+                       && resultp->lengthEmittable()
+                       && (isDynValue(args[0]) || loweredIsCarrier(firstp))) {
+                // A value that carries its own bounds, resized to a width only
+                // the elaborated design says -- "resize(addr_value,
+                // paddr'length)" in a copy made for the signals a BFM is
+                // given: made that long as a carrier and taken out of it, as
+                // for a width that is a number above. A cast has no bits of a
+                // carrier to cut.
+                VhdlType* const carrp
+                    = dynValueType(args[0]) ? dynValueType(args[0]) : args[0]->vhdlTypep();
+                AstNodeFTask* const rszp
+                    = carrp ? dynResizeFunc(carrp, isSignedType(resultp), flp) : nullptr;
+                AstNodeFTask* const tofp = !rszp ? nullptr
+                                           : resultp->isConstrainedArray()
+                                               ? dynToFixedFunc(carrp, resultp, flp)
+                                               : dynToFixedExprFunc(carrp, resultp, flp);
+                AstNodeExpr* const widthp = tofp ? lowerExpr(args[1]) : nullptr;
+                if (widthp) {
+                    FileLine* const wflp = dynFl(flp);
+                    AstFuncRef* const refp
+                        = new AstFuncRef{wflp, rszp->name(),
+                                         AstNode::addNext(new AstArg{wflp, "", firstp},
+                                                          new AstArg{wflp, "", widthp})};
+                    refp->taskp(VN_AS(rszp, Func));
+                    AstFuncRef* const outp
+                        = new AstFuncRef{wflp, tofp->name(), new AstArg{wflp, "", refp}};
+                    outp->taskp(VN_AS(tofp, Func));
+                    return outp;
+                }
             } else if (name == "resize" && !(resultp && carriedDynamically(resultp))) {
                 // The width comes from another object's range, which V3Width
                 // resolves from the context of the assignment. That works
@@ -14276,8 +14428,7 @@ private:
                               : firstp;
                     sized = new AstCast{flp, srcp, VFlagChildDType{}, wantp};
                 }
-            } else if (resultp && resultp->lengthEmittable()
-                       && !carriedDynamically(resultp)) {
+            } else if (resultp && resultp->lengthEmittable() && !carriedDynamically(resultp)) {
                 // A width that names a generic or a port's bounds is not a
                 // number here. The result's own subtype says it, and what the
                 // value is given to has that subtype, so the width comes from
@@ -24341,6 +24492,33 @@ private:
                 = pair.loweredp ? pair.loweredp->cloneTree(false) : lowerExpr(pair.exprp);
             if (!onep) return false;
             AstVar* const objp = VN_IS(onep, VarRef) ? VN_AS(onep, VarRef)->varp() : nullptr;
+            // The other way about: a value carried with its bounds, handed to
+            // a copy that holds the parameter at a fixed width -- made first
+            // for a call whose actual had one. UVVM's apb_write for a record
+            // hands its own byte_enable on to the one for signals. Only a
+            // parameter of mode IN: it is read, so its elements are copied
+            // into one of the width the copy was made with.
+            if (!fvarp && taskp && prepp && objp && isCarrierDType(objp->childDTypep())
+                && (!pair.formalp || pair.formalp->mode() == VhdlMode::IN)) {
+                const auto ioIt = ios.find(pair.name);
+                AstVar* const formalVarp = ioIt != ios.end() ? ioIt->second : nullptr;
+                AstNodeExpr* leftp = nullptr;
+                AstNodeExpr* rightp = nullptr;
+                bool ascending = false;
+                if (formalVarp && !isCarrierDType(formalVarp->childDTypep())
+                    && emittedBoundsOf(formalVarp, leftp, rightp, ascending, flp)) {
+                    AstVar* const fixp = newTempVar(
+                        "__Vdynfix", formalVarp->childDTypep()->cloneTree(false), flp);
+                    *prepp = AstNode::addNextNull(
+                        *prepp, carrierRoundTripOn(objp, new AstVarRef{flp, fixp, VAccess::READ},
+                                                   leftp, rightp, ascending, false, flp));
+                    VL_DO_DANGLING(onep->deleteTree(), onep);
+                    refp->addArgsp(new AstArg{flp, pair.name, rd(fixp, flp)});
+                    continue;
+                }
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            }
             AstNodeExpr* leftp = nullptr;
             AstNodeExpr* rightp = nullptr;
             bool ascending = false;
@@ -24953,6 +25131,19 @@ private:
                 itemsp,
                 senItemFor(new AstVarRef{flp, varp, VAccess::READ}, isOneBitVar(varp), flp));
         }
+        // An external name (8.7) reads a signal of another module through a
+        // hierarchical reference, and is waited on the same way. Left out,
+        // a condition that also read a constant parameter waited on that
+        // alone and woke only at its timeout: "wait until (target = exp)"
+        // in UVVM's await_value, given a clock by an external name through
+        // two procedures, never saw the clock change (clock_generator_tb).
+        std::set<std::string> xrefNames;
+        condp->foreach([&](AstVarXRef* xrefp) {
+            if (!xrefNames.insert(xrefp->dotted() + "." + xrefp->name()).second) return;
+            AstVarXRef* const readp = xrefp->cloneTree(false);
+            readp->access(VAccess::READ);
+            itemsp = AstNode::addNext(itemsp, senItemFor(readp, false, flp));
+        });
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
@@ -27944,6 +28135,8 @@ private:
         m_modp->addStmtsp(m_shadowsp);
         m_shadowsp = nullptr;
         m_shadows.clear();
+        m_partShadows.clear();
+        m_partShadowVars.clear();
         relaxConcurrentDeltas(flp);
         m_concDeltas.clear();
         m_concSenp.clear();
