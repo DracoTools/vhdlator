@@ -8873,7 +8873,8 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         prefixTypep = prefixTypep->base()->designatedp();
     }
     const bool isArray = prefixTypep && prefixTypep->base()->kind() == VhdlTypeKind::ARRAY;
-    if (prefixTypep && !prefixTypep->isError() && !m_inSpecialized) {
+    if (prefixTypep && (!prefixTypep->isError() || prefixTypep->base()->isGenericFormal())
+        && !m_inSpecialized) {
         checkAttrPrefix(nodep, prefixTypep, isArray);
     }
 
@@ -10430,8 +10431,12 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
             return isSlice ? analyzeSliceName(nodep, retp) : analyzeIndexedName(nodep, retp);
         }
+        // A value of a generic type is not in error: it is of a type of its
+        // own, which only its own operations take (6.5.3)
         for (const VhdlType* const typep : argTypes) {
-            if (typep && typep->isError()) return V3VhdlStd::errorType();
+            if (typep && typep->isError() && !typep->base()->isGenericFormal()) {
+                return V3VhdlStd::errorType();
+            }
         }
         const std::string name = parts.empty() ? std::string{"<name>"} : parts.back();
         // Where exactly one declaration has the right formals, say which
@@ -10511,7 +10516,7 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         // saying the call is ambiguous on top of the mistake that made it so
         // is noise rather than news
         for (const VhdlType* const typep : argTypes) {
-            if (!typep || !typep->isError()) continue;
+            if (!typep || !typep->isError() || typep->base()->isGenericFormal()) continue;
             nodep->vhdlSymp(cands[0]);
             return cands[0]->returnTypep() ? cands[0]->returnTypep()
                                            : V3VhdlStd::errorType();

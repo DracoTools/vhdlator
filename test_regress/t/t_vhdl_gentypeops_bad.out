@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_gentypeops_bad.vhd:29:22: No visible subprogram 'to_hstring' takes 1 argument(s) of these types: argument 1 is t_element, and every declaration wants bit_vector or std_ulogic_vector or unresolved_signed or unresolved_unsigned there
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_gentypeops_bad.vhd:34:13: Attribute 'length asks about an array, but 'a' is of type t_element
+%Error: Exiting due to

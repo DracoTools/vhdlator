@@ -4950,6 +4950,49 @@ private:
         return funcp;
     }
 
+    // Writing one character of a STRING held as text. SystemVerilog's putc
+    // leaves the string as it was when the character is 0 (1800-2023
+    // 6.16.2), but NUL is a CHARACTER like any other (16.3): UVVM pads every
+    // name with it and strips it again, so a NUL written as nothing leaves
+    // what was there before. Where the character is NUL it is spliced in.
+    AstNodeFTask* m_putcFuncp = nullptr;
+    AstNodeFTask* putcFunc(FileLine* origFlp) {
+        if (m_putcFuncp && usableHelper(m_putcFuncp)) return m_putcFuncp;
+        if (!m_modp) return nullptr;
+        FileLine* const flp = dynFl(origFlp);
+        const std::string name = "__Vputc";
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp));
+        AstVar* const sp = dynArg(funcp, "s", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+        AstVar* const ip = dynArg(funcp, "i", newIntDType(flp), flp);
+        AstVar* const cp = dynArg(funcp, "c", newLogicDType(flp, 8), flp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        const auto num = [&](int v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        AstNodeExpr* const headp
+            = new AstSubstrN{flp, rd(sp, flp), num(0), new AstSub{flp, rd(ip, flp), num(1)}};
+        AstNodeExpr* const tailp
+            = new AstSubstrN{flp, rd(sp, flp), new AstAdd{flp, rd(ip, flp), num(1)},
+                             new AstSub{flp, new AstLenN{flp, rd(sp, flp)}, num(1)}};
+        AstNodeExpr* const splicep = new AstConcatN{
+            flp,
+            new AstConcatN{flp, headp,
+                           new AstConst{flp, AstConst::String{}, std::string(1, '\0')}},
+            tailp};
+        AstNodeExpr* const inRangep
+            = new AstLogAnd{flp, new AstGteS{flp, rd(ip, flp), num(0)},
+                            new AstLtS{flp, rd(ip, flp), new AstLenN{flp, rd(sp, flp)}}};
+        funcp->addStmtsp(new AstAssign{flp, out(), rd(sp, flp)});
+        funcp->addStmtsp(new AstIf{
+            flp, new AstEq{flp, rd(cp, flp), new AstConst{flp, AstConst::WidthedValue{}, 8, 0}},
+            new AstIf{flp, inRangep, new AstAssign{flp, out(), splicep}},
+            new AstAssign{flp, out(), new AstPutcN{flp, rd(sp, flp), rd(ip, flp), rd(cp, flp)}}});
+        addHelperFunc(funcp);
+        m_putcFuncp = funcp;
+        return funcp;
+    }
+
     // A positional aggregate some of whose elements are arrays of its own
     // type -- "(x(5 downto 0), y(W - 1 downto 0))" -- is those arrays and
     // elements one after the other (9.3.3.3), which is what joining them
@@ -6884,7 +6927,7 @@ private:
                     setp, static_cast<AstNode*>(new AstAssign{
                               flp, new AstVarRef{flp, varp, VAccess::WRITE},
                               new AstReplicateN{
-                                  flp, new AstConst{flp, AstConst::String{}, " "},
+                                  flp, new AstConst{flp, AstConst::String{}, std::string(1, '\0')},
                                   new AstVarRef{flp, lenp, VAccess::READ}}}));
                 // A declaration of a subprogram is elaborated on every call;
                 // anywhere else it happens once, before the design runs, and
@@ -6974,7 +7017,9 @@ private:
         if (!typep || !isStringType(typep) || typep->isConstrainedArray()) return nullptr;
         AstNodeExpr* const lenp = dynamicLength(typep, flp);
         if (!lenp) return nullptr;
-        return new AstReplicateN{flp, new AstConst{flp, AstConst::String{}, " "}, lenp};
+        // Every character starts at CHARACTER'LEFT, which is NUL (6.4.2.3)
+        return new AstReplicateN{flp, new AstConst{flp, AstConst::String{}, std::string(1, '\0')},
+                                 lenp};
     }
 
     // How long an array whose bounds are expressions will be, as an
@@ -12136,6 +12181,22 @@ private:
                 if (AstNodeExpr* const outp = unpackedConcat(nodep, lhsp, rhsp, flp)) {
                     return outp;
                 }
+            }
+            // A character joined to text becomes a string of one, and a 0
+            // byte made a string in SystemVerilog is no character at all
+            // (1800-2023 6.16), where NUL is a CHARACTER like any other
+            // (16.3): "name & NUL" came out one short. Written with %c it is
+            // the character, whatever it is.
+            if (isStringType(rtypep)) {
+                const auto keepNul = [&](const AstNodeVhdlExpr* opp, AstNodeExpr* exprp) {
+                    const VhdlType* const optp = opp ? opp->vhdlTypep() : nullptr;
+                    if (!optp || optp->base() != V3VhdlStd::characterType()) return exprp;
+                    const AstConst* const constp = VN_CAST(exprp, Const);
+                    if (constp && !constp->num().isEqZero()) return exprp;
+                    return static_cast<AstNodeExpr*>(new AstSFormatF{flp, "%c", false, exprp});
+                };
+                lhsp = keepNul(nodep->lhsp(), lhsp);
+                rhsp = keepNul(nodep->rhsp(), rhsp);
             }
             return new AstConcat{flp, lhsp, rhsp};
         }
@@ -21153,8 +21214,21 @@ private:
                 VL_DO_DANGLING(wholep->deleteTree(), wholep);
                 return nullptr;
             }
-            outp = new AstPutcN{flp, wholep->cloneTree(false),
-                                stringIndex(strTypep, idxp, flp), valuep};
+            // A character known not to be NUL is SystemVerilog's putc
+            const AstConst* const cvalp = VN_CAST(valuep, Const);
+            AstNodeFTask* const putcp
+                = cvalp && !cvalp->num().isEqZero() ? nullptr : putcFunc(flp);
+            if (putcp) {
+                AstArg* const argsp = new AstArg{flp, "", wholep->cloneTree(false)};
+                argsp->addNext(new AstArg{flp, "", stringIndex(strTypep, idxp, flp)});
+                argsp->addNext(new AstArg{flp, "", valuep});
+                AstFuncRef* const refp = new AstFuncRef{flp, putcp->name(), argsp};
+                refp->taskp(VN_AS(putcp, Func));
+                outp = refp;
+            } else {
+                outp = new AstPutcN{flp, wholep->cloneTree(false),
+                                    stringIndex(strTypep, idxp, flp), valuep};
+            }
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(callp->prefixp());
         VL_DO_DANGLING(wholep->deleteTree(), wholep);
