@@ -154,6 +154,7 @@ class DelayedVisitor final : public VNVisitor {
         bool m_partial = false;  // Used on LHS of NBA under a Sel
         bool m_inLoop = false;  // Used on LHS of NBA in a loop
         bool m_inSuspOrFork = false;  // Used on LHS of NBA in suspendable process or fork
+        uint32_t m_nSites = 0;  // Number of NBAs in the source that assign it
         Scheme m_scheme = Scheme::Undecided;  // Conversion scheme to use for this variable
         uint32_t m_nTmp = 0;  // Temporary number for unique names
 
@@ -451,8 +452,16 @@ class DelayedVisitor final : public VNVisitor {
         // would commit only its last write. The masked shadow scheme has no
         // 'Pre' copy, which is what cannot follow a suspendable, and commits
         // every bit written, so it works there too.
+        // Nor where more than one NBA assigns it: unique flags are committed
+        // in the order the NBAs appear in the source, and IEEE 1800-2023
+        // 10.4.2 has them performed in the order they were executed -- two
+        // processes that assign it in one time slot left the value of the
+        // one written first in the source, whichever ran last. The masked
+        // shadow is one value per variable, so the last write executed is
+        // the one committed.
         if (vscpInfo.m_inSuspOrFork) {
-            if (isIntegralOrPacked && vscpInfo.m_inLoop && vscpInfo.m_partial) {
+            if (isIntegralOrPacked
+                && ((vscpInfo.m_inLoop && vscpInfo.m_partial) || vscpInfo.m_nSites > 1)) {
                 return Scheme::ShadowVarMasked;
             }
             return Scheme::FlagUnique;
@@ -1303,6 +1312,7 @@ class DelayedVisitor final : public VNVisitor {
         vscpInfo.m_partial |= VN_IS(nodep->lhsp(), Sel);
         vscpInfo.m_inLoop |= m_inLoop;
         vscpInfo.m_inSuspOrFork |= m_inSuspendableOrFork;
+        ++vscpInfo.m_nSites;
         // Sensitivity might be non-clocked, in a suspendable process, which are handled elsewhere
         if (m_activep->sentreep()->hasClocked()) {
             if (vscpInfo.m_fistActivep != m_activep) {
