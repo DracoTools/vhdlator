@@ -1736,11 +1736,13 @@ private:
         // "left to right" holds right-left+1, "left downto right" left-right+1
         AstNodeExpr* diffp = nullptr;
         if (rp->dirUnknown()) {
-            // Which way round it runs only folds with the instance
-            diffp = new AstCond{
-                flp, ascendingOf(leftp, rightp, flp),
-                new AstSub{flp, rightp->cloneTree(false), leftp->cloneTree(false)},
-                new AstSub{flp, leftp, rightp}};
+            // Which way round it runs only folds with the instance: the
+            // actual's 'ASCENDING, where the instance binds it
+            AstNodeExpr* ascp = boundsAscendingExpr(idxp, flp);
+            if (!ascp) ascp = ascendingOf(leftp, rightp, flp);
+            diffp = new AstCond{flp, ascp,
+                                new AstSub{flp, rightp->cloneTree(false), leftp->cloneTree(false)},
+                                new AstSub{flp, leftp, rightp}};
         } else {
             diffp = rp->dir() == VhdlDir::TO
                         ? static_cast<AstNodeExpr*>(new AstSub{flp, rightp, leftp})
@@ -6518,6 +6520,13 @@ private:
         }
         varp->declDirection(varp->direction());
         if (triPort) m_triPorts.insert(varp);
+        // A record's default is left out: an interface record's default
+        // gives its inward elements 'Z', which a value here cannot hold, and
+        // the net's resolution is worked out from the drivers' values
+        if (triPort && nodep->defaultp()
+            && symp->typep()->base()->kind() != VhdlTypeKind::RECORD) {
+            m_triDefaults.emplace(varp, nodep->defaultp());
+        }
         varp->ansi(true);
         // A port's default value is what an input takes when the instance
         // leaves it open, and what an output's driver starts at (6.5.6.3).
@@ -7357,7 +7366,9 @@ private:
                     // default as the range is long, which V3Param settles
                     // along with the range itself
                     if (AstNodeExpr* const lenp = boundsLength(typep, flp)) {
-                        return new AstReplicate{flp, elemp, lenp};
+                        // As many as the range is declared with, which a
+                        // null one given "G - 1 downto 0" still has two of
+                        return new AstReplicate{flp, elemp, declaredPlaces(lenp, flp)};
                     }
                 }
                 AstNodeExpr* const outp = packedRepeat(elemp, count, flp);
@@ -7847,8 +7858,13 @@ private:
                 if (!dirKnown) {
                     // The bounds arrive with the instance, and so does which
                     // way round they run, so every answer is written to fold
-                    // once they do
-                    AstNodeExpr* const ascp = ascendingOf(leftp, rightp, flp);
+                    // once they do. Which way is the actual's own 'ASCENDING
+                    // where the instance binds it: read off the bounds, a
+                    // null range "(G - 1 downto 0)" of an instance given 0
+                    // is "-1 to 0", two elements long -- UVVM's AXI VVC with
+                    // no ID bits saw awid'length 2
+                    AstNodeExpr* ascp = boundsAscendingExpr(indexSubtype(typep, dim), flp);
+                    if (!ascp) ascp = ascendingOf(leftp, rightp, flp);
                     if (attr == "ascending") {
                         VL_DO_DANGLING(leftp->deleteTree(), leftp);
                         VL_DO_DANGLING(rightp->deleteTree(), rightp);
@@ -8535,6 +8551,148 @@ private:
     }
     std::map<std::pair<const VhdlSymbol*, std::string>, VhdlShadow> m_partShadows;
     std::set<const AstVar*> m_partShadowVars;  // The history variables of those
+
+    // A signal of this architecture associated with an element of an inout
+    // port is that element: one signal, with the instance's drivers and this
+    // architecture's together (6.5.7.1). A pin carries the whole port, so the
+    // element of the signal standing in for the port is what this
+    // architecture's names of the signal come to mean.
+    std::vector<std::pair<AstVar*, AstNodeExpr*>> m_elemAliases;
+    std::set<const AstVar*> m_elemAliased;
+
+    // An integer the lowering wrote as arithmetic on literals: "3 - 1"
+    static bool foldedInt(const AstNode* nodep, int64_t& valr) {
+        if (const AstConst* const constp = VN_CAST(nodep, Const)) {
+            if (constp->num().isFourState() || constp->width() > 64) return false;
+            valr = constp->num().isSigned() ? constp->num().toSQuad()
+                                            : static_cast<int64_t>(constp->num().toUQuad());
+            return true;
+        }
+        int64_t l = 0;
+        int64_t r = 0;
+        if (const AstNodeBiop* const biopp = VN_CAST(nodep, NodeBiop)) {
+            if (!foldedInt(biopp->lhsp(), l) || !foldedInt(biopp->rhsp(), r)) return false;
+            if (VN_IS(nodep, Add)) {
+                valr = l + r;
+            } else if (VN_IS(nodep, Sub)) {
+                valr = l - r;
+            } else if (VN_IS(nodep, Mul) || VN_IS(nodep, MulS)) {
+                valr = l * r;
+            } else {
+                return false;
+            }
+            return true;
+        }
+        if (const AstNegate* const negp = VN_CAST(nodep, Negate)) {
+            if (!foldedInt(negp->lhsp(), l)) return false;
+            valr = -l;
+            return true;
+        }
+        return false;
+    }
+    // The shape of a lowered scalar or packed array: its element kind and the
+    // bounds of each dimension, outermost first, where literals settle them
+    static bool packedShape(const AstNodeDType* dtp, std::string& kindr,
+                            std::vector<std::pair<int64_t, int64_t>>& dimsr) {
+        if (const AstBasicDType* const bdtp = VN_CAST(dtp, BasicDType)) {
+            kindr = bdtp->keyword().ascii();
+            if (const AstRange* const rangep = bdtp->rangep()) {
+                int64_t l = 0;
+                int64_t r = 0;
+                if (!foldedInt(rangep->leftp(), l) || !foldedInt(rangep->rightp(), r)) {
+                    return false;
+                }
+                dimsr.emplace_back(l, r);
+            } else if (bdtp->nrange().ranged()) {
+                dimsr.emplace_back(bdtp->left(), bdtp->right());
+            }
+            return true;
+        }
+        if (const AstPackArrayDType* const adtp = VN_CAST(dtp, PackArrayDType)) {
+            const AstRange* const rangep = adtp->rangep();
+            int64_t l = 0;
+            int64_t r = 0;
+            if (!rangep || !foldedInt(rangep->leftp(), l) || !foldedInt(rangep->rightp(), r)) {
+                return false;
+            }
+            dimsr.emplace_back(l, r);
+            const AstNodeDType* const subp
+                = adtp->childDTypep() ? adtp->childDTypep() : adtp->subDTypep();
+            return subp && packedShape(subp, kindr, dimsr);
+        }
+        return false;
+    }
+    // The lowered type of an element of a structure, before widths are
+    // known: "s.a.b" is found through the members' own declarations
+    static const AstNodeDType* partDType(const AstNodeExpr* partp) {
+        if (const AstVarRef* const refp = VN_CAST(partp, VarRef)) {
+            return refp->varp()->childDTypep() ? refp->varp()->childDTypep()
+                                               : refp->varp()->dtypep();
+        }
+        const AstMemberSel* const selp = VN_CAST(partp, MemberSel);
+        if (!selp) return nullptr;
+        const AstNodeUOrStructDType* const structp
+            = VN_CAST(partDType(selp->fromp()), NodeUOrStructDType);
+        if (!structp) return nullptr;
+        for (const AstMemberDType* memp = structp->membersp(); memp;
+             memp = VN_AS(memp->nextp(), MemberDType)) {
+            if (memp->name() != selp->name()) continue;
+            return memp->childDTypep() ? memp->childDTypep() : memp->subDTypep();
+        }
+        return nullptr;
+    }
+    // Whether an actual can be the element it is associated with: a signal of
+    // this architecture as a whole, not yet any other element, whose lowered
+    // type is the element's to the bound, so an index written against
+    // either names the same bit
+    bool aliasableActual(const AstVhdlAssoc* asp, const AstNodeExpr* actp,
+                         const AstNodeExpr* partp) const {
+        const AstVhdlName* const namep = VN_CAST(asp->actualp(), VhdlName);
+        const VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
+        if (!symp || symp->resolved()->kind() != VhdlSymKind::SIGNAL
+            || declaredInPackage(symp->resolved())) {
+            return false;
+        }
+        const AstVarRef* const refp = VN_CAST(actp, VarRef);
+        if (!refp || refp->varp()->isIO() || m_elemAliased.count(refp->varp())) return false;
+        const AstNodeDType* const actDtp
+            = refp->varp()->childDTypep() ? refp->varp()->childDTypep() : refp->varp()->dtypep();
+        const AstNodeDType* const partDtp = partDType(partp);
+        std::string actKind;
+        std::string partKind;
+        std::vector<std::pair<int64_t, int64_t>> actDims;
+        std::vector<std::pair<int64_t, int64_t>> partDims;
+        return actDtp && partDtp && packedShape(actDtp, actKind, actDims)
+               && packedShape(partDtp, partKind, partDims) && actKind == partKind
+               && actDims == partDims;
+    }
+    // Every name of such a signal becomes the element; the signal itself
+    // follows it, for a name another unit reaches it by
+    void settleElementAliases() {
+        if (m_elemAliases.empty()) return;
+        std::vector<AstVarRef*> refps;
+        m_modp->foreach([&](AstVarRef* refp) {
+            if (m_elemAliased.count(refp->varp())) refps.push_back(refp);
+        });
+        std::map<const AstVar*, AstNodeExpr*> partOf;
+        for (const auto& pair : m_elemAliases) partOf.emplace(pair.first, pair.second);
+        for (AstVarRef* const refp : refps) {
+            AstNodeExpr* const newp = partOf.at(refp->varp())->cloneTree(false);
+            const VAccess access = refp->access();
+            newp->foreach([&](AstVarRef* innerp) { innerp->access(access); });
+            refp->replaceWith(newp);
+            VL_DO_DANGLING(refp->deleteTree(), refp);
+        }
+        for (const auto& pair : m_elemAliases) {
+            AstVar* const varp = pair.first;
+            FileLine* const cflp = new FileLine{varp->fileline()};
+            cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            m_modp->addStmtsp(new AstAlways{
+                new AstAssignW{cflp, new AstVarRef{cflp, varp, VAccess::WRITE}, pair.second}});
+        }
+        m_elemAliases.clear();
+        m_elemAliased.clear();
+    }
 
     // The history of a signal an attribute made rather than the design:
     // "clk'DELAYED(t)'LAST_EVENT" asks about the delayed signal's own past,
@@ -12536,6 +12694,9 @@ private:
         if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
             return exprVectorWidth(qp->valuep());
         }
+        // A literal of an unconstrained type -- x"a0" as an UNSIGNED operand
+        // of "+" -- is as long as what it spells
+        if (VN_IS(nodep, VhdlLiteral)) return staticArrayLength(nodep, nodep->vhdlTypep());
         return 0;
     }
 
@@ -19352,6 +19513,14 @@ private:
             const bool outward = declp
                                  && (declp->mode() == VhdlMode::OUT
                                      || declp->mode() == VhdlMode::BUFFER);
+            // Both ways at once is one signal, not two wired together
+            if (declp && declp->mode() == VhdlMode::INOUT && aliasableActual(asp, actp, partp)) {
+                AstVar* const actVarp = VN_AS(actp, VarRef)->varp();
+                m_elemAliases.emplace_back(actVarp, partp);
+                m_elemAliased.insert(actVarp);
+                VL_DO_DANGLING(actp->deleteTree(), actp);
+                continue;
+            }
             FileLine* const cflp = new FileLine{flp};
             cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
             addStmt(new AstAlways{outward ? new AstAssignW{cflp, actp, partp}
@@ -23729,6 +23898,60 @@ private:
     // How large, in nodes, a copy made for a call may be and still be written
     // into its caller
     static constexpr int kLargeSignalCopy = 2000;
+
+    // The shared variable, or the part of one, that a composite variable
+    // parameter is given, where a copy of the subprogram can name it itself:
+    // through an alias or not, selected with nothing the caller alone can see
+    // -- a generic, a literal, a package's constant, but not a variable of the
+    // calling process
+    AstNodeVhdlExpr* sharedVariableActual(const AstVhdlIfaceDecl* formalp,
+                                          AstNodeVhdlExpr* actualp) const {
+        if (!actualp || formalp->kind() != VhdlIfaceKind::VARIABLE) return nullptr;
+        const VhdlType* const ftypep
+            = formalp->vhdlSymp() ? formalp->vhdlSymp()->typep() : nullptr;
+        if (!ftypep
+            || (ftypep->base()->kind() != VhdlTypeKind::RECORD
+                && ftypep->base()->kind() != VhdlTypeKind::ARRAY)) {
+            return nullptr;
+        }
+        for (int depth = 0; depth < 32; ++depth) {
+            const VhdlSymbol* const asymp = actualp->vhdlSymp();
+            if (!asymp || asymp->kind() != VhdlSymKind::ALIAS) break;
+            AstVhdlAliasDecl* const adeclp = VN_CAST(asymp->declp(), VhdlAliasDecl);
+            if (!adeclp || !adeclp->targetp()) return nullptr;
+            actualp = adeclp->targetp();
+        }
+        if (!VN_IS(actualp, VhdlName) && !VN_IS(actualp, VhdlSelected)
+            && !VN_IS(actualp, VhdlCall)) {
+            return nullptr;
+        }
+        const VhdlSymbol* const rootp = rootSymOf(actualp);
+        if (!rootp || rootp->resolved()->kind() != VhdlSymKind::SHARED_VARIABLE) return nullptr;
+        // A protected type's object is handed over as the object already
+        if (rootp->resolved()->typep()
+            && rootp->resolved()->typep()->base()->kind() == VhdlTypeKind::PROTECTED) {
+            return nullptr;
+        }
+        bool nameable = true;
+        actualp->foreach([&](const AstNodeVhdlExpr* exprp) {
+            const VhdlSymbol* const symp = exprp->vhdlSymp();
+            if (!symp) return;
+            const VhdlSymbol* const resp = symp->resolved();
+            switch (resp->kind()) {
+            case VhdlSymKind::SHARED_VARIABLE:
+            case VhdlSymKind::GENERIC:
+            case VhdlSymKind::ENUM_LITERAL:
+            case VhdlSymKind::PHYSICAL_UNIT:
+            case VhdlSymKind::TYPE:
+            case VhdlSymKind::RECORD_ELEMENT: break;
+            case VhdlSymKind::CONSTANT:
+                if (!declaredInPackage(resp)) nameable = false;
+                break;
+            default: nameable = false;
+            }
+        });
+        return nameable ? actualp : nullptr;
+    }
     AstNodeFTask* signalCopyFor(VhdlSymbol* symp, AstVhdlCall* callp,
                                 std::vector<AstVhdlExprPair>& passed) {
         m_sigCopyWhy.clear();
@@ -23804,6 +24027,23 @@ private:
                 continue;
             }
             if (formals[i]->kind() != VhdlIfaceKind::SIGNAL) {
+                // A composite variable parameter may be passed by reference
+                // (4.2.2.2), and a shared variable handed to a procedure that
+                // never returns is only ever seen that way: UVVM's UART
+                // monitor runs forever, writing what it saw into the shared
+                // transaction record the testbench reads on each trigger, and
+                // reading the configuration the testbench changes as it goes.
+                // The copy is made for this call, so the formal can be that
+                // object itself.
+                if (AstNodeVhdlExpr* const sharedp = sharedVariableActual(formals[i], actualp)) {
+                    exprBind.emplace(formals[i]->vhdlSymp(), sharedp);
+                    std::string path;
+                    key += "|shv" + formals[i]->name() + "="
+                           + (staticSelectKey(sharedp, path)
+                                  ? path
+                                  : std::to_string(reinterpret_cast<uintptr_t>(sharedp)));
+                    continue;
+                }
                 if (actualp) {
                     passed.push_back(
                         AstVhdlExprPair{formals[i]->name(), actualp, nullptr, formals[i]});
@@ -24001,6 +24241,17 @@ private:
                                                + formals[i]->name());
                     }
                     for (size_t d = 0; d < idxExprps.size(); ++d) {
+                        // The copy takes each index as an INTEGER; an index
+                        // of an enumeration -- UVVM's triggers are indexed by
+                        // channel, TX or RX -- is its position, as wide
+                        if (!isIntegerType(idxExprps[d]->vhdlTypep())) {
+                            if (AstNodeExpr* const idxp = lowerExpr(idxExprps[d])) {
+                                passed.push_back(
+                                    AstVhdlExprPair{dyn.argNames[d], nullptr,
+                                                    sizedTo(idxp, 32, idxExprps[d]->fileline())});
+                                continue;
+                            }
+                        }
                         passed.push_back(AstVhdlExprPair{dyn.argNames[d], idxExprps[d]});
                     }
                     dynBind.emplace(formals[i]->vhdlSymp(), dyn);
@@ -27470,9 +27721,26 @@ private:
         AstVar* const valp = new AstVar{flp, VVarType::VAR, base + "__val", portp};
         AstVar* const enp = new AstVar{flp, VVarType::VAR, base + "__en", VFlagChildDType{},
                                        new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
-        // Nothing is driven until the subprogram has run, which is what a
-        // driver contributes before its first transaction
-        enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
+        AstNodeExpr* const dfltp = triDefaultValue(portp);
+        if (dfltp) {
+            // The driver a process has of a signal it assigns starts at the
+            // signal's default (14.7.2), before the process has run: UVVM's
+            // UART transmitter holds its line at the idle level its port
+            // declares until the first byte goes out. What the default says
+            // is 'Z' is 0 here, which the resolution of the port leaves to
+            // the other drivers.
+            valp->valuep(dfltp);
+            enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 1});
+        } else {
+            // What the call has not assigned it does not drive: an interface
+            // record the call drives a few elements of -- cs, rena, addr of
+            // UVVM's SBI -- would otherwise drive the others, rdata among
+            // them, with nothing, over the design that drives them
+            // (uart_vvc_tb read TX_READY as 0)
+            valp->valuep(new AstConst{flp, AstConst::StringToParse{}, "'z"});
+            // Nothing is driven until the subprogram has run
+            enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
+        }
         addStmt(valp);
         addStmt(enp);
         addStmt(new AstAlways{new AstAssignW{
@@ -27526,6 +27794,52 @@ private:
         return false;
     }
     std::set<const AstVar*> m_triPorts;  // Ports a net's resolution decides
+    // The defaults those ports were declared with, which are drivers rather
+    // than initial values
+    std::map<const AstVar*, AstNodeVhdlExpr*> m_triDefaults;
+
+    // The default such a port was declared with, where it has the port's own
+    // shape. One that carries its bounds is left out.
+    AstNodeExpr* triDefaultValue(const AstVar* portp) {
+        const auto it = m_triDefaults.find(portp);
+        if (it == m_triDefaults.end()) return nullptr;
+        AstNodeExpr* const valuep = lowerExpr(it->second);
+        // A function giving back a record whose element lengths travel with
+        // it gives one of the structures made for that, not the port's
+        const AstFuncRef* const frefp = VN_CAST(valuep, FuncRef);
+        const AstFunc* const funcp = frefp ? VN_CAST(frefp->taskp(), Func) : nullptr;
+        const AstVar* const retp = funcp ? VN_CAST(funcp->fvarp(), Var) : nullptr;
+        const bool openRecord = retp && retp->childDTypep()
+                                && VN_IS(retp->childDTypep()->skipRefp(), StructDType)
+                                && !VN_AS(retp->childDTypep()->skipRefp(), StructDType)->packed();
+        if (valuep && (loweredIsCarrier(valuep) || openRecord)) {
+            VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            return nullptr;
+        }
+        return valuep;
+    }
+    // A port of mode inout that nothing in the instance drives contributes
+    // its default to the net it is connected to (14.7.3.2): an idle level
+    // the design declares, which nothing would otherwise hold
+    void driveTriDefaults() {
+        if (m_triDefaults.empty()) return;
+        std::set<const AstVar*> written;
+        m_modp->foreach([&](const AstVarRef* refp) {
+            if (refp->access().isWriteOrRW()) written.insert(refp->varp());
+        });
+        for (const auto& pair : m_triDefaults) {
+            AstVar* const portp = const_cast<AstVar*>(pair.first);
+            if (written.count(portp) || m_subDrivers.count(portp)) continue;
+            AstNodeExpr* const dfltp = triDefaultValue(portp);
+            if (!dfltp) continue;
+            FileLine* const flp = portp->fileline();
+            m_modp->addStmtsp(new AstAlways{
+                new AstAssignW{flp, new AstVarRef{flp, portp, VAccess::WRITE}, dfltp}});
+        }
+        // Whatever lowering the defaults made on the way belongs here too
+        m_modp->addStmtsp(m_stmtsp);
+        m_stmtsp = nullptr;
+    }
 
     // The variable an assignment writes, through selections of every kind:
     // those this lowering makes too -- "ifc.tkeep(i)" is a bit selected from
@@ -27546,10 +27860,13 @@ private:
         return nullptr;
     }
 
-    void redirectPortDrives(AstNodeFTask* ftaskp) {
-        if (!m_modp) return;
+    // The signal assignments under a node that drive a port a net's
+    // resolution decides, and of those only the ports "wantedp" names when
+    // it names any
+    std::vector<AstNodeAssign*> triPortDrives(AstNode* rootp,
+                                              const std::set<const AstVar*>* wantedp) const {
         std::vector<AstNodeAssign*> asgps;
-        ftaskp->foreach([&](AstNodeAssign* asgp) {
+        rootp->foreach([&](AstNodeAssign* asgp) {
             if (!VN_IS(asgp, AssignDly) && !VN_IS(asgp, AssignW)) return;
             AstVarRef* const refp = lvalueVarRef(asgp->lhsp());
             if (!refp || !refp->varp()) return;
@@ -27557,8 +27874,53 @@ private:
             if (varp->isFuncLocal() || !varp->isIO()) return;
             if (varp->direction() != VDirection::INOUT) return;
             if (!m_triPorts.count(varp)) return;
+            if (wantedp && !wantedp->count(varp)) return;
             asgps.push_back(asgp);
         });
+        return asgps;
+    }
+    // Which ports each subprogram's drives were given a driver of their own
+    std::map<const AstNodeFTask*, std::set<const AstVar*>> m_subDriven;
+
+    void redirectPortDrives(AstNodeFTask* ftaskp) {
+        if (!m_modp) return;
+        const std::vector<AstNodeAssign*> asgps = triPortDrives(ftaskp, nullptr);
+        for (AstNodeAssign* const asgp : asgps) {
+            m_subDriven[ftaskp].insert(lvalueVarRef(asgp->lhsp())->varp());
+        }
+        redirectToSubDrivers(asgps);
+    }
+    // A process has one driver of a signal however its assignments are
+    // written (14.7.2): one that calls a subprogram driving a port drives it
+    // with the driver that call uses, in its own statements too. Two drivers
+    // there -- the call's and the process's -- would be resolved against each
+    // other, so the address an SBI access set through the BFM and the one
+    // the process then wrote itself came out ORed together.
+    void redirectProcessDrives() {
+        if (m_subDriven.empty()) return;
+        std::vector<AstNodeProcedure*> procps;
+        m_modp->foreach([&](AstNodeProcedure* procp) { procps.push_back(procp); });
+        for (AstNodeProcedure* const procp : procps) {
+            std::set<const AstVar*> ports;
+            std::set<const AstNodeFTask*> seen;
+            std::vector<const AstNode*> todo{procp};
+            while (!todo.empty()) {
+                const AstNode* const nodep = todo.back();
+                todo.pop_back();
+                nodep->foreach([&](const AstNodeFTaskRef* callp) {
+                    const AstNodeFTask* const taskp = callp->taskp();
+                    if (!taskp || !seen.insert(taskp).second) return;
+                    const auto it = m_subDriven.find(taskp);
+                    if (it != m_subDriven.end())
+                        ports.insert(it->second.begin(), it->second.end());
+                    todo.push_back(taskp);
+                });
+            }
+            if (!ports.empty()) redirectToSubDrivers(triPortDrives(procp, &ports));
+        }
+        m_subDriven.clear();
+    }
+    void redirectToSubDrivers(const std::vector<AstNodeAssign*>& asgps) {
         for (AstNodeAssign* const asgp : asgps) {
             FileLine* const flp = asgp->fileline();
             AstVarRef* const refp = lvalueVarRef(asgp->lhsp());
@@ -28021,7 +28383,11 @@ private:
         m_emitting.clear();
         m_drivers.clear();
         m_subDrivers.clear();
+        m_subDriven.clear();
         m_triPorts.clear();
+        m_triDefaults.clear();
+        m_elemAliases.clear();
+        m_elemAliased.clear();
         m_bindTypes.clear();
         m_bindDrivers.clear();
         m_driverCount.clear();
@@ -28132,6 +28498,7 @@ private:
         settleExternalNames();
         m_modp->addStmtsp(m_stmtsp);
         m_stmtsp = nullptr;
+        driveTriDefaults();
         m_modp->addStmtsp(m_shadowsp);
         m_shadowsp = nullptr;
         m_shadows.clear();
@@ -28141,6 +28508,8 @@ private:
         m_concDeltas.clear();
         m_concSenp.clear();
         m_historied.clear();
+        redirectProcessDrives();
+        settleElementAliases();
         m_netlistp->addModulesp(m_modp);
         m_modp = nullptr;
     }

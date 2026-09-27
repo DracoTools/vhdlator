@@ -2135,7 +2135,7 @@ private:
     void bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
     void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
     bool defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim, int64_t& leftr,
-                       int64_t& rightr) VL_MT_DISABLED;
+                       int64_t& rightr, bool* ascendingp = nullptr) VL_MT_DISABLED;
     void constrainBlockPorts(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
 
     VhdlType* loopParamType(const RangeInfo& info, FileLine* flp,
@@ -13967,7 +13967,7 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
 // has them, and otherwise its length starting at the index subtype's own left
 // bound (9.3.3.3)
 bool VhdlSemVisitor::defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim,
-                                   int64_t& leftr, int64_t& rightr) {
+                                   int64_t& leftr, int64_t& rightr, bool* ascendingp) {
     VhdlType* const valueTypep = valuep->vhdlTypep();
     if (valueTypep && valueTypep->isConstrainedArray()
         && dim < static_cast<int>(valueTypep->indexTypes().size())) {
@@ -13975,6 +13975,7 @@ bool VhdlSemVisitor::defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, in
         if (idxp && idxp->bounded()) {
             leftr = idxp->left();
             rightr = idxp->right();
+            if (ascendingp) *ascendingp = idxp->ascending();
             return true;
         }
     }
@@ -13987,6 +13988,7 @@ bool VhdlSemVisitor::defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, in
     if (len < 0) return false;
     leftr = baseIndexes[0]->left();
     rightr = baseIndexes[0]->ascending() ? leftr + len - 1 : leftr - len + 1;
+    if (ascendingp) *ascendingp = baseIndexes[0]->ascending();
     return true;
 }
 
@@ -14005,7 +14007,27 @@ void VhdlSemVisitor::fillOpenGenericDefaults(VhdlScope* scopep) {
         if (!declp || !declp->defaultp()) continue;
         int64_t left = 0;
         int64_t right = 0;
-        if (!defaultBounds(found[0], declp->defaultp(), bound.dim, left, right)) continue;
+        bool ascending = false;
+        if (!defaultBounds(found[0], declp->defaultp(), bound.dim, left, right, &ascending)) {
+            continue;
+        }
+        // Which way the default's range runs, which is what the instance
+        // that says nothing gets as well
+        if (!bound.ascName.empty()) {
+            std::vector<VhdlSymbol*> afound;
+            scopep->lookupLocal(bound.ascName, afound);
+            AstVhdlIfaceDecl* const ascp
+                = afound.empty() ? nullptr : VN_CAST(afound[0]->declp(), VhdlIfaceDecl);
+            if (ascp) {
+                if (AstNode* const oldp = ascp->defaultp()) {
+                    VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+                }
+                AstVhdlName* const valp
+                    = new AstVhdlName{ascp->fileline(), ascending ? "true" : "false"};
+                ascp->defaultp(valp);
+                analyzeExpr(valp, V3VhdlStd::booleanType());
+            }
+        }
         for (int side = 0; side < 2; ++side) {
             std::vector<VhdlSymbol*> gfound;
             scopep->lookupLocal(side == 0 ? bound.leftName : bound.rightName, gfound);
@@ -14065,9 +14087,23 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
         if (!actualp) continue;
         int64_t left = 0;
         int64_t right = 0;
-        if (!defaultBounds(found[0], actualp, bound.dim, left, right)) continue;
+        bool ascending = false;
+        if (!defaultBounds(found[0], actualp, bound.dim, left, right, &ascending)) continue;
         FileLine* const flp = nodep->fileline();
         if (genericMapNames(nodep, bound.leftName)) continue;
+        // Which way round the actual runs goes with its bounds: "101" for a
+        // BIT_VECTOR runs upward from 0, which the bounds alone do not say
+        // for a range of one element or none
+        if (!bound.ascName.empty() && !genericMapNames(nodep, bound.ascName)) {
+            AstVhdlAssoc* const asp
+                = new AstVhdlAssoc{flp, new AstVhdlName{flp, bound.ascName},
+                                   new AstVhdlName{flp, ascending ? "true" : "false"}};
+            nodep->addGenericMapp(asp);
+            std::vector<VhdlSymbol*> gfound;
+            unitScopep->lookupLocal(bound.ascName, gfound);
+            if (!gfound.empty()) asp->formalp()->vhdlSymp(gfound[0]);
+            analyzeExpr(asp->actualp(), V3VhdlStd::booleanType());
+        }
         for (int side = 0; side < 2; ++side) {
             const int64_t value = side == 0 ? left : right;
             AstVhdlLiteral* const litp
