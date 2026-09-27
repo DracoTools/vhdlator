@@ -1486,6 +1486,12 @@ private:
                      : static_cast<AstNodeExpr*>(new AstNeq{flp, lp, rp});
     }
 
+    // Whether an expression reads an element of a carrier's own storage
+    static bool readsCarrierElement(const AstNodeExpr* nodep) {
+        const AstSelBit* const selp = VN_CAST(nodep, SelBit);
+        const AstMemberSel* const memp = selp ? VN_CAST(selp->fromp(), MemberSel) : nullptr;
+        return memp && memp->name() == "q";
+    }
     static bool hasMetaConst(const AstNodeExpr* nodep) {
         const AstConst* const constp = VN_CAST(nodep, Const);
         return constp && constp->num().isAnyZ();
@@ -6929,7 +6935,10 @@ private:
             || VN_IS(nodep, VhdlGroupTemplate)) {
             return;  // Nothing to emit: analysis already used these
         }
-        if (VN_IS(nodep, VhdlAliasDecl)) return;  // Names, not storage
+        if (AstVhdlAliasDecl* const aliasp = VN_CAST(nodep, VhdlAliasDecl)) {
+            aliasCarrier(aliasp);
+            return;  // Names, not storage
+        }
         if (AstVhdlSubprogDecl* const subp = VN_CAST(nodep, VhdlSubprogDecl)) {
             // An uninstantiated generic subprogram is a template, never
             // called as it stands (4.4)
@@ -7565,8 +7574,39 @@ private:
             // read from the value rather than from the type. Such a value
             // always runs from 1 (16.3).
             // A value whose length only running decides carries its own
-            // bounds, so the attribute reads them from the value
-            if (isDynValue(nodep->prefixp())) {
+            // bounds, so the attribute reads them from the value -- unless
+            // the name is an alias written with a subtype of its own, whose
+            // bounds are the alias's (6.6.2): UVVM's normalize_and_check
+            // renumbers "alias a_value : std_logic_vector(value'length - 1
+            // downto 0) is value", and asks a_value'left
+            bool ownBounds = false;
+            if (const VhdlSymbol* const aliasSymp = nodep->prefixp()->vhdlSymp()) {
+                const AstVhdlAliasDecl* const adp
+                    = VN_IS(nodep->prefixp(), VhdlName) && aliasSymp->kind() == VhdlSymKind::ALIAS
+                          ? VN_CAST(aliasSymp->declp(), VhdlAliasDecl)
+                          : nullptr;
+                const VhdlType* const atp = aliasSymp->typep();
+                if (adp && adp->subtypep() && atp && atp->base()->kind() == VhdlTypeKind::ARRAY
+                    && (atp->isConstrainedArray() || atp->lengthEmittable())) {
+                    AstNodeExpr* lp = nullptr;
+                    AstNodeExpr* rp = nullptr;
+                    bool asc = true;
+                    bool known = false;
+                    if (atp->dimensions() == 1 && atp->isConstrainedArray() && indexSubtype(atp, 0)
+                        && indexSubtype(atp, 0)->bounded()) {
+                        known = true;
+                    } else if (atp->dimensions() == 1
+                               && dynamicBounds(atp, 0, flp, lp, rp, asc, &known)) {
+                        VL_DO_DANGLING(lp->deleteTree(), lp);
+                        VL_DO_DANGLING(rp->deleteTree(), rp);
+                    }
+                    if (known) {
+                        ownBounds = true;
+                        typep = atp;
+                    }
+                }
+            }
+            if (!ownBounds && isDynValue(nodep->prefixp())) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                 AstNodeExpr* carrp = lowerExpr(nodep->prefixp());
                 if (!carrp) return nullptr;
@@ -8194,6 +8234,18 @@ private:
                 = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
             if (fsymp && fsymp->kind() == VhdlSymKind::FUNCTION) {
                 return fsymp->returnTypep() ? fsymp->returnTypep() : callp->vhdlTypep();
+            }
+            // A conversion to an array type that leaves its bounds open keeps
+            // those of its operand (9.3.6): "integer_vector(gen.seeds(v))"
+            // over a method whose copy returns two elements is two long
+            const VhdlSymbol* const markp
+                = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            if (markp && markp->kind() == VhdlSymKind::TYPE) {
+                const AstVhdlAssoc* const argp = VN_CAST(callp->argsp(), VhdlAssoc);
+                if (argp && !argp->nextp() && argp->actualp()) {
+                    VhdlType* const innerp = boundTypeOf(argp->actualp(), depth + 1);
+                    if (innerp && innerp->isConstrainedArray()) return innerp;
+                }
             }
             VhdlType* const ownp = callp->vhdlTypep();
             if (ownp && callp->prefixp() && !arrayStillOpen(ownp)) return ownp;
@@ -9188,6 +9240,59 @@ private:
         return true;
     }
 
+    // An alias with a subtype of its own that renumbers a constant carried
+    // with its bounds -- UVVM's "alias a_value : std_logic_vector(value'length
+    // - 1 downto 0) is value" over a parameter only running measures -- is
+    // that value under the alias's bounds (6.6.2): every index, slice and
+    // attribute through it counts from them. It is given a carrier of its
+    // own, the same elements with those bounds. Only an object nothing
+    // writes: a write through the alias would reach the copy.
+    // Per subprogram being emitted: a copy of one reaches the same alias
+    std::map<std::pair<const AstNodeFTask*, const VhdlSymbol*>, AstVar*> m_aliasCarriers;
+    void aliasCarrier(AstVhdlAliasDecl* declp) {
+        if (!m_ftaskp || !declp->subtypep() || !declp->targetp()) return;
+        VhdlSymbol* const symp = declp->vhdlSymp();
+        VhdlType* const atp = symp ? symp->typep() : nullptr;
+        if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY || atp->dimensions() != 1) return;
+        AstNodeVhdlExpr* const targetp = declp->targetp();
+        if (!VN_IS(targetp, VhdlName) || !isDynObj(targetp)) return;
+        const VhdlSymbol* const tsymp
+            = targetp->vhdlSymp() ? targetp->vhdlSymp()->resolved() : nullptr;
+        if (!tsymp) return;
+        bool readOnly = tsymp->kind() == VhdlSymKind::CONSTANT;
+        if (const AstVhdlIfaceDecl* const ifp = VN_CAST(tsymp->declp(), VhdlIfaceDecl)) {
+            readOnly = ifp->kind() == VhdlIfaceKind::CONSTANT && ifp->mode() == VhdlMode::IN;
+        }
+        if (!readOnly) return;
+        FileLine* const flp = declp->fileline();
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        bool dirKnown = false;
+        if (!dynamicBounds(atp, 0, flp, leftp, rightp, ascending, &dirKnown)) return;
+        if (!dirKnown) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return;
+        }
+        AstNodeExpr* const srcp = lowerExpr(targetp);
+        AstNodeDType* const carrDTypep = srcp ? dynCarrierRef(tsymp->typep(), flp) : nullptr;
+        if (!carrDTypep) {
+            if (srcp) VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return;
+        }
+        AstVar* const varp = newTempVar("__Valias_" + declp->name() + "_", carrDTypep, flp);
+        AstNode* setp = new AstAssign{flp, wr(varp, flp), srcp};
+        setp->addNext(new AstAssign{flp, dynPart(wr(varp, flp), "lft", flp), leftp});
+        setp->addNext(new AstAssign{flp, dynPart(wr(varp, flp), "rgt", flp), rightp});
+        setp->addNext(new AstAssign{flp, dynPart(wr(varp, flp), "dsc", flp),
+                                    new AstConst{flp, AstConst::BitTrue{}, !ascending}});
+        addStmt(setp);
+        m_aliasCarriers[std::make_pair(m_ftaskp, symp)] = varp;
+    }
+
     AstNodeExpr* lowerRef(VhdlSymbol* symp, const std::string& name, FileLine* flp) {
         if (!symp) {
             unsup(flp, "reference to '" + name + "'");
@@ -9198,6 +9303,12 @@ private:
         // downto 0) is v(7 downto 4)" -- would need its indices translated,
         // which is not done here.
         if (symp->kind() == VhdlSymKind::ALIAS) {
+            // One that renumbers a value carried with its bounds has a
+            // carrier of its own (aliasCarrier)
+            const auto ait = m_aliasCarriers.find(std::make_pair(m_ftaskp, symp));
+            if (m_ftaskp && ait != m_aliasCarriers.end()) {
+                return new AstVarRef{flp, ait->second, VAccess::READ};
+            }
             AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
             // Where the target is a plain name, what it denotes is already
             // known and the expression adds nothing -- which matters for an
@@ -11576,6 +11687,17 @@ private:
         // A logic literal with a Z in it is compared exactly: "s = 'Z'"
         // is true when s is 'Z' (9.2.3), where Verilog's "==" answers X.
         if (hasMetaConst(lhsp) || hasMetaConst(rhsp)) {
+            // An element of a value carried with its bounds is held in two
+            // states and never passes through the tristate pass that tells
+            // a net's 'Z' apart, so it is never one: "a_vector(i) = target"
+            // over a carried vector, in the copy of UVVM's
+            // idx_leftmost_p1_in_p2 made for 'Z', found every zero
+            const AstNodeExpr* const otherp = hasMetaConst(lhsp) ? rhsp : lhsp;
+            if (readsCarrierElement(otherp)) {
+                VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                return new AstConst{flp, AstConst::BitTrue{}, !equal};
+            }
             return equal ? static_cast<AstNodeExpr*>(new AstEqCase{flp, lhsp, rhsp})
                          : static_cast<AstNodeExpr*>(new AstNeqCase{flp, lhsp, rhsp});
         }
@@ -23040,6 +23162,108 @@ private:
         return true;
     }
 
+    // A parameter held two levels deep that a call writes, given an object
+    // carried one level deep -- its elements a length of their own, how many
+    // only running settles: UVVM's axi_check hands axi_read "variable
+    // v_rdata_value : t_slv_array(0 to n)(axi_if.read_data_channel.rdata'length
+    // - 1 downto 0)". The value goes in made one of those, and each element
+    // comes back into the object's own places afterwards; its bounds stay the
+    // object's (4.2.2.3). False, with nothing added, where the actual is not
+    // such an object.
+    bool dyn2OfDyn1RoundTrip(AstNodeVhdlExpr* actualp, VhdlType* formalp, AstNode*& prep,
+                             AstNode*& postp, AstVar*& tpr, FileLine* flp) {
+        if (!VN_IS(actualp, VhdlName) || !isDynObj(actualp) || isDyn2Value(actualp)) {
+            return false;
+        }
+        // The element as the object is carried: the carrier's own
+        VhdlType* const carrp = dynValueType(actualp);
+        VhdlType* const fixedElemp = !carrp              ? nullptr
+                                     : carrp->elementp() ? carrp->elementp()
+                                                         : carrp->base()->elementp();
+        VhdlType* const elemCarrp = openCarriedElement(formalp);
+        if (!fixedElemp || !elemCarrp || lengthOnlyRunningDecides(fixedElemp)) return false;
+        AstNodeFTask* const backFuncp = fixedElemp->isConstrainedArray()
+                                            ? dynToFixedFunc(elemCarrp, fixedElemp, flp)
+                                            : nullptr;
+        // An element written against something of this subprogram's own --
+        // a signal formal's element, as UVVM's axi_check writes it -- has no
+        // number a shared helper could take, so each element is converted
+        // right here, as dyn2OfCarrier does going the other way
+        AstRange* elemRangep = nullptr;
+        bool elemAsc = true;
+        if (!backFuncp) {
+            const VhdlType* const eidxp
+                = fixedElemp->indexTypes().empty() ? nullptr : fixedElemp->indexTypes()[0];
+            if (!eidxp || !fixedElemp->lengthEmittable() || fixedElemp->indexTypes().size() != 1) {
+                return false;
+            }
+            if (AstNodeExpr* const ascExprp = boundsAscendingExpr(eidxp, flp)) {
+                VL_DO_DANGLING(ascExprp->deleteTree(), ascExprp);
+                return false;
+            }
+            elemAsc = boundsAscending(eidxp);
+            elemRangep = boundsRange(eidxp, flp);
+            if (!elemRangep) return false;
+        }
+        AstNodeExpr* const twop = asDyn2Carrier(actualp, formalp, flp);
+        AstNodeExpr* const objp = twop ? lowerDriveTarget(actualp) : nullptr;
+        if (!objp) {
+            if (twop) VL_DO_DANGLING(twop->deleteTree(), twop);
+            if (elemRangep) VL_DO_DANGLING(elemRangep->deleteTree(), elemRangep);
+            return false;
+        }
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        AstVar* const tp = newTempVar("__Vdyn2rt", dyn2CarrierRef(formalp, flp), flp);
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(tp, flp), twop});
+        AstVar* const kVarp = newTempVar("__Vdyn2rk", newIntDType(flp), flp);
+        kVarp->usedLoopIdx(true);
+        const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        AstNode* const backp = new AstAssign{flp, wr(kVarp, flp), num(0)};
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, k(), dynCarrierLength(rd(tp, flp), flp)}});
+        if (backFuncp) {
+            AstFuncRef* const elemRefp = new AstFuncRef{
+                flp, backFuncp->name(),
+                new AstArg{flp, "", new AstSelBit{flp, dynPart(rd(tp, flp), "q", flp), k()}}};
+            elemRefp->taskp(VN_AS(backFuncp, Func));
+            loopp->addStmtsp(
+                new AstAssign{flp, new AstSelBit{flp, dynPart(objp, "q", flp), k()}, elemRefp});
+        } else {
+            // Each place of the element read from the carrier by its count
+            // from the left, into the element as the object holds it
+            AstVar* const ep = newTempVar("__Vdyn2re", lowerType(fixedElemp, flp), flp);
+            AstVar* const cp = newTempVar("__Vdyn2rl", dynCarrierRef(elemCarrp, flp), flp);
+            AstVar* const jp = newTempVar("__Vdyn2rj", newIntDType(flp), flp);
+            jp->usedLoopIdx(true);
+            AstNodeExpr* const lftp = elemRangep->leftp()->unlinkFrBack();
+            VL_DO_DANGLING(elemRangep->deleteTree(), elemRangep);
+            const auto j = [&]() { return new AstVarRef{flp, jp, VAccess::READ}; };
+            loopp->addStmtsp(new AstAssign{
+                flp, wr(cp, flp), new AstSelBit{flp, dynPart(rd(tp, flp), "q", flp), k()}});
+            loopp->addStmtsp(new AstAssign{flp, wr(jp, flp), num(0)});
+            AstLoop* const innerp = new AstLoop{flp};
+            innerp->addStmtsp(new AstLoopTest{
+                flp, innerp, new AstLtS{flp, j(), dynCarrierLength(rd(cp, flp), flp)}});
+            AstNodeExpr* const atp
+                = elemAsc ? static_cast<AstNodeExpr*>(new AstAdd{flp, lftp->cloneTree(false), j()})
+                          : new AstSub{flp, lftp->cloneTree(false), j()};
+            innerp->addStmtsp(
+                new AstAssign{flp, new AstSelBit{flp, wr(ep, flp), atp},
+                              new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), j()}});
+            innerp->addContsp(new AstAssign{flp, wr(jp, flp), new AstAdd{flp, j(), num(1)}});
+            loopp->addStmtsp(innerp);
+            loopp->addStmtsp(
+                new AstAssign{flp, new AstSelBit{flp, dynPart(objp, "q", flp), k()}, rd(ep, flp)});
+            VL_DO_DANGLING(lftp->deleteTree(), lftp);
+        }
+        loopp->addContsp(new AstAssign{flp, wr(kVarp, flp), new AstAdd{flp, k(), num(1)}});
+        backp->addNext(loopp);
+        postp = AstNode::addNextNull(postp, backp);
+        tpr = tp;
+        return true;
+    }
+
     bool dynOutRoundTrip(const VhdlSymbol* symp, AstVhdlCall* callp, AstNode*& prep,
                          AstNode*& postp, FileLine* flp) {
         if (!symp || !callp) return true;
@@ -23077,6 +23301,16 @@ private:
                                          dynPart(rd(tp, flp), "q", flp)});
                 m_argCarrier.emplace(asp, tp);
                 continue;
+            }
+            // A parameter held two levels deep that the call writes, given an
+            // object carried one level deep (dyn2OfDyn1RoundTrip)
+            if (isDyn2Type(symp->paramTypes()[at]) && paramModeOf(symp, at) != VhdlMode::IN) {
+                AstVar* tp = nullptr;
+                if (dyn2OfDyn1RoundTrip(asp->actualp(), symp->paramTypes()[at], prep, postp, tp,
+                                        flp)) {
+                    m_argCarrier.emplace(asp, tp);
+                    continue;
+                }
             }
             // What this call settles about the parameter. The declaration
             // may leave the element open where the actual fixes it, and it
@@ -23860,6 +24094,16 @@ private:
                     VhdlType* const ptypep = pair.formalp && pair.formalp->vhdlSymp()
                                                  ? pair.formalp->vhdlSymp()->typep()
                                                  : nullptr;
+                    // Written, and given an object carried one level deep:
+                    // the call's own copy of it comes back afterwards
+                    if (ptypep && postpp && pair.formalp && pair.formalp->mode() != VhdlMode::IN) {
+                        AstVar* tp = nullptr;
+                        if (dyn2OfDyn1RoundTrip(pair.exprp, ptypep, *prepp, *postpp, tp, flp)) {
+                            refp->addArgsp(new AstArg{flp, pair.name,
+                                                      new AstVarRef{flp, tp, VAccess::READWRITE}});
+                            continue;
+                        }
+                    }
                     AstNodeExpr* const twop
                         = ptypep ? asDyn2Carrier(pair.exprp, ptypep, flp) : nullptr;
                     if (!twop) {
@@ -26242,8 +26486,8 @@ private:
     // its position. The literals are known here, so the choice between them
     // is made without a table at run time; nothing else in the design needs
     // the names, so nothing else pays for them.
-    static AstNodeExpr* enumImage(AstNodeExpr* exprp, const VhdlType* typep, FileLine* flp,
-                                  bool isImage) {
+    AstNodeExpr* enumImage(AstNodeExpr* exprp, const VhdlType* typep, FileLine* flp,
+                           bool isImage) {
         if (!typep) return nullptr;
         const VhdlType* const basep = typep->base();
         if (basep->kind() != VhdlTypeKind::ENUM || enumIsLogic(basep)) return nullptr;
@@ -26252,6 +26496,16 @@ private:
         if (basep == V3VhdlStd::characterType()) return nullptr;
         const std::vector<VhdlSymbol*>& literals = basep->literals();
         if (literals.empty() || literals.size() > 256) return nullptr;
+        // The value is tested once per literal, so one that calls something
+        // -- "boolean'image(f(x))" -- is worked out once, into a temporary:
+        // an impure function reporting as it goes reported twice
+        AstNode* setp = nullptr;
+        if (!repeatable(exprp)) {
+            AstVar* const tmpp
+                = newTempVar("__Vimg", lowerType(const_cast<VhdlType*>(typep), flp), flp);
+            setp = new AstAssign{flp, wr(tmpp, flp), exprp};
+            exprp = rd(tmpp, flp);
+        }
         AstNodeExpr* outp = new AstConst{flp, AstConst::String{}, "?"};
         // Built from the last literal back, so the first is tested first
         for (size_t i = literals.size(); i-- > 0;) {
@@ -26264,6 +26518,7 @@ private:
                 outp};
         }
         VL_DO_DANGLING(exprp->deleteTree(), exprp);
+        if (setp) return new AstExprStmt{flp, setp, outp};
         return outp;
     }
 

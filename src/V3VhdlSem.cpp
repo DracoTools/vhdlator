@@ -6035,6 +6035,29 @@ private:
                 if (refp->vhdlSymp() && params.count(refp->vhdlSymp())) found = true;
             });
         });
+        if (found) return true;
+        // A logic value the body compares: in two states a 'Z' held in an
+        // object reads as '0', so "a_vector(i) = target" found every zero
+        // when UVVM's idx_leftmost_p1_in_p2 was asked for 'Z' (methods_pkg,
+        // through matching_widths and normalize_and_check). A copy per value
+        // makes the comparison one with the literal, which is told apart.
+        declp->foreach([&](AstVhdlBinary* bp) {
+            if (found) return;
+            if (bp->op() != VhdlBinaryOp::EQ && bp->op() != VhdlBinaryOp::NE) return;
+            for (AstNodeVhdlExpr* const opp : {bp->lhsp(), bp->rhsp()}) {
+                const AstVhdlName* const namep = VN_CAST(opp, VhdlName);
+                const VhdlSymbol* const psymp = namep ? namep->vhdlSymp() : nullptr;
+                if (!psymp || !params.count(psymp)) continue;
+                const VhdlType* const ptypep = psymp->typep();
+                // The nine values of std_logic_1164, 'Z' among them
+                const std::vector<VhdlSymbol*>& lits
+                    = ptypep ? ptypep->base()->literals() : std::vector<VhdlSymbol*>{};
+                if (ptypep && ptypep->base()->kind() == VhdlTypeKind::ENUM && lits.size() == 9
+                    && lits[4] && lits[4]->name() == "'Z'") {
+                    found = true;
+                }
+            }
+        });
         return found;
     }
 
@@ -6473,7 +6496,15 @@ private:
                     // decides whether a value can be carried (5.3.2.2)
                     VhdlType* const elemSpecp
                         = elementOnlySpec(symp->paramTypes()[i], typep, nodep->fileline());
-                    if (!elemSpecp) return;
+                    if (!elemSpecp) {
+                        // Nothing about its length to settle, but the copy
+                        // may be wanted for a value another parameter has
+                        // (bodyNeedsParamValues): that one keeps the
+                        // declaration's own subtype, carried as ever
+                        if (!byValue || resultIsUnconstrained(symp)) return;
+                        actualTypes.push_back(symp->paramTypes()[i]);
+                        continue;
+                    }
                     actualTypes.push_back(elemSpecp);
                     continue;
                 }
