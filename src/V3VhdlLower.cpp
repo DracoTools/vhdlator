@@ -186,6 +186,7 @@ class VhdlLowerVisitor final {
     std::map<const VhdlSymbol*, AstNodeFTask*> m_pkgFuncs;
     bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
     bool m_asTarget = false;  // Lowering what an assignment writes, not what it reads
+    const AstVhdlCall* m_dirReportedp = nullptr;  // Slice whose direction check is made
     bool m_emitForUnit = false;  // Building something the unit will hold
     // The names those classes have been given. A generic package instantiated
     // twice has two protected types of the one name, and each needs a class
@@ -13122,6 +13123,23 @@ private:
     // conversion or a call (8.1)
     AstNodeExpr* lowerCall(AstVhdlCall* nodep) {
         FileLine* const flp = nodep->fileline();
+        // A slice running against its prefix in a copy made for one call: an
+        // error when it is reached (8.5), and the analysis left it to be one
+        if (!m_asTarget && m_dirReportedp != nodep) {
+            if (const std::string msg = sliceAgainstPrefix(nodep); !msg.empty()) {
+                VL_RESTORER(m_dirReportedp);
+                m_dirReportedp = nodep;
+                AstNodeExpr* const valp = lowerCall(nodep);
+                if (!valp) return nullptr;
+                // The value comes after the error and stands for nothing, so
+                // the select running the wrong way is not warned about either
+                FileLine* const quietp = new FileLine{flp};
+                quietp->warnOff(V3ErrorCode::SELRANGE, true);
+                valp->foreach([&](AstNode* np) { np->fileline(quietp); });
+                return new AstExprStmt{
+                    flp, new AstDisplay{flp, VDisplayType::DT_ERROR, msg, nullptr, nullptr}, valp};
+            }
+        }
         // An indexed name of a formal whose elements the call named one at a
         // time is the actual that element was given (6.5.7.1)
         if (AstNodeVhdlExpr* const boundp = indexBindOf(nodep)) return lowerExpr(boundp);
@@ -22215,7 +22233,78 @@ private:
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
         if (!lhsp || !rhsp) return nullptr;
+        if (textLengthUnsettled(nodep->targetp(), valuep, lhsp)) {
+            return lengthCheckedTextAssign(VN_AS(lhsp, VarRef), rhsp, flp);
+        }
         return new AstAssign{flp, lhsp, rhsp};
+    }
+
+    // Whether a variable of a STRING type is written with a value that may
+    // not be as long as it is. Such a variable is held as text exactly as
+    // long as the object is, and the value must be as long (10.6.2.1).
+    bool textLengthUnsettled(const AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
+                             const AstNodeExpr* lhsp) const {
+        const AstVarRef* const refp = VN_CAST(lhsp, VarRef);
+        if (!refp || !VN_IS(targetp, VhdlName) || !targetp->vhdlSymp()) return false;
+        switch (targetp->vhdlSymp()->resolved()->kind()) {
+        case VhdlSymKind::VARIABLE:
+        case VhdlSymKind::SHARED_VARIABLE:
+        case VhdlSymKind::PARAMETER: break;
+        default: return false;
+        }
+        const VhdlType* const ttypep = targetp->vhdlTypep();
+        if (!ttypep || !isStringType(ttypep)) return false;
+        const AstVar* const varp = refp->varp();
+        const AstBasicDType* const basicp
+            = VN_CAST(varp->childDTypep() ? varp->childDTypep() : varp->dtypep(), BasicDType);
+        if (!basicp || basicp->keyword() != VBasicDTypeKwd::STRING) return false;
+        // Two settled lengths the analysis checked, except in a copy made
+        // for one call, where it leaves a mismatch to be reported if reached
+        const int want = vectorWidth(ttypep);
+        return !(want > 0 && want == exprVectorWidth(valuep));
+    }
+    // The text written, and afterwards as long as it was before, or the
+    // length check every conversion makes while running reports it
+    AstNode* lengthCheckedTextAssign(AstVarRef* lhsp, AstNodeExpr* rhsp, FileLine* flp) {
+        AstVar* const lenp = newTempVar("__Vstrlen", newIntDType(flp), flp);
+        const auto text = [&]() {
+            AstVarRef* const refp = lhsp->cloneTree(false);
+            refp->access(VAccess::READ);
+            return refp;
+        };
+        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, lenp, VAccess::WRITE},
+                                      new AstLenN{flp, text()}};
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(new AstAssign{flp, lhsp, rhsp}));
+        return AstNode::addNext(
+            outp,
+            static_cast<AstNode*>(new AstIf{
+                flp,
+                new AstNeq{flp, new AstLenN{flp, text()}, new AstVarRef{flp, lenp, VAccess::READ}},
+                new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match", nullptr,
+                               nullptr},
+                nullptr}));
+    }
+
+    // What the analysis says of a slice whose settled range runs the other
+    // way from its prefix's, or nothing where it does not
+    static std::string sliceAgainstPrefix(const AstVhdlCall* nodep) {
+        if (!VN_IS(nodep->argsp(), VhdlRange) || !nodep->prefixp()) return "";
+        const VhdlType* const slicep = nodep->vhdlTypep();
+        const VhdlType* const arrayp = nodep->prefixp()->vhdlTypep();
+        if (!slicep || !arrayp || arrayp->base()->kind() != VhdlTypeKind::ARRAY
+            || !arrayp->isConstrainedArray() || slicep->indexTypes().size() != 1
+            || arrayp->indexTypes().size() != 1) {
+            return "";
+        }
+        const VhdlType* const sidxp = slicep->indexTypes()[0];
+        const VhdlType* const aidxp = arrayp->indexTypes()[0];
+        if (!sidxp || !aidxp || !sidxp->bounded() || !aidxp->bounded() || sidxp->isNull()
+            || sidxp->ascending() == aidxp->ascending()) {
+            return "";
+        }
+        return std::string{"Slice runs "} + (sidxp->ascending() ? "'to'" : "'downto'") + " but "
+               + arrayp->prettyName() + " is indexed "
+               + (aidxp->ascending() ? "'to'" : "'downto'");
     }
 
     // Whether a lowered value is held two levels deep: a variable declared as

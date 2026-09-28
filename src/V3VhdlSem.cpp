@@ -10977,7 +10977,10 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
         // and the object decides the direction, not the subtype (8.5)
         if (indexp && indexp->bounded() && arrayp->isConstrainedArray()
             && !sliceIndexp->isNull()) {
-            if (info.ascending != indexp->ascending()) {
+            // In a copy made for one call the prefix's range is the one that
+            // call gave, and a slice against it is an error only if it is
+            // reached, which lowering reports while running
+            if (info.ascending != indexp->ascending() && !m_inSpecialized) {
                 err(nodep->fileline(), "Slice runs "
                                            + std::string{info.ascending ? "'to'" : "'downto'"}
                                            + " but " + arrayp->prettyName() + " is indexed "
