@@ -6876,7 +6876,24 @@ private:
                 // An object declared with a value that carries its own bounds
                 // takes them from it -- which is the only thing that says how
                 // long "constant c : t := f(x)" is (6.4.2.2)
-                if (objp->defaultp() && isDynValue(objp->defaultp())) {
+                // -- unless its own subtype constrains the index, as
+                // "t_slv_array(0 to d'length - 1)(7 downto 0) := d" does to
+                // renumber a parameter from zero: then the bounds are the
+                // declaration's and only the elements come from the value,
+                // by position (UVVM's gmii_write)
+                const VhdlType* const dtypep = symp->typep();
+                const bool ownIndex
+                    = dtypep && dtypep->indexTypes().size() == 1
+                      && dtypep->base()->indexTypes().size() == 1
+                      && dtypep->indexTypes()[0] != dtypep->base()->indexTypes()[0];
+                if (objp->defaultp() && isDynValue(objp->defaultp()) && ownIndex) {
+                    if (AstNodeExpr* const srcp = lowerExpr(objp->defaultp())) {
+                        later(dynCarrierInit(varp, symp->typep(), flp));
+                        later(new AstAssign{
+                            flp, dynPart(new AstVarRef{flp, varp, VAccess::WRITE}, "q", flp),
+                            dynPart(srcp, "q", flp)});
+                    }
+                } else if (objp->defaultp() && isDynValue(objp->defaultp())) {
                     if (AstNodeExpr* const srcp = lowerExpr(objp->defaultp())) {
                         later(new AstAssign{
                             flp, new AstVarRef{flp, varp, VAccess::WRITE}, srcp});
@@ -22144,6 +22161,29 @@ private:
         if (valuep) {
             if (AstNode* const outp = dynAllToFixed(nodep->targetp(), valuep, flp)) return outp;
         }
+        // A value held two levels deep put into an object whose elements
+        // and count are fixed -- a parameter a copy of the procedure holds
+        // at the width its call gave it: UVVM's axistream_receive ends with
+        // "data_array := convert_byte_array_to_slv_array(...)"
+        if (valuep && (isDyn2Value(valuep) || dyn2ResultCall(valuep))
+            && !isDyn2Value(nodep->targetp()) && !isDynObj(nodep->targetp())) {
+            if (AstNode* const outp = dyn2ToFixed(nodep->targetp(), valuep, flp)) return outp;
+            // Where the object's subtype does not say its lengths, the
+            // object as it was emitted does
+            AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
+            AstNodeExpr* const rhsp = lhsp ? lowerExpr(valuep) : nullptr;
+            // A copy that is handed back nothing would be a wrong answer
+            // with no word said; the C++ compiler refused it before
+            const bool refuse = lhsp && rhsp && VN_IS(lhsp, VarRef) && loweredIsDyn2(rhsp)
+                                && !isDyn2Var(VN_AS(lhsp, VarRef)->varp());
+            if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            if (rhsp) VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+            if (refuse) {
+                unsup(flp, "value held two levels deep copied into a parameter this call holds"
+                           " at a fixed width");
+                return nullptr;
+            }
+        }
         // A value that carries its own bounds put into an object that has
         // its own: the elements are copied across, and the lengths have to
         // match, which is a check only running can make (10.5.2.1)
@@ -22176,6 +22216,93 @@ private:
         AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
         if (!lhsp || !rhsp) return nullptr;
         return new AstAssign{flp, lhsp, rhsp};
+    }
+
+    // Whether a lowered value is held two levels deep: a variable declared as
+    // one, or a call of a function that gives one back
+    static bool loweredIsDyn2(const AstNodeExpr* exprp) {
+        if (const AstVarRef* const refp = VN_CAST(exprp, VarRef)) return isDyn2Var(refp->varp());
+        if (const AstFuncRef* const frefp = VN_CAST(exprp, FuncRef)) {
+            const AstFunc* const funcp = VN_CAST(frefp->taskp(), Func);
+            return funcp && isDyn2Var(VN_CAST(funcp->fvarp(), Var));
+        }
+        return false;
+    }
+    // A value held two levels deep copied into an object whose count and
+    // element length are fixed: element by element, each made fixed, and the
+    // counts have to match (10.6.2.1). Null where the object is not that.
+    AstNode* dyn2ToFixed(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        VhdlType* ttypep = boundTypeOf(targetp);
+        if (!ttypep) ttypep = const_cast<VhdlType*>(targetp->vhdlTypep());
+        if (!ttypep || ttypep->dimensions() != 1 || !ttypep->isConstrainedArray()
+            || ttypep->indexTypes().empty() || !ttypep->indexTypes()[0]
+            || !ttypep->indexTypes()[0]->bounded()) {
+            return nullptr;
+        }
+        VhdlType* const fixedElemp
+            = ttypep->elementp() ? ttypep->elementp() : ttypep->base()->elementp();
+        if (!fixedElemp || !fixedElemp->isConstrainedArray()
+            || lengthOnlyRunningDecides(fixedElemp)) {
+            return nullptr;
+        }
+        const VhdlSymbol* const namedp = VN_IS(valuep, VhdlName) && valuep->vhdlSymp()
+                                             ? valuep->vhdlSymp()->resolved()
+                                             : nullptr;
+        VhdlType* const vtypep
+            = namedp ? namedp->typep()
+              : dyn2ResultCall(valuep)
+                  ? emittedReturnType(VN_AS(valuep, VhdlCall)->vhdlSymp()->resolved())
+                  : const_cast<VhdlType*>(valuep->vhdlTypep());
+        VhdlType* const elemCarrp = vtypep ? openCarriedElement(vtypep) : nullptr;
+        if (!elemCarrp) return nullptr;
+        AstNodeFTask* const elemFuncp = dynToFixedFunc(elemCarrp, fixedElemp, flp);
+        if (!elemFuncp) return nullptr;
+        const VhdlType* const idxp = ttypep->indexTypes()[0];
+        const int64_t count = idxp->length();
+        if (count < 0 || count > (1 << 24)) return nullptr;
+        AstNodeExpr* const srcp = asDyn2Carrier(valuep, vtypep, flp);
+        if (!srcp) return nullptr;
+        AstNodeExpr* const lhsp = lowerDriveTarget(targetp);
+        if (!lhsp) {
+            VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            return nullptr;
+        }
+        AstVar* const srcVarp = newTempVar("__Vdyn2f", dyn2CarrierRef(vtypep, flp), flp);
+        AstVar* const kVarp = newTempVar("__Vdyn2k", newIntDType(flp), flp);
+        kVarp->usedLoopIdx(true);
+        const auto sr = [&]() { return new AstVarRef{flp, srcVarp, VAccess::READ}; };
+        const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        const auto num = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(
+                      new AstIf{flp, new AstNeq{flp, dynCarrierLength(sr(), flp), num(count)},
+                                new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                               "Array lengths do not match", nullptr, nullptr},
+                                nullptr}));
+        outp
+            = AstNode::addNext(outp, static_cast<AstNode*>(new AstAssign{
+                                         flp, new AstVarRef{flp, kVarp, VAccess::WRITE}, num(0)}));
+        // The object's own places, from its left bound in its own direction
+        AstNodeExpr* const placep
+            = idxp->ascending()
+                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, num(idxp->left()), k()})
+                  : static_cast<AstNodeExpr*>(new AstSub{flp, num(idxp->left()), k()});
+        AstFuncRef* const elemRefp = new AstFuncRef{
+            flp, elemFuncp->name(),
+            new AstArg{flp, "", new AstSelBit{flp, dynPart(sr(), "q", flp), k()}}};
+        elemRefp->taskp(VN_AS(elemFuncp, Func));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp,
+                            new AstLogAnd{flp, new AstLtS{flp, k(), num(count)},
+                                          new AstLtS{flp, k(), dynCarrierLength(sr(), flp)}}});
+        loopp->addStmtsp(new AstAssign{flp, new AstSelBit{flp, lhsp, placep}, elemRefp});
+        loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                                       new AstAdd{flp, k(), num(1)}});
+        return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
     }
 
     // The elements of one value held two levels deep put into another's
@@ -28016,12 +28143,13 @@ private:
             valp->valuep(dfltp);
             enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 1});
         } else {
-            // What the call has not assigned it does not drive: an interface
-            // record the call drives a few elements of -- cs, rena, addr of
-            // UVVM's SBI -- would otherwise drive the others, rdata among
-            // them, with nothing, over the design that drives them
-            // (uart_vvc_tb read TX_READY as 0)
-            valp->valuep(new AstConst{flp, AstConst::StringToParse{}, "'z"});
+            // Zero, which the port's resolution leaves to the other drivers.
+            // Not 'z: a variable holding 'z is a net of the tristate pass,
+            // which takes every task writing it for a driver of its own and
+            // never lets one go -- so what one copy of a BFM left behind was
+            // ORed into every later copy's writes (UVVM's axistream receive
+            // could not lower tready after an expect had raised it).
+            valp->valuep(new AstConst{flp, AstConst::StringToParse{}, "'0"});
             // Nothing is driven until the subprogram has run
             enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
         }
@@ -28206,6 +28334,18 @@ private:
     }
     void redirectToSubDrivers(const std::vector<AstNodeAssign*>& asgps) {
         for (AstNodeAssign* const asgp : asgps) {
+            // The driver's value holds no 'Z': writing one is not driving
+            // that element, which is a 0 here for the same reason as above
+            std::vector<AstConst*> zconstps;
+            asgp->rhsp()->foreach([&](AstConst* constp) {
+                if (constp->num().isAnyZ()) zconstps.push_back(constp);
+            });
+            for (AstConst* const constp : zconstps) {
+                V3Number num{constp, constp->width()};
+                num.opBitsOne(constp->num());
+                constp->replaceWith(new AstConst{constp->fileline(), num});
+                VL_DO_DANGLING(constp->deleteTree(), constp);
+            }
             FileLine* const flp = asgp->fileline();
             AstVarRef* const refp = lvalueVarRef(asgp->lhsp());
             const auto drv = subDriverFor(refp->varp(), flp);
