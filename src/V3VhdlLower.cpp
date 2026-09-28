@@ -27337,7 +27337,10 @@ private:
     // Takes ownership of neither reference: each is cloned.
     AstNode* fileOpenCheck(AstNodeExpr* fdp, AstNodeExpr* namep, const std::string& mode,
                            FileLine* flp) {
-        const std::string what = mode == "r" ? "reading" : (mode == "w" ? "writing" : "appending");
+        const std::string what = mode == "r"   ? "reading"
+                                 : mode == "w" ? "writing"
+                                 : mode == "a" ? "appending"
+                                               : "the mode asked";
         const std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
                                    + std::to_string(flp->firstColumn())
                                    + ":@%0t:(report failure): cannot open file '%s' for " + what;
@@ -27366,13 +27369,29 @@ private:
         if (!filep || !namep) return nullptr;
         // READ_MODE, WRITE_MODE, APPEND_MODE (16.3)
         std::string mode = "r";
+        AstNodeExpr* modep = nullptr;
         if (args.size() > first + 2) {
             const VhdlValue kind = V3VhdlEval::eval(args[first + 2]);
-            if (kind.isInt()) mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
+            if (kind.isInt()) {
+                mode = kind.toInt() == 1 ? "w" : (kind.toInt() == 2 ? "a" : "r");
+            } else if (AstNodeExpr* const kindp = lowerExpr(args[first + 2])) {
+                // Known only when the call runs: a mode handed in as a
+                // parameter, as UVVM's coverage reports are opened with the
+                // mode their caller asks for
+                const auto is = [&](int32_t value) {
+                    return new AstEq{flp, sizedTo(kindp->cloneTree(false), 32, flp),
+                                     new AstConst{flp, AstConst::Signed32{}, value}};
+                };
+                modep = new AstCond{flp, is(1), new AstConst{flp, AstConst::String{}, "w"},
+                                    new AstCond{flp, is(2),
+                                                new AstConst{flp, AstConst::String{}, "a"},
+                                                new AstConst{flp, AstConst::String{}, "r"}}};
+                VL_DO_DANGLING(kindp->deleteTree(), kindp);
+                mode = "?";
+            }
         }
-        AstNode* outp = new AstAssign{
-            flp, filep,
-            new AstFOpen{flp, namep, new AstConst{flp, AstConst::String{}, mode}}};
+        if (!modep) modep = new AstConst{flp, AstConst::String{}, mode};
+        AstNode* outp = new AstAssign{flp, filep, new AstFOpen{flp, namep, modep}};
         if (statusp) {
             // FILE_OPEN_STATUS is (OPEN_OK, STATUS_ERROR, NAME_ERROR,
             // MODE_ERROR), so a file that would not open is 2 (16.3)
