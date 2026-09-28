@@ -22323,9 +22323,10 @@ private:
     AstNode* dyn2ToFixed(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
         VhdlType* ttypep = boundTypeOf(targetp);
         if (!ttypep) ttypep = const_cast<VhdlType*>(targetp->vhdlTypep());
-        if (!ttypep || ttypep->dimensions() != 1 || !ttypep->isConstrainedArray()
-            || ttypep->indexTypes().empty() || !ttypep->indexTypes()[0]
-            || !ttypep->indexTypes()[0]->bounded()) {
+        if (!ttypep || ttypep->dimensions() != 1 || ttypep->indexTypes().empty()
+            || !ttypep->indexTypes()[0]
+            || (!ttypep->indexTypes()[0]->bounded() && !ttypep->indexTypes()[0]->boundsp())
+            || (!ttypep->isConstrainedArray() && !ttypep->indexTypes()[0]->boundsp())) {
             return nullptr;
         }
         VhdlType* const fixedElemp
@@ -22347,13 +22348,19 @@ private:
         AstNodeFTask* const elemFuncp = dynToFixedFunc(elemCarrp, fixedElemp, flp);
         if (!elemFuncp) return nullptr;
         const VhdlType* const idxp = ttypep->indexTypes()[0];
-        const int64_t count = idxp->length();
-        if (count < 0 || count > (1 << 24)) return nullptr;
+        const int64_t count = idxp->bounded() ? idxp->length() : -1;
+        if (count > (1 << 24)) return nullptr;
+        // A count that names a generic is settled when the instance is, not
+        // here -- "t_slv_array(0 to NBYTES / 4 - 1)" -- so the bounds are
+        // taken as expressions and worked out when the copy runs
+        AstRange* const boundsp = count < 0 ? boundsRange(idxp, flp) : nullptr;
+        if (count < 0 && !boundsp) return nullptr;
+        const bool ascending = boundsp ? boundsAscending(idxp) : idxp->ascending();
         AstNodeExpr* const srcp = asDyn2Carrier(valuep, vtypep, flp);
-        if (!srcp) return nullptr;
-        AstNodeExpr* const lhsp = lowerDriveTarget(targetp);
+        AstNodeExpr* const lhsp = srcp ? lowerDriveTarget(targetp) : nullptr;
         if (!lhsp) {
-            VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            if (srcp) VL_DO_DANGLING(srcp->deleteTree(), srcp);
+            if (boundsp) VL_DO_DANGLING(boundsp->deleteTree(), boundsp);
             return nullptr;
         }
         AstVar* const srcVarp = newTempVar("__Vdyn2f", dyn2CarrierRef(vtypep, flp), flp);
@@ -22365,9 +22372,32 @@ private:
             return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
         };
         AstNode* outp = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
+        AstVar* const leftVarp = boundsp ? newTempVar("__Vdyn2l", newIntDType(flp), flp) : nullptr;
+        AstVar* const countVarp
+            = boundsp ? newTempVar("__Vdyn2n", newIntDType(flp), flp) : nullptr;
+        if (boundsp) {
+            AstNodeExpr* const leftp = boundsp->leftp()->unlinkFrBack();
+            AstNodeExpr* const rightp = boundsp->rightp()->unlinkFrBack();
+            VL_DO_DANGLING(boundsp->deleteTree(), boundsp);
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssign{flp, wr(leftVarp, flp), leftp}));
+            outp = AstNode::addNext(
+                outp, static_cast<AstNode*>(new AstAssign{
+                          flp, wr(countVarp, flp),
+                          new AstAdd{flp,
+                                     ascending ? new AstSub{flp, rightp, rd(leftVarp, flp)}
+                                               : new AstSub{flp, rd(leftVarp, flp), rightp},
+                                     num(1)}}));
+        }
+        const auto countOf = [&]() -> AstNodeExpr* {
+            return countVarp ? static_cast<AstNodeExpr*>(rd(countVarp, flp)) : num(count);
+        };
+        const auto leftOf = [&]() -> AstNodeExpr* {
+            return leftVarp ? static_cast<AstNodeExpr*>(rd(leftVarp, flp)) : num(idxp->left());
+        };
         outp = AstNode::addNext(
             outp, static_cast<AstNode*>(
-                      new AstIf{flp, new AstNeq{flp, dynCarrierLength(sr(), flp), num(count)},
+                      new AstIf{flp, new AstNeq{flp, dynCarrierLength(sr(), flp), countOf()},
                                 new AstDisplay{flp, VDisplayType::DT_ERROR,
                                                "Array lengths do not match", nullptr, nullptr},
                                 nullptr}));
@@ -22376,9 +22406,8 @@ private:
                                          flp, new AstVarRef{flp, kVarp, VAccess::WRITE}, num(0)}));
         // The object's own places, from its left bound in its own direction
         AstNodeExpr* const placep
-            = idxp->ascending()
-                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, num(idxp->left()), k()})
-                  : static_cast<AstNodeExpr*>(new AstSub{flp, num(idxp->left()), k()});
+            = ascending ? static_cast<AstNodeExpr*>(new AstAdd{flp, leftOf(), k()})
+                        : static_cast<AstNodeExpr*>(new AstSub{flp, leftOf(), k()});
         AstFuncRef* const elemRefp = new AstFuncRef{
             flp, elemFuncp->name(),
             new AstArg{flp, "", new AstSelBit{flp, dynPart(sr(), "q", flp), k()}}};
@@ -22386,7 +22415,7 @@ private:
         AstLoop* const loopp = new AstLoop{flp};
         loopp->addStmtsp(
             new AstLoopTest{flp, loopp,
-                            new AstLogAnd{flp, new AstLtS{flp, k(), num(count)},
+                            new AstLogAnd{flp, new AstLtS{flp, k(), countOf()},
                                           new AstLtS{flp, k(), dynCarrierLength(sr(), flp)}}});
         loopp->addStmtsp(new AstAssign{flp, new AstSelBit{flp, lhsp, placep}, elemRefp});
         loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
