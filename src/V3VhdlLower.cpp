@@ -11621,6 +11621,7 @@ private:
         AstVar* const lp = dynArg(funcp, "l", newIntDType(flp), flp);
         AstVar* const rp = dynArg(funcp, "r", newIntDType(flp), flp);
         AstVar* const dp = dynArg(funcp, "d", bitDType(flp), flp);
+        AstVar* const xp = dynArg(funcp, "x", bitDType(flp), flp);
         AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
         AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
         funcp->addStmtsp(np);
@@ -11635,6 +11636,22 @@ private:
                        i32(1, flp)}});
         funcp->addStmtsp(new AstIf{flp, new AstLtS{flp, rd(np, flp), i32(0, flp)},
                                    new AstAssign{flp, wr(np, flp), i32(0, flp)}, nullptr});
+        // A slice that is not null runs the way the value does (8.5), where
+        // the value is the slice's own prefix ("x")
+        const auto dirError = [&](bool sliceDsc) {
+            return new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                  std::string{"Slice runs "} + (sliceDsc ? "'downto'" : "'to'")
+                                      + " but " + typep->base()->prettyName() + " is indexed "
+                                      + (sliceDsc ? "'to'" : "'downto'"),
+                                  nullptr, nullptr};
+        };
+        funcp->addStmtsp(new AstIf{
+            flp,
+            new AstLogAnd{
+                flp, rd(xp, flp),
+                new AstLogAnd{flp, new AstGtS{flp, rd(np, flp), i32(0, flp)},
+                              new AstNeq{flp, dynPart(rd(cp, flp), "dsc", flp), rd(dp, flp)}}},
+            new AstIf{flp, rd(dp, flp), dirError(true), dirError(false)}, nullptr});
         funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), rd(lp, flp)});
         funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rd(rp, flp)});
         funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp), rd(dp, flp)});
@@ -13230,6 +13247,10 @@ private:
                     argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
                     argsp->addNext(new AstArg{
                         flp, "", new AstConst{flp, AstConst::BitTrue{}, !sliceAsc}});
+                    // Only a prefix that is the value itself says which way
+                    // the slice must run; a name numbered its own way does not
+                    argsp->addNext(new AstArg{
+                        flp, "", new AstConst{flp, AstConst::BitTrue{}, shifts.empty()}});
                     AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
                     refp->taskp(VN_AS(funcp, Func));
                     return refp;
@@ -13542,6 +13563,7 @@ private:
             argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
             argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
             argsp->addNext(new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, !asc}});
+            argsp->addNext(new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, true}});
             AstFuncRef* const refp = new AstFuncRef{flp, slicep->name(), argsp};
             refp->taskp(VN_AS(slicep, Func));
             return refp;
