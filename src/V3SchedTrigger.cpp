@@ -871,7 +871,7 @@ class AwaitBeforeTrigVisitor final : public VNVisitor {
     // Vector containing SenTrees and coresponding scheduler
     std::vector<std::pair<AstSenTree*, AstNodeExpr*>> m_senTreeToSched;
     // Map containing vectors of SenItems that share the same prevValue variable
-    std::unordered_map<VNRef<AstNode>, std::vector<AstSenItem*>> m_senExprToSenItem;
+    std::unordered_map<VNRef<AstNode>, std::vector<const AstSenItem*>> m_senExprToSenItem;
 
     // Returns node which is used for grouping SenItems in `m_senExprToSenItem`
     static AstNode* getSenHashNode(const AstSenItem* const nodep) {
@@ -895,9 +895,24 @@ class AwaitBeforeTrigVisitor final : public VNVisitor {
             }
         }
 
+        // The triggers of static sensitivities -- an always block's -- on the same
+        // expression read the same previous value too. A before-trigger function
+        // updates it, so it has to evaluate those as well, or the change it
+        // consumes is never seen by them.
+        for (const auto& itemToIdx : m_trigKit.senItem2TrigIdxMap()) {
+            const AstSenItem* const itemp = &itemToIdx.first.get();
+            const VEdgeType edge = itemp->edgeType();
+            if (!edge.anEdge() && edge != VEdgeType::ET_CHANGED && edge != VEdgeType::ET_HYBRID) {
+                continue;
+            }
+            const auto it = m_senExprToSenItem.find(*getSenHashNode(itemp));
+            if (it == m_senExprToSenItem.end()) continue;
+            it->second.push_back(itemp);
+        }
+
         std::vector<VNRef<AstNode>> toRemove;
         for (const auto& senExprToSenTree : m_senExprToSenItem) {
-            std::vector<AstSenItem*> senItemps = senExprToSenTree.second;
+            const std::vector<const AstSenItem*>& senItemps = senExprToSenTree.second;
             toRemove.push_back(senExprToSenTree.first);
             for (size_t i = 1; i < senItemps.size(); ++i) {
                 if (senItemps[i]->edgeType() != senItemps[i - 1]->edgeType()) {
@@ -1048,7 +1063,7 @@ public:
                     emplaceAt(m_senExprBuilder.build(itemp).first, idx);
                     auto iter = m_senExprToSenItem.find(*getSenHashNode(itemp));
                     if (iter != m_senExprToSenItem.end()) {
-                        for (AstSenItem* const additionalItemp : iter->second) {
+                        for (const AstSenItem* const additionalItemp : iter->second) {
                             const size_t idx = m_trigKit.senItem2TrigIdx(additionalItemp);
                             emplaceAt(m_senExprBuilder.build(additionalItemp).first, idx);
                         }

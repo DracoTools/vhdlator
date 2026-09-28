@@ -334,6 +334,9 @@ public:
     size_t senItem2TrigIdx(const AstSenItem* senItemp) const {
         return m_senItem2TrigIdx.at(*senItemp);
     }
+    const std::unordered_map<VNRef<const AstSenItem>, size_t>& senItem2TrigIdxMap() const {
+        return m_senItem2TrigIdx;
+    }
     AstCFunc* compBasep() const { return m_compVecp; }
     const std::string& name() const { return m_name; }
     const std::unordered_map<const AstSenTree*, AstSenTree*>& mapPre() const { return m_mapPre; }
