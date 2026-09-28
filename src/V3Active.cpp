@@ -592,6 +592,10 @@ class ActiveVisitor final : public VNVisitor {
         m_canBeComb = false;
         iterateChildrenConst(nodep);
     }
+    // The simulation time is not a variable, so a process reading it is not a function of the
+    // variables it reads, and as a combinational process it would never rerun
+    void visit(AstTime*) override { m_canBeComb = false; }
+    void visit(AstTimeD*) override { m_canBeComb = false; }
     void visit(AstFork* nodep) override {
         if (nodep->isTimingControl()) {
             m_canBeComb = false;
