@@ -11,7 +11,8 @@
 -- runs forever from a concurrent procedure call, writes what it saw into a
 -- shared transaction record through an alias, pulses a trigger the
 -- testbench waits on, and reads a configuration record the testbench
--- changes while it runs.
+-- changes while it runs. UVVM's vvc_constructor, which takes no signal at
+-- all, sets a VVC's configuration from its generic and then waits forever.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -61,8 +62,15 @@ architecture a of t_vhdl_sharedbyref_mon is
       t <= '0';
     end loop;
   end procedure;
+  -- Takes no signal, sets the object and never returns
+  procedure construct(variable c : inout t_config; constant init : in t_config) is
+  begin
+    c := init;
+    wait;
+  end procedure;
 begin
   p_watch : watch(tx_trig, tx_info, config(TX, IDX));
+  p_construct : construct(config(RX, IDX), (step => 5, gap => 3 ns));
 end architecture;
 
 library ieee;
@@ -79,6 +87,9 @@ begin
   process
     variable seen : natural := 0;
   begin
+    wait for 0 ns;
+    assert config(RX, 1).step = 5 and config(RX, 1).gap = 3 ns
+      report "constructed config step " & integer'image(config(RX, 1).step) severity failure;
     for k in 1 to 3 loop
       wait until trig(TX, 1) = '1';
       seen := seen + 1;

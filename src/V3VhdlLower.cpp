@@ -8791,8 +8791,112 @@ private:
         AstVar* drvp = nullptr;  // What the ordinary drivers write
         AstVar* valp = nullptr;  // The value the force put there
         AstVar* enp = nullptr;  // Whether the force is in charge
+        AstVar* sigp = nullptr;  // The signal itself
     };
+    // The signals of this unit given such a pair, and the writes to each
+    // that choose between the two, which are the only writes it keeps
+    std::vector<const VhdlSymbol*> m_forcedHere;
+    std::set<const AstVarRef*> m_forceSelects;
     std::set<const VhdlSymbol*> m_needForce;
+    // The names of the signals some unit forces through an external name
+    // (8.7), and those of this unit that one of them may be. A force from
+    // another module has no driver pair of its own to write, so such a
+    // signal keeps one under names the external name reaches it by -- the
+    // signal's own with these suffixes -- and a release then hands it back
+    // to its drivers as a local one does (10.5.2.1). UVVM's AXI VVC test
+    // forces and releases the harness's response signals this way.
+    std::set<std::string> m_extForced;
+    std::set<const VhdlSymbol*> m_extForceSyms;
+    static constexpr const char* kExtForceVal = "__Vxfrc_val";
+    static constexpr const char* kExtForceEn = "__Vxfrc_en";
+    static constexpr const char* kExtForceDrv = "__Vxfrc_drv";
+    // The external name a force or release writes, through aliases of it
+    static AstVhdlExternalName* forcedExternal(AstNodeVhdlExpr* targetp) {
+        for (int depth = 0; targetp && depth < 32; ++depth) {
+            if (AstVhdlExternalName* const extp = VN_CAST(targetp, VhdlExternalName)) {
+                return extp;
+            }
+            if (AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+                targetp = callp->prefixp();
+                continue;
+            }
+            if (AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
+                targetp = selp->prefixp();
+                continue;
+            }
+            const VhdlSymbol* const symp = targetp->vhdlSymp();
+            if (!symp || symp->kind() != VhdlSymKind::ALIAS) return nullptr;
+            const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+            targetp = declp ? declp->targetp() : nullptr;
+        }
+        return nullptr;
+    }
+    // The last name of an external name's path, which is the object's
+    static std::string externalObjectName(const AstVhdlExternalName* extp) {
+        const AstNode* lastp = nullptr;
+        for (const AstNode* p = extp->pathp(); p; p = p->nextp()) lastp = p;
+        std::vector<std::string> parts;
+        if (!lastp || !flattenName(VN_AS(const_cast<AstNode*>(lastp), NodeVhdlExpr), parts)
+            || parts.empty()) {
+            return "";
+        }
+        return parts.back();
+    }
+    // This unit's signals and driven ports of a name some unit forces from
+    // outside
+    void collectExtForced(AstVhdlEntity* entp, AstVhdlArchitecture* archp) {
+        m_extForceSyms.clear();
+        if (m_extForced.empty()) return;
+        const auto consider = [&](const VhdlSymbol* symp) {
+            if (!symp || !m_extForced.count(symp->name()) || !m_vars.count(symp)) return;
+            m_needForce.insert(symp);
+            m_extForceSyms.insert(symp);
+        };
+        for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (!ifp || ifp->mode() == VhdlMode::IN || ifp->mode() == VhdlMode::LINKAGE) continue;
+            if (ifp->vhdlSymp()) consider(ifp->vhdlSymp()->resolved());
+        }
+        if (!archp) return;
+        for (AstNode* p = archp->declsp(); p; p = p->nextp()) {
+            const AstVhdlObjectDecl* const objp = VN_CAST(p, VhdlObjectDecl);
+            if (!objp || objp->kind() != VhdlObjKind::SIGNAL || !objp->vhdlSymp()) continue;
+            consider(objp->vhdlSymp()->resolved());
+        }
+    }
+    // A reference to one of those, made from the reference to the signal
+    AstVarXRef* extForceRef(AstVarXRef* sigRefp, const char* suffix, VAccess access) {
+        AstVarXRef* const refp = sigRefp->cloneTree(false);
+        refp->name(sigRefp->name() + suffix);
+        refp->access(access);
+        for (size_t i = 0, n = m_pendingExt.size(); i < n; ++i) {
+            if (m_pendingExt[i].first != sigRefp) continue;
+            std::vector<std::string> parts = m_pendingExt[i].second;
+            parts.back() += suffix;
+            m_pendingExt.emplace_back(refp, parts);
+            break;
+        }
+        return refp;
+    }
+    // The hierarchical reference a lowered target writes through, where it
+    // is one
+    static AstVarXRef* rootXRefOf(AstNode* nodep) {
+        for (int depth = 0; nodep && depth < 64; ++depth) {
+            if (AstVarXRef* const refp = VN_CAST(nodep, VarXRef)) return refp;
+            if (AstNodePreSel* const selp = VN_CAST(nodep, NodePreSel)) {
+                nodep = selp->fromp();
+            } else if (AstMemberSel* const selp = VN_CAST(nodep, MemberSel)) {
+                nodep = selp->fromp();
+            } else if (AstSel* const selp = VN_CAST(nodep, Sel)) {
+                nodep = selp->fromp();
+            } else if (AstArraySel* const selp = VN_CAST(nodep, ArraySel)) {
+                nodep = selp->fromp();
+            } else {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
     std::map<const VhdlSymbol*, VhdlForced> m_forced;
     std::map<const VhdlSymbol*, AstVar*> m_forceDrv;  // Symbol -> what drivers write
 
@@ -8820,9 +8924,22 @@ private:
             FileLine* const mflp = new FileLine{flp};
             mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
             AstNodeDType* const dtypep = lowerType(symp->typep(), flp);
-            fc.drvp = newTempVar(base + "__drv", dtypep, mflp);
-            fc.valp = newTempVar(base + "__val", lowerType(symp->typep(), flp), mflp);
-            fc.enp = newTempVar(base + "__en", newLogicDType(flp, 1), flp);
+            if (m_extForceSyms.count(symp)) {
+                // Named so that a force from another unit reaches them
+                const auto named = [&](const char* suffix, AstNodeDType* dtp, FileLine* vflp) {
+                    AstVar* const varp = new AstVar{vflp, VVarType::VAR, symp->name() + suffix,
+                                                    VFlagChildDType{}, dtp};
+                    addStmt(varp);
+                    return varp;
+                };
+                fc.drvp = named(kExtForceDrv, dtypep, mflp);
+                fc.valp = named(kExtForceVal, lowerType(symp->typep(), flp), mflp);
+                fc.enp = named(kExtForceEn, newLogicDType(flp, 1), flp);
+            } else {
+                fc.drvp = newTempVar(base + "__drv", dtypep, mflp);
+                fc.valp = newTempVar(base + "__val", lowerType(symp->typep(), flp), mflp);
+                fc.enp = newTempVar(base + "__en", newLogicDType(flp, 1), flp);
+            }
             fc.enp->valuep(new AstConst{flp, AstConst::BitFalse{}});
             // The drivers keep what the signal started with, so that a
             // release hands back a value it really had
@@ -8858,14 +8975,42 @@ private:
                 new AstCond{mflp, new AstVarRef{mflp, fc.enp, VAccess::READ},
                             new AstVarRef{mflp, fc.valp, VAccess::READ},
                             new AstVarRef{mflp, fc.drvp, VAccess::READ}}};
+            AstNode* const initBodyp = bodyp->cloneTree(false);
+            m_forceSelects.insert(VN_AS(VN_AS(bodyp, Assign)->lhsp(), VarRef));
+            m_forceSelects.insert(VN_AS(VN_AS(initBodyp, Assign)->lhsp(), VarRef));
             m_shadowsp = AstNode::addNextNull(
                 m_shadowsp,
                 static_cast<AstNode*>(new AstAlways{mflp, VAlwaysKwd::ALWAYS, senp, bodyp}));
             m_shadowsp = AstNode::addNextNull(
-                m_shadowsp, static_cast<AstNode*>(new AstInitial{mflp, bodyp->cloneTree(false)}));
+                m_shadowsp, static_cast<AstNode*>(new AstInitial{mflp, initBodyp}));
+            fc.sigp = sigp;
             m_forced.emplace(symp, fc);
+            m_forcedHere.push_back(symp);
             m_forceDrv.emplace(symp, fc.drvp);
         }
+    }
+
+    // What drives a forced signal from outside the processes -- an instance's
+    // output connected to it, a port association's copy -- writes the signal
+    // too, and those writes go where the drivers' do: to the value a release
+    // hands back. UVVM's AXI harness forces signals the slave model drives.
+    void redirectForcedWrites() {
+        if (m_forcedHere.empty()) return;
+        std::map<const AstVar*, AstVar*> drvOf;
+        for (const VhdlSymbol* const symp : m_forcedHere) {
+            const VhdlForced& fc = m_forced.at(symp);
+            drvOf.emplace(fc.sigp, fc.drvp);
+        }
+        // What an assignment writes, whatever access its reference says yet:
+        // the lowering marks a target written only where it knows it is one
+        m_modp->foreach([&](AstNodeAssign* asgp) {
+            AstVarRef* const refp = lvalueVarRef(asgp->lhsp());
+            if (!refp || m_forceSelects.count(refp)) return;
+            const auto it = drvOf.find(refp->varp());
+            if (it != drvOf.end()) refp->varp(it->second);
+        });
+        m_forcedHere.clear();
+        m_forceSelects.clear();
     }
 
     // The left-hand side of an ordinary driver. For a signal something else
@@ -8877,7 +9022,22 @@ private:
         m_asTarget = true;
         VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(targetp));
         const auto it = rootp ? m_forceDrv.find(rootp->resolved()) : m_forceDrv.end();
-        if (it == m_forceDrv.end()) return lowerExpr(targetp);
+        if (it == m_forceDrv.end()) {
+            AstNodeExpr* const outp = lowerExpr(targetp);
+            // A signal another unit forces keeps what its drivers write
+            // apart, and an ordinary assignment through an external name is
+            // one of those drivers
+            const AstVhdlExternalName* const extp = forcedExternal(targetp);
+            AstVarXRef* const sigRefp = outp ? rootXRefOf(outp) : nullptr;
+            if (extp && extp->objClass() == "signal" && sigRefp
+                && m_extForced.count(sigRefp->name())) {
+                for (auto& pending : m_pendingExt) {
+                    if (pending.first == sigRefp) pending.second.back() += kExtForceDrv;
+                }
+                sigRefp->name(sigRefp->name() + kExtForceDrv);
+            }
+            return outp;
+        }
         const auto prevIt = m_vars.find(rootp);
         const bool had = prevIt != m_vars.end();
         AstVar* const savedp = had ? prevIt->second : nullptr;
@@ -17158,7 +17318,13 @@ private:
         if (!nodep) return false;
         if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
             if (!staticSelectKey(selp->prefixp(), out)) return false;
-            out += "." + selp->name();
+            // The element is the suffix's name: the node's own is empty, and
+            // "r.a.b" and "r.c.d" made one key -- so a copy of a procedure
+            // made for one element's call ran for the other's too, and UVVM's
+            // AXI VVC checked bresp where rresp had changed
+            const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+            if (!sufp) return false;
+            out += "." + sufp->name();
             return true;
         }
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
@@ -18237,7 +18403,14 @@ private:
         const auto it = symp ? m_drivers.find(symp) : m_drivers.end();
         if (it == m_drivers.end()
             || m_driverUsed[symp] >= static_cast<int>(it->second.size())) {
-            return nullptr;
+            // A signal something forces keeps what its drivers write apart,
+            // and an instance's output is one of them (10.5.2.1)
+            const auto fIt = symp ? m_forceDrv.find(symp) : m_forceDrv.end();
+            if (fIt == m_forceDrv.end()) return nullptr;
+            VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
+            savedp = m_vars[keyp];
+            m_vars[keyp] = fIt->second;
+            return keyp;
         }
         const VhdlDriver& drv = it->second[m_driverUsed[symp]];
         VhdlSymbol* const keyp = const_cast<VhdlSymbol*>(symp);
@@ -20460,6 +20633,55 @@ private:
                 // hold.
                 AstNodeExpr* const extLhsp = lowerTarget(nodep->targetp());
                 if (!extLhsp) return nullptr;
+                // A signal of another unit that keeps a driver pair for
+                // forces from outside is written through that pair
+                AstVarXRef* const sigRefp = rootXRefOf(extLhsp);
+                const AstVhdlExternalName* const fextp = forcedExternal(nodep->targetp());
+                if (sigRefp && fextp && fextp->objClass() == "signal"
+                    && m_extForced.count(sigRefp->name())) {
+                    FileLine* const xflp = new FileLine{flp};
+                    xflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    xflp->warnOff(V3ErrorCode::COMBDLY, true);
+                    if (nodep->release()) {
+                        AstNode* const outp = new AstAssignDly{
+                            xflp, extForceRef(sigRefp, kExtForceEn, VAccess::WRITE),
+                            new AstConst{xflp, AstConst::BitFalse{}}};
+                        VL_DO_DANGLING(extLhsp->deleteTree(), extLhsp);
+                        return outp;
+                    }
+                    AstVhdlWaveform* const xwfp = nodep->wavesp();
+                    AstNodeExpr* const xrhsp
+                        = xwfp && xwfp->valuep() ? lowerExpr(xwfp->valuep()) : nullptr;
+                    if (!xrhsp) {
+                        VL_DO_DANGLING(extLhsp->deleteTree(), extLhsp);
+                        return nullptr;
+                    }
+                    // What the force holds starts from what the drivers have,
+                    // so a force of part of the signal leaves the rest theirs
+                    AstNode* outp
+                        = new AstAssign{xflp, extForceRef(sigRefp, kExtForceVal, VAccess::WRITE),
+                                        extForceRef(sigRefp, kExtForceDrv, VAccess::READ)};
+                    AstVarXRef* const enRefp = extForceRef(sigRefp, kExtForceEn, VAccess::WRITE);
+                    AstVarXRef* const valRefp = extForceRef(sigRefp, kExtForceVal, VAccess::WRITE);
+                    // The part of the signal the force names, of the value
+                    AstNodeExpr* valLhsp = valRefp;
+                    if (sigRefp != extLhsp) {
+                        sigRefp->replaceWith(valRefp);
+                        valLhsp = extLhsp;
+                    }
+                    for (size_t i = 0; i < m_pendingExt.size(); ++i) {
+                        if (m_pendingExt[i].first == sigRefp) {
+                            m_pendingExt.erase(m_pendingExt.begin() + i);
+                            break;
+                        }
+                    }
+                    VL_DO_DANGLING(sigRefp->deleteTree(), sigRefp);
+                    outp = AstNode::addNext(
+                        outp, static_cast<AstNode*>(new AstAssign{xflp, valLhsp, xrhsp}));
+                    return AstNode::addNext(
+                        outp, static_cast<AstNode*>(new AstAssignDly{
+                                  xflp, enRefp, new AstConst{xflp, AstConst::BitTrue{}}}));
+                }
                 v3Global.setHasForceableSignals();
                 if (nodep->release()) return new AstRelease{flp, extLhsp};
                 AstVhdlWaveform* const extWfp = nodep->wavesp();
@@ -23027,7 +23249,7 @@ private:
         }
         // A procedure with a signal parameter drives the caller's own signal,
         // so it gets a copy bound to the signals this call passes (4.2.2.3)
-        if (symp && callp && hasSignalParam(symp)) {
+        if (symp && callp && (hasSignalParam(symp) || suspendsOnShared(symp, callp))) {
             if (AstNode* const outp = lowerSignalProcCall(symp, callp, flp)) return outp;
             // Passing such a signal by value would compile and quietly throw
             // the drives away, which is worse than saying so
@@ -23863,6 +24085,34 @@ private:
         return p;
     }
 
+    // Whether a procedure that may suspend is given a shared variable for a
+    // composite variable parameter. Copied in and out, what it writes is seen
+    // only when it returns, and what others write while it waits not at all:
+    // UVVM's vvc_constructor sets the VVC's configuration from its generic
+    // and then waits forever, so the configuration kept its default. Only
+    // one that suspends: one that runs through cannot tell the difference.
+    bool suspendsOnShared(VhdlSymbol* symp, AstVhdlCall* callp) const {
+        AstVhdlSubprogDecl* const declp = declOf(symp);
+        const AstVhdlSubprogDecl* const bodyp = symp->resolved()->bodyp();
+        if (!declp || !bodyp || !hasWait(bodyp->stmtsp())) return false;
+        size_t pos = 0;
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp(), ++pos) {
+            const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            AstNodeVhdlExpr* actualp = nullptr;
+            size_t a = 0;
+            for (AstNode* q = callp->argsp(); q; q = q->nextp(), ++a) {
+                const AstVhdlAssoc* const asp = VN_CAST(q, VhdlAssoc);
+                if (!asp) continue;
+                const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                if (namep ? namep->name() == ifp->name() : (!asp->formalp() && a == pos)) {
+                    actualp = asp->actualp();
+                }
+            }
+            if (sharedVariableActual(ifp, actualp)) return true;
+        }
+        return false;
+    }
+
     // Whether any parameter is of the signal class (4.2.2.3)
     static bool hasSignalParam(VhdlSymbol* symp) {
         AstVhdlSubprogDecl* const declp = declOf(symp);
@@ -24614,6 +24864,30 @@ private:
             }
         }
         for (const AstVhdlExprPair& pair : passed) {
+            // One character of a STRING, which is text here, has no place
+            // of its own to hand over for writing: it goes as a variable
+            // filled from it, and is put back into the text afterwards
+            if (prepp && postpp && pair.exprp && !pair.loweredp && pair.formalp
+                && pair.formalp->mode() != VhdlMode::IN && isStringPart(pair.exprp)
+                && !VN_IS(VN_CAST(pair.exprp, VhdlCall)->argsp(), VhdlRange)) {
+                AstNodeExpr* const readp = lowerExpr(pair.exprp);
+                VhdlType* const ctypep = const_cast<VhdlType*>(pair.exprp->vhdlTypep());
+                if (readp && ctypep) {
+                    AstVar* const tmpp = newTempVar("__Vstrch", lowerType(ctypep, flp), flp);
+                    *prepp = AstNode::addNextNull(
+                        *prepp, static_cast<AstNode*>(new AstAssign{
+                                    flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, readp}));
+                    if (AstNode* const backp = lowerStringPartAssign(
+                            pair.exprp, new AstVarRef{flp, tmpp, VAccess::READ}, false, false,
+                            flp)) {
+                        *postpp = AstNode::addNextNull(*postpp, backp);
+                    }
+                    refp->addArgsp(
+                        new AstArg{flp, pair.name, new AstVarRef{flp, tmpp, VAccess::READWRITE}});
+                    continue;
+                }
+                if (readp) VL_DO_DANGLING(readp->deleteTree(), readp);
+            }
             // A parameter held two levels deep is handed the actual made
             // that way, as a call without a copy hands it (addCallArgs)
             if (taskp && prepp && pair.exprp && !pair.loweredp) {
@@ -25616,7 +25890,16 @@ private:
             return AstNode::addNext(static_cast<AstNode*>(new AstDelay{flp, timep, false}),
                                     deltaWait(flp));
         }
-        // Not known here, so decide at run time
+        // Not known here, so decide at run time. The expression is read
+        // twice below, and it is evaluated once (10.2): UVVM waits "for
+        // v_rand.rand(ONLY, ...)", and a second call took the next number.
+        AstNode* prep = nullptr;
+        if (!repeatable(timep)) {
+            AstVar* const tmpp
+                = newTempVar("__Vwaitfor", lowerType(V3VhdlStd::timeType(), flp), flp);
+            prep = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, timep};
+            timep = new AstVarRef{flp, tmpp, VAccess::READ};
+        }
         AstNodeExpr* const isZerop = new AstEq{
             flp, timep->cloneTree(false), new AstConst{flp, AstConst::Unsized64{}, 0}};
         // The zero case is taken by the other branch, so this delay is never
@@ -25625,7 +25908,8 @@ private:
         dflp->warnOff(V3ErrorCode::ZERODLY, true);
         AstNode* elsep = new AstDelay{dflp, timep, false};
         if (m_anyAfter) elsep = AstNode::addNext(elsep, deltaWait(flp));
-        return new AstIf{flp, isZerop, deltaWait(flp), elsep};
+        return AstNode::addNextNull(
+            prep, static_cast<AstNode*>(new AstIf{flp, isZerop, deltaWait(flp), elsep}));
     }
 
     // The procedures of std.textio and the implicit file operations (5.5.2,
@@ -28488,6 +28772,7 @@ private:
         // Every signal now has its variable, so the transaction bits that
         // the statements will mark can be made
         makeActives(flp);
+        collectExtForced(entp, archp);
         makeForced(flp);
         for (AstNodeVhdlStmt* const stmtp : entStmtsp) lowerConcurrentDriver(stmtp);
         if (archp) {
@@ -28508,6 +28793,7 @@ private:
         m_concDeltas.clear();
         m_concSenp.clear();
         m_historied.clear();
+        redirectForcedWrites();
         redirectProcessDrives();
         settleElementAliases();
         m_netlistp->addModulesp(m_modp);
@@ -28535,6 +28821,17 @@ static bool hasUnboundGeneric(const AstVhdlEntity* entp) {
 }
 
 void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+    // Which signals are forced from another unit, by name, before any unit
+    // is lowered: the signal's unit may come first
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([this](AstVhdlSigAssign* asgp) {
+            if (!asgp->force() && !asgp->release()) return;
+            const AstVhdlExternalName* const extp = forcedExternal(asgp->targetp());
+            if (!extp || extp->package() || extp->objClass() != "signal") return;
+            const std::string name = externalObjectName(extp);
+            if (!name.empty()) m_extForced.insert(name);
+        });
+    }
     // An alternative of a conditional assignment that a settled condition
     // closes off never runs, and what it assigns is checked for length only
     // when it runs (10.5.2.1). Drop it before anything reads the alternatives,
