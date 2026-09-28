@@ -1807,6 +1807,9 @@ class ConstVisitor final : public VNVisitor {
         if (!thensp || thensp->nextp()) return false;  // Must be SINGLE statement
         if (!elsesp || elsesp->nextp()) return false;
         if (thensp->type() != elsesp->type()) return false;  // Can't mix an assigndly with assign
+        // "if (c) x <= #d1 a; else x <= #d2 a;" waits d1 or d2: the merged
+        // assignment would keep only the first branch's delay
+        if (thensp->timingControlp() || elsesp->timingControlp()) return false;
         if (!thensp->lhsp()->sameGateTree(elsesp->lhsp())) return false;
         if (!thensp->rhsp()->gateTree()) return false;
         if (!elsesp->rhsp()->gateTree()) return false;
