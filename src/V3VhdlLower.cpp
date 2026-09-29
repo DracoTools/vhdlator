@@ -22338,10 +22338,21 @@ private:
                              const AstNodeExpr* lhsp) const {
         const AstVarRef* const refp = VN_CAST(lhsp, VarRef);
         if (!refp || !VN_IS(targetp, VhdlName) || !targetp->vhdlSymp()) return false;
-        switch (targetp->vhdlSymp()->resolved()->kind()) {
+        const VhdlSymbol* const tsymp = targetp->vhdlSymp()->resolved();
+        switch (tsymp->kind()) {
         case VhdlSymKind::VARIABLE:
-        case VhdlSymKind::SHARED_VARIABLE:
-        case VhdlSymKind::PARAMETER: break;
+        case VhdlSymKind::SHARED_VARIABLE: break;
+        case VhdlSymKind::PARAMETER: {
+            // Only a parameter that comes in with the actual's value holds
+            // text as long as it is. One of mode out need not: its length
+            // is the actual's (4.2.2.3), but the text it starts with is not
+            // written from the actual in every copy -- VUnit's codec
+            // decode "result := code(index + 9 to index + 9 + result'length
+            // - 1)" was reported where it was right.
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(tsymp->declp(), VhdlIfaceDecl);
+            if (!ifp || ifp->mode() != VhdlMode::INOUT) return false;
+            break;
+        }
         default: return false;
         }
         const VhdlType* const ttypep = targetp->vhdlTypep();
