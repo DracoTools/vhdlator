@@ -7141,12 +7141,13 @@ private:
     // already has, so it is asked of x's own subtype -- which is the form a
     // design uses precisely where those bounds are settled by an instance
     // rather than by the text (16.2.5).
-    bool rangeParts(AstVhdlRange* rp, AstNodeExpr*& leftp, AstNodeExpr*& rightp,
-                    bool& ascending, bool& dirKnown) {
+    bool rangeParts(AstVhdlRange* rp, AstNodeExpr*& leftp, AstNodeExpr*& rightp, bool& ascending,
+                    bool& dirKnown, AstNodeExpr** dscpp = nullptr) {
         leftp = nullptr;
         rightp = nullptr;
         ascending = true;
         dirKnown = true;
+        if (dscpp) *dscpp = nullptr;
         if (!rp) return false;
         FileLine* const flp = rp->fileline();
         if (rp->leftp() && rp->rightp()) {
@@ -7175,6 +7176,22 @@ private:
         int dim = 0;
         if (AstVhdlLiteral* const litp = VN_CAST(attrp->argp(), VhdlLiteral)) {
             dim = static_cast<int>(litp->intVal()) - 1;
+        }
+        // An object that carries its bounds has the range it carries, and
+        // runs whichever way it was given: "pop(msg)(data'range)" where
+        // data is a formal a call gave a value only running sizes. Only for
+        // a caller that can take a direction known when it runs.
+        if (dscpp && dim == 0 && isDynObj(attrp->prefixp())) {
+            AstNodeExpr* const objp = lowerExpr(attrp->prefixp());
+            if (!objp) return false;
+            leftp = dynPart(objp, reverse ? "rgt" : "lft", flp);
+            rightp = dynPart(objp->cloneTree(false), reverse ? "lft" : "rgt", flp);
+            dirKnown = false;
+            if (dscpp) {
+                AstNodeExpr* const dscp = dynPart(objp->cloneTree(false), "dsc", flp);
+                *dscpp = reverse ? static_cast<AstNodeExpr*>(new AstNot{flp, dscp}) : dscp;
+            }
+            return true;
         }
         if (!dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
             // Bounds the text already fixed
@@ -13210,7 +13227,8 @@ private:
                 AstNodeExpr* rightp = nullptr;
                 bool sliceAsc = true;
                 bool sliceDirKnown = true;
-                if (!rangeParts(rp, leftp, rightp, sliceAsc, sliceDirKnown)) {
+                AstNodeExpr* sliceDscp = nullptr;  // Which way it runs, known when it runs
+                if (!rangeParts(rp, leftp, rightp, sliceAsc, sliceDirKnown, &sliceDscp)) {
                     VL_DO_DANGLING(fromp->deleteTree(), fromp);
                     if (!rp->leftp() || !rp->rightp()) unsup(flp, "slice by an attribute range");
                     return nullptr;
@@ -13232,21 +13250,25 @@ private:
                                                 ? dynValueType(nodep->prefixp())
                                                 : nodep->prefixp()->vhdlTypep();
                     AstNodeFTask* const funcp
-                        = carrp && sliceDirKnown
+                        = carrp && (sliceDirKnown || sliceDscp)
                               ? dynSliceFunc(carrp, flp, isDyn2Value(nodep->prefixp()))
                               : nullptr;
                     if (!funcp) {
                         VL_DO_DANGLING(fromp->deleteTree(), fromp);
                         VL_DO_DANGLING(leftp->deleteTree(), leftp);
                         VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                        if (sliceDscp) VL_DO_DANGLING(sliceDscp->deleteTree(), sliceDscp);
                         unsup(flp, "slice of a value whose length only running decides");
                         return nullptr;
                     }
                     AstArg* argsp = new AstArg{flp, "", fromp};
                     argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
                     argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
-                    argsp->addNext(new AstArg{
-                        flp, "", new AstConst{flp, AstConst::BitTrue{}, !sliceAsc}});
+                    argsp->addNext(new AstArg{flp, "",
+                                              sliceDscp
+                                                  ? sliceDscp
+                                                  : static_cast<AstNodeExpr*>(new AstConst{
+                                                        flp, AstConst::BitTrue{}, !sliceAsc})});
                     // Only a prefix that is the value itself says which way
                     // the slice must run; a name numbered its own way does not
                     argsp->addNext(new AstArg{
@@ -13255,6 +13277,8 @@ private:
                     refp->taskp(VN_AS(funcp, Func));
                     return refp;
                 }
+                // Only a slice of a carrier can take its direction then
+                if (sliceDscp) VL_DO_DANGLING(sliceDscp->deleteTree(), sliceDscp);
                 if (stringBehind(prefixTypep)) {
                     // A slice of a STRING is a substring: Verilator's string
                     // is characters, not bits, so a part select of it means
