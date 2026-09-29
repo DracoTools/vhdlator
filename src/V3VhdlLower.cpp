@@ -20897,8 +20897,35 @@ private:
         AstNodeExpr* const objp = lowerDriveTarget(callp->prefixp());
         AstNodeVhdlExpr* const uniformp = uniformAggregateValue(valuep);
         AstNodeExpr* const elemp = objp && uniformp ? lowerExpr(uniformp) : nullptr;
-        AstNodeExpr* const carrp
-            = objp && !uniformp ? asDynCarrier(valuep, objTypep->base(), flp) : nullptr;
+        // A value held two levels deep, into places whose words have a fixed
+        // length -- UVVM's HVVC bridge, "bridge_to_hvvc.data_words(0 to n - 1)
+        // <= convert_slv_to_slv_array(...)": each word is made fixed as it
+        // is driven
+        VhdlType* const v2typep
+            = objp && !uniformp && (isDyn2Value(valuep) || dyn2ResultCall(valuep))
+                  ? dyn2ValueType(valuep)
+                  : nullptr;
+        AstNodeFTask* elem2Funcp = nullptr;
+        if (v2typep) {
+            VhdlType* const fixedElemp
+                = objTypep->elementp() ? objTypep->elementp() : objTypep->base()->elementp();
+            VhdlType* const elemCarrp = openCarriedElement(v2typep);
+            if (fixedElemp && fixedElemp->isConstrainedArray()
+                && !lengthOnlyRunningDecides(fixedElemp) && elemCarrp) {
+                elem2Funcp = dynToFixedFunc(elemCarrp, fixedElemp, flp);
+            }
+            // An element whose length arrives with the instance -- a record
+            // port's open element, bound by the signal the instance is given
+            // -- has bounds that are expressions rather than numbers
+            if (!elem2Funcp && fixedElemp && elemCarrp && fixedElemp->lengthEmittable()
+                && !lengthOnlyRunningDecides(fixedElemp)) {
+                elem2Funcp = dynToFixedExprFunc(elemCarrp, fixedElemp, flp);
+            }
+        }
+        AstNodeExpr* const carrp = elem2Funcp ? asDyn2Carrier(valuep, v2typep, flp)
+                                   : objp && !uniformp && !v2typep
+                                       ? asDynCarrier(valuep, objTypep->base(), flp)
+                                       : nullptr;
         if (!objp || !repeatable(objp) || (!elemp && !carrp)) {
             for (AstNodeExpr* const p : {leftp, rightp, objp, elemp, carrp}) {
                 if (p) VL_DO_DANGLING(p->deleteTree(), p);
@@ -20926,7 +20953,10 @@ private:
                                   placesp}}));
         AstVar* cvarp = nullptr;
         if (carrp) {
-            cvarp = newTempVar("__Vsdcarr", dynCarrierRef(objTypep->base(), flp), flp);
+            cvarp = newTempVar("__Vsdcarr",
+                               elem2Funcp ? dyn2CarrierRef(v2typep, flp)
+                                          : dynCarrierRef(objTypep->base(), flp),
+                               flp);
             outp = AstNode::addNext(
                 outp, static_cast<AstNode*>(new AstAssign{flp, wr(cvarp, flp), carrp}));
             outp = AstNode::addNext(
@@ -20941,8 +20971,14 @@ private:
         AstNodeExpr* const placep
             = asc ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lop, flp), rd(kp, flp)})
                   : new AstSub{flp, rd(lop, flp), rd(kp, flp)};
-        AstNodeExpr* const srcp
+        AstNodeExpr* srcp
             = elemp ? elemp : new AstSelBit{flp, dynPart(rd(cvarp, flp), "q", flp), rd(kp, flp)};
+        if (elem2Funcp) {
+            AstFuncRef* const wordp
+                = new AstFuncRef{flp, elem2Funcp->name(), new AstArg{flp, "", srcp}};
+            wordp->taskp(VN_AS(elem2Funcp, Func));
+            srcp = wordp;
+        }
         AstLoop* const loopp = new AstLoop{flp};
         AstNodeExpr* testp = new AstLtS{flp, rd(kp, flp), rd(np, flp)};
         if (cvarp) {
@@ -22339,6 +22375,17 @@ private:
         }
         return false;
     }
+    // The type a value held two levels deep is held as: a name's own, or what
+    // a function giving one back was emitted to return
+    VhdlType* dyn2ValueType(AstNodeVhdlExpr* valuep) {
+        const VhdlSymbol* const namedp = VN_IS(valuep, VhdlName) && valuep->vhdlSymp()
+                                             ? valuep->vhdlSymp()->resolved()
+                                             : nullptr;
+        return namedp ? namedp->typep()
+               : dyn2ResultCall(valuep)
+                   ? emittedReturnType(VN_AS(valuep, VhdlCall)->vhdlSymp()->resolved())
+                   : const_cast<VhdlType*>(valuep->vhdlTypep());
+    }
     // A value held two levels deep copied into an object whose count and
     // element length are fixed: element by element, each made fixed, and the
     // counts have to match (10.6.2.1). Null where the object is not that.
@@ -22357,14 +22404,7 @@ private:
             || lengthOnlyRunningDecides(fixedElemp)) {
             return nullptr;
         }
-        const VhdlSymbol* const namedp = VN_IS(valuep, VhdlName) && valuep->vhdlSymp()
-                                             ? valuep->vhdlSymp()->resolved()
-                                             : nullptr;
-        VhdlType* const vtypep
-            = namedp ? namedp->typep()
-              : dyn2ResultCall(valuep)
-                  ? emittedReturnType(VN_AS(valuep, VhdlCall)->vhdlSymp()->resolved())
-                  : const_cast<VhdlType*>(valuep->vhdlTypep());
+        VhdlType* const vtypep = dyn2ValueType(valuep);
         VhdlType* const elemCarrp = vtypep ? openCarriedElement(vtypep) : nullptr;
         if (!elemCarrp) return nullptr;
         AstNodeFTask* const elemFuncp = dynToFixedFunc(elemCarrp, fixedElemp, flp);
