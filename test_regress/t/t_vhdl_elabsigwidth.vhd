@@ -115,8 +115,11 @@ begin
   i2 : entity work.t_vhdl_elabsigwidth_sub generic map (h => h2) port map (data => d2, addr => a2);
 
   process
+    -- A process is elaborated once as well (14.4.2)
+    variable pv : std_logic_vector(len_of(h2) - 1 downto 0);
   begin
     wait for 1 ns;
+    assert pv'length = 6 report "pv length " & integer'image(pv'length) severity failure;
     assert d1'length = 12 and a1'length = 4 and d2'length = 6 and a2'length = 3
       report "lengths " & integer'image(d1'length) & " " & integer'image(a1'length) & " "
              & integer'image(d2'length) & " " & integer'image(a2'length) severity failure;
