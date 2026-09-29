@@ -2502,12 +2502,19 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
     } else {
         symp = VhdlSymTab::newSymbol(kind, nodep->name(), nodep);
         {
-            // A signal is declared only where elaboration declares it once
-            // (6.4.2.3), so its bounds are whatever elaboration makes of
-            // them: VUnit sizes one with "data_length(avalon_source_stream)
-            // - 1", an accessor of a handle an impure function built
+            // An object declared where elaboration declares it once -- a
+            // signal anywhere, and anything a process, an architecture, a
+            // block or a package declares -- has the bounds elaboration
+            // makes of it (6.4.2.3, 14.4.2): VUnit sizes one with
+            // "data_length(bus_handle) - 1", an accessor of a handle an
+            // impure function built. What a subprogram declares is
+            // elaborated at each call instead.
             VL_RESTORER(m_elabBounds);
-            m_elabBounds = kind == VhdlSymKind::SIGNAL;
+            const AstNode* const declParentp = parentOf(nodep);
+            m_elabBounds = kind == VhdlSymKind::SIGNAL || VN_IS(declParentp, VhdlProcess)
+                           || VN_IS(declParentp, VhdlArchitecture) || VN_IS(declParentp, VhdlBlock)
+                           || VN_IS(declParentp, VhdlGenerateBody)
+                           || VN_IS(declParentp, VhdlEntity) || VN_IS(declParentp, VhdlPackage);
             symp->typep(resolveSubtype(nodep->subtypep()));
         }
         nodep->vhdlSymp(symp);
