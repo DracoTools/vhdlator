@@ -605,6 +605,14 @@ class VhdlSemVisitor final : public VNVisitor {
         info.ascending = rp->dir() == VhdlDir::TO;
         info.left = evalChecked(rp->leftp());
         info.right = evalChecked(rp->rightp());
+        if (m_elabBounds) {
+            for (VhdlValue* const valp : {&info.left, &info.right}) {
+                if (valp->known()) continue;
+                const VhdlValue elab
+                    = V3VhdlEval::evalElab(valp == &info.left ? rp->leftp() : rp->rightp());
+                if (elab.isInt()) *valp = elab;
+            }
+        }
         if (info.left.known() && !info.left.typep()) info.left.typep(typep);
         if (info.right.known() && !info.right.typep()) info.right.typep(typep);
         return info;
@@ -2275,6 +2283,7 @@ private:
     // it fold because the call supplied them, not because the design wrote
     // them, so a range that does not fit is a run-time condition
     bool m_inSpecialized = false;
+    bool m_elabBounds = false;  // Bounds of an object elaborated once, a signal
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
@@ -2492,7 +2501,15 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         nodep->vhdlSymp(symp);
     } else {
         symp = VhdlSymTab::newSymbol(kind, nodep->name(), nodep);
-        symp->typep(resolveSubtype(nodep->subtypep()));
+        {
+            // A signal is declared only where elaboration declares it once
+            // (6.4.2.3), so its bounds are whatever elaboration makes of
+            // them: VUnit sizes one with "data_length(avalon_source_stream)
+            // - 1", an accessor of a handle an impure function built
+            VL_RESTORER(m_elabBounds);
+            m_elabBounds = kind == VhdlSymKind::SIGNAL;
+            symp->typep(resolveSubtype(nodep->subtypep()));
+        }
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
         // Only a constant takes its bounds from its value. A signal or a
