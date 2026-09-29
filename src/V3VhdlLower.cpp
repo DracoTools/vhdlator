@@ -24725,6 +24725,36 @@ private:
                 // copies of the caller given two signals are two callers.
                 std::map<const VhdlSymbol*, AstNodeVhdlExpr*> carried;
                 std::string carryKey;
+                // The first name along the way that stands for a driver the
+                // caller owns: "activate(event)" inside a copy of notify
+                // whose event is "runner(2 to 3)", with runner a formal
+                // bound to a package's signal. The walk goes on to the
+                // signal, which is what the name is lowered against, but it
+                // is that driver an assignment writes (4.2.2.3).
+                // The name as written comes first: a formal of this copy is
+                // already read through to what it was given by then
+                const VhdlSymbol* boundp = nullptr;
+                if (actualSymp) {
+                    if (m_bindDrivers.count(actualSymp)) {
+                        boundp = actualSymp;
+                    } else if (m_bindDrivers.count(actualSymp->resolved())) {
+                        boundp = actualSymp->resolved();
+                    }
+                }
+                if (!boundp && rootp && m_bindDrivers.count(rootp)) boundp = rootp;
+                // By now a formal of this copy is already the expression it
+                // was given -- "event" is "runner(2 to 3)" -- so it is found
+                // by what it was given
+                if (!boundp && rootp) {
+                    for (const auto& pair : m_bindDrivers) {
+                        const auto eIt = m_bindExprs.find(pair.first);
+                        if (eIt != m_bindExprs.end() && eIt->second
+                            && baseSymOf(eIt->second) == rootp) {
+                            boundp = pair.first;
+                            break;
+                        }
+                    }
+                }
                 for (int depth = 0; rootp && depth < 16; ++depth) {
                     const auto cIt = m_bindExprs.find(rootp);
                     if (cIt == m_bindExprs.end() || !cIt->second) break;
@@ -24744,6 +24774,7 @@ private:
                     const VhdlSymbol* const nextp = baseSymOf(cIt->second);
                     if (nextp == rootp) break;
                     rootp = nextp;
+                    if (!boundp && rootp && m_bindDrivers.count(rootp)) boundp = rootp;
                 }
                 // A signal a package declares has no variable of this
                 // module's own until something reads it; naming one element
@@ -24762,7 +24793,7 @@ private:
                 const VhdlSymbol* partSigp = nullptr;
                 int partIdx = 0;
                 if (formals[i]->mode() != VhdlMode::IN) {
-                    const auto outerIt = m_bindDrivers.find(rootp);
+                    const auto outerIt = m_bindDrivers.find(boundp ? boundp : rootp);
                     if (outerIt != m_bindDrivers.end()) {
                         partSigp = outerIt->second.signalp;
                         partIdx = outerIt->second.idx;
