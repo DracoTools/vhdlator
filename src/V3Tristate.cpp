@@ -924,7 +924,14 @@ class TristateVisitor final : public TristateBaseVisitor {
         }
         AstNodeAssign* const asgp = VN_CAST(np, NodeAssign);
         if (!asgp || VN_IS(asgp, AssignW) || asgp->lhsp() != childp) return nullptr;
-        if (asgp->timingControlp()) return nullptr;
+        // A nonblocking assignment with an intra-assignment delay is part of
+        // the process's driver like any other, its enable written with the
+        // same delay: "s <= #3 2'b00; s <= #5 2'bzz" hands over the first,
+        // then releases. Another timing control keeps a driver of its own.
+        if (asgp->timingControlp()
+            && !(VN_IS(asgp, AssignDly) && VN_IS(asgp->timingControlp(), Delay))) {
+            return nullptr;
+        }
         for (AstNode* upp = asgp->backp(); upp; upp = upp->backp()) {
             if (VN_IS(upp, NodeProcedure) || VN_IS(upp, NodeFTask)) {
                 asgpr = asgp;
@@ -998,6 +1005,9 @@ class TristateVisitor final : public TristateBaseVisitor {
                 = VN_IS(asgp, AssignDly)
                       ? static_cast<AstNodeAssign*>(new AstAssignDly{fl, enLhsp, enRhsp})
                       : static_cast<AstNodeAssign*>(new AstAssign{fl, enLhsp, enRhsp});
+            if (AstNode* const tcp = asgp->timingControlp()) {
+                enAsgp->timingControlp(tcp->cloneTree(false));
+            }
             enAsgp->user2Or(U2_NONGRAPH | U2_GRAPHING);
             asgp->addNextHere(enAsgp);
             // The statement-wide enable the reference was given is not used
