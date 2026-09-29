@@ -20162,7 +20162,17 @@ private:
                 // value until that module is instantiated in turn: the bound
                 // is one of its own parameters, which its instance works out
                 const auto relayIt = m_hoistRelay.find(std::make_pair(nodep, hoist.name));
-                if (relayIt == m_hoistRelay.end()) continue;
+                // Left out, the parameter would keep its default and the
+                // generate or the bound would be decided on that, with no
+                // word said: a value made by an impure function -- VUnit's
+                // actors, numbered by a protected counter -- is only known
+                // once the design runs
+                if (relayIt == m_hoistRelay.end()) {
+                    unsup(nodep->fileline(), "generic value an impure function makes, which a"
+                                             " bound or generate condition of '"
+                                                 + modName + "' needs while elaborating");
+                    continue;
+                }
                 valuep = new AstVarRef{flp, hoistVar(relayIt->second, flp), VAccess::READ};
             }
             outp = AstNode::addNext(outp, new AstPin{flp, ++*pinNump, hoist.name, valuep});
@@ -29321,76 +29331,93 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             m_dataGenerics.insert(gsymp->resolved());
         });
     }
-    for (AstNodeVhdlUnit* const unitp : unitsp) {
-        unitp->foreach([&](AstVhdlInstance* instp) {
-            for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
-                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
-                if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
-                const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
-                VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
-                if (!gsymp) continue;
-                // A value elaboration worked out element by element is not
-                // one the back end can carry: the widths it holds are folded
-                // into the bounds instead, and the object itself travels
-                const VhdlValue actVal = V3VhdlEval::eval(asp->actualp());
-                if (actVal.known() && !actVal.isComposite()) continue;
-                // Only where the actual is a constant that has no value of
-                // its own. A generic reaching down from an enclosing
-                // instance has none here either, but elaboration gives it
-                // one and V3Param folds it; an expression may still fold in
-                // the back end where nothing here could fold it.
-                const VhdlSymbol* asymp = asp->actualp()->vhdlSymp();
-                // An element of a record or of an array is part of the
-                // object it names, and it is that object which has a value
-                // or has not: VUnit hands a component "tb_cfg.write_prob",
-                // read out of a string generic while the design runs
-                if ((!asymp || asymp->resolved()->kind() != VhdlSymKind::CONSTANT)
-                    && (VN_IS(asp->actualp(), VhdlSelected) || VN_IS(asp->actualp(), VhdlCall))) {
-                    asymp = baseSymOf(asp->actualp());
-                }
-                if (!asymp) continue;
-                const VhdlSymbol* const constp = asymp->resolved();
-                if (constp->kind() != VhdlSymKind::CONSTANT || constp->hasValue()) continue;
-                // A constant settled by elaboration is a parameter of the
-                // module that declares it, and the back end folds it there,
-                // so a generic it is handed to stays a parameter as well.
-                // "WIDTH => WIDTH", with the width computed by a function,
-                // is how a design usually writes it.
-                const AstVhdlObjectDecl* const cdeclp = VN_CAST(constp->declp(), VhdlObjectDecl);
-                if (cdeclp && cdeclp->isElabConstant()
-                    && V3VhdlEval::backEndFolds(cdeclp->defaultp())) {
-                    continue;
-                }
-                // A deferred constant is declared in the package and given
-                // its value in the package body, and it is that second
-                // declaration which says what the value is (6.4.2.2). Asking
-                // only the first finds no value, so a generic handed one was
-                // made to travel as data for want of looking further.
-                //
-                // Only where the generic is a *number*. One of an array type
-                // given a value this frontend cannot fold has to travel as
-                // data whatever the back end could do with it -- a parameter
-                // of an array type handed an element of a table makes the
-                // instance's output feed back into itself -- and it is the
-                // generic's own type that says which of the two this is.
-                const AstVhdlObjectDecl* const fullp
-                    = VN_CAST(constp->fullDeclp(), VhdlObjectDecl);
-                if (fullp && fullp != cdeclp && scalarKind(gsymp->resolved()->typep())
-                    && V3VhdlEval::backEndFolds(fullp->defaultp())) {
-                    continue;
-                }
-                m_dataGenerics.insert(gsymp->resolved());
-                // And the generic of that name in the entity this binds to
-                const auto entIt = entityByName.find(boundName(instp));
-                if (entIt == entityByName.end()) continue;
-                for (AstNode* gp = entIt->second->genericsp(); gp; gp = gp->nextp()) {
-                    AstVhdlIfaceDecl* const ifp = VN_CAST(gp, VhdlIfaceDecl);
-                    if (ifp && ifp->name() == gsymp->name() && ifp->vhdlSymp()) {
-                        m_dataGenerics.insert(ifp->vhdlSymp()->resolved());
+    // Repeated until nothing changes: a generic handed all or part of an
+    // enclosing entity's generic that travels as data travels as data too
+    // (VUnit's axi_stream_master hands "monitor => master.p_monitor" on),
+    // and the entity handing it on may be read after the instance
+    for (size_t before = ~size_t{0}; before != m_dataGenerics.size();) {
+        before = m_dataGenerics.size();
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            unitp->foreach([&](AstVhdlInstance* instp) {
+                for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
+                    const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                    if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+                    const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+                    VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+                    if (!gsymp) continue;
+                    if (m_dataGenerics.count(gsymp->resolved())) continue;
+                    // A value elaboration worked out element by element is not
+                    // one the back end can carry: the widths it holds are folded
+                    // into the bounds instead, and the object itself travels
+                    const VhdlValue actVal = V3VhdlEval::eval(asp->actualp());
+                    if (actVal.known() && !actVal.isComposite()) continue;
+                    // Only where the actual is a constant that has no value of
+                    // its own. A generic reaching down from an enclosing
+                    // instance has none here either, but elaboration gives it
+                    // one and V3Param folds it; an expression may still fold in
+                    // the back end where nothing here could fold it.
+                    const VhdlSymbol* asymp = asp->actualp()->vhdlSymp();
+                    // An element of a record or of an array is part of the
+                    // object it names, and it is that object which has a value
+                    // or has not: VUnit hands a component "tb_cfg.write_prob",
+                    // read out of a string generic while the design runs
+                    if ((!asymp || asymp->resolved()->kind() != VhdlSymKind::CONSTANT)
+                        && (VN_IS(asp->actualp(), VhdlSelected)
+                            || VN_IS(asp->actualp(), VhdlCall))) {
+                        asymp = baseSymOf(asp->actualp());
+                    }
+                    if (!asymp) continue;
+                    const VhdlSymbol* const constp = asymp->resolved();
+                    const bool fromData = (constp->kind() == VhdlSymKind::GENERIC
+                                           || constp->kind() == VhdlSymKind::CONSTANT)
+                                          && m_dataGenerics.count(constp);
+                    if (!fromData
+                        && (constp->kind() != VhdlSymKind::CONSTANT || constp->hasValue())) {
+                        continue;
+                    }
+                    // A constant settled by elaboration is a parameter of the
+                    // module that declares it, and the back end folds it there,
+                    // so a generic it is handed to stays a parameter as well.
+                    // "WIDTH => WIDTH", with the width computed by a function,
+                    // is how a design usually writes it.
+                    const AstVhdlObjectDecl* const cdeclp
+                        = VN_CAST(constp->declp(), VhdlObjectDecl);
+                    if (!fromData && cdeclp && cdeclp->isElabConstant()
+                        && V3VhdlEval::backEndFolds(cdeclp->defaultp())) {
+                        continue;
+                    }
+                    // A deferred constant is declared in the package and given
+                    // its value in the package body, and it is that second
+                    // declaration which says what the value is (6.4.2.2). Asking
+                    // only the first finds no value, so a generic handed one was
+                    // made to travel as data for want of looking further.
+                    //
+                    // Only where the generic is a *number*. One of an array type
+                    // given a value this frontend cannot fold has to travel as
+                    // data whatever the back end could do with it -- a parameter
+                    // of an array type handed an element of a table makes the
+                    // instance's output feed back into itself -- and it is the
+                    // generic's own type that says which of the two this is.
+                    const AstVhdlObjectDecl* const fullp
+                        = VN_CAST(constp->fullDeclp(), VhdlObjectDecl);
+                    if (!fromData && fullp && fullp != cdeclp
+                        && scalarKind(gsymp->resolved()->typep())
+                        && V3VhdlEval::backEndFolds(fullp->defaultp())) {
+                        continue;
+                    }
+                    m_dataGenerics.insert(gsymp->resolved());
+                    // And the generic of that name in the entity this binds to
+                    const auto entIt = entityByName.find(boundName(instp));
+                    if (entIt == entityByName.end()) continue;
+                    for (AstNode* gp = entIt->second->genericsp(); gp; gp = gp->nextp()) {
+                        AstVhdlIfaceDecl* const ifp = VN_CAST(gp, VhdlIfaceDecl);
+                        if (ifp && ifp->name() == gsymp->name() && ifp->vhdlSymp()) {
+                            m_dataGenerics.insert(ifp->vhdlSymp()->resolved());
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
     // The same answer keyed by the entity's name, for a binding indication:
     // it associates the entity's own generics, and written by position it
