@@ -1160,10 +1160,55 @@ private:
             return Flow::NORMAL;
         }
         if (AstVhdlVarAssign* const p = VN_CAST(nodep, VhdlVarAssign)) {
-            if (p->kind() != VhdlAssignKind::SIMPLE) return bail();
             const VhdlSymbol* const symp = targetSym(p->targetp());
             if (!symp) return bail();
-            const VhdlValue val = eval(p->valuep());
+            // "v := a when c else b" and "with s select v := ..." stand for
+            // the if and case statements they are written as (10.6.3,
+            // 10.6.4): the value is the one the first alternative that holds
+            // gives. VUnit's new_bus writes "p_actor := actor when actor /=
+            // null_actor else new_actor".
+            AstNodeVhdlExpr* valuep = p->valuep();
+            if (p->kind() != VhdlAssignKind::SIMPLE) {
+                valuep = nullptr;
+                VhdlValue sel;
+                if (p->kind() == VhdlAssignKind::SELECTED) {
+                    if (p->matching() || !p->selectorp()) return bail();
+                    sel = eval(p->selectorp());
+                    if (!sel.known()) return bail();
+                }
+                for (AstNode* ap = p->altsp(); ap && !valuep; ap = ap->nextp()) {
+                    AstVhdlAlternative* const altp = VN_CAST(ap, VhdlAlternative);
+                    if (!altp || !altp->wavesp()) return bail();
+                    bool taken = true;
+                    if (p->kind() == VhdlAssignKind::CONDITIONAL) {
+                        if (altp->condp()) {
+                            bool ok = true;
+                            taken = condTrue(altp->condp(), ok);
+                            if (!ok) {
+                                // Which value it is, elaboration cannot tell;
+                                // the variable is not known, as it would not
+                                // be had the value itself been unknown
+                                if (!m_allowImpure) return bail();
+                                m_frames.back()[symp] = VhdlValue{};
+                                return Flow::NORMAL;
+                            }
+                        }
+                    } else {
+                        taken = false;
+                        for (AstNode* cp = altp->choicesp(); cp && !taken; cp = cp->nextp()) {
+                            AstVhdlChoice* const chp = VN_CAST(cp, VhdlChoice);
+                            if (!chp) return bail();
+                            bool ok = true;
+                            taken = choiceMatches(chp, sel, ok);
+                            if (!ok) return bail();
+                        }
+                    }
+                    if (taken) valuep = altp->wavesp()->valuep();
+                }
+                // No alternative holds: the variable is left as it was
+                if (!valuep) return Flow::NORMAL;
+            }
+            const VhdlValue val = eval(valuep);
             // Elaboration carries an unknown on rather than giving up on the
             // whole activation: what a handle's actor is decides nothing
             // about the widths beside it
@@ -1311,7 +1356,10 @@ private:
             // declaration, read in the subprogram's own region (6.5.7.1)
             if (!parms[i]->defaultp()) return VhdlValue{};
             const VhdlValue val = eval(parms[i]->defaultp());
-            if (!val.known()) return VhdlValue{};
+            // At elaboration a default no one can work out -- VUnit's
+            // new_bus defaults its logger to one get_logger made -- is as
+            // unknown as an actual would be, and only what reads it is lost
+            if (!val.known() && !m_allowImpure) return VhdlValue{};
             frame[symp->resolved()] = val;
         }
         for (AstNode* p = declp->declsp(); p; p = p->nextp()) {
