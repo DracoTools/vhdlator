@@ -451,6 +451,15 @@ public:
         out.m_typep = typep;
         return out;
     }
+    // Text with the bounds it is indexed by: what elaboration builds, where a
+    // slice keeps the indices it was taken at (8.5)
+    static VhdlValue mkStrAt(const std::string& v, int64_t left, bool ascending,
+                             VhdlType* typep = nullptr) {
+        VhdlValue out = mkStr(v, typep);
+        out.m_left = left;
+        out.m_ascending = ascending;
+        return out;
+    }
     // A record, named element by element
     static VhdlValue mkRecord(std::vector<std::pair<std::string, VhdlValue>>&& fields,
                               VhdlType* typep = nullptr) {
@@ -525,6 +534,20 @@ public:
         const int64_t off = m_ascending ? index - m_left : m_left - index;
         if (off < 0 || static_cast<size_t>(off) >= m_fieldsp->size()) return;
         (*m_fieldsp)[static_cast<size_t>(off)].second = val;
+    }
+    // One element of an array by its own index, to be written in place; null
+    // where there is none. The caller has made the elements its own first.
+    VhdlValue* elementPtr(int64_t index) {
+        if (!m_fieldsp) return nullptr;
+        const int64_t off = m_ascending ? index - m_left : m_left - index;
+        if (off < 0 || static_cast<size_t>(off) >= m_fieldsp->size()) return nullptr;
+        return &(*m_fieldsp)[static_cast<size_t>(off)].second;
+    }
+    // Text replaced, its bounds kept; bounds replaced, its text kept
+    void setStr(const std::string& text) { m_str = text; }
+    void setBounds(int64_t left, bool ascending) {
+        m_left = left;
+        m_ascending = ascending;
     }
     // A copy no other value shares, so that writing into it changes nothing else
     void ownFields() {

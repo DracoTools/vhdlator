@@ -279,15 +279,25 @@ class VhdlEvaluator final {
     // function, and what elaboration wants from it is the widths it carries,
     // not a value to emit in place of the object (9.4.3)
     const bool m_allowImpure;
+    // What allocators made while elaborating (9.3.7). An access value is held
+    // as an integer of its access type: the object's place here plus one, and
+    // zero for null. Nothing here outlives the evaluation, and no access value
+    // is handed out of it (stripAccess).
+    std::vector<VhdlValue> m_heap;
 
     // A constant folded from a self-referential declaration would recurse
     // forever; analysis reports the cycle separately, so just stop
     static constexpr int MAX_DEPTH = 64;
     // A body may name a function that names a body, and a loop may be written
     // so that it never ends. Neither is a reason to hang: a fold that runs out
-    // of either budget is simply not one that happened.
+    // of either budget is simply not one that happened. Elaboration runs text
+    // functions a character at a time -- VUnit decodes a configuration string
+    // with split, replace and strip -- so it is given room for that.
     static constexpr int MAX_CALLS = 16;
     static constexpr int MAX_STEPS = 20000;
+    static constexpr int MAX_ELAB_STEPS = 4000000;
+    static constexpr size_t MAX_HEAP = 100000;
+    int maxSteps() const { return m_allowImpure ? MAX_ELAB_STEPS : MAX_STEPS; }
 
 public:
     // CONSTRUCTORS
@@ -316,14 +326,18 @@ public:
         if (AstVhdlLiteral* const p = VN_CAST(nodep, VhdlLiteral)) return evalLiteral(p);
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) return evalSymbol(p->vhdlSymp());
         if (AstVhdlSelected* const p = VN_CAST(nodep, VhdlSelected)) {
+            // "p.all" is what an access value designates (8.3)
+            if (p->isAll()) return m_allowImpure ? deref(eval(p->prefixp())) : VhdlValue{};
             // "r.f" where r has a value of its own is that value's element;
             // where the name denotes an object in a package it is that object
             if (const AstVhdlName* const suffixp = VN_CAST(p->suffixp(), VhdlName)) {
-                const VhdlValue rec = eval(p->prefixp());
+                VhdlValue rec = eval(p->prefixp());
+                if (m_allowImpure && isAccessValue(rec)) rec = deref(rec);
                 if (rec.isRecord()) return rec.field(suffixp->name());
             }
             return evalSymbol(p->vhdlSymp());
         }
+        if (AstVhdlAllocator* const p = VN_CAST(nodep, VhdlAllocator)) return evalAllocator(p);
         if (AstVhdlAggregate* const p = VN_CAST(nodep, VhdlAggregate)) return evalAggregate(p);
         if (AstVhdlUnary* const p = VN_CAST(nodep, VhdlUnary)) return evalUnary(p);
         if (AstVhdlBinary* const p = VN_CAST(nodep, VhdlBinary)) return evalBinary(p);
@@ -340,6 +354,216 @@ public:
 private:
     void fail(const std::string& msg) {
         if (m_errp && m_errp->empty()) *m_errp = msg;
+    }
+
+    // Access values, text and arrays of them, as elaboration holds them
+
+    static bool isAccessType(const VhdlType* typep) {
+        return typep && typep->base()->kind() == VhdlTypeKind::ACCESS;
+    }
+    static bool isAccessValue(const VhdlValue& val) {
+        return val.isInt() && isAccessType(val.typep());
+    }
+    // The object an access value designates, to be read or written in place
+    VhdlValue* heapObject(const VhdlValue& val) {
+        if (!isAccessValue(val) || val.toInt() <= 0
+            || val.toInt() > static_cast<int64_t>(m_heap.size())) {
+            return nullptr;
+        }
+        return &m_heap[static_cast<size_t>(val.toInt() - 1)];
+    }
+    VhdlValue deref(const VhdlValue& val) {
+        const VhdlValue* const objp = heapObject(val);
+        return objp ? *objp : VhdlValue{};
+    }
+    VhdlValue allocate(const VhdlValue& obj, VhdlType* accessTypep) {
+        if (!obj.known() || m_heap.size() >= MAX_HEAP) return VhdlValue{};
+        m_heap.push_back(obj);
+        return VhdlValue::mkInt(static_cast<int64_t>(m_heap.size()), accessTypep);
+    }
+    // A value handed out of the evaluation keeps no access value: the heap it
+    // points into is gone
+public:
+    static VhdlValue stripAccess(const VhdlValue& val) {
+        if (isAccessValue(val)) return VhdlValue{};
+        if (val.isRecord()) {
+            std::vector<std::pair<std::string, VhdlValue>> fields;
+            for (size_t i = 0; i < val.elements(); ++i) {
+                fields.emplace_back("", stripAccess(val.elementAt(i)));
+            }
+            VhdlValue out = val;
+            out.ownFields();
+            for (const VhdlSymbol* const ep :
+                 val.typep() ? val.typep()->base()->elements() : std::vector<VhdlSymbol*>{}) {
+                out.setField(ep->name(), stripAccess(val.field(ep->name())));
+            }
+            return out;
+        }
+        if (val.isArray()) {
+            for (size_t i = 0; i < val.elements(); ++i) {
+                if (isAccessValue(val.elementAt(i))) return VhdlValue{};
+            }
+        }
+        return val;
+    }
+
+private:
+    static bool isCharType(const VhdlType* typep) {
+        const VhdlType* const charp = V3VhdlStd::characterType();
+        return typep && charp && typep->base() == charp->base();
+    }
+    // A one-dimensional array of CHARACTER, which is held as text
+    static bool isTextType(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (typep->base()->indexTypes().size() != 1) return false;
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        return isCharType(elemp);
+    }
+    // Where an unconstrained array type's values start: its index subtype's
+    // left bound, POSITIVE'LEFT for STRING (5.3.2.2)
+    static int64_t typeLeft(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return 1;
+        const std::vector<VhdlType*>& idx
+            = typep->indexTypes().empty() ? typep->base()->indexTypes() : typep->indexTypes();
+        return !idx.empty() && idx[0] && idx[0]->bounded() ? idx[0]->left() : 1;
+    }
+    static int64_t valLength(const VhdlValue& val) {
+        return val.isStr() ? static_cast<int64_t>(val.toStr().size())
+                           : static_cast<int64_t>(val.elements());
+    }
+    static int64_t valRight(const VhdlValue& val) {
+        const int64_t len = valLength(val);
+        return val.arrayAscending() ? val.arrayLeft() + len - 1 : val.arrayLeft() - len + 1;
+    }
+    // One element of text or of an array, at its own index
+    static VhdlValue elementOf(const VhdlValue& whole, int64_t index) {
+        if (whole.isArray()) return whole.element(index);
+        if (!whole.isStr()) return VhdlValue{};
+        const int64_t off
+            = whole.arrayAscending() ? index - whole.arrayLeft() : whole.arrayLeft() - index;
+        if (off < 0 || off >= valLength(whole)) return VhdlValue{};
+        return VhdlValue::mkInt(
+            static_cast<unsigned char>(whole.toStr()[static_cast<size_t>(off)]),
+            V3VhdlStd::characterType());
+    }
+    // A slice keeps the indices it was taken at, and runs the way the value
+    // does; a null slice is empty whichever way it is written (8.5)
+    static VhdlValue sliceOf(const VhdlValue& whole, int64_t left, int64_t right, bool ascending) {
+        const int64_t len = ascending ? right - left + 1 : left - right + 1;
+        if (len <= 0) {
+            if (whole.isStr()) return VhdlValue::mkStrAt("", left, ascending, whole.typep());
+            return VhdlValue::mkArray({}, left, ascending, whole.typep());
+        }
+        if (ascending != whole.arrayAscending()) return VhdlValue{};
+        const int64_t off
+            = whole.arrayAscending() ? left - whole.arrayLeft() : whole.arrayLeft() - left;
+        if (off < 0 || off + len > valLength(whole)) return VhdlValue{};
+        if (whole.isStr()) {
+            return VhdlValue::mkStrAt(
+                whole.toStr().substr(static_cast<size_t>(off), static_cast<size_t>(len)), left,
+                ascending, whole.typep());
+        }
+        std::vector<VhdlValue> elems;
+        for (int64_t i = 0; i < len; ++i) elems.push_back(whole.elementAt(off + i));
+        return VhdlValue::mkArray(std::move(elems), left, ascending, whole.typep());
+    }
+    // The bounds of a constrained array type, working out any that did not
+    // fold when it was declared -- "string(1 to s'length)" in a body run for
+    // one call
+    bool boundsOf(const VhdlType* typep, int64_t& left, int64_t& right, bool& ascending) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
+            || typep->indexTypes().size() != 1 || !typep->indexTypes()[0]) {
+            return false;
+        }
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        if (typep->isConstrainedArray() && idxp->bounded()) {
+            left = idxp->left();
+            right = idxp->right();
+            ascending = idxp->ascending();
+            return true;
+        }
+        AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!rp) return false;
+        return rangeValues(rp, left, right, ascending);
+    }
+    // The values a range runs over: its bounds, or those of the object whose
+    // 'RANGE it is
+    bool rangeValues(AstVhdlRange* rp, int64_t& left, int64_t& right, bool& ascending) {
+        if (rp->leftp() && rp->rightp()) {
+            const VhdlValue l = eval(rp->leftp());
+            const VhdlValue r = eval(rp->rightp());
+            if (!l.isInt() || !r.isInt()) return false;
+            left = l.toInt();
+            right = r.toInt();
+            ascending = rp->dir() == VhdlDir::TO;
+            return true;
+        }
+        return attrRangeValues(VN_CAST(rp->attrp(), VhdlAttrName), left, right, ascending);
+    }
+    // The values "x'range" runs over, where x is text or an array held here
+    bool attrRangeValues(AstVhdlAttrName* attrp, int64_t& left, int64_t& right, bool& ascending) {
+        if (!attrp || !m_allowImpure || attrp->argp()) return false;
+        const bool reverse = attrp->name() == "reverse_range";
+        if (!reverse && attrp->name() != "range") return false;
+        VhdlValue val = eval(attrp->prefixp());
+        if (isAccessValue(val)) val = deref(val);
+        if (!val.isStr() && !val.isArray()) return false;
+        left = val.arrayLeft();
+        right = valRight(val);
+        ascending = val.arrayAscending();
+        if (reverse) {
+            std::swap(left, right);
+            ascending = !ascending;
+        }
+        return true;
+    }
+    // The value an object of this subtype starts with where none is written
+    // (6.4.2.3): null for an access type, and for text and arrays the left
+    // value of their element in every place
+    VhdlValue defaultOf(VhdlType* typep) {
+        if (!typep) return VhdlValue{};
+        if (isAccessType(typep)) return VhdlValue::mkInt(0, typep);
+        if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            int64_t left = 0;
+            int64_t right = 0;
+            bool ascending = true;
+            if (!boundsOf(typep, left, right, ascending)) return VhdlValue{};
+            const int64_t len = ascending ? right - left + 1 : left - right + 1;
+            if (len > (1 << 20)) return VhdlValue{};
+            if (isTextType(typep)) {
+                return VhdlValue::mkStrAt(
+                    std::string(static_cast<size_t>(std::max<int64_t>(len, 0)), '\0'), left,
+                    ascending, typep);
+            }
+            VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+            const VhdlValue elem = defaultOf(elemp);
+            if (!elem.known()) return VhdlValue{};
+            std::vector<VhdlValue> elems(static_cast<size_t>(std::max<int64_t>(len, 0)), elem);
+            return VhdlValue::mkArray(std::move(elems), left, ascending, typep);
+        }
+        if (scalarValued(typep) && typep->bounded()
+            && typep->base()->kind() != VhdlTypeKind::FLOATING) {
+            return VhdlValue::mkInt(typep->left(), typep);
+        }
+        return VhdlValue{};
+    }
+    // A value given to an object of a constrained subtype takes the object's
+    // bounds, element for element (10.6.2.1); where the lengths differ the
+    // assignment is an error, and nothing is held
+    VhdlValue conformTo(const VhdlValue& val, VhdlType* typep) {
+        if (!val.isStr() && !val.isArray()) return val;
+        int64_t left = 0;
+        int64_t right = 0;
+        bool ascending = true;
+        if (!typep || !boundsOf(typep, left, right, ascending)) return val;
+        const int64_t len = ascending ? right - left + 1 : left - right + 1;
+        if (std::max<int64_t>(len, 0) != valLength(val)) return VhdlValue{};
+        VhdlValue out = val;
+        if (out.isArray()) out.ownFields();
+        out.setBounds(left, ascending);
+        return out;
     }
 
     VhdlValue evalSymbol(VhdlSymbol* symp) {
@@ -372,6 +596,9 @@ private:
             // is built from, and is what a width taken from a record's
             // element is folded with
             if (!symp->hasValue() && symp->elabValue().known()) return symp->elabValue();
+            if (m_allowImpure && symp->kind() == VhdlSymKind::GENERIC && !symp->value().known()) {
+                return rootGenericValue(symp);
+            }
             return symp->value();
         case VhdlSymKind::PARAMETER:
             // A parameter has a value only in a copy of a subprogram made for
@@ -385,6 +612,34 @@ private:
             return evalUserCall(nullptr, symp);
         default: return VhdlValue{};
         }
+    }
+
+    // What a text generic of the design's root entity is elaborated with: the
+    // value the command line gives it, between quotes, or else its default
+    // (14.2). A generic of any other entity is given its value by the
+    // instance, which hands it in as a binding. A number is left to the
+    // parameter it becomes, which the back end folds: a null range written
+    // over one is then the same object wherever it is written.
+    VhdlValue rootGenericValue(const VhdlSymbol* symp) {
+        const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl);
+        if (!ifp || !isTextType(symp->typep())) return VhdlValue{};
+        const AstVhdlEntity* entp = nullptr;
+        for (const AstNode* up = ifp->backp(); up && !entp; up = up->backp()) {
+            entp = VN_CAST(up, VhdlEntity);
+        }
+        const std::string top = v3Global.opt.topModule();
+        if (!entp || top.empty() || VString::downcase(entp->name()) != VString::downcase(top)) {
+            return VhdlValue{};
+        }
+        const std::string given = v3Global.opt.peekParameterCaseless(symp->name());
+        if (!given.empty()) {
+            if (given.size() < 2 || given.front() != '"' || given.back() != '"') {
+                return VhdlValue{};
+            }
+            return VhdlValue::mkStrAt(given.substr(1, given.size() - 2), typeLeft(symp->typep()),
+                                      true, symp->typep());
+        }
+        return ifp->defaultp() ? eval(ifp->defaultp()) : VhdlValue{};
     }
 
     // A record aggregate, element by element (9.3.3.2). An element whose own
@@ -567,6 +822,22 @@ private:
         return out;
     }
 
+    // "new T'(value)" or "new T(constraint)", made while elaborating (9.3.7)
+    VhdlValue evalAllocator(AstVhdlAllocator* nodep) {
+        if (!m_allowImpure) return VhdlValue{};
+        VhdlType* const accessTypep = nodep->vhdlTypep();
+        if (!isAccessType(accessTypep)) return VhdlValue{};
+        if (nodep->valuep()) {
+            VhdlValue val = eval(nodep->valuep());
+            // A qualified text value with no constraint of its own starts
+            // where its type's index does
+            return allocate(val, accessTypep);
+        }
+        VhdlType* typep = nodep->subtypep() ? nodep->subtypep()->vhdlTypep() : nullptr;
+        if (!typep) typep = accessTypep->base()->designatedp();
+        return allocate(defaultOf(typep), accessTypep);
+    }
+
     VhdlValue evalLiteral(AstVhdlLiteral* nodep) {
         VhdlType* const typep = nodep->vhdlTypep();
         switch (nodep->kind()) {
@@ -604,9 +875,12 @@ private:
         case VhdlLitKind::STRING:
         case VhdlLitKind::BITSTRING:
             // The scanner has already expanded a bit string to its bits and
-            // applied the length given, so both kinds carry their characters
-            return VhdlValue::mkStr(nodep->text(), typep);
-        case VhdlLitKind::NULLLIT: return VhdlValue{};
+            // applied the length given, so both kinds carry their characters.
+            // Unconstrained, it starts where its type's index does (9.3.2).
+            return VhdlValue::mkStrAt(nodep->text(), typeLeft(typep), true, typep);
+        case VhdlLitKind::NULLLIT:
+            // The one value of every access type that designates nothing
+            return m_allowImpure && isAccessType(typep) ? VhdlValue::mkInt(0, typep) : VhdlValue{};
         }
         return VhdlValue{};  // LCOV_EXCL_LINE
     }
@@ -704,7 +978,10 @@ private:
             std::string l;
             std::string r;
             if (!asCharString(lhs, l) || !asCharString(rhs, r)) return VhdlValue{};
-            return VhdlValue::mkStr(l + r, resp);
+            // An unconstrained result starts where its left operand does, or
+            // at its type's left where that operand is null (9.2.5)
+            const int64_t left = lhs.isStr() && !l.empty() ? lhs.arrayLeft() : typeLeft(resp);
+            return VhdlValue::mkStrAt(l + r, left, true, resp);
         }
         case VhdlBinaryOp::ADD: {
             if (anyReal) return VhdlValue::mkReal(lhs.toReal() + rhs.toReal(), resp);
@@ -953,6 +1230,30 @@ private:
             return VhdlValue::mkStr(out, V3VhdlStd::stringType());
         }
 
+        // Elaboration asks text and arrays it holds about the bounds they were
+        // built with: "s'length" of a parameter is the actual's (4.2.2.2)
+        if (m_allowImpure && nodep->prefixp() && !nodep->argp()
+            && (attr == "left" || attr == "right" || attr == "high" || attr == "low"
+                || attr == "ascending" || attr == "length")) {
+            const VhdlSymbol* const psymp = nodep->prefixp()->vhdlSymp();
+            if (!psymp || psymp->kind() != VhdlSymKind::TYPE) {
+                VhdlValue val = eval(nodep->prefixp());
+                if (isAccessValue(val)) val = deref(val);
+                if (val.isStr() || val.isArray()) {
+                    const int64_t left = val.arrayLeft();
+                    const int64_t right = valRight(val);
+                    const bool ascending = val.arrayAscending();
+                    VhdlType* const intp = V3VhdlStd::integerType();
+                    if (attr == "length") return VhdlValue::mkInt(valLength(val), intp);
+                    if (attr == "left") return VhdlValue::mkInt(left, intp);
+                    if (attr == "right") return VhdlValue::mkInt(right, intp);
+                    if (attr == "ascending") return mkBool(ascending);
+                    if (attr == "high") return VhdlValue::mkInt(ascending ? right : left, intp);
+                    return VhdlValue::mkInt(ascending ? left : right, intp);
+                }
+            }
+        }
+
         VhdlType* typep = prefixType(nodep);
         if (!typep || typep->isError()) return VhdlValue{};
 
@@ -1143,7 +1444,7 @@ private:
     }
 
     Flow execStmt(AstNode* nodep, VhdlValue& retr) {
-        if (++m_steps > MAX_STEPS) return bail();
+        if (++m_steps > maxSteps()) return bail();
         if (VN_IS(nodep, VhdlNull)) return Flow::NORMAL;
         if (AstVhdlReturn* const p = VN_CAST(nodep, VhdlReturn)) {
             if (p->valuep()) {
@@ -1161,7 +1462,10 @@ private:
         }
         if (AstVhdlVarAssign* const p = VN_CAST(nodep, VhdlVarAssign)) {
             const VhdlSymbol* const symp = targetSym(p->targetp());
-            if (!symp) return bail();
+            // Elaboration also writes an element, a slice or what an access
+            // value designates, in place (assignInPlace)
+            const bool inPlace = m_allowImpure && !VN_IS(p->targetp(), VhdlName);
+            if (!symp && !inPlace) return bail();
             // "v := a when c else b" and "with s select v := ..." stand for
             // the if and case statements they are written as (10.6.3,
             // 10.6.4): the value is the one the first alternative that holds
@@ -1188,7 +1492,7 @@ private:
                                 // Which value it is, elaboration cannot tell;
                                 // the variable is not known, as it would not
                                 // be had the value itself been unknown
-                                if (!m_allowImpure) return bail();
+                                if (!m_allowImpure || !symp) return bail();
                                 m_frames.back()[symp] = VhdlValue{};
                                 return Flow::NORMAL;
                             }
@@ -1213,6 +1517,17 @@ private:
             // whole activation: what a handle's actor is decides nothing
             // about the widths beside it
             if (!val.known() && !m_allowImpure) return bail();
+            if (inPlace) return assignInPlace(p->targetp(), val) ? Flow::NORMAL : bail();
+            // A variable keeps its own bounds, and takes the value's elements
+            // in order (10.6.2.1)
+            if (m_allowImpure) {
+                const auto it = m_frames.back().find(symp);
+                if (it != m_frames.back().end() && (it->second.isStr() || it->second.isArray())
+                    && symp->typep() && symp->typep()->isConstrainedArray()) {
+                    m_frames.back()[symp] = conformTo(val, symp->typep());
+                    return Flow::NORMAL;
+                }
+            }
             m_frames.back()[symp] = val;
             return Flow::NORMAL;
         }
@@ -1245,9 +1560,231 @@ private:
             }
             return p->isExit() ? Flow::EXITED : Flow::NEXTED;
         }
+        if (AstVhdlProcCall* const p = VN_CAST(nodep, VhdlProcCall)) {
+            if (m_allowImpure && (execTextio(p) || execUserProc(p))) return Flow::NORMAL;
+            return bail();
+        }
         // A wait or a signal assignment cannot appear in a function at all,
         // and a procedure call would have to carry values back out
         return bail();
+    }
+
+    // The object a variable target names, to be written in place: one of
+    // this activation's, an element of one, or what an access value in one
+    // designates. Null where it is none of these.
+    VhdlValue* targetObject(AstNodeVhdlExpr* targetp) {
+        if (AstVhdlName* const namep = VN_CAST(targetp, VhdlName)) {
+            if (!namep->vhdlSymp() || m_frames.empty()) return nullptr;
+            const auto it = m_frames.back().find(namep->vhdlSymp()->resolved());
+            return it == m_frames.back().end() ? nullptr : &it->second;
+        }
+        if (AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
+            if (!selp->isAll()) return nullptr;
+            VhdlValue* const accp = targetObject(selp->prefixp());
+            return accp ? heapObject(*accp) : nullptr;
+        }
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        if (!callp) return nullptr;
+        AstVhdlAssoc* const idxp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (!idxp || idxp->nextp() || idxp->formalp() || !idxp->actualp()) return nullptr;
+        const VhdlValue idx = eval(idxp->actualp());
+        if (!idx.isInt()) return nullptr;
+        VhdlValue* wholep = targetObject(callp->prefixp());
+        if (wholep && isAccessValue(*wholep)) wholep = heapObject(*wholep);
+        if (!wholep || !wholep->isArray()) return nullptr;
+        wholep->ownFields();
+        return wholep->elementPtr(idx.toInt());
+    }
+    // "x(i) := v", "x.all := v", "x(i to j) := v": the value is written into
+    // the places the target names, which keep their own bounds
+    bool assignInPlace(AstNodeVhdlExpr* targetp, const VhdlValue& val) {
+        if (AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+            VhdlValue* wholep = targetObject(callp->prefixp());
+            if (wholep && isAccessValue(*wholep)) wholep = heapObject(*wholep);
+            if (wholep && wholep->isStr()) {
+                // One character, or a run of them, of text
+                std::string text = wholep->toStr();
+                int64_t left = 0;
+                int64_t right = 0;
+                bool ascending = true;
+                if (AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
+                    if (!rangeValues(rp, left, right, ascending) || !val.isStr()) return false;
+                } else {
+                    AstVhdlAssoc* const idxp = VN_CAST(callp->argsp(), VhdlAssoc);
+                    const VhdlValue idx
+                        = idxp && idxp->actualp() ? eval(idxp->actualp()) : VhdlValue{};
+                    std::string one;
+                    if (!idx.isInt() || !asCharString(val, one) || one.size() != 1) return false;
+                    left = right = idx.toInt();
+                    ascending = wholep->arrayAscending();
+                    const int64_t off
+                        = ascending ? left - wholep->arrayLeft() : wholep->arrayLeft() - left;
+                    if (off < 0 || off >= valLength(*wholep)) return false;
+                    text[static_cast<size_t>(off)] = one[0];
+                    wholep->setStr(text);
+                    return true;
+                }
+                const int64_t len = ascending ? right - left + 1 : left - right + 1;
+                if (std::max<int64_t>(len, 0) != valLength(val)) return false;
+                if (len <= 0) return true;
+                if (ascending != wholep->arrayAscending()) return false;
+                const int64_t off
+                    = ascending ? left - wholep->arrayLeft() : wholep->arrayLeft() - left;
+                if (off < 0 || off + len > valLength(*wholep)) return false;
+                text.replace(static_cast<size_t>(off), static_cast<size_t>(len), val.toStr());
+                wholep->setStr(text);
+                return true;
+            }
+        }
+        VhdlValue* const objp = targetObject(targetp);
+        if (!objp) return false;
+        if ((objp->isStr() || objp->isArray()) && (val.isStr() || val.isArray())) {
+            // The target keeps its own bounds, and the lengths must agree
+            if (valLength(*objp) != valLength(val)) return false;
+            VhdlValue out = val;
+            if (out.isArray()) out.ownFields();
+            out.setBounds(objp->arrayLeft(), objp->arrayAscending());
+            *objp = out;
+            return true;
+        }
+        *objp = val;
+        return true;
+    }
+    // TEXTIO's WRITE of text to a LINE, and DEALLOCATE, which a function
+    // building text writes with (16.4): "write(ret_val(i), s(a to b))"
+    bool execTextio(AstVhdlProcCall* nodep) {
+        AstVhdlCall* const callp = VN_CAST(nodep->callp(), VhdlCall);
+        if (!callp || !callp->vhdlSymp()) return false;
+        const VhdlSymbol* const procp = callp->vhdlSymp()->resolved();
+        const std::string& name = procp->name();
+        std::vector<AstNodeVhdlExpr*> actuals;
+        for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            // Written by position only; a named association is not taken
+            if (!asp || asp->formalp() || !asp->actualp()) return false;
+            actuals.push_back(asp->actualp());
+        }
+        if (actuals.empty()) return false;
+        VhdlValue* const linep = targetObject(actuals[0]);
+        if (!linep || !isAccessValue(*linep)) return false;
+        if (name == "deallocate" && actuals.size() == 1) {
+            *linep = VhdlValue::mkInt(0, linep->typep());
+            return true;
+        }
+        if (name != "write" || actuals.size() != 2) return false;
+        const VhdlType* const desigp = linep->typep()->base()->designatedp();
+        if (!isTextType(desigp)) return false;
+        const VhdlValue val = eval(actuals[1]);
+        std::string text;
+        if (!val.isStr() || !asCharString(val, text)) return false;
+        const VhdlValue old = deref(*linep);
+        const std::string before = old.isStr() ? old.toStr() : "";
+        VhdlType* const accessTypep = linep->typep();
+        // A LINE written to holds all it held and then the text, from 1. The
+        // new object moves the heap, so the target is found again after it.
+        const VhdlValue newp = allocate(
+            VhdlValue::mkStrAt(before + text, 1, true, old.typep() ? old.typep() : val.typep()),
+            accessTypep);
+        if (!newp.known()) return false;
+        VhdlValue* const againp = targetObject(actuals[0]);
+        if (!againp) return false;
+        *againp = newp;
+        return true;
+    }
+    // A call of a procedure the design declares, run while elaborating: its
+    // constant and variable parameters, each out or inout one written back
+    // to its actual when the body is done (4.2.2.1). A procedure given a
+    // signal or a file is not run.
+    bool execUserProc(AstVhdlProcCall* nodep) {
+        AstNodeVhdlExpr* const callExprp = nodep->callp();
+        AstVhdlCall* const callp = VN_CAST(callExprp, VhdlCall);
+        const VhdlSymbol* const symp = callp       ? callp->vhdlSymp()
+                                       : callExprp ? callExprp->vhdlSymp()
+                                                   : nullptr;
+        if (!symp) return false;
+        const VhdlSymbol* const procp = symp->resolved();
+        if (procp->kind() != VhdlSymKind::PROCEDURE || procp->predefined() || procp->isForeign()) {
+            return false;
+        }
+        AstVhdlSubprogDecl* const declp = procp->bodyp();
+        if (!declp || declp->isFunction() || m_calls >= MAX_CALLS) return false;
+        std::vector<AstVhdlIfaceDecl*> parms;
+        int skip = declp->genericCount();
+        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+            AstVhdlIfaceDecl* const ip = VN_CAST(p, VhdlIfaceDecl);
+            if (!ip) return false;
+            if (skip > 0) {
+                --skip;
+                continue;
+            }
+            if (ip->kind() != VhdlIfaceKind::CONSTANT && ip->kind() != VhdlIfaceKind::VARIABLE) {
+                return false;
+            }
+            parms.push_back(ip);
+        }
+        std::vector<AstNodeVhdlExpr*> actuals(parms.size(), nullptr);
+        size_t at = 0;
+        for (AstNode* p = callp ? callp->argsp() : nullptr; p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            AstNodeVhdlExpr* const actualp = asp ? asp->actualp() : VN_CAST(p, NodeVhdlExpr);
+            if (!actualp) return false;
+            size_t which = at++;
+            if (asp && asp->formalp()) {
+                const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                if (!namep) return false;
+                which = parms.size();
+                for (size_t i = 0; i < parms.size(); ++i) {
+                    if (parms[i]->name() == namep->name()) which = i;
+                }
+            }
+            if (which >= parms.size() || actuals[which]) return false;
+            actuals[which] = actualp;
+        }
+        // The values that go in, worked out where the call was written
+        std::vector<VhdlValue> args(parms.size());
+        for (size_t i = 0; i < parms.size(); ++i) {
+            VhdlSymbol* const psymp = parms[i]->vhdlSymp();
+            if (!psymp) return false;
+            const VhdlMode mode = parms[i]->mode();
+            if (!actuals[i]) {
+                if (mode != VhdlMode::IN || !parms[i]->defaultp()) return false;
+                args[i] = eval(parms[i]->defaultp());
+            } else if (mode == VhdlMode::IN) {
+                args[i] = eval(actuals[i]);
+            } else {
+                const VhdlValue* const objp = targetObject(actuals[i]);
+                if (!objp) return false;
+                args[i] = mode == VhdlMode::OUT ? defaultOf(psymp->typep()) : *objp;
+                // An out parameter of a type left open takes the actual's
+                // bounds, and what it holds is the actual's (4.2.2.1)
+                if (mode == VhdlMode::OUT && !args[i].known()) args[i] = *objp;
+            }
+        }
+        VL_RESTORER(m_bail);
+        m_bail = false;
+        ++m_calls;
+        m_frames.emplace_back();
+        Frame& frame = m_frames.back();
+        for (size_t i = 0; i < parms.size(); ++i)
+            frame[parms[i]->vhdlSymp()->resolved()] = args[i];
+        declareLocals(declp, frame);
+        VhdlValue ret;
+        const Flow f = execStmts(declp->stmtsp(), ret);
+        std::vector<VhdlValue> outs(parms.size());
+        for (size_t i = 0; i < parms.size(); ++i) {
+            outs[i] = m_frames.back()[parms[i]->vhdlSymp()->resolved()];
+        }
+        m_frames.pop_back();
+        --m_calls;
+        if (m_bail || f == Flow::EXITED || f == Flow::NEXTED) return false;
+        // Written back, each target found again now the body has run
+        for (size_t i = 0; i < parms.size(); ++i) {
+            if (parms[i]->mode() == VhdlMode::IN) continue;
+            VhdlValue* const objp = targetObject(actuals[i]);
+            if (!objp) return false;
+            *objp = outs[i];
+        }
+        return true;
     }
 
     // Whether a case choice covers the selector. Clears okr where the choice
@@ -1309,13 +1846,14 @@ private:
         if (isFor) {
             // The discrete range decides both the values and how many there
             // are, so it has to fold before the first iteration (10.10)
+            bool ascending = true;
             AstVhdlRange* const rp = VN_CAST(nodep->rangep(), VhdlRange);
-            const VhdlValue lo = rp && rp->leftp() ? eval(rp->leftp()) : VhdlValue{};
-            const VhdlValue hi = rp && rp->rightp() ? eval(rp->rightp()) : VhdlValue{};
-            if (!lo.isInt() || !hi.isInt()) return bail();
-            from = lo.toInt();
-            to = hi.toInt();
-            step = rp->dir() == VhdlDir::TO ? 1 : -1;
+            AstVhdlAttrName* const attrp = VN_CAST(nodep->rangep(), VhdlAttrName);
+            if (!(rp ? rangeValues(rp, from, to, ascending)
+                     : attrRangeValues(attrp, from, to, ascending))) {
+                return bail();
+            }
+            step = ascending ? 1 : -1;
             parmp = nodep->vhdlSymp();
             if (!parmp) return bail();
             parmTypep = nodep->vhdlSymp()->typep();
@@ -1330,7 +1868,7 @@ private:
                 if (!ok) return bail();
                 if (!go) break;
             }
-            if (++m_steps > MAX_STEPS) return bail();
+            if (++m_steps > maxSteps()) return bail();
             const Flow f = execStmts(nodep->stmtsp(), retr);
             if (f == Flow::RETURNED) return f;
             if (f == Flow::EXITED) break;
@@ -1338,6 +1876,35 @@ private:
         // The loop parameter is not visible outside the loop (10.10)
         if (parmp) m_frames.back().erase(parmp);
         return Flow::NORMAL;
+    }
+
+    // What a body declares, given the values its objects start with
+    void declareLocals(AstVhdlSubprogDecl* declp, Frame& frame) {
+        for (AstNode* p = declp->declsp(); p; p = p->nextp()) {
+            // Anything that is not an object declares no value to hold -- a
+            // type, a nested subprogram, a use clause -- and a name that
+            // denotes one of those folds by its own rules or not at all
+            AstVhdlObjectDecl* const op = VN_CAST(p, VhdlObjectDecl);
+            if (!op) continue;
+            if (op->kind() != VhdlObjKind::CONSTANT && op->kind() != VhdlObjKind::VARIABLE) {
+                continue;
+            }
+            VhdlSymbol* const symp = op->vhdlSymp();
+            if (!symp || !held(symp->typep())) continue;
+            // A variable with no initial value starts at the leftmost value
+            // of its subtype, which is not a value held here. Left unknown,
+            // so that reading it before it is written stops the fold rather
+            // than inventing a number. Elaboration does hold the ones text,
+            // access values and arrays of them start with.
+            VhdlValue init = op->defaultp() ? eval(op->defaultp()) : VhdlValue{};
+            if (m_allowImpure) {
+                if (!op->defaultp() && !scalarValued(symp->typep())) {
+                    init = defaultOf(symp->typep());
+                }
+                init = conformTo(init, symp->typep());
+            }
+            frame[symp->resolved()] = init;
+        }
     }
 
     // One activation: bind the parameters, elaborate the declarations, run
@@ -1362,23 +1929,7 @@ private:
             if (!val.known() && !m_allowImpure) return VhdlValue{};
             frame[symp->resolved()] = val;
         }
-        for (AstNode* p = declp->declsp(); p; p = p->nextp()) {
-            // Anything that is not an object declares no value to hold -- a
-            // type, a nested subprogram, a use clause -- and a name that
-            // denotes one of those folds by its own rules or not at all
-            AstVhdlObjectDecl* const op = VN_CAST(p, VhdlObjectDecl);
-            if (!op) continue;
-            if (op->kind() != VhdlObjKind::CONSTANT && op->kind() != VhdlObjKind::VARIABLE) {
-                continue;
-            }
-            VhdlSymbol* const symp = op->vhdlSymp();
-            if (!symp || !valueHeld(symp->typep())) continue;
-            // A variable with no initial value starts at the leftmost value
-            // of its subtype, which is not a value held here. Left unknown,
-            // so that reading it before it is written stops the fold rather
-            // than inventing a number.
-            frame[symp->resolved()] = op->defaultp() ? eval(op->defaultp()) : VhdlValue{};
-        }
+        declareLocals(declp, frame);
         VhdlValue ret;
         const Flow f = execStmts(declp->stmtsp(), ret);
         // Reaching the end of a function without a return statement is an
@@ -1387,6 +1938,22 @@ private:
         return ret;
     }
 
+    // What elaboration holds besides: text, an access value, and an array of
+    // either -- what a verification library's string functions are written
+    // over (VUnit's split gives back an array of LINE)
+    bool held(const VhdlType* typep) const {
+        if (valueHeld(typep)) return true;
+        if (!m_allowImpure || !typep) return false;
+        if (isAccessType(typep)) return true;
+        if (isTextType(typep)) return true;
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY
+            || typep->base()->indexTypes().size() != 1) {
+            return false;
+        }
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        return isAccessType(elemp) || isTextType(elemp);
+    }
     // Whether a value of this type is one this evaluator holds at all: a
     // scalar, or a record whose elements are themselves held. An array is
     // not: a value here carries no index range of its own, and a bound is
@@ -1426,13 +1993,13 @@ private:
         AstVhdlSubprogDecl* const declp = funcp->bodyp();
         if (!declp || !declp->isFunction()) return VhdlValue{};
         if (!declp->vhdlPure() && !m_allowImpure) return VhdlValue{};
-        if (m_calls >= MAX_CALLS || m_steps >= MAX_STEPS) return VhdlValue{};
+        if (m_calls >= MAX_CALLS || m_steps >= maxSteps()) return VhdlValue{};
         // Only where every value that goes in and the one that comes out is
         // a scalar. A value here is a number, not an array with bounds of its
         // own, so a body that builds one would be run over values that had
         // lost how they were indexed -- and a bound is exactly what such a
         // call is usually asked for.
-        if (!valueHeld(funcp->returnTypep())) return VhdlValue{};
+        if (!held(funcp->returnTypep())) return VhdlValue{};
 
         // The parameters, in order. A generic subprogram keeps its generics
         // ahead of them, and a call associates only the parameters (4.2.1).
@@ -1456,10 +2023,10 @@ private:
             // a branch on it stops the fold, so what folds is only what does
             // not depend on it: VUnit's testbenches size their buses from
             // the literal widths of a record decoded from a string generic.
-            const bool held = valueHeld(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr);
-            if (!held && !m_allowImpure) return VhdlValue{};
+            const bool isHeld = held(ip->vhdlSymp() ? ip->vhdlSymp()->typep() : nullptr);
+            if (!isHeld && !m_allowImpure) return VhdlValue{};
             parms.push_back(ip);
-            unheld.push_back(!held);
+            unheld.push_back(!isHeld);
         }
 
         // The actuals, evaluated where the call was written, before this
@@ -1529,6 +2096,28 @@ private:
             }
         }
         VhdlSymbol* const symp = prefixp ? prefixp->vhdlSymp() : nullptr;
+        // Elaboration reads text and arrays it holds, and what an access value
+        // designates, an element or a slice at a time (8.4, 8.5)
+        if (m_allowImpure && prefixp && (!symp || symp->kind() != VhdlSymKind::TYPE)) {
+            VhdlValue whole = eval(prefixp);
+            if (isAccessValue(whole)) whole = deref(whole);
+            if (whole.isStr() || whole.isArray()) {
+                if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
+                    int64_t left = 0;
+                    int64_t right = 0;
+                    bool ascending = true;
+                    if (!rangeValues(rp, left, right, ascending)) return VhdlValue{};
+                    return sliceOf(whole, left, right, ascending);
+                }
+                AstVhdlAssoc* const idxp = VN_CAST(nodep->argsp(), VhdlAssoc);
+                if (idxp && !idxp->nextp() && !idxp->formalp() && idxp->actualp()) {
+                    const VhdlValue idx = eval(idxp->actualp());
+                    if (!idx.isInt()) return VhdlValue{};
+                    return elementOf(whole, idx.toInt());
+                }
+                return VhdlValue{};
+            }
+        }
         // An indexed name is static where the array it names is and the index
         // is (9.4.2), and reading one element of a value already in hand is
         // not running code. It is how a package writes a table -- "constant
@@ -1581,13 +2170,13 @@ VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
 
 VhdlValue V3VhdlEval::evalElab(AstNodeVhdlExpr* nodep) {
     VhdlEvaluator evaluator{nullptr, true};
-    return evaluator.eval(nodep);
+    return VhdlEvaluator::stripAccess(evaluator.eval(nodep));
 }
 
 VhdlValue V3VhdlEval::evalElabWith(AstNodeVhdlExpr* nodep,
                                    const std::map<const VhdlSymbol*, VhdlValue>& bindings) {
     VhdlEvaluator evaluator{nullptr, true};
-    return evaluator.evalWith(nodep, bindings);
+    return VhdlEvaluator::stripAccess(evaluator.evalWith(nodep, bindings));
 }
 
 std::string V3VhdlEval::image(const VhdlValue& val) {

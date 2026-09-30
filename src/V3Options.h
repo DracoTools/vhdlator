@@ -734,6 +734,13 @@ public:
     std::map<const string, string>::iterator findParameterCaseless(const string& name);
     bool hasParameterCaseless(const string& name);
     string parameterCaseless(const string& name);
+    // The value given for a root generic, without taking it: a VHDL design's
+    // root generic is read while the design is elaborated, and applied to the
+    // parameter later
+    string peekParameterCaseless(const string& name) {
+        const auto it = findParameterCaseless(name);
+        return it == m_parameters.end() ? "" : it->second;
+    }
     void checkParameters();
 
     bool isFuture(const string& flag) const;
