@@ -11,11 +11,11 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# An array compared with a value written with a metavalue never matches
-test.top_filename = "t/t_vhdl_cmpaggmeta.vhd"
+# An input left open, compared with its metavalue default
+test.top_filename = "t/t_vhdl_openportmeta.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_cmpaggmeta"],
+             verilator_flags2=["--timing", "--top-module t_vhdl_openportmeta"],
              make_top_shell=False,
              make_main=False)
 

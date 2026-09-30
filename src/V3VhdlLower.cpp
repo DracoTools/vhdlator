@@ -379,6 +379,7 @@ public:
     void addTraceRequest() VL_MT_DISABLED;
     void reportReachedRefusals() VL_MT_DISABLED;
     void addLogicPosPins() VL_MT_DISABLED;
+    void addOpenPortPins() VL_MT_DISABLED;
     void markPackageSignalRefs() VL_MT_DISABLED;
     static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
@@ -6393,6 +6394,12 @@ private:
     // parameter holding its position in the type, which is all that tells
     // 'X' from '0' (see logicPosOf)
     std::map<const VhdlSymbol*, AstVar*> m_logicPosVars;
+    // An input whose default is written with a metavalue has a parameter
+    // saying whether its instance left it open (see openPortIs): the
+    // parameter, and the default it then holds
+    std::map<const VhdlSymbol*, std::pair<AstVar*, AstNodeVhdlExpr*>> m_portOpenVars;
+    // Module -> its ports that have one, by name
+    std::map<std::string, std::vector<std::string>> m_openPortsOf;
     std::map<const AstNode*, AstNodeExpr*> m_logicPosPins;  // Parameter pin -> its position
     // Each instance's positions, handed over once it is known which modules
     // have a parameter to take them
@@ -6623,6 +6630,21 @@ private:
         }
         addStmt(new AstPort{flp, ++pinNum, varp->name()});
         addStmt(varp);
+        // An input the instance leaves open holds its default for as long
+        // as the design runs, since nothing assigns an input. Where the
+        // default is written with a metavalue that value is not one this
+        // runtime keeps, so whether the port is open is kept instead: VUnit's
+        // resolve_tstrb asks "tstrb = (tstrb'range => 'U')" to tell whether
+        // anything is connected to tstrb.
+        if (nodep->mode() == VhdlMode::IN && nodep->defaultp() && !triPort && m_modp
+            && isNineValuedOrArray(symp->typep()) && uniformMetavalue(nodep->defaultp())) {
+            AstVar* const openp = new AstVar{flp, VVarType::GPARAM, varp->name() + "__Vopen",
+                                             VFlagChildDType{}, newIntDType(flp)};
+            openp->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+            addStmt(openp);
+            m_portOpenVars[symp->resolved()] = std::make_pair(openp, nodep->defaultp());
+            m_openPortsOf[m_modp->name()].push_back(varp->name());
+        }
     }
 
     // An object held two levels deep. Its own bounds are what its subtype
@@ -11737,6 +11759,49 @@ private:
         return false;
     }
 
+    // The one metavalue a value is written as throughout -- a single literal,
+    // or an aggregate that gives every place the same one -- or 0
+    static char uniformMetavalue(const AstNodeVhdlExpr* nodep) {
+        while (const AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
+            nodep = qp->valuep();
+        }
+        if (const AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate)) {
+            const AstVhdlElemAssoc* const eap = aggp->elemsp();
+            if (!eap || eap->nextp() || !eap->choicesp()) return 0;
+            nodep = eap->valuep();
+        }
+        if (!metavalueLiteral(nodep)) return 0;
+        std::string name;
+        if (const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral)) name = litp->text();
+        if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) name = namep->name();
+        if (name.size() == 3) return name[1];
+        return name.size() == 1 ? name[0] : 0;
+    }
+    static bool isNineValuedOrArray(const VhdlType* typep) {
+        if (isNineValued(typep)) return true;
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        return isNineValued(typep->base()->elementp());
+    }
+
+    // "p = (p'range => 'U')" where p is an input of the module being built
+    // whose default is written the same way: it holds exactly when the
+    // instance left p open. Null where that is not the question.
+    AstNodeExpr* openPortIs(AstVhdlBinary* nodep, FileLine* flp) {
+        const bool litLeft = uniformMetavalue(nodep->lhsp()) != 0;
+        AstNodeVhdlExpr* const litp = litLeft ? nodep->lhsp() : nodep->rhsp();
+        AstNodeVhdlExpr* const otherp = litLeft ? nodep->rhsp() : nodep->lhsp();
+        if (!VN_IS(otherp, VhdlName) || !otherp->vhdlSymp()) return nullptr;
+        const auto it = m_portOpenVars.find(otherp->vhdlSymp()->resolved());
+        if (it == m_portOpenVars.end()) return nullptr;
+        const char c = uniformMetavalue(litp);
+        if (!c || c != uniformMetavalue(it->second.second)) return nullptr;
+        AstNodeExpr* const openp
+            = new AstNeq{flp, new AstVarRef{flp, it->second.first, VAccess::READ},
+                         new AstConst{flp, AstConst::Signed32{}, 0}};
+        if (nodep->op() == VhdlBinaryOp::EQ) return openp;
+        return new AstLogNot{flp, openp};
+    }
+
     // Whether an array value is written with a 'U', 'X', 'W' or '-' in it: a
     // string literal, or an aggregate one of whose values is such a literal
     static bool writtenWithMetavalue(const AstNodeVhdlExpr* nodep) {
@@ -12505,18 +12570,23 @@ private:
                 // two-state value has to agree with the position, so that
                 // one an instance did not hand over is not believed.
                 if (AstNodeExpr* const outp = logicGenericIs(nodep, flp)) return outp;
+                if (AstNodeExpr* const outp = openPortIs(nodep, flp)) return outp;
                 if (nodep->op() == VhdlBinaryOp::EQ) {
                     return new AstConst{flp, AstConst::BitFalse{}};
                 }
                 return new AstConst{flp, AstConst::BitTrue{}};
             }
-            // And the same for an array of a logic type compared with a value
-            // written with one of them in it: VUnit's resolve_tstrb asks
-            // "tstrb = (tstrb'range => 'U')" to tell an unconnected port, and
-            // with 'U' written as zero it took every all-zero tstrb for one
+            // An array of a logic type compared with a value written with one
+            // of them in it is compared as written, a metavalue as zero:
+            // VUnit's resolve_tstrb asks "tstrb = (tstrb'range => 'U')"
+            // inside a function to tell whether tstrb is connected, and an
+            // open tstrb reads as zeros here. Answering "never" instead would
+            // break that for every design that leaves tstrb open, to mend it
+            // for one that drives it all zero. Where the value is the port
+            // itself, whether it is open is known and is the answer.
             if (isLogicArray(ltypep) && isLogicArray(rtypep)
                 && (writtenWithMetavalue(nodep->lhsp()) || writtenWithMetavalue(nodep->rhsp()))) {
-                return new AstConst{flp, AstConst::BitTrue{}, nodep->op() == VhdlBinaryOp::NE};
+                if (AstNodeExpr* const outp = openPortIs(nodep, flp)) return outp;
             }
         }
         // What an access value points at carries its own bounds too, and is
@@ -30193,6 +30263,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     dropLogicPosPins();
     markPackageSignalRefs();
     addLogicPosPins();
+    addOpenPortPins();
     reportReachedRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
 }
@@ -30226,6 +30297,32 @@ void VhdlLowerVisitor::addLogicPosPins() {
         cellp->addParamsp(new AstPin{posp->fileline(), pinNum + 1, name, posp});
     }
     m_logicPosCells.clear();
+}
+
+// Each instance that leaves open an input whose default is written with a
+// metavalue says so to the parameter beside it. Whatever instantiates the
+// module -- a Verilog one too -- leaves the port open where no pin names it
+// or the pin has nothing connected. Pins written by position name nothing,
+// and the port is taken as connected there, which is what it was before.
+void VhdlLowerVisitor::addOpenPortPins() {
+    if (m_openPortsOf.empty()) return;
+    m_netlistp->foreach([&](AstCell* cellp) {
+        const auto it = m_openPortsOf.find(cellp->modName());
+        if (it == m_openPortsOf.end()) return;
+        std::set<std::string> connected;
+        for (AstPin* pinp = cellp->pinsp(); pinp; pinp = VN_AS(pinp->nextp(), Pin)) {
+            if (pinp->name().empty()) return;
+            if (pinp->exprp()) connected.insert(pinp->name());
+        }
+        int pinNum = 0;
+        for (AstNode* pp = cellp->paramsp(); pp; pp = pp->nextp()) ++pinNum;
+        for (const std::string& portName : it->second) {
+            if (connected.count(portName)) continue;
+            FileLine* const flp = cellp->fileline();
+            cellp->addParamsp(new AstPin{flp, ++pinNum, portName + "__Vopen",
+                                         new AstConst{flp, AstConst::Signed32{}, 1}});
+        }
+    });
 }
 
 // The refusals that wait on whether their module is elaborated, reported for

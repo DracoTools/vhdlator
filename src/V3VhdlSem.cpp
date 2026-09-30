@@ -2300,6 +2300,19 @@ private:
     // not locally static, so the length of what is assigned to one is
     // checked when the assignment runs, not here (10.6.2.1)
     std::set<const VhdlType*> m_elabSizedTypes;
+    // The subtype, and the element subtypes a record or an array of it
+    // declares within it: "axi_stream_transaction_t(tdata(tdata'range),
+    // ...)" is sized element by element
+    void markElabSized(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || !m_elabSizedTypes.insert(typep).second) return;
+        if (typep->base()->kind() == VhdlTypeKind::RECORD) {
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                markElabSized(elemp->typep(), depth + 1);
+            }
+        } else if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            markElabSized(typep->elementp(), depth + 1);
+        }
+    }
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
@@ -2533,7 +2546,7 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
                            || VN_IS(declParentp, VhdlGenerateBody)
                            || VN_IS(declParentp, VhdlEntity) || VN_IS(declParentp, VhdlPackage);
             symp->typep(resolveSubtype(nodep->subtypep()));
-            if (m_elabFolds != foldsBefore) m_elabSizedTypes.insert(symp->typep());
+            if (m_elabFolds != foldsBefore) markElabSized(symp->typep());
         }
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
@@ -11781,6 +11794,10 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
     if (!nodep || !typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return;
     if (!typep->isConstrainedArray()) return;
     if (!lengthIsLocallyStatic(nodep)) return;
+    // Nor where the subtype's own length only elaboration settled: a
+    // record aggregate in a branch that does not run for the width a
+    // generic gives is no error (10.6.2.1)
+    if (m_elabSizedTypes.count(typep)) return;
     // In a copy made for one call site the parameter's length is what that
     // call supplied, not something the design wrote, so a call the length
     // rules out is written anyway and guarded: "if v'length = 5 then f(v)"
