@@ -16150,6 +16150,42 @@ private:
 
     // A record aggregate lays its elements out in declaration order, which is
     // how the packed structure it lowers to is laid out (9.3.3.2)
+    // An element whose length only elaboration settles, given a value whose
+    // length the source fixes: whether the two match is a check made where the
+    // value is assigned, when it runs (10.6.2.1). Once the design is elaborated
+    // the lengths are numbers, and the check folds away where they agree.
+    AstNodeExpr* elemLengthChecked(AstNodeExpr* memberp, AstNodeVhdlExpr* valuep,
+                                   const VhdlType* elemTypep, FileLine* flp) {
+        const VhdlType* const elemIdxp
+            = elemTypep && elemTypep->dimensions() == 1 ? indexSubtype(elemTypep, 0) : nullptr;
+        if (!elemIdxp || elemIdxp->bounded()) return memberp;
+        const VhdlType* const valTypep = valuep->vhdlTypep();
+        const VhdlType* const valIdxp = valTypep && valTypep->base()->kind() == VhdlTypeKind::ARRAY
+                                                && valTypep->dimensions() == 1
+                                            ? indexSubtype(valTypep, 0)
+                                            : nullptr;
+        int64_t count = -1;
+        if (valIdxp && valIdxp->bounded()) {
+            count = valIdxp->length();
+        } else if (VN_IS(memberp, Const) && elemTypep->base()->elementp()
+                   && (isScalarLogic(elemTypep->base()->elementp())
+                       || elemTypep->base()->elementp()->base() == V3VhdlStd::bitType())) {
+            // A bit string's subtype is left open, and it is a number as wide
+            // as it has elements
+            count = memberp->width();
+        }
+        if (count < 0 || count > 65536) return memberp;
+        AstNodeExpr* const lenp = boundsLength(elemTypep, flp);
+        if (!lenp) return memberp;
+        // An error that ends the run, as nvc 1.22.1 and GHDL 7.0.0-dev end it
+        AstNode* const failp = new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                              "Array lengths do not match", nullptr, nullptr};
+        failp->addNext(new AstStop{flp, true});
+        AstNode* const checkp
+            = new AstIf{flp, new AstNeq{flp, lenp, i32(count, flp)}, failp, nullptr};
+        return new AstExprStmt{flp, checkp, memberp};
+    }
+
     AstNodeExpr* lowerRecordAggregate(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp) {
         const std::vector<VhdlSymbol*>& elems = typep->elements();
         if (elems.empty()) {
@@ -16203,6 +16239,7 @@ private:
             if (!memberp) memberp = lowerExpr(valuep);
             if (!memberp) return nullptr;
             if (packed) {
+                memberp = elemLengthChecked(memberp, valuep, elems[i]->typep(), flp);
                 outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
             } else {
                 itemsp = AstNode::addNextNull(
