@@ -4707,6 +4707,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         unitScopep->prefixes(lib + ":" + lower(unitp->name()),
                              lib + ":" + lower(unitp->name()));
         if (AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity)) {
+            unitScopep->designRoot(true);
             openPortGenerics(entp->genericsp(), entp, unitScopep);
             openPortGenerics(entp->portsp(), entp, unitScopep);
             m_ifacePos = 0;
@@ -4766,6 +4767,7 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // names the architecture with it (16.2.7)
                 unitScopep->prefixes(parts.back() + "(" + lower(archp->name()) + ")",
                                      parts.back());
+                unitScopep->designRoot(true);
                 // A configuration of this architecture names what it
                 // declares, so its region has to be findable (3.4)
                 m_unitScopes[lib + "." + parts.back() + "(" + lower(archp->name()) + ")"]

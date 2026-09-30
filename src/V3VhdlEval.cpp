@@ -1291,6 +1291,15 @@ private:
             // object does not.
             VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
             if (!symp) return VhdlValue{};
+            // Under a design entity the path runs through the instances above
+            // it, which differ from one instance to the next: the design
+            // carries it, and it is not one value here
+            for (const VhdlScope* scopep = symp->declScopep(); scopep;
+                 scopep = scopep->parentp()) {
+                if (scopep->instPrefix().empty()) continue;
+                if (scopep->designRoot()) return VhdlValue{};
+                break;
+            }
             const bool inst = attr == "instance_name";
             std::string out
                 = ":" + scopePath(symp->declScopep(), inst) + sourceName(symp->name());

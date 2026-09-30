@@ -329,6 +329,8 @@ class VhdlScope final {
     // with the entity it belongs to (16.2.7)
     std::string m_instPrefix;
     std::string m_pathPrefix;
+    bool m_designRoot = false;  // An entity's or architecture's region: its paths run on
+                                // through the instances above it, one per instance
     // Declared here. A multimap because a name may denote several overloads.
     std::multimap<std::string, VhdlSymbol*> m_direct;
     // Made potentially visible by a use clause (12.4). Searched only when the
@@ -373,6 +375,8 @@ public:
         m_instPrefix = inst;
         m_pathPrefix = path;
     }
+    bool designRoot() const { return m_designRoot; }
+    void designRoot(bool flag) { m_designRoot = flag; }
 
     static bool mark2008() { return s_mark2008; }
     static void mark2008(bool flag) { s_mark2008 = flag; }

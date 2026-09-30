@@ -380,6 +380,7 @@ public:
     void reportReachedRefusals() VL_MT_DISABLED;
     void addLogicPosPins() VL_MT_DISABLED;
     void addOpenPortPins() VL_MT_DISABLED;
+    void addPathPins() VL_MT_DISABLED;
     void markPackageSignalRefs() VL_MT_DISABLED;
     static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
@@ -16712,11 +16713,13 @@ private:
         return out + "]";
     }
 
-    // A name as a path writes it: overloadable ones carry their profile
+    // A name as a path writes it: overloadable ones carry their profile, and
+    // a copy made for a call is named as the subprogram it copies
     static std::string pathNameOf(const VhdlSymbol* symp) {
         if (!symp) return "";
         if (symp->kind() == VhdlSymKind::FUNCTION || symp->kind() == VhdlSymKind::PROCEDURE) {
-            return symp->name() + signatureOf(symp);
+            const std::string& name = symp->name();
+            return name.substr(0, name.find("__V")) + signatureOf(symp);
         }
         return symp->name();
     }
@@ -16850,6 +16853,17 @@ private:
         // all, so its path starts at the library the package was analyzed
         // into rather than at the design's own top (16.2.7)
         if (inPkg) return pathString(":" + lib + ":" + unit + ":" + tail, flp);
+        // Above the design entity the path runs through the instances it was
+        // reached by, which differ from one instance to the next
+        if (m_modp) {
+            const auto unitIt = m_pathUnitOf.find(m_modp->name());
+            if (unitIt != m_pathUnitOf.end() && unitIt->second.first == unit) {
+                const std::pair<AstVar*, AstVar*> params = pathParams(m_modp);
+                AstVar* const rootp = attr == "instance_name" ? params.first : params.second;
+                return new AstConcatN{flp, new AstVarRef{flp, rootp, VAccess::READ},
+                                      pathString(":" + tail, flp)};
+            }
+        }
         // 'INSTANCE_NAME names the design entity the region was built from,
         // which its path does not (16.2.7)
         std::string root = unit;
@@ -16877,6 +16891,46 @@ private:
     }
     std::map<const AstNode*, std::string> m_genIndex;  // Generate -> iteration being written
     std::vector<AstVar*> m_pathIdxp;  // The iteration each place in a path waits for
+    // The part of a path above the design entity is the instances it was reached through,
+    // one path for each instance: generics carry it, "__Vinstname" as 'INSTANCE_NAME writes
+    // it and "__Vpathname" as 'PATH_NAME does, each defaulting to the root's own (16.2.7)
+    std::map<std::string, std::pair<std::string, std::string>> m_pathUnitOf;  // Module ->
+                                                                              // entity, arch
+    std::map<std::string, std::pair<AstVar*, AstVar*>> m_pathParamsOf;  // Module -> generics
+    struct PathCell final {
+        AstCell* m_cellp;  // The instance
+        AstNodeModule* m_modp;  // The module it is in
+        std::string m_tail;  // Regions and label it adds, with places for iterations
+        std::vector<AstVar*> m_idxps;  // The iteration each place waits for
+    };
+    std::vector<PathCell> m_pathCells;  // Instances of VHDL entities
+
+    // "ent(arch)", or "ent" where the path leaves the architecture out
+    std::string pathUnitName(const std::string& modName, bool withArch) const {
+        const auto it = m_pathUnitOf.find(modName);
+        if (it == m_pathUnitOf.end()) return "";
+        if (!withArch || it->second.second.empty()) return it->second.first;
+        return it->second.first + "(" + it->second.second + ")";
+    }
+
+    // The generics carrying a module's paths, made on first use
+    std::pair<AstVar*, AstVar*> pathParams(AstNodeModule* modp) {
+        const auto it = m_pathParamsOf.find(modp->name());
+        if (it != m_pathParamsOf.end()) return it->second;
+        if (!m_pathUnitOf.count(modp->name())) return {nullptr, nullptr};
+        FileLine* const flp = modp->fileline();
+        AstVar* const instp = new AstVar{flp, VVarType::GPARAM, "__Vinstname", VFlagChildDType{},
+                                         new AstBasicDType{flp, VBasicDTypeKwd::STRING}};
+        instp->valuep(
+            new AstConst{flp, AstConst::String{}, ":" + pathUnitName(modp->name(), true)});
+        AstVar* const pathp = new AstVar{flp, VVarType::GPARAM, "__Vpathname", VFlagChildDType{},
+                                         new AstBasicDType{flp, VBasicDTypeKwd::STRING}};
+        pathp->valuep(
+            new AstConst{flp, AstConst::String{}, ":" + pathUnitName(modp->name(), false)});
+        modp->addStmtsp(instp);
+        modp->addStmtsp(pathp);
+        return m_pathParamsOf[modp->name()] = {instp, pathp};
+    }
 
     // A path with places left in it for the iterations a generate loop is on
     AstNodeExpr* pathString(const std::string& text, FileLine* flp) {
@@ -20348,6 +20402,20 @@ private:
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
         m_instantiated.insert(modName);
         AstCell* const cellp = new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr};
+        {
+            // The regions of this design entity it sits in, for the paths of
+            // the one it instantiates (16.2.7)
+            std::vector<std::string> parts;
+            std::string lib;
+            std::string unit;
+            bool inPkg = false;
+            m_pathIdxp.clear();
+            if (m_modp && vhdlPathWalk(nodep, parts, lib, unit, inPkg) && !inPkg) {
+                const std::string regions = pathTail(parts, true);
+                m_pathCells.push_back({cellp, m_modp, regions + label, m_pathIdxp});
+            }
+            m_pathIdxp.clear();
+        }
         for (AstNode* pp = paramsp; pp; pp = pp->nextp()) {
             const auto posIt = m_logicPosPins.find(pp);
             if (posIt == m_logicPosPins.end()) continue;
@@ -29369,6 +29437,7 @@ private:
         FileLine* const flp = entp->fileline();
         const std::string libname = entp->libname().empty() ? "work" : entp->libname();
         m_modp = new AstModule{flp, asName.empty() ? entp->name() : asName, libname};
+        m_pathUnitOf[m_modp->name()] = {entp->name(), archp ? archp->name() : ""};
         // VHDL counts time in its primary unit, which for TIME is the
         // femtosecond (16.3), so that is the module's time unit, and the
         // design's precision must be at least as fine. Verilator keeps the
@@ -30264,6 +30333,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     markPackageSignalRefs();
     addLogicPosPins();
     addOpenPortPins();
+    addPathPins();
     reportReachedRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
 }
@@ -30323,6 +30393,46 @@ void VhdlLowerVisitor::addOpenPortPins() {
                                          new AstConst{flp, AstConst::Signed32{}, 1}});
         }
     });
+}
+
+// Each instance of a module whose paths a generic carries hands it the paths
+// it is reached by: its own module's, then the regions it sits in and its
+// label, and for 'INSTANCE_NAME the entity and architecture it builds
+// (16.2.7). That makes the module instantiating it need its own paths, and so
+// on up to the top, whose paths are its defaults.
+void VhdlLowerVisitor::addPathPins() {
+    if (m_pathParamsOf.empty()) {
+        m_pathCells.clear();
+        return;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const PathCell& pc : m_pathCells) {
+            if (!m_pathParamsOf.count(pc.m_cellp->modName())) continue;
+            if (m_pathParamsOf.count(pc.m_modp->name())) continue;
+            if (pathParams(pc.m_modp).first) changed = true;
+        }
+    }
+    for (const PathCell& pc : m_pathCells) {
+        AstCell* const cellp = pc.m_cellp;
+        if (!m_pathParamsOf.count(cellp->modName())) continue;
+        const auto parentIt = m_pathParamsOf.find(pc.m_modp->name());
+        if (parentIt == m_pathParamsOf.end()) continue;
+        FileLine* const flp = cellp->fileline();
+        int pinNum = 0;
+        for (AstNode* pp = cellp->paramsp(); pp; pp = pp->nextp()) ++pinNum;
+        m_pathIdxp = pc.m_idxps;
+        AstNodeExpr* const instp = new AstConcatN{
+            flp, new AstVarRef{flp, parentIt->second.first, VAccess::READ},
+            pathString(":" + pc.m_tail + "@" + pathUnitName(cellp->modName(), true), flp)};
+        AstNodeExpr* const pathp
+            = new AstConcatN{flp, new AstVarRef{flp, parentIt->second.second, VAccess::READ},
+                             pathString(":" + pc.m_tail, flp)};
+        cellp->addParamsp(new AstPin{flp, ++pinNum, "__Vinstname", instp});
+        cellp->addParamsp(new AstPin{flp, ++pinNum, "__Vpathname", pathp});
+    }
+    m_pathIdxp.clear();
+    m_pathCells.clear();
 }
 
 // The refusals that wait on whether their module is elaborated, reported for
