@@ -2131,6 +2131,7 @@ void AstCell::dumpJson(std::ostream& str) const {
 void AstCellInline::dump(std::ostream& str) const {
     this->AstNode::dump(str);
     str << " -> " << origModName();
+    if (caseInsensitive()) str << " [CASEI]";
 }
 void AstCellInline::dumpJson(std::ostream& str) const {
     dumpJsonStrFunc(str, origModName);

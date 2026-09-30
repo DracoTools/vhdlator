@@ -827,10 +827,11 @@ private:
     const char* const m_defnamep;  // Definition name (SCOPE_MODULE only)
     const int8_t m_timeunit;  // Timeunit in negative power-of-10
     const Type m_type;  // Type of the scope
+    const bool m_caseInsensitive;  // Names within were declared in VHDL, stored lower case
 
 public:  // But internals only - called from verilated modules, VerilatedSyms
     VerilatedScope(VerilatedSyms* symsp, const char* suffixp, const char* identifier,
-                   const char* defnamep, int8_t timeunit, Type type);
+                   const char* defnamep, int8_t timeunit, Type type, bool caseInsensitive = false);
     ~VerilatedScope();
 
     void exportInsert(int finalize, const char* namep, void* cb) VL_MT_UNSAFE;
@@ -860,6 +861,7 @@ public:  // But internals only - called from verilated modules, VerilatedSyms
     static void* exportFindNullError(int funcnum) VL_MT_SAFE;
     static void* exportFind(const VerilatedScope* scopep, int funcnum) VL_MT_SAFE;
     Type type() const { return m_type; }
+    bool caseInsensitive() const VL_MT_SAFE_POSTINIT { return m_caseInsensitive; }
 };
 
 // One scope, consumed by VerilatedScope::scopesConstructFromTable(); replaces
@@ -871,6 +873,7 @@ struct VlScopeTableEntry final {
     const char* defnamep;  // Definition name (SCOPE_MODULE only), else "<null>"
     int8_t timeunit;  // Timeunit in negative power-of-10
     VerilatedScope::Type type;
+    bool caseInsensitive = false;  // Names within were declared in VHDL, stored lower case
 };
 
 class VerilatedHierarchy final {

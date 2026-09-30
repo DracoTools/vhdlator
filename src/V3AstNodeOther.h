@@ -752,6 +752,7 @@ class AstCellInline final : public AstNode {
     // @astgen ptr := m_scopep : Optional[AstScope]  // The scope that the cell is inlined into
     string m_name;  // Cell name, possibly {a}__DOT__{b}...
     const string m_origModName;  // Original name of module, ignoring name() changes, for LinkDot
+    bool m_caseInsensitive = false;  // Names within were declared in VHDL, stored lower case
 public:
     AstCellInline(FileLine* fl, const string& name, const string& origModName)
         : ASTGEN_SUPER_CellInline(fl)
@@ -765,6 +766,8 @@ public:
     bool maybePointedTo() const override VL_MT_SAFE { return true; }
     string origModName() const { return m_origModName; }  // * = modp()->origName() before inlining
     void name(const string& name) override { m_name = name; }
+    bool caseInsensitive() const { return m_caseInsensitive; }
+    void caseInsensitive(bool flag) { m_caseInsensitive = flag; }
 };
 class AstCellInlineScope final : public AstNode {
     // A particular scoped usage of a Cell Inline
@@ -792,6 +795,7 @@ public:
     string origModName() const {
         return m_cellp->origModName();
     }  // * = modp()->origName() before inlining
+    bool caseInsensitive() const { return m_cellp->caseInsensitive(); }
 };
 class AstCgOptionAssign final : public AstNode {
     // A covergroup set of option

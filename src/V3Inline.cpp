@@ -804,8 +804,10 @@ void inlineCell(AstNodeModule* modp, AstCell* cellp, bool last, InlineModGraph& 
     }
 
     // Create data for resolving hierarchical references later.
-    modp->addInlinesp(
-        new AstCellInline{cellp->fileline(), cellp->name(), cellp->modp()->origName()});
+    AstCellInline* const inlinep
+        = new AstCellInline{cellp->fileline(), cellp->name(), cellp->modp()->origName()};
+    inlinep->caseInsensitive(cellp->modp()->fileline()->language().vhdl());
+    modp->addInlinesp(inlinep);
 
     // Connect the pins on the instance
     for (AstPin* pinp = cellp->pinsp(); pinp; pinp = VN_AS(pinp->nextp(), Pin)) {

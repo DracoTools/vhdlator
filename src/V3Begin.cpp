@@ -98,6 +98,7 @@ class BeginVisitor final : public VNVisitor {
             // Create CellInline for dotted var resolution
             if (!m_ftaskp) {
                 AstCellInline* const inlinep = new AstCellInline{flp, m_unnamedScope, blockName};
+                inlinep->caseInsensitive(m_modp->fileline()->language().vhdl());
                 m_modp->addInlinesp(inlinep);  // Must be parsed before any AstCells
             }
         }

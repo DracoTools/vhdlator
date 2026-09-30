@@ -36,6 +36,7 @@
 #include "vltstd/vpi_user.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -2748,12 +2749,71 @@ _vl_vpi_handle_dotted_indexed_member_by_name(const std::string& scopeAndName) {
 
 // for obtaining handles
 
-vpiHandle vpi_handle_by_name(PLI_BYTE8* namep, vpiHandle scope) {
-    VerilatedVpiImp::assertOneCheck();
-    VL_VPI_ERROR_RESET_();
-    if (VL_UNLIKELY(!namep)) return nullptr;
-    VL_DEBUG_IF_PLI(VL_DBG_MSGF("- vpi: vpi_handle_by_name %s %p\n", namep, scope););
+// A name a case-insensitive language (VHDL) declares is stored in lower case. Fold to lower
+// case each part of a hierarchical name that names something in such a scope, leaving the
+// rest, and any extended or escaped identifier, as written. Return false if nothing folds.
+static bool _vl_vpi_case_fold_name(const char* namep, vpiHandle scope, std::string& folded) {
+    std::string name = namep;
+    if (std::none_of(name.begin(), name.end(),
+                     [](char c) { return std::isupper(static_cast<unsigned char>(c)); })) {
+        return false;
+    }
+    if (name.find("::") != std::string::npos) return false;  // Package scopes stay exact
+    std::string lead;
+    std::string prefix;  // Scope searched so far, spelled as the lookup spells it
+    bool fold = false;  // Names in the current scope are case insensitive
+    if (0 == std::strncmp(name.c_str(), "$root.", std::strlen("$root."))) {
+        lead = "$root.";
+        name.erase(0, std::strlen("$root."));
+    } else if (const VerilatedVpioScope* const voScopep = VerilatedVpioScope::castp(scope)) {
+        if (VerilatedVpioPackage::castp(scope)) return false;
+        prefix = voScopep->fullname();
+        fold = voScopep->scopep()->caseInsensitive();
+    } else if (const VerilatedVpioVar* const voVarp = VerilatedVpioVar::castp(scope)) {
+        prefix = voVarp->fullname();
+        fold = voVarp->scopep() && voVarp->scopep()->caseInsensitive();
+    }
+    std::vector<std::string> parts;
+    _vl_vpi_split_dotted_name(name, parts);
+    bool changed = false;
+    std::string result;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        std::string part = parts[i];
+        if (!part.empty() && part[0] != '\\') {
+            std::string lower = part;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](char c) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            });
+            if (lower != part) {
+                bool foldPart = fold;
+                if (!foldPart) {
+                    // A scope's own name, as a VHDL top entity's under a Verilog root
+                    const std::string candidate = prefix.empty() ? lower : prefix + "." + lower;
+                    const VerilatedScope* const scopep
+                        = Verilated::threadContextp()->scopeFind(candidate.c_str());
+                    foldPart = scopep && scopep->caseInsensitive();
+                }
+                if (foldPart) {
+                    part = lower;
+                    changed = true;
+                }
+            }
+        }
+        if (i) result += ".";
+        result += part;
+        prefix = prefix.empty() ? part : prefix + "." + part;
+        // Past a scope, its own flag applies; past a variable, a member keeps its scope's
+        if (const VerilatedScope* const scopep
+            = Verilated::threadContextp()->scopeFind(prefix.c_str())) {
+            fold = scopep->caseInsensitive();
+        }
+    }
+    if (!changed) return false;
+    folded = lead + result;
+    return true;
+}
 
+static vpiHandle _vl_vpi_handle_by_name(PLI_BYTE8* namep, vpiHandle scope) {
     std::string scopeAndName = namep;
 
     // Collapse consecutive spaces into single spaces (can occur with escaped identifiers)
@@ -2896,6 +2956,20 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* namep, vpiHandle scope) {
     }
 
     return resultHandle;
+}
+
+vpiHandle vpi_handle_by_name(PLI_BYTE8* namep, vpiHandle scope) {
+    VerilatedVpiImp::assertOneCheck();
+    VL_VPI_ERROR_RESET_();
+    if (VL_UNLIKELY(!namep)) return nullptr;
+    VL_DEBUG_IF_PLI(VL_DBG_MSGF("- vpi: vpi_handle_by_name %s %p\n", namep, scope););
+    if (const vpiHandle resultp = _vl_vpi_handle_by_name(namep, scope)) return resultp;
+    // Not found as written: VHDL names are case insensitive, so look again with the parts
+    // that fall in a VHDL scope in the lower case they are stored in
+    std::string folded;
+    if (!_vl_vpi_case_fold_name(namep, scope, folded)) return nullptr;
+    VL_VPI_ERROR_RESET_();
+    return _vl_vpi_handle_by_name(const_cast<PLI_BYTE8*>(folded.c_str()), scope);
 }
 
 vpiHandle vpi_handle_by_index(vpiHandle object, PLI_INT32 indx) {

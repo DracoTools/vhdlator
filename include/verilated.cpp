@@ -4131,7 +4131,8 @@ void* VerilatedVarProps::datapAdjustIndex(void* datap, int dim, int indx) const 
 // VerilatedScope:: Methods
 
 VerilatedScope::VerilatedScope(VerilatedSyms* symsp, const char* suffixp, const char* identifier,
-                               const char* defnamep, int8_t timeunit, Type type)
+                               const char* defnamep, int8_t timeunit, Type type,
+                               bool caseInsensitive)
     : m_symsp{symsp}
     , m_namep{[symsp, suffixp]() {
         // We don't want the space and reference-count access overhead of strings.
@@ -4147,7 +4148,8 @@ VerilatedScope::VerilatedScope(VerilatedSyms* symsp, const char* suffixp, const 
     , m_identifierp{identifier}
     , m_defnamep{defnamep}
     , m_timeunit{timeunit}
-    , m_type{type} {
+    , m_type{type}
+    , m_caseInsensitive{caseInsensitive} {
     Verilated::threadContextp()->impp()->scopeInsert(this);
 }
 
@@ -4252,7 +4254,8 @@ void VerilatedScope::scopesConstructFromTable(const VlScopeTableEntry* entp, siz
     for (size_t i = 0; i < n; ++i) {
         const VlScopeTableEntry& e = entp[i];
         VerilatedScope** const slotp = reinterpret_cast<VerilatedScope**>(base + e.ptrOffset);
-        *slotp = new VerilatedScope{symsp, e.namep, e.identp, e.defnamep, e.timeunit, e.type};
+        *slotp = new VerilatedScope{symsp,      e.namep, e.identp,         e.defnamep,
+                                    e.timeunit, e.type,  e.caseInsensitive};
     }
 }
 

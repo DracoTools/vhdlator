@@ -52,14 +52,17 @@ class EmitCSyms final : EmitCBaseVisitorConst {
         const std::string m_defName;
         const int m_timeunit;
         std::string m_type;  // TODO: this should be an enum
+        const bool m_caseInsensitive;  // Names within were declared in VHDL, stored lower case
         ScopeData(const AstNode* nodep, const std::string& symName, const std::string& prettyName,
-                  const std::string& defName, int timeunit, const std::string& type)
+                  const std::string& defName, int timeunit, const std::string& type,
+                  bool caseInsensitive = false)
             : m_nodep{nodep}
             , m_symName{symName}
             , m_prettyName{prettyName}
             , m_defName{defName}
             , m_timeunit{timeunit}
-            , m_type{type} {}
+            , m_type{type}
+            , m_caseInsensitive{caseInsensitive} {}
     };
     struct ScopeFuncData final {
         const AstScopeName* const m_scopep;
@@ -699,7 +702,8 @@ class EmitCSyms final : EmitCBaseVisitorConst {
                 m_scopeNames.emplace(  //
                     std::piecewise_construct,  //
                     std::forward_as_tuple(scpSym),  //
-                    std::forward_as_tuple(varp, scpSym, scpPretty, "<null>", 0, "SCOPE_OTHER"));
+                    std::forward_as_tuple(varp, scpSym, scpPretty, "<null>", 0, "SCOPE_OTHER",
+                                          varp->fileline()->language().vhdl()));
 
                 m_scopeVars.emplace(  //
                     std::piecewise_construct,  //
@@ -788,7 +792,7 @@ class EmitCSyms final : EmitCBaseVisitorConst {
             std::forward_as_tuple(scopeSymString(name)),  //
             std::forward_as_tuple(nodep, scopeSymString(name), AstNode::vpiName(name),
                                   type == "SCOPE_MODULE" ? nodep->origModName() : "<null>",
-                                  timeunit, type));
+                                  timeunit, type, nodep->caseInsensitive()));
     }
     void visit(AstScope* nodep) override {
         if (VN_IS(m_modp, Class)) return;  // The ClassPackage is what is visible
@@ -805,7 +809,8 @@ class EmitCSyms final : EmitCBaseVisitorConst {
                 std::forward_as_tuple(scopeSymString(nodep->name())),  //
                 std::forward_as_tuple(nodep, scopeSymString(nodep->name()),
                                       AstNode::vpiName(nodep->shortName()),
-                                      nodep->modp()->origName(), timeunit, type));
+                                      nodep->modp()->origName(), timeunit, type,
+                                      nodep->modp()->fileline()->language().vhdl()));
         }
         iterateChildrenConst(nodep);
     }
@@ -1249,7 +1254,9 @@ std::vector<std::string> EmitCSyms::getSymCtorStmts() {
             row += V3OutFormatter::quoteNameControls(sd.m_defName);
             row += "\", ";
             row += std::to_string(sd.m_timeunit);
-            row += ", VerilatedScope::" + sd.m_type + "}";
+            row += ", VerilatedScope::" + sd.m_type;
+            if (sd.m_caseInsensitive) row += ", true";
+            row += "}";
             m_scopeTableRows.emplace_back(std::move(row));
         }
         m_scopeTableName = symClass + "__VpiScopeTable";
