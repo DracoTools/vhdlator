@@ -3744,11 +3744,8 @@ private:
             static_cast<AstNode*>(new AstIf{
                 flp,
                 new AstNeq{flp, dynCarrierLength(keepp->cloneTree(false), flp),
-                           new AstConst{flp, AstConst::Signed32{},
-                                        static_cast<int32_t>(count)}},
-                new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match",
-                               nullptr, nullptr},
-                nullptr}));
+                           new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)}},
+                lengthMismatch(flp), nullptr}));
         const bool asc = idxp->ascending();
         for (int64_t i = 0; i < count; ++i) {
             const int64_t at = asc ? idxp->left() + i : idxp->left() - i;
@@ -4579,6 +4576,16 @@ private:
         return refp;
     }
 
+    // Lengths that do not match, where only running can tell, are an error
+    // that ends the run (5.3.2.2, 10.6.2.1), as nvc 1.22.1 and GHDL 7.0.0-dev
+    // end it
+    static AstNode* lengthMismatch(FileLine* flp) {
+        AstNode* const displayp = new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                                 "Array lengths do not match", nullptr, nullptr};
+        displayp->addNext(new AstStop{flp, true});
+        return displayp;
+    }
+
     std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynToFuncs;
 
     // A value that carries its own bounds, copied into one whose subtype
@@ -4612,9 +4619,7 @@ private:
             flp,
             new AstNeq{flp, dynCarrierLength(rd(cp, flp), flp),
                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)}},
-            new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match", nullptr,
-                           nullptr},
-            nullptr});
+            lengthMismatch(flp), nullptr});
         const auto out = [&]() {
             return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE};
         };
@@ -4690,11 +4695,9 @@ private:
                        ascending ? new AstSub{flp, rightp, rd(lp, flp)}
                                  : new AstSub{flp, rd(lp, flp), rightp},
                        i32(1, flp)}});
-        funcp->addStmtsp(new AstIf{
-            flp, new AstNeq{flp, dynCarrierLength(rd(cp, flp), flp), rd(np, flp)},
-            new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match", nullptr,
-                           nullptr},
-            nullptr});
+        funcp->addStmtsp(
+            new AstIf{flp, new AstNeq{flp, dynCarrierLength(rd(cp, flp), flp), rd(np, flp)},
+                      lengthMismatch(flp), nullptr});
         const auto out
             = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
         funcp->addStmtsp(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
@@ -12121,11 +12124,8 @@ private:
         // What is written must be as long as the slice, which only running
         // can check (10.5.2.1)
         if (srcp) {
-            add(new AstIf{flp,
-                          new AstNeq{flp, rd(np, flp), dynCarrierLength(rd(sp, flp), flp)},
-                          new AstDisplay{flp, VDisplayType::DT_ERROR,
-                                         "Array lengths do not match", nullptr, nullptr},
-                          nullptr});
+            add(new AstIf{flp, new AstNeq{flp, rd(np, flp), dynCarrierLength(rd(sp, flp), flp)},
+                          lengthMismatch(flp), nullptr});
         }
         add(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
         AstNode* bodyp = new AstAssign{
@@ -16177,12 +16177,8 @@ private:
         if (count < 0 || count > 65536) return memberp;
         AstNodeExpr* const lenp = boundsLength(elemTypep, flp);
         if (!lenp) return memberp;
-        // An error that ends the run, as nvc 1.22.1 and GHDL 7.0.0-dev end it
-        AstNode* const failp = new AstDisplay{flp, VDisplayType::DT_ERROR,
-                                              "Array lengths do not match", nullptr, nullptr};
-        failp->addNext(new AstStop{flp, true});
         AstNode* const checkp
-            = new AstIf{flp, new AstNeq{flp, lenp, i32(count, flp)}, failp, nullptr};
+            = new AstIf{flp, new AstNeq{flp, lenp, i32(count, flp)}, lengthMismatch(flp), nullptr};
         return new AstExprStmt{flp, checkp, memberp};
     }
 
@@ -21412,9 +21408,7 @@ private:
             outp = AstNode::addNext(
                 outp, static_cast<AstNode*>(new AstIf{
                           flp, new AstNeq{flp, dynCarrierLength(rd(cvarp, flp), flp), rd(np, flp)},
-                          new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match",
-                                         nullptr, nullptr},
-                          nullptr}));
+                          lengthMismatch(flp), nullptr}));
         }
         outp = AstNode::addNext(outp,
                                 static_cast<AstNode*>(new AstAssign{flp, wr(kp, flp), num(0)}));
@@ -22794,14 +22788,11 @@ private:
         AstNode* outp = new AstAssign{flp, new AstVarRef{flp, lenp, VAccess::WRITE},
                                       new AstLenN{flp, text()}};
         outp = AstNode::addNext(outp, static_cast<AstNode*>(new AstAssign{flp, lhsp, rhsp}));
-        return AstNode::addNext(
-            outp,
-            static_cast<AstNode*>(new AstIf{
-                flp,
-                new AstNeq{flp, new AstLenN{flp, text()}, new AstVarRef{flp, lenp, VAccess::READ}},
-                new AstDisplay{flp, VDisplayType::DT_ERROR, "Array lengths do not match", nullptr,
-                               nullptr},
-                nullptr}));
+        return AstNode::addNext(outp, static_cast<AstNode*>(new AstIf{
+                                          flp,
+                                          new AstNeq{flp, new AstLenN{flp, text()},
+                                                     new AstVarRef{flp, lenp, VAccess::READ}},
+                                          lengthMismatch(flp), nullptr}));
     }
 
     // What the analysis says of a slice whose settled range runs the other
@@ -22921,9 +22912,7 @@ private:
         outp = AstNode::addNext(
             outp, static_cast<AstNode*>(
                       new AstIf{flp, new AstNeq{flp, dynCarrierLength(sr(), flp), countOf()},
-                                new AstDisplay{flp, VDisplayType::DT_ERROR,
-                                               "Array lengths do not match", nullptr, nullptr},
-                                nullptr}));
+                                lengthMismatch(flp), nullptr}));
         outp
             = AstNode::addNext(outp, static_cast<AstNode*>(new AstAssign{
                                          flp, new AstVarRef{flp, kVarp, VAccess::WRITE}, num(0)}));
@@ -23147,9 +23136,7 @@ private:
         const auto idx = [&]() { return new AstVarRef{flp, idxVarp, VAccess::READ}; };
         // "assert v'length = p'length", which is what the LRM asks of it
         AstNode* outp = new AstIf{flp, new AstNeq{flp, dynLength(dynp, objp, flp), num(count)},
-                                  new AstDisplay{flp, VDisplayType::DT_ERROR,
-                                                 "Array lengths do not match", nullptr, nullptr},
-                                  nullptr};
+                                  lengthMismatch(flp), nullptr};
         AstNodeExpr* const placep
             = idxp->ascending()
                   ? static_cast<AstNodeExpr*>(new AstAdd{flp, num(idxp->left()), idx()})

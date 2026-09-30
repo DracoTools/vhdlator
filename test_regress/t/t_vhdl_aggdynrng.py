@@ -21,10 +21,11 @@ test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--ma
              make_top_shell=False,
              make_main=False)
 
-test.execute()
-
 # The last assignment gives three bits a thousand-element aggregate, which
-# nvc and GHDL both stop at; here it is reported
+# nvc and GHDL both stop at, and so does this: after the checks have passed
+test.execute(fails=True)
+
+test.file_grep(test.run_log_filename, r'\*-\* All Finished \*-\*')
 test.file_grep(test.run_log_filename, r'Array lengths do not match')
 
 test.passes()

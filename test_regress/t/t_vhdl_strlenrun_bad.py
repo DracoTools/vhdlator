@@ -22,7 +22,8 @@ test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--ma
              make_top_shell=False,
              make_main=False)
 
-test.execute()
+# The mismatch ends the run, after the values that match have passed
+test.execute(fails=True)
 
 test.file_grep(test.run_log_filename, r'lengths that match passed')
 test.file_grep_count(test.run_log_filename, r'Array lengths do not match', 1)
