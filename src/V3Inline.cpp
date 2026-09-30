@@ -33,6 +33,7 @@
 #include "V3Inst.h"
 #include "V3Stats.h"
 
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -398,6 +399,21 @@ class InlineRelinkVisitor final : public VNVisitor {
     const AstCell* const m_cellp;  // The cell being inlined
 
     size_t m_nPlaceholders = 0;  // Unique identifier sequence number for placeholder variables
+    // Input ports being inlined, recorded before visit(AstVar) clears their I/O bits
+    std::set<const AstVar*> m_inputPorts;
+    bool m_inInitialStatic = false;  // Under an AstInitialStatic
+
+    // A write to a port that is not to reach what the port is connected to
+    // goes to a placeholder variable instead, which is later pruned
+    void replaceWithPlaceholder(AstVarRef* nodep) {
+        AstVar* const varp = nodep->varp();
+        const std::string name
+            = m_cellp->name() + "__vInlPlaceholder_" + std::to_string(++m_nPlaceholders);
+        AstVar* const holdep = new AstVar{varp->fileline(), VVarType::VAR, name, varp};
+        m_modp->addStmtsp(holdep);
+        nodep->replaceWith(new AstVarRef{nodep->fileline(), holdep, nodep->access()});
+        VL_DO_DANGLING(nodep->deleteTree(), nodep);
+    }
 
     // VISITORS
     void visit(AstCellInline* nodep) override {
@@ -428,7 +444,13 @@ class InlineRelinkVisitor final : public VNVisitor {
         m_renamedInterfaces.clear();
         iterateChildren(nodep);
     }
+    void visit(AstInitialStatic* nodep) override {
+        VL_RESTORER(m_inInitialStatic);
+        m_inInitialStatic = true;
+        iterateChildren(nodep);
+    }
     void visit(AstVar* nodep) override {
+        if (nodep->user2p() && nodep->direction() == VDirection::INPUT) m_inputPorts.insert(nodep);
         // Iterate won't hit AstIfaceRefDType directly as it is no longer underneath the module
         if (AstIfaceRefDType* const ifacerefp = VN_CAST(nodep->dtypep(), IfaceRefDType)) {
             m_renamedInterfaces.insert(nodep->name());
@@ -491,17 +513,22 @@ class InlineRelinkVisitor final : public VNVisitor {
             // yet emiting code like 0 = 0, we instead substitute a placeholder
             // variable that will later be pruned (it will otherwise be unreferenced).
             if (!nodep->access().isReadOnly()) {
-                AstVar* const varp = nodep->varp();
-                const std::string name
-                    = m_cellp->name() + "__vInlPlaceholder_" + std::to_string(++m_nPlaceholders);
-                AstVar* const holdep = new AstVar{varp->fileline(), VVarType::VAR, name, varp};
-                m_modp->addStmtsp(holdep);
-                AstVarRef* const newp = new AstVarRef{nodep->fileline(), holdep, nodep->access()};
-                nodep->replaceWith(newp);
-            } else {
-                nodep->replaceWith(constp->cloneTree(false));
+                replaceWithPlaceholder(nodep);
+                return;
             }
+            nodep->replaceWith(constp->cloneTree(false));
             VL_DO_DANGLING(nodep->deleteTree(), nodep);
+            return;
+        }
+
+        // A static initializer of an input port is its default value (IEEE
+        // 1800-2023 23.2.2.4), which applies only where the port is left
+        // unconnected. The port is connected here, so the initializer must not
+        // be retargeted onto the connected variable, whose own initial value
+        // it would overwrite.
+        if (m_inInitialStatic && !nodep->access().isReadOnly()
+            && m_inputPorts.count(nodep->varp())) {
+            replaceWithPlaceholder(nodep);
             return;
         }
 
