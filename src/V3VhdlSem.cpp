@@ -572,6 +572,14 @@ class VhdlSemVisitor final : public VNVisitor {
             if (!typep) return info;
             info.typep = typep;
             takeBoundsFrom(info, typep);
+            // "v'range" of an object only elaboration sized is only
+            // elaboration's to know too
+            if (const AstVhdlAttrName* const ap = VN_CAST(namep, VhdlAttrName)) {
+                const VhdlSymbol* const psymp
+                    = ap->prefixp() ? ap->prefixp()->vhdlSymp() : nullptr;
+                const VhdlType* const ptypep = psymp ? psymp->resolved()->typep() : nullptr;
+                if (ptypep && m_elabSizedTypes.count(ptypep)) ++m_elabFolds;
+            }
             if (reversed) {
                 std::swap(info.left, info.right);
                 info.ascending = !info.ascending;
@@ -609,8 +617,11 @@ class VhdlSemVisitor final : public VNVisitor {
             for (VhdlValue* const valp : {&info.left, &info.right}) {
                 if (valp->known()) continue;
                 const VhdlValue elab
-                    = V3VhdlEval::evalElab(valp == &info.left ? rp->leftp() : rp->rightp());
-                if (elab.isInt()) *valp = elab;
+                    = V3VhdlEval::evalElabBound(valp == &info.left ? rp->leftp() : rp->rightp());
+                if (elab.isInt()) {
+                    *valp = elab;
+                    ++m_elabFolds;
+                }
             }
         }
         if (info.left.known() && !info.left.typep()) info.left.typep(typep);
@@ -2284,6 +2295,11 @@ private:
     // them, so a range that does not fit is a run-time condition
     bool m_inSpecialized = false;
     bool m_elabBounds = false;  // Bounds of an object elaborated once, a signal
+    int m_elabFolds = 0;  // Bounds elaboration worked out that analysis could not
+    // Subtypes of objects whose bounds only elaboration works out: they are
+    // not locally static, so the length of what is assigned to one is
+    // checked when the assignment runs, not here (10.6.2.1)
+    std::set<const VhdlType*> m_elabSizedTypes;
     // True if the candidates could stand where 'wantp' is expected
     static bool anyMatches(const CandSet& cands, const VhdlType* wantp) VL_MT_DISABLED;
     // True if that match needs no implicit conversion (9.3.2)
@@ -2510,12 +2526,14 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             // impure function built. What a subprogram declares is
             // elaborated at each call instead.
             VL_RESTORER(m_elabBounds);
+            const int foldsBefore = m_elabFolds;
             const AstNode* const declParentp = parentOf(nodep);
             m_elabBounds = kind == VhdlSymKind::SIGNAL || VN_IS(declParentp, VhdlProcess)
                            || VN_IS(declParentp, VhdlArchitecture) || VN_IS(declParentp, VhdlBlock)
                            || VN_IS(declParentp, VhdlGenerateBody)
                            || VN_IS(declParentp, VhdlEntity) || VN_IS(declParentp, VhdlPackage);
             symp->typep(resolveSubtype(nodep->subtypep()));
+            if (m_elabFolds != foldsBefore) m_elabSizedTypes.insert(symp->typep());
         }
         nodep->vhdlSymp(symp);
         declare(symp, nodep->fileline());
@@ -10798,6 +10816,7 @@ void VhdlSemVisitor::checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* target
     // nothing more about it
     if (!checkAssignedType(nodep, targetp)) return;
     checkValueInRange(nodep, targetp, "the assignment target");
+    if (m_elabSizedTypes.count(targetp)) return;
     checkArrayValue(nodep, targetp, "the assignment target");
 }
 
@@ -11442,6 +11461,19 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
     // -- "t_slv_array(0 to n-1)" over an element type of std_logic_vector --
     // and then the element takes its bounds from the value too (5.3.2.2)
     if (!typep->unconstrained()) return constrainElementFromValue(typep, valuep, flp);
+    // Nor does a range written with bounds that do not fold, which is marked
+    // unconstrained only because its length is not a number here: it is the
+    // object's range all the same (5.3.2.2). "constant value_i :
+    // unsigned(value'length downto 1) := value" in VUnit's to_nibble_string
+    // is indexed from value'length down to 1, however value is indexed.
+    {
+        bool written = !typep->indexTypes().empty();
+        for (size_t i = 0; written && i < typep->indexTypes().size(); ++i) {
+            const VhdlType* const idxp = typep->indexTypes()[i];
+            if (typep->dimOpen(i) || !idxp || !VN_IS(idxp->boundsp(), VhdlRange)) written = false;
+        }
+        if (written) return constrainElementFromValue(typep, valuep, flp);
+    }
     // A value that is itself constrained hands over its index ranges
     // directly, whether it says its length as a number or as an expression
     // elaboration settles

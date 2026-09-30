@@ -8,15 +8,17 @@
 -- A generate condition written over a generic an impure function builds --
 -- a record holding a number a protected counter handed out, as VUnit's
 -- verification components compare their actors -- needs that value while
--- elaborating, which only running the design gives here. It is refused
--- rather than decided on a default (nvc 1.22.1 generates the leaf).
+-- elaborating. Here the counter is one elaboration does not follow, so only
+-- running the design gives the number, and the condition turns on nothing
+-- else. It is refused rather than decided on a default (nvc 1.22.1
+-- generates the leaf).
 
 package t_vhdl_datagenimpure_bad_pkg is
   type leaf_t is record
     id : integer;
     len : natural;
   end record;
-  constant null_leaf : leaf_t := (id => -1, len => 0);
+  constant null_leaf : leaf_t := (id => -1, len => 5);
   type outer_t is record
     p_leaf : leaf_t;
     width : natural;
@@ -32,7 +34,13 @@ package body t_vhdl_datagenimpure_bad_pkg is
     variable n : integer := 0;
     impure function next_id return integer is
     begin
-      n := n + 1;
+      -- A labelled exit is not followed while elaborating
+      outer : for i in 0 to 1 loop
+        for j in 0 to 1 loop
+          exit outer when j = 1;
+          n := n + 1;
+        end loop;
+      end loop;
       return n;
     end function;
   end protected body;

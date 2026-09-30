@@ -199,14 +199,23 @@ bool compareValues(const VhdlValue& lhs, const VhdlValue& rhs, int& out) {
     // has to be said to be unequal
     if (lhs.isRecord() && rhs.isRecord()) {
         if (lhs.elements() != rhs.elements()) return false;
+        // Two records are equal when every element is, so one pair of
+        // elements known to differ settles it whatever the others hold: a
+        // verification library's null and default handles differ in a kind
+        // beside an actor no one can work out
+        bool undecided = false;
         for (size_t i = 0; i < lhs.elements(); ++i) {
             int sub = 0;
-            if (!compareValues(lhs.elementAt(i), rhs.elementAt(i), sub)) return false;
+            if (!compareValues(lhs.elementAt(i), rhs.elementAt(i), sub)) {
+                undecided = true;
+                continue;
+            }
             if (sub != 0) {
                 out = 1;
                 return true;
             }
         }
+        if (undecided) return false;
         out = 0;
         return true;
     }
@@ -279,11 +288,19 @@ class VhdlEvaluator final {
     // function, and what elaboration wants from it is the widths it carries,
     // not a value to emit in place of the object (9.4.3)
     const bool m_allowImpure;
+    // Whether a number a generic of the root entity is given is worked out
+    // here. A bound of an object's own subtype leaves it to the parameter
+    // it becomes: a null range written over one is then the same object as
+    // the port it is connected to, which keeps it over the parameter.
+    const bool m_rootNumbers;
     // What allocators made while elaborating (9.3.7). An access value is held
     // as an integer of its access type: the object's place here plus one, and
     // zero for null. Nothing here outlives the evaluation, and no access value
     // is handed out of it (stripAccess).
     std::vector<VhdlValue> m_heap;
+    // A procedure this evaluation could not run changed what it changed in
+    // shared variables, so none of them is read from here on
+    bool m_sharedStale = false;
 
     // A constant folded from a self-referential declaration would recurse
     // forever; analysis reports the cycle separately, so just stop
@@ -301,9 +318,10 @@ class VhdlEvaluator final {
 
 public:
     // CONSTRUCTORS
-    explicit VhdlEvaluator(std::string* errp, bool allowImpure = false)
+    explicit VhdlEvaluator(std::string* errp, bool allowImpure = false, bool rootNumbers = true)
         : m_errp{errp}
-        , m_allowImpure{allowImpure} {}
+        , m_allowImpure{allowImpure}
+        , m_rootNumbers{rootNumbers} {}
 
     // METHODS
     // The same, with names given values from outside: what an instantiation
@@ -605,6 +623,7 @@ private:
             // one call site, which is where the call's own values were fixed
             return symp->value();
         case VhdlSymKind::SHARED_VARIABLE:
+            if (m_sharedStale) return VhdlValue{};
             return V3VhdlEval::s_sharedInitValues ? symp->elabValue() : VhdlValue{};
         case VhdlSymKind::FUNCTION:
             // A function taking no parameters is called by writing its name
@@ -614,15 +633,17 @@ private:
         }
     }
 
-    // What a text generic of the design's root entity is elaborated with: the
-    // value the command line gives it, between quotes, or else its default
-    // (14.2). A generic of any other entity is given its value by the
-    // instance, which hands it in as a binding. A number is left to the
-    // parameter it becomes, which the back end folds: a null range written
-    // over one is then the same object wherever it is written.
+    // What a generic of the design's root entity is elaborated with: the value
+    // the command line gives it -- text between quotes, a number as digits --
+    // or else its default (14.2). A generic of any other entity is given its
+    // value by the instance, which hands it in as a binding.
     VhdlValue rootGenericValue(const VhdlSymbol* symp) {
         const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl);
-        if (!ifp || !isTextType(symp->typep())) return VhdlValue{};
+        if (!ifp) return VhdlValue{};
+        const bool text = isTextType(symp->typep());
+        const bool number
+            = symp->typep() && symp->typep()->base()->kind() == VhdlTypeKind::INTEGER;
+        if (!text && !(number && m_rootNumbers)) return VhdlValue{};
         const AstVhdlEntity* entp = nullptr;
         for (const AstNode* up = ifp->backp(); up && !entp; up = up->backp()) {
             entp = VN_CAST(up, VhdlEntity);
@@ -633,6 +654,13 @@ private:
         }
         const std::string given = v3Global.opt.peekParameterCaseless(symp->name());
         if (!given.empty()) {
+            if (number) {
+                // Decimal digits, as the command line writes a number
+                char* endp = nullptr;
+                const long long v = std::strtoll(given.c_str(), &endp, 10);
+                if (!endp || *endp || endp == given.c_str()) return VhdlValue{};
+                return VhdlValue::mkInt(v, symp->typep());
+            }
             if (given.size() < 2 || given.front() != '"' || given.back() != '"') {
                 return VhdlValue{};
             }
@@ -1087,6 +1115,57 @@ private:
         return nullptr;
     }
 
+    // The range the declaration of an attribute's prefix was constrained
+    // with, for the dimension the attribute asks about. Null where the
+    // prefix is not a whole object declared with an index constraint.
+    const AstVhdlRange* declaredRange(AstVhdlAttrName* nodep) {
+        if (!VN_IS(nodep->prefixp(), VhdlName)) return nullptr;
+        const VhdlSymbol* const symp = nodep->prefixp()->vhdlSymp();
+        if (!symp) return nullptr;
+        const AstVhdlObjectDecl* const declp = VN_CAST(symp->resolved()->declp(), VhdlObjectDecl);
+        if (!declp || !declp->subtypep()) return nullptr;
+        // "std_logic_vector(n - 1 downto 0)" is kept the way it parsed, as a
+        // call of the type mark with the range for its argument
+        AstNode* rp = nullptr;
+        if (const AstVhdlIndexConstraint* const consp
+            = VN_CAST(declp->subtypep()->constraintp(), VhdlIndexConstraint)) {
+            rp = consp->rangesp();
+        } else if (const AstVhdlCall* const callp
+                   = VN_CAST(declp->subtypep()->typeMarkp(), VhdlCall)) {
+            rp = callp->argsp();
+        }
+        int64_t dim = 0;
+        if (nodep->argp()) {
+            const VhdlValue arg = eval(nodep->argp());
+            if (!arg.isInt() || arg.toInt() < 1) return nullptr;
+            dim = arg.toInt() - 1;
+        }
+        for (; rp && dim > 0; --dim) rp = rp->nextp();
+        return VN_CAST(rp, VhdlRange);
+    }
+
+    // A range attribute of a range as it was written, its bounds worked out
+    // here (16.2.4)
+    VhdlValue writtenRangeAttr(const std::string& attr, const AstVhdlRange* rp) {
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return VhdlValue{};
+        const VhdlValue lv = eval(rp->leftp());
+        const VhdlValue rv = eval(rp->rightp());
+        if (!lv.isInt() || !rv.isInt()) return VhdlValue{};
+        const int64_t left = lv.toInt();
+        const int64_t right = rv.toInt();
+        const bool ascending = rp->dir() == VhdlDir::TO;
+        const int64_t low = ascending ? left : right;
+        const int64_t high = ascending ? right : left;
+        VhdlType* const intp = V3VhdlStd::integerType();
+        if (attr == "left") return VhdlValue::mkInt(left, intp);
+        if (attr == "right") return VhdlValue::mkInt(right, intp);
+        if (attr == "high") return VhdlValue::mkInt(high, intp);
+        if (attr == "low") return VhdlValue::mkInt(low, intp);
+        if (attr == "ascending") return mkBool(ascending);
+        if (attr == "length") return VhdlValue::mkInt(high < low ? 0 : high - low + 1, intp);
+        return VhdlValue{};
+    }
+
     // The index type an array attribute asks about, honouring the optional
     // dimension argument (16.2.4)
     VhdlType* indexTypeOf(AstVhdlAttrName* nodep, VhdlType* typep) {
@@ -1263,8 +1342,23 @@ private:
         if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
             || attr == "ascending" || attr == "length" || attr == "range"
             || attr == "reverse_range") {
+            // An object whose constraint names a generic of the root --
+            // "signal tdata : std_logic_vector(data_length - 1 downto 0)" --
+            // was left the unconstrained type by analysis, and only its
+            // declaration says what the bounds are. VUnit builds its protocol
+            // checker from "tdata'length" while elaborating.
+            if (m_allowImpure && isArray && typep->unconstrained()) {
+                return writtenRangeAttr(attr, declaredRange(nodep));
+            }
             VhdlType* const rangep = isArray ? indexTypeOf(nodep, typep) : typep;
-            if (!rangep || !rangep->bounded()) return VhdlValue{};
+            if (!rangep) return VhdlValue{};
+            // Bounds analysis left as written, since they name a generic of
+            // the root, are worked out here, where the root's generics have
+            // values
+            if (!rangep->bounded()) {
+                if (!m_allowImpure) return VhdlValue{};
+                return writtenRangeAttr(attr, VN_CAST(rangep->boundsp(), VhdlRange));
+            }
             const bool isReal = rangep->base()->kind() == VhdlTypeKind::FLOATING;
             if (attr == "left") {
                 return isReal ? VhdlValue::mkReal(rangep->leftReal(), rangep)
@@ -1562,11 +1656,42 @@ private:
         }
         if (AstVhdlProcCall* const p = VN_CAST(nodep, VhdlProcCall)) {
             if (m_allowImpure && (execTextio(p) || execUserProc(p))) return Flow::NORMAL;
+            // A procedure that hands nothing back through its parameters
+            // changes only what is shared -- VUnit's "set(handle.p_config,
+            // ...)" writes a protected store -- and nothing this evaluation
+            // holds depends on that once shared values are no longer read
+            if (m_allowImpure && writesNoParameter(p)) {
+                m_sharedStale = true;
+                return Flow::NORMAL;
+            }
             return bail();
         }
         // A wait or a signal assignment cannot appear in a function at all,
         // and a procedure call would have to carry values back out
         return bail();
+    }
+
+    // Whether a procedure call has no parameter of mode out or inout, and no
+    // signal or file parameter, so that what it does reaches nothing a caller
+    // holds but what is shared
+    static bool writesNoParameter(AstVhdlProcCall* nodep) {
+        AstNodeVhdlExpr* const callExprp = nodep->callp();
+        const VhdlSymbol* const symp = callExprp ? callExprp->vhdlSymp() : nullptr;
+        if (!symp) return false;
+        const VhdlSymbol* const procp = symp->resolved();
+        if (procp->kind() != VhdlSymKind::PROCEDURE) return false;
+        const AstVhdlSubprogDecl* const declp
+            = procp->bodyp() ? procp->bodyp() : VN_CAST(procp->declp(), VhdlSubprogDecl);
+        if (!declp) return false;
+        for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ip = VN_CAST(p, VhdlIfaceDecl);
+            if (!ip) return false;
+            if (ip->kind() != VhdlIfaceKind::CONSTANT && ip->kind() != VhdlIfaceKind::VARIABLE) {
+                return false;
+            }
+            if (ip->mode() != VhdlMode::IN) return false;
+        }
+        return true;
     }
 
     // The object a variable target names, to be written in place: one of
@@ -2170,6 +2295,11 @@ VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
 
 VhdlValue V3VhdlEval::evalElab(AstNodeVhdlExpr* nodep) {
     VhdlEvaluator evaluator{nullptr, true};
+    return VhdlEvaluator::stripAccess(evaluator.eval(nodep));
+}
+
+VhdlValue V3VhdlEval::evalElabBound(AstNodeVhdlExpr* nodep) {
+    VhdlEvaluator evaluator{nullptr, true, false};
     return VhdlEvaluator::stripAccess(evaluator.eval(nodep));
 }
 

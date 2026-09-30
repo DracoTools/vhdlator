@@ -75,6 +75,9 @@ public:
     // out is left unknown inside an otherwise known value. What comes back
     // says how wide something is; it never stands in for the object itself.
     static VhdlValue evalElab(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    // The same for a bound of an object's own subtype, where a number the
+    // root entity's generic gives is left to the parameter it becomes
+    static VhdlValue evalElabBound(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
 
     // The same, with the generics of an entity given the values one
     // instantiation hands them

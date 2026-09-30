@@ -29,6 +29,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -201,6 +202,9 @@ class VhdlLowerVisitor final {
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::set<std::string> m_instantiated;  // Modules something else builds one of
+    // Refusals that stand only if their module is part of the design: the
+    // module, where, and what
+    std::vector<std::tuple<std::string, FileLine*, std::string>> m_reachedRefusals;
     std::set<std::string> m_knownEntities;  // "lib.entity" of every entity there is
     // The generics and the ports each entity declares, in order, for a
     // binding indication whose maps are written positionally
@@ -373,6 +377,8 @@ public:
 
     void lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void addTraceRequest() VL_MT_DISABLED;
+    void reportReachedRefusals() VL_MT_DISABLED;
+    void addLogicPosPins() VL_MT_DISABLED;
     void markPackageSignalRefs() VL_MT_DISABLED;
     static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
@@ -4463,6 +4469,27 @@ private:
         if (!typep || !typep->isConstrainedArray()) {
             if (VhdlType* const emp = emittedArrayType(nodep)) typep = emp;
         }
+        // One value over one range whose ends are not numbers here -- "(d'range
+        // => v)" in a copy made for a signal a generic sizes, as VUnit's
+        // protocol checker hands to_nibble_string -- has no fixed length to
+        // convert from, so the carrier is filled over the range as it runs
+        if (carrierTypep) {
+            AstNodeVhdlExpr* innerp = nodep;
+            while (AstVhdlQualified* const qp = VN_CAST(innerp, VhdlQualified)) {
+                innerp = qp->valuep();
+            }
+            const VhdlType* const idxp
+                = typep && typep->isConstrainedArray() && !typep->indexTypes().empty()
+                      ? typep->indexTypes()[0]
+                      : nullptr;
+            AstVhdlAggregate* const aggp = VN_CAST(innerp, VhdlAggregate);
+            if (aggp && !(idxp && idxp->bounded())) {
+                if (AstNodeExpr* const filledp
+                    = rangeFillCarrier(aggp, carrierTypep->base(), flp)) {
+                    return filledp;
+                }
+            }
+        }
         // A bound that names a generic settles at elaboration but is not a
         // number here, so the conversion takes the bounds as expressions
         // rather than as folded values -- an RTL signal declared
@@ -6362,6 +6389,14 @@ private:
     // port clause, and giving one of these an early port position would move
     // every port association written positionally
     std::vector<AstVar*> m_dataGenericVarps;
+    // A generic of a logic type keeps, beside its two-state value, a
+    // parameter holding its position in the type, which is all that tells
+    // 'X' from '0' (see logicPosOf)
+    std::map<const VhdlSymbol*, AstVar*> m_logicPosVars;
+    std::map<const AstNode*, AstNodeExpr*> m_logicPosPins;  // Parameter pin -> its position
+    // Each instance's positions, handed over once it is known which modules
+    // have a parameter to take them
+    std::vector<std::tuple<AstCell*, std::string, AstNodeExpr*>> m_logicPosCells;
 
     // An interface element of a generic or port clause (6.5)
     // Whether a value of this type is one the back end can carry as a
@@ -6420,6 +6455,31 @@ private:
         return !elemp || elemp->base()->kind() != VhdlTypeKind::RECORD || recordPacks(elemp);
     }
 
+    // The position in its type of a value of a logic type, from its
+    // two-state value: '1' where that is one, '0' otherwise -- the value
+    // cannot say which metavalue it was
+    static AstNodeExpr* logicPosFromValue(AstNodeExpr* valp, FileLine* flp) {
+        return new AstCond{flp, valp, new AstConst{flp, AstConst::Signed32{}, 3},
+                           new AstConst{flp, AstConst::Signed32{}, 2}};
+    }
+
+    // The position in its type of what an expression of a logic type is
+    // worth, where elaboration knows it: a value that folds, or a generic of
+    // the module being built, which has its own. Otherwise what the two-state
+    // value says.
+    AstNodeExpr* logicPosOf(AstNodeVhdlExpr* nodep, FileLine* flp) {
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        if (val.isInt()) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(val.toInt())};
+        }
+        if (VN_IS(nodep, VhdlName) && nodep->vhdlSymp()) {
+            const auto it = m_logicPosVars.find(nodep->vhdlSymp()->resolved());
+            if (it != m_logicPosVars.end()) return new AstVarRef{flp, it->second, VAccess::READ};
+        }
+        AstNodeExpr* const valp = lowerExpr(nodep);
+        return valp ? logicPosFromValue(valp, flp) : nullptr;
+    }
+
     void lowerInterface(AstVhdlIfaceDecl* nodep, bool isGeneric, int& pinNum) {
         VhdlSymbol* const symp = nodep->vhdlSymp();
         if (!symp) return;
@@ -6475,6 +6535,20 @@ private:
                     }
                 }
                 addStmt(varp);
+                // Its position in the type, which elaboration knows exactly:
+                // VUnit's axi_stream_master asks whether a generic still has
+                // its default of 'X', which the two-state value cannot say
+                if (isScalarLogic(symp->typep())) {
+                    AstNodeExpr* posValp
+                        = nodep->defaultp() ? logicPosOf(nodep->defaultp(), flp) : nullptr;
+                    if (!posValp)
+                        posValp = logicPosFromValue(new AstVarRef{flp, varp, VAccess::READ}, flp);
+                    AstVar* const posp = new AstVar{flp, VVarType::GPARAM, varp->name() + "__Vpos",
+                                                    VFlagChildDType{}, newIntDType(flp)};
+                    posp->valuep(posValp);
+                    addStmt(posp);
+                    m_logicPosVars[symp->resolved()] = posp;
+                }
                 return;
             }
             AstVar* const varp = newVar(symp, VVarType::VAR, flp);
@@ -11284,7 +11358,14 @@ private:
             if (!fromp) return nullptr;
             // What an access to an array that carries its own bounds points
             // at is a value that carries them, read whole
-            if (isAccessAll(nodep) && repeatable(fromp)) {
+            // An access value worked out by a call -- OSVVM's
+            // "CovBinPtr(GetRandIndex(ID, PercentCov)).BinVal.all" -- is
+            // worked out once and kept, where the carrier is read whole
+            const bool once = isAccessAll(nodep) && !repeatable(fromp) && !isDyn2Value(nodep)
+                              && accessCarrierType(nodep->prefixp())
+                              && carriedDynamically(accessCarrierType(nodep->prefixp()))
+                              && dynAccessOfExpr(nodep->prefixp());
+            if (isAccessAll(nodep) && (repeatable(fromp) || once)) {
                 // An array whose elements carry their own bounds is read
                 // whole two levels deep
                 if (isDyn2Value(nodep)) {
@@ -11557,6 +11638,33 @@ private:
     // Whether a type is one value of a logic type -- STD_ULOGIC and the like
     static bool isScalarLogic(const VhdlType* typep) {
         return typep && typep->base()->kind() == VhdlTypeKind::ENUM && enumIsLogic(typep);
+    }
+
+    // "g = 'X'" or "g /= 'X'" where g is a generic of the module being built,
+    // answered from the position it keeps beside its value. Null otherwise.
+    AstNodeExpr* logicGenericIs(AstVhdlBinary* nodep, FileLine* flp) {
+        const bool litLeft = metavalueLiteral(nodep->lhsp());
+        AstNodeVhdlExpr* const litp = litLeft ? nodep->lhsp() : nodep->rhsp();
+        AstNodeVhdlExpr* const otherp = litLeft ? nodep->rhsp() : nodep->lhsp();
+        if (!VN_IS(otherp, VhdlName) || !otherp->vhdlSymp()) return nullptr;
+        const auto it = m_logicPosVars.find(otherp->vhdlSymp()->resolved());
+        if (it == m_logicPosVars.end()) return nullptr;
+        const VhdlValue litVal = V3VhdlEval::eval(litp);
+        if (!litVal.isInt()) return nullptr;
+        AstNodeExpr* const valp = lowerExpr(otherp);
+        if (!valp) return nullptr;
+        AstVar* const posVarp = it->second;
+        const auto pos = [&]() { return new AstVarRef{flp, posVarp, VAccess::READ}; };
+        const auto num = [&](int64_t n) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(n)};
+        };
+        // '1' and 'H' are the positions whose two-state value is one
+        AstNodeExpr* const oneAtp
+            = new AstLogOr{flp, new AstEq{flp, pos(), num(3)}, new AstEq{flp, pos(), num(7)}};
+        AstNodeExpr* const outp = new AstLogAnd{flp, new AstEq{flp, pos(), num(litVal.toInt())},
+                                                new AstEq{flp, oneAtp, valp}};
+        if (nodep->op() == VhdlBinaryOp::EQ) return outp;
+        return new AstLogNot{flp, outp};
     }
 
     // Whether an expression is written as one of the four literals that this
@@ -12331,6 +12439,11 @@ private:
         if (nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE) {
             if (isScalarLogic(ltypep) && isScalarLogic(rtypep)
                 && (metavalueLiteral(nodep->lhsp()) || metavalueLiteral(nodep->rhsp()))) {
+                // Except a generic, whose position elaboration knows: "v =
+                // 'X'" over a generic left at its default of 'X' holds. The
+                // two-state value has to agree with the position, so that
+                // one an instance did not hand over is not believed.
+                if (AstNodeExpr* const outp = logicGenericIs(nodep, flp)) return outp;
                 if (nodep->op() == VhdlBinaryOp::EQ) {
                     return new AstConst{flp, AstConst::BitFalse{}};
                 }
@@ -13521,16 +13634,23 @@ private:
         return funcp;
     }
 
-    // The carrier what an access value lowered as objp points at is. Null
-    // where the object is not a name, since it is read three times over.
+    // The carrier what an access value lowered as objp points at is. The
+    // object is read three times over, so one that is not a name is kept in
+    // a temporary first, and read from there.
     AstNodeExpr* accessCarrier(AstNodeExpr* objp, const DynAccess* dynp, VhdlType* carrp,
                                FileLine* flp) {
-        AstNodeFTask* const funcp = repeatable(objp) && carrp && carriedDynamically(carrp)
-                                        ? dynOfAccessFunc(carrp, dynp, flp)
-                                        : nullptr;
+        AstNodeFTask* const funcp
+            = carrp && carriedDynamically(carrp) ? dynOfAccessFunc(carrp, dynp, flp) : nullptr;
         if (!funcp) {
             VL_DO_DANGLING(objp->deleteTree(), objp);
             return nullptr;
+        }
+        AstNode* setp = nullptr;
+        if (!repeatable(objp)) {
+            AstVar* const objVarp
+                = newTempVar("__Vdynobj", new AstClassRefDType{flp, dynp->classp, nullptr}, flp);
+            setp = new AstAssign{flp, new AstVarRef{flp, objVarp, VAccess::WRITE}, objp};
+            objp = new AstVarRef{flp, objVarp, VAccess::READ};
         }
         AstArg* const argsp
             = new AstArg{flp, "", memberOf(objp->cloneTree(false), dynp->datap->name(), flp)};
@@ -13539,6 +13659,7 @@ private:
         argsp->addNext(new AstArg{flp, "", memberOf(objp, dynp->dirp->name(), flp)});
         AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
         refp->taskp(VN_AS(funcp, Func));
+        if (setp) return new AstExprStmt{flp, setp, refp};
         return refp;
     }
     // The carrier type what an access value points at is held as
@@ -15571,21 +15692,28 @@ private:
         AstNodeVhdlExpr* const valuep = uniformAggregateValue(nodep);
         AstVhdlChoice* const chp = valuep ? nodep->elemsp()->choicesp() : nullptr;
         AstVhdlRange* const rp = chp ? chp->rangep() : nullptr;
-        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return nullptr;
+        if (!rp) return nullptr;
         AstNodeFTask* const fillp = dynFillFunc(carrp, flp);
         if (!fillp) return nullptr;
-        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
-        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
-        AstNodeExpr* const elemp = rightp ? lowerExpr(valuep) : nullptr;
+        // Written "d'range", the range is the one d has, which a copy made
+        // for a signal a generic sizes knows only as expressions
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        AstNodeExpr* dscp = nullptr;
+        bool ascending = true;
+        bool dirKnown = true;
+        if (!rangeParts(rp, leftp, rightp, ascending, dirKnown, &dscp)) return nullptr;
+        AstNodeExpr* const elemp = dirKnown || dscp ? lowerExpr(valuep) : nullptr;
         if (!elemp) {
-            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
-            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (dscp) VL_DO_DANGLING(dscp->deleteTree(), dscp);
             return nullptr;
         }
         AstArg* const argsp = new AstArg{flp, "", intBound(leftp, flp)};
         argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
-        argsp->addNext(new AstArg{
-            flp, "", new AstConst{flp, AstConst::BitTrue{}, rp->dir() == VhdlDir::DOWNTO}});
+        argsp->addNext(
+            new AstArg{flp, "", dscp ? dscp : new AstConst{flp, AstConst::BitTrue{}, !ascending}});
         argsp->addNext(new AstArg{flp, "", elemp});
         AstFuncRef* const filledp = new AstFuncRef{flp, fillp->name(), argsp};
         filledp->taskp(VN_AS(fillp, Func));
@@ -19390,8 +19518,18 @@ private:
 
     // An instance binds to the entity of the same name, which is VHDL's
     // default binding rule (7.3.3)
+    // Positions made for pins that did not end up on an instance
+    void dropLogicPosPins() {
+        for (const auto& pair : m_logicPosPins) {
+            AstNodeExpr* posp = pair.second;
+            VL_DO_DANGLING(posp->deleteTree(), posp);
+        }
+        m_logicPosPins.clear();
+    }
+
     void lowerInstance(AstVhdlInstance* nodep) {
         FileLine* const flp = nodep->fileline();
+        dropLogicPosPins();
         std::vector<std::string> parts;
         // "entity work.reg4(behav)" names the architecture as well (7.3.2),
         // which the parser could not tell from a call
@@ -19866,6 +20004,12 @@ private:
                 pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }
+            if (gsymp && isScalarLogic(gsymp->typep()) && asp->actualp()
+                && !VN_IS(asp->actualp(), VhdlOpen)) {
+                if (AstNodeExpr* const posp = logicPosOf(asp->actualp(), flp)) {
+                    m_logicPosPins[pinp] = posp;
+                }
+            }
             paramsp = AstNode::addNext(paramsp, pinp);
         }
         // A binding indication may give the generics and the ports itself,
@@ -20028,8 +20172,13 @@ private:
                     }
                     AstNodeExpr* const valuep = lowerExpr(ifp->defaultp());
                     if (!valuep) continue;
-                    paramsp = AstNode::addNextNull(
-                        paramsp, new AstPin{flp, ++pinNum, ifp->name(), valuep});
+                    AstPin* const defPinp = new AstPin{flp, ++pinNum, ifp->name(), valuep};
+                    if (gsymp && isScalarLogic(gsymp->typep())) {
+                        if (AstNodeExpr* const posp = logicPosOf(ifp->defaultp(), flp)) {
+                            m_logicPosPins[defPinp] = posp;
+                        }
+                    }
+                    paramsp = AstNode::addNextNull(paramsp, defPinp);
                 }
             }
         }
@@ -20052,7 +20201,15 @@ private:
         paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
         m_instantiated.insert(modName);
-        addStmt(new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr});
+        AstCell* const cellp = new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr};
+        for (AstNode* pp = paramsp; pp; pp = pp->nextp()) {
+            const auto posIt = m_logicPosPins.find(pp);
+            if (posIt == m_logicPosPins.end()) continue;
+            m_logicPosCells.emplace_back(cellp, VN_AS(pp, Pin)->name(), posIt->second);
+            m_logicPosPins.erase(posIt);
+        }
+        dropLogicPosPins();
+        addStmt(cellp);
     }
 
     // The transactions of each actual whose port asks for them. A transaction
@@ -20192,9 +20349,17 @@ private:
                 // actors, numbered by a protected counter -- is only known
                 // once the design runs
                 if (relayIt == m_hoistRelay.end()) {
-                    unsup(nodep->fileline(), "generic value an impure function makes, which a"
-                                             " bound or generate condition of '"
-                                                 + modName + "' needs while elaborating");
+                    // A module nothing reaches from the top is never
+                    // elaborated, and neither is what it instantiates: a
+                    // verification library compiled whole has components the
+                    // testbench does not use, whose generics nobody hands a
+                    // value. So the question waits until it is known which
+                    // modules the design is made of.
+                    m_reachedRefusals.emplace_back(
+                        m_modp ? m_modp->name() : "", nodep->fileline(),
+                        "generic value an impure function makes, which a"
+                        " bound or generate condition of '"
+                            + modName + "' needs while elaborating");
                     continue;
                 }
                 valuep = new AstVarRef{flp, hoistVar(relayIt->second, flp), VAccess::READ};
@@ -29311,6 +29476,31 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         const AstVhdlName* const namep = VN_CAST(np, VhdlName);
         return namep ? namep->name() : "";
     };
+    // An entity instantiated before it is analyzed -- VUnit's axi_stream_master
+    // is read before the monitor it instantiates -- has the formals of its
+    // generic map left unresolved, and everything below asks a formal which
+    // generic it names: whether it travels as data, whether its pin is a
+    // parameter or a port, what a hoisted bound is worked out through. The
+    // generic of that name in the entity is what it names (6.5.7.2).
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([&](AstVhdlInstance* instp) {
+            if (instp->kind() != "entity") return;
+            const auto entIt = entityByName.find(boundName(instp));
+            if (entIt == entityByName.end()) return;
+            for (AstNode* p = instp->genericMapp(); p; p = p->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                AstVhdlName* const fnamep = asp ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+                if (!fnamep || fnamep->vhdlSymp()) continue;
+                for (AstNode* gp = entIt->second->genericsp(); gp; gp = gp->nextp()) {
+                    const AstVhdlIfaceDecl* const ifp = VN_CAST(gp, VhdlIfaceDecl);
+                    if (!ifp || !ifp->vhdlSymp() || ifp->name() != fnamep->name()) continue;
+                    fnamep->vhdlSymp(ifp->vhdlSymp());
+                    if (!fnamep->vhdlTypep()) fnamep->vhdlTypep(ifp->vhdlSymp()->typep());
+                    break;
+                }
+            }
+        });
+    }
     // Which of an entity's ports the design outside asks the transactions of.
     // The actual an instance drives is marked from a companion bit the port
     // carries out, and that bit is made when the entity is lowered -- which
@@ -29564,8 +29754,29 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             };
             // Each of these is the head of a list of siblings, and foreach
             // walks a node's children, not the ones written after it
+            // A formal of a subprogram declared in here is constrained the
+            // same way, and a signal formal is passed as a reference whose
+            // width has to be a number: axi_stream_master's drive_inactive
+            // takes "l_tdata : out std_logic_vector(data_length(master)-1
+            // downto 0)". A component's ports are interface declarations
+            // too, but name its own generics, so only subprograms are asked.
+            const auto hoistFormals = [&](AstVhdlSubprogDecl* subp) {
+                for (AstNode* p = subp->paramsp(); p; p = p->nextp()) {
+                    hoistIn(p);
+                    const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+                    const VhdlSymbol* const symp = ifp ? ifp->vhdlSymp() : nullptr;
+                    const VhdlType* const typep = symp ? symp->typep() : nullptr;
+                    if (!typep) continue;
+                    for (const VhdlType* const idxp : typep->indexTypes()) {
+                        if (idxp && idxp->boundsp()) hoistIn(idxp->boundsp());
+                    }
+                }
+            };
             for (AstNode* const headp : partsp) {
-                for (AstNode* p = headp; p; p = p->nextp()) p->foreach(hoistDecls);
+                for (AstNode* p = headp; p; p = p->nextp()) {
+                    p->foreach(hoistDecls);
+                    p->foreach(hoistFormals);
+                }
             }
             // An if generate's condition has to be settled before the design
             // runs as much as a bound does, and one written in terms of a
@@ -29900,8 +30111,78 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                         altArchName(entities[key]->name(), wanted));
         }
     }
+    dropLogicPosPins();
     markPackageSignalRefs();
+    addLogicPosPins();
+    reportReachedRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
+}
+
+// Each instance hands the generics of a logic type their positions too, where
+// the module it builds has a parameter for them: one built from a VHDL
+// entity. A Verilog module has none, and is handed only the value.
+void VhdlLowerVisitor::addLogicPosPins() {
+    if (m_logicPosCells.empty()) return;
+    std::map<std::string, std::set<std::string>> posParamsOf;
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        for (AstNode* sp = modp->stmtsp(); sp; sp = sp->nextp()) {
+            const AstVar* const varp = VN_CAST(sp, Var);
+            if (varp && varp->varType() == VVarType::GPARAM) {
+                posParamsOf[modp->name()].insert(varp->name());
+            }
+        }
+    }
+    for (const auto& entry : m_logicPosCells) {
+        AstCell* const cellp = std::get<0>(entry);
+        const std::string name = std::get<1>(entry) + "__Vpos";
+        AstNodeExpr* posp = std::get<2>(entry);
+        const auto modIt = posParamsOf.find(cellp->modName());
+        if (modIt == posParamsOf.end() || !modIt->second.count(name)) {
+            VL_DO_DANGLING(posp->deleteTree(), posp);
+            continue;
+        }
+        int pinNum = 0;
+        for (AstNode* pp = cellp->paramsp(); pp; pp = pp->nextp()) ++pinNum;
+        cellp->addParamsp(new AstPin{posp->fileline(), pinNum + 1, name, posp});
+    }
+    m_logicPosCells.clear();
+}
+
+// The refusals that wait on whether their module is elaborated, reported for
+// those the top reaches. Without a top every module nothing instantiates is
+// one, and each of them is elaborated, so all of them are reported.
+void VhdlLowerVisitor::reportReachedRefusals() {
+    if (m_reachedRefusals.empty()) return;
+    std::map<std::string, std::vector<std::string>> cellsOf;
+    std::set<std::string> reached;
+    const std::string wanted = VString::downcase(v3Global.opt.topModule());
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        std::vector<std::string>& cells = cellsOf[modp->name()];
+        modp->foreach([&](const AstCell* cellp) { cells.push_back(cellp->modName()); });
+        if (wanted.empty() ? !m_instantiated.count(modp->name())
+                           : VString::downcase(modp->name()) == wanted) {
+            reached.insert(modp->name());
+        }
+    }
+    // A top given as something no module is named after -- a Verilog
+    // wrapper, a configuration -- leaves nothing known unreached
+    const bool allReached = reached.empty();
+    std::vector<std::string> todo{reached.begin(), reached.end()};
+    while (!todo.empty()) {
+        const std::string name = todo.back();
+        todo.pop_back();
+        for (const std::string& childName : cellsOf[name]) {
+            if (reached.insert(childName).second) todo.push_back(childName);
+        }
+    }
+    for (const auto& refusal : m_reachedRefusals) {
+        if (allReached || reached.count(std::get<0>(refusal))) {
+            unsup(std::get<1>(refusal), std::get<2>(refusal));
+        }
+    }
+    m_reachedRefusals.clear();
 }
 
 // A reference to a signal a package declares has to say which package it is
