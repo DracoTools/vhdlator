@@ -6538,7 +6538,7 @@ private:
                 // Its position in the type, which elaboration knows exactly:
                 // VUnit's axi_stream_master asks whether a generic still has
                 // its default of 'X', which the two-state value cannot say
-                if (isScalarLogic(symp->typep())) {
+                if (isNineValued(symp->typep())) {
                     AstNodeExpr* posValp
                         = nodep->defaultp() ? logicPosOf(nodep->defaultp(), flp) : nullptr;
                     if (!posValp)
@@ -7676,6 +7676,38 @@ private:
         AstNodeExpr* const argp = nodep->argp() ? lowerExpr(nodep->argp()) : nullptr;
         // An enumeration value is its own position, and a position its own
         // value, so 'POS and 'VAL are identities in the emitted code (16.2.3)
+        // Except a logic type, whose value is held as the bit it stands for
+        // rather than as its position: '1' is at position 3, and every
+        // value that is not one is taken for '0', at 2. VUnit prints a
+        // std_logic through a table indexed by 'POS, which gave 'X' for '1'.
+        if ((attr == "pos" || attr == "val") && argp) {
+            const VhdlType* ptypep = nodep->prefixp()->vhdlTypep();
+            if (!ptypep && nodep->prefixp()->vhdlSymp()) {
+                ptypep = nodep->prefixp()->vhdlSymp()->typep();
+            }
+            // 'VAL reads its argument twice, which is only sound where
+            // reading it has no effect of its own
+            if (isNineValued(ptypep) && (attr == "pos" || argp->isPure())) {
+                VhdlType* const ltypep = const_cast<VhdlType*>(ptypep);
+                const auto num = [&](int64_t n) {
+                    return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(n)};
+                };
+                if (attr == "pos") return new AstCond{flp, argp, num(3), num(2)};
+                // 'H' is a one too; every other position is a value this
+                // runtime writes as zero -- 'Z' included, which only a net
+                // keeps, not a value worked out
+                AstNodeExpr* const onep = lowerValue(VhdlValue::mkInt(3, ltypep), ltypep, flp);
+                AstNodeExpr* const zerop = lowerValue(VhdlValue::mkInt(2, ltypep), ltypep, flp);
+                if (onep && zerop) {
+                    AstNodeExpr* const isOnep
+                        = new AstLogOr{flp, new AstEq{flp, argp, num(3)},
+                                       new AstEq{flp, argp->cloneTree(false), num(7)}};
+                    return new AstCond{flp, isOnep, onep, zerop};
+                }
+                if (onep) VL_DO_DANGLING(onep->deleteTree(), onep);
+                if (zerop) VL_DO_DANGLING(zerop->deleteTree(), zerop);
+            }
+        }
         if (attr == "pos") {
             // "T'POS(v)" is an integer, however narrow the value's own type
             if (argp) {
@@ -11639,6 +11671,11 @@ private:
     static bool isScalarLogic(const VhdlType* typep) {
         return typep && typep->base()->kind() == VhdlTypeKind::ENUM && enumIsLogic(typep);
     }
+    // STD_ULOGIC and its subtypes, but not BIT: a logic type with values the
+    // runtime holds as something other than their position
+    static bool isNineValued(const VhdlType* typep) {
+        return isScalarLogic(typep) && typep->base()->literals().size() == 9;
+    }
 
     // "g = 'X'" or "g /= 'X'" where g is a generic of the module being built,
     // answered from the position it keeps beside its value. Null otherwise.
@@ -11700,6 +11737,25 @@ private:
         return false;
     }
 
+    // Whether an array value is written with a 'U', 'X', 'W' or '-' in it: a
+    // string literal, or an aggregate one of whose values is such a literal
+    static bool writtenWithMetavalue(const AstNodeVhdlExpr* nodep) {
+        while (const AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
+            nodep = qp->valuep();
+        }
+        if (const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral)) {
+            return litp->kind() == VhdlLitKind::STRING
+                   && litp->text().find_first_of("UuXxWw-") != std::string::npos;
+        }
+        const AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
+        if (!aggp) return false;
+        for (const AstVhdlElemAssoc* eap = aggp->elemsp(); eap;
+             eap = VN_CAST(eap->nextp(), VhdlElemAssoc)) {
+            if (metavalueLiteral(eap->valuep())) return true;
+        }
+        return false;
+    }
+
     // Whether a type is an array of a logic type, so that a string written
     // for it stands for a vector rather than for text
     static bool isLogicArray(const VhdlType* typep) {
@@ -11710,15 +11766,20 @@ private:
     // Whether a case choice names a value this runtime cannot hold, so that
     // it can never be taken. Both a single 'U'/'X'/'W'/'-' and a string with
     // one in it count -- the latter is how a selected assignment over a
-    // vector is usually written.
-    static bool metavalueChoice(const AstNodeVhdlExpr* nodep) {
-        if (metavalueLiteral(nodep)) return true;
+    // vector is usually written. Only of a logic type: 'X' is an ordinary
+    // literal of an enumeration a design declares -- VUnit's
+    // inactive_bus_policy_t is ('0', '1', 'X', hold, rand01) -- and a
+    // choice naming it is taken like any other. The selector's type stands
+    // in where the choice has none of its own.
+    static bool metavalueChoice(const AstNodeVhdlExpr* nodep, const VhdlType* selTypep) {
+        if (metavalueLiteral(nodep)) {
+            return isScalarLogic(nodep->vhdlTypep() ? nodep->vhdlTypep() : selTypep);
+        }
         const AstVhdlLiteral* const litp = VN_CAST(nodep, VhdlLiteral);
         if (!litp || litp->kind() != VhdlLitKind::STRING) return false;
         if (!isLogicArray(nodep->vhdlTypep())) return false;
         return litp->text().find_first_of("UuXxWw-") != std::string::npos;
     }
-
 
     std::map<const VhdlType*, AstNodeFTask*> m_dynSliceFuncs;
     std::map<const VhdlType*, AstNodeFTask*> m_dyn2SliceFuncs;
@@ -12448,6 +12509,14 @@ private:
                     return new AstConst{flp, AstConst::BitFalse{}};
                 }
                 return new AstConst{flp, AstConst::BitTrue{}};
+            }
+            // And the same for an array of a logic type compared with a value
+            // written with one of them in it: VUnit's resolve_tstrb asks
+            // "tstrb = (tstrb'range => 'U')" to tell an unconnected port, and
+            // with 'U' written as zero it took every all-zero tstrb for one
+            if (isLogicArray(ltypep) && isLogicArray(rtypep)
+                && (writtenWithMetavalue(nodep->lhsp()) || writtenWithMetavalue(nodep->rhsp()))) {
+                return new AstConst{flp, AstConst::BitTrue{}, nodep->op() == VhdlBinaryOp::NE};
             }
         }
         // What an access value points at carries its own bounds too, and is
@@ -16252,9 +16321,16 @@ private:
             }
             if (!actualp) continue;
             // Only a signal is waited on. A constant or a variable named
-            // there is read once and never changes the process's mind.
+            // there is read once and never changes the process's mind. A
+            // port is a signal too (6.5.2): VUnit's check_stable, called in
+            // a protocol checker over its ports, returns when a window
+            // closes and has to be called again for the next one.
             const VhdlSymbol* const rootp = rootSymOf(actualp);
-            if (!rootp || rootp->resolved()->kind() != VhdlSymKind::SIGNAL) continue;
+            if (!rootp
+                || (rootp->resolved()->kind() != VhdlSymKind::SIGNAL
+                    && rootp->resolved()->kind() != VhdlSymKind::PORT)) {
+                continue;
+            }
             AstNodeExpr* const onep = lowerExpr(actualp);
             if (!onep) continue;
             collectVars(onep, varps);
@@ -20004,7 +20080,7 @@ private:
                 pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }
-            if (gsymp && isScalarLogic(gsymp->typep()) && asp->actualp()
+            if (gsymp && isNineValued(gsymp->typep()) && asp->actualp()
                 && !VN_IS(asp->actualp(), VhdlOpen)) {
                 if (AstNodeExpr* const posp = logicPosOf(asp->actualp(), flp)) {
                     m_logicPosPins[pinp] = posp;
@@ -20173,7 +20249,7 @@ private:
                     AstNodeExpr* const valuep = lowerExpr(ifp->defaultp());
                     if (!valuep) continue;
                     AstPin* const defPinp = new AstPin{flp, ++pinNum, ifp->name(), valuep};
-                    if (gsymp && isScalarLogic(gsymp->typep())) {
+                    if (gsymp && isNineValued(gsymp->typep())) {
                         if (AstNodeExpr* const posp = logicPosOf(ifp->defaultp(), flp)) {
                             m_logicPosPins[defPinp] = posp;
                         }
@@ -23365,7 +23441,10 @@ private:
                             condsp, quietXZ(new AstConst{chp->fileline(), num}));
                         continue;
                     }
-                    if (!nodep->matching() && metavalueChoice(chp->valuep())) continue;
+                    if (!nodep->matching()
+                        && metavalueChoice(chp->valuep(), nodep->exprp()->vhdlTypep())) {
+                        continue;
+                    }
                     if (AstNodeExpr* const cvp = lowerExpr(chp->valuep())) {
                         condsp = AstNode::addNextNull(condsp, quietXZ(cvp));
                     }
