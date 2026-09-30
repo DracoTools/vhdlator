@@ -2767,7 +2767,7 @@ static bool _vl_vpi_case_fold_name(const char* namep, vpiHandle scope, std::stri
         name.erase(0, std::strlen("$root."));
     } else if (const VerilatedVpioScope* const voScopep = VerilatedVpioScope::castp(scope)) {
         if (VerilatedVpioPackage::castp(scope)) return false;
-        prefix = voScopep->fullname();
+        prefix = voScopep->scopep()->name();
         fold = voScopep->scopep()->caseInsensitive();
     } else if (const VerilatedVpioVar* const voVarp = VerilatedVpioVar::castp(scope)) {
         prefix = voVarp->fullname();
@@ -2958,18 +2958,32 @@ static vpiHandle _vl_vpi_handle_by_name(PLI_BYTE8* namep, vpiHandle scope) {
     return resultHandle;
 }
 
+static vpiHandle _vl_vpi_handle_by_name_under(PLI_BYTE8* namep, vpiHandle scope) {
+    if (const vpiHandle resultp = _vl_vpi_handle_by_name(namep, scope)) return resultp;
+    // A scope handle's full name leaves out the "TOP." of a model named TOP, which the scope
+    // table keeps, so look again under the scope's own name
+    const VerilatedVpioScope* const voScopep = VerilatedVpioScope::castp(scope);
+    if (!voScopep || VerilatedVpioPackage::castp(scope)) return nullptr;
+    if (0 == std::strncmp(namep, "$root.", std::strlen("$root."))) return nullptr;
+    const char* const scopeNamep = voScopep->scopep()->name();
+    if (0 == std::strcmp(voScopep->fullname(), scopeNamep)) return nullptr;
+    const std::string absolute = std::string{scopeNamep} + "." + namep;
+    VL_VPI_ERROR_RESET_();
+    return _vl_vpi_handle_by_name(const_cast<PLI_BYTE8*>(absolute.c_str()), nullptr);
+}
+
 vpiHandle vpi_handle_by_name(PLI_BYTE8* namep, vpiHandle scope) {
     VerilatedVpiImp::assertOneCheck();
     VL_VPI_ERROR_RESET_();
     if (VL_UNLIKELY(!namep)) return nullptr;
     VL_DEBUG_IF_PLI(VL_DBG_MSGF("- vpi: vpi_handle_by_name %s %p\n", namep, scope););
-    if (const vpiHandle resultp = _vl_vpi_handle_by_name(namep, scope)) return resultp;
+    if (const vpiHandle resultp = _vl_vpi_handle_by_name_under(namep, scope)) return resultp;
     // Not found as written: VHDL names are case insensitive, so look again with the parts
     // that fall in a VHDL scope in the lower case they are stored in
     std::string folded;
     if (!_vl_vpi_case_fold_name(namep, scope, folded)) return nullptr;
     VL_VPI_ERROR_RESET_();
-    return _vl_vpi_handle_by_name(const_cast<PLI_BYTE8*>(folded.c_str()), scope);
+    return _vl_vpi_handle_by_name_under(const_cast<PLI_BYTE8*>(folded.c_str()), scope);
 }
 
 vpiHandle vpi_handle_by_index(vpiHandle object, PLI_INT32 indx) {
