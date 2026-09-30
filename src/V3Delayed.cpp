@@ -266,6 +266,8 @@ class DelayedVisitor final : public VNVisitor {
 
     // STATE - across all visitors
     VInsertionSet<AstSenTree*> m_timingDomains;  // Timing resume domains
+    // Timing domains a function may suspend on, its own and its callees'
+    std::unordered_map<const AstCFunc*, std::vector<AstSenTree*>> m_calleeDomains;
 
     // STATE - for current visit position (use VL_RESTORER)
     AstActive* m_activep = nullptr;  // Current activate
@@ -1200,8 +1202,42 @@ class DelayedVisitor final : public VNVisitor {
         m_inSuspendableOrFork = true;
         iterateChildren(nodep);
     }
+    // The timing domains a function may suspend on: those it awaits itself, and those of the
+    // functions it calls. A function being worked out answers what is known of it so far,
+    // which ends a recursion.
+    const std::vector<AstSenTree*>& calleeDomains(const AstCFunc* funcp) {
+        const auto it = m_calleeDomains.find(funcp);
+        if (it != m_calleeDomains.end()) return it->second;
+        m_calleeDomains.emplace(funcp, std::vector<AstSenTree*>{});
+        std::vector<AstSenTree*> domains;
+        std::vector<const AstCFunc*> calleeps;
+        funcp->foreach([&](const AstNode* np) {
+            if (const AstCAwait* const awaitp = VN_CAST(np, CAwait)) {
+                if (awaitp->sentreep()) domains.push_back(awaitp->sentreep());
+            } else if (const AstNodeCCall* const callp = VN_CAST(np, NodeCCall)) {
+                if (callp->funcp() && callp->funcp()->isCoroutine()) {
+                    calleeps.push_back(callp->funcp());
+                }
+            }
+        });
+        for (const AstCFunc* const calleep : calleeps) {
+            const std::vector<AstSenTree*>& sub = calleeDomains(calleep);
+            domains.insert(domains.end(), sub.begin(), sub.end());
+        }
+        std::vector<AstSenTree*>& entry = m_calleeDomains[funcp];
+        entry = std::move(domains);
+        return entry;
+    }
     void visit(AstCAwait* nodep) override {
         if (nodep->sentreep()) m_timingDomains.insert(nodep->sentreep());
+        // Awaiting a call suspends wherever the function called does, and the process resumes
+        // on what resumes it there: an NBA after the call has to commit on that too
+        nodep->exprp()->foreach([&](const AstNodeCCall* callp) {
+            if (!callp->funcp() || !callp->funcp()->isCoroutine()) return;
+            for (AstSenTree* const domainp : calleeDomains(callp->funcp())) {
+                m_timingDomains.insert(domainp);
+            }
+        });
     }
     void visit(AstFireEvent* nodep) override {
         UASSERT_OBJ(v3Global.hasEvents(), nodep, "Inconsistent");
