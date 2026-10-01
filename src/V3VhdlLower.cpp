@@ -12350,17 +12350,16 @@ private:
         const VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
         if (!ltypep || !rtypep) return nullptr;
         if (ltypep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
-        if (!ltypep->isConstrainedArray() || !rtypep->isConstrainedArray()) return nullptr;
         if (ltypep->dimensions() != 1 || rtypep->dimensions() != 1) return nullptr;
         const VhdlType* const elemp
             = ltypep->elementp() ? ltypep->elementp() : ltypep->base()->elementp();
         if (!elemp) return nullptr;
-        const VhdlType* const lidxp = ltypep->indexTypes()[0];
-        const VhdlType* const ridxp = rtypep->indexTypes()[0];
-        if (!lidxp || !ridxp || !lidxp->bounded() || !ridxp->bounded()) return nullptr;
-        const int64_t la = lidxp->length();
-        const int64_t lb = ridxp->length();
-        if (la < 0 || lb < 0 || la > 4096 || lb > 4096) return nullptr;
+        LexShape lshape;
+        LexShape rshape;
+        if (!lexShapeOf(nodep->lhsp(), ltypep, lshape)) return nullptr;
+        if (!lexShapeOf(nodep->rhsp(), rtypep, rshape)) return nullptr;
+        const int64_t la = lshape.len;
+        const int64_t lb = rshape.len;
         // An array that lowers to a packed vector is compared correctly as a
         // number, but only against one of its own length: the back end pads
         // the shorter operand, and a padded comparison is arithmetic where
@@ -12372,7 +12371,9 @@ private:
         // at all: they compare what the two operands are worth, so an
         // eight-bit three is less than a four-bit four (16.5)
         if (la != lb && isNumericVector(ltypep) && isNumericVector(rtypep)) return nullptr;
-        if (la == lb && !VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp), UnpackArrayDType)) {
+        if (la == lb
+            && (lshape.literal || rshape.literal
+                || !VN_IS(lowerType(const_cast<VhdlType*>(ltypep), flp), UnpackArrayDType))) {
             return nullptr;
         }
         AstNodeExpr* lhsp = lowerExpr(nodep->lhsp());
@@ -12393,12 +12394,12 @@ private:
                           new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, expp}));
             expp = new AstVarRef{flp, tmpp, VAccess::READ};
         };
-        keep(lhsp, ltypep);
-        keep(rhsp, rtypep);
+        if (!lshape.literal) keep(lhsp, ltypep);
+        if (!rshape.literal) keep(rhsp, rtypep);
         const bool wantLess0 = op == VhdlBinaryOp::LT || op == VhdlBinaryOp::LE;
         const bool orEqual0 = op == VhdlBinaryOp::LE || op == VhdlBinaryOp::GE;
         AstNodeExpr* const outp0
-            = lexCompareOf(lhsp, ltypep, rhsp, rtypep, wantLess0, orEqual0, flp);
+            = lexCompareShapes(lhsp, lshape, rhsp, rshape, elemp, wantLess0, orEqual0, flp);
         VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
         VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
         if (!outp0) {
@@ -12418,24 +12419,74 @@ private:
         const VhdlType* const elemp
             = ltypep->elementp() ? ltypep->elementp() : ltypep->base()->elementp();
         if (!elemp) return nullptr;
-        const VhdlType* const lidxp = ltypep->indexTypes()[0];
-        const VhdlType* const ridxp = rtypep->indexTypes()[0];
-        if (!lidxp || !ridxp || !lidxp->bounded() || !ridxp->bounded()) return nullptr;
-        const int64_t la = lidxp->length();
-        const int64_t lb = ridxp->length();
-        if (la < 0 || lb < 0 || la > 4096 || lb > 4096) return nullptr;
+        LexShape lshape;
+        LexShape rshape;
+        if (!lexShapeOf(nullptr, ltypep, lshape) || !lexShapeOf(nullptr, rtypep, rshape)) {
+            return nullptr;
+        }
+        return lexCompareShapes(lhsp, lshape, rhsp, rshape, elemp, wantLess, orEqual, flp);
+    }
+
+    // How one operand of a lexicographic comparison is read: its length, and
+    // where its elements are. An object or a value of a constrained subtype is
+    // indexed by its own range; a string or bit string literal of an open one
+    // -- "00" < y -- is a number as wide as it has elements, its leftmost the
+    // most significant (9.3.2)
+    struct LexShape final {
+        int64_t len = -1;
+        int64_t left = 0;
+        bool ascending = true;
+        bool literal = false;
+    };
+    static bool lexShapeOf(AstNodeVhdlExpr* exprp, const VhdlType* typep, LexShape& out) {
+        if (typep && typep->isConstrainedArray() && typep->dimensions() == 1) {
+            const VhdlType* const idxp = typep->indexTypes()[0];
+            if (!idxp || !idxp->bounded()) return false;
+            out.len = idxp->length();
+            out.left = idxp->left();
+            out.ascending = idxp->ascending();
+            return out.len >= 0 && out.len <= 4096;
+        }
+        const AstVhdlLiteral* const litp = VN_CAST(exprp, VhdlLiteral);
+        if (!litp
+            || (litp->kind() != VhdlLitKind::STRING && litp->kind() != VhdlLitKind::BITSTRING)) {
+            return false;
+        }
+        const VhdlType* const elemp = typep ? typep->base()->elementp() : nullptr;
+        if (!elemp || elemp->base()->kind() != VhdlTypeKind::ENUM) return false;
+        const VhdlValue val = V3VhdlEval::eval(exprp);
+        if (!val.isStr()) return false;
+        out.len = static_cast<int64_t>(val.toStr().size());
+        out.literal = true;
+        return out.len > 0 && out.len <= 4096;
+    }
+
+    AstNodeExpr* lexCompareShapes(AstNodeExpr* lhsp, const LexShape& lshape, AstNodeExpr* rhsp,
+                                  const LexShape& rshape, const VhdlType* elemp, bool wantLess,
+                                  bool orEqual, FileLine* flp) {
+        const int64_t la = lshape.len;
+        const int64_t lb = rshape.len;
         const bool real = elemp->base()->kind() == VhdlTypeKind::FLOATING;
         const bool signd = !real && isSignedType(const_cast<VhdlType*>(elemp));
-        const auto at = [&](AstNodeExpr* fromp, const VhdlType* idxp, int64_t i) {
-            const int64_t k = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
+        const auto at = [&](AstNodeExpr* fromp, const LexShape& shape, int64_t i) -> AstNodeExpr* {
+            // A literal of one element is that element, with nothing to select
+            if (shape.literal && shape.len == 1) return fromp->cloneTree(false);
+            const int64_t k = shape.literal     ? shape.len - 1 - i
+                              : shape.ascending ? shape.left + i
+                                                : shape.left - i;
             return new AstSelBit{flp, fromp->cloneTree(false),
                                  new AstConst{flp, AstConst::Signed32{},
                                               static_cast<int32_t>(k)}};
         };
+        // An element of a literal is a constant, and "x < '0'" is a comparison
+        // the language asked for, not one the design wrote
+        FileLine* const cmpFlp = new FileLine{flp};
+        cmpFlp->warnOff(V3ErrorCode::UNSIGNED, true);
+        cmpFlp->warnOff(V3ErrorCode::CMPCONST, true);
         const auto less = [&](AstNodeExpr* ap, AstNodeExpr* bp) -> AstNodeExpr* {
-            if (real) return new AstLtD{flp, ap, bp};
-            return signd ? static_cast<AstNodeExpr*>(new AstLtS{flp, ap, bp})
-                         : static_cast<AstNodeExpr*>(new AstLt{flp, ap, bp});
+            if (real) return new AstLtD{cmpFlp, ap, bp};
+            return signd ? static_cast<AstNodeExpr*>(new AstLtS{cmpFlp, ap, bp})
+                         : static_cast<AstNodeExpr*>(new AstLt{cmpFlp, ap, bp});
         };
         const auto differ = [&](AstNodeExpr* ap, AstNodeExpr* bp) -> AstNodeExpr* {
             if (real) return new AstNeqD{flp, ap, bp};
@@ -12453,10 +12504,9 @@ private:
         AstNodeExpr* outp = new AstConst{flp, AstConst::BitTrue{}, tailAnswer};
         const int64_t common = la < lb ? la : lb;
         for (int64_t i = common - 1; i >= 0; --i) {
-            AstNodeExpr* const decidep
-                = wantLess ? less(at(lhsp, lidxp, i), at(rhsp, ridxp, i))
-                           : less(at(rhsp, ridxp, i), at(lhsp, lidxp, i));
-            outp = new AstCond{flp, differ(at(lhsp, lidxp, i), at(rhsp, ridxp, i)), decidep,
+            AstNodeExpr* const decidep = wantLess ? less(at(lhsp, lshape, i), at(rhsp, rshape, i))
+                                                  : less(at(rhsp, rshape, i), at(lhsp, lshape, i));
+            outp = new AstCond{flp, differ(at(lhsp, lshape, i), at(rhsp, rshape, i)), decidep,
                                outp};
         }
         return outp;
