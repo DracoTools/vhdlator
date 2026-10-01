@@ -8156,6 +8156,7 @@ private:
         // built from -- but it is an ordinary expression too, and a function
         // may return it (16.2.3)
         if (attr == "image" && nodep->argp()) {
+            if (AstNodeExpr* const namep = logicValImage(nodep->argp(), flp)) return namep;
             if (AstNodeExpr* const textp = dynTextOf(nodep->argp(), flp)) return textp;
             AstNodeExpr* const valuep = lowerExpr(nodep->argp());
             if (!valuep) return nullptr;
@@ -28838,6 +28839,43 @@ private:
             return name.substr(1, name.size() - 2);
         }
         return name;
+    }
+
+    // "t'image(t'val(n))" of a logic type: the name of the literal at that
+    // position (16.2), read off the position itself. A value of such a type
+    // has two states here, so the image of one cannot say 'L' from '0' --
+    // but this never needs the value: VUnit's test support asks whether a
+    // character is one of the nine with "std_logic'image(std_logic'val(i))"
+    // and loops for ever where 'L' and 'H' are never among the answers.
+    AstNodeExpr* logicValImage(AstNodeVhdlExpr* argp, FileLine* flp) {
+        const AstVhdlAttrName* const valp = VN_CAST(argp, VhdlAttrName);
+        if (!valp || !valp->argp() || valp->name() != "val") return nullptr;
+        const VhdlType* const typep = argp->vhdlTypep();
+        if (!typep) return nullptr;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ENUM || !enumIsLogic(basep)) return nullptr;
+        const std::vector<VhdlSymbol*>& literals = basep->literals();
+        if (literals.empty() || literals.size() > 256) return nullptr;
+        AstNodeExpr* posp = lowerExpr(valp->argp());
+        if (!posp) return nullptr;
+        AstNode* setp = nullptr;
+        if (!repeatable(posp)) {
+            AstVar* const tmpp = newTempVar("__Vimgpos", newIntDType(flp), flp);
+            setp = new AstAssign{flp, wr(tmpp, flp), posp};
+            posp = rd(tmpp, flp);
+        }
+        AstNodeExpr* outp = new AstConst{flp, AstConst::String{}, "?"};
+        for (size_t i = literals.size(); i-- > 0;) {
+            outp = new AstCond{
+                flp,
+                new AstEq{flp, posp->cloneTree(false),
+                          new AstConst{flp, AstConst::Signed32{},
+                                       static_cast<int32_t>(literals[i]->position())}},
+                new AstConst{flp, AstConst::String{}, literals[i]->name()}, outp};
+        }
+        VL_DO_DANGLING(posp->deleteTree(), posp);
+        if (setp) return new AstExprStmt{flp, setp, outp};
+        return outp;
     }
 
     // 'IMAGE of an enumeration value is the literal's own name (16.2), not
