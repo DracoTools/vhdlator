@@ -26048,6 +26048,29 @@ private:
                 const auto it = m_vars.find(ifp->vhdlSymp());
                 if (it != m_vars.end()) saved.emplace(ifp->vhdlSymp(), it->second);
             }
+            // A subprogram declared inside this one reads the signals this
+            // copy names (4.2.2.3 with 12.3), so it is this copy's own: the
+            // one an earlier copy made reads that copy's signals, and a call
+            // here that found it would watch the wrong instance -- VUnit's
+            // check_next, whose check_expr then read another checker's input
+            std::map<const VhdlSymbol*, AstNodeFTask*> nestedFuncs;
+            std::map<const VhdlSymbol*, AstNodeFTask*> nestedPkgFuncs;
+            if (declp->declsp()) {
+                declp->declsp()->foreachAndNext([&](const AstVhdlSubprogDecl* subp) {
+                    const VhdlSymbol* const nsymp = subp->vhdlSymp();
+                    if (!nsymp) return;
+                    const auto fIt = m_funcs.find(nsymp);
+                    if (fIt != m_funcs.end()) {
+                        nestedFuncs.emplace(nsymp, fIt->second);
+                        m_funcs.erase(fIt);
+                    }
+                    const auto pIt = m_pkgFuncs.find(nsymp);
+                    if (pIt != m_pkgFuncs.end()) {
+                        nestedPkgFuncs.emplace(nsymp, pIt->second);
+                        m_pkgFuncs.erase(pIt);
+                    }
+                });
+            }
             AstNodeFTask* taskp = nullptr;
             {
                 VL_RESTORER_COPY(m_bindSignals);
@@ -26071,6 +26094,10 @@ private:
                 for (const auto& pair : activeBind) m_actives.emplace(pair.first, pair.second);
                 taskp = lowerSubprogramInto(declp, uniqueName(symp) + "__Vsig");
                 for (const auto& pair : activeBind) m_actives.erase(pair.first);
+            }
+            for (const auto& pair : nestedFuncs) m_funcs.insert_or_assign(pair.first, pair.second);
+            for (const auto& pair : nestedPkgFuncs) {
+                m_pkgFuncs.insert_or_assign(pair.first, pair.second);
             }
             for (AstVhdlIfaceDecl* const ifp : formals) {
                 const auto it = saved.find(ifp->vhdlSymp());
