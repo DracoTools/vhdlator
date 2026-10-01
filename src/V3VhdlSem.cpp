@@ -10802,6 +10802,21 @@ void VhdlSemVisitor::checkDelay(AstNodeVhdlExpr* nodep, const char* what) {
 // The elements of a waveform take effect in the order written, so their times
 // must strictly increase and only the first may be immediate (10.5.2.1)
 void VhdlSemVisitor::checkWaveform(AstNode* wavesp) {
+    // The pulse rejection limit is no more than the first element's delay
+    // (10.5.2.1), which is the window that element's own transaction opens
+    if (AstVhdlWaveform* const firstp = VN_CAST(wavesp, VhdlWaveform)) {
+        if (firstp->rejectp()) {
+            checkDelay(firstp->rejectp(), "pulse rejection limit");
+            const VhdlValue rej = V3VhdlEval::eval(firstp->rejectp());
+            const VhdlValue aft
+                = firstp->afterp() ? V3VhdlEval::eval(firstp->afterp()) : VhdlValue::mkInt(0);
+            if (rej.isInt() && aft.isInt() && rej.toInt() > aft.toInt()) {
+                err(firstp->rejectp()->fileline(),
+                    "The pulse rejection limit is longer than the delay of the first waveform "
+                    "element, which it may not be (10.5.2.1)");
+            }
+        }
+    }
     bool haveLast = false;
     int64_t last = 0;
     for (AstNode* wp = wavesp; wp; wp = wp->nextp()) {
@@ -12153,6 +12168,7 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
             checkOthersTarget(nodep->targetp(), wfp->valuep());
         }
         if (wfp->afterp()) analyzeExpr(wfp->afterp(), V3VhdlStd::timeType());
+        if (wfp->rejectp()) analyzeExpr(wfp->rejectp(), V3VhdlStd::timeType());
     }
     checkWaveform(nodep->wavesp());
     if (nodep->selectorp()) analyzeExpr(nodep->selectorp(), nullptr);
@@ -12174,6 +12190,7 @@ void VhdlSemVisitor::visit(AstVhdlSigAssign* nodep) {
                 checkOthersTarget(nodep->targetp(), wfp->valuep());
             }
             if (wfp->afterp()) analyzeExpr(wfp->afterp(), V3VhdlStd::timeType());
+            if (wfp->rejectp()) analyzeExpr(wfp->rejectp(), V3VhdlStd::timeType());
         }
         checkWaveform(altp->wavesp());
     }

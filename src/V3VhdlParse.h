@@ -154,7 +154,8 @@ private:
     AstNodeVhdlStmt* parseReport(const std::string& label, bool postponed) VL_MT_DISABLED;
     AstNodeVhdlStmt* parseAssignOrCall(const std::string& label) VL_MT_DISABLED;
     AstVhdlWaveform* parseWaveform() VL_MT_DISABLED;
-    void parseDelayMechanism(AstVhdlSigAssign* nodep) VL_MT_DISABLED;
+    AstNodeVhdlExpr* parseDelayMechanism(AstVhdlSigAssign* nodep) VL_MT_DISABLED;
+    static void attachReject(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* rejectp) VL_MT_DISABLED;
 
     // Expressions and names (clauses 8, 9)
     AstNodeVhdlExpr* parseExpression() VL_MT_DISABLED;

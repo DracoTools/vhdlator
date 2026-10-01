@@ -571,6 +571,9 @@ class AstVhdlWaveform final : public AstNodeVhdl {
     // waveform_element (10.5.2.1): value [after time]
     // @astgen op1 := valuep : Optional[AstNodeVhdlExpr]  // Absent means "unaffected"
     // @astgen op2 := afterp : Optional[AstNodeVhdlExpr]
+    // The pulse rejection limit written "reject t inertial", kept on the
+    // first element of each waveform the statement assigns (10.5.2.1)
+    // @astgen op3 := rejectp : Optional[AstNodeVhdlExpr]
     // Written "null": a null transaction, which turns the driver off. It has
     // no value either, but it is not "unaffected" (10.5.2.2).
     bool m_nullTxn = false;

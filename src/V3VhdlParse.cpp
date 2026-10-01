@@ -1565,7 +1565,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
         nodep->matching(matching);
         nodep->selectorp(selectorp);
         nodep->guarded(check(VhdlTokType::KWD_GUARDED));
-        parseDelayMechanism(nodep);
+        AstNodeVhdlExpr* const rejectp = parseDelayMechanism(nodep);
         do {
             AstVhdlAlternative* const altp = new AstVhdlAlternative{here()};
             altp->addWavesp(parseWaveform());
@@ -1574,6 +1574,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
             nodep->addAltsp(altp);
         } while (check(VhdlTokType::COMMA));
         expect(VhdlTokType::SEMICOLON, "';' after the selected signal assignment");
+        attachReject(nodep, rejectp);
         return nodep;
     }
 
@@ -1589,6 +1590,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
         nodep->name(label);
         nodep->postponed(postponed);
         nodep->guarded(check(VhdlTokType::KWD_GUARDED));
+        AstNodeVhdlExpr* rejectp = nullptr;
         // VHDL-2008 force and release
         if (check(VhdlTokType::KWD_FORCE)) {
             nodep->force(true);
@@ -1607,7 +1609,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
             expect(VhdlTokType::SEMICOLON, "';' after 'release'");
             return nodep;
         } else {
-            parseDelayMechanism(nodep);
+            rejectp = parseDelayMechanism(nodep);
         }
         AstVhdlWaveform* const wavep = parseWaveform();
         if (peekType() == VhdlTokType::KWD_WHEN) {
@@ -1632,10 +1634,12 @@ AstNodeVhdlStmt* V3VhdlParse::parseConcurrentSimple(const std::string& label, bo
             }
             expect(VhdlTokType::SEMICOLON, "';' after the conditional signal assignment");
             VL_DO_DANGLING(nodep->deleteTree(), nodep);
+            attachReject(condp, rejectp);
             return condp;
         }
         nodep->addWavesp(wavep);
         expect(VhdlTokType::SEMICOLON, "';' after the signal assignment");
+        attachReject(nodep, rejectp);
         return nodep;
     }
 
@@ -2114,17 +2118,35 @@ AstNodeVhdlStmt* V3VhdlParse::parseLoop(const std::string& label) {
     return nodep;
 }
 
-void V3VhdlParse::parseDelayMechanism(AstVhdlSigAssign* nodep) {
+AstNodeVhdlExpr* V3VhdlParse::parseDelayMechanism(AstVhdlSigAssign* nodep) {
     // delay_mechanism ::= TRANSPORT | [ REJECT time ] INERTIAL   (10.5.2.1)
+    // Returns the rejection limit, which attachReject hands to the waveforms
     if (check(VhdlTokType::KWD_TRANSPORT)) {
         nodep->delay(VhdlDelayKind::TRANSPORT);
     } else if (check(VhdlTokType::KWD_REJECT)) {
         nodep->delay(VhdlDelayKind::REJECT_INERTIAL);
-        parseExpression();  // Rejection limit; kept only as a flag for now
+        AstNodeVhdlExpr* const rejectp = parseExpression();
         expect(VhdlTokType::KWD_INERTIAL, "'inertial' after the rejection limit");
+        return rejectp;
     } else if (check(VhdlTokType::KWD_INERTIAL)) {
         nodep->delay(VhdlDelayKind::INERTIAL);
     }
+    return nullptr;
+}
+
+// The rejection limit applies to the first element of whichever waveform
+// the statement schedules (10.5.2.2), so each waveform's first element
+// keeps a copy
+void V3VhdlParse::attachReject(AstVhdlSigAssign* nodep, AstNodeVhdlExpr* rejectp) {
+    if (!rejectp) return;
+    if (AstVhdlWaveform* const wfp = nodep->wavesp()) {
+        if (wfp->valuep()) wfp->rejectp(rejectp->cloneTree(false));
+    }
+    for (AstNode* ap = nodep->altsp(); ap; ap = ap->nextp()) {
+        AstVhdlWaveform* const wfp = VN_AS(ap, VhdlAlternative)->wavesp();
+        if (wfp && wfp->valuep()) wfp->rejectp(rejectp->cloneTree(false));
+    }
+    VL_DO_DANGLING(rejectp->deleteTree(), rejectp);
 }
 
 AstVhdlWaveform* V3VhdlParse::parseWaveform() {
@@ -2187,7 +2209,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
         nodep->name(label);
         nodep->matching(matching);
         nodep->selectorp(selectorp);
-        parseDelayMechanism(nodep);
+        AstNodeVhdlExpr* const rejectp = parseDelayMechanism(nodep);
         do {
             AstVhdlAlternative* const altp = new AstVhdlAlternative{here()};
             altp->addWavesp(parseWaveform());
@@ -2196,6 +2218,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
             nodep->addAltsp(altp);
         } while (check(VhdlTokType::COMMA));
         expect(VhdlTokType::SEMICOLON, "';' after the selected signal assignment");
+        attachReject(nodep, rejectp);
         return nodep;
     }
 
@@ -2236,6 +2259,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
         AstVhdlSigAssign* const nodep
             = new AstVhdlSigAssign{flp, VhdlAssignKind::SIMPLE, namep};
         nodep->name(label);
+        AstNodeVhdlExpr* rejectp = nullptr;
         if (check(VhdlTokType::KWD_FORCE)) {
             nodep->force(true);
             if (check(VhdlTokType::KWD_IN)) {
@@ -2253,7 +2277,7 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
             expect(VhdlTokType::SEMICOLON, "';' after 'release'");
             return nodep;
         } else {
-            parseDelayMechanism(nodep);
+            rejectp = parseDelayMechanism(nodep);
         }
         AstVhdlWaveform* const wavep = parseWaveform();
         if (peekType() == VhdlTokType::KWD_WHEN) {
@@ -2275,10 +2299,12 @@ AstNodeVhdlStmt* V3VhdlParse::parseAssignOrCall(const std::string& label) {
             }
             expect(VhdlTokType::SEMICOLON, "';' after the conditional signal assignment");
             VL_DO_DANGLING(nodep->deleteTree(), nodep);
+            attachReject(condp, rejectp);
             return condp;
         }
         nodep->addWavesp(wavep);
         expect(VhdlTokType::SEMICOLON, "';' after the signal assignment");
+        attachReject(nodep, rejectp);
         return nodep;
     }
 
