@@ -1276,6 +1276,21 @@ private:
                     const int64_t off = ascending ? idx.toInt() - left : left - idx.toInt();
                     const std::string text = whole.toStr();
                     if (off < 0 || static_cast<size_t>(off) >= text.size()) return VhdlValue{};
+                    // The value of an array of another enumeration -- "101" for a
+                    // BIT_VECTOR -- is held as the characters its elements are written
+                    // with, so the element is the literal the character names
+                    VhdlType* const elemp = atp ? atp->base()->elementp() : nullptr;
+                    const VhdlType* const charp = V3VhdlStd::characterType();
+                    if (elemp && charp && elemp->base() != charp->base()
+                        && elemp->base()->kind() == VhdlTypeKind::ENUM) {
+                        const std::string want{'\'', text[off], '\''};
+                        for (const VhdlSymbol* const litp : elemp->base()->literals()) {
+                            if (litp->name() == want) {
+                                return VhdlValue::mkInt(litp->position(), elemp);
+                            }
+                        }
+                        return VhdlValue{};
+                    }
                     return VhdlValue::mkInt(static_cast<unsigned char>(text[off]),
                                             V3VhdlStd::characterType());
                 }
@@ -1319,8 +1334,13 @@ private:
         }
 
         // Elaboration asks text and arrays it holds about the bounds they were
-        // built with: "s'length" of a parameter is the actual's (4.2.2.2)
-        if (m_allowImpure && nodep->prefixp() && !nodep->argp()
+        // built with: "s'length" of a parameter is the actual's (4.2.2.2). A
+        // user-defined attribute's value is static, and is asked the same way
+        // at any time: "i'a'left" (7.2)
+        const AstVhdlAttrName* const pattrp = VN_CAST(nodep->prefixp(), VhdlAttrName);
+        const bool userAttrPrefix
+            = pattrp && pattrp->vhdlSymp() && pattrp->vhdlSymp()->kind() == VhdlSymKind::ATTRIBUTE;
+        if ((m_allowImpure || userAttrPrefix) && nodep->prefixp() && !nodep->argp()
             && (attr == "left" || attr == "right" || attr == "high" || attr == "low"
                 || attr == "ascending" || attr == "length")) {
             const VhdlSymbol* const psymp = nodep->prefixp()->vhdlSymp();
