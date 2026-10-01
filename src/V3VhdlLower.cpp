@@ -1369,11 +1369,12 @@ private:
         if (zero < 0 || one < 0) return indexp;
         // Only '0' and '1' survive the two-state model, so those are the two
         // positions a value can stand for (see the accepted divergences)
-        return new AstCond{flp, indexp,
-                           new AstConst{flp, AstConst::Signed32{},
-                                        static_cast<int32_t>(one)},
-                           new AstConst{flp, AstConst::Signed32{},
-                                        static_cast<int32_t>(zero)}};
+        // The index may have been widened on its way here -- an array of
+        // CHARACTER is text, and an index into text is an INTEGER -- so
+        // whether it is a one is asked of all of it
+        return new AstCond{flp, new AstRedOr{flp, indexp},
+                           new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(one)},
+                           new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(zero)}};
     }
 
     // The index a STRING's own range starts at. Verilator's string is indexed
@@ -3849,7 +3850,7 @@ private:
     }
     std::map<const VhdlType*, AstNodeFTask*> m_dynEqFuncs;
     std::map<const VhdlType*, AstNodeFTask*> m_dynFillFuncs;
-    std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynOfFuncs;
+    std::map<std::tuple<const VhdlType*, int64_t, int64_t, bool>, AstNodeFTask*> m_dynOfFuncs;
 
     // "a = b" over two values that carry their own bounds is a length and
     // then an element at a time, which is a loop, so it is a function of its
@@ -4028,7 +4029,7 @@ private:
 
     // A value whose length its subtype fixes, made into one that carries its
     // own bounds, so that the two can be compared or joined. One function per
-    // type and length, since the argument's own type says how long it is.
+    // type and index range, since the argument's own type says what they are.
     AstNodeFTask* dynOfFixedFunc(VhdlType* carrierTypep, VhdlType* fixedTypep, FileLine* flp) {
         const VhdlType* const idxp = fixedTypep->indexTypes().empty()
                                          ? nullptr
@@ -4036,7 +4037,11 @@ private:
         if (!idxp || !idxp->bounded()) return nullptr;
         const int64_t count = idxp->length();
         if (count < 0 || count > 65536) return nullptr;
-        const auto key = std::make_pair(carrierTypep->base(), count);
+        // The bounds are written into the function, so they are part of
+        // what it is: keyed on the length alone, a second value as long as
+        // the first but numbered otherwise was given the first one's bounds
+        const auto key = std::make_tuple(carrierTypep->base(), idxp->left(), idxp->right(),
+                                         idxp->ascending());
         const auto it = m_dynOfFuncs.find(key);
         if (it != m_dynOfFuncs.end() && usableHelper(it->second)) return it->second;
         if (!m_modp) return nullptr;
@@ -6285,9 +6290,10 @@ private:
 
     // A string of '0'/'1' characters as the vector it stands for
     AstNodeExpr* lowerBitString(const std::string& bits, VhdlType* typep, FileLine* flp) {
-        if (bits.empty()) return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
-        // Text is text, not a vector
+        // Text is text, not a vector -- text of no characters too, which is
+        // the empty string and not the one place a null vector is given
         if (isStringType(typep)) return new AstConst{flp, AstConst::String{}, bits};
+        if (bits.empty()) return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
         V3Number num{flp, static_cast<int>(bits.size()), 0};
         num.setAllBits0();
         for (size_t i = 0; i < bits.size(); ++i) {
@@ -28800,7 +28806,10 @@ private:
             }
         } else if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
             const VhdlSymbol* const symp = callp->vhdlSymp();
-            if (symp && symp->name() == "to_string") {
+            // The operation the language declares, that is: a package's own
+            // TO_STRING -- ieee.fixed_pkg's, which writes the binary point --
+            // is a function like any other and says what it says
+            if (symp && symp->name() == "to_string" && symp->predefined()) {
                 if (AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc)) {
                     if (asp->actualp() && !asp->nextp()) valuep = asp->actualp();
                 }
@@ -29047,6 +29056,10 @@ private:
             // image keeps the apostrophes a character literal is written with.
             return "%0t fs";
         case VhdlTypeKind::ARRAY:
+            // A STRING is text, and is written as it stands. Asked for as a
+            // number it came out right only where it had characters: one of
+            // none -- "write(l, string'(\"\"))" -- was written as "0"
+            if (isStringType(typep)) return "%s";
             // A vector of logic reads in binary, as VHDL prints it
             return basep->elementp() && enumIsLogic(basep->elementp()->base()) ? "%b" : "%0d";
         case VhdlTypeKind::ENUM:
