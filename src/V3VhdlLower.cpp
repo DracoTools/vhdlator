@@ -15251,12 +15251,15 @@ private:
                     // A SIGNED value keeps its sign as it widens, so the cast
                     // is told what it is casting before it is asked to make it
                     // longer
+                    // A length of zero is a null array (5.3.2.1), which one
+                    // place stands for here as it does wherever one is
+                    // declared: "to_unsigned(255, v'length)" in a copy made
+                    // for an argument of no elements
                     sized = new AstCastSize{
                         flp,
-                        signd ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
-                              : firstp,
+                        signd ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp}) : firstp,
                         new AstConst{flp, AstConst::Unsized32{},
-                                     static_cast<uint32_t>(want)}};
+                                     static_cast<uint32_t>(want < 1 ? 1 : want)}};
                 }
             } else if (name == "resize" && resultp && !carriedDynamically(resultp)
                        && resultp->lengthEmittable()

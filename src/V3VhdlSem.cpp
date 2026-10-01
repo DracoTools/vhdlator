@@ -6266,6 +6266,11 @@ private:
     }
 
     void trySpecialize(AstNodeVhdlExpr* nodep, VhdlSymbol* symp, AstNode* argsp) {
+        // An alias of a subprogram denotes the subprogram (6.6.3), so a call
+        // written on one is a call of it, and wants the copy any other call
+        // with these actuals would: left naming the alias, it kept the
+        // original, and every such call read the bounds of the first
+        if (symp) symp = symp->resolved();
         if (!needsSpecializing(symp)) return;
         // A copy is never itself specialized: it was made for one call site
         // and has nothing left to fix
