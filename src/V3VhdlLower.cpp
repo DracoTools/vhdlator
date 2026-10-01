@@ -3682,6 +3682,13 @@ private:
     // analysis that settles types, so at that point the call still says
     // nothing, and every reader of its type is told nothing.
     static VhdlType* emittedArrayType(AstNodeVhdlExpr* nodep, int depth = 0) {
+        // A qualified expression says which type its operand is of and
+        // leaves the value, bounds included, as it was (9.3.5): "ufixed'(f(x))"
+        // against an unconstrained formal is as long as the call makes it
+        while (const AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
+            if (qp->vhdlTypep() && qp->vhdlTypep()->isConstrainedArray()) return nullptr;
+            nodep = qp->valuep();
+        }
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || depth > 8) return nullptr;
         const VhdlSymbol* const symp
@@ -5373,6 +5380,74 @@ private:
         funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
         addHelperFunc(funcp);
         m_dynNotFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
+        return funcp;
+    }
+
+    std::map<std::pair<const VhdlType*, int>, AstNodeFTask*> m_dynLogicFuncs;
+
+    // "a and b" and the other five over two carriers: element by element in
+    // matching positions, which the operands must have as many of as each
+    // other (9.2.2). The predefined operator gives the result the range of
+    // its left operand; numeric_std and numeric_bit give "length-1 downto 0"
+    // and std_logic_1164 "1 to length", which "bsel" chooses between.
+    AstNodeFTask* dynLogicFunc(VhdlType* typep, VhdlBinaryOp op, FileLine* origFlp) {
+        FileLine* const flp = dynFl(origFlp);
+        const auto key = std::make_pair(carrierKeyOf(typep), static_cast<int>(op));
+        const auto it = m_dynLogicFuncs.find(key);
+        if (it != m_dynLogicFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        AstFunc* const funcp = newDynFunc("__Vdynlogic", typep, dynCarrierRef(typep, flp), flp);
+        AstVar* const ap = dynArg(funcp, "a", dynCarrierRef(typep, flp), flp);
+        AstVar* const bp = dynArg(funcp, "b", dynCarrierRef(typep, flp), flp);
+        AstVar* const bselp = dynArg(funcp, "bsel", newIntDType(flp), flp);
+        AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        for (AstVar* const vp : {lenp, ip}) funcp->addStmtsp(vp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, wr(lenp, flp), dynCarrierLength(rd(ap, flp), flp)});
+        funcp->addStmtsp(
+            new AstIf{flp, new AstNeq{flp, rd(lenp, flp), dynCarrierLength(rd(bp, flp), flp)},
+                      lengthMismatch(flp), nullptr});
+        const auto sel
+            = [&](AstNodeExpr* leftp, AstNodeExpr* numericp, AstNodeExpr* logicp) -> AstNodeExpr* {
+            return new AstCond{
+                flp, new AstEq{flp, rd(bselp, flp), i32(1, flp)}, numericp,
+                new AstCond{flp, new AstEq{flp, rd(bselp, flp), i32(2, flp)}, logicp, leftp}};
+        };
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "lft", flp),
+                          sel(dynPart(rd(ap, flp), "lft", flp),
+                              new AstSub{flp, rd(lenp, flp), i32(1, flp)}, i32(1, flp))});
+        funcp->addStmtsp(
+            new AstAssign{flp, dynPart(out(), "rgt", flp),
+                          sel(dynPart(rd(ap, flp), "rgt", flp), i32(0, flp), rd(lenp, flp))});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp),
+                                       sel(dynPart(rd(ap, flp), "dsc", flp),
+                                           new AstConst{flp, AstConst::BitTrue{}},
+                                           new AstConst{flp, AstConst::BitFalse{}})});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "q", flp),
+                                       new AstNewDynamic{flp, rd(lenp, flp), nullptr}});
+        funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+        AstNodeExpr* const xp = new AstSelBit{flp, dynPart(rd(ap, flp), "q", flp), rd(ip, flp)};
+        AstNodeExpr* const yp = new AstSelBit{flp, dynPart(rd(bp, flp), "q", flp), rd(ip, flp)};
+        AstNodeExpr* valp = nullptr;
+        switch (op) {
+        case VhdlBinaryOp::AND: valp = new AstAnd{flp, xp, yp}; break;
+        case VhdlBinaryOp::OR: valp = new AstOr{flp, xp, yp}; break;
+        case VhdlBinaryOp::XOR: valp = new AstXor{flp, xp, yp}; break;
+        case VhdlBinaryOp::NAND: valp = new AstNot{flp, new AstAnd{flp, xp, yp}}; break;
+        case VhdlBinaryOp::NOR: valp = new AstNot{flp, new AstOr{flp, xp, yp}}; break;
+        default: valp = new AstNot{flp, new AstXor{flp, xp, yp}}; break;
+        }
+        AstNode* bodyp
+            = new AstAssign{flp, new AstSelBit{flp, dynPart(out(), "q", flp), rd(ip, flp)}, valp};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
+        funcp->addStmtsp(whileLoop(flp, new AstLtS{flp, rd(ip, flp), rd(lenp, flp)}, bodyp));
+        addHelperFunc(funcp);
+        m_dynLogicFuncs.insert_or_assign(key, funcp);
         return funcp;
     }
 
@@ -11673,16 +11748,59 @@ private:
                            new AstConst{dynFl(flp), AstConst::Signed32{}, 0}},
                 new AstNegate{flp, lhsp->cloneTree(false)}, lhsp};
         case VhdlUnaryOp::NOT: return new AstNot{flp, lhsp};
-        case VhdlUnaryOp::AND: return new AstRedAnd{flp, lhsp};
-        case VhdlUnaryOp::OR: return new AstRedOr{flp, lhsp};
-        case VhdlUnaryOp::XOR: return new AstRedXor{flp, lhsp};
-        case VhdlUnaryOp::NAND: return new AstNot{flp, new AstRedAnd{flp, lhsp}};
-        case VhdlUnaryOp::NOR: return new AstNot{flp, new AstRedOr{flp, lhsp}};
-        case VhdlUnaryOp::XNOR: return new AstNot{flp, new AstRedXor{flp, lhsp}};
+        case VhdlUnaryOp::AND:
+            return orIdentity(nodep->lhsp(), new AstRedAnd{flp, lhsp}, true, flp);
+        case VhdlUnaryOp::OR:
+            return orIdentity(nodep->lhsp(), new AstRedOr{flp, lhsp}, false, flp);
+        case VhdlUnaryOp::XOR:
+            return orIdentity(nodep->lhsp(), new AstRedXor{flp, lhsp}, false, flp);
+        case VhdlUnaryOp::NAND:
+            return orIdentity(nodep->lhsp(), new AstNot{flp, new AstRedAnd{flp, lhsp}}, false,
+                              flp);
+        case VhdlUnaryOp::NOR:
+            return orIdentity(nodep->lhsp(), new AstNot{flp, new AstRedOr{flp, lhsp}}, true, flp);
+        case VhdlUnaryOp::XNOR:
+            return orIdentity(nodep->lhsp(), new AstNot{flp, new AstRedXor{flp, lhsp}}, true, flp);
         case VhdlUnaryOp::COND_CONV: return lhsp;  // Already one bit
         }
         unsup(flp, "unary operator");
         return nullptr;
+    }
+
+    // A reduction over an operand that may have no elements. A slice whose
+    // ends run the wrong way round is a null array (5.2.1), and a reduction
+    // of one gives the operator's identity (9.2.8): ieee.fixed_pkg's HREAD
+    // asks "or (slv(hi downto v'high + 1 - lo)) = '0'" of bits that at some
+    // widths are not there. A statically sized select has no zero-width
+    // value -- it selects the places the ends name, whichever way round --
+    // so which the ends are is asked first.
+    AstNodeExpr* orIdentity(AstNodeVhdlExpr* operandp, AstNodeExpr* reducedp, bool identity,
+                            FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(operandp, VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rangep || !callp->prefixp()) return reducedp;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        bool dirKnown = true;
+        const bool ok = rangeParts(rangep, leftp, rightp, ascending, dirKnown) && leftp && rightp
+                        && dirKnown;
+        const AstConst* const lcp = VN_CAST(leftp, Const);
+        const AstConst* const rcp = VN_CAST(rightp, Const);
+        if (!ok
+            || (lcp && rcp
+                && (ascending ? lcp->toSInt() <= rcp->toSInt()
+                              : lcp->toSInt() >= rcp->toSInt()))) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return reducedp;
+        }
+        FileLine* const nflp = dynFl(flp);
+        AstNodeExpr* const nullp
+            = ascending ? static_cast<AstNodeExpr*>(new AstGtS{nflp, leftp, rightp})
+                        : static_cast<AstNodeExpr*>(new AstLtS{nflp, leftp, rightp});
+        return new AstCond{nflp, nullp, new AstConst{nflp, AstConst::BitTrue{}, identity},
+                           reducedp};
     }
 
     // The types the short-circuit rule of 9.2.2 names, and no others: a
@@ -12163,6 +12281,11 @@ private:
         return refp;
     }
 
+    static bool isArrayOperand(const AstNodeVhdlExpr* nodep) {
+        const VhdlType* const typep = nodep ? nodep->vhdlTypep() : nullptr;
+        return typep && typep->base()->kind() == VhdlTypeKind::ARRAY;
+    }
+
     // Whether an operator gives back a value that carries its own bounds
     // because one of its operands does
     bool dynBinaryCarries(const AstVhdlBinary* nodep) const {
@@ -12177,6 +12300,25 @@ private:
         case VhdlBinaryOp::MOD:
         case VhdlBinaryOp::REM:
         case VhdlBinaryOp::CONCAT: break;
+        case VhdlBinaryOp::AND:
+        case VhdlBinaryOp::OR:
+        case VhdlBinaryOp::XOR:
+        case VhdlBinaryOp::NAND:
+        case VhdlBinaryOp::NOR:
+        case VhdlBinaryOp::XNOR:
+            // Of two arrays; an array with a single element is another
+            // operator (9.2.2)
+            if (!isArrayOperand(nodep->lhsp()) || !isArrayOperand(nodep->rhsp())) return false;
+            // And the language's or the IEEE packages': one a design
+            // declares gives back whatever it says it does
+            if (const VhdlSymbol* const symp = nodep->vhdlSymp()) {
+                if (!symp->predefined()
+                    && !isIeeeOperator(symp, nodep->lhsp()->vhdlTypep(),
+                                       nodep->rhsp()->vhdlTypep())) {
+                    return false;
+                }
+            }
+            break;
         default: return false;
         }
         const bool ldyn = isDynValue(nodep->lhsp());
@@ -12270,6 +12412,34 @@ private:
                 return nullptr;
             }
             return call(funcp, {catap, catbp});
+        }
+        case VhdlBinaryOp::AND:
+        case VhdlBinaryOp::OR:
+        case VhdlBinaryOp::XOR:
+        case VhdlBinaryOp::NAND:
+        case VhdlBinaryOp::NOR:
+        case VhdlBinaryOp::XNOR: {
+            if (!isArrayOperand(nodep->lhsp()) || !isArrayOperand(nodep->rhsp())) return nullptr;
+            AstNodeFTask* const funcp = dynLogicFunc(carrp, op, flp);
+            if (!funcp) return nullptr;
+            const auto operand = [&](AstNodeVhdlExpr* exprp) {
+                return isDynValue(exprp) ? lowerExpr(exprp) : asDynCarrier(exprp, carrp, flp);
+            };
+            AstNodeExpr* const ap = operand(nodep->lhsp());
+            AstNodeExpr* const bp = ap ? operand(nodep->rhsp()) : nullptr;
+            if (!bp) {
+                if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
+                return nullptr;
+            }
+            int bsel = 0;
+            if (symp && !symp->predefined()) {
+                bsel = 1;
+                for (const VhdlScope* scopep = symp->declScopep(); scopep;
+                     scopep = scopep->parentp()) {
+                    if (scopep->name() == "std_logic_1164") bsel = 2;
+                }
+            }
+            return call(funcp, {ap, bp, i32(bsel, flp)});
         }
         case VhdlBinaryOp::ADD:
         case VhdlBinaryOp::SUB: {
