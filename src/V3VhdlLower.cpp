@@ -20243,7 +20243,21 @@ private:
         if (AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) unitp = callp->prefixp();
         std::vector<std::string> parts;
         if (!flattenName(unitp, parts) || parts.empty()) return;
-        const std::string entity = parts.back();
+        std::string entity = parts.back();
+        // "use configuration work.c" names a configuration, which chose the
+        // entity and the architecture already and carries bindings of its
+        // own: the module built for it is what the instance is built from
+        // (7.3.2.1), as it is for the same words in a configuration
+        // declaration. Read as an entity's name it found none.
+        if (bindingp->kind() == "configuration") {
+            const std::string here
+                = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+            const std::string cfgLib
+                = parts.size() > 1 ? VString::downcase(parts[parts.size() - 2]) : here;
+            auto cfgIt = m_configOf.find(cfgLib + "." + entity);
+            if (cfgIt == m_configOf.end()) cfgIt = m_configOf.find("work." + entity);
+            if (cfgIt != m_configOf.end()) entity = cfgModName(cfgIt->second.first, entity);
+        }
         // "labels : component_name", where the component name is the last of
         // the names and the ones before it are the instances it applies to
         // (7.3.1). "all" and "others" leave only the component name.
