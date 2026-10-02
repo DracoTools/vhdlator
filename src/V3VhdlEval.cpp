@@ -1644,8 +1644,9 @@ private:
             // A variable keeps its own bounds, and takes the value's elements
             // in order (10.6.2.1)
             if (m_allowImpure) {
-                const auto it = m_frames.back().find(symp);
-                if (it != m_frames.back().end() && (it->second.isStr() || it->second.isArray())
+                auto& frame = m_frames.back();
+                const auto it = frame.find(symp);
+                if (it != frame.end() && (it->second.isStr() || it->second.isArray())
                     && symp->typep() && symp->typep()->isConstrainedArray()) {
                     m_frames.back()[symp] = conformTo(val, symp->typep());
                     return Flow::NORMAL;
@@ -1729,8 +1730,9 @@ private:
     VhdlValue* targetObject(AstNodeVhdlExpr* targetp) {
         if (AstVhdlName* const namep = VN_CAST(targetp, VhdlName)) {
             if (!namep->vhdlSymp() || m_frames.empty()) return nullptr;
-            const auto it = m_frames.back().find(namep->vhdlSymp()->resolved());
-            return it == m_frames.back().end() ? nullptr : &it->second;
+            auto& frame = m_frames.back();
+            const auto it = frame.find(namep->vhdlSymp()->resolved());
+            return it == frame.end() ? nullptr : &it->second;
         }
         if (AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
             if (!selp->isAll()) return nullptr;
