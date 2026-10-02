@@ -14734,16 +14734,46 @@ private:
         // is written here is handed back to the caller untouched where this
         // cannot be done, and one operand already pulled to pieces would
         // leave it holding nothing
-        if (!canExpand(nodep->lhsp(), lhsp) || !canExpand(nodep->rhsp(), rhsp)) return nullptr;
-        AstNode* const leftMembersp = concatMembers(nodep->lhsp(), lhsp, flp);
-        AstNode* const rightMembersp = concatMembers(nodep->rhsp(), rhsp, flp);
+        VhdlType* const ltypep = concatOperandType(nodep->lhsp(), lhsp);
+        VhdlType* const rtypep = concatOperandType(nodep->rhsp(), rhsp);
+        if (!canExpand(ltypep, lhsp) || !canExpand(rtypep, rhsp)) return nullptr;
+        // What a call gives back is read once per element, so it is worked
+        // out once into an object and the elements are read from that
+        AstNode* heldp = nullptr;
+        const auto hold = [&](VhdlType* typep, AstNodeExpr* loweredp) -> AstNodeExpr* {
+            if (VN_IS(loweredp, Pattern) || repeatable(loweredp)) return loweredp;
+            AstVar* const tmpp = newTempVar("__Vcat", lowerType(typep, flp), flp);
+            heldp = AstNode::addNextNull(
+                heldp, static_cast<AstNode*>(new AstAssign{flp, wr(tmpp, flp), loweredp}));
+            return rd(tmpp, flp);
+        };
+        lhsp = hold(ltypep, lhsp);
+        rhsp = hold(rtypep, rhsp);
+        AstNode* const leftMembersp = concatMembers(ltypep, lhsp, flp);
+        AstNode* const rightMembersp = concatMembers(rtypep, rhsp, flp);
         UASSERT_OBJ(leftMembersp && rightMembersp, nodep, "Expansion asked about and refused");
+        if (heldp) {
+            // The object is given its value as the first element is read
+            AstPatMember* const firstp = VN_AS(leftMembersp, PatMember);
+            AstNodeExpr* const firstValp = firstp->lhssp()->unlinkFrBack();
+            firstp->addLhssp(new AstExprStmt{flp, heldp, firstValp});
+        }
         return new AstPattern{flp, AstNode::addNext(leftMembersp, rightMembersp)};
+    }
+
+    // The subtype an operand of such a concatenation is read at: its own,
+    // or for a call the one the copy made for this call site gives back
+    VhdlType* concatOperandType(AstNodeVhdlExpr* opp, AstNodeExpr* loweredp) {
+        VhdlType* typep = opp ? opp->vhdlTypep() : nullptr;
+        if (loweredp && !VN_IS(loweredp, Pattern) && (!typep || !typep->isConstrainedArray())) {
+            if (VhdlType* const emp = emittedArrayType(opp)) typep = emp;
+        }
+        return typep;
     }
 
     // Whether every element of an operand can be written out, asked before
     // anything is taken apart
-    bool canExpand(AstNodeVhdlExpr* opp, AstNodeExpr* loweredp) {
+    bool canExpand(const VhdlType* typep, AstNodeExpr* loweredp) {
         if (!loweredp) return false;
         if (const AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
             if (!patp->itemsp()) return false;
@@ -14755,8 +14785,10 @@ private:
             }
             return true;
         }
-        if (!repeatable(loweredp)) return false;
-        const VhdlType* const typep = opp ? opp->vhdlTypep() : nullptr;
+        // A call is held in an object first; anything else that cannot be
+        // read twice is left as it was
+        if (!repeatable(loweredp) && !VN_IS(loweredp, FuncRef)) return false;
+        if (loweredIsCarrier(loweredp)) return false;
         if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
             || !typep->isConstrainedArray()) {
             return false;
@@ -14770,7 +14802,7 @@ private:
     // Every element of one operand of such a concatenation, in index order.
     // An aggregate has already become a pattern, and its members are taken as
     // they stand; anything else is indexed, which needs its length.
-    AstNode* concatMembers(AstNodeVhdlExpr* opp, AstNodeExpr* loweredp, FileLine* flp) {
+    AstNode* concatMembers(const VhdlType* typep, AstNodeExpr* loweredp, FileLine* flp) {
         if (AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
             // An aggregate is already written out element by element
             AstNode* const outp = patp->itemsp()->unlinkFrBackWithNext();
@@ -14779,7 +14811,6 @@ private:
         }
         // Anything else is read once per element, so it has to be a name
         // rather than something that would be worked out again each time
-        const VhdlType* const typep = opp->vhdlTypep();
         const VhdlType* const idxp = indexSubtype(typep, 0);
         const int64_t count = idxp->length();
         AstNode* outp = nullptr;
@@ -30128,7 +30159,21 @@ private:
             };
             std::vector<AstNodeStmt*> returns;
             ftaskp->foreach([&](AstReturn* retp) { returns.push_back(retp); });
-            for (AstNodeStmt* const retp : returns) retp->addHereThisAsNext(closes());
+            AstVar* const resultp = VN_CAST(ftaskp->fvarp(), Var);
+            for (AstNodeStmt* const stmtp : returns) {
+                AstReturn* const retp = VN_AS(stmtp, Return);
+                // What is returned is worked out with the files still open
+                // -- "return f1(f)" hands one of them on -- so the value is
+                // taken first and the files closed after
+                if (retp->lhsp() && resultp) {
+                    AstNodeExpr* const valuep = retp->lhsp()->unlinkFrBack();
+                    retp->addHereThisAsNext(new AstAssign{
+                        retp->fileline(), new AstVarRef{retp->fileline(), resultp, VAccess::WRITE},
+                        valuep});
+                    retp->lhsp(new AstVarRef{retp->fileline(), resultp, VAccess::READ});
+                }
+                retp->addHereThisAsNext(closes());
+            }
             ftaskp->addStmtsp(closes());
         }
         for (const auto& pair : savedCaps) {
