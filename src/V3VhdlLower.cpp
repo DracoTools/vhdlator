@@ -21297,6 +21297,24 @@ private:
                     }
                     pinp = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
                 }
+                // An association written by position names the port at that
+                // place of what is instantiated -- a component's, where it is
+                // one, whose ports need not come in the entity's order
+                // (6.5.7.1) -- so the pin says which by name. A converted
+                // association also takes a pin ahead of its turn.
+                // Not where the binding has a port map of its own: that
+                // says which of the entity's ports each of the component's
+                // is, and the names are not the entity's.
+                if (pinp && !asp->formalp() && pinp->name().empty()
+                    && !(bindingp && bindingp->portMapp())) {
+                    size_t position = 0;
+                    for (AstNode* qp = nodep->portMapp(); qp && qp != asp; qp = qp->nextp()) {
+                        ++position;
+                    }
+                    if (position < nodep->formalPorts().size()) {
+                        pinp->name(nodep->formalPorts()[position]);
+                    }
+                }
                 if (pinp) pinsp = AstNode::addNext(pinsp, pinp);
                 continue;
             }
