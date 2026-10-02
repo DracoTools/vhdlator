@@ -4423,9 +4423,58 @@ private:
     }
 
     // Whatever an expression is worth, as a value that carries its own bounds
+    // A value that carries its own bounds by its type, lowered -- and made
+    // to carry them where what was emitted does not: a function whose result
+    // is unconstrained is copied for a call that fixes its length, and that
+    // copy returns a value of the fixed length
+    AstNodeExpr* lowerDynValue(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp) {
+        AstNodeExpr* const exprp = lowerExpr(nodep);
+        if (!exprp || !carrierTypep || !VN_IS(exprp, FuncRef) || loweredIsCarrier(exprp)) {
+            return exprp;
+        }
+        // What the function that was emitted returns, which the call's own
+        // type does not say
+        VhdlType* emittedp = nullptr;
+        {
+            const AstFuncRef* const frefp = VN_AS(exprp, FuncRef);
+            const auto retIt = m_retTypeOf.find(VN_CAST(frefp->taskp(), Func));
+            if (retIt != m_retTypeOf.end()) emittedp = retIt->second;
+        }
+        if (!emittedp) emittedp = emittedArrayType(nodep);
+        if (!emittedp || !emittedp->isConstrainedArray() || carriedDynamically(emittedp)) {
+            // No subtype to read the bounds off, but a length may still be
+            // plain: a function that hands its argument back is as long as
+            // the argument. The elements are carried from zero up, which is
+            // all an arithmetic or logical operator asks of them.
+            int width = exprVectorWidth(nodep);
+            if (!width) {
+                const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+                const VhdlSymbol* const csymp
+                    = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+                if (csymp && passesItsArgumentThrough(csymp)) {
+                    if (AstNodeVhdlExpr* const argp = conversionArgOf(callp)) {
+                        width = exprVectorWidth(argp);
+                    }
+                }
+            }
+            AstNodeFTask* const litFuncp
+                = width > 0 ? dynOfLiteralFunc(carrierTypep, width, flp) : nullptr;
+            if (!litFuncp) return exprp;
+            AstFuncRef* const litRefp
+                = new AstFuncRef{flp, litFuncp->name(), new AstArg{flp, "", exprp}};
+            litRefp->taskp(VN_AS(litFuncp, Func));
+            return litRefp;
+        }
+        AstNodeFTask* const funcp = dynOfFixedFunc(carrierTypep, emittedp, flp);
+        if (!funcp) return exprp;
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", exprp}};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
-        if (isDynValue(nodep)) return lowerExpr(nodep);
+        if (isDynValue(nodep)) return lowerDynValue(nodep, carrierTypep, flp);
         if (isDyn2Value(nodep)) return carrierOfDyn2(nodep, carrierTypep, flp);
         if (AstNodeExpr* const joinedp = aggregateOfArraysCarrier(nodep, carrierTypep, flp)) {
             return joinedp;
@@ -4521,6 +4570,24 @@ private:
                         exprRefp->taskp(VN_AS(exprFuncp, Func));
                         return exprRefp;
                     }
+                }
+            }
+        }
+        // A conversion between closely related array types leaves the
+        // elements and their number as they are (9.3.6), so what is converted
+        // is what has the length: "unsigned(a & b)" handed to an
+        // unconstrained formal is as long as the concatenation
+        if ((!typep || !typep->isConstrainedArray()) && carrierTypep) {
+            const AstVhdlCall* const convp = VN_CAST(nodep, VhdlCall);
+            const VhdlSymbol* const csymp
+                = convp && convp->prefixp() ? convp->prefixp()->vhdlSymp() : nullptr;
+            AstVhdlAssoc* const argp = convp ? VN_CAST(convp->argsp(), VhdlAssoc) : nullptr;
+            if (csymp && csymp->kind() == VhdlSymKind::TYPE && argp && !argp->nextp()
+                && argp->actualp() && argp->actualp()->vhdlTypep()
+                && argp->actualp()->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY) {
+                if (AstNodeExpr* const innerp
+                    = asDynCarrier(argp->actualp(), carrierTypep, flp, asLongAsp)) {
+                    return innerp;
                 }
             }
         }
@@ -12363,7 +12430,7 @@ private:
     // An operand as a carrier of the type the operator is working in, which
     // an integer becomes by being spread over as many places as it takes
     AstNodeExpr* dynOperand(AstNodeVhdlExpr* nodep, VhdlType* carrp, FileLine* flp) {
-        if (isDynValue(nodep)) return lowerExpr(nodep);
+        if (isDynValue(nodep)) return lowerDynValue(nodep, carrp, flp);
         if (AstNodeExpr* const outp = asDynCarrier(nodep, carrp, flp)) return outp;
         // An integer beside a vector is taken at its own full width; what
         // lies above it is the sign, which the operators extend themselves

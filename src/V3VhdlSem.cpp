@@ -11131,6 +11131,31 @@ int64_t VhdlSemVisitor::staticLength(AstNodeVhdlExpr* nodep) {
             if (rhsLen < 0) return -1;
             return lhsLen + rhsLen;
         }
+        // The result of an operator a package declares over arrays is as
+        // long as the package says, which for "+" and "-" of the arithmetic
+        // packages is the longer operand (16.5, std_logic_arith the same).
+        // The type recorded for the expression is the left operand's, and
+        // read as the answer it refused "unsigned'(\"00000\") - f(x)" where
+        // f returns six elements. Where an operand's own length is not
+        // known here, neither is the result's.
+        const VhdlSymbol* const opSymp = binp->vhdlSymp();
+        if (opSymp && !opSymp->predefined()) {
+            const auto isArray = [](AstNodeVhdlExpr* sidep) {
+                const VhdlType* const tp = sidep ? sidep->vhdlTypep() : nullptr;
+                return tp && tp->base() && tp->base()->kind() == VhdlTypeKind::ARRAY;
+            };
+            const bool lArr = isArray(binp->lhsp());
+            const bool rArr = isArray(binp->rhsp());
+            const int64_t lLen = lArr ? staticLength(binp->lhsp()) : 0;
+            const int64_t rLen = rArr ? staticLength(binp->rhsp()) : 0;
+            if ((lArr && lLen < 0) || (rArr && rLen < 0)) return -1;
+            if (lArr && rArr && lLen != rLen) {
+                if (binp->op() == VhdlBinaryOp::ADD || binp->op() == VhdlBinaryOp::SUB) {
+                    return std::max(lLen, rLen);
+                }
+                return -1;  // What the package's body makes of it
+            }
+        }
     }
     const VhdlValue val = V3VhdlEval::eval(nodep);
     if (val.isStr()) return static_cast<int64_t>(val.toStr().size());
@@ -11828,6 +11853,43 @@ void VhdlSemVisitor::checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
     if (AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate)) {
         checkAggregate(aggp, typep, what);
         return;
+    }
+    // What an operator of a package gives is as long as the package makes
+    // it, and the subtype recorded for the expression -- the left operand's
+    // -- is not that: "unsigned'(\"00000\") - f(x)" is six elements where f
+    // returns six. Through whatever conversions and qualifications are
+    // written round it, such an operator is asked for its length by its
+    // operands, and where they do not say the check is left to running.
+    {
+        AstNodeVhdlExpr* innerp = nodep;
+        for (int depth = 0; innerp && depth < 8; ++depth) {
+            if (AstVhdlQualified* const qp = VN_CAST(innerp, VhdlQualified)) {
+                innerp = qp->valuep();
+                continue;
+            }
+            AstVhdlCall* const callp = VN_CAST(innerp, VhdlCall);
+            const VhdlSymbol* const csymp
+                = callp && callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            AstVhdlAssoc* const argp = callp ? VN_CAST(callp->argsp(), VhdlAssoc) : nullptr;
+            if (csymp && csymp->kind() == VhdlSymKind::TYPE && argp && !argp->nextp()
+                && argp->actualp()) {
+                innerp = argp->actualp();
+                continue;
+            }
+            break;
+        }
+        const AstVhdlBinary* const binp = VN_CAST(innerp, VhdlBinary);
+        if (binp && binp->op() != VhdlBinaryOp::CONCAT && binp->vhdlSymp()
+            && !binp->vhdlSymp()->predefined()) {
+            if (typep->dimensions() != 1) return;
+            const int64_t have = staticLength(innerp);
+            if (have < 0) return;
+            const int64_t want = typep->dimLength(0);
+            if (have == want) return;
+            err(nodep->fileline(), "Expected " + std::to_string(want) + " element(s) for " + what
+                                       + ", but the value has " + std::to_string(have));
+            return;
+        }
     }
     // Another array value must match dimension for dimension. A string or
     // bit string literal is the exception: it was handed the target's
