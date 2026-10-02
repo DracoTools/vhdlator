@@ -18184,10 +18184,30 @@ private:
         netp->varType(VVarType::TRIWIRE);
         // What the signal starts at is decided by its drivers, not by the
         // declaration: a net takes its value from what drives it
+        // -- but what the declaration gives it is what each driver holds to
+        // begin with (14.7.3.2), so a driver that only ever assigns part of
+        // the signal contributes the rest as it was declared. VUnit's events
+        // keep an identifier in the bits their drivers never assign. Worked
+        // out once, as the declaration is elaborated once, and off where it
+        // is all 'Z', which is what a driver that is off contributes.
+        AstVar* initVarp = nullptr;
+        AstNodeExpr* initConstp = nullptr;
+        bool initDrives = false;
         if (netp->valuep()) {
             AstNode* const oldp = netp->valuep();
             oldp->unlinkFrBack();
-            VL_DO_DANGLING(oldp->deleteTree(), oldp);
+            if (AstConst* const constp = VN_CAST(oldp, Const)) {
+                initDrives = !constp->num().isAllZ();
+                initConstp = constp;
+            } else if (AstNodeExpr* const exprp = VN_CAST(oldp, NodeExpr)) {
+                initDrives = true;
+                initVarp = new AstVar{flp, VVarType::VAR, "__Vdrvinit__" + m_prefix + symp->name(),
+                                      VFlagChildDType{}, lowerType(symp->typep(), flp)};
+                addStmt(initVarp);
+                initVarp->valuep(exprp);
+            } else {
+                VL_DO_DANGLING(oldp->deleteTree(), oldp);
+            }
         }
         std::vector<VhdlDriver> drivers;
         // What a driver holds is written from two blocks by construction --
@@ -18210,8 +18230,14 @@ private:
             addStmt(drv.valp);
             addStmt(drv.enp);
             // Off until the driver says otherwise, which is what a driver of
-            // a resolved signal contributes before it has run
-            drv.enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, 0});
+            // a resolved signal with no initial value contributes before it
+            // has run; one with an initial value holds that from the start
+            drv.enp->valuep(new AstConst{flp, AstConst::WidthedValue{}, 1, initDrives ? 1U : 0U});
+            if (initDrives && initVarp) {
+                drv.valp->valuep(new AstVarRef{flp, initVarp, VAccess::READ});
+            } else if (initDrives && initConstp) {
+                drv.valp->valuep(initConstp->cloneTree(false));
+            }
             drv.weakp = new AstVar{dflp, VVarType::VAR, base + "__weak", VFlagChildDType{},
                                    new AstBasicDType{flp, VBasicDTypeKwd::LOGIC}};
             addStmt(drv.weakp);
@@ -18242,6 +18268,7 @@ private:
                             new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
         }
         VL_DO_DANGLING(forcingp->deleteTree(), forcingp);
+        if (initConstp) VL_DO_DANGLING(initConstp->deleteTree(), initConstp);
         m_drivers.emplace(symp, drivers);
     }
 
