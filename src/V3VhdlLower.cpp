@@ -202,6 +202,10 @@ class VhdlLowerVisitor final {
     VarMap m_vars;  // Declaration -> the variable it became
     std::map<std::string, AstNodeVhdlUnit*> m_entities;  // "lib.name" -> entity
     std::set<std::string> m_instantiated;  // Modules something else builds one of
+    // Which modules build one of each module, and the external names that
+    // start one region up from a module and name an object of whatever that is
+    std::map<std::string, std::set<std::string>> m_cellParents;
+    std::vector<std::pair<AstVarXRef*, std::string>> m_pendingUpExt;
     // Refusals that stand only if their module is part of the design: the
     // module, where, and what
     std::vector<std::tuple<std::string, FileLine*, std::string>> m_reachedRefusals;
@@ -381,6 +385,7 @@ public:
     void addLogicPosPins() VL_MT_DISABLED;
     void addOpenPortPins() VL_MT_DISABLED;
     void addPathPins() VL_MT_DISABLED;
+    void settleUpwardNames() VL_MT_DISABLED;
     void markPackageSignalRefs() VL_MT_DISABLED;
     static std::string topArchitectureOf(AstVhdlBlockConfig* nodep) VL_MT_DISABLED;
 
@@ -11698,8 +11703,34 @@ private:
             return nullptr;
         }
         if (nodep->upLevels() > 0) {
-            unsup(flp, "external name with a relative pathname starting at '^'");
-            return nullptr;
+            // "^" is the region enclosing this one (8.7). Written straight in
+            // an architecture, one of them is the region that instantiates
+            // it: what follows names an instance there, which is found from
+            // here by going up as a hierarchical name is, or an object of
+            // that region itself, which needs the region's name -- known
+            // once every unit has been lowered and the instances counted.
+            // Any other count, or one written inside a block or a generate,
+            // moves among regions that are not modules here.
+            std::vector<std::string> upParts;
+            bool plain = nodep->upLevels() == 1 && m_blockPrefix.empty() && m_modp && !m_ftaskp;
+            for (AstNode* p = nodep->pathp(); plain && p; p = p->nextp()) {
+                std::vector<std::string> one;
+                if (!flattenName(VN_AS(p, NodeVhdlExpr), one) || one.empty()) plain = false;
+                for (const std::string& part : one) upParts.push_back(part);
+            }
+            if (!plain || upParts.empty()) {
+                unsup(flp, "external name with a relative pathname starting at '^'");
+                return nullptr;
+            }
+            std::string dotted;
+            for (size_t i = 0; i + 1 < upParts.size(); ++i) {
+                if (!dotted.empty()) dotted += ".";
+                dotted += upParts[i];
+            }
+            AstVarXRef* const refp = new AstVarXRef{flp, upParts.back(), dotted,
+                                                    write ? VAccess::WRITE : VAccess::READ};
+            m_pendingUpExt.emplace_back(refp, m_modp->name());
+            return refp;
         }
         std::vector<std::string> parts;
         for (AstNode* p = nodep->pathp(); p; p = p->nextp()) {
@@ -21644,6 +21675,7 @@ private:
         paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
         m_instantiated.insert(modName);
+        if (m_modp) m_cellParents[modName].insert(m_modp->name());
         AstCell* const cellp = new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr};
         {
             // The regions of this design entity it sits in, for the paths of
@@ -32025,6 +32057,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     addLogicPosPins();
     addOpenPortPins();
     addPathPins();
+    settleUpwardNames();
     reportReachedRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
 }
@@ -32091,6 +32124,29 @@ void VhdlLowerVisitor::addOpenPortPins() {
 // label, and for 'INSTANCE_NAME the entity and architecture it builds
 // (16.2.7). That makes the module instantiating it need its own paths, and so
 // on up to the top, whose paths are its defaults.
+// An external name that starts one region up names something of whatever
+// instantiates this unit. That is one module where one design entity does,
+// and the name is then written from it, as a hierarchical name that starts
+// at an enclosing module is.
+void VhdlLowerVisitor::settleUpwardNames() {
+    for (const auto& pending : m_pendingUpExt) {
+        AstVarXRef* const refp = pending.first;
+        const auto it = m_cellParents.find(pending.second);
+        if (!refp->backp()) continue;
+        if (it == m_cellParents.end() || it->second.size() != 1) {
+            unsup(refp->fileline(),
+                  std::string{"external name with a relative pathname starting at '^', in a"
+                              " unit that "}
+                      + (it == m_cellParents.end() ? "nothing instantiates"
+                                                   : "more than one unit instantiates"));
+            continue;
+        }
+        const std::string& parent = *it->second.begin();
+        refp->dotted(refp->dotted().empty() ? parent : parent + "." + refp->dotted());
+    }
+    m_pendingUpExt.clear();
+}
+
 void VhdlLowerVisitor::addPathPins() {
     if (m_pathParamsOf.empty()) {
         m_pathCells.clear();
