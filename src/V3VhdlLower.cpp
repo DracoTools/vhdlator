@@ -29063,7 +29063,27 @@ private:
                 skipp->addStmtsp(new AstAssign{
                     flp, new AstVarRef{flp, posp, VAccess::WRITE},
                     new AstAdd{flp, pos(), new AstConst{flp, AstConst::Signed32{}, 1}}});
-                loopp->addStmtsp(skipp);
+                if (name == "read") {
+                    loopp->addStmtsp(skipp);
+                } else {
+                    // HREAD, OREAD and BREAD take one item: blanks come only
+                    // before it, and an underscore may stand between two of
+                    // its digits (16.4)
+                    const auto cnt = [&]() { return new AstVarRef{flp, cntp, VAccess::READ}; };
+                    loopp->addStmtsp(new AstIf{
+                        flp, new AstEq{flp, cnt(), new AstConst{flp, AstConst::Signed32{}, 0}},
+                        skipp,
+                        new AstIf{
+                            flp,
+                            new AstLogAnd{
+                                flp, new AstLtS{flp, pos(), len()},
+                                new AstEq{flp, new AstGetcN{flp, linep->cloneTree(false), pos()},
+                                          new AstConst{flp, AstConst::Signed32{}, '_'}}},
+                            new AstAssign{flp, new AstVarRef{flp, posp, VAccess::WRITE},
+                                          new AstAdd{flp, pos(),
+                                                     new AstConst{flp, AstConst::Signed32{}, 1}}},
+                            nullptr}});
+                }
                 // The line may run out, or hold a character this radix has no
                 // meaning for; either way there is no value and GOOD says so
                 AstNode* const stopp = AstNode::addNext(
@@ -29090,6 +29110,29 @@ private:
                     new AstAdd{flp, new AstVarRef{flp, cntp, VAccess::READ},
                                new AstConst{flp, AstConst::Signed32{}, 1}}});
                 outp = AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+                // Digits say more bits than the value has when its length is
+                // no multiple of the radix's: those of the first digit that
+                // have no place must be zero, or there is no value
+                const int64_t spare = chars * per - bits;
+                if (!run.objp && spare > 0) {
+                    outp = AstNode::addNext(
+                        outp,
+                        static_cast<AstNode*>(new AstIf{
+                            flp,
+                            new AstLogAnd{
+                                flp, new AstVarRef{flp, okp, VAccess::READ},
+                                new AstGteS{
+                                    flp,
+                                    new AstAtoN{flp,
+                                                new AstSubstrN{
+                                                    flp, new AstVarRef{flp, accp, VAccess::READ},
+                                                    new AstConst{flp, AstConst::Signed32{}, 0},
+                                                    new AstConst{flp, AstConst::Signed32{}, 0}},
+                                                fmt},
+                                    new AstConst{flp, AstConst::Signed32{},
+                                                 static_cast<int32_t>(1 << (per - spare))}}},
+                            setOk(false), nullptr}));
+                }
                 AstNode* takep = nullptr;
                 if (run.objp) {
                     takep = runningReadTake(
@@ -29110,9 +29153,22 @@ private:
                         new AstSubstrN{flp, linep->cloneTree(false), pos(),
                                        new AstSub{flp, len(),
                                                   new AstConst{flp, AstConst::Signed32{}, 1}}}}));
+                // What a radix read that fails leaves on the line the
+                // standard does not say. GHDL leaves all of it; nvc and
+                // Questa take what was read, Questa up to the character that
+                // could not be -- which is what is done here, as the least
+                // that two of the three agree on.
+                AstNode* failp = nullptr;
+                if (name != "read") {
+                    failp = new AstAssign{
+                        flp, linep->cloneTree(false),
+                        new AstSubstrN{
+                            flp, linep->cloneTree(false), pos(),
+                            new AstSub{flp, len(), new AstConst{flp, AstConst::Signed32{}, 1}}}};
+                }
                 outp = AstNode::addNext(
                     outp, static_cast<AstNode*>(new AstIf{
-                              flp, new AstVarRef{flp, okp, VAccess::READ}, takep, nullptr}));
+                              flp, new AstVarRef{flp, okp, VAccess::READ}, takep, failp}));
                 if (args.size() == 3) {
                     if (AstNodeExpr* const goodp = lowerExpr(args[2])) {
                         outp = AstNode::addNext(
