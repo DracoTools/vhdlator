@@ -21811,11 +21811,79 @@ private:
         return anyWave && !anyValue;
     }
 
+    // std.env's STOP and FINISH end the run where they are called (16.5):
+    // the process that called them goes no further, the other processes of
+    // the cycle run, and the simulation ends -- what nvc 1.22.1 and Questa
+    // 2025.2 do. Verilog's $finish, which they lower to, only records that
+    // the run is to end, and what follows it still runs: a testbench that
+    // should have stopped at its first error went on and reported the next
+    // sixty-eight. So what can reach one of them is known, and after a
+    // statement that calls it the run is asked whether it has been told to
+    // end; if so a subprogram returns at once and a process waits for good.
+    std::map<const VhdlSymbol*, int> m_mayStop;  // 1 yes, 0 no, 2 being worked out
+    static bool isStopSym(const VhdlSymbol* symp) {
+        return symp && symp->predefined() && symp->kind() == VhdlSymKind::PROCEDURE
+               && (symp->name() == "stop" || symp->name() == "finish");
+    }
+    bool symMayStop(const VhdlSymbol* symp) {
+        if (!symp) return false;
+        symp = symp->resolved();
+        if (isStopSym(symp)) return true;
+        if (symp->kind() != VhdlSymKind::FUNCTION && symp->kind() != VhdlSymKind::PROCEDURE) {
+            return false;
+        }
+        const auto it = m_mayStop.find(symp);
+        if (it != m_mayStop.end()) return it->second == 1;
+        m_mayStop[symp] = 2;
+        AstVhdlSubprogDecl* const declp = declOf(const_cast<VhdlSymbol*>(symp));
+        const bool yes = declp && declp->stmtsp() && nodesMayStop(declp->stmtsp(), true);
+        m_mayStop[symp] = yes ? 1 : 0;
+        return yes;
+    }
+    // Whether anything in these statements calls what may stop the run
+    bool nodesMayStop(AstNode* nodep, bool andNext) {
+        bool yes = false;
+        const auto onep = [&](AstNodeVhdlExpr* exprp) {
+            if (yes || !exprp->vhdlSymp()) return;
+            if (symMayStop(exprp->vhdlSymp())) yes = true;
+        };
+        if (andNext) {
+            nodep->foreachAndNext(onep);
+        } else {
+            nodep->foreach(onep);
+        }
+        return yes;
+    }
+    // What a statement that may have stopped the run is followed by
+    AstNode* stopCheckAfter(AstNode* stmtp) {
+        const bool isCall = VN_IS(stmtp, VhdlProcCall);
+        // In a subprogram the check follows a procedure call and nothing
+        // else: a function the back end evaluates while elaborating has to
+        // stay something it can evaluate, and a call is where one that can
+        // stop the run is not that anyway
+        if (m_ftaskp ? !isCall : !v3Global.opt.timing().isTrue()) return nullptr;
+        if (!nodesMayStop(stmtp, false)) return nullptr;
+        FileLine* const flp = stmtp->fileline();
+        AstNode* thenp = nullptr;
+        if (AstFunc* const funcp = VN_CAST(m_ftaskp, Func)) {
+            AstVar* const retVarp = VN_CAST(funcp->fvarp(), Var);
+            if (!retVarp) return nullptr;
+            thenp = new AstReturn{flp, new AstVarRef{flp, retVarp, VAccess::READ}};
+        } else if (m_ftaskp) {
+            thenp = new AstReturn{flp, nullptr};
+        } else {
+            thenp = new AstWait{flp, new AstConst{flp, AstConst::BitFalse{}}, nullptr};
+        }
+        return new AstIf{flp, new AstCExpr{flp, "vlSymsp->_vm_contextp__->gotFinish()", 1}, thenp,
+                         nullptr};
+    }
+
     AstNode* lowerStmts(AstNode* stmtsp) {
         AstNode* outp = nullptr;
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
             const int before = V3Error::errorCount();
-            AstNode* const onep = lowerStmt(VN_AS(p, NodeVhdlStmt));
+            AstNode* onep = lowerStmt(VN_AS(p, NodeVhdlStmt));
+            if (onep) onep = AstNode::addNextNull(onep, stopCheckAfter(p));
             // A statement that lowers to nothing has to have said why: "null"
             // is the one that means nothing, and everything else that gives
             // nothing back has reported it. Saying nothing and emitting
