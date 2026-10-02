@@ -9188,8 +9188,15 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
                 // A string or bit-string literal names no type of its own,
                 // only that it must be an array. Where the element is not an
                 // array, the whole run is the only reading left.
+                // Nor does an aggregate, which must be of a composite type:
+                // "(9, 8, (1, 2))" of an array of integers.
+                const VhdlTypeKind elemKind = elemTypep->base()->kind();
                 if (cs.types.empty() && cs.need == CandSet::Need::ARRAY
-                    && elemTypep->base()->kind() != VhdlTypeKind::ARRAY) {
+                    && elemKind != VhdlTypeKind::ARRAY) {
+                    asWhole = true;
+                } else if (cs.types.empty() && VN_IS(eap->valuep(), VhdlAggregate)
+                           && elemKind != VhdlTypeKind::ARRAY
+                           && elemKind != VhdlTypeKind::RECORD) {
                     asWhole = true;
                 } else if (cs.types.empty()) {
                     asElement = true;

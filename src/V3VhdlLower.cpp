@@ -16410,8 +16410,39 @@ private:
                 }
             }
             if (spanAt[static_cast<size_t>(i)] > 1 && !packed && !asString) {
-                unsup(flp, "aggregate with a run of elements given at once");
-                return nullptr;
+                // A value of the aggregate's own type standing for several
+                // elements at once (9.3.3.3) is written out an element at a
+                // time, the way an operand of a concatenation is
+                const int64_t span = spanAt[static_cast<size_t>(i)];
+                AstNodeExpr* runp = lowerExpr(valuep);
+                VhdlType* const runTypep = runp ? concatOperandType(valuep, runp) : nullptr;
+                int64_t have = -1;
+                if (const AstPattern* const patp = VN_CAST(runp, Pattern)) {
+                    have = 0;
+                    for (AstNode* ip = patp->itemsp(); ip; ip = ip->nextp()) ++have;
+                } else if (runTypep && runTypep->isConstrainedArray()) {
+                    const VhdlType* const ridxp = indexSubtype(runTypep, 0);
+                    if (ridxp && ridxp->bounded()) have = ridxp->length();
+                }
+                if (!runp || have != span || !canExpand(runTypep, runp)) {
+                    if (runp) VL_DO_DANGLING(runp->deleteTree(), runp);
+                    unsup(flp, "aggregate with a run of elements given at once");
+                    return nullptr;
+                }
+                AstNode* heldp = nullptr;
+                if (!VN_IS(runp, Pattern) && !repeatable(runp)) {
+                    AstVar* const tmpp = newTempVar("__Vrun", lowerType(runTypep, flp), flp);
+                    heldp = new AstAssign{flp, wr(tmpp, flp), runp};
+                    runp = rd(tmpp, flp);
+                }
+                AstNode* const membersp = concatMembers(runTypep, runp, flp);
+                if (heldp) {
+                    AstPatMember* const firstp = VN_AS(membersp, PatMember);
+                    AstNodeExpr* const firstValp = firstp->lhssp()->unlinkFrBack();
+                    firstp->addLhssp(new AstExprStmt{flp, heldp, firstValp});
+                }
+                itemsp = AstNode::addNextNull(itemsp, membersp);
+                continue;
             }
             AstNodeExpr* elemp = lowerExpr(valuep);
             if (!elemp) return nullptr;
