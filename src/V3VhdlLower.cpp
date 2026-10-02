@@ -17129,6 +17129,15 @@ private:
             }
         }
         if (!known) return new AstConst{flp, AstConst::String{}, ":" + written + ":"};
+        // An alias is a named entity of its own (6.6.1), declared where it is
+        // written: its path ends in its own name, not in the name of what it
+        // denotes, as its simple name already does
+        if (const VhdlSymbol* const namedp = nodep->prefixp()->vhdlSymp()) {
+            if (namedp->kind() == VhdlSymKind::ALIAS && !parts.empty() && !region
+                && !namedp->name().empty()) {
+                parts.back() = namedp->name();
+            }
+        }
         const std::string tail = pathTail(parts, region);
         // A name a package declares is not part of the design hierarchy at
         // all, so its path starts at the library the package was analyzed
@@ -30232,6 +30241,9 @@ private:
         // belongs to the module the call is in: reused from another module
         // it would name a subprogram that is not in scope there
         m_signalCopies.clear();
+        // As does a driver's task: a unit lowered again -- for another
+        // binding of it -- emits its own, and the one before is gone
+        m_waveTasks.clear();
         m_emitting.clear();
         m_drivers.clear();
         m_subDrivers.clear();
