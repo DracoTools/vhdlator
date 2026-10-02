@@ -9316,6 +9316,52 @@ private:
                 m_needForce.insert(symp);
             }
         });
+        // A procedure that forces or releases a signal parameter does so to
+        // whatever signal each call passes (4.2.2.3), so that signal is one
+        // that is forced even where nothing forces it by name
+        nodep->foreachAndNext([this](AstVhdlProcCall* pcallp) {
+            AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+            VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nullptr;
+            VhdlSymbol* const csymp = namedp ? namedp->resolved() : nullptr;
+            AstVhdlSubprogDecl* const declp = csymp ? declOf(csymp) : nullptr;
+            if (!declp || !declp->stmtsp()) return;
+            // Which of its formals it forces
+            std::set<const VhdlSymbol*> forced;
+            declp->stmtsp()->foreachAndNext([&](AstVhdlSigAssign* asgp) {
+                if (!asgp->force() && !asgp->release()) return;
+                if (const VhdlSymbol* const fsymp = rootSymOf(asgp->targetp())) {
+                    forced.insert(fsymp->resolved());
+                }
+            });
+            if (forced.empty()) return;
+            std::vector<const AstVhdlIfaceDecl*> formals;
+            for (AstNode* fp = firstParamOf(declp); fp; fp = fp->nextp()) {
+                formals.push_back(VN_CAST(fp, VhdlIfaceDecl));
+            }
+            size_t pos = 0;
+            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+                AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                if (!asp || !asp->actualp()) continue;
+                const AstVhdlIfaceDecl* formalp = nullptr;
+                if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                    for (const AstVhdlIfaceDecl* const onep : formals) {
+                        if (onep && onep->name() == fnamep->name()) formalp = onep;
+                    }
+                } else if (!asp->formalp() && pos < formals.size()) {
+                    formalp = formals[pos];
+                }
+                if (!formalp || !formalp->vhdlSymp()
+                    || !forced.count(formalp->vhdlSymp()->resolved())) {
+                    continue;
+                }
+                const VhdlSymbol* const actp = objectBehind(rootSymOf(asp->actualp()));
+                if (actp
+                    && (actp->kind() == VhdlSymKind::SIGNAL
+                        || actp->kind() == VhdlSymKind::PORT)) {
+                    m_needForce.insert(actp);
+                }
+            }
+        });
     }
 
     void makeForced(FileLine* flp) {
@@ -9356,7 +9402,18 @@ private:
             // reader may be moved inside the function that reads it, and
             // these two have to keep what they hold from one evaluation to
             // the next.
-            if (sigp->valuep()) {
+            if (sigp->varType() == VVarType::TRIWIRE) {
+                // A signal with several drivers is a net they are resolved
+                // onto. Forced, it is what the force and the resolved value
+                // are chosen between, written from a process -- so the net
+                // is what the drivers add up to, and the signal the variable
+                // that takes one or the other
+                fc.drvp->varType(VVarType::TRIWIRE);
+                sigp->varType(VVarType::VAR);
+                if (AstNodeExpr* const def2p = defaultValueFor(symp->typep(), flp, true)) {
+                    fc.valp->valuep(def2p);
+                }
+            } else if (sigp->valuep()) {
                 fc.drvp->valuep(VN_AS(sigp->valuep()->cloneTree(false), NodeExpr));
                 fc.valp->valuep(VN_AS(sigp->valuep()->cloneTree(false), NodeExpr));
             } else {
@@ -9423,13 +9480,18 @@ private:
 
     // The left-hand side of an ordinary driver. For a signal something else
     // forces, that is the variable the drivers keep rather than the signal.
+    bool m_viaDriver = false;  // Lowering the target of one driver of several
     AstNodeExpr* lowerDriveTarget(AstNodeVhdlExpr* targetp) {
         // A slice being written names the object's own places; only a slice
         // being read is a value with bounds of its own
         VL_RESTORER(m_asTarget);
         m_asTarget = true;
         VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(targetp));
-        const auto it = rootp ? m_forceDrv.find(rootp->resolved()) : m_forceDrv.end();
+        // Where the signal has several drivers this is one of them, and
+        // writes its own value: what they add up to is what the force stands
+        // against, not each of them
+        const auto it
+            = rootp && !m_viaDriver ? m_forceDrv.find(rootp->resolved()) : m_forceDrv.end();
         if (it == m_forceDrv.end()) {
             AstNodeExpr* const outp = lowerExpr(targetp);
             // A signal another unit forces keeps what its drivers write
@@ -19375,7 +19437,12 @@ private:
         const bool hadKey = keyIt != m_vars.end();
         AstVar* const savedKeyp = hadKey ? keyIt->second : nullptr;
         m_vars[keyp] = drvVarp;
-        AstNodeExpr* const outp = lowerDriveTarget(targetp);
+        AstNodeExpr* outp = nullptr;
+        {
+            VL_RESTORER(m_viaDriver);
+            m_viaDriver = true;
+            outp = lowerDriveTarget(targetp);
+        }
         if (hadKey) {
             m_vars[keyp] = savedKeyp;
         } else {
