@@ -12521,6 +12521,139 @@ private:
         return refp;
     }
 
+    // Whether two values of one type are known here to be of different
+    // shapes: some dimension of one longer than the other's, at the top or
+    // in an element. The top level of a one-dimensional array is not asked,
+    // being compared by length where it stands.
+    static bool shapesDiffer(const VhdlType* ltypep, const VhdlType* rtypep, bool top,
+                             int depth = 0) {
+        if (!ltypep || !rtypep || depth > 8 || ltypep->base() != rtypep->base()) return false;
+        if (ltypep->base()->kind() == VhdlTypeKind::RECORD) {
+            const auto& lelems = ltypep->elements();
+            const auto& relems = rtypep->elements();
+            if (lelems.size() != relems.size()) return false;
+            for (size_t i = 0; i < lelems.size(); ++i) {
+                if (shapesDiffer(lelems[i]->typep(), relems[i]->typep(), false, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (ltypep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!ltypep->isConstrainedArray() || !rtypep->isConstrainedArray()) return false;
+        if (ltypep->dimensions() != rtypep->dimensions()) return false;
+        if (!top || ltypep->dimensions() >= 2) {
+            for (size_t d = 0; d < ltypep->dimensions(); ++d) {
+                const VhdlType* const lip = indexSubtype(ltypep, d);
+                const VhdlType* const rip = indexSubtype(rtypep, d);
+                if (lip && rip && lip->bounded() && rip->bounded()
+                    && lip->length() != rip->length()) {
+                    return true;
+                }
+            }
+        }
+        return shapesDiffer(ltypep->elementp() ? ltypep->elementp() : ltypep->base()->elementp(),
+                            rtypep->elementp() ? rtypep->elementp() : rtypep->base()->elementp(),
+                            false, depth + 1);
+    }
+
+    static const VhdlType* elementTypeOf(const VhdlType* typep) {
+        return typep->elementp() ? typep->elementp() : typep->base()->elementp();
+    }
+
+    // Whether two subtypes of one type hold a record somewhere whose
+    // elements are numbered differently in the two
+    static bool recordBoundsDiffer(const VhdlType* ltypep, const VhdlType* rtypep,
+                                   bool inRecord = false, int depth = 0) {
+        if (!ltypep || !rtypep || depth > 8 || ltypep->base() != rtypep->base()) return false;
+        if (ltypep->base()->kind() == VhdlTypeKind::RECORD) {
+            const auto& lelems = ltypep->elements();
+            const auto& relems = rtypep->elements();
+            if (lelems.size() != relems.size()) return false;
+            for (size_t i = 0; i < lelems.size(); ++i) {
+                if (recordBoundsDiffer(lelems[i]->typep(), relems[i]->typep(), true, depth + 1)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (ltypep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!ltypep->isConstrainedArray() || !rtypep->isConstrainedArray()) return false;
+        if (ltypep->dimensions() != 1 || rtypep->dimensions() != 1) return false;
+        const VhdlType* const lip = indexSubtype(ltypep, 0);
+        const VhdlType* const rip = indexSubtype(rtypep, 0);
+        if (!lip || !rip || !lip->bounded() || !rip->bounded()) return false;
+        if (inRecord && (lip->left() != rip->left() || lip->ascending() != rip->ascending())
+            && lip->length() == rip->length()) {
+            return true;
+        }
+        return recordBoundsDiffer(elementTypeOf(ltypep), elementTypeOf(rtypep), inRecord,
+                                  depth + 1);
+    }
+
+    // Two values of one shape compared an element and a member at a time.
+    // Both are read once per scalar, so both are names.
+    AstNodeExpr* deepEquality(AstNodeExpr* lp, AstNodeExpr* rp, const VhdlType* ltypep,
+                              const VhdlType* rtypep, FileLine* flp, int depth = 0) {
+        if (!ltypep || !rtypep || depth > 8) return nullptr;
+        const auto both = [&](AstNodeExpr* accp, AstNodeExpr* nextp) -> AstNodeExpr* {
+            return accp ? new AstLogAnd{flp, accp, nextp} : nextp;
+        };
+        if (ltypep->base()->kind() == VhdlTypeKind::RECORD) {
+            const auto& lelems = ltypep->elements();
+            const auto& relems = rtypep->elements();
+            AstNodeExpr* outp = nullptr;
+            for (size_t i = 0; i < lelems.size(); ++i) {
+                AstNodeExpr* const lmp = new AstMemberSel{flp, lp->cloneTree(false),
+                                                          VFlagChildDType{}, lelems[i]->name()};
+                AstNodeExpr* const rmp = new AstMemberSel{flp, rp->cloneTree(false),
+                                                          VFlagChildDType{}, relems[i]->name()};
+                AstNodeExpr* const eqp = deepEquality(lmp, rmp, lelems[i]->typep(),
+                                                      relems[i]->typep(), flp, depth + 1);
+                VL_DO_DANGLING(lmp->deleteTree(), lmp);
+                VL_DO_DANGLING(rmp->deleteTree(), rmp);
+                if (!eqp) {
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;
+                }
+                outp = both(outp, eqp);
+            }
+            return outp;
+        }
+        if (ltypep->base()->kind() == VhdlTypeKind::ARRAY
+            && recordBoundsDiffer(ltypep, rtypep, true)) {
+            const VhdlType* const lip = indexSubtype(ltypep, 0);
+            const VhdlType* const rip = indexSubtype(rtypep, 0);
+            if (!lip || !rip || !lip->bounded() || !rip->bounded()
+                || lip->length() != rip->length() || lip->length() > 4096) {
+                return nullptr;
+            }
+            AstNodeExpr* outp = nullptr;
+            for (int64_t k = 0; k < lip->length(); ++k) {
+                const int64_t lat = lip->ascending() ? lip->left() + k : lip->left() - k;
+                const int64_t rat = rip->ascending() ? rip->left() + k : rip->left() - k;
+                AstNodeExpr* const lsp = new AstSelBit{flp, lp->cloneTree(false),
+                                                       i32(static_cast<int32_t>(lat), flp)};
+                AstNodeExpr* const rsp = new AstSelBit{flp, rp->cloneTree(false),
+                                                       i32(static_cast<int32_t>(rat), flp)};
+                AstNodeExpr* const eqp = deepEquality(lsp, rsp, elementTypeOf(ltypep),
+                                                      elementTypeOf(rtypep), flp, depth + 1);
+                VL_DO_DANGLING(lsp->deleteTree(), lsp);
+                VL_DO_DANGLING(rsp->deleteTree(), rsp);
+                if (!eqp) {
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    return nullptr;
+                }
+                outp = both(outp, eqp);
+            }
+            return outp;
+        }
+        if (ltypep->base()->kind() == VhdlTypeKind::FLOATING) {
+            return new AstEqD{flp, lp->cloneTree(false), rp->cloneTree(false)};
+        }
+        return new AstEq{flp, lp->cloneTree(false), rp->cloneTree(false)};
+    }
+
     static bool isArrayOperand(const AstNodeVhdlExpr* nodep) {
         const VhdlType* const typep = nodep ? nodep->vhdlTypep() : nullptr;
         return typep && typep->base()->kind() == VhdlTypeKind::ARRAY;
@@ -13048,6 +13181,39 @@ private:
             if (isLogicArray(ltypep) && isLogicArray(rtypep)
                 && (writtenWithMetavalue(nodep->lhsp()) || writtenWithMetavalue(nodep->rhsp()))) {
                 if (AstNodeExpr* const outp = openPortIs(nodep, flp)) return outp;
+            }
+        }
+        // Two arrays are equal only where each dimension of one is as long
+        // as that of the other (9.2.3). Of one dimension that is asked while
+        // running or is two vectors of different widths; of more than one,
+        // or of elements that are themselves of different lengths, two
+        // shapes are two types to the back end, which will not compare
+        // them, and the answer is known here.
+        if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
+            && (!symp || symp->predefined()) && shapesDiffer(ltypep, rtypep, true)) {
+            return nodep->op() == VhdlBinaryOp::EQ ? new AstConst{flp, AstConst::BitFalse{}}
+                                                   : new AstConst{flp, AstConst::BitTrue{}};
+        }
+        // Of the same shape but numbered differently inside a record --
+        // "y(1 to 3)" in one and "y(0 to 2)" in the other -- the two are
+        // two structures to the back end, and are compared a member at a
+        // time
+        if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
+            && (!symp || symp->predefined()) && recordBoundsDiffer(ltypep, rtypep)) {
+            AstNodeExpr* const lp = lowerExpr(nodep->lhsp());
+            AstNodeExpr* const rp = lp ? lowerExpr(nodep->rhsp()) : nullptr;
+            if (lp && rp && repeatable(lp) && repeatable(rp)) {
+                AstNodeExpr* const eqp = deepEquality(lp, rp, ltypep, rtypep, flp);
+                VL_DO_DANGLING(lp->deleteTree(), lp);
+                VL_DO_DANGLING(rp->deleteTree(), rp);
+                if (eqp) {
+                    return nodep->op() == VhdlBinaryOp::EQ
+                               ? eqp
+                               : static_cast<AstNodeExpr*>(new AstLogNot{flp, eqp});
+                }
+            } else {
+                if (lp) VL_DO_DANGLING(lp->deleteTree(), lp);
+                if (rp) VL_DO_DANGLING(rp->deleteTree(), rp);
             }
         }
         // What an access value points at carries its own bounds too, and is
