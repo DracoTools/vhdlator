@@ -10620,8 +10620,20 @@ private:
             m_vars[symp] = found->second;
             return found->second;
         }
-        AstVar* const varp = newVar(symp, VVarType::VAR, flp);
-        varp->valuep(lowerValue(symp->value(), symp->typep(), flp));
+        // A parameter, since its value is a literal: that is what lets an
+        // instance hand it to a generic -- "generic map (init => c_init)" --
+        // or to a function a generic's value calls, both of which the back
+        // end has to fold, and a parameter carries its range as an object
+        // does. A protected type's body is a class, which keeps an object.
+        // Nor is one that holds 'Z': driven onto a signal it has to release
+        // it, which is worked out for an object and not for a parameter.
+        AstNodeExpr* const valuep = lowerValue(symp->value(), symp->typep(), flp);
+        const bool highZ = symp->value().isStr()
+                           && symp->value().toStr().find_first_of("Zz") != std::string::npos
+                           && isNineValuedOrArray(symp->typep());
+        AstVar* const varp = newVar(
+            symp, valuep && !m_protClassp && !highZ ? VVarType::LPARAM : VVarType::VAR, flp);
+        varp->valuep(valuep);
         if (m_protClassp) {
             m_protClassp->addStmtsp(varp);
         } else if (!shareObjectIntoUnit(symp, varp)) {
@@ -21621,6 +21633,25 @@ private:
                 if (symp && symp->kind() == VhdlSymKind::GENERIC) own = true;
             });
             if (!own) out.emplace(pair.second, defp);
+        }
+        // A unit that instantiates itself -- "fft" handing "even_elem(w)" to
+        // its own w, or "sub" handing "width / 2" to its own width -- names
+        // one symbol on both sides, and standing that expression in for it
+        // would define it in terms of itself, without end. Such a generic
+        // keeps its own object.
+        std::set<const VhdlSymbol*> formals;
+        for (const auto& pair : out) {
+            if (pair.first) formals.insert(pair.first->resolved());
+        }
+        for (auto it = out.begin(); it != out.end();) {
+            bool selfp = false;
+            if (it->second) {
+                it->second->foreach([&](const AstVhdlName* namep) {
+                    const VhdlSymbol* const nsymp = namep->vhdlSymp();
+                    if (nsymp && formals.count(nsymp->resolved())) selfp = true;
+                });
+            }
+            it = selfp ? out.erase(it) : std::next(it);
         }
         return out;
     }

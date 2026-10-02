@@ -2151,7 +2151,16 @@ private:
     void retargetInstance(AstVhdlInstance* nodep, const std::string& newName,
                           const std::vector<AstVhdlIfaceDecl*>& generics,
                           const std::vector<AstVhdlAssoc*>& assocs) VL_MT_DISABLED;
-    void bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) VL_MT_DISABLED;
+    void bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep,
+                               bool late = false) VL_MT_DISABLED;
+    // Instances whose unconstrained generic was given a value with no length
+    // yet -- a call, or a constant whose own bounds come from one
+    std::vector<std::pair<AstVhdlInstance*, VhdlScope*>> m_lateOpenGenerics;
+
+public:
+    void rebindOpenGenerics() VL_MT_DISABLED;
+
+private:
     void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
     bool defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim, int64_t& leftr,
                        int64_t& rightr, bool* ascendingp = nullptr) VL_MT_DISABLED;
@@ -7266,6 +7275,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     for (int round = 0; round < 8; ++round) {
         if (!visitor.reconstrainDecls(unitsp)) break;
     }
+    visitor.rebindOpenGenerics();
     visitor.spreadElabConstants(unitsp);
     // A resolution function is called once per resolved signal rather than
     // from anywhere in the source, so its copy is made here rather than by
@@ -14220,7 +14230,21 @@ static bool genericMapNames(const AstVhdlInstance* nodep, const std::string& nam
     return false;
 }
 
-void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep) {
+// What a call returns is as long as the copy made for its actuals says, and
+// a constant given such a value takes its bounds from it; both are settled
+// only once the whole design has been analyzed. An instance that hands either
+// to an unconstrained generic is asked again then.
+void VhdlSemVisitor::rebindOpenGenerics() {
+    const std::vector<std::pair<AstVhdlInstance*, VhdlScope*>> latep = m_lateOpenGenerics;
+    for (const auto& pair : latep) {
+        VL_RESTORER(m_scopep);
+        m_scopep = pair.second;
+        bindOpenGenericBounds(pair.first, pair.second, true);
+    }
+}
+
+void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* unitScopep,
+                                           bool late) {
     if (!unitScopep) return;
     const auto it = m_openBounds.find(unitScopep);
     if (it == m_openBounds.end()) return;
@@ -14250,7 +14274,10 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
         int64_t left = 0;
         int64_t right = 0;
         bool ascending = false;
-        if (!defaultBounds(found[0], actualp, bound.dim, left, right, &ascending)) continue;
+        if (!defaultBounds(found[0], actualp, bound.dim, left, right, &ascending)) {
+            if (!late) m_lateOpenGenerics.emplace_back(nodep, unitScopep);
+            continue;
+        }
         FileLine* const flp = nodep->fileline();
         if (genericMapNames(nodep, bound.leftName)) continue;
         // Which way round the actual runs goes with its bounds: "101" for a
