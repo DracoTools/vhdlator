@@ -1263,8 +1263,10 @@ class WidthVisitor final : public VNVisitor {
             iterateCheckSizedSelf(nodep, "Bit select", nodep->bitp(), SELF, BOTH);
             userIterateAndNext(nodep->fromp(), WidthVP{SELF, BOTH}.p());
             //
-            int frommsb;
-            int fromlsb;
+            // 64 bit, as a range that starts at the most negative int has a
+            // span that does not fit in one
+            int64_t frommsb;
+            int64_t fromlsb;
             const AstNodeDType* const fromDtp = nodep->fromp()->dtypep()->skipRefp();
             if (const AstUnpackArrayDType* const adtypep = VN_CAST(fromDtp, UnpackArrayDType)) {
                 frommsb = adtypep->hi();
@@ -1279,7 +1281,8 @@ class WidthVisitor final : public VNVisitor {
                 nodep->v3fatalSrc("Array reference exceeds dimension of array");
                 frommsb = fromlsb = 0;
             }
-            const int selwidth = V3Number::log2b(frommsb + 1 - 1) + 1;  // Width to address a bit
+            const int selwidth = V3Number::log2b(static_cast<uint32_t>(frommsb + 1 - 1))
+                                 + 1;  // Width to address a bit
             AstNodeDType* const selwidthDTypep
                 = nodep->findLogicDType(selwidth, selwidth, nodep->bitp()->dtypep()->numeric());
             if (widthBad(nodep->bitp(), selwidthDTypep) && nodep->bitp()->width() != 32) {
