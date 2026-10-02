@@ -134,7 +134,22 @@ class SliceVisitor final : public VNVisitor {
                 const AstNodeDType* itemRawDTypep = itemp->dtypep()->skipRefp();
                 const VCastable castable
                     = AstNode::computeCastable(expectedItemDTypep, itemRawDTypep, itemp);
-                if (castable == VCastable::SAMEISH || castable == VCastable::COMPATIBLE) {
+                // A slice of an unpacked array is an array of its own range,
+                // which is the element where the element is an array of as
+                // many of the same thing
+                bool sameShape = false;
+                {
+                    const AstUnpackArrayDType* const expArrp
+                        = VN_CAST(expectedItemDTypep, UnpackArrayDType);
+                    const AstUnpackArrayDType* const itemArrp
+                        = VN_CAST(itemRawDTypep, UnpackArrayDType);
+                    sameShape = expArrp && itemArrp
+                                && expArrp->elementsConst() == itemArrp->elementsConst()
+                                && expArrp->subDTypep()->skipRefp()->similarDType(
+                                    itemArrp->subDTypep()->skipRefp());
+                }
+                if (castable == VCastable::SAMEISH || castable == VCastable::COMPATIBLE
+                    || sameShape) {
                     if (i == elemIdx) {
                         newp = itemp->cloneTree(false, !directItem && needPure);
                         break;
