@@ -24996,6 +24996,22 @@ private:
                       && (isLineType(args[0]->vhdlTypep())
                           || args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::FILE));
             if (textio) {
+                // Which formal each actual is for: JUSTIFIED, FIELD, DIGITS
+                // and UNIT are optional and are as often named as placed
+                VL_RESTORER_COPY(m_txtArgs);
+                m_txtArgs.clear();
+                size_t pos = 0;
+                for (AstNode* p = callp ? callp->argsp() : nullptr; p; p = p->nextp(), ++pos) {
+                    AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                    if (!asp || !asp->actualp()) continue;
+                    std::string formal;
+                    if (const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName)) {
+                        formal = fnamep->name();
+                    } else if (!asp->formalp() && pos < symp->paramTypes().size()) {
+                        formal = symp->paramName(pos);
+                    }
+                    if (!formal.empty()) m_txtArgs[VString::downcase(formal)] = asp->actualp();
+                }
                 if (AstNode* const outp = lowerTextioProc(symp->name(), args, flp)) return outp;
             }
         }
@@ -27766,6 +27782,60 @@ private:
     // The procedures of std.textio and the implicit file operations (5.5.2,
     // 16.4). A LINE is a string here, so building one is string concatenation
     // and writing it is a formatted write -- neither needs a runtime object.
+    std::map<std::string, AstNodeVhdlExpr*> m_txtArgs;  // Formal -> actual, of a textio call
+
+    // What a WRITE appends: the item, in a field at least FIELD characters
+    // wide, against the right of it or the left as JUSTIFIED says (16.4).
+    // Blanks make up the difference, and an item longer than the field is
+    // written whole.
+    AstNode* appendItem(AstNodeExpr* linep, AstNodeExpr* textp, FileLine* origFlp) {
+        const auto fieldIt = m_txtArgs.find("field");
+        AstNodeVhdlExpr* const fieldVp = fieldIt == m_txtArgs.end() ? nullptr : fieldIt->second;
+        if (fieldVp) {
+            const VhdlValue fv = V3VhdlEval::eval(fieldVp);
+            if (fv.isInt() && fv.toInt() <= 0) {
+                return new AstAssign{origFlp, linep,
+                                     new AstConcatN{origFlp, linep->cloneTree(false), textp}};
+            }
+        }
+        AstNodeExpr* const fieldp = fieldVp ? lowerExpr(fieldVp) : nullptr;
+        if (!fieldp) {
+            return new AstAssign{origFlp, linep,
+                                 new AstConcatN{origFlp, linep->cloneTree(false), textp}};
+        }
+        FileLine* const flp = new FileLine{origFlp};
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        AstVar* const itemp
+            = newTempVar("__Vwritem", new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+        AstVar* const padp
+            = newTempVar("__Vwrpad", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+        AstNode* outp = new AstAssign{flp, wr(itemp, flp), textp};
+        outp->addNext(new AstAssign{flp, wr(padp, flp),
+                                    new AstSub{flp, fieldp, new AstLenN{flp, rd(itemp, flp)}}});
+        outp->addNext(new AstIf{
+            flp, new AstLtS{flp, rd(padp, flp), new AstConst{flp, AstConst::Signed32{}, 0}},
+            new AstAssign{flp, wr(padp, flp), new AstConst{flp, AstConst::Signed32{}, 0}},
+            nullptr});
+        const auto blanks = [&]() {
+            return new AstReplicateN{flp, new AstConst{flp, AstConst::String{}, " "},
+                                     rd(padp, flp)};
+        };
+        // SIDE is (RIGHT, LEFT), and RIGHT is what is meant where none is said
+        const auto justIt = m_txtArgs.find("justified");
+        AstNodeExpr* const justp = justIt == m_txtArgs.end() ? nullptr : lowerExpr(justIt->second);
+        AstNodeExpr* const rightp = new AstConcatN{flp, blanks(), rd(itemp, flp)};
+        AstNodeExpr* paddedp = rightp;
+        if (justp) {
+            paddedp = new AstCond{
+                flp, new AstNeq{flp, justp, new AstConst{flp, AstConst::Signed32{}, 0}},
+                new AstConcatN{flp, rd(itemp, flp), blanks()}, rightp};
+        }
+        outp->addNext(
+            new AstAssign{flp, linep, new AstConcatN{flp, linep->cloneTree(false), paddedp}});
+        return outp;
+    }
+
     AstNode* lowerTextioProc(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
                              FileLine* flp) {
         if (name == "file_open") return lowerFileOpen(args, flp);
@@ -27828,6 +27898,9 @@ private:
         if (name == "read" || name == "hread" || name == "oread" || name == "bread") {
             return lowerTextioRead(name, args, flp);
         }
+        if ((name == "sread" || name == "string_read") && args.size() == 3) {
+            return lowerTextioSread(args, flp);
+        }
         if (name == "deallocate" && args.size() == 1) {
             AstNodeExpr* const linep = lowerExpr(args[0]);
             if (!linep) return nullptr;
@@ -27858,8 +27931,7 @@ private:
         // at a time, which no format can do
         if (radix.empty() || radix == "%b") {
             if (AstNodeExpr* const dtextp = dynTextOf(args[1], flp)) {
-                return new AstAssign{flp, linep,
-                                     new AstConcatN{flp, linep->cloneTree(false), dtextp}};
+                return appendItem(linep, dtextp, flp);
             }
         }
         // A physical value is written in a unit, NS unless the call names one
@@ -27868,8 +27940,7 @@ private:
             AstNodeExpr* const unitTextp
                 = physicalText(args[1], args.size() >= 5 ? args[4] : nullptr, flp);
             if (!unitTextp) return nullptr;
-            return new AstAssign{flp, linep,
-                                 new AstConcatN{flp, linep->cloneTree(false), unitTextp}};
+            return appendItem(linep, unitTextp, flp);
         }
         AstNodeExpr* const valuep = lowerExpr(args[1]);
         if (!valuep) return nullptr;
@@ -27879,17 +27950,26 @@ private:
         if (radix.empty() && args[1]->vhdlTypep()
             && args[1]->vhdlTypep()->base() != V3VhdlStd::bitType()) {
             if (AstNodeExpr* const imagep = enumImage(valuep, args[1]->vhdlTypep(), flp, false)) {
-                return new AstAssign{flp, linep,
-                                     new AstConcatN{flp, linep->cloneTree(false), imagep}};
+                return appendItem(linep, imagep, flp);
             }
         }
-        const std::string format
-            = radix.empty() ? formatFor(args[1]->vhdlTypep()) : radix;
+        std::string format = radix.empty() ? formatFor(args[1]->vhdlTypep()) : radix;
+        // A real written with DIGITS places after the point is written
+        // without an exponent (16.4)
+        if (radix.empty() && args[1]->vhdlTypep()
+            && args[1]->vhdlTypep()->base()->kind() == VhdlTypeKind::FLOATING) {
+            const auto digIt = m_txtArgs.find("digits");
+            if (digIt != m_txtArgs.end()) {
+                const VhdlValue dv = V3VhdlEval::eval(digIt->second);
+                if (dv.isInt() && dv.toInt() > 0 && dv.toInt() < 64) {
+                    format = "%." + std::to_string(dv.toInt()) + "f";
+                }
+            }
+        }
         AstNodeExpr* textp = new AstSFormatF{flp, format, false, valuep};
         // VHDL writes hexadecimal in upper case (16.4)
         if (radix == "%h") textp = new AstToUpperN{flp, textp};
-        return new AstAssign{flp, linep,
-                             new AstConcatN{flp, linep->cloneTree(false), textp}};
+        return appendItem(linep, textp, flp);
     }
 
     // A variable of the lowerer's own, for holding a value across the
@@ -28456,6 +28536,81 @@ private:
             new AstAdd{flp, rd(kp, flp), new AstConst{flp, AstConst::Signed32{}, 1}}});
         run.objp = nullptr;
         return AstNode::addNext(outp, static_cast<AstNode*>(loopp));
+    }
+
+    // "sread(l, value, strlen)" skips the white space the line starts with
+    // and takes the characters up to the next white space, or as many as
+    // VALUE has room for, into the front of VALUE; STRLEN says how many
+    // (16.4). What it took, and the white space before it, leave the line.
+    AstNode* lowerTextioSread(std::vector<AstNodeVhdlExpr*>& args, FileLine* origFlp) {
+        FileLine* const flp = new FileLine{origFlp};
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        AstNodeExpr* const linep = lowerExpr(args[0]);
+        AstNodeExpr* const valuep = linep ? lowerExpr(args[1]) : nullptr;
+        AstNodeExpr* const lenOutp = valuep ? lowerExpr(args[2]) : nullptr;
+        if (!lenOutp) {
+            if (linep) VL_DO_DANGLING(linep->deleteTree(), linep);
+            if (valuep) VL_DO_DANGLING(valuep->deleteTree(), valuep);
+            return nullptr;
+        }
+        AstVar* const begp
+            = newTempVar("__Vsrbeg", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+        AstVar* const endp
+            = newTempVar("__Vsrend", new AstBasicDType{flp, VBasicDTypeKwd::INT}, flp);
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        const auto line = [&]() { return linep->cloneTree(false); };
+        const auto value = [&]() { return valuep->cloneTree(false); };
+        // Space, the format effectors that separate items, and the
+        // no-break space (16.4)
+        const auto isBlank = [&](AstVar* atp) {
+            AstNodeExpr* outp = nullptr;
+            for (const uint32_t code : {32U, 9U, 10U, 13U, 11U, 12U, 160U}) {
+                AstNodeExpr* const onep
+                    = new AstEq{flp, new AstGetcN{flp, line(), rd(atp, flp)},
+                                new AstConst{flp, AstConst::WidthedValue{}, 8, code}};
+                outp = outp ? static_cast<AstNodeExpr*>(new AstLogOr{flp, outp, onep}) : onep;
+            }
+            return outp;
+        };
+        const auto step = [&](AstVar* varp) {
+            return new AstAssign{flp, wr(varp, flp), new AstAdd{flp, rd(varp, flp), num(1)}};
+        };
+        AstNode* outp = new AstAssign{flp, wr(begp, flp), num(0)};
+        outp->addNext(
+            whileLoop(flp,
+                      new AstLogAnd{flp, new AstLtS{flp, rd(begp, flp), new AstLenN{flp, line()}},
+                                    isBlank(begp)},
+                      step(begp)));
+        outp->addNext(new AstAssign{flp, wr(endp, flp), rd(begp, flp)});
+        outp->addNext(whileLoop(
+            flp,
+            new AstLogAnd{
+                flp, new AstLtS{flp, rd(endp, flp), new AstLenN{flp, line()}},
+                new AstLogAnd{flp, new AstLogNot{flp, isBlank(endp)},
+                              new AstLtS{flp, new AstSub{flp, rd(endp, flp), rd(begp, flp)},
+                                         new AstLenN{flp, value()}}}},
+            step(endp)));
+        // What it took goes in front of what VALUE held beyond it
+        outp->addNext(new AstIf{
+            flp, new AstGtS{flp, rd(endp, flp), rd(begp, flp)},
+            new AstAssign{
+                flp, value(),
+                new AstConcatN{
+                    flp,
+                    new AstSubstrN{flp, line(), rd(begp, flp),
+                                   new AstSub{flp, rd(endp, flp), num(1)}},
+                    new AstSubstrN{flp, value(), new AstSub{flp, rd(endp, flp), rd(begp, flp)},
+                                   new AstSub{flp, new AstLenN{flp, value()}, num(1)}}}},
+            nullptr});
+        outp->addNext(new AstAssign{flp, lenOutp, new AstSub{flp, rd(endp, flp), rd(begp, flp)}});
+        outp->addNext(
+            new AstAssign{flp, line(),
+                          new AstSubstrN{flp, line(), rd(endp, flp),
+                                         new AstSub{flp, new AstLenN{flp, line()}, num(1)}}});
+        VL_DO_DANGLING(linep->deleteTree(), linep);
+        VL_DO_DANGLING(valuep->deleteTree(), valuep);
+        return outp;
     }
 
     AstNode* lowerTextioRead(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
