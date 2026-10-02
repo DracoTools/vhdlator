@@ -8190,8 +8190,99 @@ private:
         // A user-defined attribute stands for the static expression an
         // attribute specification gave the prefix (7.2)
         if (AstNodeExpr* const userp = lowerUserAttr(nodep, attr)) return userp;
+        if (AstNodeExpr* const boundp = valueBoundAttr(nodep->prefixp(), attr, flp)) return boundp;
         unsup(flp, "attribute '" + attr);
         return nullptr;
+    }
+
+    // The bounds of a value that is not an object: a string or bit string
+    // literal, or an aggregate. A literal's index range starts at the left
+    // of its index subtype and runs upward for as many elements as it has
+    // (9.3.2), and so does a positional aggregate's (9.3.3.3); an aggregate
+    // written over one range has its ends. An unconstrained port takes its
+    // bounds from its actual (6.5.6.3), and the actual may be one of these:
+    // "y => X\"cd\"".
+    AstNodeExpr* valueBoundAttr(AstNodeVhdlExpr* prefixp, const std::string& attr, FileLine* flp) {
+        if (attr != "left" && attr != "right" && attr != "high" && attr != "low"
+            && attr != "length" && attr != "ascending") {
+            return nullptr;
+        }
+        while (AstVhdlQualified* const qp = VN_CAST(prefixp, VhdlQualified)) {
+            prefixp = qp->valuep();
+        }
+        if (!prefixp) return nullptr;
+        int64_t left = 0;
+        int64_t right = 0;
+        bool ascending = true;
+        // The index subtype of the array type, not of whatever subtype the
+        // analyzer gave the literal: a BIT_VECTOR's starts at 0 and a
+        // STRING's at 1
+        const VhdlType* const typep
+            = prefixp->vhdlTypep() ? prefixp->vhdlTypep()->base() : nullptr;
+        const VhdlType* const idxp
+            = typep && !typep->indexTypes().empty() ? typep->indexTypes()[0] : nullptr;
+        const int64_t first = idxp && idxp->bounded() ? idxp->left() : 0;
+        if (const AstVhdlLiteral* const litp = VN_CAST(prefixp, VhdlLiteral)) {
+            if (litp->kind() != VhdlLitKind::STRING && litp->kind() != VhdlLitKind::BITSTRING) {
+                return nullptr;
+            }
+            const VhdlValue val = V3VhdlEval::eval(prefixp);
+            if (!val.isStr()) return nullptr;
+            left = first;
+            right = first + static_cast<int64_t>(val.toStr().size()) - 1;
+        } else if (AstVhdlAggregate* const aggp = VN_CAST(prefixp, VhdlAggregate)) {
+            int64_t count = 0;
+            bool ranged = false;
+            for (AstVhdlElemAssoc* ap = aggp->elemsp(); ap;
+                 ap = VN_AS(ap->nextp(), VhdlElemAssoc)) {
+                AstVhdlChoice* const chp = ap->choicesp();
+                if (!chp) {
+                    ++count;
+                    continue;
+                }
+                // One range, and nothing else in the aggregate
+                AstVhdlRange* const rp = VN_CAST(chp->exprp(), VhdlRange);
+                if (!rp || chp->nextp() || ap->nextp() || count || !rp->leftp() || !rp->rightp()
+                    || rp->dirUnknown()) {
+                    return nullptr;
+                }
+                const VhdlValue lv = V3VhdlEval::eval(rp->leftp());
+                const VhdlValue rv = V3VhdlEval::eval(rp->rightp());
+                if (!lv.isInt() || !rv.isInt()) return nullptr;
+                // The least and the greatest choice, in the direction of the
+                // index subtype and not the one the range was written in:
+                // "(10 downto 3 => '1')" with nothing to constrain it is
+                // "3 to 10" (9.3.3.3)
+                const int64_t lo = std::min(lv.toInt(), rv.toInt());
+                const int64_t hi = std::max(lv.toInt(), rv.toInt());
+                if ((rp->dir() == VhdlDir::TO) != (lv.toInt() <= rv.toInt())
+                    && lv.toInt() != rv.toInt()) {
+                    return nullptr;  // A null range: no elements to bound
+                }
+                ascending = !idxp || !idxp->bounded() || idxp->ascending();
+                left = ascending ? lo : hi;
+                right = ascending ? hi : lo;
+                ranged = true;
+            }
+            if (!ranged) {
+                if (!count) return nullptr;
+                left = first;
+                right = first + count - 1;
+            }
+        } else {
+            return nullptr;
+        }
+        const auto num = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        if (attr == "left") return num(left);
+        if (attr == "right") return num(right);
+        if (attr == "ascending") return new AstConst{flp, AstConst::BitTrue{}, ascending};
+        const int64_t lo = ascending ? left : right;
+        const int64_t hi = ascending ? right : left;
+        if (attr == "low") return num(lo);
+        if (attr == "high") return num(hi);
+        return num(hi >= lo ? hi - lo + 1 : 0);
     }
 
     // "while (cond) body", which the AST writes as a loop whose first

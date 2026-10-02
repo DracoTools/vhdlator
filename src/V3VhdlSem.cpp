@@ -14566,6 +14566,83 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
             }
             continue;
         }
+        // An aggregate handed to the port says its own bounds, and they are
+        // numbers here: the least and greatest choice of the one range it is
+        // written over, or as many places as it lists from the left of the
+        // index subtype, either way in that subtype's direction (9.3.3.3).
+        // Asked for as "actual'left" the aggregate would be analyzed again
+        // with no type to say what its elements are.
+        if (bound.path.empty() && bound.dim == 0 && actualp) {
+            AstNodeVhdlExpr* innerp = actualp;
+            while (AstVhdlQualified* const qp = VN_CAST(innerp, VhdlQualified)) {
+                innerp = qp->valuep();
+            }
+            // A string or bit string literal the same: as many elements as
+            // it has, from the left of the port's index subtype (9.3.2)
+            const AstVhdlLiteral* const litp = VN_CAST(innerp, VhdlLiteral);
+            const bool isText = litp
+                                && (litp->kind() == VhdlLitKind::STRING
+                                    || litp->kind() == VhdlLitKind::BITSTRING);
+            AstVhdlAggregate* const aggp = VN_CAST(innerp, VhdlAggregate);
+            if (aggp || isText) {
+                const VhdlType* const ptypep = found[0]->typep();
+                const VhdlType* const idxp
+                    = ptypep && !ptypep->indexTypes().empty() ? ptypep->indexTypes()[0] : nullptr;
+                const bool asc = !idxp || !idxp->bounded() || idxp->ascending();
+                const int64_t first = idxp && idxp->bounded() ? idxp->left() : 0;
+                int64_t lo = 0;
+                int64_t hi = -1;
+                int64_t count = 0;
+                bool ok = true;
+                bool ranged = false;
+                if (isText) {
+                    const VhdlValue tv = V3VhdlEval::eval(innerp);
+                    ok = tv.isStr() && !tv.toStr().empty();
+                    if (ok) count = static_cast<int64_t>(tv.toStr().size());
+                }
+                for (AstVhdlElemAssoc* ap = aggp ? aggp->elemsp() : nullptr; ap && ok;
+                     ap = VN_AS(ap->nextp(), VhdlElemAssoc)) {
+                    AstVhdlChoice* const chp = ap->choicesp();
+                    if (!chp) {
+                        ++count;
+                        continue;
+                    }
+                    AstVhdlRange* const rp = VN_CAST(chp->exprp(), VhdlRange);
+                    if (!rp || chp->nextp() || ap->nextp() || count || !rp->leftp()
+                        || !rp->rightp()) {
+                        ok = false;
+                        break;
+                    }
+                    const VhdlValue lv = V3VhdlEval::eval(rp->leftp());
+                    const VhdlValue rv = V3VhdlEval::eval(rp->rightp());
+                    if (!lv.isInt() || !rv.isInt()) {
+                        ok = false;
+                        break;
+                    }
+                    lo = std::min(lv.toInt(), rv.toInt());
+                    hi = std::max(lv.toInt(), rv.toInt());
+                    ranged = true;
+                }
+                if (ok && !ranged && count) {
+                    lo = asc ? first : first - count + 1;
+                    hi = asc ? first + count - 1 : first;
+                }
+                if (ok && (ranged || count)) {
+                    for (int side = 0; side < 2; ++side) {
+                        const int64_t val = (side == 0) == asc ? lo : hi;
+                        AstVhdlLiteral* const litp
+                            = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, std::to_string(val)};
+                        litp->intVal(val);
+                        nodep->addGenericMapp(new AstVhdlAssoc{
+                            flp,
+                            new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName},
+                            litp});
+                    }
+                    bindAscending(nodep, bound, nullptr, asc, flp);
+                    continue;
+                }
+            }
+        }
         for (int side = 0; side < 2; ++side) {
             // Where the open dimension is inside the port's type, the same
             // place inside the actual is what has its bounds
