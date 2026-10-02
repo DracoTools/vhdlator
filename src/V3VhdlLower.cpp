@@ -13281,20 +13281,51 @@ private:
             for (int side = 0; side < 2; ++side) {
                 AstNodeVhdlExpr* const sigExprp = side ? nodep->rhsp() : nodep->lhsp();
                 AstNodeVhdlExpr* const otherExprp = side ? nodep->lhsp() : nodep->rhsp();
+                // The whole signal, or an element or a slice of it
+                const VhdlSymbol* const rootp
+                    = VN_IS(sigExprp, VhdlName) || VN_IS(sigExprp, VhdlCall) ? rootSymOf(sigExprp)
+                                                                             : nullptr;
                 VhdlSymbol* const ssymp
-                    = VN_IS(sigExprp, VhdlName) && sigExprp->vhdlSymp()
-                          ? const_cast<VhdlSymbol*>(pkgAliasBase(sigExprp->vhdlSymp()))
-                          : nullptr;
+                    = rootp ? const_cast<VhdlSymbol*>(pkgAliasBase(rootp)) : nullptr;
                 if (!ssymp || !pkgResolved(ssymp) || !VN_IS(otherExprp, VhdlLiteral)) continue;
+                if (m_bindSymbols.count(rootp) || m_ftaskp) continue;  // A formal's actual
+                AstVar* const sigVarp = pkgSignalVar(ssymp, flp);
                 AstNodeExpr* const sigp = lowerExpr(sigExprp);
                 AstNodeExpr* const otherp = sigp ? lowerExpr(otherExprp) : nullptr;
                 AstConst* const litp = VN_CAST(otherp, Const);
-                if (!litp || !VN_IS(sigp, VarRef)) {
+                // Only where what was lowered reads that one variable, by
+                // selects whose indices can be read twice
+                int refs = 0;
+                bool plain = sigp && litp && sigVarp;
+                if (plain) {
+                    sigp->foreach([&](const AstNode* np) {
+                        if (const AstVarRef* const refp = VN_CAST(np, VarRef)) {
+                            if (refp->varp() == sigVarp) ++refs;
+                        } else if (!VN_IS(np, SelBit) && !VN_IS(np, SelExtract)
+                                   && !VN_IS(np, Const) && !VN_IS(np, VarRef)) {
+                            plain = false;
+                        }
+                    });
+                }
+                if (!plain || refs != 1) {
                     if (sigp) VL_DO_DANGLING(sigp->deleteTree(), sigp);
                     if (otherp) VL_DO_DANGLING(otherp->deleteTree(), otherp);
                     break;
                 }
                 const PkgRegistry& reg = pkgRegistry(ssymp, flp);
+                // The same element or slice of the record of what is driven
+                AstNodeExpr* drivenExprp = sigp->cloneTree(false);
+                if (AstVarRef* const topRefp = VN_CAST(drivenExprp, VarRef)) {
+                    VL_DO_DANGLING(topRefp->deleteTree(), topRefp);
+                    drivenExprp = rd(reg.drivenp, flp);
+                } else {
+                    drivenExprp->foreach([&](AstVarRef* refp) {
+                        if (refp->varp() == sigVarp) {
+                            refp->varp(reg.drivenp);
+                            refp->name(reg.drivenp->name());
+                        }
+                    });
+                }
                 V3Number numz{litp, litp->width()};
                 numz.opBitsZ(litp->num());
                 V3Number driven{litp, litp->width()};
@@ -13302,7 +13333,7 @@ private:
                 V3Number ones{litp, litp->width()};
                 ones.opBitsOne(litp->num());
                 AstNodeExpr* const samep = new AstLogAnd{
-                    flp, new AstEq{flp, rd(reg.drivenp, flp), new AstConst{flp, driven}},
+                    flp, new AstEq{flp, drivenExprp, new AstConst{flp, driven}},
                     new AstEq{flp, new AstAnd{flp, sigp, new AstConst{flp, driven}},
                               new AstConst{flp, ones}}};
                 VL_DO_DANGLING(litp->deleteTree(), litp);

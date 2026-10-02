@@ -57,6 +57,14 @@ begin
         assert s /= "ZZZZ" severity failure;
         assert b = 'Z' severity failure;
         assert b /= '0' severity failure;
+        -- An element and a slice are asked the same way
+        assert s(0) = 'Z' and s(1) = 'Z' severity failure;
+        assert s(0) /= '0' and s(3) = '0' and s(2) = '1' severity failure;
+        assert s(3) /= 'Z' severity failure;
+        assert s(1 downto 0) = "ZZ" severity failure;
+        assert s(1 downto 0) /= "00" severity failure;
+        assert s(3 downto 2) = "01" severity failure;
+        assert s(2 downto 1) = "1Z" severity failure;
         -- The other unit's driver takes an element this one left alone
         go <= true;
         wait for 1 ns;
