@@ -13270,6 +13270,47 @@ private:
                 if (AstNodeExpr* const outp = openPortIs(nodep, flp)) return outp;
             }
         }
+        // A package's signal is resolved here, into two states and a record
+        // of which elements anything drives (pkgRegistry). An element
+        // nothing drives is 'Z', which the two states read as '0', so
+        // whether the signal equals a literal is asked of that record too:
+        // equal where exactly the literal's elements that are not 'Z' are
+        // driven, and those hold what it says (9.2.3).
+        if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
+            && (!symp || symp->predefined())) {
+            for (int side = 0; side < 2; ++side) {
+                AstNodeVhdlExpr* const sigExprp = side ? nodep->rhsp() : nodep->lhsp();
+                AstNodeVhdlExpr* const otherExprp = side ? nodep->lhsp() : nodep->rhsp();
+                VhdlSymbol* const ssymp
+                    = VN_IS(sigExprp, VhdlName) && sigExprp->vhdlSymp()
+                          ? const_cast<VhdlSymbol*>(pkgAliasBase(sigExprp->vhdlSymp()))
+                          : nullptr;
+                if (!ssymp || !pkgResolved(ssymp) || !VN_IS(otherExprp, VhdlLiteral)) continue;
+                AstNodeExpr* const sigp = lowerExpr(sigExprp);
+                AstNodeExpr* const otherp = sigp ? lowerExpr(otherExprp) : nullptr;
+                AstConst* const litp = VN_CAST(otherp, Const);
+                if (!litp || !VN_IS(sigp, VarRef)) {
+                    if (sigp) VL_DO_DANGLING(sigp->deleteTree(), sigp);
+                    if (otherp) VL_DO_DANGLING(otherp->deleteTree(), otherp);
+                    break;
+                }
+                const PkgRegistry& reg = pkgRegistry(ssymp, flp);
+                V3Number numz{litp, litp->width()};
+                numz.opBitsZ(litp->num());
+                V3Number driven{litp, litp->width()};
+                driven.opNot(numz);
+                V3Number ones{litp, litp->width()};
+                ones.opBitsOne(litp->num());
+                AstNodeExpr* const samep = new AstLogAnd{
+                    flp, new AstEq{flp, rd(reg.drivenp, flp), new AstConst{flp, driven}},
+                    new AstEq{flp, new AstAnd{flp, sigp, new AstConst{flp, driven}},
+                              new AstConst{flp, ones}}};
+                VL_DO_DANGLING(litp->deleteTree(), litp);
+                return nodep->op() == VhdlBinaryOp::EQ
+                           ? samep
+                           : static_cast<AstNodeExpr*>(new AstLogNot{flp, samep});
+            }
+        }
         // Two arrays are equal only where each dimension of one is as long
         // as that of the other (9.2.3). Of one dimension that is asked while
         // running or is two vectors of different widths; of more than one,
@@ -18896,6 +18937,8 @@ private:
         AstVar* countp = nullptr;
         AstFunc* newp = nullptr;  // Makes room for one more driver
         AstFunc* putp = nullptr;  // Takes one driver's value, gives the resolution
+        AstVar* drivenp = nullptr;  // Per element: some driver is driving it
+        AstFunc* drvp = nullptr;  // Works that out from the drivers as they stand
     };
     std::map<const VhdlSymbol*, PkgRegistry> m_pkgRegs;
 
@@ -19178,7 +19221,55 @@ private:
             unitp->addStmtsp(funcp);
             reg.putp = funcp;
         }
+        {
+            // Which elements any driver drives, strongly or weakly: the rest
+            // are 'Z', which the two-state value above cannot say. Every
+            // element counts as driven until a driver has said otherwise,
+            // since a signal nothing drives keeps its default and is no 'Z'.
+            // Written from every module a driver is in, as the signal is
+            FileLine* const vflp = new FileLine{flp};
+            vflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            reg.drivenp = new AstVar{vflp, VVarType::VAR, base + "__driven", VFlagChildDType{},
+                                     lowerType(symp->typep(), flp)};
+            reg.drivenp->lifetime(VLifetime::STATIC_EXPLICIT);
+            reg.drivenp->trace(false);
+            reg.drivenp->valuep(new AstConst{flp, AstConst::StringToParse{}, "'1"});
+            unitp->addStmtsp(reg.drivenp);
+            const std::string name = base + "__drv";
+            AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            AstVar* const retp = newReturnVar(name, lowerType(symp->typep(), flp), flp);
+            funcp->fvarp(retp);
+            AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+            funcp->addStmtsp(ip);
+            ip->usedLoopIdx(true);
+            funcp->addStmtsp(new AstAssign{flp, wr(retp, flp),
+                                           new AstConst{flp, AstConst::StringToParse{}, "'0"}});
+            funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), num(0)});
+            AstLoop* const loopp = new AstLoop{flp};
+            loopp->addStmtsp(
+                new AstLoopTest{flp, loopp, new AstLtS{flp, rd(ip, flp), rd(reg.countp, flp)}});
+            loopp->addStmtsp(
+                new AstAssign{flp, wr(retp, flp),
+                              new AstOr{flp, rd(retp, flp),
+                                        new AstSelBit{flp, rd(reg.ensp, flp), rd(ip, flp)}}});
+            loopp->addStmtsp(
+                new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), num(1)}});
+            funcp->addStmtsp(loopp);
+            unitp->addStmtsp(funcp);
+            reg.drvp = funcp;
+        }
         return reg;
+    }
+
+    // Scheduled beside every write of a package's signal: which of its
+    // elements are driven once that write has been made
+    AstNode* pkgDrivenStmt(const PkgRegistry& reg, FileLine* flp) {
+        AstFuncRef* const refp = new AstFuncRef{flp, reg.drvp->name(), nullptr};
+        refp->taskp(reg.drvp);
+        FileLine* const mflp = new FileLine{flp};
+        mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        return new AstAssignDly{mflp, wr(reg.drivenp, mflp), refp};
     }
 
     // "If this driver is not one of the package's yet, it joins, holding
@@ -19253,6 +19344,7 @@ private:
             // Every write of the signal is scheduled, like the ones the
             // drives themselves make (see driveResolved)
             stmtsp->addNext(new AstAssignDly{dflp, wr(sigp, dflp), putRefp});
+            stmtsp->addNext(pkgDrivenStmt(reg, dflp));
             return stmtsp;
         };
         AstSenTree* const senp = new AstSenTree{
@@ -19913,6 +20005,7 @@ private:
             FileLine* const mflp = new FileLine{flp};
             mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
             outp->addNext(new AstAssignDly{mflp, wr(pkgSigp, mflp), putRefp});
+            outp->addNext(pkgDrivenStmt(reg, flp));
             return outp;
         }
         if (drv.xp) {
