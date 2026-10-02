@@ -21,7 +21,20 @@ architecture test of t_vhdl_firstread is
     signal x : integer := 0;                          -- written by "writer"
     signal y : integer := 0;                          -- written by "reader"
     signal done : boolean := false;
+    signal runs : natural := 0;
+    signal first_ev : std_logic_vector(0 to 4) := "00000";
 begin
+
+    -- A process with a sensitivity list runs once at the start too, and
+    -- reads the resolved value then
+    watcher : process (ev) is
+    begin
+        if runs = 0 then
+            assert ev(2 to 4) = "101" report "ev unresolved to the watcher" severity failure;
+            first_ev <= ev;
+        end if;
+        runs <= runs + 1;
+    end process;
 
     reader : process is
     begin
@@ -43,6 +56,9 @@ begin
         wait for 1 ns;
         assert ev = "Z1101" report to_string(ev) severity failure;
         assert one = '0' severity failure;
+        assert first_ev(2 to 4) = "101" severity failure;
+        -- Once at the start, then once for each change of ev so far
+        assert runs = 3 report integer'image(runs) severity failure;
         done <= true;
         wait;
     end process;

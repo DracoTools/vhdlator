@@ -165,6 +165,7 @@ class VhdlLowerVisitor final {
     };
     std::map<const VhdlSymbol*, std::vector<VhdlDriver>> m_drivers;
     std::map<const VhdlSymbol*, int> m_driverCount;
+    std::set<const VhdlSymbol*> m_assignedTwice;  // Assigned by several statements
     // How many of a signal's drivers have been lowered, which is the index of
     // the one being lowered now
     std::map<const VhdlSymbol*, int> m_driverUsed;
@@ -18279,6 +18280,12 @@ private:
                     if (m_postponed) {
                         bodyp = AstNode::addNextNull(bodyp, postponedWait(flp));
                     }
+                    // Its first run reads a signal with several drivers
+                    // resolved, as a process that waits does (see below)
+                    if (readsResolved(nodep->stmtsp())) {
+                        addStmt(startAfterSettle(bodyp, flp));
+                        return;
+                    }
                     addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, bodyp});
                     return;
                 }
@@ -18324,17 +18331,23 @@ private:
         // instant has taken effect, which is all the order VHDL promises
         // between processes (14.7.5).
         if (!sentreep && v3Global.opt.timing().isTrue() && readsResolved(nodep->stmtsp())) {
-            FileLine* const zflp = new FileLine{flp};
-            zflp->warnOff(V3ErrorCode::ZERODLY, true);
-            AstLoop* const loopp = new AstLoop{flp};
-            loopp->addStmtsp(bodyp);
-            AstNode* const startp
-                = new AstDelay{zflp, new AstConst{zflp, AstConst::Unsized64{}, 0}, false};
-            startp->addNext(loopp);
-            addStmt(new AstInitial{flp, startp});
+            addStmt(startAfterSettle(bodyp, flp));
             return;
         }
         addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, sentreep, bodyp});
+    }
+
+    // A process body run for ever, its first step taken once the back end
+    // has settled what is assigned continuously
+    static AstNode* startAfterSettle(AstNode* bodyp, FileLine* flp) {
+        FileLine* const zflp = new FileLine{flp};
+        zflp->warnOff(V3ErrorCode::ZERODLY, true);
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(bodyp);
+        AstNode* const startp
+            = new AstDelay{zflp, new AstConst{zflp, AstConst::Unsized64{}, 0}, false};
+        startp->addNext(loopp);
+        return new AstInitial{flp, startp};
     }
 
     // Whether statements name a signal that has several drivers
@@ -18343,7 +18356,14 @@ private:
         for (AstNode* p = stmtsp; p && !found; p = p->nextp()) {
             p->foreach([&](const AstNodeVhdlExpr* exprp) {
                 const VhdlSymbol* const symp = exprp->vhdlSymp();
-                if (symp && m_drivers.count(symp->resolved())) found = true;
+                if (!symp) return;
+                if (m_drivers.count(symp->resolved())) found = true;
+                // Counted before anything was lowered, so known to a process
+                // that comes before the ones that drive it
+                // Nor does this, counted before anything was lowered: which
+                // process comes first, and whether a driver writes the whole
+                // signal or an element of it, make no difference to it
+                if (m_assignedTwice.count(symp->resolved())) found = true;
             });
         }
         return found;
@@ -31355,6 +31375,24 @@ private:
         // Which signals have more than one driver has to be known before the
         // declarations are lowered, since it decides what they become
         if (archp) countDrivers(archp->stmtsp());
+        // And which signals more than one concurrent statement assigns, in
+        // whole or in part (readsResolved)
+        m_assignedTwice.clear();
+        if (archp) {
+            std::map<const VhdlSymbol*, int> assigned;
+            for (AstNode* p = archp->stmtsp(); p; p = p->nextp()) {
+                std::set<const VhdlSymbol*> here;
+                p->foreach([&](AstVhdlSigAssign* asgp) {
+                    if (const VhdlSymbol* const tsymp = targetSymbol(asgp->targetp())) {
+                        here.insert(tsymp->resolved());
+                    }
+                });
+                for (const VhdlSymbol* const tsymp : here) ++assigned[tsymp];
+            }
+            for (const auto& pair : assigned) {
+                if (pair.second > 1) m_assignedTwice.insert(pair.first);
+            }
+        }
         m_actives.clear();
         m_actToggles.clear();
         m_needActive.clear();
