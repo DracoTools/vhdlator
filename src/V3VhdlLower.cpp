@@ -18244,7 +18244,37 @@ private:
         if (!sentreep && VN_IS(bodyp, EventControl)) {
             bodyp = new AstBegin{flp, "", bodyp, false};
         }
+        // A signal with several drivers has the value its resolution gives
+        // it, which the back end works out after the processes have started:
+        // one that reads such a signal before it first suspends would read
+        // it unresolved. It takes its first step once that is settled --
+        // still in the first instant, and before anything assigned in that
+        // instant has taken effect, which is all the order VHDL promises
+        // between processes (14.7.5).
+        if (!sentreep && v3Global.opt.timing().isTrue() && readsResolved(nodep->stmtsp())) {
+            FileLine* const zflp = new FileLine{flp};
+            zflp->warnOff(V3ErrorCode::ZERODLY, true);
+            AstLoop* const loopp = new AstLoop{flp};
+            loopp->addStmtsp(bodyp);
+            AstNode* const startp
+                = new AstDelay{zflp, new AstConst{zflp, AstConst::Unsized64{}, 0}, false};
+            startp->addNext(loopp);
+            addStmt(new AstInitial{flp, startp});
+            return;
+        }
         addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, sentreep, bodyp});
+    }
+
+    // Whether statements name a signal that has several drivers
+    bool readsResolved(AstNode* stmtsp) {
+        bool found = false;
+        for (AstNode* p = stmtsp; p && !found; p = p->nextp()) {
+            p->foreach([&](const AstNodeVhdlExpr* exprp) {
+                const VhdlSymbol* const symp = exprp->vhdlSymp();
+                if (symp && m_drivers.count(symp->resolved())) found = true;
+            });
+        }
+        return found;
     }
 
     // The time-zero run and the always block both drive whatever the process
