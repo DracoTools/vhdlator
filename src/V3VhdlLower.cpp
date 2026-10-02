@@ -9153,8 +9153,9 @@ private:
         if (!nodep) return;
         nodep->foreachAndNext([this](AstVhdlSigAssign* asgp) {
             if (!asgp->force() && !asgp->release()) return;
-            if (const VhdlSymbol* const symp = rootSymOf(asgp->targetp())) {
-                m_needForce.insert(symp->resolved());
+            // The signal itself, where the target names it through an alias
+            if (const VhdlSymbol* const symp = objectBehind(rootSymOf(asgp->targetp()))) {
+                m_needForce.insert(symp);
             }
         });
     }
@@ -21782,8 +21783,23 @@ private:
             // 10.5.2.1 makes both of these signal assignments, so they take
             // effect at the end of the delta like any other. Which of the
             // force and the drivers is in charge is a signal of its own.
-            VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(nodep->targetp()));
-            const auto it = rootp ? m_forced.find(rootp->resolved()) : m_forced.end();
+            // An alias of a signal is the signal (6.6.2): what is forced and
+            // released is the one object, whichever name the statement uses
+            VhdlSymbol* rootp = const_cast<VhdlSymbol*>(objectBehind(rootSymOf(nodep->targetp())));
+            // And a signal-class formal is the signal the call passed
+            // (4.2.2.3): a force or a release written in a procedure is one
+            // of that signal
+            // The name the target is lowered through, which is the formal's
+            // own where there is one
+            VhdlSymbol* nameSymp = rootp;
+            if (rootp) {
+                const auto bindIt = m_bindSymbols.find(rootp);
+                if (bindIt != m_bindSymbols.end() && bindIt->second
+                    && m_forced.count(objectBehind(bindIt->second))) {
+                    rootp = const_cast<VhdlSymbol*>(objectBehind(bindIt->second));
+                }
+            }
+            const auto it = rootp ? m_forced.find(rootp) : m_forced.end();
             if (it == m_forced.end()) {
                 // An external name reaches a signal somewhere else in the
                 // design, which has no driver pair here. Verilog's own force
@@ -21874,17 +21890,17 @@ private:
             // holds starts from what the drivers have.
             AstNode* outp = new AstAssign{mflp, new AstVarRef{mflp, fc.valp, VAccess::WRITE},
                                           new AstVarRef{mflp, fc.drvp, VAccess::READ}};
-            const auto prevIt = m_vars.find(rootp);
+            const auto prevIt = m_vars.find(nameSymp);
             const bool had = prevIt != m_vars.end();
             AstVar* const savedp = had ? prevIt->second : nullptr;
-            m_vars[rootp] = fc.valp;
+            m_vars[nameSymp] = fc.valp;
             // Not lowerDriveTarget: what a force writes is the value the
             // force holds, not what the drivers keep
             AstNodeExpr* const lhsp = lowerExpr(nodep->targetp());
             if (had) {
-                m_vars[rootp] = savedp;
+                m_vars[nameSymp] = savedp;
             } else {
-                m_vars.erase(rootp);
+                m_vars.erase(nameSymp);
             }
             if (!lhsp) {
                 VL_DO_DANGLING(outp->deleteTree(), outp);
@@ -27365,6 +27381,28 @@ private:
         return AstNode::addNext(outp, static_cast<AstNode*>(new AstWait{flp, condp, nullptr}));
     }
 
+    // Whether a wait of this long would end after TIME'HIGH. Time stops
+    // there: the simulation is complete once the next thing to happen lies
+    // beyond it (14.7.5.1), so a process waiting past it never resumes --
+    // "wait for 100 ms" in a loop ends the run after some nine thousand
+    // seconds rather than wrapping the clock round.
+    AstNodeExpr* pastTimeHigh(AstNodeExpr* timep, FileLine* flp) {
+        FileLine* const hflp = new FileLine{flp};
+        hflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        hflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        hflp->warnOff(V3ErrorCode::UNSIGNED, true);
+        hflp->warnOff(V3ErrorCode::CMPCONST, true);
+        V3Number high{hflp, 64, 0};
+        high.setQuad(0x7fffffffffffffffULL);
+        return new AstGt{hflp, timep->cloneTree(false),
+                         new AstSub{hflp, new AstConst{hflp, high},
+                                    new AstTime{hflp, VTimescale{VTimescale::TS_1FS}}}};
+    }
+    static AstNode* untilTimeHigh(AstNodeExpr* pastp, AstNode* waitp, FileLine* flp) {
+        return new AstIf{
+            flp, pastp, new AstWait{flp, new AstConst{flp, AstConst::BitFalse{}}, nullptr}, waitp};
+    }
+
     AstNode* lowerTimeout(AstNodeExpr* timep, FileLine* flp) {
         // "wait for 0 ns" does not stand still: it resumes in the next delta
         // cycle, after the signal assignments already made have taken effect
@@ -27386,9 +27424,13 @@ private:
                 VL_DO_DANGLING(timep->deleteTree(), timep);
                 return deltaWait(flp);
             }
-            if (!m_anyAfter) return new AstDelay{flp, timep, false};
-            return AstNode::addNext(static_cast<AstNode*>(new AstDelay{flp, timep, false}),
-                                    deltaWait(flp));
+            AstNodeExpr* const pastp = pastTimeHigh(timep, flp);
+            if (!m_anyAfter) return untilTimeHigh(pastp, new AstDelay{flp, timep, false}, flp);
+            return untilTimeHigh(
+                pastp,
+                AstNode::addNext(static_cast<AstNode*>(new AstDelay{flp, timep, false}),
+                                 deltaWait(flp)),
+                flp);
         }
         // Not known here, so decide at run time. The expression is read
         // twice below, and it is evaluated once (10.2): UVVM waits "for
@@ -27406,8 +27448,10 @@ private:
         // zero however little the back end can see of it
         FileLine* const dflp = new FileLine{flp};
         dflp->warnOff(V3ErrorCode::ZERODLY, true);
+        AstNodeExpr* const pastp = pastTimeHigh(timep, flp);
         AstNode* elsep = new AstDelay{dflp, timep, false};
         if (m_anyAfter) elsep = AstNode::addNext(elsep, deltaWait(flp));
+        elsep = untilTimeHigh(pastp, elsep, flp);
         return AstNode::addNextNull(
             prep, static_cast<AstNode*>(new AstIf{flp, isZerop, deltaWait(flp), elsep}));
     }
