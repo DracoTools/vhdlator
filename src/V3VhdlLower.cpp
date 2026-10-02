@@ -16625,6 +16625,21 @@ private:
     // asks of that signal -- its value, or whether it has just changed --
     // changes when the signal does, and a process waiting on the call has to
     // wait on those signals.
+    // The object a name denotes once every alias it goes through is followed:
+    // an alias of a subprogram or of a whole object names it directly, and
+    // one of a slice or an element names the object that is part of
+    static const VhdlSymbol* objectBehind(const VhdlSymbol* symp) {
+        const VhdlSymbol* curp = symp ? symp->resolved() : nullptr;
+        for (int depth = 0; curp && curp->kind() == VhdlSymKind::ALIAS && depth < 32; ++depth) {
+            const AstVhdlAliasDecl* const declp = VN_CAST(curp->declp(), VhdlAliasDecl);
+            const VhdlSymbol* const nextp
+                = declp && declp->targetp() ? rootSymOf(declp->targetp()) : nullptr;
+            if (!nextp) break;
+            curp = nextp->resolved();
+        }
+        return curp;
+    }
+
     void collectSignalArgs(AstVhdlCall* callp, std::vector<AstVar*>& varps) {
         VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nullptr;
         VhdlSymbol* const symp = namedp ? namedp->resolved() : nullptr;
@@ -16659,10 +16674,13 @@ private:
             // port is a signal too (6.5.2): VUnit's check_stable, called in
             // a protocol checker over its ports, returns when a window
             // closes and has to be called again for the next one.
-            const VhdlSymbol* const rootp = rootSymOf(actualp);
+            // An alias of part of a signal is that part of the signal (6.6.2):
+            // VUnit's watchdog waits on "is_active(runner_timeout_update)",
+            // an alias of five elements of the runner signal, and woke only
+            // at its timeout where the alias was not taken for a signal
+            const VhdlSymbol* const rootp = objectBehind(rootSymOf(actualp));
             if (!rootp
-                || (rootp->resolved()->kind() != VhdlSymKind::SIGNAL
-                    && rootp->resolved()->kind() != VhdlSymKind::PORT)) {
+                || (rootp->kind() != VhdlSymKind::SIGNAL && rootp->kind() != VhdlSymKind::PORT)) {
                 continue;
             }
             AstNodeExpr* const onep = lowerExpr(actualp);
