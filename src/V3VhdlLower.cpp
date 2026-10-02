@@ -10192,6 +10192,40 @@ private:
         return folds;
     }
 
+    // Whether a parameter's default is an aggregate of fewer elements than
+    // the parameter has in this copy of its subprogram. The copy was made
+    // for a call that gave the parameter a value of another length, so the
+    // default is not what any call of this copy gets -- "pyld : std8 := (0 =>
+    // x"00")" in the copy made for four elements -- and it does not fit.
+    static bool defaultCannotApply(const AstNodeVhdlExpr* defaultp, const VhdlType* typep) {
+        const AstVhdlAggregate* const aggp = VN_CAST(defaultp, VhdlAggregate);
+        if (!aggp || !typep || !typep->isConstrainedArray()) return false;
+        const VhdlType* const idxp = indexSubtype(typep, 0);
+        if (!idxp || !idxp->bounded()) return false;
+        int64_t given = 0;
+        for (const AstNode* p = aggp->elemsp(); p; p = p->nextp()) {
+            const AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+            const AstVhdlChoice* const chp = eap->choicesp();
+            if (chp && (chp->isOthers() || chp->nextp() || VN_IS(chp->exprp(), VhdlRange))) {
+                return false;  // How many it gives is not counted here
+            }
+            // A value of the aggregate's own type may stand for several
+            const VhdlType* const vtp = eap->valuep() ? eap->valuep()->vhdlTypep() : nullptr;
+            if (vtp && vtp->base() == typep->base()) return false;
+            // Nor does one that names a place the parameter has not got
+            if (chp) {
+                const VhdlValue at = V3VhdlEval::eval(VN_CAST(chp->exprp(), NodeVhdlExpr));
+                if (at.isInt()) {
+                    const int64_t lo = idxp->ascending() ? idxp->left() : idxp->right();
+                    const int64_t hi = idxp->ascending() ? idxp->right() : idxp->left();
+                    if (at.toInt() < lo || at.toInt() > hi) return true;
+                }
+            }
+            ++given;
+        }
+        return given < idxp->length();
+    }
+
     // Whether a subprogram may be called with no arguments at all
     static bool allParamsDefaulted(const VhdlSymbol* symp) {
         for (size_t i = 0; i < symp->paramTypes().size(); ++i) {
@@ -13082,6 +13116,28 @@ private:
             }
             return equal ? static_cast<AstNodeExpr*>(new AstEqCase{flp, lhsp, rhsp})
                          : static_cast<AstNodeExpr*>(new AstNeqCase{flp, lhsp, rhsp});
+        }
+        // An aggregate takes its type from what it is compared with, which
+        // the back end reads off an object and not off a choice between
+        // two -- 'LAST_VALUE of a composite signal is one. The comparison
+        // is made with each of the two instead.
+        {
+            const bool lpat = VN_IS(lhsp, Pattern);
+            AstCond* const condp = VN_CAST(lpat ? rhsp : lhsp, Cond);
+            AstNodeExpr* const patp = lpat ? lhsp : rhsp;
+            if (condp && VN_IS(patp, Pattern) && !VN_IS(condp->thenp(), Cond)
+                && !VN_IS(condp->elsep(), Cond)) {
+                const auto cmp = [&](AstNodeExpr* objp, AstNodeExpr* valp) -> AstNodeExpr* {
+                    return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, objp, valp})
+                                 : static_cast<AstNodeExpr*>(new AstNeq{flp, objp, valp});
+                };
+                AstNodeExpr* const whenp = condp->condp()->unlinkFrBack();
+                AstNodeExpr* const thenp = condp->thenp()->unlinkFrBack();
+                AstNodeExpr* const elsep = condp->elsep()->unlinkFrBack();
+                VL_DO_DANGLING(condp->deleteTree(), condp);
+                return new AstCond{flp, whenp, cmp(thenp, patp->cloneTree(false)),
+                                   cmp(elsep, patp)};
+            }
         }
         return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, lhsp, rhsp})
                      : static_cast<AstNodeExpr*>(new AstNeq{flp, lhsp, rhsp});
@@ -30276,7 +30332,7 @@ private:
             varp->funcLocal(true);
             // A parameter with a default value may be left out of a call
             // (4.2.2.1), which is what an initial value on the port means here
-            if (ifp->defaultp()) {
+            if (ifp->defaultp() && !defaultCannotApply(ifp->defaultp(), psymp->typep())) {
                 AstNodeExpr* initp = nullptr;
                 // A parameter of an unconstrained type is handed a value
                 // carrying its own bounds, and its default is a value like
