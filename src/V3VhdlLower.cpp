@@ -7457,6 +7457,11 @@ private:
                 && subp->hasBody()) {
                 return;
             }
+            // A copy made for a call whose parameter's subtype names a
+            // generic of another entity -- "sum_ints(o1) => x" on an
+            // instance, o1 sized by the instance's generic -- has no meaning
+            // here; the call emits it where the instance binds the generic
+            if (subp->vhdlSymp() && namesForeignGeneric(subp->vhdlSymp())) return;
             lowerSubprogram(subp);
             return;
         }
@@ -7822,6 +7827,20 @@ private:
                 VL_DO_DANGLING(elemp->deleteTree(), elemp);
                 VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
                 return nullptr;
+            }
+            // Bounds a generic gives: the type cannot go in the table, which
+            // is not copied with the module for each instance, so it would
+            // name the template's generic. A pattern takes the type of the
+            // object it initializes instead.
+            if (dtypep->exists([](const AstVarRef*) { return true; })) {
+                VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+                AstNodeExpr* outp = elemp;
+                for (size_t i = levels.size(); i-- > 0;) {
+                    AstPatMember* const memberp = new AstPatMember{flp, outp, nullptr, nullptr};
+                    memberp->isDefault(true);
+                    outp = new AstPattern{flp, memberp};
+                }
+                return outp;
             }
             AstNodeExpr* outp = elemp;
             for (size_t i = levels.size(); i-- > 0;) {
@@ -19587,6 +19606,34 @@ private:
         return true;
     }
 
+    // Whether a subprogram's parameter or result subtype has a bound naming a
+    // generic nothing here stands for
+    bool namesForeignGeneric(const VhdlSymbol* symp) const {
+        std::vector<const VhdlType*> types(symp->paramTypes().begin(), symp->paramTypes().end());
+        types.push_back(symp->returnTypep());
+        for (const VhdlType* typep : types) {
+            for (int depth = 0; typep && depth < 8; ++depth) {
+                if (typep->base()->kind() != VhdlTypeKind::ARRAY) break;
+                for (const VhdlType* const idxp : typep->indexTypes()) {
+                    const AstNode* const boundsp = idxp ? idxp->boundsp() : nullptr;
+                    if (!boundsp) continue;
+                    bool foreign = false;
+                    boundsp->foreach([&](const AstNodeVhdlExpr* exprp) {
+                        const VhdlSymbol* const gp
+                            = exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+                        if (gp && gp->kind() == VhdlSymKind::GENERIC && !m_vars.count(gp)
+                            && !m_bindExprs.count(gp)) {
+                            foreign = true;
+                        }
+                    });
+                    if (foreign) return true;
+                }
+                typep = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+            }
+        }
+        return false;
+    }
+
     // Whether a signal's subtype is a composite resolved by a function of the
     // design's own as a whole: a process that drives any part of it is a
     // driver of all of it, holding the rest as declared (14.7.2, 14.7.3.2)
@@ -22084,23 +22131,27 @@ private:
                 continue;
             }
             AstNodeDType* dtypep = nullptr;
+            AstVar* tempp = nullptr;
+            AstNodeExpr* convValuep = nullptr;
             {
+                // The port's subtype names the entity's generics, and so may
+                // the conversion, a copy of which was made for that subtype:
+                // both are read with what this instance gives them
                 VL_RESTORER_COPY(m_bindExprs);
                 for (const auto& pair : genericStandIns(nodep, portSymp->typep())) {
                     m_bindExprs[pair.first] = pair.second;
                 }
                 dtypep = lowerType(portSymp->typep(), flp);
+                tempp = newTempVar("__Vconv__" + label + "__" + portSymp->name(), dtypep, flp);
+                // The signal standing in for the port starts where the port
+                // does, so the conversion of it is right before anything runs
+                tempp->valuep(defaultValueFor(portSymp->typep(), flp));
+                // The conversion reads the port's own signal, so the name it
+                // applies to stands for that signal while it is lowered
+                m_vars.emplace(portSymp, tempp);
+                convValuep = lowerExpr(asp->formalp());
+                m_vars.erase(portSymp);
             }
-            AstVar* const tempp
-                = newTempVar("__Vconv__" + label + "__" + portSymp->name(), dtypep, flp);
-            // The signal standing in for the port starts where the port
-            // does, so the conversion of it is right before anything runs
-            tempp->valuep(defaultValueFor(portSymp->typep(), flp));
-            // The conversion reads the port's own signal, so the name it
-            // applies to stands for that signal while it is lowered
-            m_vars.emplace(portSymp, tempp);
-            AstNodeExpr* const convValuep = lowerExpr(asp->formalp());
-            m_vars.erase(portSymp);
             if (!convValuep) {
                 VL_DO_DANGLING(targetp->deleteTree(), targetp);
                 continue;
