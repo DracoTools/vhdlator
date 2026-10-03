@@ -4,7 +4,7 @@
 -- eight long, so it is a value of fixed width, as the slice it is written
 -- into is (9.3.3.3). An aggregate with named choices of an array whose index
 -- subtype has a bound a generic gives says where each element goes on its
--- own (9.3.3.3).
+-- own (9.3.3.3), and so does each row of a multidimensional one.
 --
 -- This file ONLY is placed under the Creative Commons Public Domain.
 -- SPDX-FileCopyrightText: 2026 Wilson Snyder
@@ -20,6 +20,11 @@ architecture test of t_vhdl_aggspan is
     constant table : t_table := (1 => (true, false), 2 => (false, true));
     type t_row is array (t_two) of boolean;
     constant row : t_row := (1 => true, 2 => false);
+    type t_enum is (a, b);
+    type t_cube is array (t_two, t_two, t_enum) of boolean;
+    constant cube : t_cube := (
+        1 => (1 => (others => true), 2 => (others => false)),
+        2 => (1 => (a => false, b => true), 2 => (others => true)));
     type t_down is array (N downto 1) of bit;
     constant down : t_down := (2 => '1', 1 => '0');
 begin
@@ -41,6 +46,8 @@ begin
         assert not table(2, 1) and table(2, 2) severity failure;
         assert row(1) and not row(2) severity failure;
         assert down = "10" severity failure;
+        assert cube(1, 1, b) and not cube(1, 2, a) severity failure;
+        assert not cube(2, 1, a) and cube(2, 1, b) and cube(2, 2, a) severity failure;
 
         report "*-* All Finished *-*";
         std.env.finish;

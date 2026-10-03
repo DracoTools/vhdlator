@@ -9520,7 +9520,14 @@ VhdlType* VhdlSemVisitor::analyzeAggregate(AstVhdlAggregate* nodep, VhdlType* wa
             // Where the aggregate's own type is constrained, its bounds are
             // what the remaining dimensions have; the base type's are the
             // index subtypes, which say nothing about how long a row is
-            const bool constrained = wantp->isConstrainedArray();
+            // A type declared with index subtypes rather than "<>" is
+            // constrained even where a bound names a generic and so is not a
+            // number yet: "array (t_two, t_two, t_enum)" over "1 to N"
+            bool declaredClosed = !wantp->indexTypes().empty();
+            for (size_t d = 0; d < wantp->indexTypes().size(); ++d) {
+                if (wantp->dimOpen(d) || !wantp->indexTypes()[d]) declaredClosed = false;
+            }
+            const bool constrained = wantp->isConstrainedArray() || declaredClosed;
             const std::vector<VhdlType*>& idx
                 = constrained ? wantp->indexTypes() : wantp->base()->indexTypes();
             for (size_t i = 1; i < idx.size(); ++i) subp->addIndexType(idx[i]);
