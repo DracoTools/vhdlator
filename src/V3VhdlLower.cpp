@@ -6602,6 +6602,7 @@ private:
     // whose timeout expires find a signal being updated in the same cycle,
     // and only then does a timed wait have to stand aside for the update.
     bool m_anyAfter = false;
+    bool m_inGenBody = false;  // Lowering the declarations of a generate's block
     // Signals some assignment gives a 'Z' written as a literal
     std::set<const VhdlSymbol*> m_zAssigned;
     // The names of the constants some external name reaches (8.7)
@@ -7336,6 +7337,15 @@ private:
             // names it reads its subtype, which is as static either way.
             if (varp->varType() == VVarType::LPARAM && !valueFolds(varp->valuep())) {
                 varp->varType(VVarType::VAR);
+            }
+            // A constant of a generate's block is elaborated with the block
+            // (11.8), so one whose value folds is a parameter there, which a
+            // bound written in terms of it needs: "constant stride : natural
+            // := i(n).y'length" sizing the slice the block drives
+            if (m_inGenBody && objp->kind() == VhdlObjKind::CONSTANT && !m_ftaskp && !m_protClassp
+                && varp->varType() == VVarType::VAR && varp->valuep() && !dynDecl
+                && valueFolds(varp->valuep())) {
+                varp->varType(VVarType::LPARAM);
             }
             // A subprogram's declarations are elaborated in order on every
             // call (14.6), so one may read what the one before it was just
@@ -8080,6 +8090,11 @@ private:
         // A bound that names a generic does not fold during analysis, so the
         // attributes that ask about it are answered with the same expression
         // the range itself was emitted with (16.2)
+        if (!argp
+            && (attr == "left" || attr == "right" || attr == "high" || attr == "low"
+                || attr == "length" || attr == "ascending")) {
+            if (AstNodeExpr* const outp = sliceRangeAttr(nodep, attr, flp)) return outp;
+        }
         if (attr == "length") {
             if (AstNodeExpr* const outp = externalAliasLength(nodep, flp)) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
@@ -10026,6 +10041,59 @@ private:
         return false;
     }
 
+    // The bounds of a slice are the range it was written with (8.5), not
+    // those of what it is a slice of: "i(i'low to i'low + 1)'length" is two,
+    // however long the port is. Only where the range did not fold, which is
+    // where the slice's own subtype has nothing better to say.
+    AstNodeExpr* sliceRangeAttr(AstVhdlAttrName* nodep, const std::string& attr, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(nodep->prefixp(), VhdlCall);
+        AstVhdlRange* const rp = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rp || rp->nextp() || !rp->leftp() || !rp->rightp() || rp->attrp()
+            || rp->dirUnknown()) {
+            return nullptr;
+        }
+        const VhdlType* const ptypep = callp->prefixp()->vhdlTypep();
+        if (!ptypep || ptypep->base()->kind() != VhdlTypeKind::ARRAY
+            || ptypep->dimensions() != 1) {
+            return nullptr;
+        }
+        if (V3VhdlEval::eval(rp->leftp()).isInt() && V3VhdlEval::eval(rp->rightp()).isInt()) {
+            return nullptr;
+        }
+        const bool ascending = rp->dir() == VhdlDir::TO;
+        if (attr == "ascending") return new AstConst{flp, AstConst::BitTrue{}, ascending};
+        AstNodeExpr* const leftp = lowerExpr(rp->leftp());
+        AstNodeExpr* const rightp = leftp ? lowerExpr(rp->rightp()) : nullptr;
+        if (!leftp || !rightp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            return nullptr;
+        }
+        if (attr == "left") {
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return leftp;
+        }
+        if (attr == "right") {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            return rightp;
+        }
+        if (attr == "low" || attr == "high") {
+            // The low end is the left one of an ascending range
+            if ((attr == "low") == ascending) {
+                VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return leftp;
+            }
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            return rightp;
+        }
+        // Length: none for a null range (5.2.1)
+        AstNodeExpr* const diffp
+            = ascending ? new AstSub{flp, rightp, leftp} : new AstSub{flp, leftp, rightp};
+        AstNodeExpr* const lenp
+            = new AstAdd{flp, diffp, new AstConst{flp, AstConst::Signed32{}, 1}};
+        return new AstCond{flp, new AstGtS{flp, lenp, new AstConst{flp, AstConst::Signed32{}, 0}},
+                           lenp->cloneTree(false), new AstConst{flp, AstConst::Signed32{}, 0}};
+    }
+
     // "x'length" and "x'element'length" of an alias of an external name
     // whose subtype indication leaves the bounds open: the object it denotes
     // has them, and is elaborated already (8.7), so they are asked of it --
@@ -10491,9 +10559,11 @@ private:
             }
             if (const AstVarRef* const refp = VN_CAST(itemp, VarRef)) {
                 const AstVar* const varp = refp->varp();
+                // A generate's index is as settled as a parameter in each
+                // block the generate makes (11.8)
                 if (!varp
-                    || (varp->varType() != VVarType::GPARAM
-                        && varp->varType() != VVarType::LPARAM)) {
+                    || (varp->varType() != VVarType::GPARAM && varp->varType() != VVarType::LPARAM
+                        && varp->varType() != VVarType::GENVAR)) {
                     folds = false;
                 }
             }
@@ -15231,7 +15301,15 @@ private:
         // never does, and neither does a value the analyzer could not fold
         // and no generic stands behind.
         const VhdlSymbol* const termSymp = rootSymOf(nodep);
-        const bool isGeneric = (termSymp && termSymp->kind() == VhdlSymKind::GENERIC)
+        // A constant emitted as a parameter is settled as early: one of a
+        // generate's block whose value an open port's bounds give
+        const auto paramIt = termSymp && VN_IS(nodep, VhdlName)
+                                     && termSymp->resolved()->kind() == VhdlSymKind::CONSTANT
+                                 ? m_vars.find(termSymp->resolved())
+                                 : m_vars.end();
+        const bool isParam
+            = paramIt != m_vars.end() && paramIt->second->varType() == VVarType::LPARAM;
+        const bool isGeneric = (termSymp && termSymp->kind() == VhdlSymKind::GENERIC) || isParam
                                || (namesAGeneric(nodep) && !boundsOnlyRunningDecides(nodep));
         // Measuring asks only whether the two ends cancel, so it matches
         // terms as they were written rather than building them
@@ -23011,7 +23089,11 @@ private:
         ++m_regionDepth;
         AstNode* const outerp = m_stmtsp;
         m_stmtsp = nullptr;
-        for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
+        {
+            VL_RESTORER(m_inGenBody);
+            m_inGenBody = true;
+            for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
+        }
         for (AstNode* p = nodep->stmtsp(); p; p = p->nextp()) {
             lowerConcurrent(VN_AS(p, NodeVhdlStmt));
         }
