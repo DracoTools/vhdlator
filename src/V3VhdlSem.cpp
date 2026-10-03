@@ -213,6 +213,11 @@ class VhdlSemVisitor final : public VNVisitor {
         return scopep;
     }
 
+    // The region a generic subprogram being instantiated was declared in
+    VhdlScope* m_instTemplScopep = nullptr;
+    // The region each generic subprogram's body was analyzed in
+    std::map<const AstVhdlSubprogDecl*, VhdlScope*> m_genericBodyScopes;
+
     // Push a nested region for the duration of a construct
     VhdlScope* pushScope(const std::string& name) {
         m_scopep = VhdlSymTab::newScope(m_scopep, name);
@@ -2879,11 +2884,24 @@ void VhdlSemVisitor::visitSubprogDecl(AstVhdlSubprogDecl* nodep) {
     // Parameters live in the subprogram's own region, but their types are
     // named in the enclosing one, so resolve them before pushing
     VhdlScope* const outerp = m_scopep;
+    if (nodep->genericCount() > 0 && nodep->hasBody() && !nodep->isInstance()) {
+        m_genericBodyScopes[nodep] = outerp;
+    }
     // A subprogram body is a named construct, so from inside it one of its
     // own declarations may be named in full: "f.v" is the v declared in f
     // (8.3). Only from inside, which is what naming the region in itself
     // gives, since a region is searched for outwards.
     VhdlScope* const innerp = nameEnclosing(pushScope(nodep->name()), nodep->name());
+    // A copy of a generic subprogram is analyzed where it is instantiated,
+    // but its body was written where it was declared, and names what that
+    // region and the use clauses around it make visible -- "round" of
+    // math_real, which the instantiating package need not use (4.4)
+    if (nodep->isInstance() && m_instTemplScopep) {
+        for (VhdlScope* scopep = m_instTemplScopep; scopep; scopep = scopep->parentp()) {
+            innerp->addUse(scopep);
+            for (VhdlScope* const usedp : scopep->uses()) innerp->addUse(usedp);
+        }
+    }
     // A copy made for one call site may have been given the values that call
     // site passes, so that lengths depending on them fold (see specialize())
     std::vector<VhdlValue> specValues;
@@ -5394,6 +5412,32 @@ void VhdlSemVisitor::visit(AstVhdlSubprogInst* nodep) {
         }
     }
     nodep->copyp(copyp);
+    VL_RESTORER(m_instTemplScopep);
+    m_instTemplScopep = nullptr;
+    const auto bodyScopeIt = m_genericBodyScopes.find(templp);
+    if (bodyScopeIt != m_genericBodyScopes.end()) {
+        m_instTemplScopep = bodyScopeIt->second;
+    } else {
+        // The body is in a unit not analyzed yet: what its context clause
+        // makes visible is set up on its own, which is what the body names
+        AstNode* unitp = templp;
+        while (unitp && !VN_IS(unitp, NodeVhdlUnit)) unitp = unitp->backp();
+        if (AstNodeVhdlUnit* const bodyUnitp = VN_CAST(unitp, NodeVhdlUnit)) {
+            VL_RESTORER(m_scopep);
+            m_scopep = VhdlSymTab::newScope(nullptr, bodyUnitp->name() + "$instcontext");
+            m_scopep->addUse(V3VhdlStd::standardScope());
+            for (AstNode* ctxp = bodyUnitp->contextp(); ctxp; ctxp = ctxp->nextp()) {
+                if (AstVhdlContextItem* const itemp = VN_CAST(ctxp, VhdlContextItem)) {
+                    applyContextItem(itemp);
+                }
+            }
+            const std::string lib
+                = bodyUnitp->libname().empty() ? "work" : lower(bodyUnitp->libname());
+            const auto unitIt = m_unitScopes.find(lib + "." + lower(bodyUnitp->name()));
+            if (unitIt != m_unitScopes.end()) m_scopep->addUse(unitIt->second);
+            m_instTemplScopep = m_scopep;
+        }
+    }
     iterate(copyp);
 }
 
