@@ -6603,6 +6603,8 @@ private:
     // and only then does a timed wait have to stand aside for the update.
     bool m_anyAfter = false;
     bool m_inGenBody = false;  // Lowering the declarations of a generate's block
+    // A block's port associated with a signal, and that signal (6.5.6.3)
+    std::map<const VhdlSymbol*, const VhdlSymbol*> m_blockPortSignals;
     // Signals some assignment gives a 'Z' written as a literal
     std::set<const VhdlSymbol*> m_zAssigned;
     // The names of the constants some external name reaches (8.7)
@@ -10202,7 +10204,7 @@ private:
                                   FileLine* flp) {
         const VhdlSymbol* const symp = rootSymOf(nodep->prefixp());
         if (!symp) return nullptr;
-        VhdlSymbol* const rsymp = const_cast<VhdlSymbol*>(symp->resolved());
+        VhdlSymbol* const rsymp = const_cast<VhdlSymbol*>(pkgAliasBase(symp->resolved()));
         // A driver that only ever writes part of the signal is not driving
         // the whole of it, and which process wrote which part is not known
         // here, so it is refused rather than answered for the whole
@@ -18763,6 +18765,14 @@ private:
             // driver (6.5.7.1) -- which is the whole reason for saying it
             if (!isGeneric && !inertial) {
                 if (AstVarRef* const refp = VN_CAST(valuep, VarRef)) {
+                    const VhdlSymbol* const asymp = VN_IS(actualp, VhdlName) && actualp->vhdlSymp()
+                                                        ? actualp->vhdlSymp()->resolved()
+                                                        : nullptr;
+                    if (asymp
+                        && (asymp->kind() == VhdlSymKind::SIGNAL
+                            || asymp->kind() == VhdlSymKind::PORT)) {
+                        m_blockPortSignals[symp->resolved()] = asymp;
+                    }
                     m_vars.emplace(symp, refp->varp());
                     VL_DO_DANGLING(valuep->deleteTree(), valuep);
                     continue;
@@ -19057,6 +19067,8 @@ private:
                 const VhdlSymbol* const symp = exprp->vhdlSymp();
                 if (!symp) return;
                 if (m_drivers.count(symp->resolved())) found = true;
+                // A port of a block is the signal it is associated with
+                if (m_drivers.count(pkgAliasBase(symp->resolved()))) found = true;
                 // Counted before anything was lowered, so known to a process
                 // that comes before the ones that drive it
                 // Nor does this, counted before anything was lowered: which
@@ -19736,6 +19748,14 @@ private:
     // otherwise what it was given. Driving through an alias is driving the
     // object it denotes (6.6.2).
     const VhdlSymbol* pkgAliasBase(const VhdlSymbol* symp) const {
+        // A port of a block associated with a signal of the design is that
+        // signal (6.5.6.3): a process inside the block driving the port is
+        // one of the signal's drivers
+        for (int depth = 0; symp && depth < 32; ++depth) {
+            const auto bIt = m_blockPortSignals.find(symp);
+            if (bIt == m_blockPortSignals.end()) break;
+            symp = bIt->second;
+        }
         const VhdlSymbol* curp = symp;
         for (int depth = 0; curp && curp->kind() == VhdlSymKind::ALIAS && depth < 32; ++depth) {
             const AstVhdlAliasDecl* const declp = VN_CAST(curp->declp(), VhdlAliasDecl);
@@ -32313,6 +32333,7 @@ private:
         m_actToggles.clear();
         m_needActive.clear();
         m_delayeds.clear();
+        m_blockPortSignals.clear();
         m_shadowOwners.clear();
         m_delayedPartShadows.clear();
         m_implicitActs.clear();

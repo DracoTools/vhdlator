@@ -7231,9 +7231,47 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::set<const VhdlSymbol*> outsideGenerate;
     // A block statement is not a driver of its own: the statements inside it
     // are, and so are those of a block inside that one (11.2)
+    // A port of a block associated whole with a signal is that signal
+    // (6.5.6.3), so a process inside the block driving the port is one of
+    // the signal's drivers
+    std::map<const VhdlSymbol*, const VhdlSymbol*> portSignals;
+    const auto throughPorts = [&](const VhdlSymbol* symp) {
+        for (int depth = 0; symp && depth < 32; ++depth) {
+            const auto it = portSignals.find(symp);
+            if (it == portSignals.end()) break;
+            symp = it->second;
+        }
+        return symp;
+    };
     std::function<void(AstNode*)> walk = [&](AstNode* stmtsp) {
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
             if (AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+                if (AstVhdlBlockHeader* const hdrp = blockp->headerp()) {
+                    size_t pos = 0;
+                    std::vector<const AstVhdlIfaceDecl*> ports;
+                    for (AstNode* pp = hdrp->portsp(); pp; pp = pp->nextp()) {
+                        ports.push_back(VN_CAST(pp, VhdlIfaceDecl));
+                    }
+                    for (AstNode* mp = hdrp->portMapp(); mp; mp = mp->nextp(), ++pos) {
+                        const AstVhdlAssoc* const asp = VN_CAST(mp, VhdlAssoc);
+                        if (!asp || !asp->actualp() || !VN_IS(asp->actualp(), VhdlName)) continue;
+                        const AstVhdlIfaceDecl* ifp = nullptr;
+                        if (const AstVhdlName* const fnp = VN_CAST(asp->formalp(), VhdlName)) {
+                            for (const AstVhdlIfaceDecl* const one : ports) {
+                                if (one && one->name() == fnp->name()) ifp = one;
+                            }
+                        } else if (!asp->formalp() && pos < ports.size()) {
+                            ifp = ports[pos];
+                        }
+                        const VhdlSymbol* const asymp = asp->actualp()->vhdlSymp();
+                        if (!ifp || !ifp->vhdlSymp() || !asymp) continue;
+                        const VhdlSymbol* const rp = asymp->resolved();
+                        if (rp->kind() != VhdlSymKind::SIGNAL && rp->kind() != VhdlSymKind::PORT) {
+                            continue;
+                        }
+                        portSignals[ifp->vhdlSymp()] = rp;
+                    }
+                }
                 // A block is not a driver of its own, but a conversion
                 // written on one of its ports is: what the port drives
                 // leaves through the conversion and arrives at the actual as
@@ -7287,6 +7325,9 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                 }
             }
             if (!repeat) continue;
+            std::set<const VhdlSymbol*> wholeSignals;
+            for (const VhdlSymbol* const symp : whole) wholeSignals.insert(throughPorts(symp));
+            whole.swap(wholeSignals);
             for (const VhdlSymbol* const symp : whole) {
                 counts[symp] += repeat;
                 if (!inGenerate) outsideGenerate.insert(symp);
