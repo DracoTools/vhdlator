@@ -12569,6 +12569,18 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
         resultp = wantp ? wantp : V3VhdlStd::errorType();
     } else if (AstVhdlExternalName* const p = VN_CAST(nodep, VhdlExternalName)) {
         resultp = resolveSubtype(p->subtypep());
+        // The index of a generate's iteration in the pathname is an
+        // expression of where the name is written: "g(N)" with N a generic
+        // of this entity (8.7)
+        for (AstNode* pp = p->pathp(); pp; pp = pp->nextp()) {
+            AstVhdlCall* const callp = VN_CAST(pp, VhdlCall);
+            AstVhdlAssoc* const argp = callp && callp->argsp() && !callp->argsp()->nextp()
+                                           ? VN_CAST(callp->argsp(), VhdlAssoc)
+                                           : nullptr;
+            if (argp && argp->actualp() && !argp->formalp()) {
+                analyzeExpr(argp->actualp(), nullptr);
+            }
+        }
     } else {
         iterateChildren(nodep);
     }

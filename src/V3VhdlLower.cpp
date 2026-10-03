@@ -207,6 +207,19 @@ class VhdlLowerVisitor final {
     // start one region up from a module and name an object of whatever that is
     std::map<std::string, std::set<std::string>> m_cellParents;
     std::vector<std::pair<AstVarXRef*, std::string>> m_pendingUpExt;
+    // How deep among its module's blocks and generates each module is
+    // instantiated, per module name
+    std::map<std::string, std::set<int>> m_cellDepths;
+    // An external name climbing out of its module through the regions its
+    // instance sits in: the leftmost name of the hierarchical name made of
+    // it, to be the instantiating module's, the module it is written in, and
+    // how many regions it climbs there
+    struct PendingUpDot final {
+        AstParseRef* placep;
+        std::string modName;
+        int climb;
+    };
+    std::vector<PendingUpDot> m_pendingUpDots;
     // Refusals that stand only if their module is part of the design: the
     // module, where, and what
     std::vector<std::tuple<std::string, FileLine*, std::string>> m_reachedRefusals;
@@ -12205,6 +12218,55 @@ private:
         // inside g(1) (8.7)
         const bool caretsInModule
             = nodep->upLevels() > 0 && nodep->upLevels() <= m_regionDepth && !m_ftaskp;
+        // Climbing out of this module and then through the regions the
+        // instance sits in, or naming one iteration of a generate there by
+        // an index the instance knows: "^.^.g(N).uut.k" from inside the
+        // instance g(N).uut (8.7). The name is written from the instantiating
+        // module as a hierarchical name with the index as an expression,
+        // which the back end folds per instance.
+        if (nodep->upLevels() > 0 && !caretsInModule && m_regionDepth == 0 && m_blockPrefix.empty()
+            && m_modp && !m_ftaskp) {
+            bool needsTree = nodep->upLevels() > 1;
+            for (AstNode* p = nodep->pathp(); p; p = p->nextp()) {
+                if (VN_IS(p, VhdlCall)) needsTree = true;
+            }
+            if (needsTree) {
+                AstParseRef* const placep = new AstParseRef{flp, "__Vupparent"};
+                AstNodeExpr* treep = placep;
+                bool ok = true;
+                for (AstNode* p = nodep->pathp(); ok && p; p = p->nextp()) {
+                    AstNodeExpr* partp = nullptr;
+                    if (const AstVhdlName* const namep = VN_CAST(p, VhdlName)) {
+                        partp = new AstParseRef{flp, namep->name()};
+                    } else if (const AstVhdlCall* const callp = VN_CAST(p, VhdlCall)) {
+                        const AstVhdlName* const genp = VN_CAST(callp->prefixp(), VhdlName);
+                        const AstVhdlAssoc* const argp = callp->argsp() && !callp->argsp()->nextp()
+                                                             ? VN_CAST(callp->argsp(), VhdlAssoc)
+                                                             : nullptr;
+                        AstNodeExpr* const idxp
+                            = genp && argp && argp->actualp() && !argp->formalp()
+                                  ? lowerExpr(argp->actualp())
+                                  : nullptr;
+                        if (idxp) {
+                            partp = new AstSelBit{flp, new AstParseRef{flp, genp->name()}, idxp};
+                        }
+                    }
+                    if (!partp) {
+                        ok = false;
+                        break;
+                    }
+                    treep = new AstDot{flp, false, treep, partp};
+                }
+                if (!ok) {
+                    VL_DO_DANGLING(treep->deleteTree(), treep);
+                    unsup(flp, "external name whose pathname is not a list of names");
+                    return nullptr;
+                }
+                m_pendingUpDots.push_back(
+                    PendingUpDot{placep, m_modp->name(), nodep->upLevels() - 1});
+                return treep;
+            }
+        }
         if (nodep->upLevels() > 0 && !caretsInModule) {
             // "^" is the region enclosing this one (8.7). Written straight in
             // an architecture, one of them is the region that instantiates
@@ -22667,6 +22729,7 @@ private:
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
         m_instantiated.insert(modName);
         if (m_modp) m_cellParents[modName].insert(m_modp->name());
+        m_cellDepths[modName].insert(m_regionDepth);
         AstCell* const cellp = new AstCell{flp, flp, instName, modName, pinsp, paramsp, nullptr};
         {
             // The regions of this design entity it sits in, for the paths of
@@ -33374,6 +33437,22 @@ void VhdlLowerVisitor::settleUpwardNames() {
         refp->dotted(refp->dotted().empty() ? parent : parent + "." + refp->dotted());
     }
     m_pendingUpExt.clear();
+    for (const PendingUpDot& pending : m_pendingUpDots) {
+        const auto it = m_cellParents.find(pending.modName);
+        const auto dIt = m_cellDepths.find(pending.modName);
+        // Only where one module instantiates this one, every instance as
+        // deep among its regions as the carets climb: then the region the
+        // name reaches is that module's own
+        if (it == m_cellParents.end() || it->second.size() != 1 || dIt == m_cellDepths.end()
+            || dIt->second.size() != 1 || *dIt->second.begin() != pending.climb) {
+            unsup(pending.placep->fileline(),
+                  "external name with a relative pathname starting at '^' that climbs to a"
+                  " region other than the instantiating unit's own");
+            continue;
+        }
+        pending.placep->name(*it->second.begin());
+    }
+    m_pendingUpDots.clear();
 }
 
 void VhdlLowerVisitor::addPathPins() {
