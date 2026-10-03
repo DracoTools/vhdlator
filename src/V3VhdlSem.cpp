@@ -5603,8 +5603,20 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
         }
         return;
     }
-    // A value: its subtype is named in the package, its value given here
-    VhdlType* const typep = formalp->subtypep() ? resolveSubtype(formalp->subtypep()) : nullptr;
+    // A value: its subtype is named in the package, its value given here.
+    // Named afresh in the copy: the formal was analyzed as the template's,
+    // where a generic type it names is still the formal type rather than
+    // the type this instance gave it (6.5.6.2)
+    VhdlType* typep = formalp->subtypep() ? resolveSubtype(formalp->subtypep()) : nullptr;
+    if (typep && typep->isGenericFormal() && !formalp->subtypep()->constraintp()
+        && !formalp->subtypep()->resolutionp()) {
+        // A bare type mark, so the clone holds nothing a type keeps
+        AstVhdlSubtypeInd* const freshp = formalp->subtypep()->cloneTree(false);
+        VhdlUnanalyzeVisitor{static_cast<AstNode*>(freshp)};
+        VhdlType* const boundp = resolveSubtype(freshp);
+        VL_DO_DANGLING(freshp->deleteTree(), freshp);
+        if (boundp && !boundp->isError()) typep = boundp;
+    }
     m_scopep = outerp;
     analyzeExpr(actualp, typep);
     const VhdlValue val = V3VhdlEval::eval(actualp);
