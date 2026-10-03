@@ -8890,6 +8890,35 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
             || attrName == "simple_name")) {
         std::vector<VhdlSymbol*> found;
         if (!parts.empty()) lookup(parts.back(), found);
+        // "foo [bit return string]'instance_name": where the name is
+        // overloaded the signature says which declaration it is (8.6)
+        if (found.size() > 1 && nodep->signaturep()) {
+            std::vector<VhdlType*> wantParams;
+            for (AstNode* p = nodep->signaturep()->paramTypesp(); p; p = p->nextp()) {
+                wantParams.push_back(resolveTypeMark(VN_AS(p, NodeVhdlExpr)));
+            }
+            VhdlType* const wantReturnp = nodep->signaturep()->returnTypep()
+                                              ? resolveTypeMark(nodep->signaturep()->returnTypep())
+                                              : nullptr;
+            for (size_t k = 0; k < found.size(); ++k) {
+                const VhdlSymbol* const realp = found[k]->resolved();
+                if (realp->paramTypes().size() != wantParams.size()) continue;
+                bool ok = true;
+                for (size_t i = 0; i < wantParams.size() && ok; ++i) {
+                    const VhdlType* const havep = realp->paramTypes()[i];
+                    if (!havep || !wantParams[i] || havep->base() != wantParams[i]->base()) {
+                        ok = false;
+                    }
+                }
+                const VhdlType* const haveRetp
+                    = realp->returnTypep() ? realp->returnTypep() : realp->typep();
+                if (ok && wantReturnp) ok = haveRetp && haveRetp->base() == wantReturnp->base();
+                if (ok) {
+                    std::swap(found[0], found[k]);
+                    break;
+                }
+            }
+        }
         if (!found.empty()) nodep->prefixp()->vhdlSymp(found[0]);
         // The prefix names a named entity (16.2.7), and "v'subtype" of an
         // object declared with a constraint is a subtype no declaration names
