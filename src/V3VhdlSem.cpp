@@ -55,6 +55,46 @@ VL_DEFINE_DEBUG_FUNCTIONS;
 // The node a node is a child of. backp() is the previous sibling for any
 // node but the first of a list, so walking it upward passes through every
 // declaration written earlier in the same region before reaching the region.
+// Whether a value is known throughout, every element of a composite included
+static bool allKnown(const VhdlValue& val) {
+    if (!val.known()) return false;
+    for (size_t i = 0; i < val.elements(); ++i) {
+        if (!allKnown(val.elementAt(i))) return false;
+    }
+    return true;
+}
+
+// What elaborating an expression of the root architecture's declarations
+// gives, running the impure functions it calls once (14.4.2); unknown, with
+// whatever they wrote undone, where any part of it does not fold
+static VhdlValue elabFoldOnce(AstNodeVhdlExpr* exprp) {
+    std::map<const VhdlSymbol*, VhdlValue> before;
+    for (const VhdlSymbol* const sp : V3VhdlEval::s_archShared) before[sp] = sp->elabValue();
+    const std::set<const VhdlSymbol*> writtenBefore = V3VhdlEval::s_elabWritten;
+    const auto objectsBefore = V3VhdlEval::s_objState;
+    const std::set<const VhdlSymbol*> objWrittenBefore = V3VhdlEval::s_objWritten;
+    const VhdlValue elab = V3VhdlEval::evalElab(exprp);
+    if (elab.known() && (!elab.isComposite() || allKnown(elab))) return elab;
+    V3VhdlEval::s_objState = objectsBefore;
+    V3VhdlEval::s_objWritten = objWrittenBefore;
+    for (const auto& pair : before) const_cast<VhdlSymbol*>(pair.first)->elabValue(pair.second);
+    V3VhdlEval::s_elabWritten = writtenBefore;
+    return VhdlValue{};
+}
+
+// Whether an expression calls a function declared impure
+static bool callsImpure(AstNode* exprp) {
+    bool found = false;
+    exprp->foreach([&](const AstNodeVhdlExpr* np) {
+        const VhdlSymbol* const symp = np->vhdlSymp();
+        if (!symp || symp->kind() != VhdlSymKind::FUNCTION || symp->predefined()) return;
+        const AstVhdlSubprogDecl* declp = symp->bodyp();
+        if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        if (declp && !declp->vhdlPure()) found = true;
+    });
+    return found;
+}
+
 static const AstNode* parentOf(const AstNode* nodep) {
     while (nodep->backp() && nodep->backp()->nextp() == nodep) nodep = nodep->backp();
     return nodep->backp();
@@ -194,6 +234,8 @@ class VhdlSemVisitor final : public VNVisitor {
     std::vector<AstNodeVhdl*> m_pendingPkgDecls;
     bool m_inSubprogInst = false;  // Binding the generics of a subprogram's copy
     bool m_archDecls = false;  // Analyzing an architecture's own declarations
+    // Shared variables of a protected type that packages declare
+    std::vector<const VhdlSymbol*> m_pkgProtObjects;
     std::vector<AstNodeVhdl*> m_pendingSubprogDecls;  // What that copy declares for them
     // Whether the generics being bound are a package instantiation's, which
     // is the only place a synthesized constant has declarations to live in
@@ -2073,6 +2115,7 @@ private:
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
     // Declarations
     void visit(AstVhdlTypeDecl* nodep) override;
+    bool foldElabBounds(AstNode* defp);
     void visit(AstVhdlSubtypeDecl* nodep) override;
     void visit(AstVhdlObjectDecl* nodep) override;
     void visit(AstVhdlIfaceDecl* nodep) override;
@@ -2364,6 +2407,35 @@ private:
 //######################################################################
 // Declarations
 
+// Write each bound under a type definition that elaboration alone folds as
+// the integer it gives; whether any was
+bool VhdlSemVisitor::foldElabBounds(AstNode* defp) {
+    std::vector<AstNodeVhdlExpr*> bounds;
+    defp->foreach([&](AstVhdlRange* rangep) {
+        if (rangep->leftp()) bounds.push_back(rangep->leftp());
+        if (rangep->rightp()) bounds.push_back(rangep->rightp());
+    });
+    bool any = false;
+    for (AstNodeVhdlExpr* const exprp : bounds) {
+        if (V3VhdlEval::s_elabObjects.empty()) break;
+        if (!callsImpure(exprp) || V3VhdlEval::eval(exprp).known()) continue;
+        const VhdlValue val = elabFoldOnce(exprp);
+        if (!val.isInt() || val.toInt() < 0 || !exprp->vhdlTypep()
+            || exprp->vhdlTypep()->base()->kind() != VhdlTypeKind::INTEGER) {
+            // Left to run when the design starts; see visit(AstVhdlObjectDecl)
+            if (callsImpure(exprp)) V3VhdlEval::s_elabObjects.clear();
+            continue;
+        }
+        AstVhdlLiteral* const litp = new AstVhdlLiteral{exprp->fileline(), VhdlLitKind::INTEGER,
+                                                        std::to_string(val.toInt())};
+        litp->intVal(val.toInt());
+        exprp->replaceWith(litp);
+        VL_DO_DANGLING(pushDeletep(exprp), exprp);
+        any = true;
+    }
+    return any;
+}
+
 void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
     // A protected type body completes a declaration rather than making a new
     // type (5.6.3), and its declarations belong to the region that
@@ -2430,7 +2502,16 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
         popScope();
         return;
     }
-    VhdlType* const typep = buildType(nodep->defp(), nodep->name(), nodep->fileline());
+    VhdlType* typep = buildType(nodep->defp(), nodep->name(), nodep->fileline());
+    // A bound of the root architecture's own array type that only running
+    // an impure function settles -- one calling a method of a package's
+    // protected object -- is what elaborating the declaration gives, once
+    // (14.4.2): written in as that number, the type is built again
+    if (m_archDecls && !V3VhdlEval::s_elabObjects.empty()
+        && VN_IS(parentOf(nodep), VhdlArchitecture) && typep->base()->kind() == VhdlTypeKind::ARRAY
+        && foldElabBounds(nodep->defp())) {
+        typep = buildType(nodep->defp(), nodep->name(), nodep->fileline());
+    }
     typep->name(nodep->name());
     // An incomplete type declaration is completed by the full one, not
     // redeclared by it, and an access type already declared against the name
@@ -2698,22 +2779,22 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             // declarations in the same order from the same start (14.4.2),
             // so the value is the same in each, and is what elaborating them
             // here gives. Where it does not fold, what it wrote is undone.
+            // So is one of the root architecture whose impure function runs
+            // a method of a package's protected object (s_elabObjects); only
+            // one that calls such a function is elaborated this way, so that
+            // a constant the static rules leave to a generic stays one.
+            const bool objects = !val.known() && nodep->defaultp()
+                                 && !V3VhdlEval::s_elabObjects.empty()
+                                 && callsImpure(nodep->defaultp());
             if (!val.known() && m_archDecls && VN_IS(parentOf(nodep), VhdlArchitecture)
-                && symp->typep() && symp->typep()->isScalar()
-                && !V3VhdlEval::s_archShared.empty()) {
-                std::map<const VhdlSymbol*, VhdlValue> before;
-                for (const VhdlSymbol* const sp : V3VhdlEval::s_archShared) {
-                    before[sp] = sp->elabValue();
-                }
-                const std::set<const VhdlSymbol*> writtenBefore = V3VhdlEval::s_elabWritten;
-                const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
-                if (elab.known() && !elab.isComposite()) {
+                && symp->typep()
+                && (symp->typep()->isScalar()
+                    || (symp->typep()->base()->kind() == VhdlTypeKind::RECORD && objects))
+                && (!V3VhdlEval::s_archShared.empty() || objects)) {
+                const VhdlValue elab = elabFoldOnce(nodep->defaultp());
+                if (elab.known()) {
                     val = elab;
-                } else {
-                    for (const auto& pair : before) {
-                        const_cast<VhdlSymbol*>(pair.first)->elabValue(pair.second);
-                    }
-                    V3VhdlEval::s_elabWritten = writtenBefore;
+                    V3VhdlEval::s_elabFolded.insert(symp);
                 }
             }
             if (val.isComposite()) {
@@ -2727,7 +2808,13 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             // is kept apart from the value the emitted code is built from.
             if (!val.known() && symp->typep()
                 && symp->typep()->base()->kind() == VhdlTypeKind::RECORD) {
+                // Only the widths are wanted, so a method of an object this
+                // ran is not one the design ran
+                const auto objectsBefore = V3VhdlEval::s_objState;
+                const std::set<const VhdlSymbol*> objWrittenBefore = V3VhdlEval::s_objWritten;
                 const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
+                V3VhdlEval::s_objState = objectsBefore;
+                V3VhdlEval::s_objWritten = objWrittenBefore;
                 if (elab.isComposite()) symp->elabValue(elab);
             }
         }
@@ -2752,6 +2839,38 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         // A constant declared with no value in a package declaration is
         // deferred; its value comes with the package body (6.4.2.2)
         symp->deferred(true);
+    }
+    // A declaration elaboration did not settle but whose value calls an
+    // impure function runs when the design starts, in its place among the
+    // rest (14.4.2): a method of an object it calls changes what the
+    // declarations after it would find, so from here none of them runs one
+    // here, ahead of it
+    if (m_archDecls && !V3VhdlEval::s_elabObjects.empty() && nodep->defaultp()
+        && VN_IS(parentOf(nodep), VhdlArchitecture) && !V3VhdlEval::s_elabFolded.count(symp)
+        && callsImpure(nodep->defaultp())) {
+        V3VhdlEval::s_elabObjects.clear();
+    }
+    // How many objects of a protected type the design may make: one a
+    // variable is, or many an access value may designate. An object's
+    // state elaboration changed is the state of the type's objects at the
+    // start of the run only where it is the one.
+    if ((kind == VhdlSymKind::VARIABLE || kind == VhdlSymKind::SHARED_VARIABLE) && symp->typep()) {
+        const VhdlType* const basep = symp->typep()->base();
+        if (basep->kind() == VhdlTypeKind::PROTECTED) {
+            ++V3VhdlEval::s_protObjects[basep];
+        } else if (basep->kind() == VhdlTypeKind::ACCESS && basep->designatedp()
+                   && basep->designatedp()->base()->kind() == VhdlTypeKind::PROTECTED) {
+            V3VhdlEval::s_protObjects[basep->designatedp()->base()] += 2;
+        }
+    }
+    // A package's object of a protected type, whose methods the root
+    // architecture's elaboration may run
+    if (kind == VhdlSymKind::SHARED_VARIABLE && symp->typep()
+        && symp->typep()->base()->kind() == VhdlTypeKind::PROTECTED && !m_inSpecialized) {
+        const AstNode* const upp = parentOf(nodep);
+        if (VN_IS(upp, VhdlPackage) || VN_IS(upp, VhdlPackageBody)) {
+            m_pkgProtObjects.push_back(symp);
+        }
     }
 }
 
@@ -4969,8 +5088,20 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 VL_RESTORER(m_archDecls);
                 m_archDecls = !m_inSpecialized;
                 V3VhdlEval::s_archShared.clear();
+                // The root architecture's declarations elaborate once, after
+                // the packages (14.4.2), so the methods of a package's
+                // protected objects may run there and what they change is
+                // what the design starts with
+                V3VhdlEval::s_elabObjects.clear();
+                if (m_archDecls && !parts.empty() && !v3Global.opt.topModule().empty()
+                    && lower(parts.back()) == lower(v3Global.opt.topModule())) {
+                    for (const VhdlSymbol* const objp : m_pkgProtObjects) {
+                        V3VhdlEval::s_elabObjects.insert(objp);
+                    }
+                }
                 iterateAndNextNull(archp->declsp());
                 V3VhdlEval::s_archShared.clear();
+                V3VhdlEval::s_elabObjects.clear();
             }
             iterateAndNextNull(archp->stmtsp());
             checkConfigSpecs(archp->declsp(), archp->stmtsp());

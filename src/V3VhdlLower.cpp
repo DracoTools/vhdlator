@@ -6449,6 +6449,40 @@ private:
         return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(iv)};
     }
 
+    // A record value elaboration settled in full, as the pattern (or, for
+    // one that packs, the concatenation) an object of its type is given;
+    // null if any element of it is not something lowerValue writes
+    AstNodeExpr* lowerWholeValue(const VhdlValue& val, VhdlType* typep, FileLine* flp) {
+        if (!val.isComposite()) return lowerValue(val, typep, flp);
+        VhdlType* const basep = typep ? typep->base() : nullptr;
+        if (!val.isRecord() || !basep || basep->kind() != VhdlTypeKind::RECORD
+            || basep->elements().size() != val.elements()) {
+            return nullptr;
+        }
+        const bool packed = recordPacks(basep);
+        AstNodeExpr* outp = nullptr;
+        AstNode* itemsp = nullptr;
+        for (size_t i = 0; i < val.elements(); ++i) {
+            VhdlSymbol* const elemp = basep->elements()[i];
+            AstNodeExpr* const onep = elementCarried(elemp->typep())
+                                          ? nullptr
+                                          : lowerWholeValue(val.elementAt(i), elemp->typep(), flp);
+            if (!onep) {
+                if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
+                return nullptr;
+            }
+            if (packed) {
+                outp = outp ? new AstConcat{flp, outp, onep} : onep;
+            } else {
+                itemsp = AstNode::addNextNull(
+                    itemsp, new AstPatMember{flp, onep, new AstText{flp, elemp->name()}, nullptr});
+            }
+        }
+        if (packed) return outp;
+        return itemsp ? new AstPattern{flp, itemsp} : nullptr;
+    }
+
     // One bit of a logic type. Z survives into the AST as the Verilog one
     // does, since it is representable. 'U', 'X', 'W' and '-' do not: this
     // runtime has no metavalues, and writing them as Verilog X would leave
@@ -7142,6 +7176,20 @@ private:
             switch (objp->kind()) {
             case VhdlObjKind::SIGNAL: varType = VVarType::VAR; break;
             case VhdlObjKind::CONSTANT:
+                // One elaboration gave a whole value by running an impure
+                // function (V3VhdlEval::s_elabFolded) is a parameter holding
+                // that value, as a composite one: what an instance is handed
+                // for a generic of a record type has to be one
+                if (!symp->hasValue() && V3VhdlEval::s_elabFolded.count(symp) && !m_ftaskp
+                    && !m_protClassp && symp->elabValue().known()) {
+                    if (AstNodeExpr* const valp
+                        = lowerWholeValue(symp->elabValue(), symp->typep(), flp)) {
+                        AstVar* const cvarp = newVar(symp, VVarType::LPARAM, flp);
+                        cvarp->valuep(valp);
+                        addStmt(cvarp);
+                        return;
+                    }
+                }
                 // A constant with a folded value needs no storage at all --
                 // unless an external name reaches it, from a region where
                 // the value is not in reach (8.7)
@@ -7351,6 +7399,35 @@ private:
                 }
             } else {
                 varp->valuep(defaultValueFor(symp->typep(), flp));
+            }
+            // A variable of a protected type's body whose object a method
+            // changed while the root architecture elaborated starts the run
+            // with what that left in it (14.4.2) -- which, being where every
+            // object of the type starts, needs the object to be the only one
+            if (m_protClassp && !m_ftaskp && objp->kind() == VhdlObjKind::VARIABLE) {
+                for (const VhdlSymbol* const objSymp : V3VhdlEval::s_objWritten) {
+                    const auto stateIt = V3VhdlEval::s_objState.find(objSymp);
+                    if (stateIt == V3VhdlEval::s_objState.end()) continue;
+                    const auto valIt = stateIt->second.find(symp);
+                    if (valIt == stateIt->second.end() || !valIt->second.known()) continue;
+                    const auto countIt = V3VhdlEval::s_protObjects.find(objSymp->typep()->base());
+                    if (countIt == V3VhdlEval::s_protObjects.end() || countIt->second != 1) {
+                        unsup(flp, "variable '" + objp->name()
+                                       + "' of a protected type that elaboration changed"
+                                         " in one of its several objects");
+                        break;
+                    }
+                    if (AstNodeExpr* const valp
+                        = lowerWholeValue(valIt->second, symp->typep(), flp)) {
+                        if (varp->valuep()) varp->valuep()->unlinkFrBack()->deleteTree();
+                        varp->valuep(valp);
+                    } else {
+                        unsup(flp, "variable '" + objp->name()
+                                       + "' of a protected type, holding what elaboration"
+                                         " left in it");
+                    }
+                    break;
+                }
             }
             // A constant elaboration settles is a parameter only where its
             // value folds: one given what an impure function returns --
@@ -22853,12 +22930,18 @@ private:
         const auto it = m_hoists.find(modName);
         if (it == m_hoists.end()) return nullptr;
         std::map<const VhdlSymbol*, VhdlValue> bindings;
+        size_t position = 0;
         for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            // Positional: the generic the Nth association reaches (6.5.7.1)
+            const size_t at = asp && !asp->formalp() ? position++ : SIZE_MAX;
             if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
             const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
-            const VhdlSymbol* const gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
-            if (!gsymp) continue;  // Positional: the formal is not named here
+            const VhdlSymbol* gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+            if (!gsymp && at < nodep->formalGenericSyms().size()) {
+                gsymp = nodep->formalGenericSyms()[at];
+            }
+            if (!gsymp) continue;
             const VhdlValue val = V3VhdlEval::evalElab(asp->actualp());
             if (val.known()) bindings.emplace(gsymp->resolved(), val);
         }

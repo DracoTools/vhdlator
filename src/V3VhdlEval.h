@@ -70,6 +70,20 @@ public:
     // every instance. Written while elaborating are kept in s_elabWritten.
     static std::set<const VhdlSymbol*> s_archShared;
     static std::set<const VhdlSymbol*> s_elabWritten;
+    // Objects of protected types -- shared variables of a package -- whose
+    // methods elaboration may run, while the root architecture's own
+    // declarations elaborate, which happens once (14.4.2). What their
+    // variables hold is kept per object; s_objWritten names those a method
+    // changed.
+    static std::set<const VhdlSymbol*> s_elabObjects;
+    static std::map<const VhdlSymbol*, std::map<const VhdlSymbol*, VhdlValue>> s_objState;
+    static std::set<const VhdlSymbol*> s_objWritten;
+    // Objects of each protected type the design declares, counting two for
+    // any an access value may designate
+    static std::map<const VhdlType*, int> s_protObjects;
+    // Constants elaboration gave a value by running an impure function
+    // this way, whatever their type: the value is the constant's
+    static std::set<const VhdlSymbol*> s_elabFolded;
 
     // Whether the back end can fold an expression to a value, which it does
     // by running what it names. Being static is not the same question: a

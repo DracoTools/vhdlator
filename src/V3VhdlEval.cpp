@@ -301,6 +301,50 @@ class VhdlEvaluator final {
     // A procedure this evaluation could not run changed what it changed in
     // shared variables, so none of them is read from here on
     bool m_sharedStale = false;
+    // The protected object whose method is running, at elaboration
+    const VhdlSymbol* m_thisObj = nullptr;
+
+    // The variables of the object a method runs on, made from what the
+    // protected type's body declares the first time it is used. Null where
+    // the object is not one elaboration may run methods of, or a variable's
+    // initial value is not known -- or a procedure this evaluation did not
+    // follow may have run a method of it (m_sharedStale).
+    std::map<const VhdlSymbol*, VhdlValue>* objectVars(const VhdlSymbol* objp) {
+        if (!m_allowImpure || m_sharedStale || !objp || !V3VhdlEval::s_elabObjects.count(objp)) {
+            return nullptr;
+        }
+        const auto found = V3VhdlEval::s_objState.find(objp);
+        if (found != V3VhdlEval::s_objState.end()) return &found->second;
+        const VhdlType* const typep = objp->typep();
+        const AstVhdlProtectedType* const bodyp
+            = typep ? VN_CAST(typep->base()->bodyp(), VhdlProtectedType) : nullptr;
+        if (!bodyp) return nullptr;
+        std::map<const VhdlSymbol*, VhdlValue> vars;
+        for (const AstNode* p = bodyp->declsp(); p; p = p->nextp()) {
+            const AstVhdlObjectDecl* const odp = VN_CAST(p, VhdlObjectDecl);
+            if (!odp || odp->kind() != VhdlObjKind::VARIABLE || !odp->vhdlSymp()) continue;
+            const VhdlSymbol* const vsymp = odp->vhdlSymp();
+            VhdlValue val;
+            if (odp->defaultp()) {
+                val = eval(odp->defaultp());
+            } else if (vsymp->typep() && vsymp->typep()->bounded()
+                       && scalarValued(vsymp->typep())) {
+                // A scalar starts at its subtype's leftmost value (6.4.2.4)
+                val = VhdlValue::mkInt(vsymp->typep()->left(), vsymp->typep());
+            }
+            if (!val.known()) return nullptr;
+            vars.emplace(vsymp, val);
+        }
+        return &V3VhdlEval::s_objState.emplace(objp, vars).first->second;
+    }
+    // The object a call names a method of, by the prefix it is selected from
+    const VhdlSymbol* methodObject(const AstNodeVhdlExpr* calleep) {
+        const AstVhdlSelected* const selp = VN_CAST(calleep, VhdlSelected);
+        const VhdlSymbol* const objp = selp && selp->prefixp() && selp->prefixp()->vhdlSymp()
+                                           ? selp->prefixp()->vhdlSymp()->resolved()
+                                           : nullptr;
+        return objp && objectVars(objp) ? objp : nullptr;
+    }
 
     // A constant folded from a self-referential declaration would recurse
     // forever; analysis reports the cycle separately, so just stop
@@ -352,6 +396,11 @@ public:
                 VhdlValue rec = eval(p->prefixp());
                 if (m_allowImpure && isAccessValue(rec)) rec = deref(rec);
                 if (rec.isRecord()) return rec.field(suffixp->name());
+            }
+            if (const VhdlSymbol* const objp = methodObject(p)) {
+                VL_RESTORER(m_thisObj);
+                m_thisObj = objp;
+                return evalSymbol(p->vhdlSymp());
             }
             return evalSymbol(p->vhdlSymp());
         }
@@ -598,6 +647,14 @@ private:
             const Frame& frame = m_frames.back();
             const auto it = frame.find(symp);
             if (it != frame.end()) return it->second;
+        }
+        // A variable of the object a method runs on
+        if (m_thisObj) {
+            const auto stIt = V3VhdlEval::s_objState.find(m_thisObj);
+            if (stIt != V3VhdlEval::s_objState.end()) {
+                const auto vIt = stIt->second.find(symp);
+                if (vIt != stIt->second.end()) return vIt->second;
+            }
         }
         switch (symp->kind()) {
         case VhdlSymKind::ENUM_LITERAL:
@@ -1562,6 +1619,7 @@ private:
             && V3VhdlEval::s_archShared.count(symp)) {
             return symp;
         }
+        if (m_thisObj && V3VhdlEval::s_objState[m_thisObj].count(symp)) return symp;
         return m_frames.back().count(symp) ? symp : nullptr;
     }
 
@@ -1651,6 +1709,13 @@ private:
             // architecture elaborates, one it declared is written for the
             // rest of its declarations to read; any other is the design's
             // and outlives this, so a body writing one does not fold.
+            if (symp && m_thisObj && V3VhdlEval::s_objState[m_thisObj].count(symp)
+                && !m_frames.back().count(symp)) {
+                if (!val.known() || !VN_IS(p->targetp(), VhdlName)) return bail();
+                V3VhdlEval::s_objState[m_thisObj][symp] = val;
+                V3VhdlEval::s_objWritten.insert(m_thisObj);
+                return Flow::NORMAL;
+            }
             if (symp && symp->kind() == VhdlSymKind::SHARED_VARIABLE) {
                 if (!m_allowImpure || !V3VhdlEval::s_archShared.count(symp) || !val.known()
                     || !VN_IS(p->targetp(), VhdlName)) {
@@ -1884,6 +1949,11 @@ private:
         }
         AstVhdlSubprogDecl* const declp = procp->bodyp();
         if (!declp || declp->isFunction() || m_calls >= MAX_CALLS) return false;
+        // A method of a protected object runs on that object
+        VL_RESTORER(m_thisObj);
+        if (const VhdlSymbol* const objp = methodObject(callp ? callp->prefixp() : callExprp)) {
+            m_thisObj = objp;
+        }
         std::vector<AstVhdlIfaceDecl*> parms;
         int skip = declp->genericCount();
         for (AstNode* p = declp->paramsp(); p; p = p->nextp()) {
@@ -2265,6 +2335,9 @@ private:
         if (namedp) {
             const VhdlSymbol* const funcp = namedp->resolved();
             if (funcp->kind() == VhdlSymKind::FUNCTION) {
+                // A method of a protected object runs on that object
+                VL_RESTORER(m_thisObj);
+                if (const VhdlSymbol* const objp = methodObject(prefixp)) m_thisObj = objp;
                 // A call to a pure function whose actuals are static is static
                 // in its turn (9.4.3 i), whoever declared it
                 return funcp->predefined() ? evalMinMax(nodep, funcp)
@@ -2340,6 +2413,11 @@ private:
 bool V3VhdlEval::s_sharedInitValues = false;
 std::set<const VhdlSymbol*> V3VhdlEval::s_archShared;
 std::set<const VhdlSymbol*> V3VhdlEval::s_elabWritten;
+std::set<const VhdlSymbol*> V3VhdlEval::s_elabObjects;
+std::map<const VhdlSymbol*, std::map<const VhdlSymbol*, VhdlValue>> V3VhdlEval::s_objState;
+std::set<const VhdlSymbol*> V3VhdlEval::s_objWritten;
+std::map<const VhdlType*, int> V3VhdlEval::s_protObjects;
+std::set<const VhdlSymbol*> V3VhdlEval::s_elabFolded;
 
 VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
     VhdlEvaluator evaluator{errp};
