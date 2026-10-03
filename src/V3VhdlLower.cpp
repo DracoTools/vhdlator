@@ -7177,6 +7177,167 @@ private:
         if (setupp) addStmt(m_ftaskp ? setupp : new AstInitial{flp, setupp});
     }
 
+    // An array of several dimensions whose bounds only running decides --
+    // "variable r : int3d(1 to x, 1 to y, 1 to z)" over a function's
+    // parameters -- held as one run of its elements, the last dimension
+    // varying fastest, in the carrier a one-dimensional array of the same
+    // element is held in. Beside it, one carrier per dimension holds that
+    // dimension's bounds and answers its attributes. A variable of scalar
+    // elements with no initial value, read and written an element at a time;
+    // anything that takes the whole of it is refused (lowerExpr).
+    std::map<const VhdlSymbol*, std::vector<AstVar*>> m_flatArrays;
+
+    bool lowerFlatDecl(AstVhdlObjectDecl* objp, VhdlSymbol* symp, FileLine* flp) {
+        VhdlType* const typep = symp->typep();
+        VhdlType* const basep = typep->base();
+        VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
+        if (objp->kind() != VhdlObjKind::VARIABLE || objp->defaultp() || m_protClassp || !elemp
+            || typep->indexTypes().size() != basep->indexTypes().size()) {
+            return false;
+        }
+        switch (elemp->base()->kind()) {
+        case VhdlTypeKind::ENUM:
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::FLOATING:
+        case VhdlTypeKind::PHYSICAL: break;
+        default: return false;
+        }
+        const auto local = [&](AstVar* varp) {
+            if (m_ftaskp) {
+                varp->funcLocal(true);
+            } else {
+                varp->lifetime(VLifetime::STATIC_EXPLICIT);
+            }
+        };
+        // Each dimension's bounds, as a one-dimensional subtype of its own
+        std::vector<AstVar*> dims;
+        AstNode* setupp = nullptr;
+        for (size_t d = 0; d < typep->indexTypes().size(); ++d) {
+            VhdlType* const onep = VhdlSymTab::newType(VhdlTypeKind::ARRAY, "", flp);
+            onep->base(basep);
+            onep->addIndexType(typep->indexTypes()[d]);
+            onep->elementp(elemp);
+            onep->unconstrained(false);
+            AstVar* const dimp = new AstVar{flp, VVarType::VAR,
+                                            "__Vdim" + std::to_string(d) + "__" + objp->name(),
+                                            VFlagChildDType{}, dynCarrierRef(onep, flp)};
+            AstNode* const initp
+                = dynCarrierInitOn(new AstVarRef{flp, dimp, VAccess::WRITE}, onep, flp);
+            if (!initp) {
+                VL_DO_DANGLING(dimp->deleteTree(), dimp);
+                if (setupp) VL_DO_DANGLING(setupp->deleteTree(), setupp);
+                for (AstVar* const madep : dims) VL_DO_DANGLING(madep->deleteTree(), madep);
+                return false;
+            }
+            dims.push_back(dimp);
+            setupp = AstNode::addNextNull(setupp, initp);
+        }
+        for (AstVar* const dimp : dims) {
+            local(dimp);
+            dimp->trace(false);
+            addStmt(dimp);
+        }
+        AstVar* const varp = newVarOfType(symp, VVarType::VAR, dynCarrierRef(typep, flp), flp);
+        local(varp);
+        addStmt(varp);
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        const auto vw = [&]() { return new AstVarRef{flp, varp, VAccess::WRITE}; };
+        AstNodeExpr* totalp = nullptr;
+        for (AstVar* const dimp : dims) {
+            AstNodeExpr* const lenp
+                = dynCarrierLength(new AstVarRef{flp, dimp, VAccess::READ}, flp);
+            totalp = totalp ? new AstMul{flp, totalp, lenp} : lenp;
+        }
+        setupp = AstNode::addNext(
+            setupp, static_cast<AstNode*>(new AstAssign{flp, dynPart(vw(), "lft", flp), num(0)}));
+        setupp = AstNode::addNext(setupp, static_cast<AstNode*>(new AstAssign{
+                                              flp, dynPart(vw(), "rgt", flp),
+                                              new AstSub{flp, totalp->cloneTree(false), num(1)}}));
+        setupp = AstNode::addNext(
+            setupp, static_cast<AstNode*>(new AstAssign{flp, dynPart(vw(), "dsc", flp),
+                                                        new AstConst{flp, AstConst::BitFalse{}}}));
+        setupp = AstNode::addNext(
+            setupp, static_cast<AstNode*>(new AstAssign{flp, dynPart(vw(), "q", flp),
+                                                        new AstNewDynamic{flp, totalp, nullptr}}));
+        if (AstNode* const fillp = dynDefaultFill(vw(), typep, flp)) {
+            setupp = AstNode::addNext(setupp, fillp);
+        }
+        addStmt(m_ftaskp ? setupp : new AstInitial{flp, setupp});
+        m_flatArrays[symp] = dims;
+        return true;
+    }
+
+    // The carrier holding one dimension's bounds of such an array, for a
+    // prefix that names one and an attribute's dimension argument; null
+    // where the prefix is not one. The dimension has to fold.
+    AstVar* flatDimOf(const AstNodeVhdlExpr* prefixp, AstNodeVhdlExpr* dimArgp, bool& isFlat) {
+        isFlat = false;
+        const AstVhdlName* const namep = VN_CAST(prefixp, VhdlName);
+        const VhdlSymbol* const symp
+            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        const auto it = symp ? m_flatArrays.find(symp) : m_flatArrays.end();
+        if (it == m_flatArrays.end()) return nullptr;
+        isFlat = true;
+        int64_t dim = 1;
+        if (dimArgp) {
+            const VhdlValue val = V3VhdlEval::eval(dimArgp);
+            if (!val.isInt()) return nullptr;
+            dim = val.toInt();
+        }
+        if (dim < 1 || dim > static_cast<int64_t>(it->second.size())) return nullptr;
+        return it->second[static_cast<size_t>(dim - 1)];
+    }
+
+    // An element of such an array: its place in the run is worked out from
+    // each index and its dimension's bounds. False where the call is not one.
+    bool lowerFlatIndex(AstVhdlCall* nodep, AstNodeExpr*& outp) {
+        const AstVhdlName* const namep = VN_CAST(nodep->prefixp(), VhdlName);
+        const VhdlSymbol* const symp
+            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        const auto it = symp ? m_flatArrays.find(symp) : m_flatArrays.end();
+        if (it == m_flatArrays.end()) return false;
+        outp = nullptr;
+        FileLine* const flp = nodep->fileline();
+        const std::vector<AstVar*>& dims = it->second;
+        const auto varIt = m_vars.find(symp);
+        if (varIt == m_vars.end()) return true;
+        AstNodeExpr* offp = nullptr;
+        size_t d = 0;
+        for (AstNode* p = nodep->argsp(); p; p = p->nextp(), ++d) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            AstNodeExpr* const indexp = asp && asp->actualp() && !asp->formalp() && d < dims.size()
+                                            ? lowerExpr(asp->actualp())
+                                            : nullptr;
+            if (!indexp) {
+                if (offp) VL_DO_DANGLING(offp->deleteTree(), offp);
+                unsup(flp, "part of an array of several dimensions whose bounds only running"
+                           " decides, other than one element");
+                return true;
+            }
+            AstNodeExpr* const onep
+                = dynOffset(new AstVarRef{flp, dims[d], VAccess::READ}, indexp, flp);
+            offp = offp ? new AstAdd{flp,
+                                     new AstMul{
+                                         flp, offp,
+                                         dynCarrierLength(
+                                             new AstVarRef{flp, dims[d], VAccess::READ}, flp)},
+                                     onep}
+                        : onep;
+        }
+        if (d != dims.size()) {
+            if (offp) VL_DO_DANGLING(offp->deleteTree(), offp);
+            unsup(flp, "part of an array of several dimensions whose bounds only running"
+                       " decides, other than one element");
+            return true;
+        }
+        outp = new AstSelBit{
+            flp,
+            dynPart(new AstVarRef{flp, varIt->second, m_asTarget ? VAccess::WRITE : VAccess::READ},
+                    "q", flp),
+            offp};
+        return true;
+    }
+
     // A declarative item of an entity, architecture, block or process
     void lowerDecl(AstNode* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -7235,6 +7396,20 @@ private:
                 && isDyn2Type(symp->typep())) {
                 lowerDyn2Decl(objp, symp, varType, flp);
                 return;
+            }
+            // An array of several dimensions whose bounds only running
+            // decides -- "variable r : int3d(1 to x, 1 to y, 1 to z)" over a
+            // function's parameters -- has no carrier: the one there is holds
+            // a single dimension. Refused here rather than emitted with
+            // bounds the back end cannot fold.
+            if (objp->kind() != VhdlObjKind::FILE && symp->typep()
+                && symp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                && symp->typep()->base()->indexTypes().size() > 1
+                && lengthOnlyRunningDecides(symp->typep())) {
+                if (lowerFlatDecl(objp, symp, flp)) return;
+                unsup(flp, std::string{symp->kindName()} + " '" + objp->name() + "' of "
+                               + std::to_string(symp->typep()->base()->indexTypes().size())
+                               + " dimensions whose bounds only running decides");
             }
             // A fill the region runs, for an object whose length only
             // running decides; see below
@@ -8066,6 +8241,11 @@ private:
         }
 
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) {
+            if (p->vhdlSymp() && m_flatArrays.count(p->vhdlSymp()->resolved())) {
+                unsup(flp, "whole of an array of several dimensions whose bounds only running"
+                           " decides");
+                return nullptr;
+            }
             return lowerRef(p->vhdlSymp(), p->name(), flp);
         }
         if (AstVhdlSelected* const p = VN_CAST(nodep, VhdlSelected)) return lowerSelected(p);
@@ -8110,6 +8290,23 @@ private:
         // attribute, so it converts rather than asking anything (16.2.5)
         if ((attr == "subtype" || attr == "element") && nodep->argp()) {
             return lowerConversion(nodep->vhdlTypep(), nodep->argp(), flp);
+        }
+        // A dimension of an array held as one run, answered by the carrier
+        // that holds that dimension's bounds (16.2.3)
+        {
+            bool isFlat = false;
+            AstVar* const dimp = flatDimOf(nodep->prefixp(), nodep->argp(), isFlat);
+            if (isFlat) {
+                AstNodeExpr* const outp
+                    = dimp ? dynCarrierAttr(new AstVarRef{flp, dimp, VAccess::READ}, attr, flp)
+                           : nullptr;
+                if (!outp) {
+                    unsup(flp, "'" + attr
+                                   + " of an array of several dimensions whose bounds only"
+                                     " running decides");
+                }
+                return outp;
+            }
         }
         AstNodeExpr* const argp = nodep->argp() ? lowerExpr(nodep->argp()) : nullptr;
         // An enumeration value is its own position, and a position its own
@@ -14944,6 +15141,10 @@ private:
     // conversion or a call (8.1)
     AstNodeExpr* lowerCall(AstVhdlCall* nodep) {
         FileLine* const flp = nodep->fileline();
+        {
+            AstNodeExpr* flatp = nullptr;
+            if (lowerFlatIndex(nodep, flatp)) return flatp;
+        }
         // A slice running against its prefix in a copy made for one call: an
         // error when it is reached (8.5), and the analysis left it to be one
         if (!m_asTarget && m_dirReportedp != nodep) {
@@ -26392,6 +26593,25 @@ private:
                         unsup(flp, "loop over the range of an access value that is not a name");
                     }
                     if (objp) VL_DO_DANGLING(objp->deleteTree(), objp);
+                } else if ((name == "range" || name == "reverse_range") && attrp->prefixp()
+                           && attrp->prefixp()->vhdlSymp()
+                           && m_flatArrays.count(attrp->prefixp()->vhdlSymp()->resolved())) {
+                    // One dimension of an array held as one run
+                    bool isFlat = false;
+                    if (AstVar* const dimp = flatDimOf(attrp->prefixp(), attrp->argp(), isFlat)) {
+                        const auto dr = [&]() { return new AstVarRef{flp, dimp, VAccess::READ}; };
+                        initp = dynCarrierAttr(dr(), "left", flp);
+                        limitp = dynCarrierAttr(dr(), "right", flp);
+                        ascp = dynCarrierAscending(dr(), flp);
+                        ascending = true;
+                        if (name == "reverse_range") {
+                            std::swap(initp, limitp);
+                            ascp = new AstLogNot{flp, ascp};
+                        }
+                    } else {
+                        unsup(flp, "loop over a dimension of an array of several dimensions"
+                                   " whose bounds only running decides");
+                    }
                 } else if ((name == "range" || name == "reverse_range")
                            && isDynObj(attrp->prefixp())) {
                     AstNodeExpr* const carrp = lowerExpr(attrp->prefixp());
