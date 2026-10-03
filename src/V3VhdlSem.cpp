@@ -192,6 +192,8 @@ class VhdlSemVisitor final : public VNVisitor {
     // Constants synthesized for a package generic whose value is not static,
     // waiting to be added to the instantiation's declarations
     std::vector<AstNodeVhdl*> m_pendingPkgDecls;
+    bool m_inSubprogInst = false;  // Binding the generics of a subprogram's copy
+    std::vector<AstNodeVhdl*> m_pendingSubprogDecls;  // What that copy declares for them
     // Whether the generics being bound are a package instantiation's, which
     // is the only place a synthesized constant has declarations to live in
     bool m_inPkgInst = false;
@@ -2918,6 +2920,8 @@ void VhdlSemVisitor::visitSubprogDecl(AstVhdlSubprogDecl* nodep) {
         // An instantiation writes each actual into the formal it binds, so
         // the copy carries its own bindings wherever it is analyzed again
         if (nodep->isInstance() && ifp->defaultp()) {
+            VL_RESTORER(m_inSubprogInst);
+            m_inSubprogInst = true;
             bindPackageGeneric(ifp, ifp->defaultp(), outerp);
         } else if (nodep->isInstance()) {
             // "is <>" left as it stands: the copy uses whatever is visible
@@ -2926,6 +2930,20 @@ void VhdlSemVisitor::visitSubprogDecl(AstVhdlSubprogDecl* nodep) {
             // As written: a generic type, subprogram or package declares
             // itself here so that the body which uses it analyzes (6.5.5)
             iterate(ifp);
+        }
+    }
+    // Constants standing for generics whose values do not fold go first
+    // among the copy's declarations
+    if (!m_pendingSubprogDecls.empty()) {
+        AstNode* listp = nullptr;
+        for (AstNodeVhdl* const declp : m_pendingSubprogDecls) {
+            listp = AstNode::addNextNull(listp, static_cast<AstNode*>(declp));
+        }
+        m_pendingSubprogDecls.clear();
+        if (AstNode* const firstDeclp = nodep->declsp()) {
+            firstDeclp->addHereThisAsNext(listp);
+        } else {
+            nodep->addDeclsp(VN_AS(listp, NodeVhdl));
         }
     }
     size_t paramNum = 0;
@@ -5585,10 +5603,10 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
         // declarations are emitted into the module that instantiates the
         // package, so the generic becomes an ordinary constant of that module
         // whose value is the expression written here, and the back end folds
-        // it per instance (4.9). A generic *subprogram* instantiation has no
-        // declarations of its own to put such a constant in, so there the
-        // value must still be one that folds.
-        if (!m_inPkgInst) {
+        // it per instance (4.9). A copy of a generic *subprogram* declares
+        // the constant among its own declarations instead, elaborated on each
+        // call -- "init => to_unsigned(0, 4)", which this does not fold.
+        if (!m_inPkgInst && !m_inSubprogInst) {
             err(flp, "The value of generic '" + formalp->name()
                          + "' of an instantiated package must be static");
             declare(symp, flp);
@@ -5613,8 +5631,13 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
         AstVhdlAliasDecl* const aliasp = new AstVhdlAliasDecl{
             formalp->fileline(), formalp->name(),
             new AstVhdlName{formalp->fileline(), hiddenName}};
-        m_pendingPkgDecls.push_back(declp);
-        m_pendingPkgDecls.push_back(aliasp);
+        // A copy of a generic subprogram declares it among its own
+        // declarations, ahead of the rest, which is where it is elaborated
+        // on every call
+        std::vector<AstNodeVhdl*>& pendingp
+            = m_inSubprogInst && !m_inPkgInst ? m_pendingSubprogDecls : m_pendingPkgDecls;
+        pendingp.push_back(declp);
+        pendingp.push_back(aliasp);
         m_scopep = innerp;
         return;
     }
