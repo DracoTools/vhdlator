@@ -9283,18 +9283,68 @@ private:
     // An attribute asked of a signal another attribute made. Only 'DELAYED
     // gives back a signal of the prefix's own type that is emitted as a
     // variable of its own, which is what a history can be kept against.
+    // A part of a signal delayed -- "r.part'delayed(t)" -- is that part of
+    // the whole signal delayed, so its history is kept of the whole delayed
+    // copy, and the part is selected from that as from the copy itself
+    std::map<const AstVar*, AstVar*> m_shadowOwners;  // History variable -> what it keeps
+    // The histories of record elements of delayed copies, by copy and element
+    std::map<std::pair<const AstVar*, std::string>, VhdlShadow> m_delayedPartShadows;
     const VhdlShadow* shadowOfImplicit(AstNodeVhdlExpr* prefixp, FileLine* flp) {
         AstVhdlAttrName* const innerp = VN_CAST(prefixp, VhdlAttrName);
         if (!innerp || innerp->name() != "delayed") return nullptr;
         AstNodeExpr* const basep = lowerAttr(innerp);
         if (!basep) return nullptr;
-        AstVarRef* const refp = VN_CAST(basep, VarRef);
+        AstNodeExpr* rootp = basep;
+        bool part = false;
+        while (true) {
+            if (AstMemberSel* const msp = VN_CAST(rootp, MemberSel)) {
+                rootp = msp->fromp();
+            } else if (AstSelBit* const sbp = VN_CAST(rootp, SelBit)) {
+                rootp = sbp->fromp();
+            } else if (AstArraySel* const asp = VN_CAST(rootp, ArraySel)) {
+                rootp = asp->fromp();
+            } else {
+                break;
+            }
+            part = true;
+        }
+        AstVarRef* const refp = VN_CAST(rootp, VarRef);
         AstVar* const sigp = refp ? refp->varp() : nullptr;
         VL_DO_DANGLING(basep->deleteTree(), basep);
         if (!sigp) return nullptr;
-        VhdlType* typep = innerp->vhdlTypep();
-        if (!typep && innerp->prefixp()) typep = innerp->prefixp()->vhdlTypep();
-        return shadowForVar(sigp, typep, flp);
+        VhdlType* typep = nullptr;
+        if (part) {
+            // An element of a record has a history of its own, as an element
+            // of the record signal itself has (see shadowFor): a copy of the
+            // element of the delayed copy is kept, and its history
+            std::string partPath;
+            if (recordElementPath(innerp->prefixp(), partPath)) {
+                const auto key = std::make_pair(static_cast<const AstVar*>(sigp), partPath);
+                const auto dIt = m_delayedPartShadows.find(key);
+                if (dIt != m_delayedPartShadows.end()) return &dIt->second;
+                VhdlType* const ptypep = recordElementType(innerp->prefixp());
+                AstVar* const copyp = ptypep && ptypep->lengthEmittable()
+                                          ? partCopyOf(innerp, ptypep, flp)
+                                          : nullptr;
+                VhdlShadow psh;
+                if (copyp && buildShadow(copyp, ptypep, copyp->name(), flp, psh)) {
+                    m_partShadowVars.insert(psh.prevp);
+                    m_partShadowVars.insert(psh.lastp);
+                    return &m_delayedPartShadows.emplace(key, psh).first->second;
+                }
+            }
+            const VhdlSymbol* const ssymp = rootSymOf(innerp->prefixp());
+            typep = ssymp ? ssymp->resolved()->typep() : nullptr;
+        } else {
+            typep = innerp->vhdlTypep();
+            if (!typep && innerp->prefixp()) typep = innerp->prefixp()->vhdlTypep();
+        }
+        const VhdlShadow* const shp = shadowForVar(sigp, typep, flp);
+        if (shp && part) {
+            m_shadowOwners[shp->prevp] = sigp;
+            m_shadowOwners[shp->lastp] = sigp;
+        }
+        return shp;
     }
 
     // The variables that keep one signal's past, and the block that fills
@@ -9347,6 +9397,16 @@ private:
             stmtsp, static_cast<AstNode*>(new AstAssignDly{
                         flp, new AstVarRef{flp, sh.transp, VAccess::WRITE},
                         new AstNot{flp, new AstVarRef{flp, sh.transp, VAccess::READ}}}));
+        // Only a change is an event (14.7.3.1). The back end runs a block
+        // waiting on a wide value once as the design starts, whether or not
+        // it changed -- one waiting on an edge it does not -- and that run
+        // would record an event at time zero on a signal nothing assigned
+        if (!isOneBitVar(sigp)) {
+            stmtsp = new AstIf{flp,
+                               new AstNeq{flp, new AstVarRef{flp, sigp, VAccess::READ},
+                                          new AstVarRef{flp, sh.prevp, VAccess::READ}},
+                               stmtsp};
+        }
         AstSenTree* const senp = new AstSenTree{
             flp, senItemFor(new AstVarRef{flp, sigp, VAccess::READ}, isOneBitVar(sigp), flp)};
         AstAlways* const alwaysp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp};
@@ -9863,6 +9923,22 @@ private:
     // and no other -- which means indexing the history the way the signal
     // itself is indexed.
     AstNodeExpr* shadowPart(AstNodeVhdlExpr* prefixp, AstVar* shadowVarp, FileLine* flp) {
+        // A history kept of the element itself is that element already
+        if (m_partShadowVars.count(shadowVarp)) {
+            return new AstVarRef{flp, shadowVarp, VAccess::READ};
+        }
+        // The history of a part of a delayed copy: the same selection, made
+        // of the history variable rather than of the copy
+        const auto ownIt = m_shadowOwners.find(shadowVarp);
+        if (ownIt != m_shadowOwners.end() && VN_IS(prefixp, VhdlAttrName)) {
+            if (AstNodeExpr* const outp = lowerExpr(prefixp)) {
+                AstVar* const ownerp = ownIt->second;
+                outp->foreach([&](AstVarRef* refp) {
+                    if (refp->varp() == ownerp) refp->varp(shadowVarp);
+                });
+                return outp;
+            }
+        }
         VhdlSymbol* const rootp = const_cast<VhdlSymbol*>(rootSymOf(prefixp));
         // A history kept of the element itself is that element already
         if (!rootp || VN_IS(prefixp, VhdlName) || m_partShadowVars.count(shadowVarp)) {
@@ -32237,6 +32313,8 @@ private:
         m_actToggles.clear();
         m_needActive.clear();
         m_delayeds.clear();
+        m_shadowOwners.clear();
+        m_delayedPartShadows.clear();
         m_implicitActs.clear();
         collectActive(entp->declsp());
         // A port this entity drives carries its transactions out to the
