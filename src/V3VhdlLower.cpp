@@ -25436,14 +25436,19 @@ private:
         }
         VhdlType* const fixedElemp
             = ttypep->elementp() ? ttypep->elementp() : ttypep->base()->elementp();
-        if (!fixedElemp || !fixedElemp->isConstrainedArray()
-            || lengthOnlyRunningDecides(fixedElemp)) {
-            return nullptr;
-        }
+        if (!fixedElemp || lengthOnlyRunningDecides(fixedElemp)) return nullptr;
+        // An element whose bounds name a generic -- "t_slv_array(2 to
+        // 6)(GC_DATA_WIDTH - 1 downto 0)", what a copy of UVVM's
+        // avalon_st_receive holds -- is as long as the instance settles
+        const VhdlType* const elemIdxp
+            = fixedElemp->indexTypes().empty() ? nullptr : fixedElemp->indexTypes()[0];
+        const bool elemFixed = fixedElemp->isConstrainedArray();
+        if (!elemFixed && !(elemIdxp && elemIdxp->boundsp())) return nullptr;
         VhdlType* const vtypep = dyn2ValueType(valuep);
         VhdlType* const elemCarrp = vtypep ? openCarriedElement(vtypep) : nullptr;
         if (!elemCarrp) return nullptr;
-        AstNodeFTask* const elemFuncp = dynToFixedFunc(elemCarrp, fixedElemp, flp);
+        AstNodeFTask* const elemFuncp = elemFixed ? dynToFixedFunc(elemCarrp, fixedElemp, flp)
+                                                  : dynToFixedExprFunc(elemCarrp, fixedElemp, flp);
         if (!elemFuncp) return nullptr;
         const VhdlType* const idxp = ttypep->indexTypes()[0];
         const int64_t count = idxp->bounded() ? idxp->length() : -1;
