@@ -6602,6 +6602,8 @@ private:
     // whose timeout expires find a signal being updated in the same cycle,
     // and only then does a timed wait have to stand aside for the update.
     bool m_anyAfter = false;
+    // The names of the constants some external name reaches (8.7)
+    std::set<std::string> m_extConstNames;
     // Generics no instance can hand a value the back end folds. A generic is
     // ordinarily a parameter, which is what makes V3Param copy a module per
     // set of values and so what makes the ordinary case fast. But a constant
@@ -7122,8 +7124,21 @@ private:
             switch (objp->kind()) {
             case VhdlObjKind::SIGNAL: varType = VVarType::VAR; break;
             case VhdlObjKind::CONSTANT:
-                // A constant with a folded value needs no storage at all
-                if (symp->hasValue()) return;
+                // A constant with a folded value needs no storage at all --
+                // unless an external name reaches it, from a region where
+                // the value is not in reach (8.7)
+                if (symp->hasValue()) {
+                    if (m_ftaskp || m_protClassp
+                        || !m_extConstNames.count(VString::downcase(symp->name()))) {
+                        return;
+                    }
+                    if (AstNodeExpr* const valp = lowerValue(symp->value(), symp->typep(), flp)) {
+                        AstVar* const cvarp = newVar(symp, VVarType::LPARAM, flp);
+                        cvarp->valuep(valp);
+                        addStmt(cvarp);
+                    }
+                    return;
+                }
                 // One standing for a generic an instantiation supplied is a
                 // parameter: its value is settled by elaboration, and a range
                 // written in terms of it has to fold with it (4.9)
@@ -8057,6 +8072,12 @@ private:
         // A bound that names a generic does not fold during analysis, so the
         // attributes that ask about it are answered with the same expression
         // the range itself was emitted with (16.2)
+        if (attr == "length") {
+            if (AstNodeExpr* const outp = externalAliasLength(nodep, flp)) {
+                if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                return outp;
+            }
+        }
         if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
             || attr == "length" || attr == "ascending") {
             const VhdlType* typep = nodep->prefixp()->vhdlTypep();
@@ -9995,6 +10016,34 @@ private:
             return ifp->signalKind() != VhdlSignalKind::NONE;
         }
         return false;
+    }
+
+    // "x'length" and "x'element'length" of an alias of an external name
+    // whose subtype indication leaves the bounds open: the object it denotes
+    // has them, and is elaborated already (8.7), so they are asked of it --
+    // what the back end knows as the size of that dimension
+    AstNodeExpr* externalAliasLength(AstVhdlAttrName* nodep, FileLine* flp) {
+        AstNodeVhdlExpr* prefixp = nodep->prefixp();
+        int dim = 1;
+        while (AstVhdlAttrName* const elemp = VN_CAST(prefixp, VhdlAttrName)) {
+            if (VString::downcase(elemp->name()) != "element" || dim > 8) return nullptr;
+            ++dim;
+            prefixp = elemp->prefixp();
+        }
+        if (nodep->argp()) return nullptr;  // "x'length(n)" counts the other way
+        const AstVhdlName* const namep = VN_CAST(prefixp, VhdlName);
+        const VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return nullptr;
+        const AstVhdlAliasDecl* const adp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!adp || !VN_IS(adp->targetp(), VhdlExternalName)) return nullptr;
+        const VhdlType* const typep = symp->typep();
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY || typep->lengthEmittable()) {
+            return nullptr;
+        }
+        AstNodeExpr* const objp = lowerExpr(prefixp);
+        if (!objp) return nullptr;
+        return new AstAttrOf{flp, VAttrType::DIM_SIZE, objp,
+                             new AstConst{flp, AstConst::Signed32{}, dim}};
     }
 
     AstNodeExpr* lowerDrivingAttr(AstVhdlAttrName* nodep, const std::string& attr,
@@ -32700,10 +32749,19 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // stand aside for a signal update in the same cycle, and it is a property
     // of the whole design, so it is answered before any of it is lowered.
     for (AstNodeVhdlUnit* const unitp : unitsp) {
-        if (m_anyAfter) break;
         unitp->foreach([this](AstNode* nodep) {
             if (const AstVhdlWaveform* const wfp = VN_CAST(nodep, VhdlWaveform)) {
                 if (wfp->afterp()) m_anyAfter = true;
+            } else if (const AstVhdlExternalName* const extp = VN_CAST(nodep, VhdlExternalName)) {
+                // A constant an external name reaches has to be an object
+                // there, though nothing in its own region needs one
+                if (extp->objClass() == "constant") {
+                    const AstNode* lastp = extp->pathp();
+                    while (lastp && lastp->nextp()) lastp = lastp->nextp();
+                    if (const AstVhdlName* const namep = VN_CAST(lastp, VhdlName)) {
+                        m_extConstNames.insert(VString::downcase(namep->name()));
+                    }
+                }
             } else if (const AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
                 if (attrp->name() == "delayed" && attrp->argp()) m_anyAfter = true;
                 // The TRUE transaction of S'STABLE(T) or S'QUIET(T), which
