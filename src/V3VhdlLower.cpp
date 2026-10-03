@@ -11814,8 +11814,31 @@ private:
         for (AstNode* p = nodep->pathp(); p; p = p->nextp()) {
             std::vector<std::string> one;
             if (!flattenName(VN_AS(p, NodeVhdlExpr), one) || one.empty()) {
-                unsup(flp, "external name whose pathname is not a list of names");
-                return nullptr;
+                // "g(1).uut.k": one iteration of a for generate (8.7), which
+                // the back end names as an element of an array of blocks --
+                // or, where this module wrote the iterations out one by one
+                // (unrollGenerate), as a block of its own
+                const AstVhdlCall* const callp = VN_CAST(p, VhdlCall);
+                const AstVhdlAssoc* const argp
+                    = callp && callp->argsp() && !callp->argsp()->nextp()
+                          ? VN_CAST(callp->argsp(), VhdlAssoc)
+                          : nullptr;
+                const VhdlValue idx = argp && argp->actualp() && !argp->formalp()
+                                          ? V3VhdlEval::eval(argp->actualp())
+                                          : VhdlValue{};
+                std::vector<std::string> genParts;
+                if (!idx.isInt() || !flattenName(callp->prefixp(), genParts) || genParts.empty()) {
+                    unsup(flp, "external name whose pathname is not a list of names");
+                    return nullptr;
+                }
+                const int64_t n = idx.toInt();
+                std::string& label = genParts.back();
+                if (m_unrolledGens.count(m_blockPrefix + label)) {
+                    label += "__" + (n < 0 ? "n" + std::to_string(-n) : std::to_string(n));
+                } else {
+                    label += "__BRA__" + AstNode::encodeNumber(n) + "__KET__";
+                }
+                one = genParts;
             }
             for (const std::string& part : one) parts.push_back(part);
         }
@@ -22385,8 +22408,11 @@ private:
     // A for generate written out once per iteration, with its parameter a
     // constant in each copy. Each copy is a driver of whatever it drives,
     // which is why the loop cannot be left for the back end to unroll.
+    std::set<std::string> m_unrolledGens;  // For generates written out per iteration
+
     void unrollGenerate(AstVhdlGenerate* nodep, VhdlSymbol* symp, VhdlType* rangep,
                         const std::string& label, FileLine* flp) {
+        m_unrolledGens.insert(label);
         std::set<const VhdlSymbol*> driven;
         collectDriven(nodep, driven);
         std::vector<const VhdlSymbol*> resolved;
@@ -22413,7 +22439,15 @@ private:
             AstVar* const savedp = had ? prevIt->second : nullptr;
             m_vars[symp] = paramp;
             m_genIndex[nodep] = std::to_string(value);
-            AstNode* const itemsp = lowerGenerateBody(nodep->altsp());
+            // Each iteration is a block of its own, so an instance in it is
+            // named as written -- "w(4).uut" -- whatever the other iterations
+            // and the module around them call theirs
+            AstNode* itemsp = nullptr;
+            {
+                VL_RESTORER_COPY(m_instNames);
+                m_instNames.clear();
+                itemsp = lowerGenerateBody(nodep->altsp());
+            }
             m_genIndex.erase(nodep);
             if (had) {
                 m_vars[symp] = savedp;
