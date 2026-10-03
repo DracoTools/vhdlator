@@ -193,6 +193,7 @@ class VhdlSemVisitor final : public VNVisitor {
     // waiting to be added to the instantiation's declarations
     std::vector<AstNodeVhdl*> m_pendingPkgDecls;
     bool m_inSubprogInst = false;  // Binding the generics of a subprogram's copy
+    bool m_archDecls = false;  // Analyzing an architecture's own declarations
     std::vector<AstNodeVhdl*> m_pendingSubprogDecls;  // What that copy declares for them
     // Whether the generics being bound are a package instantiation's, which
     // is the only place a synthesized constant has declarations to live in
@@ -2681,7 +2682,31 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         // needs no object of its own, and one element of a record being
         // unknown is no reason to emit the rest as a number.
         if (kind == VhdlSymKind::CONSTANT) {
-            const VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            // An architecture's constant given what an impure function of it
+            // returns, where that function touches only shared variables the
+            // architecture itself declared: every instance elaborates the
+            // declarations in the same order from the same start (14.4.2),
+            // so the value is the same in each, and is what elaborating them
+            // here gives. Where it does not fold, what it wrote is undone.
+            if (!val.known() && m_archDecls && VN_IS(parentOf(nodep), VhdlArchitecture)
+                && symp->typep() && symp->typep()->isScalar()
+                && !V3VhdlEval::s_archShared.empty()) {
+                std::map<const VhdlSymbol*, VhdlValue> before;
+                for (const VhdlSymbol* const sp : V3VhdlEval::s_archShared) {
+                    before[sp] = sp->elabValue();
+                }
+                const std::set<const VhdlSymbol*> writtenBefore = V3VhdlEval::s_elabWritten;
+                const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
+                if (elab.known() && !elab.isComposite()) {
+                    val = elab;
+                } else {
+                    for (const auto& pair : before) {
+                        const_cast<VhdlSymbol*>(pair.first)->elabValue(pair.second);
+                    }
+                    V3VhdlEval::s_elabWritten = writtenBefore;
+                }
+            }
             if (val.isComposite()) {
                 symp->elabValue(val);
             } else {
@@ -2702,6 +2727,17 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         if (kind == VhdlSymKind::SHARED_VARIABLE && V3VhdlEval::s_sharedInitValues) {
             const VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
             if (val.known()) symp->elabValue(val);
+        }
+        // One an architecture declares starts at its initial value for the
+        // declarations after it to read and write while they elaborate
+        if (kind == VhdlSymKind::SHARED_VARIABLE && m_archDecls
+            && VN_IS(parentOf(nodep), VhdlArchitecture) && symp->typep()
+            && symp->typep()->isScalar()) {
+            const VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            if (val.known() && !val.isComposite()) {
+                symp->elabValue(val);
+                V3VhdlEval::s_archShared.insert(symp);
+            }
         }
     } else if (kind == VhdlSymKind::CONSTANT) {
         // A constant declared with no value in a package declaration is
@@ -4920,7 +4956,13 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 const auto it = m_unitScopes.find(lib + "." + parts.back());
                 m_archEntityScopep = it != m_unitScopes.end() ? it->second : nullptr;
             }
-            iterateAndNextNull(archp->declsp());
+            {
+                VL_RESTORER(m_archDecls);
+                m_archDecls = !m_inSpecialized;
+                V3VhdlEval::s_archShared.clear();
+                iterateAndNextNull(archp->declsp());
+                V3VhdlEval::s_archShared.clear();
+            }
             iterateAndNextNull(archp->stmtsp());
             checkConfigSpecs(archp->declsp(), archp->stmtsp());
             analyzeDrivers(archp);

@@ -623,6 +623,7 @@ private:
             // one call site, which is where the call's own values were fixed
             return symp->value();
         case VhdlSymKind::SHARED_VARIABLE:
+            if (m_allowImpure && V3VhdlEval::s_archShared.count(symp)) return symp->elabValue();
             if (m_sharedStale) return VhdlValue{};
             return V3VhdlEval::s_sharedInitValues ? symp->elabValue() : VhdlValue{};
         case VhdlSymKind::FUNCTION:
@@ -1555,6 +1556,12 @@ private:
         VhdlSymbol* symp = namep ? namep->vhdlSymp() : nullptr;
         if (!symp) return nullptr;
         symp = symp->resolved();
+        // A shared variable the architecture being elaborated declared is
+        // written where it is (s_archShared)
+        if (m_allowImpure && symp->kind() == VhdlSymKind::SHARED_VARIABLE
+            && V3VhdlEval::s_archShared.count(symp)) {
+            return symp;
+        }
         return m_frames.back().count(symp) ? symp : nullptr;
     }
 
@@ -1640,6 +1647,19 @@ private:
             // whole activation: what a handle's actor is decides nothing
             // about the widths beside it
             if (!val.known() && !m_allowImpure) return bail();
+            // A shared variable is no variable of the frame. While an
+            // architecture elaborates, one it declared is written for the
+            // rest of its declarations to read; any other is the design's
+            // and outlives this, so a body writing one does not fold.
+            if (symp && symp->kind() == VhdlSymKind::SHARED_VARIABLE) {
+                if (!m_allowImpure || !V3VhdlEval::s_archShared.count(symp) || !val.known()
+                    || !VN_IS(p->targetp(), VhdlName)) {
+                    return bail();
+                }
+                const_cast<VhdlSymbol*>(symp)->elabValue(val);
+                V3VhdlEval::s_elabWritten.insert(symp);
+                return Flow::NORMAL;
+            }
             if (inPlace) return assignInPlace(p->targetp(), val) ? Flow::NORMAL : bail();
             // A variable keeps its own bounds, and takes the value's elements
             // in order (10.6.2.1)
@@ -2318,6 +2338,8 @@ private:
 // Entry points
 
 bool V3VhdlEval::s_sharedInitValues = false;
+std::set<const VhdlSymbol*> V3VhdlEval::s_archShared;
+std::set<const VhdlSymbol*> V3VhdlEval::s_elabWritten;
 
 VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
     VhdlEvaluator evaluator{errp};

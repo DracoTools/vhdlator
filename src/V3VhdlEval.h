@@ -38,6 +38,7 @@
 #include "V3VhdlSym.h"
 
 #include <map>
+#include <set>
 #include <string>
 
 class AstNodeVhdlExpr;
@@ -62,6 +63,13 @@ public:
     // shared_spec_cov_config.max_requirement_lines)" -- is that value.
     // Anywhere else a shared variable's value is whatever running made it.
     static bool s_sharedInitValues;
+    // While an architecture's own declarations elaborate, the shared
+    // variables it declared, which an impure function called there reads
+    // and writes in the order the declarations elaborate (14.4.2): each
+    // instance elaborates them afresh, so what they come to is the same for
+    // every instance. Written while elaborating are kept in s_elabWritten.
+    static std::set<const VhdlSymbol*> s_archShared;
+    static std::set<const VhdlSymbol*> s_elabWritten;
 
     // Whether the back end can fold an expression to a value, which it does
     // by running what it names. Being static is not the same question: a

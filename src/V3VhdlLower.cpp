@@ -7314,6 +7314,13 @@ private:
                     && (VN_IS(objp->defaultp(), VhdlName) || VN_IS(objp->defaultp(), VhdlCall))) {
                     initp = recordAsShape(objp->defaultp(), symp->typep(), flp);
                 }
+                // A shared variable an architecture's elaboration wrote --
+                // an impure function its constants were given ran there --
+                // starts the run with what elaboration left in it (14.4.2)
+                if (!initp && objp->kind() == VhdlObjKind::SHARED_VARIABLE
+                    && V3VhdlEval::s_elabWritten.count(symp) && symp->elabValue().known()) {
+                    initp = lowerValue(symp->elabValue(), symp->typep(), flp);
+                }
                 if (!initp) initp = lowerExpr(objp->defaultp());
                 varp->valuep(initp);
             } else if (AstNodeExpr* const spacesp = dynamicStringInit(symp->typep(), flp)) {
