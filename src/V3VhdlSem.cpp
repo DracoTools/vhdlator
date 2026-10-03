@@ -5159,6 +5159,26 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     const auto unitIt = m_primaryUnits.find(key);
     AstVhdlPackage* pkgp
         = unitIt == m_primaryUnits.end() ? nullptr : VN_CAST(unitIt->second, VhdlPackage);
+    if (!pkgp && parts.size() == 1) {
+        // A package declared inside another, made visible by a use clause of
+        // that one -- "use work.outer.all; package inner4 is new inner" --
+        // is found as any other name is (12.4), and is then the nested
+        // package its full name "work.outer.inner" would name
+        std::vector<VhdlSymbol*> found;
+        lookup(parts[0], found);
+        for (VhdlSymbol* const symp : found) {
+            const AstVhdlPackage* const np = VN_CAST(symp->resolved()->declp(), VhdlPackage);
+            if (!np) continue;
+            const AstNode* outerp = np->backp();
+            while (outerp && !VN_IS(outerp, NodeVhdlUnit)) outerp = outerp->backp();
+            const AstVhdlPackage* const outerPkgp = VN_CAST(outerp, VhdlPackage);
+            if (!outerPkgp || outerPkgp == np) continue;
+            const std::string olib
+                = outerPkgp->libname().empty() ? m_libname : lower(outerPkgp->libname());
+            parts = {olib, lower(outerPkgp->name()), parts[0]};
+            break;
+        }
+    }
     if (!pkgp && parts.size() >= 3) {
         // The uninstantiated package may be one declared inside another --
         // "package p is new work.axi4s.make" -- and then the design unit is
