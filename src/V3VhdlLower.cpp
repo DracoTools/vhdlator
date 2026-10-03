@@ -6596,7 +6596,7 @@ private:
     // what that architecture wants has to be known before either is lowered.
     std::set<std::string> m_wantActiveOut;
     // The signal "S delayed by T", one per signal and delay it is asked for
-    std::map<std::pair<const VhdlSymbol*, int64_t>, AstVar*> m_delayeds;
+    std::map<std::pair<const VhdlSymbol*, std::string>, AstVar*> m_delayeds;
     // Whether anything in the design delivers a signal transaction at a time
     // of its own -- an "after" clause or a 'DELAYED. Only then can a process
     // whose timeout expires find a signal being updated in the same cycle,
@@ -9884,11 +9884,17 @@ private:
                            FileLine* flp) {
         if (!argp) return shadowPart(prefixp, shp->prevp, flp);
         AstConst* const constp = VN_CAST(argp, Const);
-        if (!constp) {
+        // A time a generic gives is as static as a literal one (9.4.3): the
+        // delay is whatever the instance was given, and only zero -- one
+        // delta back, as with no argument -- is told apart when it runs
+        const bool generic = !constp && !argp->exists([](const AstVarRef* refp) {
+            return !refp->varp()->isParam();
+        }) && !argp->exists([](const AstNodeFTaskRef*) { return true; });
+        if (!constp && !generic) {
             unsup(flp, "'delayed by a time that is not static");
             return nullptr;
         }
-        const int64_t ticks = static_cast<int64_t>(constp->toUQuad());
+        const int64_t ticks = constp ? static_cast<int64_t>(constp->toUQuad()) : -1;
         if (ticks == 0) {
             VL_DO_DANGLING(argp->deleteTree(), argp);
             return shadowPart(prefixp, shp->prevp, flp);
@@ -9901,11 +9907,27 @@ private:
         const auto varIt = symp ? m_vars.find(symp->resolved()) : m_vars.end();
         if (varIt == m_vars.end()) return nullptr;
         AstVar* const sigp = varIt->second;
-        const auto key = std::make_pair(static_cast<const VhdlSymbol*>(symp->resolved()), ticks);
+        // Zero as the generic's value, decided where the instance has it
+        const auto orZero = [&](AstNodeExpr* delayedp) -> AstNodeExpr* {
+            if (!generic) return delayedp;
+            AstNodeExpr* const zerop = new AstEq{
+                flp, argp->cloneTree(false), new AstConst{flp, AstConst::WidthedValue{}, 64, 0}};
+            return new AstCond{flp, zerop, shadowPart(prefixp, shp->prevp, flp), delayedp};
+        };
+        // The same generic is the same delay, so a name that is nothing but
+        // the generic shares one copy of the signal; any other expression of
+        // generics gets its own
+        const AstVarRef* const genRefp = VN_CAST(argp, VarRef);
+        const std::string keyStr
+            = constp    ? std::to_string(ticks)
+              : genRefp ? "g" + std::to_string(reinterpret_cast<uintptr_t>(genRefp->varp()))
+                        : "e" + std::to_string(++m_nameNum);
+        const auto key = std::make_pair(static_cast<const VhdlSymbol*>(symp->resolved()), keyStr);
         const auto found = m_delayeds.find(key);
         if (found != m_delayeds.end()) {
+            AstNodeExpr* const outp = orZero(shadowPart(prefixp, found->second, flp));
             VL_DO_DANGLING(argp->deleteTree(), argp);
-            return shadowPart(prefixp, found->second, flp);
+            return outp;
         }
         VL_RESTORER(m_ftaskp);
         m_ftaskp = nullptr;
@@ -9919,6 +9941,7 @@ private:
         } else if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp)) {
             dlyp->valuep(defp);
         }
+        AstNodeExpr* const zeroArgp = generic ? argp->cloneTree(false) : nullptr;
         AstNode* const bodyp = new AstAssignDly{flp, new AstVarRef{flp, dlyp, VAccess::WRITE},
                                                 new AstVarRef{flp, sigp, VAccess::READ},
                                                 new AstDelay{flp, argp, false}};
@@ -9928,7 +9951,10 @@ private:
             m_shadowsp,
             static_cast<AstNode*>(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp}));
         m_delayeds.emplace(key, dlyp);
-        return shadowPart(prefixp, dlyp, flp);
+        if (!zeroArgp) return shadowPart(prefixp, dlyp, flp);
+        return new AstCond{
+            flp, new AstEq{flp, zeroArgp, new AstConst{flp, AstConst::WidthedValue{}, 64, 0}},
+            shadowPart(prefixp, shp->prevp, flp), shadowPart(prefixp, dlyp, flp)};
     }
 
     // "S'DRIVING" and "S'DRIVING_VALUE" ask about the driver this process
