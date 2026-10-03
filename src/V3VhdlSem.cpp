@@ -1273,6 +1273,15 @@ class VhdlSemVisitor final : public VNVisitor {
                     VhdlType* const newElemp = cloneSubtype(elemp, flp);
                     applyConstraint(newElemp, elemp, nestedp, nullptr, flp);
                     typep->elementp(newElemp);
+                    continue;
+                }
+                // And of a record element, a record constraint:
+                // "rec_array(1 to 2)(y(1 to 3))" (5.3.3)
+                VhdlType* const recp = elemp ? elemp : typep->base()->elementp();
+                if (recp && recp->base()->kind() == VhdlTypeKind::RECORD) {
+                    VhdlType* const newElemp = cloneSubtype(recp, flp);
+                    applyConstraint(newElemp, recp, nestedp, nullptr, flp);
+                    typep->elementp(newElemp);
                 }
                 continue;
             }
