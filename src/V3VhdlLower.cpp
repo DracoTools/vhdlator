@@ -16710,6 +16710,7 @@ private:
             return nullptr;
         }
         if (runningRangeAggregate(nodep)) {
+            if (AstNodeExpr* const outp = constantSpanFill(nodep, typep, flp)) return outp;
             if (AstNodeExpr* const outp = rangeFillCarrier(nodep, typep->base(), flp)) return outp;
         }
         // An aggregate written entirely positionally, of an element type that
@@ -17066,6 +17067,38 @@ private:
         return outp;
     }
 
+    // "(i*8+7 downto i*8 => '1')": ends only running settles, but always the
+    // same distance apart, so it is that many of the value whatever they
+    // are -- a value of fixed width, as the slice it is written into is
+    // (9.3.3.3). Only of an element that is one bit or one enumeration
+    // value, which is what packs into a replication.
+    AstNodeExpr* constantSpanFill(AstVhdlAggregate* nodep, VhdlType* typep, FileLine* flp) {
+        AstNodeVhdlExpr* const valuep = uniformAggregateValue(nodep);
+        AstVhdlChoice* const chp = valuep ? nodep->elemsp()->choicesp() : nullptr;
+        if (!chp || chp->nextp() || chp->isOthers()) return nullptr;
+        AstVhdlRange* const rp = chp->rangep();
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return nullptr;
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!elemp || elemp->base()->kind() != VhdlTypeKind::ENUM) return nullptr;
+        LinearForm span;
+        linearAdd(span, rp->leftp(), 1, 0, true);
+        linearAdd(span, rp->rightp(), -1, 0, true);
+        bool constant = span.ok;
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0) constant = false;
+        }
+        const int64_t distance = span.konst;
+        span.clear();
+        if (!constant) return nullptr;
+        // Written in its own direction, or it is a null range (5.3.2.2)
+        const int64_t length = (rp->dir() == VhdlDir::TO ? -distance : distance) + 1;
+        if (length < 1 || length > 65536) return nullptr;
+        AstNodeExpr* const onep = lowerExpr(valuep);
+        if (!onep) return nullptr;
+        return new AstReplicate{flp, onep, static_cast<uint32_t>(length)};
+    }
+
     // The value such an aggregate is, carrying the bounds its range gives it:
     // one value in every place from one end to the other (9.3.3.3)
     AstNodeExpr* rangeFillCarrier(AstVhdlAggregate* nodep, VhdlType* carrp, FileLine* flp) {
@@ -17329,7 +17362,21 @@ private:
         const VhdlType* const indexp = typep->base()->indexTypes().empty()
                                            ? nullptr
                                            : typep->base()->indexTypes()[0];
-        if (!indexp || !indexp->bounded()) return false;
+        // Named choices that are numbers say where every element goes on
+        // their own: an index subtype whose bound names a generic -- "integer
+        // range 1 to N" -- says only which way it runs, and that is enough
+        if (!indexp) return false;
+        // Which way it runs, which an unbounded one keeps on the range it
+        // was written with
+        bool idxAscending = indexp->ascending();
+        bool idxDirKnown = indexp->bounded();
+        if (!idxDirKnown) {
+            const AstVhdlRange* const brp = VN_CAST(indexp->boundsp(), VhdlRange);
+            if (brp && !brp->dirUnknown() && !brp->attrp()) {
+                idxDirKnown = true;
+                idxAscending = brp->dir() == VhdlDir::TO;
+            }
+        }
         int64_t positional = 0;
         bool named = false;
         bool sawRange = false;
@@ -17375,13 +17422,15 @@ private:
                 highest = std::max(highest, hi);
             }
         }
-        step = (sawRange ? rangeAscending : indexp->ascending()) ? 1 : -1;
+        if (!sawRange && !idxDirKnown) return false;
+        step = (sawRange ? rangeAscending : idxAscending) ? 1 : -1;
         if (named) {
             if (lowest > highest) return false;
             left = step > 0 ? lowest : highest;
             count = highest - lowest + 1;
         } else {
             if (positional <= 0) return false;
+            if (!indexp->bounded()) return false;
             left = indexp->left();
             count = positional;
         }
