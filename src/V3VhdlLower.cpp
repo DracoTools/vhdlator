@@ -10051,8 +10051,109 @@ private:
         return prefixp;
     }
 
+    // "S'STABLE(T)'ACTIVE" and "S'QUIET(T)'ACTIVE". The implicit signal has a
+    // transaction, FALSE, in every cycle in which S has an event -- a
+    // transaction, for 'QUIET -- and one more, TRUE, T after the last of
+    // them, which is the next delta when T is zero (16.2.4). The second is
+    // marked by a bit flipped T after each of those cycles, and counts only
+    // where nothing happened to S in between to cancel it.
+    std::map<std::pair<const AstVar*, std::string>, std::pair<AstVar*, AstVar*>> m_implicitActs;
+    AstNodeExpr* implicitActiveOf(AstVhdlAttrName* innerp, FileLine* flp) {
+        const std::string what = VString::downcase(innerp->name());
+        if (what != "stable" && what != "quiet") return nullptr;
+        if (!v3Global.opt.timing().isTrue()) return nullptr;
+        AstNodeVhdlExpr* const sp = boundNameOf(innerp->prefixp());
+        // Only of a whole signal: its history is kept whole
+        if (!VN_IS(sp, VhdlName)) return nullptr;
+        const VhdlShadow* const shp = shadowFor(sp, flp);
+        if (!shp) return nullptr;
+        const VhdlActive* const acp = what == "quiet" ? activeFor(sp) : nullptr;
+        VhdlSymbol* const symp = const_cast<VhdlSymbol*>(rootSymOf(sp));
+        const auto varIt = symp ? m_vars.find(symp->resolved()) : m_vars.end();
+        if (varIt == m_vars.end()) return nullptr;
+        AstVar* const sigp = varIt->second;
+        AstNodeExpr* argp = innerp->argp() ? lowerExpr(innerp->argp()) : nullptr;
+        if (innerp->argp() && !argp) return nullptr;
+        if (!argp) argp = new AstConst{flp, AstConst::Unsized64{}, 0};
+        // The time is static (16.2.4): a literal, or what generics give
+        if (argp->exists([](const AstVarRef* refp) { return !refp->varp()->isParam(); })
+            || argp->exists([](const AstNodeFTaskRef*) { return true; })) {
+            VL_DO_DANGLING(argp->deleteTree(), argp);
+            return nullptr;
+        }
+        AstNodeExpr* const happeningp = acp ? activeOf(acp, flp) : eventOf(sp, shp, flp);
+        if (!happeningp) {
+            VL_DO_DANGLING(argp->deleteTree(), argp);
+            return nullptr;
+        }
+        AstVar* const timep = acp ? acp->timep : shp->timep;
+        AstVar* const markp = acp ? acp->togglep : sigp;
+        const AstConst* const constp = VN_CAST(argp, Const);
+        const auto key
+            = std::make_pair(static_cast<const AstVar*>(markp),
+                             constp ? "c" + constp->num().ascii()
+                                    : "e" + std::to_string(reinterpret_cast<uintptr_t>(innerp)));
+        auto it = m_implicitActs.find(key);
+        if (it == m_implicitActs.end()) {
+            VL_RESTORER(m_ftaskp);
+            m_ftaskp = nullptr;
+            const std::string base = "__Vimpl" + std::to_string(++m_nameNum) + "__" + symp->name();
+            AstVar* const togp = newTempVar(base + "__tog", newLogicDType(flp, 1), flp);
+            AstVar* const prevp = newTempVar(base + "__prev", newLogicDType(flp, 1), flp);
+            // Which of them this is, by parity. A delayed assignment's value
+            // is worked out when it is scheduled, so "not the toggle" would
+            // give two that are pending at once the same value, and the
+            // second would deliver no change.
+            AstVar* const parp = newTempVar(base + "__par", newLogicDType(flp, 1), flp);
+            togp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            prevp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            parp->valuep(new AstConst{flp, AstConst::BitFalse{}});
+            AstNode* const flipp
+                = new AstAssign{flp, new AstVarRef{flp, parp, VAccess::WRITE},
+                                new AstNot{flp, new AstVarRef{flp, parp, VAccess::READ}}};
+            flipp->addNext(new AstAssignDly{
+                flp, new AstVarRef{flp, togp, VAccess::WRITE},
+                new AstVarRef{flp, parp, VAccess::READ},
+                constp && constp->isZero() ? nullptr
+                                           : new AstDelay{flp, argp->cloneTree(false), false}});
+            m_shadowsp = AstNode::addNextNull(
+                m_shadowsp,
+                static_cast<AstNode*>(new AstAlways{
+                    flp, VAlwaysKwd::ALWAYS,
+                    new AstSenTree{flp, senItemFor(new AstVarRef{flp, markp, VAccess::READ},
+                                                   isOneBitVar(markp), flp)},
+                    flipp}));
+            AstNode* const followp
+                = new AstAssignDly{flp, new AstVarRef{flp, prevp, VAccess::WRITE},
+                                   new AstVarRef{flp, togp, VAccess::READ}};
+            m_shadowsp = AstNode::addNextNull(
+                m_shadowsp,
+                static_cast<AstNode*>(new AstAlways{
+                    flp, VAlwaysKwd::ALWAYS,
+                    new AstSenTree{flp,
+                                   senItemFor(new AstVarRef{flp, togp, VAccess::READ}, true, flp)},
+                    followp}));
+            it = m_implicitActs.emplace(key, std::make_pair(togp, prevp)).first;
+        }
+        // The TRUE transaction is due now, and nothing has happened to S
+        // since the cycle that scheduled it
+        AstNodeExpr* const dueNowp = new AstLogAnd{
+            flp,
+            new AstNeq{flp, new AstVarRef{flp, it->second.first, VAccess::READ},
+                       new AstVarRef{flp, it->second.second, VAccess::READ}},
+            new AstEq{flp, nowOf(flp),
+                      new AstAdd{flp, new AstVarRef{flp, timep, VAccess::READ}, argp}}};
+        return new AstLogOr{flp, happeningp, dueNowp};
+    }
+
     AstNodeExpr* lowerSignalAttr(AstVhdlAttrName* nodep, const std::string& attr,
                                  AstNodeExpr* argp, FileLine* flp) {
+        if (attr == "active") {
+            if (AstVhdlAttrName* const innerp = VN_CAST(nodep->prefixp(), VhdlAttrName)) {
+                if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                return implicitActiveOf(innerp, flp);
+            }
+        }
         // A signal parameter's history is the history of the signal the call
         // passed, whether that is a signal of its own or part of one: what
         // the formal names has none (4.2.2.3)
@@ -31829,6 +31930,7 @@ private:
         m_actToggles.clear();
         m_needActive.clear();
         m_delayeds.clear();
+        m_implicitActs.clear();
         collectActive(entp->declsp());
         // A port this entity drives carries its transactions out to the
         // actual, where the architecture instantiating it asked for them
@@ -32436,6 +32538,13 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 if (wfp->afterp()) m_anyAfter = true;
             } else if (const AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
                 if (attrp->name() == "delayed" && attrp->argp()) m_anyAfter = true;
+                // The TRUE transaction of S'STABLE(T) or S'QUIET(T), which
+                // 'ACTIVE asks about, is delivered T after it was scheduled
+                const AstVhdlAttrName* const innerp = VN_CAST(attrp->prefixp(), VhdlAttrName);
+                if (attrp->name() == "active" && innerp && innerp->argp()
+                    && (innerp->name() == "stable" || innerp->name() == "quiet")) {
+                    m_anyAfter = true;
+                }
             }
         });
     }
