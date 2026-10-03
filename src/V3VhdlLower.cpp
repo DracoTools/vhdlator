@@ -23588,7 +23588,15 @@ private:
         AstNodeExpr* const rhsp = lowerExpr(valuep);
         if (!rhsp) return nullptr;
         AstNodeDType* tempDTypep = nullptr;
-        if (isRecord || typep->isConstrainedArray()) {
+        // A record a function gives back is what the copy made for this call
+        // returns, whose elements the call has constrained -- a "signed" left
+        // open in the type is eight bits here -- and so is the name holding it
+        const AstFuncRef* const callRefp = isRecord ? VN_CAST(rhsp, FuncRef) : nullptr;
+        const AstFunc* const calledp = callRefp ? VN_CAST(callRefp->taskp(), Func) : nullptr;
+        const AstVar* const resultp = calledp ? VN_CAST(calledp->fvarp(), Var) : nullptr;
+        if (resultp && resultp->childDTypep()) {
+            tempDTypep = resultp->childDTypep()->cloneTree(false);
+        } else if (isRecord || typep->isConstrainedArray()) {
             tempDTypep = lowerType(typep, flp);
         } else {
             // The value has as many elements as the target names, starting at
