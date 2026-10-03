@@ -6602,6 +6602,8 @@ private:
     // whose timeout expires find a signal being updated in the same cycle,
     // and only then does a timed wait have to stand aside for the update.
     bool m_anyAfter = false;
+    // Signals some assignment gives a 'Z' written as a literal
+    std::set<const VhdlSymbol*> m_zAssigned;
     // The names of the constants some external name reaches (8.7)
     std::set<std::string> m_extConstNames;
     // Generics no instance can hand a value the back end folds. A generic is
@@ -7376,7 +7378,13 @@ private:
                     // whose element subtype names a function of the design's
                     // own is not resolved by the logic tables even though it
                     // is made of bits, so it is not wired this way.
-                    if (isResolvedSignal(symp)) makeResolved(symp, varp, flp);
+                    // -- except where it may be given a 'Z', which only a net
+                    // can hold: a variable has two states, and the 'Z' would
+                    // read back as a zero
+                    if (isResolvedSignal(symp)
+                        || (symp->driverCount() == 1 && m_zAssigned.count(symp->resolved()))) {
+                        makeResolved(symp, varp, flp);
+                    }
                 } else if (symp->resolverp()) {
                     // A guarded signal goes through its own function however
                     // few drivers it has and whatever its type: only the
@@ -32752,6 +32760,28 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         unitp->foreach([this](AstNode* nodep) {
             if (const AstVhdlWaveform* const wfp = VN_CAST(nodep, VhdlWaveform)) {
                 if (wfp->afterp()) m_anyAfter = true;
+            } else if (const AstVhdlSigAssign* const sap = VN_CAST(nodep, VhdlSigAssign)) {
+                // A signal some assignment gives a 'Z' as a literal
+                const VhdlSymbol* const tsymp = rootSymOf(sap->targetp());
+                if (tsymp && !sap->force() && !sap->release()) {
+                    bool z = false;
+                    sap->foreach([&](const AstVhdlLiteral* litp) {
+                        if (litp->kind() != VhdlLitKind::CHARACTER
+                            && litp->kind() != VhdlLitKind::STRING
+                            && litp->kind() != VhdlLitKind::BITSTRING) {
+                            return;
+                        }
+                        const std::string& text = litp->text();
+                        if (text.find('Z') != std::string::npos
+                            || text.find('z') != std::string::npos) {
+                            z = true;
+                        }
+                    });
+                    sap->foreach([&](const AstVhdlName* namep) {
+                        if (namep->name() == "'Z'" || namep->name() == "'z'") z = true;
+                    });
+                    if (z) m_zAssigned.insert(tsymp->resolved());
+                }
             } else if (const AstVhdlExternalName* const extp = VN_CAST(nodep, VhdlExternalName)) {
                 // A constant an external name reaches has to be an object
                 // there, though nothing in its own region needs one
