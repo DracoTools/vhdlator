@@ -7035,11 +7035,50 @@ class WidthVisitor final : public VNVisitor {
             bool didWidth = false;
             if (AstPattern* const patternp = VN_CAST(nodep->exprp(), Pattern)) {
                 const AstVar* const modVarp = nodep->modVarp();
-                // Convert BracketArrayDType
-                userIterate(modVarp->childDTypep(),
-                            WidthVP{SELF, BOTH}.p());  // May relink pointed to node
-                AstNodeDType* const setDtp = modVarp->childDTypep();
-                if (!patternp->childDTypep()) patternp->childDTypep(setDtp->cloneTree(false));
+                // The parameter's type may be sized by other parameters of the
+                // module -- "parameter int foo [0:n-1]" -- and those are what
+                // this instance gives them, not the template's defaults. Asked
+                // before the template's type is widthed, which folds them in.
+                const bool dependent = m_cellp && modVarp->childDTypep()
+                                       && modVarp->childDTypep()->exists(
+                                           [](const AstNode* np) { return VN_IS(np, VarRef); });
+                if (!dependent) {
+                    // Convert BracketArrayDType
+                    userIterate(modVarp->childDTypep(),
+                                WidthVP{SELF, BOTH}.p());  // May relink pointed to node
+                }
+                AstNodeDType* setDtp = modVarp->childDTypep();
+                if (dependent) {
+                    AstNodeDType* const clonep = setDtp->cloneTree(false);
+                    if (AstNodeDType* const oldp = patternp->childDTypep()) {
+                        VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+                    }
+                    patternp->childDTypep(clonep);
+                    std::vector<std::pair<AstVarRef*, AstNodeExpr*>> substs;
+                    clonep->foreach([&](AstVarRef* refp) {
+                        AstNodeExpr* valuep = nullptr;
+                        for (AstPin* pinp = m_cellp->paramsp(); pinp;
+                             pinp = VN_AS(pinp->nextp(), Pin)) {
+                            if (pinp->modVarp() != refp->varp()) continue;
+                            if (AstConst* const constp = VN_CAST(pinp->exprp(), Const)) {
+                                valuep = constp->cloneTree(false);
+                            }
+                            break;
+                        }
+                        if (!valuep && refp->varp()->valuep()) {
+                            valuep = VN_AS(refp->varp()->valuep(), NodeExpr)->cloneTree(false);
+                        }
+                        if (valuep) substs.emplace_back(refp, valuep);
+                    });
+                    for (const auto& pair : substs) {
+                        pair.first->replaceWith(pair.second);
+                        VL_DO_DANGLING(pair.first->deleteTree(), pair.first);
+                    }
+                    userIterate(patternp->childDTypep(), WidthVP{SELF, BOTH}.p());
+                    setDtp = patternp->childDTypep();
+                } else if (!patternp->childDTypep()) {
+                    patternp->childDTypep(setDtp->cloneTree(false));
+                }
                 userIterateChildren(nodep, WidthVP{setDtp, BOTH}.p());
                 didWidth = true;
             }
