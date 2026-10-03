@@ -13279,68 +13279,120 @@ private:
         // driven, and those hold what it says (9.2.3).
         if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
             && (!symp || symp->predefined())) {
-            for (int side = 0; side < 2; ++side) {
-                AstNodeVhdlExpr* const sigExprp = side ? nodep->rhsp() : nodep->lhsp();
-                AstNodeVhdlExpr* const otherExprp = side ? nodep->lhsp() : nodep->rhsp();
-                // The whole signal, or an element or a slice of it
-                const VhdlSymbol* const rootp
-                    = VN_IS(sigExprp, VhdlName) || VN_IS(sigExprp, VhdlCall) ? rootSymOf(sigExprp)
-                                                                             : nullptr;
+            // A name of a package's signal, or an element or a slice of it,
+            // lowered, with the same select of its record of what is driven
+            const auto pkgSide = [&](AstNodeVhdlExpr* exprp, AstNodeExpr*& valuep,
+                                     AstNodeExpr*& drivenp) -> bool {
+                valuep = drivenp = nullptr;
+                const VhdlSymbol* const rootp = VN_IS(exprp, VhdlName) || VN_IS(exprp, VhdlCall)
+                                                    ? rootSymOf(exprp)
+                                                    : nullptr;
                 VhdlSymbol* const ssymp
                     = rootp ? const_cast<VhdlSymbol*>(pkgAliasBase(rootp)) : nullptr;
-                if (!ssymp || !pkgResolved(ssymp) || !VN_IS(otherExprp, VhdlLiteral)) continue;
-                if (m_bindSymbols.count(rootp) || m_ftaskp) continue;  // A formal's actual
+                if (!ssymp || !pkgResolved(ssymp)) return false;
+                if (m_bindSymbols.count(rootp) || m_ftaskp) return false;  // A formal's actual
                 AstVar* const sigVarp = pkgSignalVar(ssymp, flp);
-                AstNodeExpr* const sigp = lowerExpr(sigExprp);
-                AstNodeExpr* const otherp = sigp ? lowerExpr(otherExprp) : nullptr;
-                AstConst* const litp = VN_CAST(otherp, Const);
+                if (!sigVarp) return false;
+                AstNodeExpr* const sigp = lowerExpr(exprp);
                 // Only where what was lowered reads that one variable, by
                 // selects whose indices can be read twice
                 int refs = 0;
-                bool plain = sigp && litp && sigVarp;
+                bool plain = sigp;
                 if (plain) {
                     sigp->foreach([&](const AstNode* np) {
                         if (const AstVarRef* const refp = VN_CAST(np, VarRef)) {
                             if (refp->varp() == sigVarp) ++refs;
                         } else if (!VN_IS(np, SelBit) && !VN_IS(np, SelExtract)
-                                   && !VN_IS(np, Const) && !VN_IS(np, VarRef)) {
+                                   && !VN_IS(np, Const)) {
                             plain = false;
                         }
                     });
                 }
                 if (!plain || refs != 1) {
                     if (sigp) VL_DO_DANGLING(sigp->deleteTree(), sigp);
-                    if (otherp) VL_DO_DANGLING(otherp->deleteTree(), otherp);
-                    break;
+                    return false;
                 }
                 const PkgRegistry& reg = pkgRegistry(ssymp, flp);
-                // The same element or slice of the record of what is driven
-                AstNodeExpr* drivenExprp = sigp->cloneTree(false);
-                if (AstVarRef* const topRefp = VN_CAST(drivenExprp, VarRef)) {
+                AstNodeExpr* drvp = sigp->cloneTree(false);
+                if (AstVarRef* const topRefp = VN_CAST(drvp, VarRef)) {
                     VL_DO_DANGLING(topRefp->deleteTree(), topRefp);
-                    drivenExprp = rd(reg.drivenp, flp);
+                    drvp = rd(reg.drivenp, flp);
                 } else {
-                    drivenExprp->foreach([&](AstVarRef* refp) {
+                    drvp->foreach([&](AstVarRef* refp) {
                         if (refp->varp() == sigVarp) {
                             refp->varp(reg.drivenp);
                             refp->name(reg.drivenp->name());
                         }
                     });
                 }
-                V3Number numz{litp, litp->width()};
-                numz.opBitsZ(litp->num());
-                V3Number driven{litp, litp->width()};
-                driven.opNot(numz);
-                V3Number ones{litp, litp->width()};
-                ones.opBitsOne(litp->num());
-                AstNodeExpr* const samep = new AstLogAnd{
-                    flp, new AstEq{flp, drivenExprp, new AstConst{flp, driven}},
-                    new AstEq{flp, new AstAnd{flp, sigp, new AstConst{flp, driven}},
-                              new AstConst{flp, ones}}};
-                VL_DO_DANGLING(litp->deleteTree(), litp);
+                valuep = sigp;
+                drivenp = drvp;
+                return true;
+            };
+            const auto answer = [&](AstNodeExpr* samep) -> AstNodeExpr* {
                 return nodep->op() == VhdlBinaryOp::EQ
                            ? samep
                            : static_cast<AstNodeExpr*>(new AstLogNot{flp, samep});
+            };
+            AstNodeExpr* lValp = nullptr;
+            AstNodeExpr* lDrvp = nullptr;
+            AstNodeExpr* rValp = nullptr;
+            AstNodeExpr* rDrvp = nullptr;
+            const bool lPkg = pkgSide(nodep->lhsp(), lValp, lDrvp);
+            const bool rPkg = pkgSide(nodep->rhsp(), rValp, rDrvp);
+            if (lPkg && rPkg) {
+                // Two of them: equal where the same elements are driven, and
+                // those hold the same
+                AstNodeExpr* const samep
+                    = new AstLogAnd{flp, new AstEq{flp, lDrvp, rDrvp->cloneTree(false)},
+                                    new AstEq{flp, new AstAnd{flp, lValp, rDrvp->cloneTree(false)},
+                                              new AstAnd{flp, rValp, rDrvp}}};
+                return answer(samep);
+            }
+            if (lPkg || rPkg) {
+                AstNodeExpr* const sigp = lPkg ? lValp : rValp;
+                AstNodeExpr* const drvp = lPkg ? lDrvp : rDrvp;
+                AstNodeVhdlExpr* const otherExprp = lPkg ? nodep->rhsp() : nodep->lhsp();
+                // Lowered only where it is something this answers for, so that
+                // nothing lowering it adds is left behind otherwise
+                const VhdlSymbol* const orootp
+                    = VN_IS(otherExprp, VhdlName) || VN_IS(otherExprp, VhdlCall)
+                          ? rootSymOf(otherExprp)
+                          : nullptr;
+                const bool otherHolds = orootp
+                                        && (orootp->kind() == VhdlSymKind::VARIABLE
+                                            || orootp->kind() == VhdlSymKind::CONSTANT);
+                AstNodeExpr* const otherp = VN_IS(otherExprp, VhdlLiteral) || otherHolds
+                                                ? lowerExpr(otherExprp)
+                                                : nullptr;
+                if (AstConst* const litp = VN_CAST(otherp, Const)) {
+                    // A literal: equal where exactly its elements that are not
+                    // 'Z' are driven, and those hold what it says (9.2.3)
+                    V3Number numz{litp, litp->width()};
+                    numz.opBitsZ(litp->num());
+                    V3Number driven{litp, litp->width()};
+                    driven.opNot(numz);
+                    V3Number ones{litp, litp->width()};
+                    ones.opBitsOne(litp->num());
+                    AstNodeExpr* const samep = new AstLogAnd{
+                        flp, new AstEq{flp, drvp, new AstConst{flp, driven}},
+                        new AstEq{flp, new AstAnd{flp, sigp, new AstConst{flp, driven}},
+                                  new AstConst{flp, ones}}};
+                    VL_DO_DANGLING(litp->deleteTree(), litp);
+                    return answer(samep);
+                }
+                // A variable or a constant holds no 'Z' here, so the signal
+                // equals it only where every element is driven
+                if (otherp && otherHolds) {
+                    AstNodeExpr* const samep = new AstLogAnd{
+                        flp,
+                        new AstEq{flp, drvp, new AstConst{flp, AstConst::StringToParse{}, "'1"}},
+                        new AstEq{flp, sigp, otherp}};
+                    return answer(samep);
+                }
+                if (otherp) VL_DO_DANGLING(otherp->deleteTree(), otherp);
+                VL_DO_DANGLING(sigp->deleteTree(), sigp);
+                VL_DO_DANGLING(drvp->deleteTree(), drvp);
             }
         }
         // Two arrays are equal only where each dimension of one is as long
