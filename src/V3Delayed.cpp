@@ -420,8 +420,15 @@ class DelayedVisitor final : public VNVisitor {
         const AstNodeDType* const dtypep = vscp->dtypep()->skipRefp();
         // Unpacked arrays
         if (const AstUnpackArrayDType* const uaDTypep = VN_CAST(dtypep, UnpackArrayDType)) {
-            // If whole array is target of NBA, use ShadowVar
-            if (vscpInfo.m_whole) return Scheme::ShadowVar;
+            // If whole array is target of NBA, use ShadowVar -- except in a
+            // suspendable or fork, where the 'Pre' copy of the shadow
+            // cannot follow the process: it is taken when the commit runs,
+            // overwriting what the process wrote, so the NBA is lost. A
+            // unique flag captures the value at the NBA instead.
+            if (vscpInfo.m_whole) {
+                if (vscpInfo.m_inSuspOrFork && !vscpInfo.m_inLoop) return Scheme::FlagUnique;
+                return Scheme::ShadowVar;
+            }
             // Basic underlying type of elements, if any.
             const AstBasicDType* const basicp = uaDTypep->basicp();
             // If used in a loop, we must have a dynamic commit queue. (Also works in suspendables)
