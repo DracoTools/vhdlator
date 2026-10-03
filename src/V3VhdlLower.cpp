@@ -1872,6 +1872,41 @@ private:
         return structp;
     }
 
+    std::map<std::string, VhdlType*> m_recShapes;  // Record subtype by its shape
+
+    // The base type of a record and the bounds of every element in it, as
+    // text: two subtypes alike in all of that are one shape. Empty where a
+    // bound is not a number here.
+    static std::string recordShape(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8) return "";
+        std::ostringstream os;
+        os << static_cast<const void*>(typep->base()) << "{";
+        const VhdlTypeKind kind = typep->base()->kind();
+        if (kind == VhdlTypeKind::RECORD) {
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                if (!elemp || !elemp->typep()) return "";
+                const std::string inner = recordShape(elemp->typep(), depth + 1);
+                if (inner.empty()) return "";
+                os << inner << ";";
+            }
+        } else if (kind == VhdlTypeKind::ARRAY) {
+            if (!typep->isConstrainedArray()) return "";
+            for (size_t d = 0; d < typep->dimensions(); ++d) {
+                const VhdlType* const idxp = indexSubtype(typep, d);
+                if (!idxp || !idxp->bounded()) return "";
+                os << idxp->left() << (idxp->ascending() ? "to" : "downto") << idxp->right()
+                   << ",";
+            }
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+            const std::string inner = recordShape(elemp, depth + 1);
+            if (inner.empty()) return "";
+            os << inner;
+        }
+        os << "}";
+        return os.str();
+    }
+
     // A record that does not pack becomes a C++ structure, which has to be
     // declared once and named -- so it is a typedef of the module, and every
     // use of the record refers to it by name.
@@ -1912,7 +1947,18 @@ private:
         // running sizes, is carried where the port's own shape is not, so it
         // is a structure of its own
         const bool carryHere = recordMayCarry(typep) && !recordMayCarry(typep->base());
-        VhdlType* const keyp = openElement || carryHere ? typep : typep->base();
+        VhdlType* keyp = openElement || carryHere ? typep : typep->base();
+        // Two subtypes that constrain the open elements alike are one shape,
+        // and values of them are assigned to one another -- "v := (a =>
+        // k.a)" where v and k are each declared "rec2_t(a(1 to 2)(x(1 to
+        // 3)))" -- so they are one structure, found by that shape
+        if (openElement && !carryHere) {
+            const std::string shape = recordShape(typep);
+            if (!shape.empty()) {
+                const auto shapeIt = m_recShapes.emplace(shape, typep).first;
+                keyp = shapeIt->second;
+            }
+        }
         // Where an element's length is a generic rather than a number, the
         // structure is not one shape but one per set of generics, and only
         // the module it belongs to is cloned per instance. Declaring it in
@@ -7634,7 +7680,10 @@ private:
                 return new AstConst{flp, AstConst::String{},
                                     std::string(static_cast<size_t>(len), '\0')};
             }
-            AstNodeExpr* const elemp = defaultValueFor(basep->elementp(), flp, true);
+            // The element as this subtype constrains it: a record whose own
+            // element is left open has a default only once that is closed
+            AstNodeExpr* const elemp = defaultValueFor(
+                typep->elementp() ? typep->elementp() : basep->elementp(), flp, true);
             if (!elemp) return nullptr;
             AstNodeDType* const dtypep = lowerType(typep, flp);
             // A vector of single bits comes out as a type with a range
