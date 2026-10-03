@@ -19002,7 +19002,7 @@ private:
                 AstNodeVhdlExpr* const innerp = actualSignal(asp->actualp());
                 AstNodeVhdlExpr* const namedp = innerp ? innerp : asp->actualp();
                 if (const VhdlSymbol* const symp = pkgAliasBase(rootSymOf(namedp))) {
-                    if (VN_IS(namedp, VhdlName) || pkgResolved(symp)) {
+                    if (VN_IS(namedp, VhdlName) || pkgResolved(symp) || resolvedAsWhole(symp)) {
                         out.insert(symp);
                     } else {
                         s_partialDriven.insert(symp);
@@ -19043,7 +19043,8 @@ private:
                         // A package's signal is resolved element by element
                         // wherever it is driven from (makePkgDriver), so a
                         // part of it is a driver like the whole
-                        if (VN_IS(asp->actualp(), VhdlName) || pkgResolved(symp)) {
+                        if (VN_IS(asp->actualp(), VhdlName) || pkgResolved(symp)
+                            || resolvedAsWhole(symp)) {
                             out.insert(symp);
                         } else {
                             s_partialDriven.insert(symp);
@@ -19059,7 +19060,8 @@ private:
                 // here and another from there is not two drivers of the
                 // signal. Only a whole-signal assignment is counted, and a
                 // partial one takes the signal out of resolution altogether.
-                if (VN_IS(asgp->targetp(), VhdlName) || pkgResolved(symp)) {
+                if (VN_IS(asgp->targetp(), VhdlName) || pkgResolved(symp)
+                    || resolvedAsWhole(symp)) {
                     out.insert(symp);
                 } else {
                     s_partialDriven.insert(symp);
@@ -19106,6 +19108,17 @@ private:
             if (used >= static_cast<int>(it->second.size())) return false;
         }
         return true;
+    }
+
+    // Whether a signal's subtype is a composite resolved by a function of the
+    // design's own as a whole: a process that drives any part of it is a
+    // driver of all of it, holding the rest as declared (14.7.2, 14.7.3.2)
+    static bool resolvedAsWhole(const VhdlSymbol* symp) {
+        if (!symp->resolverp() || symp->resolvePerElement()) return false;
+        const VhdlType* const typep = symp->typep();
+        if (!typep || isLogicish(typep)) return false;
+        const VhdlTypeKind kind = typep->base()->kind();
+        return kind == VhdlTypeKind::RECORD || kind == VhdlTypeKind::ARRAY;
     }
 
     // Whether this signal needs resolving, and can be
@@ -23617,6 +23630,24 @@ private:
                 return nullptr;
             }
             AstNode* outp = nullptr;
+            // Each element is a transaction on this process's driver, as a
+            // single one is, and not on the signal its drivers resolve to
+            if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
+                for (AstVhdlWaveform* p = wfp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
+                    AstNodeExpr* const valuep
+                        = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
+                    if (!valuep) return outp;
+                    AstNode* const delayp
+                        = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                    AstNode* const markp
+                        = transactionMark(nodep->targetp(), delayp, sequential, valuep, flp);
+                    outp
+                        = AstNode::addNextNull(outp, driveResolved(nodep, nodep->targetp(), valuep,
+                                                                   delayp, sequential, flp));
+                    outp = AstNode::addNextNull(outp, markp);
+                }
+                return outp;
+            }
             if (AstTask* const wtaskp
                 = sequential ? waveTaskFor(nodep->targetp(), flp) : nullptr) {
                 for (AstVhdlWaveform* p = wfp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
@@ -26744,6 +26775,69 @@ private:
         return false;
     }
 
+    // Whether a subprogram's body may drive the signal formal it declares:
+    // an assignment to it or to a part of it, or a call that passes it on
+    // to a formal that may. A mode says only what a body is allowed to do;
+    // a procedure taking "inout" and only reading it is no driver. Anything
+    // not followed -- an alias of it, a call whose body is not here -- counts.
+    static bool drivesFormal(const AstVhdlSubprogDecl* declp, const VhdlSymbol* formalp,
+                             int depth = 0) {
+        if (!declp || !declp->hasBody() || depth > 16) return true;
+        const VhdlSymbol* const wantp = formalp->resolved();
+        const auto isFormal = [wantp](const AstNode* nodep) {
+            const VhdlSymbol* const rootp = rootSymOf(nodep);
+            return rootp && rootp->resolved() == wantp;
+        };
+        bool drives = false;
+        declp->foreach([&](const AstNode* nodep) {
+            if (drives) return;
+            if (const AstVhdlSigAssign* const sap = VN_CAST(nodep, VhdlSigAssign)) {
+                if (isFormal(sap->targetp())) drives = true;
+            } else if (const AstVhdlAliasDecl* const adp = VN_CAST(nodep, VhdlAliasDecl)) {
+                if (adp->targetp() && isFormal(adp->targetp())) drives = true;
+            } else if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+                VhdlSymbol* const namedp = callp->vhdlSymp();
+                VhdlSymbol* const calleep = namedp ? namedp->resolved() : nullptr;
+                const AstVhdlSubprogDecl* const cdeclp = declOf(calleep);
+                if (!cdeclp) {
+                    // An index or a slice of the formal, or a call whose
+                    // body is not here that is given it
+                    for (const AstNode* p = callp->argsp(); p; p = p->nextp()) {
+                        const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                        if (calleep && asp && asp->actualp() && isFormal(asp->actualp())) {
+                            drives = true;
+                        }
+                    }
+                    return;
+                }
+                std::vector<const AstVhdlIfaceDecl*> formals;
+                for (const AstNode* p = firstParamOf(cdeclp); p; p = p->nextp()) {
+                    formals.push_back(VN_AS(p, VhdlIfaceDecl));
+                }
+                size_t pos = 0;
+                for (const AstNode* p = callp->argsp(); p; p = p->nextp(), ++pos) {
+                    const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                    if (!asp || !asp->actualp() || !isFormal(asp->actualp())) continue;
+                    const AstVhdlIfaceDecl* ifp = nullptr;
+                    if (!asp->formalp()) {
+                        if (pos < formals.size()) ifp = formals[pos];
+                    } else if (const AstVhdlName* const fnp = VN_CAST(asp->formalp(), VhdlName)) {
+                        for (const AstVhdlIfaceDecl* const fp : formals) {
+                            if (fp->name() == fnp->name()) ifp = fp;
+                        }
+                    }
+                    if (!ifp || !ifp->vhdlSymp()) {
+                        drives = true;
+                    } else if (ifp->kind() == VhdlIfaceKind::SIGNAL && ifp->mode() != VhdlMode::IN
+                               && drivesFormal(cdeclp, ifp->vhdlSymp(), depth + 1)) {
+                        drives = true;
+                    }
+                }
+            }
+        });
+        return drives;
+    }
+
     // A copy of a subprogram's body made for one call site, with each
     // signal-class formal bound to the signal the call passed (4.2.2.3): an
     // assignment inside it drives that signal, and the formal's history
@@ -27183,6 +27277,14 @@ private:
                 // is the one object it was
                 if (!passedOn && pkgResolved(drivenp)
                     && idx >= static_cast<int>(drvIt->second.size())) {
+                    drvIt = m_drivers.end();
+                }
+                // A driver combined by a function of the design's own cannot
+                // be written from a copy (below), but a formal the body only
+                // reads, whatever its mode, writes none: it names the signal,
+                // and the driver the call gave the process holds its value
+                if (drvIt != m_drivers.end() && idx < static_cast<int>(drvIt->second.size())
+                    && !drvIt->second[idx].enp && !drivesFormal(declp, formals[i]->vhdlSymp())) {
                     drvIt = m_drivers.end();
                 }
             }

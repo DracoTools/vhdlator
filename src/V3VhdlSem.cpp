@@ -2227,6 +2227,7 @@ private:
                              bool generics = false) VL_MT_DISABLED;
     void analyzeDrivers(AstVhdlArchitecture* archp) VL_MT_DISABLED;
     static bool isLogicValued(const VhdlType* typep) VL_MT_DISABLED;
+    static bool resolvedAsWhole(const VhdlSymbol* symp) VL_MT_DISABLED;
     static bool driversCombined(const VhdlType* typep, int depth = 0) VL_MT_DISABLED;
     static VhdlSymbol* elementResolver(const VhdlType* typep) VL_MT_DISABLED;
     static bool compositeResolved(const VhdlType* typep, int depth = 0) VL_MT_DISABLED;
@@ -6920,8 +6921,25 @@ bool convertedFormalDrives(const AstNodeVhdlExpr* formalp) {
            || declp->mode() == VhdlMode::BUFFER;
 }
 
+// The object a name is part of: past every index, slice and selection, where
+// driverRootSym stops at the longest static prefix
+const VhdlSymbol* objectRootSym(const AstNode* nodep) {
+    while (nodep) {
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            nodep = callp->prefixp();
+        } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            nodep = selp->prefixp();
+        } else if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
+            return vp->vhdlSymp();
+        } else {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
 void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
-                       std::set<const VhdlSymbol*>& partial, bool follow) {
+                       std::set<const VhdlSymbol*>& partial, bool follow,
+                       std::set<const VhdlSymbol*>* partRootsp = nullptr) {
     if (!nodep) return;
     if (const AstVhdlAssoc* const asp = VN_CAST(nodep, VhdlAssoc)) {
         // An instance's out port drives the signal it is associated with
@@ -6932,6 +6950,7 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                     whole.insert(symp);
                 } else {
                     partial.insert(symp);
+                    if (partRootsp) partRootsp->insert(objectRootSym(namedp));
                 }
             }
         }
@@ -6941,11 +6960,11 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
         // a release hands the signal back to the drivers it already had
         // (10.5.2.1), so neither adds a driver
         if (asgp->force() || asgp->release()) {
-            collectDrivenSyms(nodep->op1p(), whole, partial, true);
-            collectDrivenSyms(nodep->op2p(), whole, partial, true);
-            collectDrivenSyms(nodep->op3p(), whole, partial, true);
-            collectDrivenSyms(nodep->op4p(), whole, partial, true);
-            if (follow) collectDrivenSyms(nodep->nextp(), whole, partial, true);
+            collectDrivenSyms(nodep->op1p(), whole, partial, true, partRootsp);
+            collectDrivenSyms(nodep->op2p(), whole, partial, true, partRootsp);
+            collectDrivenSyms(nodep->op3p(), whole, partial, true, partRootsp);
+            collectDrivenSyms(nodep->op4p(), whole, partial, true, partRootsp);
+            if (follow) collectDrivenSyms(nodep->nextp(), whole, partial, true, partRootsp);
             return;
         }
         if (const VhdlSymbol* const symp = driverRootSym(asgp->targetp())) {
@@ -6953,14 +6972,15 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                 whole.insert(symp);
             } else {
                 partial.insert(symp);
+                if (partRootsp) partRootsp->insert(objectRootSym(asgp->targetp()));
             }
         }
     }
-    collectDrivenSyms(nodep->op1p(), whole, partial, true);
-    collectDrivenSyms(nodep->op2p(), whole, partial, true);
-    collectDrivenSyms(nodep->op3p(), whole, partial, true);
-    collectDrivenSyms(nodep->op4p(), whole, partial, true);
-    if (follow) collectDrivenSyms(nodep->nextp(), whole, partial, true);
+    collectDrivenSyms(nodep->op1p(), whole, partial, true, partRootsp);
+    collectDrivenSyms(nodep->op2p(), whole, partial, true, partRootsp);
+    collectDrivenSyms(nodep->op3p(), whole, partial, true, partRootsp);
+    collectDrivenSyms(nodep->op4p(), whole, partial, true, partRootsp);
+    if (follow) collectDrivenSyms(nodep->nextp(), whole, partial, true, partRootsp);
 }
 }  // namespace
 
@@ -7107,6 +7127,17 @@ static VhdlSignalKind guardedKindOf(const VhdlSymbol* symp) {
     return VhdlSignalKind::NONE;
 }
 
+// Whether a signal's subtype is a composite that names a resolution function
+// of the design's own, which resolves the composite as a whole rather than
+// one element at a time
+bool VhdlSemVisitor::resolvedAsWhole(const VhdlSymbol* symp) {
+    const VhdlType* const typep = symp->typep();
+    if (!typep || !typep->resolutionp()) return false;
+    const VhdlTypeKind kind = typep->base()->kind();
+    if (kind != VhdlTypeKind::RECORD && kind != VhdlTypeKind::ARRAY) return false;
+    return !isLogicValued(typep);
+}
+
 void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::map<const VhdlSymbol*, int> counts;
     std::map<const VhdlSymbol*, FileLine*> where;
@@ -7148,8 +7179,16 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                 continue;
             }
             std::set<const VhdlSymbol*> whole;
-            collectDrivenSyms(p, whole, partial, false);
+            std::set<const VhdlSymbol*> partRoots;
+            collectDrivenSyms(p, whole, partial, false, &partRoots);
             collectCallDrivers(p, whole, partial);
+            for (const VhdlSymbol* const symp : partRoots) {
+                // A source of a signal whose composite subtype names a
+                // resolution function is a value of the whole composite, so
+                // a process that drives only part of it is a driver of all
+                // of it, holding the rest as declared (14.7.2, 14.7.3.2)
+                if (symp && resolvedAsWhole(symp)) whole.insert(symp);
+            }
             const AstVhdlGenerate* const genp = VN_CAST(p, VhdlGenerate);
             const bool inGenerate = genp;
             // Every iteration of a for generate elaborates the statements of
@@ -7175,7 +7214,8 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     walk(archp->stmtsp());
     for (const auto& pair : counts) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
-        if (partial.count(symp)) continue;  // Its elements are driven, not it
+        // Its elements are driven, not it
+        if (partial.count(symp) && !resolvedAsWhole(symp)) continue;
         symp->driverCount(pair.second);
         VhdlType* const typep = symp->typep();
         VhdlSymbol* const resolvep = typep ? typep->resolutionp() : nullptr;
