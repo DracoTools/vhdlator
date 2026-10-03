@@ -19609,7 +19609,8 @@ private:
     // Whether a subprogram's parameter or result subtype has a bound naming a
     // generic nothing here stands for
     bool namesForeignGeneric(const VhdlSymbol* symp) const {
-        std::vector<const VhdlType*> types(symp->paramTypes().begin(), symp->paramTypes().end());
+        const std::vector<VhdlType*>& ptypes = symp->paramTypes();
+        std::vector<const VhdlType*> types{ptypes.begin(), ptypes.end()};
         types.push_back(symp->returnTypep());
         for (const VhdlType* typep : types) {
             for (int depth = 0; typep && depth < 8; ++depth) {
