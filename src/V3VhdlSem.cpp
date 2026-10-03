@@ -9092,12 +9092,47 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
     // A user-defined attribute (7.2)
     std::vector<VhdlSymbol*> found;
     lookup(attr, found);
+    // One declared in a design unit that is the prefix -- "work.e'delay",
+    // with "attribute delay" declared in entity e -- is that unit's own and
+    // is found there, where it is not visible from here
+    VhdlSymbol* unitSymp = nullptr;
+    if (!parts.empty()) {
+        const std::string lib = parts.size() > 1 ? lower(parts[0]) : m_libname;
+        const std::string unit = lower(parts.back());
+        const auto unitIt = m_unitScopes.find((lib == "work" ? m_libname : lib) + "." + unit);
+        if (unitIt != m_unitScopes.end()) {
+            std::vector<VhdlSymbol*> own;
+            unitIt->second->lookupLocal(attr, own);
+            bool any = false;
+            for (VhdlSymbol* const symp : own) {
+                if (symp->kind() == VhdlSymKind::ATTRIBUTE) {
+                    found.insert(found.begin(), symp);
+                    any = true;
+                }
+            }
+            // The unit's own name, declared in its own region, is what holds
+            // the value (declareUnitSelf)
+            if (any) {
+                std::vector<VhdlSymbol*> selves;
+                unitIt->second->lookupLocal(unit, selves);
+                for (VhdlSymbol* const selfp : selves) {
+                    if (selfp->userAttr(attr)) {
+                        unitSymp = selfp;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     for (VhdlSymbol* const symp : found) {
         if (symp->kind() == VhdlSymKind::ATTRIBUTE) {
             nodep->vhdlSymp(symp);
             // The prefix names whatever was given the attribute, which may be
             // a design unit or a label and so need not analyze as an
             // expression (7.2, 16.2)
+            // The unit the attribute was found in is what the prefix names,
+            // whatever the selected name was resolved to on the way
+            if (unitSymp) nodep->prefixp()->vhdlSymp(unitSymp);
             if (!nodep->prefixp()->vhdlSymp() && !parts.empty()) {
                 std::vector<VhdlSymbol*> prefs;
                 lookup(parts.back(), prefs);
