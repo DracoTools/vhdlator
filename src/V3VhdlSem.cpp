@@ -4267,7 +4267,78 @@ void VhdlSemVisitor::constrainBlockPorts(AstVhdlBlockHeader* nodep) {
         // too, though its own index constraint says nothing (5.3.3)
         const VhdlType* const declp = symp->typep();
         const bool isRecord = declp->base()->kind() == VhdlTypeKind::RECORD;
+        // An array whose index range is given but whose element is left
+        // open -- "m : matrix_t(0 to 1)" of BIT_VECTORs -- takes the
+        // element's from what it is associated with: the actual's elements
+        // where it is associated whole, and otherwise the actuals of its
+        // elements, which have to agree (6.5.6.3)
+        if (declp->base()->kind() == VhdlTypeKind::ARRAY && !declp->unconstrained()
+            && !declp->lengthEmittable()) {
+            VhdlType* elemp = nullptr;
+            bool agrees = true;
+            for (size_t i = 0; i < assocs.size(); ++i) {
+                AstNodeVhdlExpr* const actp = assocs[i]->actualp();
+                if (!actp || VN_IS(actp, VhdlOpen)) continue;
+                const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
+                if (namep ? namep->name() == symp->name()
+                          : (!assocs[i]->formalp() && i == position)) {
+                    VhdlType* const narrowp
+                        = constrainElementFromValue(symp->typep(), actp, ifp->fileline());
+                    if (narrowp->lengthEmittable()) symp->typep(narrowp);
+                    agrees = false;
+                    break;
+                }
+                const AstVhdlCall* const partp = VN_CAST(assocs[i]->formalp(), VhdlCall);
+                const AstVhdlName* const ownerp
+                    = partp ? VN_CAST(partp->prefixp(), VhdlName) : nullptr;
+                if (!ownerp || ownerp->name() != symp->name()) continue;
+                VhdlType* const atp = actp->vhdlTypep();
+                if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY || !atp->lengthEmittable()
+                    || atp->dimensions() != 1
+                    || (elemp && elemp->dimLength(0) != atp->dimLength(0))) {
+                    agrees = false;
+                    break;
+                }
+                if (!elemp) elemp = atp;
+            }
+            if (agrees && elemp) {
+                VhdlType* const portTypep = cloneSubtype(symp->typep(), ifp->fileline());
+                portTypep->elementp(elemp);
+                symp->typep(portTypep);
+            }
+            continue;
+        }
         if (!declp->unconstrained() && !(isRecord && !fullyConstrainedRecord(declp))) continue;
+        // A record associated element by element -- "p.a => s.a, p.b => s.b"
+        // -- takes each open element's bounds from that element's actual
+        if (isRecord) {
+            std::vector<AstNodeVhdlExpr*> byPos(declp->elements().size(), nullptr);
+            bool any = false;
+            for (AstVhdlAssoc* const asp : assocs) {
+                const AstVhdlSelected* const selp = VN_CAST(asp->formalp(), VhdlSelected);
+                const AstVhdlName* const ownerp
+                    = selp ? VN_CAST(selp->prefixp(), VhdlName) : nullptr;
+                const AstVhdlName* const elemNamep
+                    = selp ? VN_CAST(selp->suffixp(), VhdlName) : nullptr;
+                if (!ownerp || !elemNamep || ownerp->name() != symp->name()) continue;
+                if (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+                const std::vector<VhdlSymbol*>& elems = declp->elements();
+                for (size_t e = 0; e < elems.size(); ++e) {
+                    if (elems[e]->name() == elemNamep->name()) {
+                        byPos[e] = asp->actualp();
+                        any = true;
+                    }
+                }
+            }
+            if (any) {
+                VhdlType* const narrowp
+                    = constrainRecordFromParts(symp->typep(), byPos, ifp->fileline());
+                if (fullyConstrainedRecord(narrowp)) {
+                    symp->typep(narrowp);
+                    continue;
+                }
+            }
+        }
         for (size_t i = 0; i < assocs.size(); ++i) {
             const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
             // A conversion written on the formal means the actual's subtype
@@ -11734,7 +11805,12 @@ VhdlType* VhdlSemVisitor::constrainRecordFromParts(VhdlType* typep,
     for (size_t i = 0; i < elems.size() && i < byPos.size(); ++i) {
         VhdlType* const elemTypep = elems[i]->typep();
         if (!elemTypep || !byPos[i]) continue;
-        if (elemTypep->base()->kind() != VhdlTypeKind::ARRAY || !elemTypep->unconstrained()) {
+        // A record element may be open in its turn, through an array element
+        // of its own (5.3.3)
+        const bool openRecord = elemTypep->base()->kind() == VhdlTypeKind::RECORD
+                                && !fullyConstrainedRecord(elemTypep);
+        if (!openRecord
+            && (elemTypep->base()->kind() != VhdlTypeKind::ARRAY || !elemTypep->unconstrained())) {
             continue;
         }
         // An element the record's own declaration constrained is not open,
@@ -11743,7 +11819,7 @@ VhdlType* VhdlSemVisitor::constrainRecordFromParts(VhdlType* typep,
         // value instead would make an object of the type a different
         // structure from the type itself, and the two would no longer be
         // assignable to one another.
-        if (elemTypep->lengthEmittable()) continue;
+        if (!openRecord && elemTypep->lengthEmittable()) continue;
         VhdlType* const newTypep = constrainFromValue(elemTypep, byPos[i], flp);
         if (newTypep == elemTypep) continue;
         if (!outp) outp = cloneSubtype(typep, flp);

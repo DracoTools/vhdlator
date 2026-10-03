@@ -18370,7 +18370,7 @@ private:
                 const bool byName = namep && namep->name() == symp->name();
                 const bool byConv = convNamep && convNamep->name() != symp->name()
                                     && formalNamed(convp->argsp()) == symp->name();
-                if (byName || byConv || (!namep && !convp && i == position)) {
+                if (byName || byConv || (!assocs[i]->formalp() && i == position)) {
                     actualp = assocs[i]->actualp();
                     inertial = assocs[i]->inertial();
                     if (byConv) outConvp = assocs[i]->formalp();
@@ -18408,6 +18408,54 @@ private:
                     outConvp = nullptr;
                 } else {
                     lowerConvertedPort(symp, ifp, outConvp, inConvp, innerp, targetp, flp);
+                    continue;
+                }
+            }
+            // Associated element by element -- "m(0) => x, m(1) => y" --
+            // the port is a signal of its own, each part of it following
+            // its actual, as a port associated whole would (6.5.7.1)
+            if (!actualp && !isGeneric) {
+                std::vector<AstVhdlAssoc*> parts;
+                for (AstVhdlAssoc* const asp : assocs) {
+                    const AstNodeVhdlExpr* const formalp = asp->formalp();
+                    if (!formalp || VN_IS(formalp, VhdlName) || !asp->actualp()
+                        || VN_IS(asp->actualp(), VhdlOpen)) {
+                        continue;
+                    }
+                    const VhdlSymbol* const ownerp = rootSymOf(formalp);
+                    if (ownerp && ownerp->resolved() == symp->resolved()) parts.push_back(asp);
+                }
+                if (!parts.empty() && ifp->mode() == VhdlMode::IN) {
+                    FileLine* const vflp = new FileLine{flp};
+                    vflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    AstVar* const varp = newVar(symp, VVarType::VAR, vflp);
+                    addStmt(varp);
+                    // A formal names the port's element by the element's name:
+                    // the association analyzed it as the port, so the
+                    // selection is made here from what was written
+                    std::function<AstNodeExpr*(AstNodeVhdlExpr*)> partOf
+                        = [&](AstNodeVhdlExpr* formalp) -> AstNodeExpr* {
+                        AstVhdlSelected* const selp = VN_CAST(formalp, VhdlSelected);
+                        const AstVhdlName* const elemp
+                            = selp ? VN_CAST(selp->suffixp(), VhdlName) : nullptr;
+                        if (!elemp) return lowerExpr(formalp);
+                        AstNodeExpr* const fromp = partOf(selp->prefixp());
+                        if (!fromp) return nullptr;
+                        return new AstMemberSel{selp->fileline(), fromp, VFlagChildDType{},
+                                                elemp->name()};
+                    };
+                    for (AstVhdlAssoc* const asp : parts) {
+                        AstNodeExpr* const valuep = lowerExpr(asp->actualp());
+                        AstNodeExpr* const lhsp = valuep ? partOf(asp->formalp()) : nullptr;
+                        if (!lhsp) {
+                            if (valuep) VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                            continue;
+                        }
+                        lhsp->foreach([varp](AstVarRef* refp) {
+                            if (refp->varp() == varp) refp->access(VAccess::WRITE);
+                        });
+                        addStmt(new AstAlways{new AstAssignW{vflp, lhsp, valuep}});
+                    }
                     continue;
                 }
             }
