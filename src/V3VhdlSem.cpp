@@ -11029,13 +11029,25 @@ bool VhdlSemVisitor::markAsRange(AstNodeVhdl* holderp) {
 // One index per dimension, each within its own index range (8.4)
 VhdlType* VhdlSemVisitor::analyzeIndexedName(AstVhdlCall* nodep, VhdlType* arrayp) {
     const std::vector<VhdlType*>& indexes = arrayp->indexTypes();
+    // Where the element is only the prefix of an attribute of its subtype --
+    // "v2(5)'left" -- the index names no element that is read, and one
+    // outside the range is said rather than refused (nvc 1.22.1, GHDL
+    // 7.0.0-dev and Questa 2025.2 all warn)
+    bool onlySubtype = false;
+    if (const AstVhdlAttrName* const attrp = VN_CAST(nodep->backp(), VhdlAttrName)) {
+        static const std::set<std::string> subtypeAttrs{
+            "left",  "right",         "high",      "low",     "length",
+            "range", "reverse_range", "ascending", "element", "subtype"};
+        onlySubtype = attrp->prefixp() == nodep && subtypeAttrs.count(attrp->name());
+    }
     size_t dim = 0;
     for (AstNode* argp = nodep->argsp(); argp; argp = argp->nextp(), ++dim) {
         AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc);
         if (!asp || !asp->actualp()) continue;
         VhdlType* const wantp = dim < indexes.size() ? indexes[dim] : nullptr;
         analyzeExpr(asp->actualp(), wantp);
-        checkValueInRange(asp->actualp(), wantp, "the index of " + arrayp->prettyName(), true);
+        checkValueInRange(asp->actualp(), wantp, "the index of " + arrayp->prettyName(),
+                          !onlySubtype);
     }
     if (!indexes.empty() && dim != indexes.size()) {
         err(nodep->fileline(), "Expected " + std::to_string(indexes.size()) + " index(es) for "
