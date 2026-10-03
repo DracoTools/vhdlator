@@ -11780,7 +11780,13 @@ private:
             unsup(flp, "external name of an object in a package");
             return nullptr;
         }
-        if (nodep->upLevels() > 0) {
+        // Carets that climb no further than the blocks and generates this
+        // is written in stay in this module, where what follows is found
+        // from here as a hierarchical name is: "^.^.g(1).y" from a block
+        // inside g(1) (8.7)
+        const bool caretsInModule
+            = nodep->upLevels() > 0 && nodep->upLevels() <= m_regionDepth && !m_ftaskp;
+        if (nodep->upLevels() > 0 && !caretsInModule) {
             // "^" is the region enclosing this one (8.7). Written straight in
             // an architecture, one of them is the region that instantiates
             // it: what follows names an instance there, which is found from
@@ -17359,6 +17365,8 @@ private:
             VL_RESTORER(m_cfgScopep);
             m_cfgScopep = cfgScopeIn(blockp->label());
             if (!blockp->label().empty()) m_blockPrefix += blockp->label() + "__";
+            VL_RESTORER(m_regionDepth);
+            ++m_regionDepth;
             if (blockp->guardp()) lowerGuard(blockp, flp);
             if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
                 lowerBlockHeader(headerp);
@@ -22594,8 +22602,12 @@ private:
 
     // The declarations and statements of one generate alternative, collected
     // rather than added to the enclosing module
+    int m_regionDepth = 0;  // Blocks and generate bodies around what is lowered
+
     AstNode* lowerGenerateBody(AstVhdlGenerateBody* nodep) {
         if (!nodep) return nullptr;
+        VL_RESTORER(m_regionDepth);
+        ++m_regionDepth;
         AstNode* const outerp = m_stmtsp;
         m_stmtsp = nullptr;
         for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
