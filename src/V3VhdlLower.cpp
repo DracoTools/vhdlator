@@ -1435,7 +1435,38 @@ private:
     // An index into a STRING, brought back to where Verilator counts from.
     // Verilator's string counts up from zero whichever way the subtype runs,
     // so a descending one counts back from its left bound.
+    // Whether an array's bounds do not fit the 32 bits a range is emitted
+    // in -- "array_t(-9223372036854775807 to -9223372036854775800)" of a
+    // 64-bit index type. Such an array is emitted counting from zero up from
+    // its low bound, and indexed relative to that.
+    static bool wideIndexRange(const VhdlType* typep, int64_t* lowp = nullptr) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!typep->isConstrainedArray() || typep->indexTypes().empty()) return false;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        if (!idxp || !idxp->bounded()) return false;
+        const int64_t lo = std::min(idxp->left(), idxp->right());
+        const int64_t hi = std::max(idxp->left(), idxp->right());
+        if (lo >= INT32_MIN && hi <= INT32_MAX) return false;
+        if (lowp) *lowp = idxp->ascending() || idxp->length() > 0 ? lo : idxp->left();
+        return true;
+    }
+
     static AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
+        int64_t wideLow = 0;
+        if (!stringBehind(typep) && wideIndexRange(typep, &wideLow)) {
+            // Worked out at 64 bits, then an INTEGER's width for the select
+            FileLine* const wflp = new FileLine{flp};
+            wflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+            wflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+            AstNodeExpr* const widep
+                = new AstCast{wflp, indexp, VFlagChildDType{},
+                              new AstBasicDType{wflp, VBasicDTypeKwd::LONGINT, VSigning::SIGNED}};
+            AstConst* const lowp
+                = new AstConst{wflp, AstConst::Unsized64{}, static_cast<uint64_t>(wideLow)};
+            // Two's complement: the difference is the same signed or not
+            return new AstCast{wflp, new AstSub{wflp, widep, lowp}, VFlagChildDType{},
+                               new AstBasicDType{wflp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED}};
+        }
         typep = stringBehind(typep);
         if (!typep) return indexp;
         // The index may be of a narrow type -- an array of CHARACTER may be
@@ -1576,8 +1607,15 @@ private:
                 // the width emitted here.
                 const int64_t left = idxp->left();
                 const int64_t right = idxp->length() <= 0 ? left : idxp->right();
-                rangep = new AstRange{flp, static_cast<int>(left),
-                                      static_cast<int>(right)};
+                if (wideIndexRange(typep)) {
+                    // Bounds no int holds: counted from zero, the low bound
+                    // first, which is how stringIndex indexes it
+                    const int last = static_cast<int>(std::max<int64_t>(idxp->length(), 1) - 1);
+                    rangep = idxp->ascending() ? new AstRange{flp, 0, last}
+                                               : new AstRange{flp, last, 0};
+                } else {
+                    rangep = new AstRange{flp, static_cast<int>(left), static_cast<int>(right)};
+                }
             }
             // A vector of single bits is what Verilog writes as "logic
             // [7:0]", which is a type with a range rather than an array of
