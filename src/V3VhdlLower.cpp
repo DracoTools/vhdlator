@@ -13444,6 +13444,27 @@ private:
                 VL_DO_DANGLING(drvp->deleteTree(), drvp);
             }
         }
+        // Two arrays of no elements are equal, whatever the one element each
+        // is held in here holds (9.2.3): a slice "x(3 to 0)" a call returns
+        // against "(1 to 0 => (1, 1))"
+        if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
+            && (!symp || symp->predefined())) {
+            const auto isNull = [&](AstNodeVhdlExpr* exprp, VhdlType* typep) {
+                VhdlType* tp = typep;
+                if ((!tp || !tp->isConstrainedArray()) && VN_IS(exprp, VhdlCall)) {
+                    if (VhdlType* const emp = emittedArrayType(exprp)) tp = emp;
+                }
+                if (!tp || tp->base()->kind() != VhdlTypeKind::ARRAY || !tp->isConstrainedArray()
+                    || tp->dimensions() != 1) {
+                    return false;
+                }
+                const VhdlType* const idxp = indexSubtype(tp, 0);
+                return idxp && idxp->bounded() && idxp->length() == 0;
+            };
+            if (isNull(nodep->lhsp(), ltypep) && isNull(nodep->rhsp(), rtypep)) {
+                return new AstConst{flp, AstConst::BitTrue{}, nodep->op() == VhdlBinaryOp::EQ};
+            }
+        }
         // Two arrays are equal only where each dimension of one is as long
         // as that of the other (9.2.3). Of one dimension that is asked while
         // running or is two vectors of different widths; of more than one,
@@ -14518,6 +14539,26 @@ private:
                         nflp->warnOff(V3ErrorCode::SELRANGE, true);
                         nflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
                         nflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        // Elements that do not pack are an unpacked array,
+                        // which the back end will not slice backwards at all.
+                        // An object of no elements is held as one of a
+                        // single element, so that is what the slice gives:
+                        // the object's first, a value no one reads
+                        const VhdlType* const ownElemp
+                            = ownerTypep ? ownerTypep->base()->elementp() : nullptr;
+                        const VhdlType* const ownIdxp
+                            = ownerTypep && ownerTypep->isConstrainedArray()
+                                  ? indexSubtype(ownerTypep, 0)
+                                  : nullptr;
+                        if (ownElemp && !elementPacks(ownElemp) && ownIdxp && ownIdxp->bounded()
+                            && !stringBehind(prefixTypep)) {
+                            const int32_t first = static_cast<int32_t>(ownIdxp->left());
+                            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                            return new AstSelExtract{
+                                nflp, fromp, new AstConst{nflp, AstConst::Signed32{}, first},
+                                new AstConst{nflp, AstConst::Signed32{}, first}};
+                        }
                         return new AstSelExtract{nflp, fromp, leftp, rightp};
                     }
                 }
@@ -23760,13 +23801,23 @@ private:
                 VL_DO_DANGLING(srcp->deleteTree(), srcp);
                 return outp;
             }
+            // A name of no elements -- a null array -- takes nothing of the
+            // value and is given nothing (10.6.2.1)
+            if (span == 0) continue;
             AstNodeExpr* fromp = nullptr;
             const int64_t last = index + (span - 1) * step;
             AstNodeExpr* const firstIdxp
                 = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(index)};
             AstNodeExpr* const lastIdxp
                 = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(last)};
-            if (span == 1 && !VN_IS(assocs[i]->valuep(), VhdlAggregate)) {
+            // One element, unless the name is itself an array of the
+            // value's type that happens to be one long
+            const VhdlType* const nameTypep = assocs[i]->valuep()->vhdlTypep();
+            const bool runOfOne
+                = nameTypep && typep && nameTypep->base() == typep->base() && !isString;
+            const bool oneElement
+                = span == 1 && !VN_IS(assocs[i]->valuep(), VhdlAggregate) && !runOfOne;
+            if (oneElement) {
                 VL_DO_DANGLING(lastIdxp->deleteTree(), lastIdxp);
                 fromp = new AstSelBit{flp, srcp->cloneTree(false),
                                       stringIndex(typep, firstIdxp, flp)};
@@ -23784,7 +23835,7 @@ private:
             // A name that stands for one element takes the element's type; a
             // name that stands for a run of them takes the array's own
             outp = AstNode::addNextNull(outp, oneTarget(assocs[i]->valuep(), fromp,
-                                                        span == 1 ? elemp : typep, signalAssign,
+                                                        oneElement ? elemp : typep, signalAssign,
                                                         sequential, flp, delayp));
         }
         VL_DO_DANGLING(srcp->deleteTree(), srcp);
