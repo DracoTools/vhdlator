@@ -22824,12 +22824,32 @@ private:
                 // A range that names a generic is fixed once the instance is
                 // elaborated: the bounds go to the back end as expressions
                 bool dirKnown = true;
-                if (!dynamicBounds(rangep, 0, flp, fromp, limitp, ascending, &dirKnown)
-                    || !dirKnown) {
+                if (!dynamicBounds(rangep, 0, flp, fromp, limitp, ascending, &dirKnown)) {
                     if (fromp) VL_DO_DANGLING(fromp->deleteTree(), fromp);
                     if (limitp) VL_DO_DANGLING(limitp->deleteTree(), limitp);
                     fromp = nullptr;
                     limitp = nullptr;
+                } else if (!dirKnown) {
+                    // Which way it runs only the instance knows -- "for n in
+                    // i'range" over an open port -- but a generate makes the
+                    // same blocks in any order (11.8), so it goes from the
+                    // low end to the high end, which is no iterations at all
+                    // for a null range either way round
+                    AstNodeExpr* const ascp = boundsAscendingExpr(rangep, flp);
+                    if (ascp) {
+                        AstNodeExpr* const lowp = new AstCond{flp, ascp, fromp->cloneTree(false),
+                                                              limitp->cloneTree(false)};
+                        AstNodeExpr* const highp
+                            = new AstCond{flp, ascp->cloneTree(false), limitp, fromp};
+                        fromp = lowp;
+                        limitp = highp;
+                        ascending = true;
+                    } else {
+                        VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                        VL_DO_DANGLING(limitp->deleteTree(), limitp);
+                        fromp = nullptr;
+                        limitp = nullptr;
+                    }
                 }
             }
             if (!fromp && (!symp || !rangep || !rangep->bounded())) {
