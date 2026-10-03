@@ -2418,6 +2418,7 @@ std::map<const VhdlSymbol*, std::map<const VhdlSymbol*, VhdlValue>> V3VhdlEval::
 std::set<const VhdlSymbol*> V3VhdlEval::s_objWritten;
 std::map<const VhdlType*, int> V3VhdlEval::s_protObjects;
 std::set<const VhdlSymbol*> V3VhdlEval::s_elabFolded;
+std::map<const AstNode*, std::map<const VhdlSymbol*, int>> V3VhdlEval::s_archPortDrivers;
 
 VhdlValue V3VhdlEval::eval(AstNodeVhdlExpr* nodep, std::string* errp) {
     VhdlEvaluator evaluator{errp};

@@ -95,6 +95,72 @@ static bool callsImpure(AstNode* exprp) {
     return found;
 }
 
+// Whether running a subprogram can reach nothing outside it: no shared
+// variable, file, signal or port, no variable of a region around it, no
+// allocator, and only subprograms that are pure or reach nothing either.
+// An impure function like that gives every caller the same value, wherever
+// it is elaborated.
+static bool effectFree(const VhdlSymbol* subp, std::set<const VhdlSymbol*>& seen) {
+    if (subp->predefined()) return true;
+    const AstVhdlSubprogDecl* const bodyp = subp->bodyp();
+    if (!bodyp || subp->isForeign()) return false;
+    if (!seen.insert(subp).second) return true;
+    if (seen.size() > 64) return false;
+    const auto inside = [&](const AstNode* np) {
+        for (; np; np = np->backp()) {
+            if (np == bodyp) return true;
+        }
+        return false;
+    };
+    bool clean = true;
+    bodyp->foreach([&](const AstNode* np) {
+        if (!clean) return;
+        if (VN_IS(np, VhdlAllocator)) {
+            clean = false;
+            return;
+        }
+        const AstNodeVhdlExpr* const exprp = VN_CAST(np, NodeVhdlExpr);
+        const VhdlSymbol* const symp = exprp ? exprp->vhdlSymp() : nullptr;
+        if (!symp) return;
+        switch (symp->kind()) {
+        case VhdlSymKind::SHARED_VARIABLE:
+        case VhdlSymKind::FILE:
+        case VhdlSymKind::SIGNAL:
+        case VhdlSymKind::PORT: clean = false; break;
+        case VhdlSymKind::VARIABLE: clean = inside(symp->declp()); break;
+        case VhdlSymKind::FUNCTION:
+        case VhdlSymKind::PROCEDURE: {
+            if (symp->predefined()) break;
+            const AstVhdlSubprogDecl* declp = symp->bodyp();
+            if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+            if (symp->kind() == VhdlSymKind::FUNCTION && declp && declp->vhdlPure()) break;
+            clean = effectFree(symp, seen);
+            break;
+        }
+        default: break;
+        }
+    });
+    return clean;
+}
+
+// Whether every impure function an expression calls reaches nothing
+// outside itself (effectFree)
+static bool impureCallsEffectFree(AstNode* exprp) {
+    bool clean = true;
+    std::set<const VhdlSymbol*> seen;
+    exprp->foreach([&](const AstNodeVhdlExpr* np) {
+        const VhdlSymbol* const symp = np->vhdlSymp();
+        if (!clean || !symp || symp->kind() != VhdlSymKind::FUNCTION || symp->predefined()) {
+            return;
+        }
+        const AstVhdlSubprogDecl* declp = symp->bodyp();
+        if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+        if (declp && declp->vhdlPure()) return;
+        clean = effectFree(symp, seen);
+    });
+    return clean;
+}
+
 static const AstNode* parentOf(const AstNode* nodep) {
     while (nodep->backp() && nodep->backp()->nextp() == nodep) nodep = nodep->backp();
     return nodep->backp();
@@ -2796,6 +2862,16 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
                     val = elab;
                     V3VhdlEval::s_elabFolded.insert(symp);
                 }
+            }
+            // An architecture's constant given what an impure function returns
+            // that reaches nothing outside itself has the value running it
+            // gives, which is the same in every instance (driver19's
+            // "constant limit : integer := get_limit", ranging a generate)
+            if (!val.known() && nodep->defaultp() && VN_IS(parentOf(nodep), VhdlArchitecture)
+                && !m_inSpecialized && symp->typep() && symp->typep()->isScalar()
+                && callsImpure(nodep->defaultp()) && impureCallsEffectFree(nodep->defaultp())) {
+                const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
+                if (elab.known() && !elab.isComposite()) val = elab;
             }
             if (val.isComposite()) {
                 symp->elabValue(val);
@@ -7576,6 +7652,12 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             m_needResolve.push_back(NeedResolve{symp, resolvep, pair.second, where[symp]});
         }
     }
+    // A port is its entity's, which every architecture of it shares, so how
+    // many drivers it has is kept for each architecture apart
+    for (const auto& pair : counts) {
+        if (pair.first->kind() != VhdlSymKind::PORT) continue;
+        V3VhdlEval::s_archPortDrivers[archp][pair.first] = pair.first->driverCount();
+    }
 }
 
 // Give each resolution function the copy that takes as many values as the
@@ -7691,6 +7773,13 @@ void VhdlSemVisitor::specializeResolvers() {
             }
             if (VhdlSymbol* const nullp = copyFor(0)) need.symp->resolverNullp(nullp);
         }
+    }
+    // A port is counted for each architecture of its entity, and each count
+    // wants its own copy, so the one for every count is kept by count
+    for (const NeedResolve& need : m_needResolve) {
+        if (need.symp->kind() != VhdlSymKind::PORT) continue;
+        const auto it = made.find(std::make_pair(need.resolvep, need.count));
+        if (it != made.end()) need.symp->resolverForCount(need.count, it->second);
     }
 }
 

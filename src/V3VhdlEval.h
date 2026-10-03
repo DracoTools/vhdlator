@@ -84,6 +84,8 @@ public:
     // Constants elaboration gave a value by running an impure function
     // this way, whatever their type: the value is the constant's
     static std::set<const VhdlSymbol*> s_elabFolded;
+    // How many drivers each architecture gives the ports of its entity
+    static std::map<const AstNode*, std::map<const VhdlSymbol*, int>> s_archPortDrivers;
 
     // Whether the back end can fold an expression to a value, which it does
     // by running what it names. Being static is not the same question: a

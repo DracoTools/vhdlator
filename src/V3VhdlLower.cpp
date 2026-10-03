@@ -6935,6 +6935,17 @@ private:
         }
         addStmt(new AstPort{flp, ++pinNum, varp->name()});
         addStmt(varp);
+        // The driving value of an output whose subtype names a resolution
+        // function of the design's own is what the function makes of the
+        // drivers the architecture gives it (14.7.3.2), and that is what the
+        // port reads inside and hands out as one source of the actual
+        if ((nodep->mode() == VhdlMode::OUT || nodep->mode() == VhdlMode::BUFFER)
+            && symp->resolverp() && symp->driverCount() > 1 && !isLogicish(symp->typep())) {
+            if (VhdlSymbol* const ownp = symp->resolverForCount(symp->driverCount())) {
+                symp->resolverp(ownp);
+            }
+            makeResolvedByFunction(symp, varp, flp);
+        }
         // An input the instance leaves open holds its default for as long
         // as the design runs, since nothing assigns an input. Where the
         // default is written with a metavalue that value is not one this
@@ -32606,6 +32617,21 @@ private:
             lowerInterface(VN_AS(p, VhdlIfaceDecl), true, pinNum);
         }
         pinNum = 0;
+        // How many drivers a port has is this architecture's to say: the
+        // entity's other architectures may drive it differently
+        if (archp) {
+            const auto archIt = V3VhdlEval::s_archPortDrivers.find(archp);
+            for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
+                VhdlSymbol* const symp = VN_AS(p, VhdlIfaceDecl)->vhdlSymp();
+                if (!symp) continue;
+                int count = 0;
+                if (archIt != V3VhdlEval::s_archPortDrivers.end()) {
+                    const auto it = archIt->second.find(symp);
+                    if (it != archIt->second.end()) count = it->second;
+                }
+                symp->driverCount(count);
+            }
+        }
         for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
             lowerInterface(VN_AS(p, VhdlIfaceDecl), false, pinNum);
         }
