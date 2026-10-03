@@ -9970,10 +9970,13 @@ private:
         }
         if (attr == "driving") {
             // A guarded signal's driver stops driving when it is handed a
-            // null transaction, and that disconnection is not modelled here.
-            // Saying "driving" for one of those would be a wrong answer
-            // where saying nothing is only a missing one.
-            if (guardedSignal(rsymp)) return nullptr;
+            // null transaction (10.5.2.2), which is what its connection says.
+            // One without that flag would be a wrong answer where saying
+            // nothing is only a missing one.
+            if (guardedSignal(rsymp)) {
+                if (!drvp || !drvp->connp) return nullptr;
+                return new AstVarRef{flp, drvp->connp, VAccess::READ};
+            }
             if (drvp && drvp->enp) return new AstVarRef{flp, drvp->enp, VAccess::READ};
             return new AstConst{flp, AstConst::BitTrue{}};
         }
@@ -19872,8 +19875,16 @@ private:
                                new AstIf{flp, new AstVarRef{flp, drivers[i].connp, VAccess::READ},
                                          AstNode::addNext(onep, bumpp)}));
             }
-            // One call per number of connected drivers, chosen by that number
+            // One call per number of connected drivers, chosen by that number.
+            // A register whose drivers are all off keeps the value it had,
+            // and its function is not called at all (14.7.3.2)
+            const AstVhdlObjectDecl* const odeclp = VN_CAST(symp->declp(), VhdlObjectDecl);
+            const AstVhdlIfaceDecl* const ideclp = VN_CAST(symp->declp(), VhdlIfaceDecl);
+            const bool registerKind
+                = (odeclp && odeclp->signalKind() == VhdlSignalKind::REGISTER)
+                  || (ideclp && ideclp->signalKind() == VhdlSignalKind::REGISTER);
             AstNode* chainp = nullptr;
+            bool built = false;
             for (int k = 0; k <= count; ++k) {
                 VhdlSymbol* const ksymp
                     = k == count ? symp->resolverp() : symp->resolverForCount(k);
@@ -19888,8 +19899,10 @@ private:
                 if (!kftaskp) {
                     if (chainp) VL_DO_DANGLING(chainp->deleteTree(), chainp);
                     chainp = nullptr;
+                    built = false;
                     break;
                 }
+                built = true;
                 // The array of exactly that length, filled from the front of
                 // the packed one
                 AstNode* stmtsp = nullptr;
@@ -19918,7 +19931,11 @@ private:
                     stmtsp, static_cast<AstNode*>(new AstAssign{
                                 flp, new AstVarRef{flp, netp, VAccess::WRITE}, kcallp}));
                 if (k == 0) {
-                    chainp = stmtsp;
+                    if (registerKind) {
+                        VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                    } else {
+                        chainp = stmtsp;
+                    }
                 } else {
                     FileLine* const kflp = new FileLine{flp};
                     kflp->warnOff(V3ErrorCode::LATCH, true);
@@ -19928,9 +19945,9 @@ private:
                                        stmtsp, chainp};
                 }
             }
-            if (chainp) {
+            if (built) {
                 VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
-                bodyp = AstNode::addNext(packp, chainp);
+                bodyp = AstNode::addNextNull(packp, chainp);
             } else {
                 VL_DO_DANGLING(packp->deleteTree(), packp);
             }
