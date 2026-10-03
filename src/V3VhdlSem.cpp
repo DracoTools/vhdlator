@@ -3203,6 +3203,21 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         } else {
             lookup(parts.back(), found);
         }
+        // "alias inc is pt.increment []": the prefix is an object of a
+        // protected type, so the name is one of that type's methods, and the
+        // call the alias stands for runs on that object (5.6.2)
+        AstVhdlSelected* const methSelp = VN_CAST(nodep->targetp(), VhdlSelected);
+        if (methSelp) {
+            VhdlScope* methScopep = nullptr;
+            if (VhdlSymbol* const objp = protectedObject(methSelp->prefixp(), methScopep)) {
+                if (AstVhdlName* const objNamep = VN_CAST(methSelp->prefixp(), VhdlName)) {
+                    objNamep->vhdlSymp(objp);
+                    objNamep->vhdlTypep(objp->typep());
+                }
+                found.clear();
+                methScopep->lookupLocal(parts.back(), found);
+            }
+        }
         // "alias r is p[real, real]": a signature says which of an overloaded
         // name's declarations the alias denotes (4.5.3, 6.6.2)
         if (nodep->signaturep() && !found.empty()) {
@@ -3248,6 +3263,7 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         // so only an unambiguous target is worth recording here
         if (found.size() == 1) {
             symp->aliasp(found[0]);
+            if (methSelp && !methSelp->vhdlSymp()) methSelp->vhdlSymp(found[0]);
             if (!symp->typep() && found[0]->typep()) symp->typep(found[0]->typep());
             // An alias of a package is another name for its region, so
             // "renamed.thing" reaches what the package declares (6.6.3)

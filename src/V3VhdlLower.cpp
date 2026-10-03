@@ -1236,6 +1236,15 @@ private:
 
     // The object a method is called on, which the analyzer left on the prefix
     // of the selected name (5.6.2). Null if this is not such a call.
+    // The selected name an alias of a protected type's method stands for --
+    // "alias inc is pt.increment []" -- which says the object it runs on
+    static AstVhdlSelected* methodAliasTarget(const AstNodeVhdlExpr* namep) {
+        const VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return nullptr;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        return declp ? VN_CAST(declp->targetp(), VhdlSelected) : nullptr;
+    }
+
     AstNodeExpr* protectedInstance(AstNodeVhdlExpr* objNamep,
                                    const VhdlType** typepp = nullptr) {
         if (!objNamep) return nullptr;
@@ -10352,6 +10361,25 @@ private:
         // downto 0) is v(7 downto 4)" -- would need its indices translated,
         // which is not done here.
         if (symp->kind() == VhdlSymKind::ALIAS) {
+            // A method of a protected type named through an alias with no
+            // parentheses -- "get" for "alias get is pt.get [return natural]"
+            // -- is a call on the object the alias names (4.3.3.2, 5.6.2)
+            {
+                const AstVhdlAliasDecl* const adeclp = VN_CAST(symp->declp(), VhdlAliasDecl);
+                AstVhdlSelected* const selp
+                    = adeclp ? VN_CAST(adeclp->targetp(), VhdlSelected) : nullptr;
+                VhdlSymbol* funcp = symp->aliasp() ? symp->aliasp() : nullptr;
+                if (!funcp && selp) funcp = selp->vhdlSymp();
+                if (!funcp) funcp = symp->resolved();
+                if (selp && funcp && funcp->kind() == VhdlSymKind::FUNCTION) {
+                    const VhdlType* protTypep = nullptr;
+                    if (AstNodeExpr* const instp
+                        = protectedInstance(selp->prefixp(), &protTypep)) {
+                        return new AstMethodCall{flp, instp, methodName(funcp, protTypep),
+                                                 nullptr};
+                    }
+                }
+            }
             // One that renumbers a value carried with its bounds has a
             // carrier of its own (aliasCarrier)
             const auto ait = m_aliasCarriers.find(std::make_pair(m_ftaskp, symp));
@@ -15629,7 +15657,9 @@ private:
         }
         if (AstNodeExpr* const outp = lowerIntrinsic(symp, args, nodep, flp)) return outp;
         // A function of a protected type runs on the object it is called on
-        if (AstVhdlSelected* const selp = VN_CAST(nodep->prefixp(), VhdlSelected)) {
+        AstVhdlSelected* funcSelp = VN_CAST(nodep->prefixp(), VhdlSelected);
+        if (!funcSelp) funcSelp = methodAliasTarget(nodep->prefixp());
+        if (AstVhdlSelected* const selp = funcSelp) {
             const VhdlType* protTypep = nullptr;
             if (AstNodeExpr* const instp = protectedInstance(selp->prefixp(), &protTypep)) {
                 AstMethodCall* const callp
@@ -25716,8 +25746,9 @@ private:
         }
         // A procedure of a protected type runs on the object it is called on
         if (symp) {
-            AstVhdlSelected* const selp
-                = VN_CAST(callp ? callp->prefixp() : nodep->callp(), VhdlSelected);
+            AstNodeVhdlExpr* const calleep = callp ? callp->prefixp() : nodep->callp();
+            AstVhdlSelected* selp = VN_CAST(calleep, VhdlSelected);
+            if (!selp) selp = methodAliasTarget(calleep);
             const VhdlType* protTypep = nullptr;
             if (AstNodeExpr* const instp
                 = selp ? protectedInstance(selp->prefixp(), &protTypep) : nullptr) {
