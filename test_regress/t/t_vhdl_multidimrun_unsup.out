@@ -1,5 +1,6 @@
-%Error: t/t_vhdl_multidimrun_unsup.vhd:20:18: Unsupported: VHDL variable 'z' of 2 dimensions whose bounds only running decides cannot be lowered yet
+%Error: t/t_vhdl_multidimrun_unsup.vhd:21:18: Unsupported: VHDL variable 'z' of 2 dimensions whose bounds only running decides cannot be lowered yet
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_multidimrun_unsup.vhd:27:9: Unsupported: VHDL whole of an array of several dimensions whose bounds only running decides cannot be lowered yet
-%Error: t/t_vhdl_multidimrun_unsup.vhd:27:14: Unsupported: VHDL whole of an array of several dimensions whose bounds only running decides cannot be lowered yet
+%Error: t/t_vhdl_multidimrun_unsup.vhd:21:47: Unsupported: VHDL aggregate of this type cannot be lowered yet
+%Error: t/t_vhdl_multidimrun_unsup.vhd:28:9: Unsupported: VHDL whole of an array of several dimensions whose bounds only running decides cannot be lowered yet
+%Error: t/t_vhdl_multidimrun_unsup.vhd:28:14: Unsupported: VHDL whole of an array of several dimensions whose bounds only running decides cannot be lowered yet
 %Error: Exiting due to

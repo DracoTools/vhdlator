@@ -7191,9 +7191,26 @@ private:
         VhdlType* const typep = symp->typep();
         VhdlType* const basep = typep->base();
         VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
-        if (objp->kind() != VhdlObjKind::VARIABLE || objp->defaultp() || m_protClassp || !elemp
+        if (objp->kind() != VhdlObjKind::VARIABLE || m_protClassp || !elemp
             || typep->indexTypes().size() != basep->indexTypes().size()) {
             return false;
+        }
+        // An initial value that gives every element one value --
+        // "(others => (others => 0))" -- is that value in every place; any
+        // other would need its elements placed one by one
+        AstNodeVhdlExpr* fillValuep = nullptr;
+        if (objp->defaultp()) {
+            fillValuep = objp->defaultp();
+            for (size_t d = 0; d < typep->indexTypes().size() && fillValuep; ++d) {
+                AstVhdlAggregate* const aggp = VN_CAST(fillValuep, VhdlAggregate);
+                AstVhdlElemAssoc* const assocp = aggp ? aggp->elemsp() : nullptr;
+                if (!assocp || assocp->nextp() || !assocp->choicesp()
+                    || assocp->choicesp()->nextp() || !assocp->choicesp()->isOthers()) {
+                    return false;
+                }
+                fillValuep = assocp->valuep();
+            }
+            if (!fillValuep) return false;
         }
         switch (elemp->base()->kind()) {
         case VhdlTypeKind::ENUM:
@@ -7259,7 +7276,33 @@ private:
         setupp = AstNode::addNext(
             setupp, static_cast<AstNode*>(new AstAssign{flp, dynPart(vw(), "q", flp),
                                                         new AstNewDynamic{flp, totalp, nullptr}}));
-        if (AstNode* const fillp = dynDefaultFill(vw(), typep, flp)) {
+        if (fillValuep) {
+            // The value is worked out once, before it is put everywhere
+            AstNodeExpr* const valuep = lowerExpr(fillValuep);
+            if (!valuep) {
+                VL_DO_DANGLING(setupp->deleteTree(), setupp);
+                return true;
+            }
+            AstVar* const valVarp = newTempVar("__Vfill", lowerType(elemp, flp), flp);
+            local(valVarp);
+            AstVar* const kVarp = newTempVar("__Vfillk", newIntDType(flp), flp);
+            local(kVarp);
+            kVarp->usedLoopIdx(true);
+            const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+            setupp = AstNode::addNext(
+                setupp, static_cast<AstNode*>(new AstAssign{flp, wr(valVarp, flp), valuep}));
+            setupp = AstNode::addNext(
+                setupp, static_cast<AstNode*>(new AstAssign{flp, wr(kVarp, flp), num(0)}));
+            AstLoop* const loopp = new AstLoop{flp};
+            loopp->addStmtsp(new AstLoopTest{
+                flp, loopp,
+                new AstLtS{flp, k(),
+                           dynCarrierLength(new AstVarRef{flp, varp, VAccess::READ}, flp)}});
+            loopp->addStmtsp(new AstAssign{flp, new AstSelBit{flp, dynPart(vw(), "q", flp), k()},
+                                           rd(valVarp, flp)});
+            loopp->addContsp(new AstAssign{flp, wr(kVarp, flp), new AstAdd{flp, k(), num(1)}});
+            setupp = AstNode::addNext(setupp, static_cast<AstNode*>(loopp));
+        } else if (AstNode* const fillp = dynDefaultFill(vw(), typep, flp)) {
             setupp = AstNode::addNext(setupp, fillp);
         }
         addStmt(m_ftaskp ? setupp : new AstInitial{flp, setupp});

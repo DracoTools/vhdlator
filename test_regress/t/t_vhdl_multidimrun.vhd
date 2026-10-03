@@ -3,7 +3,7 @@
 --
 -- A function's local array of three dimensions sized by its parameters
 -- (NVC func10), one of two dimensions with a descending dimension, and a
--- process variable sized by a variable's value through a subprogram: each
+-- procedure's local, one given a value for every element: each
 -- element read and written by its indices, and each dimension's attributes
 -- and range read with the dimension number (16.2.3).
 --
@@ -20,7 +20,12 @@ architecture test of t_vhdl_multidimrun is
 
     function middle (x, y, z : integer) return integer is
         variable r : int3d(1 to x, 1 to y, 1 to z);
+        -- One value for every element, worked out once
+        variable u : int3d(1 to x, 1 to y, 1 to z) := (others => (others => (others => x + y)));
     begin
+        assert u(1, 1, 1) = 9 and u(x, y, z) = 9 severity failure;
+        u(2, 3, 4) := 0;
+        assert u(2, 3, 4) = 0 and u(2, 3, 5) = 9 severity failure;
         for i in 1 to x loop
             for j in 1 to y loop
                 for k in 1 to z loop
