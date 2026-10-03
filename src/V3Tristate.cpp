@@ -2681,6 +2681,29 @@ public:
         // Combine interface tristate contributions after all modules processed
         combineIfaceContribs();
 
+        // What was made beside a package's variable -- its enable -- is named
+        // from other modules as the variable itself is, through the package.
+        // Found a module at a time: asking each reference which module it is
+        // in walks back over every node before it.
+        std::unordered_map<const AstVar*, AstNodeModule*> pkgVars;
+        for (AstNode* modp = netlistp->modulesp(); modp; modp = modp->nextp()) {
+            AstPackage* const pkgp = VN_CAST(modp, Package);
+            if (!pkgp) continue;
+            for (AstNode* stmtp = pkgp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                if (const AstVar* const varp = VN_CAST(stmtp, Var)) pkgVars.emplace(varp, pkgp);
+            }
+        }
+        if (!pkgVars.empty()) {
+            for (AstNode* modp = netlistp->modulesp(); modp; modp = modp->nextp()) {
+                if (VN_IS(modp, Package)) continue;
+                modp->foreach([&](AstVarRef* refp) {
+                    if (refp->classOrPackagep()) return;
+                    const auto it = pkgVars.find(refp->varp());
+                    if (it != pkgVars.end()) refp->classOrPackagep(it->second);
+                });
+            }
+        }
+
 #ifdef VL_LEAK_CHECKS
         // It's a bit chaotic up there
         std::vector<AstNode*> unusedRootps;
