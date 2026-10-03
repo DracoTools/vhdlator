@@ -8153,6 +8153,26 @@ private:
                         return nullptr;
                     }
                 }
+                // What an access value points at, read once and kept in an
+                // object of its carrier type: "p.all'low"
+                const AstVhdlSelected* const allp = VN_CAST(nodep->prefixp(), VhdlSelected);
+                if ((attr == "high" || attr == "low") && !repeatable(carrp) && allp
+                    && allp->isAll() && isAccessAll(allp)) {
+                    VhdlType* const ctypep = accessCarrierType(allp->prefixp());
+                    AstNodeDType* const carrDTypep = ctypep && carriedDynamically(ctypep)
+                                                         ? dynCarrierRef(ctypep, flp)
+                                                         : nullptr;
+                    if (carrDTypep) {
+                        AstVar* const tmpp = newTempVar("__Vdynacc", carrDTypep, flp);
+                        AstNode* const setp
+                            = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, carrp};
+                        AstNodeExpr* const attrp
+                            = dynCarrierAttr(new AstVarRef{flp, tmpp, VAccess::READ}, attr, flp);
+                        if (attrp) return new AstExprStmt{flp, setp, attrp};
+                        VL_DO_DANGLING(setp->deleteTree(), setp);
+                        return nullptr;
+                    }
+                }
                 if ((attr == "high" || attr == "low") && !repeatable(carrp)) {
                     VL_DO_DANGLING(carrp->deleteTree(), carrp);
                     unsup(flp, "'" + attr + " of a value whose length only running decides");
@@ -25325,6 +25345,37 @@ private:
             }
             VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
             return nullptr;
+        }
+        // A positional aggregate gives its values in order, so the one at
+        // the offset is the offset's own (9.3.3.2)
+        if (const AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate)) {
+            std::vector<AstNodeVhdlExpr*> values;
+            bool positional = true;
+            for (const AstNode* p = aggp->elemsp(); p; p = p->nextp()) {
+                const AstVhdlElemAssoc* const eap = VN_CAST(p, VhdlElemAssoc);
+                if (!eap || eap->choicesp() || !eap->valuep()) {
+                    positional = false;
+                    break;
+                }
+                values.push_back(eap->valuep());
+            }
+            if (positional && !values.empty() && repeatable(offsetp)) {
+                AstNodeExpr* outp = lowerExpr(values.back());
+                for (size_t i = values.size() - 1; outp && i-- > 0;) {
+                    AstNodeExpr* const onep = lowerExpr(values[i]);
+                    if (!onep) {
+                        VL_DO_DANGLING(outp->deleteTree(), outp);
+                        outp = nullptr;
+                        break;
+                    }
+                    AstNodeExpr* const atp = new AstEq{
+                        flp, offsetp->cloneTree(false),
+                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(i)}};
+                    outp = new AstCond{flp, atp, onep, outp};
+                }
+                VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                return outp;
+            }
         }
         const DynAccess* dynp = nullptr;
         AstVhdlRange* rangep = nullptr;
