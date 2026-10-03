@@ -21854,6 +21854,18 @@ private:
                         m_bindExprs[pair.first] = pair.second;
                     }
                 }
+                // A signal given to a generic is read as the design is
+                // elaborated, before anything has run, so the generic is the
+                // signal's initial value (6.5.6.2, 14.4.2.5)
+                if (const AstVhdlName* const anamep = VN_CAST(asp->actualp(), VhdlName)) {
+                    const VhdlSymbol* const asymp
+                        = anamep->vhdlSymp() ? anamep->vhdlSymp()->resolved() : nullptr;
+                    const AstVhdlObjectDecl* const sdeclp
+                        = asymp && asymp->kind() == VhdlSymKind::SIGNAL
+                              ? VN_CAST(asymp->declp(), VhdlObjectDecl)
+                              : nullptr;
+                    if (sdeclp && sdeclp->defaultp()) m_bindExprs[asymp] = sdeclp->defaultp();
+                }
                 pinp = lowerAssoc(asp, ++pinNum);
             }
             if (!pinp) continue;
