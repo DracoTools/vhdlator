@@ -17965,21 +17965,63 @@ private:
             if (!oneBit) return nullptr;
         }
         std::vector<std::pair<int64_t, AstNodeVhdlExpr*>> named;
+        // Positional elements before the "others" -- "('1', others => '0')"
+        // -- take the places from the left (9.3.3.2), counted from the top
+        // whichever way the range runs. In VHDL-2008 one may be a value of
+        // the aggregate's own type, and then takes as many places as it is
+        // long (9.3.3.3).
+        std::vector<std::pair<AstNodeVhdlExpr*, int64_t>> positional;
         AstNodeVhdlExpr* othersp = nullptr;
         for (AstVhdlElemAssoc* eap = nodep->elemsp(); eap;
              eap = VN_AS(eap->nextp(), VhdlElemAssoc)) {
             AstVhdlChoice* const chp = eap->choicesp();
-            if (!chp || chp->nextp() || othersp) return nullptr;
+            if (othersp) return nullptr;
+            if (!chp) {
+                int64_t span = elementSpan(eap->valuep(), typep);
+                // A string literal of the array's type is as long as it is
+                // written, whatever subtype it was given (9.3.2)
+                const AstVhdlLiteral* const litp = VN_CAST(eap->valuep(), VhdlLiteral);
+                if (span < 1 && litp && litp->kind() == VhdlLitKind::STRING
+                    && eap->valuep()->vhdlTypep()
+                    && eap->valuep()->vhdlTypep()->base() == typep->base()) {
+                    span = static_cast<int64_t>(litp->text().size());
+                }
+                // A slice "c(w - 1 downto w - 3)" whose ends name a generic
+                // but are always the same distance apart
+                const VhdlType* const vtypep = eap->valuep()->vhdlTypep();
+                const VhdlType* const vidxp = span < 1 && vtypep && vtypep->base() == typep->base()
+                                                  ? indexSubtype(vtypep, 0)
+                                                  : nullptr;
+                const AstVhdlRange* const vrp
+                    = vidxp ? VN_CAST(vidxp->boundsp(), VhdlRange) : nullptr;
+                if (vrp && vrp->leftp() && vrp->rightp() && !vrp->dirUnknown()) {
+                    LinearForm dist;
+                    linearAdd(dist, vrp->leftp(), 1, 0, true);
+                    linearAdd(dist, vrp->rightp(), -1, 0, true);
+                    bool constant = dist.ok;
+                    for (const auto& term : dist.terms) {
+                        if (term.coeff != 0) constant = false;
+                    }
+                    if (constant) {
+                        span = (vrp->dir() == VhdlDir::TO ? -dist.konst : dist.konst) + 1;
+                    }
+                    dist.clear();
+                }
+                if (!named.empty() || span < 1) return nullptr;
+                positional.emplace_back(eap->valuep(), span);
+                continue;
+            }
+            if (chp->nextp()) return nullptr;
             if (chp->isOthers()) {
                 othersp = eap->valuep();
                 continue;
             }
-            if (chp->rangep() || !chp->valuep()) return nullptr;
+            if (!positional.empty() || chp->rangep() || !chp->valuep()) return nullptr;
             const VhdlValue at = V3VhdlEval::eval(chp->valuep());
             if (!at.isInt()) return nullptr;
             named.emplace_back(at.toInt(), eap->valuep());
         }
-        if (!othersp || named.empty()) return nullptr;
+        if (!othersp || (named.empty() && positional.empty())) return nullptr;
         const bool ascending = rangep->dir() == VhdlDir::TO;
         AstNodeExpr* const lenp = boundsLength(typep, flp);
         AstNodeExpr* const rightp = lenp ? lowerBound(rangep->rightp()) : nullptr;
@@ -17997,13 +18039,15 @@ private:
         rflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
         rflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
         AstNodeExpr* const placesp = declaredPlaces(lenp, rflp);
-        // One bit at the bottom of as many places as the object has
-        const auto atBottom = [&](AstNodeExpr* bitp) -> AstNodeExpr* {
+        // A value of "width" bits at the bottom of as many places as the
+        // object has
+        const auto atBottom = [&](AstNodeExpr* bitp, int64_t width = 1) -> AstNodeExpr* {
             return new AstConcat{
                 rflp,
                 new AstReplicate{rflp, new AstConst{rflp, AstConst::BitFalse{}},
                                  new AstSub{rflp, placesp->cloneTree(false),
-                                            new AstConst{rflp, AstConst::Signed32{}, 1}}},
+                                            new AstConst{rflp, AstConst::Signed32{},
+                                                         static_cast<int32_t>(width)}}},
                 bitp};
         };
         AstNodeExpr* outp = new AstReplicate{rflp, fillp, placesp->cloneTree(false)};
@@ -18024,6 +18068,27 @@ private:
             AstNodeExpr* const maskp = new AstShiftL{
                 rflp, atBottom(new AstConst{rflp, AstConst::BitTrue{}}), posp->cloneTree(false)};
             AstNodeExpr* const bitp = new AstShiftL{rflp, atBottom(valuep), posp};
+            outp = new AstOr{rflp, new AstAnd{rflp, outp, new AstNot{rflp, maskp}}, bitp};
+        }
+        int64_t taken = 0;
+        for (const auto& pair : positional) {
+            AstNodeExpr* const valuep = lowerExpr(pair.first);
+            if (!valuep) {
+                VL_DO_DANGLING(outp->deleteTree(), outp);
+                VL_DO_DANGLING(placesp->deleteTree(), placesp);
+                VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return nullptr;
+            }
+            const int64_t width = pair.second;
+            taken += width;
+            AstNodeExpr* const posp = new AstSub{
+                rflp, placesp->cloneTree(false),
+                new AstConst{rflp, AstConst::Signed32{}, static_cast<int32_t>(taken)}};
+            AstNodeExpr* const onesp = new AstReplicate{
+                rflp, new AstConst{rflp, AstConst::BitTrue{}}, static_cast<uint32_t>(width)};
+            AstNodeExpr* const maskp
+                = new AstShiftL{rflp, atBottom(onesp, width), posp->cloneTree(false)};
+            AstNodeExpr* const bitp = new AstShiftL{rflp, atBottom(valuep, width), posp};
             outp = new AstOr{rflp, new AstAnd{rflp, outp, new AstNot{rflp, maskp}}, bitp};
         }
         VL_DO_DANGLING(placesp->deleteTree(), placesp);
