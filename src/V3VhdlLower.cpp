@@ -6385,8 +6385,12 @@ private:
         // An element of a record whose length nothing settles is held in a
         // carrier of its own, and naming the element names that carrier
         if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
-            const VhdlType* const ptypep
-                = selp->prefixp() ? selp->prefixp()->vhdlTypep() : nullptr;
+            const VhdlType* ptypep = selp->prefixp() ? selp->prefixp()->vhdlTypep() : nullptr;
+            // Through an access value too: "p.data" names the element of
+            // the record p designates (8.3)
+            if (ptypep && ptypep->base()->kind() == VhdlTypeKind::ACCESS && !isLineType(ptypep)) {
+                ptypep = ptypep->base()->designatedp();
+            }
             if (ptypep && ptypep->base()->kind() == VhdlTypeKind::RECORD) {
                 return recordMayCarry(ptypep) && elementCarried(selp->vhdlTypep());
             }
@@ -11589,6 +11593,20 @@ private:
             AstNodeExpr* const outp = lowerDynAllocator(nodep, flp);
             AstNew* const dynNewp = VN_CAST(outp, New);
             return dynNewp ? allocatedValue(nodep, dynNewp, flp) : outp;
+        }
+        // A record whose element carries its own bounds is held with that
+        // element in a carrier, and neither a value nor a constraint is
+        // turned into that shape here yet
+        {
+            const VhdlType* const accp = nodep->vhdlTypep();
+            const VhdlType* const desigp = accp && accp->base()->kind() == VhdlTypeKind::ACCESS
+                                               ? accp->base()->designatedp()
+                                               : nullptr;
+            if (desigp && desigp->base()->kind() == VhdlTypeKind::RECORD
+                && recordCarriesElement(desigp->base())) {
+                unsup(flp, "allocator of a record whose element carries its own bounds");
+                return nullptr;
+            }
         }
         AstNew* const newp = new AstNew{flp};
         AstNodeExpr* valuep = nullptr;
