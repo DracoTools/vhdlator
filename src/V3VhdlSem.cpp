@@ -306,6 +306,7 @@ class VhdlSemVisitor final : public VNVisitor {
     bool m_archDecls = false;  // Analyzing an architecture's own declarations
     // Shared variables of a protected type that packages declare
     std::vector<const VhdlSymbol*> m_pkgProtObjects;
+    std::set<std::string> m_instantiatedUnits;  // Names the design's instances give
     std::vector<AstNodeVhdl*> m_pendingSubprogDecls;  // What that copy declares for them
     // Whether the generics being bound are a package instantiation's, which
     // is the only place a synthesized constant has declarations to live in
@@ -5104,6 +5105,16 @@ void VhdlSemVisitor::dumpScope(const VhdlScope* scopep, const std::string& inden
 
 void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     const bool dump = v3Global.opt.dumpLevel("vhdl-syms") != 0;
+    // What the design's instances name, so that with no top named an entity
+    // none of them instantiates is known for one of the design's tops
+    for (AstNodeVhdlUnit* const unitp : unitsp) {
+        unitp->foreach([this](AstVhdlInstance* instp) {
+            std::vector<std::string> parts;
+            if (instp->unitp() && flatten(instp->unitp(), parts) && !parts.empty()) {
+                m_instantiatedUnits.insert(lower(parts.back()));
+            }
+        });
+    }
     // A package instantiation needs the body as well as the declaration, and
     // may be written before either is analyzed, so find them all first
     for (AstNodeVhdlUnit* const unitp : unitsp) {
@@ -5217,8 +5228,14 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // protected objects may run there and what they change is
                 // what the design starts with
                 V3VhdlEval::s_elabObjects.clear();
-                if (m_archDecls && !parts.empty() && !v3Global.opt.topModule().empty()
-                    && lower(parts.back()) == lower(v3Global.opt.topModule())) {
+                // The top the command line names, or with none named, an
+                // entity that no instance of the design instantiates
+                const bool isRoot
+                    = !parts.empty()
+                      && (v3Global.opt.topModule().empty()
+                              ? !m_instantiatedUnits.count(lower(parts.back()))
+                              : lower(parts.back()) == lower(v3Global.opt.topModule()));
+                if (m_archDecls && isRoot) {
                     for (const VhdlSymbol* const objp : m_pkgProtObjects) {
                         V3VhdlEval::s_elabObjects.insert(objp);
                     }
