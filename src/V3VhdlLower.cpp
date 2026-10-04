@@ -19182,6 +19182,9 @@ private:
                            new AstVarRef{cflp, portIt->second.togglep, VAccess::READ}}});
     }
 
+    static bool isRecordTyped(const VhdlSymbol* symp) {
+        return symp->typep() && symp->typep()->base()->kind() == VhdlTypeKind::RECORD;
+    }
     void lowerBlockInterface(AstNode* formalsp, AstNode* mapp, bool isGeneric) {
         // The actual for each formal, by position or by name
         std::vector<AstVhdlAssoc*> assocs;
@@ -19299,7 +19302,8 @@ private:
                 addStmt(varp);
                 if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
                 // The same for a generic left to its default
-                if (isGeneric && varp->valuep() && valueFolds(varp->valuep())) {
+                if (isGeneric && varp->valuep() && valueFolds(varp->valuep())
+                    && !isRecordTyped(symp)) {
                     varp->varType(VVarType::LPARAM);
                 }
                 continue;
@@ -19347,7 +19351,13 @@ private:
                 // bound written in terms of it needs: "constant zero :
                 // bit_vector(0 to width - 1)" in the block (VESTS
                 // ch_16_fg_16_14)
-                if (valueFolds(valuep)) varp->varType(VVarType::LPARAM);
+                // A record's value is a pattern keyed by its elements' names,
+                // which a parameter's value would read as names of its own
+                // -- "r : c_r := (10, 3.4, '1')" with an element r is then
+                // circular -- so a record generic stays what it was
+                if (valueFolds(valuep) && !isRecordTyped(symp)) {
+                    varp->varType(VVarType::LPARAM);
+                }
                 continue;
             }
             // A conversion applied to a signal is still an association with
