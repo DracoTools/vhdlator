@@ -7009,9 +7009,14 @@ private:
             }
             later(new AstAssign{flp, vw(), srcp});
         }
-        // The array's own bounds, where its subtype writes them
-        const VhdlType* const idxp
-            = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
+        // The array's own bounds, where its subtype writes them. A subtype
+        // left open -- "constant c : arr_t := f(x)" -- writes none: its
+        // index list is the type's own index subtype, and the value keeps
+        // the bounds it came with (5.3.2.2)
+        const bool openIndex = typep->unconstrained() || typep->dimOpen(0);
+        const VhdlType* const idxp = typep->indexTypes().empty() || (openIndex && hasValue)
+                                         ? nullptr
+                                         : typep->indexTypes()[0];
         AstRange* const rangep = idxp ? anyBoundsRange(idxp, flp) : nullptr;
         if (rangep) {
             // Which way it runs is what the subtype says: a bound only
@@ -7641,7 +7646,15 @@ private:
                 addStmt(varp);
                 AstNode* setp = dynRecordInit(varp, symp->typep(), flp);
                 if (objp->defaultp()) {
-                    if (AstNodeExpr* const srcp = lowerExpr(objp->defaultp())) {
+                    // A record in the other shape -- what the copy of a
+                    // function made for this call returns, with the
+                    // element's length fixed -- as an assignment takes it
+                    AstNodeExpr* srcp = nullptr;
+                    if (VN_IS(objp->defaultp(), VhdlName) || VN_IS(objp->defaultp(), VhdlCall)) {
+                        srcp = recordAsShape(objp->defaultp(), symp->typep(), flp);
+                    }
+                    if (!srcp) srcp = lowerExpr(objp->defaultp());
+                    if (srcp) {
                         setp = AstNode::addNextNull(
                             setp, new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE},
                                                 srcp});
