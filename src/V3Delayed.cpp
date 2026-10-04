@@ -155,6 +155,7 @@ class DelayedVisitor final : public VNVisitor {
         bool m_inLoop = false;  // Used on LHS of NBA in a loop
         bool m_inSuspOrFork = false;  // Used on LHS of NBA in suspendable process or fork
         uint32_t m_nSites = 0;  // Number of NBAs in the source that assign it
+        uint32_t m_nWholeSites = 0;  // How many of those assign all of it
         Scheme m_scheme = Scheme::Undecided;  // Conversion scheme to use for this variable
         uint32_t m_nTmp = 0;  // Temporary number for unique names
 
@@ -424,9 +425,16 @@ class DelayedVisitor final : public VNVisitor {
             // suspendable or fork, where the 'Pre' copy of the shadow
             // cannot follow the process: it is taken when the commit runs,
             // overwriting what the process wrote, so the NBA is lost. A
-            // unique flag captures the value at the NBA instead.
+            // unique flag captures the value at the NBA instead. That holds
+            // in a loop too where every NBA assigns the whole array: each
+            // captures the value it wrote last, which is all there is to
+            // commit. A process that never ends is a loop, so without this
+            // "forever begin #1; s <= tmp; end" lost every update.
             if (vscpInfo.m_whole) {
-                if (vscpInfo.m_inSuspOrFork && !vscpInfo.m_inLoop) return Scheme::FlagUnique;
+                if (vscpInfo.m_inSuspOrFork
+                    && (!vscpInfo.m_inLoop || vscpInfo.m_nWholeSites == vscpInfo.m_nSites)) {
+                    return Scheme::FlagUnique;
+                }
                 return Scheme::ShadowVar;
             }
             // Basic underlying type of elements, if any.
@@ -1352,6 +1360,7 @@ class DelayedVisitor final : public VNVisitor {
         }
         // Note usage context
         vscpInfo.m_whole |= VN_IS(nodep->lhsp(), VarRef);
+        if (VN_IS(nodep->lhsp(), VarRef)) ++vscpInfo.m_nWholeSites;
         vscpInfo.m_partial |= VN_IS(nodep->lhsp(), Sel);
         vscpInfo.m_inLoop |= m_inLoop;
         vscpInfo.m_inSuspOrFork |= m_inSuspendableOrFork;
