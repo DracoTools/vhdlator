@@ -4883,28 +4883,39 @@ private:
         AstNodeExpr* const leftp = rangep->leftp()->unlinkFrBack();
         AstNodeExpr* const rightp = rangep->rightp()->unlinkFrBack();
         const bool ascending = boundsAscending(idxp);
+        // An open port's range runs the way its actual's does, which the
+        // instance says: "port (i : bit_vector)" given a "1 to 4"
+        AstNodeExpr* const ascp = boundsAscendingExpr(idxp, flp);
         VL_DO_DANGLING(rangep->deleteTree(), rangep);
         AstVar* const lp = newFuncLocal("l", newIntDType(flp), flp);
         AstVar* const np = newFuncLocal("n", newIntDType(flp), flp);
         AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
         for (AstVar* const vp : {lp, np, kp}) funcp->addStmtsp(vp);
         funcp->addStmtsp(new AstAssign{flp, wr(lp, flp), leftp});
-        funcp->addStmtsp(new AstAssign{
-            flp, wr(np, flp),
-            new AstAdd{flp,
-                       ascending ? new AstSub{flp, rightp, rd(lp, flp)}
-                                 : new AstSub{flp, rd(lp, flp), rightp},
-                       i32(1, flp)}});
+        AstNodeExpr* lenp = nullptr;
+        if (ascp) {
+            lenp = new AstCond{flp, ascp->cloneTree(false),
+                               new AstSub{flp, rightp->cloneTree(false), rd(lp, flp)},
+                               new AstSub{flp, rd(lp, flp), rightp}};
+        } else {
+            lenp = ascending ? new AstSub{flp, rightp, rd(lp, flp)}
+                             : new AstSub{flp, rd(lp, flp), rightp};
+        }
+        funcp->addStmtsp(new AstAssign{flp, wr(np, flp), new AstAdd{flp, lenp, i32(1, flp)}});
         funcp->addStmtsp(
             new AstIf{flp, new AstNeq{flp, dynCarrierLength(rd(cp, flp), flp), rd(np, flp)},
                       lengthMismatch(flp), nullptr});
         const auto out
             = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
         funcp->addStmtsp(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
-        AstNodeExpr* const atp
-            = ascending
-                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lp, flp), rd(kp, flp)})
-                  : static_cast<AstNodeExpr*>(new AstSub{flp, rd(lp, flp), rd(kp, flp)});
+        AstNodeExpr* atp = nullptr;
+        if (ascp) {
+            atp = new AstCond{flp, ascp, new AstAdd{flp, rd(lp, flp), rd(kp, flp)},
+                              new AstSub{flp, rd(lp, flp), rd(kp, flp)}};
+        } else {
+            atp = ascending ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lp, flp), rd(kp, flp)})
+                            : static_cast<AstNodeExpr*>(new AstSub{flp, rd(lp, flp), rd(kp, flp)});
+        }
         AstNode* bodyp = new AstAssign{
             flp, new AstSelBit{flp, out(), atp},
             new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), rd(kp, flp)}};
