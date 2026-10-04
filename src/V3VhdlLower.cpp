@@ -19973,6 +19973,36 @@ private:
         }
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
             if (!staticSelectKey(callp->prefixp(), out)) return false;
+            // A slice whose range is a subtype's name -- "valid(ret_split_t)"
+            // -- is the subtype's range (8.5; GHDL gna issue156)
+            {
+                const AstNodeVhdlExpr* markp = nullptr;
+                if (const AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
+                    if (!rp->leftp() && !rp->rightp()) markp = rp->attrp();
+                } else if (const AstVhdlAssoc* const ap = VN_CAST(callp->argsp(), VhdlAssoc)) {
+                    if (!ap->nextp() && !ap->formalp()) markp = ap->actualp();
+                }
+                // Written as the subtype's own name, or as "t'range" of it
+                bool reversed = false;
+                if (const AstVhdlAttrName* const ap = VN_CAST(markp, VhdlAttrName)) {
+                    if (ap->name() == "range" || ap->name() == "reverse_range") {
+                        reversed = ap->name() == "reverse_range";
+                        markp = ap->prefixp();
+                    } else {
+                        markp = nullptr;
+                    }
+                }
+                const VhdlSymbol* const msymp
+                    = markp && markp->vhdlSymp() ? markp->vhdlSymp()->resolved() : nullptr;
+                if (msymp && msymp->kind() == VhdlSymKind::TYPE && msymp->typep()
+                    && msymp->typep()->bounded()) {
+                    const int64_t left = msymp->typep()->left();
+                    const int64_t right = msymp->typep()->right();
+                    out += "(" + std::to_string(reversed ? right : left) + ":"
+                           + std::to_string(reversed ? left : right) + ")";
+                    return true;
+                }
+            }
             if (const AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange)) {
                 const VhdlValue lv = V3VhdlEval::eval(rp->leftp());
                 const VhdlValue rv = V3VhdlEval::eval(rp->rightp());
