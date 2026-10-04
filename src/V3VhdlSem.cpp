@@ -15646,6 +15646,28 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                         }
                         return staticLength(sidep);
                     };
+                    // The subtype of what is associated with an unconstrained
+                    // port has to be globally static (6.5.6.3), which a
+                    // concatenation of signals is not -- "data => a & b" --
+                    // as nvc 1.22.1 and GHDL 7.0.0-dev both say
+                    bool ofObjects = false;
+                    catp->foreach([&](const AstVhdlName* np) {
+                        std::vector<VhdlSymbol*> syms;
+                        m_scopep->lookup(np->name(), syms);
+                        if (syms.size() != 1) return;
+                        const VhdlSymKind k = syms[0]->resolved()->kind();
+                        if (k == VhdlSymKind::SIGNAL || k == VhdlSymKind::PORT
+                            || k == VhdlSymKind::VARIABLE || k == VhdlSymKind::SHARED_VARIABLE) {
+                            ofObjects = true;
+                        }
+                    });
+                    if (ofObjects) {
+                        err(catp->fileline(),
+                            "What is associated with unconstrained port '" + bound.port
+                                + "' must have a globally static subtype, and a concatenation"
+                                  " of signals or variables does not");
+                        continue;
+                    }
                     count = pbasep ? lengthOf(catp) : -1;
                     ok = count > 0;
                     // Before VHDL-2008, the left operand an array: the
