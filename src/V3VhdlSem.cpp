@@ -467,6 +467,44 @@ class VhdlSemVisitor final : public VNVisitor {
     // Every declaration a simple name denotes here
     void lookup(const std::string& name, std::vector<VhdlSymbol*>& out) const {
         if (m_scopep) m_scopep->lookup(name, out);
+        if (out.size() > 1) dropGenericTemplates(out);
+    }
+    // A generic package's own declarations are not what a use clause
+    // reaches from outside it: an instance of it is (4.9). Where a copy an
+    // instance made of a declaration is in view, the uninstantiated
+    // package's own declaration of it gives way -- a package instantiated
+    // with a formal generic package mapped to an instance of the same
+    // generic package otherwise sees both (GHDL gna issue476)
+    void dropGenericTemplates(std::vector<VhdlSymbol*>& out) const {
+        const auto templateOf = [&](const VhdlSymbol* symp) -> const AstVhdlPackage* {
+            const AstNodeVhdlUnit* const unitp = symp->declp() ? unitOf(symp->declp()) : nullptr;
+            const AstVhdlPackage* const pkgp = VN_CAST(unitp, VhdlPackage);
+            if (!pkgp || !pkgp->genericsp() || pkgp == m_curUnitp) return nullptr;
+            return pkgp;
+        };
+        bool any = false;
+        for (const VhdlSymbol* const symp : out) {
+            if (templateOf(symp)) any = true;
+        }
+        if (!any) return;
+        std::vector<VhdlSymbol*> kept;
+        for (VhdlSymbol* const symp : out) {
+            if (templateOf(symp)) {
+                const std::string at = symp->declp()->fileline()->ascii();
+                bool copied = false;
+                for (const VhdlSymbol* const otherp : out) {
+                    if (otherp == symp || !otherp->declp() || templateOf(otherp)) continue;
+                    if (VN_IS(unitOf(otherp->declp()), VhdlPackageInst)
+                        && otherp->declp()->fileline()->ascii() == at) {
+                        copied = true;
+                        break;
+                    }
+                }
+                if (copied) continue;
+            }
+            kept.push_back(symp);
+        }
+        out.swap(kept);
     }
 
     // Resolve a name that must denote exactly one non-overloadable thing
