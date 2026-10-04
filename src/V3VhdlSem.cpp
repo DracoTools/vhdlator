@@ -15423,6 +15423,7 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
             }
         }
         // Left open, so the default the entity gives it decides the bounds
+        const bool fromDefault = !actualp;
         if (!actualp) {
             AstVhdlIfaceDecl* const declp = VN_CAST(found[0]->declp(), VhdlIfaceDecl);
             if (declp) actualp = declp->defaultp();
@@ -15431,11 +15432,71 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
         int64_t left = 0;
         int64_t right = 0;
         bool ascending = false;
+        FileLine* const flp = nodep->fileline();
         if (!defaultBounds(found[0], actualp, bound.dim, left, right, &ascending)) {
+            // Bounds that are not numbers here -- "(0 to ix => '1')", or a
+            // constant declared "(0 to ix)", in a for generate -- are the
+            // instance's to settle as it is elaborated: they go over as
+            // expressions and V3Param folds them. An aggregate written over
+            // one range has that range's ends (9.3.3.3); an object has its
+            // own 'LEFT and 'RIGHT. Only here, where they are read in the
+            // instance's own region.
+            AstNodeVhdlExpr* innerp = actualp;
+            while (AstVhdlQualified* const qp = VN_CAST(innerp, VhdlQualified)) {
+                innerp = qp->valuep();
+            }
+            AstNodeVhdlExpr* leftEndp = nullptr;
+            AstNodeVhdlExpr* rightEndp = nullptr;
+            AstNodeVhdlExpr* ascp = nullptr;
+            if (!late && !fromDefault && bound.dim == 0
+                && !genericMapNames(nodep, bound.leftName)) {
+                const AstVhdlAggregate* const aggp = VN_CAST(innerp, VhdlAggregate);
+                const AstVhdlElemAssoc* const ap = aggp ? aggp->elemsp() : nullptr;
+                const AstVhdlChoice* const chp = ap && !ap->nextp() ? ap->choicesp() : nullptr;
+                const AstVhdlRange* const rp
+                    = chp && !chp->nextp() ? VN_CAST(chp->exprp(), VhdlRange) : nullptr;
+                AstVhdlName* const onamep = VN_CAST(innerp, VhdlName);
+                const VhdlSymbol* const osymp
+                    = onamep && onamep->vhdlSymp() ? onamep->vhdlSymp()->resolved() : nullptr;
+                if (rp && rp->leftp() && rp->rightp() && !rp->dirUnknown()) {
+                    leftEndp = rp->leftp()->cloneTree(false);
+                    rightEndp = rp->rightp()->cloneTree(false);
+                    ascp = new AstVhdlName{flp, rp->dir() == VhdlDir::TO ? "true" : "false"};
+                } else if (osymp && osymp->isObject() && osymp->typep()
+                           && osymp->typep()->dimensions() == 1 && osymp->typep()->indexTypes()[0]
+                           && !osymp->typep()->indexTypes()[0]->bounded()
+                           && osymp->typep()->indexTypes()[0]->boundsp()) {
+                    // Its range is written but does not fold here; one with
+                    // no range at all takes its bounds from a value settled
+                    // later, and is asked again then
+                    leftEndp = new AstVhdlAttrName{flp, onamep->cloneTree(false), "left"};
+                    rightEndp = new AstVhdlAttrName{flp, onamep->cloneTree(false), "right"};
+                    ascp = new AstVhdlAttrName{flp, onamep->cloneTree(false), "ascending"};
+                }
+            }
+            if (leftEndp) {
+                const auto bindOne
+                    = [&](const std::string& name, AstNodeVhdlExpr* valuep, VhdlType* typep) {
+                          if (name.empty() || genericMapNames(nodep, name)) {
+                              VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                              return;
+                          }
+                          AstVhdlAssoc* const asp
+                              = new AstVhdlAssoc{flp, new AstVhdlName{flp, name}, valuep};
+                          nodep->addGenericMapp(asp);
+                          std::vector<VhdlSymbol*> gfound;
+                          unitScopep->lookupLocal(name, gfound);
+                          if (!gfound.empty()) asp->formalp()->vhdlSymp(gfound[0]);
+                          analyzeExpr(valuep, typep);
+                      };
+                bindOne(bound.ascName, ascp, V3VhdlStd::booleanType());
+                bindOne(bound.leftName, leftEndp, V3VhdlStd::integerType());
+                bindOne(bound.rightName, rightEndp, V3VhdlStd::integerType());
+                continue;
+            }
             if (!late) m_lateOpenGenerics.emplace_back(nodep, unitScopep);
             continue;
         }
-        FileLine* const flp = nodep->fileline();
         if (genericMapNames(nodep, bound.leftName)) continue;
         // Which way round the actual runs goes with its bounds: "101" for a
         // BIT_VECTOR runs upward from 0, which the bounds alone do not say
