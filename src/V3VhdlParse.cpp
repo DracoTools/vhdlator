@@ -813,7 +813,18 @@ AstNodeVhdl* V3VhdlParse::parseObjectDecl() {
     if (kind == VhdlObjKind::FILE) {
         // file_open_information ::= [ OPEN expr ] IS file_logical_name   (6.4.2.5)
         if (check(VhdlTokType::KWD_OPEN)) fileOpenp = parseExpression();
-        if (check(VhdlTokType::KWD_IS)) fileNamep = parseExpression();
+        if (check(VhdlTokType::KWD_IS)) {
+            // VHDL-87 wrote the mode here -- "is in", "is out" -- which
+            // means READ_MODE or WRITE_MODE; nvc and Questa still take it
+            // in later revisions, and GHDL's own testsuite writes it
+            FileLine* const modeFlp = here();
+            if (!fileOpenp && check(VhdlTokType::KWD_OUT)) {
+                fileOpenp = new AstVhdlName{modeFlp, "write_mode"};
+            } else if (!fileOpenp && check(VhdlTokType::KWD_IN)) {
+                fileOpenp = new AstVhdlName{modeFlp, "read_mode"};
+            }
+            fileNamep = parseExpression();
+        }
     } else if (check(VhdlTokType::VAR_ASSIGN)) {
         defaultp = parseExpression();
     }
