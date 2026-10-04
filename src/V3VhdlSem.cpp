@@ -2173,10 +2173,14 @@ public:
         // A generic type an instantiation has given an unconstrained array
         // type: the copy's objects of it have no bounds (nvc 1.22.1, GHDL
         // 7.0.0-dev; Questa 2025.2 takes it)
+        // -- not one whose bounds name a generic, "std_logic_vector(WIDTH - 1
+        // downto 0)", which says its length though not as a number (GHDL gna
+        // issue2580)
         if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
             const VhdlType* const typep = symp->typep();
             return ifp->kind() == VhdlIfaceKind::TYPE && typep && !typep->isError()
-                   && typep->base()->kind() == VhdlTypeKind::ARRAY && typep->unconstrained();
+                   && typep->base()->kind() == VhdlTypeKind::ARRAY && typep->unconstrained()
+                   && !typep->lengthEmittable();
         }
         if (const AstVhdlSubtypeDecl* const sdp = VN_CAST(symp->declp(), VhdlSubtypeDecl)) {
             return leavesBoundsOpen(sdp->subtypep());
