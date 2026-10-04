@@ -32844,6 +32844,18 @@ private:
                 && !psymp->typep()->isConstrainedArray()) {
                 varp->direction(VDirection::INOUT);
             }
+            // A variable of a composite type given to an out parameter that
+            // the body never assigns keeps its value: an array or record may
+            // be passed by reference (4.2.2.1), and nvc 1.22.1, GHDL 7.0.0-dev
+            // and Questa 2025.2 all do so. A procedure that returns early
+            // leaves the caller's object as it was, not reset (VESTS
+            // ashenden ch_10_bvat-b's "16/0").
+            if (ifp->mode() == VhdlMode::OUT && ifp->kind() != VhdlIfaceKind::SIGNAL
+                && psymp->typep()
+                && (psymp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                    || psymp->typep()->base()->kind() == VhdlTypeKind::RECORD)) {
+                varp->direction(VDirection::INOUT);
+            }
             // A parameter of a protected type must be a variable of mode
             // inout (4.2.2.3), but what is passed is the object itself, not a
             // copy of its state -- so the handle goes in and nothing comes
