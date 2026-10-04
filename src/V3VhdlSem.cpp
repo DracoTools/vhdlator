@@ -1179,6 +1179,15 @@ class VhdlSemVisitor final : public VNVisitor {
     // parser could not tell that from a call.
     VhdlType* resolveTypeActual(AstNodeVhdlExpr* nodep) {
         if (!nodep) return nullptr;
+        // "T => foo'subtype": an attribute standing for a subtype, as it may
+        // wherever a type mark does (16.2.5; GHDL gna issue3098)
+        if (const AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
+            if (attrp->name() == "subtype" || attrp->name() == "base"
+                || attrp->name() == "element") {
+                VhdlType* const typep = resolveTypeMark(nodep);
+                return typep && !typep->isError() ? typep : nullptr;
+            }
+        }
         if (VhdlSymbol* const symp = lookupTypeQuiet(nodep)) {
             nodep->vhdlSymp(symp);
             return symp->typep();
