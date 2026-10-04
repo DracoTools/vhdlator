@@ -5235,6 +5235,10 @@ void VhdlSemVisitor::analyzeUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             unitScopep->addNamed(lower(unitp->name()), unitScopep);
             rejectGenericObjects(pkgp->genericsp());
             iterateAndNextNull(pkgp->genericsp());
+            // One with a generic map of its own is an instance of itself,
+            // as a package declared inside another region is (4.7; GHDL gna
+            // bug057)
+            if (pkgp->genericMapp()) bindOwnGenerics(pkgp, unitScopep);
             if (!m_inSpecialized) rejectUnsharedVariables(pkgp->declsp(), "a package");
             iteratePackageDecls(pkgp->declsp());
             m_unitScopes[lib + "." + lower(unitp->name())] = unitScopep;
