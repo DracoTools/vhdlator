@@ -15927,11 +15927,41 @@ void VhdlSemVisitor::analyzeAssociations(AstNode* assocsp, VhdlScope* unitScopep
                         AstVhdlAssoc* const argp = VN_CAST(convp->argsp(), VhdlAssoc);
                         AstNodeVhdlExpr* const argValp
                             = argp ? argp->actualp() : VN_CAST(convp->argsp(), NodeVhdlExpr);
-                        AstVhdlName* const pnamep
-                            = convp->argsp() && !convp->argsp()->nextp()
-                                  ? VN_CAST(argValp, VhdlName)
-                                  : nullptr;
-                        if (pnamep && !pnamep->vhdlSymp()) {
+                        const bool oneArg = convp->argsp() && !convp->argsp()->nextp();
+                        AstVhdlName* pnamep = oneArg ? VN_CAST(argValp, VhdlName) : nullptr;
+                        // The conversion of a slice or an element of the port,
+                        // "signed(res(7 downto 0)) => a": what is inside is a
+                        // name of the unit's own region, so it is analyzed
+                        // there (GHDL gna issue530)
+                        bool partOfPort = false;
+                        if (!pnamep && oneArg && argValp
+                            && (VN_IS(argValp, VhdlCall) || VN_IS(argValp, VhdlSelected))) {
+                            AstNodeVhdlExpr* innerp = argValp;
+                            while (innerp && !VN_IS(innerp, VhdlName)) {
+                                if (AstVhdlCall* const icp = VN_CAST(innerp, VhdlCall)) {
+                                    innerp = icp->prefixp();
+                                } else if (AstVhdlSelected* const isp
+                                           = VN_CAST(innerp, VhdlSelected)) {
+                                    innerp = isp->prefixp();
+                                } else {
+                                    innerp = nullptr;
+                                }
+                            }
+                            AstVhdlName* const rnamep = VN_CAST(innerp, VhdlName);
+                            std::vector<VhdlSymbol*> rfound;
+                            if (rnamep) unitScopep->lookupLocal(rnamep->name(), rfound);
+                            const AstVhdlName* const cprefixp
+                                = VN_CAST(convp->prefixp(), VhdlName);
+                            if (!rfound.empty() && rfound[0]->kind() == VhdlSymKind::PORT
+                                && cprefixp && cprefixp->name() != rnamep->name()) {
+                                VL_RESTORER(m_scopep);
+                                m_scopep = unitScopep;
+                                analyzeExpr(argValp, nullptr);
+                                pnamep = rnamep;
+                                partOfPort = true;
+                            }
+                        }
+                        if (pnamep && (partOfPort || !pnamep->vhdlSymp())) {
                             std::vector<VhdlSymbol*> pfound;
                             unitScopep->lookupLocal(pnamep->name(), pfound);
                             if (!pfound.empty()

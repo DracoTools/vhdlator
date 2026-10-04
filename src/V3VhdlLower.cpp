@@ -22910,6 +22910,10 @@ private:
         // actual (6.5.7.1): the port is a signal of its own here, and the
         // actual follows the conversion of it.
         std::set<const AstVhdlAssoc*> converted;
+        // The signal standing in for a port, where conversions written on
+        // parts of it -- "signed(res(7 downto 0)) => a, signed(res(15
+        // downto 8)) => b" -- each read their own part (GHDL gna issue530)
+        std::map<const VhdlSymbol*, AstVar*> convTemps;
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
             AstVhdlCall* const convp = VN_CAST(asp->formalp(), VhdlCall);
@@ -22919,10 +22923,31 @@ private:
             const AstVhdlAssoc* const argp = VN_CAST(convp->argsp(), VhdlAssoc);
             const AstNodeVhdlExpr* const argValp
                 = argp ? argp->actualp() : VN_CAST(convp->argsp(), NodeVhdlExpr);
-            const AstVhdlName* const portNamep
-                = convp->argsp() && !convp->argsp()->nextp() ? VN_CAST(argValp, VhdlName)
-                                                             : nullptr;
-            VhdlSymbol* const portSymp = portNamep ? portNamep->vhdlSymp() : nullptr;
+            const bool oneArg = convp->argsp() && !convp->argsp()->nextp();
+            const AstVhdlName* const portNamep = oneArg ? VN_CAST(argValp, VhdlName) : nullptr;
+            VhdlSymbol* portSymp = portNamep ? portNamep->vhdlSymp() : nullptr;
+            // The conversion of a slice or an element of a port: the formal
+            // designator inside it is the port (6.5.7.1). A slice of a
+            // formal is written as a call too, so it is the port only where
+            // the conversion's own name is not that port's.
+            if (!portSymp && oneArg && argValp
+                && (VN_IS(argValp, VhdlCall) || VN_IS(argValp, VhdlSelected))) {
+                const AstNodeVhdlExpr* rootp = argValp;
+                while (rootp && !VN_IS(rootp, VhdlName)) {
+                    if (const AstVhdlCall* const cp = VN_CAST(rootp, VhdlCall)) {
+                        rootp = cp->prefixp();
+                    } else if (const AstVhdlSelected* const sp = VN_CAST(rootp, VhdlSelected)) {
+                        rootp = sp->prefixp();
+                    } else {
+                        rootp = nullptr;
+                    }
+                }
+                VhdlSymbol* const rsymp = rootp ? rootp->vhdlSymp() : nullptr;
+                if (rsymp && rsymp->kind() == VhdlSymKind::PORT
+                    && rsymp->name() != convNamep->name()) {
+                    portSymp = rsymp;
+                }
+            }
             if (!portSymp || portSymp->kind() != VhdlSymKind::PORT) continue;
             // What the port drives is the signal, not a conversion written
             // around it: "f(p) => g(s)" is an association with s (6.5.7.1)
@@ -22946,11 +22971,17 @@ private:
                 for (const auto& pair : genericStandIns(nodep, portSymp->typep())) {
                     m_bindExprs[pair.first] = pair.second;
                 }
-                dtypep = lowerType(portSymp->typep(), flp);
-                tempp = newTempVar("__Vconv__" + label + "__" + portSymp->name(), dtypep, flp);
-                // The signal standing in for the port starts where the port
-                // does, so the conversion of it is right before anything runs
-                tempp->valuep(defaultValueFor(portSymp->typep(), flp));
+                const auto tIt = convTemps.find(portSymp);
+                if (tIt != convTemps.end()) {
+                    tempp = tIt->second;
+                } else {
+                    dtypep = lowerType(portSymp->typep(), flp);
+                    tempp = newTempVar("__Vconv__" + label + "__" + portSymp->name(), dtypep, flp);
+                    // The signal standing in for the port starts where the
+                    // port does, so the conversion of it is right before
+                    // anything runs
+                    tempp->valuep(defaultValueFor(portSymp->typep(), flp));
+                }
                 // The conversion reads the port's own signal, so the name it
                 // applies to stands for that signal while it is lowered
                 m_vars.emplace(portSymp, tempp);
@@ -22979,9 +23010,14 @@ private:
             // outward direction alone, and the port keeps its own value
             // inward. The construct is written by test suites rather than by
             // designs, and this is what lets them compile.
-            pinsp = AstNode::addNextNull(
-                pinsp, new AstPin{flp, ++pinNum, portSymp->name(),
-                                  new AstVarRef{flp, tempp, VAccess::WRITE}});
+            // The port is associated once, however many parts of it are
+            // converted
+            if (!convTemps.count(portSymp)) {
+                convTemps.emplace(portSymp, tempp);
+                pinsp = AstNode::addNextNull(
+                    pinsp, new AstPin{flp, ++pinNum, portSymp->name(),
+                                      new AstVarRef{flp, tempp, VAccess::WRITE}});
+            }
             converted.insert(asp);
         }
         // A formal may name part of a port rather than the whole of it, and
