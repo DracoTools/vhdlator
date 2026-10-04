@@ -7434,6 +7434,18 @@ private:
         return outp;
     }
 
+    // A call to a function whose result is carried with its bounds, the
+    // bounds being only what running it settles
+    bool carriedCallResult(const AstNodeVhdlExpr* nodep) {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        const VhdlSymbol* const fsymp
+            = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (!fsymp || fsymp->kind() != VhdlSymKind::FUNCTION) return false;
+        VhdlType* const rtypep = emittedReturnType(fsymp);
+        return rtypep && rtypep->base()->kind() == VhdlTypeKind::ARRAY && !isStringType(rtypep)
+               && carriedDynamically(rtypep);
+    }
+
     // A declarative item of an entity, architecture, block or process
     void lowerDecl(AstNode* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -26800,7 +26812,15 @@ private:
         AstNodeExpr* limitp = nullptr;
         AstNodeExpr* ascp = nullptr;  // Set where the direction only folds later
         const DynAccess* dynLoopp = nullptr;
-        if (AstVhdlRange* const rp = VN_CAST(nodep->rangep(), VhdlRange)) {
+        AstNode* rangeSetupp = nullptr;  // Run before the loop starts
+        AstVhdlRange* rp = VN_CAST(nodep->rangep(), VhdlRange);
+        // "for k in st" where st is "natural range 1 to w" or "range
+        // str'range" of a generic the run settles: the range st is declared
+        // with, read as if written here
+        if (!rangep->bounded() && (!rp || (!rp->leftp() && !VN_IS(rp->attrp(), VhdlAttrName)))) {
+            if (AstVhdlRange* const declp = VN_CAST(rangep->boundsp(), VhdlRange)) rp = declp;
+        }
+        if (rp) {
             if (rp->leftp() && rp->rightp()) {
                 initp = lowerExpr(rp->leftp());
                 limitp = lowerExpr(rp->rightp());
@@ -26900,6 +26920,28 @@ private:
                     } else {
                         if (elemp) VL_DO_DANGLING(elemp->deleteTree(), elemp);
                         unsup(flp, "loop over the range of a value that is not a name");
+                    }
+                } else if ((name == "range" || name == "reverse_range") && !attrp->argp()
+                           && carriedCallResult(attrp->prefixp())) {
+                    // "for i in f(x)'range": what the call gives back is
+                    // carried with its bounds, which are worked out by
+                    // running it -- its subtype names the copy's own
+                    // parameters, which mean nothing here (GHDL gna issue713)
+                    const VhdlSymbol* const fsymp = attrp->prefixp()->vhdlSymp()->resolved();
+                    AstNodeExpr* const valp = lowerExpr(attrp->prefixp());
+                    if (valp) {
+                        AstVar* const tmpp = newTempVar(
+                            "__Vrange", dynCarrierRef(emittedReturnType(fsymp), flp), flp);
+                        if (m_ftaskp) tmpp->funcLocal(true);
+                        rangeSetupp = new AstAssign{flp, wr(tmpp, flp), valp};
+                        initp = dynCarrierAttr(rd(tmpp, flp), "left", flp);
+                        limitp = dynCarrierAttr(rd(tmpp, flp), "right", flp);
+                        ascp = dynCarrierAscending(rd(tmpp, flp), flp);
+                        ascending = true;
+                        if (name == "reverse_range") {
+                            std::swap(initp, limitp);
+                            ascp = new AstLogNot{flp, ascp};
+                        }
                     }
                 } else if (name == "range" || name == "reverse_range") {
                     int dim = 0;
@@ -27049,6 +27091,7 @@ private:
         AstNode* outp
             = new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, initp};
         if (preloadp) outp = AstNode::addNext(static_cast<AstNode*>(preloadp), outp);
+        if (rangeSetupp) outp = AstNode::addNext(rangeSetupp, outp);
         if (!runsAtAll) {
             VL_DO_DANGLING(wrappedp->deleteTree(), wrappedp);
             return outp;
