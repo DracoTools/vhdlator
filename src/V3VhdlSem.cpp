@@ -1321,6 +1321,7 @@ class VhdlSemVisitor final : public VNVisitor {
                 std::vector<VhdlSymbol*> found;
                 lookup(rnamep->name(), found);
                 VhdlSymbol* fitp = nullptr;
+                int fitDepth = 0;  // How many element levels down it resolves
                 for (VhdlSymbol* const candp : found) {
                     const VhdlSymbol* const rp = candp->resolved();
                     if (rp->kind() != VhdlSymKind::FUNCTION || rp->paramTypes().size() != 1)
@@ -1336,18 +1337,41 @@ class VhdlSemVisitor final : public VNVisitor {
                     // parentheses that say which do not survive parsing
                     bool anyLevel = false;
                     const VhdlType* levelp = basep;
-                    for (int depth = 0; levelp && depth < 8 && !anyLevel; ++depth) {
+                    int depth = 0;
+                    for (; levelp && depth < 8; ++depth) {
                         anyLevel = elemp->base() == levelp->base()
                                    && rp->returnTypep()->base() == levelp->base();
+                        if (anyLevel) break;
                         levelp = levelp->base()->kind() == VhdlTypeKind::ARRAY
                                      ? levelp->base()->elementp()
                                      : nullptr;
                     }
                     if (!anyLevel) continue;
                     fitp = candp;
+                    fitDepth = depth;
                     break;
                 }
-                if (fitp) {
+                if (fitp && fitDepth > 0 && !isLogicValued(typep)) {
+                    // "(areso) ivec" resolves each element of the array and
+                    // not the array (6.3), so the function belongs to the
+                    // element subtype at the depth whose values it takes. The
+                    // logic vectors keep theirs where it is: their elements
+                    // resolve natively and every user of them expects it so.
+                    typep->resolutionp(nullptr);
+                    VhdlType* curp = typep;
+                    for (int d = 0; d < fitDepth && curp; ++d) {
+                        VhdlType* const levelElemp
+                            = curp->elementp() ? curp->elementp() : curp->base()->elementp();
+                        if (!levelElemp) {
+                            curp = nullptr;
+                            break;
+                        }
+                        VhdlType* const newElemp = cloneSubtype(levelElemp, flp);
+                        curp->elementp(newElemp);
+                        curp = newElemp;
+                    }
+                    if (curp) curp->resolutionp(fitp);
+                } else if (fitp) {
                     typep->resolutionp(fitp);
                 } else {
                     err(resolutionExprp->fileline(),
@@ -7627,20 +7651,26 @@ bool VhdlSemVisitor::isLogicValued(const VhdlType* typep) {
 // The resolution function a composite signal's *elements* name, where the
 // signal's own subtype names none. A signal of such a subtype is resolved:
 // its drivers are resolved one element at a time, and the function is run
-// once per element with that element's values (14.7.3.2). Only a
-// one-dimensional array of a scalar element is answered for, since that is
+// once per element with that element's values (14.7.3.2). An array of
+// arrays may name it for its elements' elements, "((areso)) ivec_arr"
+// (6.3), and then it is run once per element of each element. Only
+// one-dimensional arrays down to a scalar are answered for, since that is
 // the shape lowering can build the per-element resolution for.
 VhdlSymbol* VhdlSemVisitor::elementResolver(const VhdlType* typep) {
     if (!typep || typep->resolutionp()) return nullptr;
-    const VhdlType* const basep = typep->base();
-    if (basep->kind() != VhdlTypeKind::ARRAY) return nullptr;
-    if (typep->dimensions() != 1) return nullptr;
-    const VhdlType* const elemp = typep->elementp() ? typep->elementp() : basep->elementp();
-    if (!elemp || elemp->base()->kind() == VhdlTypeKind::ARRAY
-        || elemp->base()->kind() == VhdlTypeKind::RECORD) {
-        return nullptr;
+    const VhdlType* levelp = typep;
+    for (int depth = 0; levelp && depth < 4; ++depth) {
+        const VhdlType* const basep = levelp->base();
+        if (basep->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (levelp->dimensions() != 1) return nullptr;
+        const VhdlType* const elemp = levelp->elementp() ? levelp->elementp() : basep->elementp();
+        if (!elemp || elemp->base()->kind() == VhdlTypeKind::RECORD) return nullptr;
+        if (elemp->resolutionp()) {
+            return elemp->base()->kind() == VhdlTypeKind::ARRAY ? nullptr : elemp->resolutionp();
+        }
+        levelp = elemp;
     }
-    return elemp->resolutionp();
+    return nullptr;
 }
 
 // Whether every part of a composite is resolved, though not in the shape

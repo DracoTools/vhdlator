@@ -21152,19 +21152,39 @@ private:
         // index range says how many times it is run and over which indices
         // (14.7.3.2), so that range has to be known here
         const bool perElement = symp->resolvePerElement();
-        VhdlType* const sigTypep = symp->typep();
-        const VhdlType* sigIdxp = nullptr;
-        int64_t elems = 0;
+        // The index of each element resolved on its own, outermost first:
+        // one index for an array of scalars, two where an array of arrays
+        // resolves its elements' elements, "((areso)) ivec_arr" (6.3)
+        std::vector<std::vector<int64_t>> paths;
         if (perElement) {
-            if (!sigTypep || !sigTypep->isConstrainedArray() || sigTypep->dimensions() != 1) {
-                unsup(flp, what);
-                return;
-            }
-            sigIdxp = sigTypep->indexTypes()[0];
-            elems = sigTypep->dimLength(0);
-            if (!sigIdxp || !sigIdxp->bounded() || elems <= 0) {
-                unsup(flp, what);
-                return;
+            paths.emplace_back();
+            const VhdlType* levelp = symp->typep();
+            for (int depth = 0;; ++depth) {
+                if (depth >= 4 || !levelp || !levelp->isConstrainedArray()
+                    || levelp->dimensions() != 1) {
+                    unsup(flp, what);
+                    return;
+                }
+                const VhdlType* const idxp = levelp->indexTypes()[0];
+                const int64_t elems = levelp->dimLength(0);
+                if (!idxp || !idxp->bounded() || elems <= 0
+                    || static_cast<int64_t>(paths.size()) * elems > 65536) {
+                    unsup(flp, what);
+                    return;
+                }
+                std::vector<std::vector<int64_t>> next;
+                for (const std::vector<int64_t>& path : paths) {
+                    for (int64_t k = 0; k < elems; ++k) {
+                        next.push_back(path);
+                        next.back().push_back(idxp->ascending() ? idxp->left() + k
+                                                                : idxp->left() - k);
+                    }
+                }
+                paths.swap(next);
+                const VhdlType* const elemp
+                    = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
+                if (!elemp || elemp->resolutionp()) break;
+                levelp = elemp;
             }
         }
         AstNodeFTask* ftaskp = nullptr;
@@ -21245,17 +21265,21 @@ private:
         // One pass where the function resolves the whole signal, and one per
         // element where it resolves the elements. The array handed to the
         // function is filled afresh each pass, so one of it serves them all.
-        const int64_t passes = perElement ? elems : 1;
+        const size_t passes = perElement ? paths.size() : 1;
         AstNode* bodyp = nullptr;
-        for (int64_t pass = 0; pass < passes; ++pass) {
-            const int64_t at = !perElement            ? 0
-                               : sigIdxp->ascending() ? sigIdxp->left() + pass
-                                                      : sigIdxp->left() - pass;
+        for (size_t pass = 0; pass < passes; ++pass) {
+            // The element this pass resolves, of a driver or of the signal
+            const auto atPath = [&](AstNodeExpr* fromp) -> AstNodeExpr* {
+                if (!perElement) return fromp;
+                for (const int64_t at : paths[pass]) {
+                    fromp = new AstSelBit{
+                        flp, fromp,
+                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at)}};
+                }
+                return fromp;
+            };
             const auto driverValue = [&](int i) -> AstNodeExpr* {
-                AstNodeExpr* const refp = new AstVarRef{flp, drivers[i].valp, VAccess::READ};
-                if (!perElement) return refp;
-                return new AstSelBit{
-                    flp, refp, new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at)}};
+                return atPath(new AstVarRef{flp, drivers[i].valp, VAccess::READ});
             };
             for (int i = 0; i < count; ++i) {
                 const int64_t index = idxp->ascending() ? idxp->left() + i : idxp->left() - i;
@@ -21270,12 +21294,7 @@ private:
             AstFuncRef* const callp = new AstFuncRef{flp, ftaskp->name(), nullptr};
             callp->taskp(ftaskp);
             callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, arrp, VAccess::READ}});
-            AstNodeExpr* targetp = new AstVarRef{flp, netp, VAccess::WRITE};
-            if (perElement) {
-                targetp = new AstSelBit{
-                    flp, targetp,
-                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at)}};
-            }
+            AstNodeExpr* const targetp = atPath(new AstVarRef{flp, netp, VAccess::WRITE});
             bodyp = AstNode::addNextNull(
                 bodyp, static_cast<AstNode*>(new AstAssign{flp, targetp, callp}));
         }
