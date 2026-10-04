@@ -19298,6 +19298,10 @@ private:
                 AstVar* const varp = newVar(symp, VVarType::VAR, flp);
                 addStmt(varp);
                 if (ifp->defaultp()) varp->valuep(lowerExpr(ifp->defaultp()));
+                // The same for a generic left to its default
+                if (isGeneric && varp->valuep() && valueFolds(varp->valuep())) {
+                    varp->varType(VVarType::LPARAM);
+                }
                 continue;
             }
             // The actual is looked at before the formal has a variable, so
@@ -19338,6 +19342,12 @@ private:
             addStmt(varp);
             if (isGeneric) {
                 varp->valuep(valuep);
+                // A block's generic is settled when the block is elaborated
+                // (14.5.2), so one whose actual folds is a parameter, which a
+                // bound written in terms of it needs: "constant zero :
+                // bit_vector(0 to width - 1)" in the block (VESTS
+                // ch_16_fg_16_14)
+                if (valueFolds(valuep)) varp->varType(VVarType::LPARAM);
                 continue;
             }
             // A conversion applied to a signal is still an association with
