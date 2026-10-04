@@ -6465,10 +6465,36 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
                         if (madep && madep->lengthEmittable()) convp->vhdlTypep(madep);
                     }
                 }
+                // An operator the design declares is a call (4.5.2), and what
+                // it gives is as long as its own result makes it: the type
+                // recorded for the expression is an operand's, which "a +
+                // tv'(1 => b)" is not as long as (GHDL gna issue2536)
+                VhdlType* opResultp = nullptr;
+                {
+                    const AstNodeVhdlExpr* const opp = retp->valuep();
+                    const VhdlSymbol* const osymp
+                        = (VN_IS(opp, VhdlBinary) || VN_IS(opp, VhdlUnary)) && opp->vhdlSymp()
+                              ? opp->vhdlSymp()->resolved()
+                              : nullptr;
+                    if (osymp && !osymp->predefined() && osymp->kind() == VhdlSymKind::FUNCTION) {
+                        VhdlType* const rtp = osymp->returnTypep();
+                        if (rtp && rtp->base()->kind() == VhdlTypeKind::ARRAY) {
+                            // Only bounds that are numbers: ones written in
+                            // that copy's own terms mean nothing here
+                            if (!rtp->isConstrainedArray()) {
+                                sawOpen = true;
+                                continue;
+                            }
+                            opResultp = rtp;
+                        }
+                    }
+                }
                 // The returned value may constrain itself, as an aggregate
                 // written with its own range does (9.3.3.3)
-                VhdlType* const typep = constrainFromValue(
-                    retp->valuep()->vhdlTypep(), retp->valuep(), retp->fileline());
+                VhdlType* const typep = opResultp
+                                            ? opResultp
+                                            : constrainFromValue(retp->valuep()->vhdlTypep(),
+                                                                 retp->valuep(), retp->fileline());
                 const bool usable
                     = typep
                       && (typep->base()->kind() == VhdlTypeKind::ARRAY
@@ -9265,8 +9291,35 @@ VhdlType* VhdlSemVisitor::analyzeBinary(AstVhdlBinary* nodep, VhdlType* wantp) {
     // how long it is. Only for the operators that do: "&" is as long as both
     // together, and numeric_std's "*" as long as both operands' lengths
     // added, so neither takes its length from one of them (9.2.2, 16.5).
-    if (resultp && resultp->base()->kind() == VhdlTypeKind::ARRAY
-        && !resultp->lengthEmittable() && sameLengthAsOperands(nodep->op())) {
+    // Only the language's own and the IEEE arithmetic packages' are known to:
+    // an operator a design declares gives what its body makes, which the
+    // copy made for each use settles, and an operand's length taken for it
+    // instead is a guess -- "a + tv'(1 => b)" is not one long (GHDL gna
+    // issue2536)
+    const auto knownLength = [](const VhdlSymbol* symp) {
+        if (!symp) return true;
+        symp = symp->resolved();
+        if (symp->predefined()) return true;
+        static const std::set<std::string> pkgs{"numeric_std",
+                                                "numeric_bit",
+                                                "numeric_std_unsigned",
+                                                "numeric_bit_unsigned",
+                                                "std_logic_1164",
+                                                "std_logic_arith",
+                                                "std_logic_unsigned",
+                                                "std_logic_signed",
+                                                "std_logic_misc",
+                                                "fixed_generic_pkg",
+                                                "fixed_pkg",
+                                                "float_generic_pkg",
+                                                "float_pkg"};
+        for (const VhdlScope* scopep = symp->declScopep(); scopep; scopep = scopep->parentp()) {
+            if (pkgs.count(scopep->name())) return true;
+        }
+        return false;
+    };
+    if (resultp && resultp->base()->kind() == VhdlTypeKind::ARRAY && !resultp->lengthEmittable()
+        && sameLengthAsOperands(nodep->op()) && knownLength(nodep->vhdlSymp())) {
         VhdlType* bestp = nullptr;
         for (AstNodeVhdlExpr* const opp : {nodep->lhsp(), nodep->rhsp()}) {
             VhdlType* typep = opp ? opp->vhdlTypep() : nullptr;

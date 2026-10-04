@@ -13794,6 +13794,16 @@ private:
     // Whether an operator gives back a value that carries its own bounds
     // because one of its operands does
     bool dynBinaryCarries(const AstVhdlBinary* nodep) const {
+        // An operator the design declares is a call of its own copy (4.5.2),
+        // and gives back what that copy returns, carried or not, whatever
+        // its operands are (GHDL gna issue2536)
+        if (const VhdlSymbol* const symp = nodep->vhdlSymp()) {
+            const VhdlSymbol* const rp = symp->resolved();
+            if (!rp->predefined() && rp->kind() == VhdlSymKind::FUNCTION
+                && !isIeeeOperator(rp, nodep->lhsp()->vhdlTypep(), nodep->rhsp()->vhdlTypep())) {
+                return carriedDynamically(emittedReturnType(rp));
+            }
+        }
         switch (nodep->op()) {
         case VhdlBinaryOp::SLL:
         case VhdlBinaryOp::SRL:
@@ -25278,7 +25288,40 @@ private:
             new AstRange{flp, new AstSub{flp, totalp, new AstConst{flp, AstConst::Signed32{}, 1}},
                          new AstConst{flp, AstConst::Signed32{}, 0}}};
         AstVar* const tempp = newTempVar("__Vaggtgt", tempDTypep, flp);
-        AstNode* outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
+        AstNode* outp = nullptr;
+        if (isDynValue(valuep)) {
+            // A value that carries its own bounds -- what a design's own "+"
+            // over unconstrained arrays gives back (GHDL gna issue2536) -- is
+            // held as it is, must be as long as the names cover (10.6.2.1),
+            // and is copied in leftmost element first
+            AstVar* const carrp = newTempVar("__Vaggval", dynCarrierRef(typep, flp), flp);
+            outp = new AstAssign{flp, new AstVarRef{flp, carrp, VAccess::WRITE}, rhsp};
+            const auto cr = [&]() { return new AstVarRef{flp, carrp, VAccess::READ}; };
+            outp->addNext(new AstIf{
+                flp, new AstNeq{flp, dynCarrierLength(cr(), flp), totalp->cloneTree(false)},
+                lengthMismatch(flp)});
+            AstVar* const kp = newTempVar("__Vaggk", newIntDType(flp), flp);
+            const auto k = [&]() { return new AstVarRef{flp, kp, VAccess::READ}; };
+            outp->addNext(new AstAssign{flp, new AstVarRef{flp, kp, VAccess::WRITE},
+                                        new AstConst{flp, AstConst::Signed32{}, 0}});
+            AstLoop* const loopp = new AstLoop{flp};
+            loopp->addStmtsp(
+                new AstLoopTest{flp, loopp, new AstLtS{flp, k(), totalp->cloneTree(false)}});
+            loopp->addStmtsp(new AstAssign{
+                flp,
+                new AstSelBit{flp, new AstVarRef{flp, tempp, VAccess::WRITE},
+                              new AstSub{flp,
+                                         new AstSub{flp, totalp->cloneTree(false),
+                                                    new AstConst{flp, AstConst::Signed32{}, 1}},
+                                         k()}},
+                new AstSelBit{flp, dynPart(cr(), "q", flp), k()}});
+            loopp->addContsp(
+                new AstAssign{flp, new AstVarRef{flp, kp, VAccess::WRITE},
+                              new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+            outp->addNext(loopp);
+        } else {
+            outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
+        }
         // The leftmost name takes the run at the high end, and each name after
         // it starts where the one before it ended
         AstNodeExpr* atp = new AstSub{flp, totalp->cloneTree(false),
