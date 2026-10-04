@@ -25233,9 +25233,15 @@ private:
                 return outp;
             }
         }
+        // A value that carries its own bounds -- "x(4 downto i1)" with i1 a
+        // variable -- is held as it is, and its elements, stored from zero
+        // leftmost first, copied into a value as long as the names on the
+        // left cover, which only running can check (10.6.2.1)
+        const bool dynValue = !isRecord && isDynValue(valuep);
         AstNodeExpr* const rhsp = lowerExpr(valuep);
         if (!rhsp) return nullptr;
         AstNodeDType* tempDTypep = nullptr;
+        int64_t dynLength = 0;
         // A record a function gives back is what the copy made for this call
         // returns, whose elements the call has constrained -- a "signed" left
         // open in the type is eight bits here -- and so is the name holding it
@@ -25244,7 +25250,7 @@ private:
         const AstVar* const resultp = calledp ? VN_CAST(calledp->fvarp(), Var) : nullptr;
         if (resultp && resultp->childDTypep()) {
             tempDTypep = resultp->childDTypep()->cloneTree(false);
-        } else if (isRecord || typep->isConstrainedArray()) {
+        } else if (!dynValue && (isRecord || typep->isConstrainedArray())) {
             tempDTypep = lowerType(typep, flp);
         } else {
             // The value has as many elements as the target names, starting at
@@ -25264,6 +25270,7 @@ private:
                 }
                 length += span;
             }
+            dynLength = length;
             VhdlType* const elemp
                 = typep->elementp() ? typep->elementp() : typep->base()->elementp();
             AstNodeDType* const edtp = elemp ? lowerType(elemp, flp) : newLogicDType(flp, 1);
@@ -25277,10 +25284,45 @@ private:
                                    new AstUnpackArrayDType{flp, VFlagChildDType{}, edtp, rp});
         }
         AstVar* const tempp = newTempVar("__Vaggtgt", tempDTypep, flp);
-        AstNode* const outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
-        return AstNode::addNextNull(
-            outp, spreadAggregate(targetp, new AstVarRef{flp, tempp, VAccess::READ}, typep,
-                                  signalAssign, sequential, flp, delayp));
+        AstNode* outp = nullptr;
+        if (dynValue) {
+            if (dynLength > 4096) {
+                unsup(flp, "aggregate target of this many elements given a value whose bounds"
+                           " only running decides");
+                VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                return nullptr;
+            }
+            AstVar* const carrp = newTempVar("__Vaggval", dynCarrierRef(typep, flp), flp);
+            outp = new AstAssign{flp, new AstVarRef{flp, carrp, VAccess::WRITE}, rhsp};
+            const auto cr = [&]() { return new AstVarRef{flp, carrp, VAccess::READ}; };
+            outp->addNext(new AstIf{flp,
+                                    new AstNeq{flp, dynCarrierLength(cr(), flp),
+                                               new AstConst{flp, AstConst::Unsized32{},
+                                                            static_cast<uint32_t>(dynLength)}},
+                                    lengthMismatch(flp)});
+            const VhdlType* const indexp
+                = typep->base()->indexTypes().empty() ? nullptr : typep->base()->indexTypes()[0];
+            const int64_t index = indexp ? indexp->left() : 0;
+            const int64_t step = (indexp && !indexp->ascending()) ? -1 : 1;
+            for (int64_t k = 0; k < dynLength; ++k) {
+                outp->addNext(new AstAssign{
+                    flp,
+                    new AstSelBit{flp, new AstVarRef{flp, tempp, VAccess::WRITE},
+                                  new AstConst{flp, AstConst::Signed32{},
+                                               static_cast<int32_t>(index + k * step)}},
+                    new AstSelBit{
+                        flp, dynPart(cr(), "q", flp),
+                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(k)}}});
+            }
+        } else {
+            outp = new AstAssign{flp, new AstVarRef{flp, tempp, VAccess::WRITE}, rhsp};
+        }
+        // The copy is indexed as the type's own index subtype starts, the
+        // value's bounds being only what running settles
+        return AstNode::addNextNull(outp, spreadAggregate(targetp,
+                                                          new AstVarRef{flp, tempp, VAccess::READ},
+                                                          dynValue ? typep->base() : typep,
+                                                          signalAssign, sequential, flp, delayp));
     }
 
     // Each name the aggregate lists takes the part of "srcp" that stands in
