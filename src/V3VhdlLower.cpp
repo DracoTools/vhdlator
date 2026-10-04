@@ -17878,6 +17878,30 @@ private:
     // The value such an aggregate is, carrying the bounds its range gives it:
     // one value in every place from one end to the other (9.3.3.3)
     AstNodeExpr* rangeFillCarrier(AstVhdlAggregate* nodep, VhdlType* carrp, FileLine* flp) {
+        // "(index => '1')": one element at a place only running settles,
+        // which is allowed where the choice is the only one (9.3.3.3). The
+        // value runs from that place to it, the way its index subtype runs.
+        if (AstVhdlChoice* const onep = runningSingleChoice(nodep)) {
+            AstNodeFTask* const fillp = dynFillFunc(carrp, flp);
+            const VhdlType* const idxp = indexSubtype(carrp, 0);
+            if (!fillp || !idxp) return nullptr;
+            AstNodeExpr* const atp = lowerExpr(onep->valuep());
+            if (!atp) return nullptr;
+            AstNodeExpr* const elemp
+                = repeatable(atp) ? lowerExpr(nodep->elemsp()->valuep()) : nullptr;
+            if (!elemp) {
+                VL_DO_DANGLING(atp->deleteTree(), atp);
+                return nullptr;
+            }
+            AstArg* const argsp = new AstArg{flp, "", intBound(atp->cloneTree(false), flp)};
+            argsp->addNext(new AstArg{flp, "", intBound(atp, flp)});
+            argsp->addNext(
+                new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, !idxp->ascending()}});
+            argsp->addNext(new AstArg{flp, "", elemp});
+            AstFuncRef* const filledp = new AstFuncRef{flp, fillp->name(), argsp};
+            filledp->taskp(VN_AS(fillp, Func));
+            return filledp;
+        }
         AstNodeVhdlExpr* const valuep = uniformAggregateValue(nodep);
         AstVhdlChoice* const chp = valuep ? nodep->elemsp()->choicesp() : nullptr;
         AstVhdlRange* const rp = chp ? chp->rangep() : nullptr;
@@ -17909,6 +17933,18 @@ private:
         return filledp;
     }
 
+    // The one choice of an aggregate that is one element at a place only
+    // running settles -- "(index => '1')" -- or null
+    AstVhdlChoice* runningSingleChoice(const AstVhdlAggregate* aggp) const {
+        const AstVhdlElemAssoc* const eap = aggp->elemsp();
+        if (!eap || eap->nextp() || !eap->choicesp() || eap->choicesp()->nextp()) return nullptr;
+        AstVhdlChoice* const chp = eap->choicesp();
+        if (chp->isOthers() || chp->rangep() || !chp->valuep()) return nullptr;
+        const VhdlSymbol* const symp = chp->valuep()->vhdlSymp();
+        if (symp && symp->resolved()->kind() == VhdlSymKind::TYPE) return nullptr;
+        return boundsOnlyRunningDecides(chp->valuep()) ? chp : nullptr;
+    }
+
     // Whether an aggregate is one value over one range that only running
     // settles, with no subtype of its own that fixes its length -- standing
     // as an operand, or returned where the result is unconstrained. Such an
@@ -17929,6 +17965,7 @@ private:
             && typep->indexTypes()[0]->bounded()) {
             return false;
         }
+        if (runningSingleChoice(aggp)) return true;
         const AstVhdlElemAssoc* const eap = aggp->elemsp();
         if (!eap || eap->nextp() || !eap->choicesp() || eap->choicesp()->nextp()) return false;
         const AstVhdlRange* const rp = eap->choicesp()->rangep();
