@@ -3505,6 +3505,29 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
     // as a type mark and an alias of an object as an object (6.6)
     std::vector<std::string> parts;
     std::vector<VhdlSymbol*> found;
+    // An alias of a package is another name for that region (6.6.3):
+    // "alias p is work.pkg" and then "p.c" (GHDL gna issue2473). A package
+    // is a region and not a symbol, so it is named rather than declared.
+    if (!nodep->subtypep() && !nodep->signaturep() && flatten(nodep->targetp(), parts)
+        && !parts.empty()) {
+        VhdlScope* regionp = m_scopep->findNamed(lower(parts[0]));
+        for (size_t i = 1; regionp && i < parts.size(); ++i) {
+            regionp = regionp->findNamed(lower(parts[i]));
+        }
+        std::vector<VhdlSymbol*> asSymbol;
+        if (parts.size() == 1) lookup(parts[0], asSymbol);
+        bool isPackage = false;
+        for (const auto& pair : m_unitScopes) {
+            if (pair.second != regionp) continue;
+            const auto uIt = m_primaryUnits.find(pair.first);
+            if (uIt != m_primaryUnits.end() && VN_IS(uIt->second, VhdlPackage)) isPackage = true;
+        }
+        if (regionp && isPackage && asSymbol.empty()) {
+            m_scopep->addNamed(lower(nodep->name()), regionp);
+            return;
+        }
+    }
+    parts.clear();
     if (flatten(nodep->targetp(), parts) && !parts.empty()) {
         VhdlScope* scopep = m_scopep;
         bool viaScope = parts.size() > 1;
