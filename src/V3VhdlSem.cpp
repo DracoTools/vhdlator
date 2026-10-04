@@ -12017,17 +12017,71 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
         // A slice whose bounds did not fold is still that long: a bound
         // naming a generic is fixed once the instance is elaborated, so the
         // range is kept as written for the back end to fold then (8.5).
-        // Only where every name in them is a generic: that value arrives
-        // with the instance, where a variable's or a loop parameter's
-        // arrives only while running.
+        // Only where every name in them is fixed by then too: a generic, a
+        // constant outside a subprogram, a call of a pure function, or an
+        // array attribute of an object declared outside one, whose subtype
+        // elaboration fixes -- "s(s'high downto f(2))" with s sized by a
+        // function the analysis does not fold (GHDL gna issue2540). A
+        // variable's or a loop parameter's value arrives only while running.
         if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
             bool onlyGenerics = true;
             bool anyName = false;
+            const auto outsideSubprogram = [](const VhdlSymbol* symp) {
+                for (const AstNode* up = parentOf(symp->declp()); up; up = parentOf(up)) {
+                    if (VN_IS(up, VhdlSubprogDecl)) return false;
+                }
+                return true;
+            };
+            // Names other than generics only where the object sliced has no
+            // numbers for its own range either: elsewhere a slice whose ends
+            // do not fold keeps the path it always had
+            const bool prefixOpen = !indexp || !indexp->bounded();
             rp->foreach([&](AstVhdlName* namep) {
-                const VhdlSymbol* const nsymp
-                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                // The name a call is written on carries no symbol of its own;
+                // the call does
+                const AstVhdlCall* const callp = VN_CAST(namep->backp(), VhdlCall);
+                const VhdlSymbol* const nameSymp
+                    = namep->vhdlSymp()
+                          ? namep->vhdlSymp()
+                          : (callp && callp->prefixp() == namep ? callp->vhdlSymp() : nullptr);
+                const VhdlSymbol* const nsymp = nameSymp ? nameSymp->resolved() : nullptr;
                 anyName = true;
-                if (!nsymp || nsymp->kind() != VhdlSymKind::GENERIC) onlyGenerics = false;
+                if (!nsymp) {
+                    onlyGenerics = false;
+                    return;
+                }
+                if (nsymp->kind() == VhdlSymKind::GENERIC) return;
+                if (!prefixOpen) {
+                    onlyGenerics = false;
+                    return;
+                }
+                switch (nsymp->kind()) {
+                case VhdlSymKind::ENUM_LITERAL:
+                case VhdlSymKind::PHYSICAL_UNIT: return;
+                case VhdlSymKind::CONSTANT:
+                    if (!outsideSubprogram(nsymp)) onlyGenerics = false;
+                    return;
+                case VhdlSymKind::FUNCTION: {
+                    if (nsymp->predefined()) return;
+                    const AstVhdlSubprogDecl* declp = nsymp->bodyp();
+                    if (!declp) declp = VN_CAST(nsymp->declp(), VhdlSubprogDecl);
+                    if (!declp || !declp->vhdlPure()) onlyGenerics = false;
+                    return;
+                }
+                case VhdlSymKind::SIGNAL:
+                case VhdlSymKind::PORT:
+                case VhdlSymKind::VARIABLE: {
+                    // Only as the prefix of an attribute of its subtype
+                    const AstVhdlAttrName* const ap = VN_CAST(namep->backp(), VhdlAttrName);
+                    const bool subtypeAttr
+                        = ap && ap->prefixp() == namep && !ap->argp()
+                          && (ap->name() == "left" || ap->name() == "right" || ap->name() == "high"
+                              || ap->name() == "low" || ap->name() == "length");
+                    if (!subtypeAttr || !outsideSubprogram(nsymp)) onlyGenerics = false;
+                    return;
+                }
+                default: onlyGenerics = false;
+                }
             });
             if (info.valid && !info.unbounded && rp->leftp() && rp->rightp() && anyName
                 && onlyGenerics) {
@@ -12525,7 +12579,7 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
                 case VhdlSymKind::CONSTANT: {
                     // Not one a subprogram declares, which is elaborated
                     // afresh on each call
-                    for (const AstNode* up = symp->declp(); up; up = up->backp()) {
+                    for (const AstNode* up = parentOf(symp->declp()); up; up = parentOf(up)) {
                         if (VN_IS(up, VhdlSubprogDecl)) {
                             settled = false;
                             break;
