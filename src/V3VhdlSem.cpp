@@ -2251,6 +2251,9 @@ public:
     }
     // Whether a subprogram may be called with no arguments at all (4.2.2.1)
     static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
+    // The subtype a string or bit string literal has where its context
+    // leaves the length open (9.3.2)
+    VhdlType* literalSubtype(AstNodeVhdlExpr* valuep, VhdlType* typep) VL_MT_DISABLED;
     // A record subtype whose open elements take their bounds from the values
     // written for them one at a time (5.3.3, 6.5.7.1)
     VhdlType* constrainRecordFromParts(VhdlType* typep,
@@ -2403,7 +2406,6 @@ private:
     int64_t elementSpan(AstNodeVhdlExpr* valuep, VhdlType* arrayTypep) VL_MT_DISABLED;
     VhdlType* aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* typep) VL_MT_DISABLED;
     static bool sameElementLengths(const VhdlType* ap, const VhdlType* bp) VL_MT_DISABLED;
-    VhdlType* literalSubtype(AstNodeVhdlExpr* valuep, VhdlType* typep) VL_MT_DISABLED;
     void checkCompositeElements(VhdlType* typep, FileLine* flp) VL_MT_DISABLED;
     bool checkAssignedType(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
     static bool indexedCallWouldFit(const AstNodeVhdlExpr* nodep, const VhdlType* valuep,
@@ -7281,6 +7283,18 @@ private:
                 }
             }
             VhdlType* typep = actp->vhdlTypep();
+            // A string or bit string literal handed to an operator --
+            // X"05" * X"07" -- is typed by the formal it goes to, which is
+            // open, but it is as long as it is written (9.3.2)
+            if (typep && !typep->isConstrainedArray() && symp->paramTypes()[i]) {
+                AstNodeVhdlExpr* litp = actp;
+                while (AstVhdlQualified* const qp = VN_CAST(litp, VhdlQualified)) {
+                    litp = qp->valuep();
+                }
+                if (VhdlType* const ownp = m_sem.literalSubtype(litp, symp->paramTypes()[i])) {
+                    typep = ownp;
+                }
+            }
             // A formal named by a slice of itself is as long as that slice
             // says, whatever length the actual happens to have (6.5.7.1)
             if (i < byFormalSlice.size() && byFormalSlice[i]) {
