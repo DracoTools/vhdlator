@@ -227,6 +227,11 @@ class VhdlLowerVisitor final {
     // The generics and the ports each entity declares, in order, for a
     // binding indication whose maps are written positionally
     std::map<std::string, std::vector<std::string>> m_entityGenericNames;
+    // Generics of other units a copy's generic types are sized by -- "dat =>
+    // dat" with "subtype dat is bit_vector(width - 1 downto 0)" -- keyed by
+    // the module the copy becomes: it declares a parameter for each, which
+    // every instance hands the value it has
+    std::map<std::string, std::vector<VhdlSymbol*>> m_typeGenBounds;
     // The generics of each entity that travel as data, by the entity's name.
     // A binding indication associates the entity's generics rather than the
     // component's, and names them where a positional map gives no symbol.
@@ -1705,6 +1710,10 @@ private:
         if (it == m_hoistName.end()) return lowerExpr(nodep);
         return new AstVarRef{nodep->fileline(), hoistVar(it->second, nodep->fileline()),
                              VAccess::READ};
+    }
+
+    static std::string typeGenBoundName(const VhdlSymbol* symp, size_t index) {
+        return "__Vtg" + std::to_string(index) + "_" + symp->name();
     }
 
     // The parameter a hoisted bound reads, declared in this module the first
@@ -23630,6 +23639,20 @@ private:
         // can carry: elaboration works each out over what this instance
         // hands that generic, and the number goes over as a parameter
         paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
+        // A copy made for a generic type sized by a generic of this unit
+        // takes that generic's value here
+        {
+            const auto tgbIt = m_typeGenBounds.find(modName);
+            if (tgbIt != m_typeGenBounds.end()) {
+                for (size_t i = 0; i < tgbIt->second.size(); ++i) {
+                    VhdlSymbol* const gsymp = tgbIt->second[i];
+                    AstNodeExpr* const valp = lowerRef(gsymp, gsymp->name(), flp);
+                    if (!valp) continue;
+                    paramsp = AstNode::addNextNull(
+                        paramsp, new AstPin{flp, ++pinNum, typeGenBoundName(gsymp, i), valp});
+                }
+            }
+        }
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
         m_instantiated.insert(modName);
         if (m_modp) m_cellParents[modName].insert(m_modp->name());
@@ -33584,6 +33607,32 @@ private:
                 }
             }
         }
+        // A generic type sized by a generic of the unit that instantiates
+        // this copy: that generic is a parameter of this module too, which
+        // the instance gives its own value. Declared first: a generic of that
+        // type is sized by it
+        {
+            const auto tgbIt = m_typeGenBounds.find(m_modp->name());
+            if (tgbIt != m_typeGenBounds.end()) {
+                for (size_t i = 0; i < tgbIt->second.size(); ++i) {
+                    VhdlSymbol* const gsymp = tgbIt->second[i];
+                    AstNodeDType* const dtypep
+                        = gsymp->typep() ? lowerType(gsymp->typep(), flp) : nullptr;
+                    AstVar* const gvarp
+                        = new AstVar{flp, VVarType::GPARAM, typeGenBoundName(gsymp, i),
+                                     VFlagChildDType{}, dtypep ? dtypep : newIntDType(flp)};
+                    const VhdlValue defv
+                        = V3VhdlEval::eval(VN_CAST(gsymp->declp(), VhdlIfaceDecl)
+                                               ? VN_AS(gsymp->declp(), VhdlIfaceDecl)->defaultp()
+                                               : nullptr);
+                    AstNodeExpr* const valp
+                        = defv.known() ? lowerValue(defv, gsymp->typep(), flp) : nullptr;
+                    gvarp->valuep(valp ? valp : new AstConst{flp, AstConst::Signed32{}, 0});
+                    addStmt(gvarp);
+                    m_vars[gsymp] = gvarp;
+                }
+            }
+        }
         int pinNum = 0;
         m_dataGenericVarps.clear();
         for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
@@ -34328,6 +34377,39 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     }
     for (const auto& pair : entities) {
         m_knownEntities.insert(pair.first);
+        {
+            // The generics of other units that this entity's generic types
+            // are sized by, in the order the types name them
+            std::vector<VhdlSymbol*>& tgb = m_typeGenBounds[pair.second->name()];
+            std::set<const VhdlSymbol*> own;
+            for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
+                if (const VhdlSymbol* const gsymp = VN_AS(gp, VhdlIfaceDecl)->vhdlSymp()) {
+                    own.insert(gsymp->resolved());
+                }
+            }
+            std::set<const VhdlSymbol*> seen;
+            const std::function<void(const VhdlType*, int)> fromType
+                = [&](const VhdlType* typep, int depth) {
+                      if (!typep || depth > 4) return;
+                      for (const VhdlType* const idxp : typep->indexTypes()) {
+                          if (!idxp || !idxp->boundsp()) continue;
+                          idxp->boundsp()->foreach([&](const AstVhdlName* namep) {
+                              VhdlSymbol* const nsymp
+                                  = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                              if (!nsymp || nsymp->kind() != VhdlSymKind::GENERIC) return;
+                              if (own.count(nsymp) || !seen.insert(nsymp).second) return;
+                              tgb.push_back(nsymp);
+                          });
+                      }
+                      fromType(typep->elementp(), depth + 1);
+                  };
+            for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
+                const AstVhdlIfaceDecl* const ifp = VN_AS(gp, VhdlIfaceDecl);
+                if (ifp->kind() != VhdlIfaceKind::TYPE || !ifp->vhdlSymp()) continue;
+                fromType(ifp->vhdlSymp()->typep(), 0);
+            }
+            if (tgb.empty()) m_typeGenBounds.erase(pair.second->name());
+        }
         std::vector<std::string>& names = m_entityGenericNames[pair.first];
         for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
             names.push_back(VN_AS(gp, VhdlIfaceDecl)->name());
