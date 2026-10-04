@@ -12288,10 +12288,20 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
     bool named = false;
     bool sawRange = false;
     bool rangeAscending = true;
+    // Whether a named association gives a slice of the aggregate rather
+    // than one element: "(15 downto 12 => s, 11 downto 0 => v)"
+    bool sliceNamed = false;
+    // Whether the one choice there is a range that is not locally static,
+    // "(width - 1 downto 0 => fill)" with width a parameter
+    bool soleRangeDynamic = false;
     int64_t lowest = INT64_MAX;
     int64_t highest = INT64_MIN;
     for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
         AstVhdlElemAssoc* const eap = VN_AS(p, VhdlElemAssoc);
+        if (eap->choicesp() && eap->valuep() && eap->valuep()->vhdlTypep()
+            && eap->valuep()->vhdlTypep()->base() == typep->base()) {
+            sliceNamed = true;
+        }
         if (!eap->choicesp()) {
             const int64_t span = elementSpan(eap->valuep(), typep);
             if (span < 0) return nullptr;
@@ -12324,10 +12334,25 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
                 lo = std::min(info.left.toInt(), info.right.toInt());
                 hi = std::max(info.left.toInt(), info.right.toInt());
                 // A choice written as a range says which way the aggregate's
-                // own index runs, whatever the index subtype does (9.3.3.3)
+                // own index runs where an association gives a slice of it,
+                // or where it is the only choice and not locally static;
+                // where every one gives an element, the index subtype does
+                // (9.3.3.3). nvc 1.22.1, GHDL 7.0.0-dev and Questa 2025.2
+                // all give "(3 downto 0 => '0')" the range 0 to 3, and
+                // "(7 downto 4 => '1', 3 downto 0 => a)" 7 downto 0.
                 if (!sawRange) {
                     sawRange = true;
                     rangeAscending = info.left.toInt() <= info.right.toInt();
+                }
+                if (p == nodep->elemsp() && !eap->nextp() && cp == eap->choicesp()
+                    && !cp->nextp()) {
+                    bool param = false;
+                    rp->foreach([&](const AstVhdlName* namep) {
+                        const VhdlSymbol* const symp
+                            = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                        if (symp && symp->kind() == VhdlSymKind::PARAMETER) param = true;
+                    });
+                    soleRangeDynamic = param || notLocallyStatic(rp);
                 }
             } else {
                 const VhdlValue v = V3VhdlEval::eval(chp->valuep());
@@ -12338,7 +12363,10 @@ VhdlType* VhdlSemVisitor::aggregateSubtype(AstVhdlAggregate* nodep, VhdlType* ty
             highest = std::max(highest, hi);
         }
     }
-    const bool ascending = sawRange ? rangeAscending : indexp->ascending();
+    // nvc 1.22.1 and GHDL 7.0.0-dev let such a sole range decide as well,
+    // where Questa 2025.2 keeps the index subtype's direction
+    const bool ascending
+        = sawRange && (sliceNamed || soleRangeDynamic) ? rangeAscending : indexp->ascending();
     int64_t left = 0;
     int64_t right = 0;
     if (named) {
