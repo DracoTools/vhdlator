@@ -18127,6 +18127,21 @@ private:
                                                : new AstSub{flp, lop, hip};
                 return new AstAdd{flp, spanp, new AstConst{flp, AstConst::Signed32{}, 1}};
             }
+            // "(msg'range => ' ')" of a STRING whose length only running
+            // decides -- what a LINE points at -- is as long as that value
+            const AstVhdlAttrName* const attrp = rp ? VN_CAST(rp->attrp(), VhdlAttrName) : nullptr;
+            if (attrp && attrp->prefixp() && !attrp->argp()
+                && (attrp->name() == "range" || attrp->name() == "reverse_range")) {
+                const VhdlType* strTypep = attrp->prefixp()->vhdlTypep();
+                if (strTypep && strTypep->base()->kind() == VhdlTypeKind::ACCESS) {
+                    strTypep = strTypep->base()->designatedp();
+                }
+                if (strTypep && isStringType(strTypep) && !strTypep->isConstrainedArray()) {
+                    if (AstNodeExpr* const strp = lowerExpr(attrp->prefixp())) {
+                        return new AstLenN{flp, strp};
+                    }
+                }
+            }
             return nullptr;
         };
         AstVhdlElemAssoc* const eap = nodep->elemsp();
