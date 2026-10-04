@@ -16435,6 +16435,45 @@ private:
             // t_natural_vector -- and not a number to reinterpret
             const VhdlType* const telemp
                 = top->elementp() ? top->elementp() : top->base()->elementp();
+            // Unless the elements are of closely related types themselves,
+            // INTEGER and REAL: "real_vector(i)" converts each element as a
+            // conversion of it would (9.3.6)
+            const VhdlType* const felemp
+                = fromp && fromKind == VhdlTypeKind::ARRAY
+                      ? (fromp->elementp() ? fromp->elementp() : fromp->base()->elementp())
+                      : nullptr;
+            const bool toReal = telemp && telemp->base()->kind() == VhdlTypeKind::FLOATING;
+            const bool fromReal = felemp && felemp->base()->kind() == VhdlTypeKind::FLOATING;
+            if (telemp && felemp && toReal != fromReal) {
+                const auto convertOne = [&](AstNodeExpr* elemp) -> AstNodeExpr* {
+                    if (toReal) {
+                        return new AstCast{flp, elemp, VFlagChildDType{},
+                                           lowerType(const_cast<VhdlType*>(telemp), flp)};
+                    }
+                    return new AstRToIRoundS{flp, elemp};
+                };
+                const VhdlType* const fidxp = indexSubtype(fromp, 0);
+                if (fromp->dimensions() != 1 || !fidxp || !fidxp->bounded() || fidxp->length() <= 0
+                    || fidxp->length() > 4096 || !repeatable(valuep)) {
+                    VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                    unsup(flp, "conversion between arrays of INTEGER and REAL elements whose"
+                               " length is not known here");
+                    return nullptr;
+                }
+                AstNode* membersp = nullptr;
+                for (int64_t i = 0; i < fidxp->length(); ++i) {
+                    const int64_t at = fidxp->ascending() ? fidxp->left() + i : fidxp->left() - i;
+                    AstNodeExpr* elemp = new AstSelBit{
+                        flp, valuep->cloneTree(false),
+                        new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at)}};
+                    elemp = convertOne(elemp);
+                    membersp = AstNode::addNextNull(
+                        membersp,
+                        static_cast<AstNode*>(new AstPatMember{flp, elemp, nullptr, nullptr}));
+                }
+                VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                return new AstPattern{flp, membersp};
+            }
             if (telemp && !elementPacks(telemp)) return valuep;
             // unsigned(x), signed(x) and std_logic_vector(x) reinterpret the
             // same bits; only the signedness changes
