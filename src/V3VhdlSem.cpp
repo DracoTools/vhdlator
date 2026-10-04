@@ -15560,7 +15560,29 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
         }
         if (!subp || subp->constraintp() || !subp->typeMarkp()) continue;
         VhdlSymbol* const tsymp = lookupTypeQuiet(subp->typeMarkp());
-        VhdlType* const typep = tsymp ? tsymp->typep() : nullptr;
+        VhdlType* typep = tsymp ? tsymp->typep() : nullptr;
+        // In a copy made for an instance, a port of a generic type is of the
+        // type the instance named, which the copy's generic clause declares
+        // only after this runs: "tyi => bit_vector" leaves the port as open
+        // as one written "bit_vector" (GHDL gna issue2702)
+        // A subtype whose range names a generic -- "bit_vector(width - 1
+        // downto 0)" -- is marked unconstrained as well, but it is not open
+        // and has nothing to take from the actual.
+        if (!typep) {
+            if (const AstVhdlName* const mnp = VN_CAST(subp->typeMarkp(), VhdlName)) {
+                const auto boundIt = m_boundGenTypes.find(mnp->name());
+                VhdlType* const boundp
+                    = boundIt != m_boundGenTypes.end() ? boundIt->second : nullptr;
+                bool open = boundp && boundp->base()->kind() == VhdlTypeKind::ARRAY
+                            && boundp->unconstrained();
+                if (open) {
+                    for (const VhdlType* const idxp : boundp->indexTypes()) {
+                        if (!idxp || !idxp->bounded()) open = false;
+                    }
+                }
+                if (open) typep = boundp;
+            }
+        }
         if (!typep) continue;
         // An array port, including an array of arrays, is a shape the back
         // end builds from a range and nothing more, so bounds an instance
