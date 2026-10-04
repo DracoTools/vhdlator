@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_convopen_bad.vhd:40:72: The conversion in the formal part of unconstrained port 'foo' must give a constrained subtype, and 'std_logic_vector' is not one
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_convopen_bad.vhd:41:63: The conversion in the formal part of unconstrained port 'foo' must give a constrained subtype, and 'std_logic_vector' is not one
+%Error: Exiting due to

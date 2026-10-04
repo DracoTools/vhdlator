@@ -15923,6 +15923,34 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                     }
                     const AstVhdlName* const argNamep = VN_CAST(argp, VhdlName);
                     if (argNamep && argNamep->name() == bound.port) {
+                        // What the conversion gives has to be constrained,
+                        // or nothing would say how long the port is: GHDL
+                        // 7.0.0-dev and Questa 2025.2 refuse
+                        // "std_logic_vector(foo) => bar" for an open foo,
+                        // nvc 1.22.1 accepts it (GHDL gna issue40)
+                        const VhdlType* convTypep = nullptr;
+                        if (VhdlSymbol* const tsymp = lookupTypeQuiet(callp->prefixp())) {
+                            convTypep = tsymp->typep();
+                        } else if (rootp) {
+                            std::vector<VhdlSymbol*> funcs;
+                            lookup(rootp->name(), funcs);
+                            for (const VhdlSymbol* const fsymp : funcs) {
+                                const VhdlSymbol* const rp = fsymp->resolved();
+                                if (rp->kind() == VhdlSymKind::FUNCTION
+                                    && rp->paramTypes().size() == 1 && rp->returnTypep()) {
+                                    convTypep = rp->returnTypep();
+                                    break;
+                                }
+                            }
+                        }
+                        if (convTypep && convTypep->base()->kind() == VhdlTypeKind::ARRAY
+                            && !convTypep->isConstrainedArray()) {
+                            err(callp->fileline(),
+                                "The conversion in the formal part of unconstrained port '"
+                                    + bound.port + "' must give a constrained subtype, and '"
+                                    + convTypep->prettyName() + "' is not one");
+                            continue;
+                        }
                         actualp = asp->actualp();
                         break;
                     }
