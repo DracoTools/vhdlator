@@ -10247,6 +10247,13 @@ void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, boo
                     && !callp->argsp()->nextp()) {
                     choicep = new AstVhdlChoice{asp->fileline(),
                                                 idxValp->cloneTree(false)};
+                } else if (AstVhdlRange* const rangep = VN_CAST(callp->argsp(), VhdlRange)) {
+                    // A slice of the formal, "a(1 downto 0) => x": in the
+                    // aggregate that range takes the elements of x, which is
+                    // of the formal's own type (9.3.3.3; GHDL gna issue73)
+                    if (VN_IS(callp->prefixp(), VhdlName) && !rangep->nextp()) {
+                        choicep = new AstVhdlChoice{asp->fileline(), rangep->cloneTree(false)};
+                    }
                 }
             }
             if (!choicep) {
@@ -10254,6 +10261,19 @@ void VhdlSemVisitor::mergeIndividualIn(AstNode* assocsp, AstVhdlCall* callp, boo
                 break;
             }
             AstNodeVhdlExpr* const valuep = asp->actualp()->cloneTree(false);
+            // "a(3 downto 2) => (others => '0')": the slice is what says how
+            // long that value is, and inside the aggregate nothing else would,
+            // so it is written with the slice's own range instead of "others"
+            if (AstVhdlRange* const crangep = choicep->rangep()) {
+                AstVhdlAggregate* const vaggp = VN_CAST(valuep, VhdlAggregate);
+                AstVhdlElemAssoc* const onep = vaggp ? vaggp->elemsp() : nullptr;
+                AstVhdlChoice* const ochp = onep && !onep->nextp() ? onep->choicesp() : nullptr;
+                if (ochp && ochp->isOthers() && !ochp->nextp()) {
+                    VL_DO_DANGLING(ochp->unlinkFrBack()->deleteTree(), ochp);
+                    onep->addChoicesp(
+                        new AstVhdlChoice{asp->fileline(), crangep->cloneTree(false)});
+                }
+            }
             AstVhdlElemAssoc* const elemp
                 = new AstVhdlElemAssoc{asp->fileline(), choicep, valuep};
             if (!aggp) {
