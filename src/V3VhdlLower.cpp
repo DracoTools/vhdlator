@@ -9201,6 +9201,40 @@ private:
         return funcp;
     }
 
+    // The parameter that holds an attribute's array value, typed as an array
+    // as long as the value; one per value and module
+    std::map<std::pair<const AstNode*, const AstNodeModule*>, AstVar*> m_userAttrParams;
+    AstVar* userAttrParam(AstNodeVhdlExpr* valuep, const VhdlType* arrTypep, VhdlType* elemTp,
+                          const VhdlType* ixp, int64_t left, int64_t len, bool ascending,
+                          FileLine* flp) {
+        const auto key = std::make_pair(static_cast<const AstNode*>(valuep),
+                                        static_cast<const AstNodeModule*>(m_modp));
+        const auto it = m_userAttrParams.find(key);
+        if (it != m_userAttrParams.end()) return it->second;
+        VhdlType* const idxp = VhdlSymTab::newType(ixp->base()->kind(), "", flp);
+        idxp->base(ixp->base());
+        idxp->setBounds(left, ascending ? left + len - 1 : left - len + 1, ascending);
+        VhdlType* const ctp = VhdlSymTab::newType(VhdlTypeKind::ARRAY, "", flp);
+        ctp->base(arrTypep->base());
+        ctp->addIndexType(idxp);
+        ctp->elementp(elemTp);
+        ctp->unconstrained(false);
+        // The value lowered as one of that type, which is how an object's
+        // initial value is: the aggregate as written has the open type
+        AstNodeVhdlExpr* const typedp = valuep->cloneTree(false);
+        typedp->vhdlTypep(ctp);
+        AstNodeExpr* const initp = lowerExpr(typedp);
+        VL_DO_DANGLING(typedp->deleteTree(), typedp);
+        if (!initp) return nullptr;
+        AstVar* const parp
+            = new AstVar{flp, VVarType::LPARAM, "__Vattr" + std::to_string(++m_tempNum),
+                         VFlagChildDType{}, lowerType(ctp, flp)};
+        parp->valuep(initp);
+        m_modp->addStmtsp(parp);
+        m_userAttrParams.emplace(key, parp);
+        return parp;
+    }
+
     // The value an attribute specification gave the named prefix, lowered in
     // place of the attribute name
     AstNodeExpr* lowerUserAttr(AstVhdlAttrName* nodep, const std::string& attr) {
@@ -9269,6 +9303,24 @@ private:
                     const VhdlType* const ixp = idxs.empty() ? nullptr : idxs[0];
                     const bool ascending = !ixp || ixp->ascending();
                     const int64_t left = ixp && ixp->bounded() ? ixp->left() : 0;
+                    // An array of records or of vectors is no vector of bits:
+                    // the value is held as a parameter of its own, as long as
+                    // the value, and indexed as an object is, so that an
+                    // element's own elements can be named -- "t_tuple'attr(i).a"
+                    // (GHDL gna issue10)
+                    VhdlType* const elemTp = arrTypep->elementp() ? arrTypep->elementp()
+                                                                  : arrTypep->base()->elementp();
+                    if (elemTp && !isOneBitType(elemTp) && len > 0 && len <= (1 << 20) && ixp
+                        && m_modp && idxs.size() == 1) {
+                        if (AstVar* const parp
+                            = userAttrParam(valuep, arrTypep, elemTp, ixp, left, len, ascending,
+                                            nodep->fileline())) {
+                            VL_DO_DANGLING(outp->deleteTree(), outp);
+                            return new AstSelBit{
+                                nodep->fileline(),
+                                new AstVarRef{nodep->fileline(), parp, VAccess::READ}, indexp};
+                        }
+                    }
                     if (len > 0 && len <= (1 << 20)) {
                         FileLine* const iflp = nodep->fileline();
                         // Ascending, the leftmost index is the highest bit;
