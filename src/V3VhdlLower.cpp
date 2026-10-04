@@ -7988,6 +7988,37 @@ private:
             }
             return true;
         }
+        // "big_range(f(x)'range)": what the call gives back carries its
+        // bounds, which the call's result subtype writes in the terms of its
+        // own copy's parameters and so cannot be read here (nvc range1). The
+        // call is read for them -- once per end, so only a pure one.
+        if (dscpp && dim == 0 && carriedCallResult(attrp->prefixp())) {
+            const VhdlSymbol* const fsymp = attrp->prefixp()->vhdlSymp()->resolved();
+            const AstVhdlSubprogDecl* fdeclp = fsymp->bodyp();
+            if (!fdeclp) fdeclp = VN_CAST(fsymp->declp(), VhdlSubprogDecl);
+            if (fdeclp && fdeclp->vhdlPure()) {
+                AstNodeExpr* const objp = lowerExpr(attrp->prefixp());
+                if (!objp) return false;
+                leftp = dynPart(objp, reverse ? "rgt" : "lft", flp);
+                rightp = dynPart(objp->cloneTree(false), reverse ? "lft" : "rgt", flp);
+                // Which way it runs the result subtype says, though its ends
+                // only running settles -- "bit_vector(k + 3 downto k)" --
+                // and a slice of an object of fixed length needs it to know
+                // which end its part-select is anchored at
+                const VhdlType* const ridxp = indexSubtype(typep, 0);
+                const AstVhdlRange* const rrp
+                    = ridxp ? VN_CAST(ridxp->boundsp(), VhdlRange) : nullptr;
+                if (rrp && !rrp->dirUnknown()) {
+                    ascending = (rrp->dir() == VhdlDir::TO) != reverse;
+                    dirKnown = true;
+                    return true;
+                }
+                dirKnown = false;
+                AstNodeExpr* const dscp = dynPart(objp->cloneTree(false), "dsc", flp);
+                *dscpp = reverse ? static_cast<AstNodeExpr*>(new AstNot{flp, dscp}) : dscp;
+                return true;
+            }
+        }
         if (!dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
             // Bounds the text already fixed
             const VhdlType* const idxp = indexSubtype(typep, dim);
