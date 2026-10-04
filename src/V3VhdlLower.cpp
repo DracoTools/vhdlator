@@ -10813,7 +10813,10 @@ private:
                 // no assignment here writes, such as a port driven from
                 // outside. Its events are all this side can see, and every
                 // event is a transaction, so answer from those.
-                const VhdlShadow* const evp = shadowFor(prefixp, flp);
+                // An implicit signal -- "s(0)'delayed'last_active" -- the
+                // same, from the history kept of it (GHDL gna bug0140)
+                const VhdlShadow* evp = shadowFor(prefixp, flp);
+                if (!evp && VN_IS(prefixp, VhdlAttrName)) evp = shadowOfImplicit(prefixp, flp);
                 if (!evp) return nullptr;
                 if (attr == "transaction") {
                     return new AstVarRef{flp, evp->transp, VAccess::READ};
