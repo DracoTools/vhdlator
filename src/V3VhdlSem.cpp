@@ -12362,6 +12362,22 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
                     markIn(p, ignored, true);
                 }
             });
+            // A slice in a concurrent signal assignment is a part the back
+            // end settles when it elaborates the design, so a constant its
+            // bounds name -- "dout(c_l(i) + c_w(i) - 1 downto c_l(i))" in a
+            // generate -- is settled with it. In a process or a subprogram a
+            // slice whose bounds only running decides is handled as one.
+            unitp->foreach([&](AstVhdlSigAssign* asp) {
+                for (const AstNode* up = asp->backp(); up; up = up->backp()) {
+                    if (VN_IS(up, VhdlProcess) || VN_IS(up, VhdlSubprogDecl)) return;
+                    if (VN_IS(up, NodeVhdlUnit)) break;
+                }
+                asp->foreach([&](AstVhdlCall* callp) {
+                    for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+                        if (VN_IS(ap, VhdlRange)) markIn(ap, ignored, true);
+                    }
+                });
+            });
         }
     }
     for (int round = 0; round < 16; ++round) {
