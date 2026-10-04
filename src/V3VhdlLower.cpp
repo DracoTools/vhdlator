@@ -18485,13 +18485,28 @@ private:
             // where this element's is carried -- is converted as an
             // assignment would convert it. Taken as it stood it was a record
             // of another type, which came out as zero (GHDL's issue646)
+            // "others" stands for every element it covers, each of its own
+            // subtype: "(others => (others => '0'))" over a record of a
+            // five-bit and a six-bit vector is five zeros and six zeros
+            // (9.3.3.1). Analysis gave the one value one subtype, so it is
+            // lowered as each element's in turn (GHDL gna issue1323).
+            VhdlType* const givenp = valuep->vhdlTypep();
+            const bool retype = !byElem[i] && VN_IS(valuep, VhdlAggregate) && givenp
+                                && elems[i]->typep()
+                                && elems[i]->typep()->base() == givenp->base();
+            if (retype) valuep->vhdlTypep(elems[i]->typep());
             AstNodeExpr* memberp = recordAsShape(valuep, elems[i]->typep(), flp);
             if (!memberp) memberp = lowerExpr(valuep);
-            if (!memberp) return nullptr;
+            if (!memberp) {
+                if (retype) valuep->vhdlTypep(givenp);
+                return nullptr;
+            }
             if (packed) {
                 memberp = elemLengthChecked(memberp, valuep, elems[i]->typep(), flp);
+                if (retype) valuep->vhdlTypep(givenp);
                 outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
             } else {
+                if (retype) valuep->vhdlTypep(givenp);
                 itemsp = AstNode::addNextNull(
                     itemsp, new AstPatMember{flp, memberp,
                                              new AstText{flp, elems[i]->name()}, nullptr});
