@@ -15223,6 +15223,57 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
             continue;
         }
         AstVhdlSubtypeInd* const subp = ifp->subtypep();
+        // A record constraint that leaves an element "open" -- "my_rec
+        // (v1(open), v2(l - 1 downto 0))" -- leaves that element to take its
+        // bounds from the actual, as an unconstrained element would
+        // (5.3.3); the elements it does constrain keep what it says (GHDL
+        // gna bug0136)
+        if (subp && !subp->constraintp() && VN_IS(subp->typeMarkp(), VhdlCall)) {
+            AstVhdlCall* const markp = VN_AS(subp->typeMarkp(), VhdlCall);
+            VhdlSymbol* const rsymp = lookupTypeQuiet(markp->prefixp());
+            VhdlType* const rtypep = rsymp ? rsymp->typep() : nullptr;
+            if (!rtypep || rtypep->base()->kind() != VhdlTypeKind::RECORD
+                || !recordWouldPack(rtypep)) {
+                continue;
+            }
+            const auto isOpen = [](const AstNode* ap) {
+                if (VN_IS(ap, VhdlOpen)) return true;
+                const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                return asp && !asp->formalp()
+                       && (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen));
+            };
+            for (AstNode* ap = markp->argsp(); ap; ap = ap->nextp()) {
+                // Each element's constraint is an argument of the mark, read
+                // as an association with no formal
+                AstNode* argp = ap;
+                if (const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc)) {
+                    if (!asp->formalp()) argp = asp->actualp();
+                }
+                AstVhdlCall* const elemCallp = VN_CAST(argp, VhdlCall);
+                const AstVhdlName* const enamep
+                    = elemCallp ? VN_CAST(elemCallp->prefixp(), VhdlName) : nullptr;
+                if (!enamep || !elemCallp->argsp() || elemCallp->argsp()->nextp()
+                    || !isOpen(elemCallp->argsp())) {
+                    continue;
+                }
+                VhdlType* etypep = nullptr;
+                for (const VhdlSymbol* const elemp : rtypep->base()->elements()) {
+                    if (elemp->name() == enamep->name()) etypep = elemp->typep();
+                }
+                if (!etypep || etypep->base()->kind() != VhdlTypeKind::ARRAY) continue;
+                std::vector<std::string> path{enamep->name()};
+                AstVhdlIndexConstraint* const innerp
+                    = openConstraintFor(etypep, ifp, entp, compp, scopep, path);
+                if (!innerp) continue;
+                if (AstNode* const rangesp = innerp->rangesp()) {
+                    AstNode* const oldp = elemCallp->argsp()->unlinkFrBackWithNext();
+                    VL_DO_DANGLING(pushDeletep(oldp), oldp);
+                    elemCallp->addArgsp(VN_AS(rangesp->unlinkFrBackWithNext(), NodeVhdl));
+                }
+                VL_DO_DANGLING(innerp->deleteTree(), innerp);
+            }
+            continue;
+        }
         if (!subp || subp->constraintp() || !subp->typeMarkp()) continue;
         VhdlSymbol* const tsymp = lookupTypeQuiet(subp->typeMarkp());
         VhdlType* const typep = tsymp ? tsymp->typep() : nullptr;
