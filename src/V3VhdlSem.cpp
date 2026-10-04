@@ -2340,6 +2340,7 @@ private:
     bool defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim, int64_t& leftr,
                        int64_t& rightr, bool* ascendingp = nullptr) VL_MT_DISABLED;
     void constrainBlockPorts(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
+    void constrainBlockGenerics(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
 
     VhdlType* loopParamType(const RangeInfo& info, FileLine* flp,
                             AstVhdlRange* rangep = nullptr) VL_MT_DISABLED;
@@ -4500,6 +4501,7 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
         // A block is elaborated where it stands, so a port left unconstrained
         // simply takes the subtype of the one actual it is ever given
         constrainBlockPorts(nodep->headerp());
+        constrainBlockGenerics(nodep->headerp());
         // A conversion written on the formal converts what the port drives
         // on its way out to the actual (6.5.7.1). It names the port, which
         // is declared here, so it is analyzed once that has happened.
@@ -4539,6 +4541,37 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
     iterateAndNextNull(nodep->stmtsp());
     checkConfigSpecs(nodep->declsp(), nodep->stmtsp());
     popScope();
+}
+
+// A block generic of an unconstrained array type -- "generic (taps :
+// bit_vector)" -- takes the subtype of the value its generic map gives it
+// (6.5.6.2), so "taps'range" is a range inside the block (GHDL gna issue2445)
+void VhdlSemVisitor::constrainBlockGenerics(AstVhdlBlockHeader* nodep) {
+    size_t position = 0;
+    for (AstNode* p = nodep->genericsp(); p; p = p->nextp(), ++position) {
+        AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+        if (!ifp || ifp->kind() != VhdlIfaceKind::CONSTANT) continue;
+        VhdlSymbol* const symp = ifp->vhdlSymp();
+        if (!symp || !symp->typep() || !symp->typep()->unconstrained()
+            || symp->typep()->base()->kind() != VhdlTypeKind::ARRAY) {
+            continue;
+        }
+        size_t i = 0;
+        for (AstNode* ap = nodep->genericMapp(); ap; ap = ap->nextp(), ++i) {
+            const AstVhdlAssoc* const asp = VN_AS(ap, VhdlAssoc);
+            const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+            if (namep ? namep->name() != symp->name() : (asp->formalp() || i != position)) {
+                continue;
+            }
+            if (!asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) break;
+            VhdlType* const actualp = asp->actualp()->vhdlTypep();
+            if (actualp && actualp->base() == symp->typep()->base()
+                && actualp->isConstrainedArray() && actualp->lengthEmittable()) {
+                symp->typep(actualp);
+            }
+            break;
+        }
+    }
 }
 
 // A block port whose subtype is unconstrained takes that of its actual
