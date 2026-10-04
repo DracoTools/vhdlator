@@ -386,6 +386,10 @@ public:
     // Declare a symbol here. Returns the symbol it hides, if any, so the
     // caller can complain about an illegal redeclaration (12.3).
     VhdlSymbol* insert(VhdlSymbol* symp) VL_MT_DISABLED;
+    // A declaration of another region made visible by this one's name too,
+    // as an instantiated package makes visible what its generics stand for.
+    // The symbol stays the other region's own.
+    void reexport(VhdlSymbol* symp) { m_direct.emplace(symp->name(), symp); }
 
     // Symbols declared directly in this region with that name
     void lookupLocal(const std::string& name, std::vector<VhdlSymbol*>& out) const VL_MT_DISABLED;

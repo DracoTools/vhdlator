@@ -5673,6 +5673,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     m_inPkgInst = true;
     m_pkgGenTypeNames.clear();
     size_t position = 0;
+    std::vector<const AstVhdlIfaceDecl*> boxDefaults;  // "is <>" the map left to default
     for (AstNode* p = pkgp->genericsp(); p; p = p->nextp(), ++position) {
         AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
         AstNodeVhdlExpr* actualp = nullptr;
@@ -5698,6 +5699,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
                 // (6.5.6.2). Declaring nothing leaves the copy's region
                 // transparent to the instantiation site, which the addUse
                 // above has already made reachable.
+                boxDefaults.push_back(formalp);
                 continue;
             } else {
                 err(nodep->fileline(), "Generic '" + formalp->name()
@@ -5796,6 +5798,64 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         iterate(p);
     }
     m_scopep = savedp;
+    // What the generics bring with them is part of the instance too, for a
+    // use clause of it to make visible (12.4): a generic type's "=" and "/="
+    // (6.5.3), and the subprogram an "is <>" generic took from where the
+    // package is instantiated (6.5.6.2). They are the declarations they
+    // stand for, so made visible as themselves; only now, after the copy is
+    // analyzed, since inside it they were reachable already (GHDL gna
+    // issue2561).
+    std::map<std::string, const VhdlType*> genTypes;
+    for (AstNode* p = pkgp->genericsp(); p; p = p->nextp()) {
+        const AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
+        if (formalp->kind() != VhdlIfaceKind::TYPE) continue;
+        std::vector<VhdlSymbol*> tfound;
+        intop->lookupLocal(formalp->name(), tfound);
+        const VhdlType* const typep
+            = !tfound.empty() && tfound[0]->kind() == VhdlSymKind::TYPE && tfound[0]->typep()
+                  ? tfound[0]->typep()->base()
+                  : nullptr;
+        if (!typep) continue;
+        genTypes.emplace(formalp->name(), typep);
+        for (const char* const op : {"=", "/="}) {
+            std::vector<VhdlSymbol*> ofound;
+            savedp->lookup(op, ofound);
+            for (VhdlSymbol* const opp : ofound) {
+                const VhdlSymbol* const rp = opp->resolved();
+                if (rp->paramTypes().size() == 2 && rp->paramTypes()[0]
+                    && rp->paramTypes()[0]->base() == typep) {
+                    intop->reexport(opp);
+                }
+            }
+        }
+    }
+    for (const AstVhdlIfaceDecl* const formalp : boxDefaults) {
+        const AstVhdlSubprogDecl* const profp = formalp->profilep();
+        size_t nparams = 0;
+        const VhdlType* firstp = nullptr;
+        for (const AstNode* pp = profp->paramsp(); pp; pp = pp->nextp(), ++nparams) {
+            if (nparams) continue;
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(pp, VhdlIfaceDecl);
+            const AstVhdlName* const markp = ifp && ifp->subtypep()
+                                                 ? VN_CAST(ifp->subtypep()->typeMarkp(), VhdlName)
+                                                 : nullptr;
+            const auto gIt = markp ? genTypes.find(markp->name()) : genTypes.end();
+            if (gIt != genTypes.end()) firstp = gIt->second;
+        }
+        std::vector<VhdlSymbol*> sfound;
+        savedp->lookup(formalp->name(), sfound);
+        for (VhdlSymbol* const subp : sfound) {
+            const VhdlSymbol* const rp = subp->resolved();
+            if (rp->kind() != VhdlSymKind::FUNCTION && rp->kind() != VhdlSymKind::PROCEDURE) {
+                continue;
+            }
+            if (rp->paramTypes().size() != nparams) continue;
+            if (firstp && (!rp->paramTypes()[0] || rp->paramTypes()[0]->base() != firstp)) {
+                continue;
+            }
+            intop->reexport(subp);
+        }
+    }
 }
 
 // Which subprogram each call of the template resolved to, recorded against
