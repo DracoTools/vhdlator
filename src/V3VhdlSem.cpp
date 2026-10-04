@@ -12011,6 +12011,21 @@ VhdlType* VhdlSemVisitor::convertedType(VhdlType* top, AstVhdlAssoc* argp) {
     outp->clearIndexTypes();
     for (VhdlType* const idxp : fromp->indexTypes()) outp->addIndexType(idxp);
     outp->unconstrained(false);
+    // An element left open takes the operand's element bounds the same way:
+    // "slv_array_t(a)" of an array of UNSIGNED(0 downto 0) is an array of
+    // STD_LOGIC_VECTOR(0 downto 0) (9.3.6; GHDL gna issue2657)
+    VhdlType* const topElemp = top->elementp() ? top->elementp() : top->base()->elementp();
+    VhdlType* const fromElemp = fromp->elementp() ? fromp->elementp() : fromp->base()->elementp();
+    if (topElemp && fromElemp && topElemp->base()->kind() == VhdlTypeKind::ARRAY
+        && !topElemp->lengthEmittable() && fromElemp->base()->kind() == VhdlTypeKind::ARRAY
+        && fromElemp->lengthEmittable()
+        && fromElemp->indexTypes().size() == topElemp->base()->indexTypes().size()) {
+        VhdlType* const elemp = cloneSubtype(topElemp, argp->fileline());
+        elemp->clearIndexTypes();
+        for (VhdlType* const idxp : fromElemp->indexTypes()) elemp->addIndexType(idxp);
+        elemp->unconstrained(false);
+        outp->elementp(elemp);
+    }
     return outp;
 }
 
