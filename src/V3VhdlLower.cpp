@@ -19776,6 +19776,37 @@ private:
             // it runs once at the start and then waits just the same
             if (sentreep && nodep->hasSensList()) {
                 allowInitialDriver(nodep->stmtsp(), false);
+                // A postponed process runs after the last delta of the time
+                // step its signals changed in, and reads the values that
+                // step ended with (11.3, 14.7.5.3). Woken by its signals and
+                // then waiting for the postponed region to say so, it ran a
+                // step late with the step before's values; one that only
+                // reads -- a monitor writing a log -- is run in that region
+                // itself, when one of its signals has changed since it last
+                // ran. One that assigns or waits keeps the form below.
+                bool onlyReads = m_postponed;
+                if (onlyReads) {
+                    nodep->foreach([&](const AstVhdlSigAssign*) { onlyReads = false; });
+                    nodep->foreach([&](const AstVhdlWait*) { onlyReads = false; });
+                }
+                if (onlyReads && v3Global.opt.timing().isTrue()) {
+                    FileLine* const pflp = new FileLine{flp};
+                    pflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    AstVar* const pendp = newTempVar("__Vpostpend", newLogicDType(pflp, 1), pflp);
+                    // Every process runs once at the start (11.3)
+                    pendp->valuep(new AstConst{pflp, AstConst::BitTrue{}});
+                    AstNode* const wakep = new AstEventControl{pflp, sentreep, nullptr};
+                    wakep->addNext(new AstAssign{pflp, new AstVarRef{pflp, pendp, VAccess::WRITE},
+                                                 new AstConst{pflp, AstConst::BitTrue{}}});
+                    addStmt(new AstAlways{pflp, VAlwaysKwd::ALWAYS, nullptr, wakep});
+                    AstNode* const runp
+                        = new AstAssign{pflp, new AstVarRef{pflp, pendp, VAccess::WRITE},
+                                        new AstConst{pflp, AstConst::BitFalse{}}};
+                    runp->addNext(bodyp);
+                    addStmt(new AstAlwaysPostponed{
+                        pflp, new AstIf{pflp, new AstVarRef{pflp, pendp, VAccess::READ}, runp}});
+                    return;
+                }
                 if (v3Global.opt.timing().isTrue()) {
                     // A process with a sensitivity list is the same as one
                     // with "wait on <list>" as its last statement (11.3): it
