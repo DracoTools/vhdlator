@@ -23382,6 +23382,22 @@ private:
                 }
             }
         }
+        // The generics carrying an open port's bounds are named after the
+        // port ("__vl__<port>__0"), and a binding that gives the component's
+        // port to an entity port of another name gives these to that port's
+        // (7.3.2.2)
+        const auto boundGenericName = [&renamed](const std::string& gname) {
+            if (renamed.empty()) return gname;
+            const size_t endPos = gname.size() > 6 ? gname.find("__", 6) : std::string::npos;
+            if (endPos == std::string::npos
+                || (gname.compare(0, 6, "__vl__") != 0 && gname.compare(0, 6, "__vr__") != 0
+                    && gname.compare(0, 6, "__va__") != 0)) {
+                return gname;
+            }
+            const auto renIt = renamed.find(gname.substr(6, endPos - 6));
+            if (renIt == renamed.end() || renIt->second.size() != 1) return gname;
+            return gname.substr(0, 6) + renIt->second[0] + gname.substr(endPos);
+        };
         size_t genPosition = 0;  // Which generic a positional association names
         for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
@@ -23461,6 +23477,7 @@ private:
                     m_logicPosPins[pinp] = posp;
                 }
             }
+            pinp->name(boundGenericName(pinp->name()));
             paramsp = AstNode::addNext(paramsp, pinp);
         }
         // A binding indication may give the generics and the ports itself,
@@ -23605,7 +23622,8 @@ private:
             if (compp) {
                 for (AstNode* p = compp->genericsp(); p; p = p->nextp()) {
                     const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
-                    if (!ifp->defaultp() || pinNamed(paramsp, ifp->name())) continue;
+                    const std::string gname = boundGenericName(ifp->name());
+                    if (!ifp->defaultp() || pinNamed(paramsp, gname)) continue;
                     // Where a binding indication gives the entity's generics,
                     // the component's are not passed on: they are what the
                     // binding's own actuals read (7.3.2.2)
@@ -23623,7 +23641,7 @@ private:
                     }
                     AstNodeExpr* const valuep = lowerExpr(ifp->defaultp());
                     if (!valuep) continue;
-                    AstPin* const defPinp = new AstPin{flp, ++pinNum, ifp->name(), valuep};
+                    AstPin* const defPinp = new AstPin{flp, ++pinNum, gname, valuep};
                     if (gsymp && isNineValued(gsymp->typep())) {
                         if (AstNodeExpr* const posp = logicPosOf(ifp->defaultp(), flp)) {
                             m_logicPosPins[defPinp] = posp;
