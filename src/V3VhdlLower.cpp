@@ -7381,6 +7381,27 @@ private:
         return true;
     }
 
+    // Whether an expression calls a function emitted inside a generate
+    // block: one whose place in the tree is under one, or in the block being
+    // built, which is not in the tree yet
+    static bool callsGenerateFunc(AstNode* exprp) {
+        bool found = false;
+        exprp->foreach([&](const AstNodeFTaskRef* refp) {
+            const AstNodeFTask* const taskp = refp->taskp();
+            if (!taskp || found) return;
+            const AstNode* up = taskp;
+            while (up && !VN_IS(up, NodeModule)) {
+                if (VN_IS(up, NodeGen)) break;
+                const AstNode* const backp = up->backp();
+                // The head of a list not yet put anywhere
+                if (!backp) break;
+                up = backp;
+            }
+            if (!up || !VN_IS(up, NodeModule)) found = true;
+        });
+        return found;
+    }
+
     // A declarative item of an entity, architecture, block or process
     void lowerDecl(AstNode* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -7670,9 +7691,13 @@ private:
             // (11.8), so one whose value folds is a parameter there, which a
             // bound written in terms of it needs: "constant stride : natural
             // := i(n).y'length" sizing the slice the block drives
+            // -- unless the value calls a function the block itself
+            // declares: a constant function may not be declared under a
+            // generate (IEEE 1800-2023 13.4.3), so that one stays an object
+            // given its value, as it was (NVC issue668)
             if (m_inGenBody && objp->kind() == VhdlObjKind::CONSTANT && !m_ftaskp && !m_protClassp
                 && varp->varType() == VVarType::VAR && varp->valuep() && !dynDecl
-                && valueFolds(varp->valuep())) {
+                && valueFolds(varp->valuep()) && !callsGenerateFunc(varp->valuep())) {
                 varp->varType(VVarType::LPARAM);
             }
             // A subprogram's declarations are elaborated in order on every
