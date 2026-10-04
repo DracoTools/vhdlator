@@ -15458,12 +15458,17 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                                 && (litp->kind() == VhdlLitKind::STRING
                                     || litp->kind() == VhdlLitKind::BITSTRING);
             AstVhdlAggregate* const aggp = VN_CAST(innerp, VhdlAggregate);
-            if (aggp || isText) {
+            // A concatenation too: as long as its operands together, from
+            // the index subtype's left in its direction (9.2.5) -- "vec =>
+            // a(0) & b(1)" is "0 to 1"
+            AstVhdlBinary* const catp = VN_CAST(innerp, VhdlBinary);
+            const bool isCat = catp && catp->op() == VhdlBinaryOp::CONCAT;
+            if (aggp || isText || isCat) {
                 const VhdlType* const ptypep = found[0]->typep();
                 const VhdlType* const idxp
                     = ptypep && !ptypep->indexTypes().empty() ? ptypep->indexTypes()[0] : nullptr;
-                const bool asc = !idxp || !idxp->bounded() || idxp->ascending();
-                const int64_t first = idxp && idxp->bounded() ? idxp->left() : 0;
+                bool asc = !idxp || !idxp->bounded() || idxp->ascending();
+                int64_t first = idxp && idxp->bounded() ? idxp->left() : 0;
                 int64_t lo = 0;
                 int64_t hi = -1;
                 int64_t count = 0;
@@ -15473,6 +15478,90 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                     const VhdlValue tv = V3VhdlEval::eval(innerp);
                     ok = tv.isStr() && !tv.toStr().empty();
                     if (ok) count = static_cast<int64_t>(tv.toStr().size());
+                }
+                if (isCat) {
+                    // Measured against the port's own type: the expression
+                    // has none of its own yet. An operand of its element
+                    // type is one element.
+                    const VhdlType* const pbasep = ptypep ? ptypep->base() : nullptr;
+                    const VhdlType* const pelemp = pbasep ? pbasep->elementp() : nullptr;
+                    std::function<int64_t(AstNodeVhdlExpr*)> lengthOf
+                        = [&](AstNodeVhdlExpr* sidep) -> int64_t {
+                        AstVhdlBinary* const sidecatp = VN_CAST(sidep, VhdlBinary);
+                        if (sidecatp && sidecatp->op() == VhdlBinaryOp::CONCAT) {
+                            const int64_t l = lengthOf(sidecatp->lhsp());
+                            const int64_t r = l < 0 ? -1 : lengthOf(sidecatp->rhsp());
+                            return r < 0 ? -1 : l + r;
+                        }
+                        const VhdlType* stp = sidep->vhdlTypep();
+                        if (!stp && sidep->vhdlSymp() && sidep->vhdlSymp()->isObject()) {
+                            stp = sidep->vhdlSymp()->typep();
+                        }
+                        if (stp && pelemp && stp->base() == pelemp->base()) return 1;
+                        if (stp && pbasep && stp->base() == pbasep && stp->isConstrainedArray()
+                            && stp->dimensions() == 1) {
+                            return stp->dimLength(0);
+                        }
+                        // Not analyzed yet, so a name is looked up here: an
+                        // object of the element type is one element, and
+                        // so is one element of an array of the port's type
+                        if (!stp) {
+                            const auto objectNamed = [&](AstNodeVhdlExpr* np) -> VhdlSymbol* {
+                                const AstVhdlName* const namep = VN_CAST(np, VhdlName);
+                                if (!namep) return nullptr;
+                                std::vector<VhdlSymbol*> syms;
+                                m_scopep->lookup(namep->name(), syms);
+                                if (syms.size() != 1 || !syms[0]->isObject()) return nullptr;
+                                return syms[0];
+                            };
+                            if (VhdlSymbol* const osymp = objectNamed(sidep)) {
+                                const VhdlType* const otp = osymp->typep();
+                                if (otp && pelemp && otp->base() == pelemp->base()) return 1;
+                                if (otp && otp->base() == pbasep && otp->isConstrainedArray()
+                                    && otp->dimensions() == 1) {
+                                    return otp->dimLength(0);
+                                }
+                            }
+                            if (AstVhdlCall* const idxp = VN_CAST(sidep, VhdlCall)) {
+                                const AstVhdlAssoc* const argp = VN_CAST(idxp->argsp(), VhdlAssoc);
+                                VhdlSymbol* const osymp = objectNamed(idxp->prefixp());
+                                if (osymp && argp && !argp->nextp() && !argp->formalp()
+                                    && osymp->typep() && osymp->typep()->base() == pbasep
+                                    && osymp->typep()->dimensions() == 1) {
+                                    return 1;
+                                }
+                            }
+                            const VhdlValue val = V3VhdlEval::eval(sidep);
+                            if (val.isInt() || val.isReal()) return 1;
+                            if (val.isStr()) return static_cast<int64_t>(val.toStr().size());
+                        }
+                        return staticLength(sidep);
+                    };
+                    count = pbasep ? lengthOf(catp) : -1;
+                    ok = count > 0;
+                    // Before VHDL-2008, the left operand an array: the
+                    // result starts where it does and runs its way
+                    AstNodeVhdlExpr* leftmostp = catp->lhsp();
+                    while (AstVhdlBinary* const lcatp = VN_CAST(leftmostp, VhdlBinary)) {
+                        if (lcatp->op() != VhdlBinaryOp::CONCAT) break;
+                        leftmostp = lcatp->lhsp();
+                    }
+                    // That is VHDL-93's rule; from VHDL-2008 the result runs
+                    // from the index subtype's left in its direction
+                    // whatever the left operand is, as nvc, GHDL and Questa
+                    // all give "c & b(0)" over a "1 to 2" c the range 0 to 2
+                    const VhdlType* const ltp
+                        = catp->fileline()->language() < V3LangCode::L1076_2008
+                              ? leftmostp->vhdlTypep()
+                              : nullptr;
+                    if (ltp && pbasep && ltp->base() == pbasep) {
+                        if (ltp->isConstrainedArray() && ltp->dimLength(0) > 0) {
+                            first = ltp->indexTypes()[0]->left();
+                            asc = ltp->indexTypes()[0]->ascending();
+                        } else {
+                            ok = false;  // An array whose bounds are not known here
+                        }
+                    }
                 }
                 for (AstVhdlElemAssoc* ap = aggp ? aggp->elemsp() : nullptr; ap && ok;
                      ap = VN_AS(ap->nextp(), VhdlElemAssoc)) {
