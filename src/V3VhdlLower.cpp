@@ -23715,10 +23715,34 @@ private:
     // rather than added to the enclosing module
     int m_regionDepth = 0;  // Blocks and generate bodies around what is lowered
 
+    // What a statement of a generate's block needs declared beside it at the
+    // block's own level -- the signal a sensitivity to "s(index)" follows,
+    // which reads the generate's index and so cannot stand in the module
+    AstNode* m_genLevelp = nullptr;
+    bool m_inGenerate = false;
+    void addGenLevel(AstNode* nodep) { m_genLevelp = AstNode::addNextNull(m_genLevelp, nodep); }
+    // Where such a declaration goes: beside the generate's own statements
+    // where the expression reads a generate index, the module otherwise
+    void addBesideSensitivity(AstNodeExpr* exprp, AstNode* nodep) {
+        bool readsGenvar = false;
+        exprp->foreach([&](const AstVarRef* refp) {
+            if (refp->varp() && refp->varp()->varType() == VVarType::GENVAR) readsGenvar = true;
+        });
+        if (readsGenvar && m_inGenerate) {
+            addGenLevel(nodep);
+        } else {
+            m_modp->addStmtsp(nodep);
+        }
+    }
+
     AstNode* lowerGenerateBody(AstVhdlGenerateBody* nodep) {
         if (!nodep) return nullptr;
         VL_RESTORER(m_regionDepth);
         ++m_regionDepth;
+        VL_RESTORER(m_genLevelp);
+        VL_RESTORER(m_inGenerate);
+        m_genLevelp = nullptr;
+        m_inGenerate = true;
         AstNode* const outerp = m_stmtsp;
         m_stmtsp = nullptr;
         {
@@ -23728,6 +23752,10 @@ private:
         }
         for (AstNode* p = nodep->stmtsp(); p; p = p->nextp()) {
             lowerConcurrent(VN_AS(p, NodeVhdlStmt));
+        }
+        if (m_genLevelp) {
+            m_stmtsp = AstNode::addNextNull(m_stmtsp, m_genLevelp);
+            m_genLevelp = nullptr;
         }
         AstNode* const itemsp = m_stmtsp;
         m_stmtsp = outerp;
@@ -29011,11 +29039,13 @@ private:
         AstVar* const tempp
             = new AstVar{flp, VVarType::VAR, "__Vsens" + std::to_string(++m_tempNum),
                          VFlagChildDType{}, dtypep};
-        m_modp->addStmtsp(tempp);
         FileLine* const cflp = new FileLine{flp};
         cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
-        m_modp->addStmtsp(new AstAlways{new AstAssignW{
-            cflp, new AstVarRef{cflp, tempp, VAccess::WRITE}, exprp}});
+        AstNode* const declsp
+            = AstNode::addNext(static_cast<AstNode*>(tempp),
+                               static_cast<AstNode*>(new AstAlways{new AstAssignW{
+                                   cflp, new AstVarRef{cflp, tempp, VAccess::WRITE}, exprp}}));
+        addBesideSensitivity(exprp, declsp);
         return new AstVarRef{flp, tempp, VAccess::READ};
     }
 
@@ -29490,13 +29520,15 @@ private:
         AstVar* const tempp
             = new AstVar{flp, VVarType::VAR, "__Vsens" + std::to_string(++m_tempNum),
                          VFlagChildDType{}, sensDTypep};
-        m_modp->addStmtsp(tempp);
         FileLine* const cflp = new FileLine{flp};
         cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
         cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
         cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
-        m_modp->addStmtsp(new AstAlways{new AstAssignW{
-            cflp, new AstVarRef{cflp, tempp, VAccess::WRITE}, partp}});
+        AstNode* const declsp
+            = AstNode::addNext(static_cast<AstNode*>(tempp),
+                               static_cast<AstNode*>(new AstAlways{new AstAssignW{
+                                   cflp, new AstVarRef{cflp, tempp, VAccess::WRITE}, partp}}));
+        addBesideSensitivity(partp, declsp);
         return new AstVarRef{flp, tempp, VAccess::READ};
     }
 
