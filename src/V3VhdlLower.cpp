@@ -18759,7 +18759,7 @@ private:
     // the statement writes is not something it reads.
     static bool readsAnySignal(AstNode* bodyp) {
         std::set<const AstNode*> writtenp;
-        bodyp->foreach([&writtenp](const AstNodeAssign* asgp) {
+        bodyp->foreachAndNext([&writtenp](const AstNodeAssign* asgp) {
             for (const AstNode* np = asgp->lhsp(); np;) {
                 if (VN_IS(np, VarRef)) {
                     writtenp.insert(np);
@@ -18781,7 +18781,7 @@ private:
             }
         });
         bool reads = false;
-        bodyp->foreach([&reads, &writtenp](const AstVarRef* refp) {
+        bodyp->foreachAndNext([&reads, &writtenp](const AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             if (writtenp.count(refp)) return;
             const AstVar* const varp = refp->varp();
@@ -18831,7 +18831,7 @@ private:
         // even though the reference has not been marked one way or the other
         // yet -- that happens in V3LinkLValue, long after here
         std::set<const AstNode*> writtenp;
-        bodyp->foreach([&writtenp](const AstNodeAssign* asgp) {
+        bodyp->foreachAndNext([&writtenp](const AstNodeAssign* asgp) {
             for (const AstNode* np = asgp->lhsp(); np;) {
                 if (VN_IS(np, VarRef)) {
                     writtenp.insert(np);
@@ -18853,7 +18853,7 @@ private:
             }
         });
         bool reads = false;
-        bodyp->foreach([&](const AstVarRef* refp) {
+        bodyp->foreachAndNext([&](const AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             if (writtenp.count(refp)) return;
             if (isToggleFlipRead(refp)) return;
@@ -18876,7 +18876,7 @@ private:
                 knownp.insert(pair.second);
             }
         }
-        bodyp->foreach([&](const AstVarRef* refp) {
+        bodyp->foreachAndNext([&](const AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             if (writtenp.count(refp)) return;
             if (isToggleFlipRead(refp)) return;
@@ -22263,6 +22263,30 @@ private:
         addStmt(new AstInitial{flp, stmtsp});
     }
 
+    // A target that is a slice whose ends read a signal or a variable, and
+    // so are known only while running
+    static bool runningSliceTarget(const AstNodeVhdlExpr* targetp) {
+        const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        const AstVhdlRange* const rp = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rp || !rp->leftp() || !rp->rightp()) return false;
+        bool reads = false;
+        rp->foreach([&](const AstVhdlName* namep) {
+            const VhdlSymbol* const symp
+                = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+            if (!symp) return;
+            if (symp->kind() != VhdlSymKind::SIGNAL && symp->kind() != VhdlSymKind::PORT
+                && symp->kind() != VhdlSymKind::VARIABLE
+                && symp->kind() != VhdlSymKind::SHARED_VARIABLE) {
+                return;
+            }
+            // An attribute of its subtype is fixed by elaboration
+            const AstVhdlAttrName* const ap = VN_CAST(namep->backp(), VhdlAttrName);
+            if (ap && ap->prefixp() == namep) return;
+            reads = true;
+        });
+        return reads;
+    }
+
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
         // The statement is a process of its own, with its own driver (11.6)
@@ -22282,6 +22306,25 @@ private:
                 if (stmtsp) addStmt(concurrentProcess(stmtsp, nodep->postponed(), aflp));
                 return;
             }
+        }
+        // "res7(31 downto 32 - n) <= ..." with n a signal: a slice whose ends
+        // only running settles is no target for a continuous assignment,
+        // whose part-select has to be as wide as it always is. The statement
+        // is the process it is defined to be (11.6), the sequential
+        // assignment inside it, woken by what it reads -- the ends included
+        // (GHDL gna issue522)
+        const bool oneUndelayed
+            = nodep->kind() == VhdlAssignKind::SIMPLE
+                  ? nodep->wavesp() && !nodep->wavesp()->nextp() && !nodep->wavesp()->afterp()
+                  : !anyWaveformDelay(nodep);
+        if (oneUndelayed && runningSliceTarget(nodep->targetp())) {
+            FileLine* const sflp = new FileLine{flp};
+            sflp->warnOff(V3ErrorCode::COMBDLY, true);
+            sflp->warnOff(V3ErrorCode::LATCH, true);
+            if (AstNode* const stmtsp = lowerSeqAssign(nodep, true)) {
+                addStmt(concurrentProcess(stmtsp, nodep->postponed(), sflp));
+            }
+            return;
         }
         // A waveform with a delay, or with more than one element, schedules
         // each element at its own time (11.6, 10.5.2.2). It becomes a process
