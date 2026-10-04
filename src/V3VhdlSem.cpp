@@ -12544,6 +12544,18 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
                     }
                 });
             });
+            // A generate's range, selector and conditions are settled when
+            // the design elaborates (11.8), and so is a constant they name --
+            // "constant in_len : integer := i_in'length" over an open port,
+            // ranging a for generate (GHDL gna issue1376)
+            unitp->foreach([&](AstVhdlGenerate* genp) {
+                if (genp->rangep()) markIn(genp->rangep(), ignored, true);
+                if (genp->exprp()) markIn(genp->exprp(), ignored, true);
+                for (AstNode* ap = genp->altsp(); ap; ap = ap->nextp()) {
+                    const AstVhdlGenerateBody* const bodyp = VN_CAST(ap, VhdlGenerateBody);
+                    if (bodyp && bodyp->condp()) markIn(bodyp->condp(), ignored, true);
+                }
+            });
         }
     }
     for (int round = 0; round < 16; ++round) {
