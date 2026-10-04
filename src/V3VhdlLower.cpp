@@ -17977,11 +17977,87 @@ private:
     // the instance is elaborated -- a port or signal whose width comes from a
     // generic. One value repeated as many times as the range is long, which
     // V3Param settles along with the range itself.
+    // Whether an element type is carried as one bit
+    bool elementIsOneBit(const VhdlType* elemp, FileLine* flp) {
+        if (!elemp || !elementPacks(elemp)) return false;
+        AstNodeDType* const edtp = lowerType(const_cast<VhdlType*>(elemp), flp);
+        const AstBasicDType* const basicp = VN_CAST(edtp, BasicDType);
+        // A width that is a number is held in the type itself, not as a
+        // range below it: "bit_vector(7 downto 0)" is ranged all the same
+        const bool oneBit = basicp && !basicp->isRanged()
+                            && (basicp->keyword() == VBasicDTypeKwd::LOGIC
+                                || basicp->keyword() == VBasicDTypeKwd::BIT);
+        if (edtp) VL_DO_DANGLING(edtp->deleteTree(), edtp);
+        return oneBit;
+    }
+
+    // "(0 => x, 1 => y, others => z)" or "(x, y, others => z)" as an
+    // assignment pattern: each named element keyed by its index, which the
+    // object is declared with, the positional ones in order, and the
+    // "others" value as the default -- whatever the length, which is never
+    // written out. Choices that are numbers; null otherwise.
+    AstNodeExpr* keyedOthersPattern(AstVhdlAggregate* nodep, FileLine* flp) {
+        AstNode* itemsp = nullptr;
+        AstNodeVhdlExpr* othersp = nullptr;
+        bool sawNamed = false;
+        bool ok = true;
+        for (AstVhdlElemAssoc* eap = nodep->elemsp(); eap && ok;
+             eap = VN_AS(eap->nextp(), VhdlElemAssoc)) {
+            AstVhdlChoice* const chp = eap->choicesp();
+            AstNodeExpr* keyp = nullptr;
+            if (othersp) {
+                ok = false;
+                break;
+            }
+            if (!chp) {
+                // A positional element of the aggregate's own type is a run
+                // of elements (9.3.3.3), which a pattern member is not
+                const VhdlType* const vtp = eap->valuep()->vhdlTypep();
+                if (sawNamed
+                    || (vtp && nodep->vhdlTypep() && vtp->base() == nodep->vhdlTypep()->base())) {
+                    ok = false;
+                    break;
+                }
+            } else if (chp->nextp() || chp->rangep() || (!chp->isOthers() && !chp->valuep())) {
+                ok = false;
+                break;
+            } else if (chp->isOthers()) {
+                othersp = eap->valuep();
+                continue;
+            } else {
+                const VhdlValue at = V3VhdlEval::eval(chp->valuep());
+                if (!at.isInt()) {
+                    ok = false;
+                    break;
+                }
+                sawNamed = true;
+                keyp = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(at.toInt())};
+            }
+            AstNodeExpr* const loweredp = lowerExpr(eap->valuep());
+            if (!loweredp) {
+                if (keyp) VL_DO_DANGLING(keyp->deleteTree(), keyp);
+                ok = false;
+                break;
+            }
+            itemsp = AstNode::addNextNull(itemsp, new AstPatMember{flp, loweredp, keyp, nullptr});
+        }
+        AstNodeExpr* const fillp = ok && othersp ? lowerExpr(othersp) : nullptr;
+        if (!fillp) {
+            if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
+            return nullptr;
+        }
+        AstPatMember* const defaultp = new AstPatMember{flp, fillp, nullptr, nullptr};
+        defaultp->isDefault(true);
+        itemsp = AstNode::addNextNull(itemsp, defaultp);
+        return new AstPattern{flp, itemsp};
+    }
+
     // "(0 => '1', others => '0')" where a generic gives the length: the
     // others value repeated over the object's places, and each element a
     // choice names put in at its place, which is counted from the right end
-    // the way the range runs. Elements of one bit each, and choices that
-    // are numbers; null otherwise.
+    // the way the range runs, where the elements are of one bit each; an
+    // assignment pattern where they are wider. Choices that are numbers;
+    // null otherwise.
     AstNodeExpr* namedOthersOfDynamicLength(AstVhdlAggregate* nodep, VhdlType* typep,
                                             FileLine* flp) {
         if (typep->indexTypes().size() != 1 || !typep->indexTypes()[0]) return nullptr;
@@ -17991,16 +18067,8 @@ private:
         }
         const VhdlType* const elemp
             = typep->elementp() ? typep->elementp() : typep->base()->elementp();
-        if (!elemp || !elementPacks(elemp)) return nullptr;
-        {
-            AstNodeDType* const edtp = lowerType(const_cast<VhdlType*>(elemp), flp);
-            const AstBasicDType* const basicp = VN_CAST(edtp, BasicDType);
-            const bool oneBit = basicp && !basicp->rangep()
-                                && (basicp->keyword() == VBasicDTypeKwd::LOGIC
-                                    || basicp->keyword() == VBasicDTypeKwd::BIT);
-            if (edtp) VL_DO_DANGLING(edtp->deleteTree(), edtp);
-            if (!oneBit) return nullptr;
-        }
+        if (!elemp) return nullptr;
+        const bool oneBit = elementIsOneBit(elemp, flp);
         std::vector<std::pair<int64_t, AstNodeVhdlExpr*>> named;
         // Positional elements before the "others" -- "('1', others => '0')"
         // -- take the places from the left (9.3.3.2), counted from the top
@@ -18059,6 +18127,10 @@ private:
             named.emplace_back(at.toInt(), eap->valuep());
         }
         if (!othersp || (named.empty() && positional.empty())) return nullptr;
+        // Elements of more than one bit -- "(0 => x"01", others => x"FF")"
+        // over an array of vectors, or of integers -- are an assignment
+        // pattern instead
+        if (!oneBit) return keyedOthersPattern(nodep, flp);
         const bool ascending = rangep->dir() == VhdlDir::TO;
         AstNodeExpr* const lenp = boundsLength(typep, flp);
         AstNodeExpr* const rightp = lenp ? lowerBound(rangep->rightp()) : nullptr;
