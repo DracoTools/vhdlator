@@ -15792,6 +15792,22 @@ void VhdlSemVisitor::bindOpenBounds(AstVhdlInstance* nodep, VhdlScope* unitScope
                         break;
                     }
                 }
+                // "std_logic_word(d_out) => source2" converts the whole port
+                // on its way to the actual (6.5.7.1), and the port takes the
+                // actual's bounds: GHDL 7.0.0-dev and Questa 2025.2 both
+                // say so, nvc 1.22.1 takes the conversion's type mark
+                // (VESTS ashenden ch_21_fg_21_04)
+                if (bound.path.empty() && callp->argsp() && !callp->argsp()->nextp()) {
+                    const AstNode* argp = callp->argsp();
+                    if (const AstVhdlAssoc* const argAsp = VN_CAST(argp, VhdlAssoc)) {
+                        argp = argAsp->formalp() ? nullptr : argAsp->actualp();
+                    }
+                    const AstVhdlName* const argNamep = VN_CAST(argp, VhdlName);
+                    if (argNamep && argNamep->name() == bound.port) {
+                        actualp = asp->actualp();
+                        break;
+                    }
+                }
                 continue;
             }
             const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
