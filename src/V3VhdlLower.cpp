@@ -18901,6 +18901,17 @@ private:
         if (allKnown && (schedules || part)) {
             if (AstSenTree* const senp = sensitivityOfBody(bodyp, flp)) {
                 if (part) {
+                    // Each concurrent statement is a driver of its own (11.6),
+                    // and one waking on its own element of a signal drives what
+                    // it assigns from a block clocked differently from its
+                    // neighbours' -- "y(i) <= p(i)" in a for-generate beside
+                    // "y(0) <= x(0)" -- which is no conflict in VHDL
+                    for (const AstNode* const np : writtenp) {
+                        const AstVarRef* const refp = VN_CAST(np, VarRef);
+                        if (refp && refp->varp()) {
+                            refp->varp()->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                        }
+                    }
                     AstAlways* const partp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp};
                     m_concSenp.insert(partp);
                     return partp;
@@ -24133,13 +24144,13 @@ private:
     bool m_inGenerate = false;
     void addGenLevel(AstNode* nodep) { m_genLevelp = AstNode::addNextNull(m_genLevelp, nodep); }
     // Where such a declaration goes: beside the generate's own statements
-    // where the expression reads a generate index, the module otherwise
-    void addBesideSensitivity(AstNodeExpr* exprp, AstNode* nodep) {
-        bool readsGenvar = false;
-        exprp->foreach([&](const AstVarRef* refp) {
-            if (refp->varp() && refp->varp()->varType() == VVarType::GENVAR) readsGenvar = true;
-        });
-        if (readsGenvar && m_inGenerate) {
+    // inside a generate, the module otherwise. It may read the generate's
+    // index, or a signal the generate declares -- which a generate whose
+    // condition is false never has, so a copy of it standing in the module
+    // would name nothing (GHDL gna ticket32) -- and the statement it serves
+    // is in the generate anyway.
+    void addBesideSensitivity(AstNodeExpr* /*exprp*/, AstNode* nodep) {
+        if (m_inGenerate) {
             addGenLevel(nodep);
         } else {
             m_modp->addStmtsp(nodep);
