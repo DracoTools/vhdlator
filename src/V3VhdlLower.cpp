@@ -7402,6 +7402,34 @@ private:
         return found;
     }
 
+    // "x(a to b)(k)" as "x(k)", for x a name of a one-dimensional array
+    // object whose length elaboration settles; null where the call is not
+    // that
+    AstNodeExpr* elementOfSlice(AstVhdlCall* nodep) {
+        AstVhdlCall* const slicep = VN_CAST(nodep->prefixp(), VhdlCall);
+        if (!slicep || !VN_IS(slicep->argsp(), VhdlRange) || slicep->argsp()->nextp()) {
+            return nullptr;
+        }
+        AstVhdlName* const namep = VN_CAST(slicep->prefixp(), VhdlName);
+        const VhdlSymbol* const symp
+            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        if (!symp || !symp->isObject() || !symp->typep() || isDynObj(namep)
+            || symp->typep()->base()->kind() != VhdlTypeKind::ARRAY
+            || symp->typep()->dimensions() != 1 || !symp->typep()->lengthEmittable()
+            || lengthOnlyRunningDecides(symp->typep())) {
+            return nullptr;
+        }
+        AstVhdlAssoc* const asp = VN_CAST(nodep->argsp(), VhdlAssoc);
+        if (!asp || asp->nextp() || asp->formalp() || !asp->actualp()) return nullptr;
+        AstVhdlCall* const directp = new AstVhdlCall{nodep->fileline(), namep->cloneTree(false)};
+        directp->addArgsp(asp->cloneTree(false));
+        directp->vhdlTypep(nodep->vhdlTypep());
+        directp->vhdlSymp(nodep->vhdlSymp());
+        AstNodeExpr* const outp = lowerCall(directp);
+        VL_DO_DANGLING(directp->deleteTree(), directp);
+        return outp;
+    }
+
     // A declarative item of an entity, architecture, block or process
     void lowerDecl(AstNode* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -15213,6 +15241,11 @@ private:
             AstNodeExpr* flatp = nullptr;
             if (lowerFlatIndex(nodep, flatp)) return flatp;
         }
+        // An element of a slice is the element of the sliced object with the
+        // same index: a slice keeps the indices of what it is taken from
+        // (8.5). "c(i to i)(i)" over a constant table is "c(i)", which the
+        // back end folds where a part select of a part select it would not
+        if (AstNodeExpr* const outp = elementOfSlice(nodep)) return outp;
         // A slice running against its prefix in a copy made for one call: an
         // error when it is reached (8.5), and the analysis left it to be one
         if (!m_asTarget && m_dirReportedp != nodep) {

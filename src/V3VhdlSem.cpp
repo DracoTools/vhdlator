@@ -232,6 +232,10 @@ class VhdlSemVisitor final : public VNVisitor {
     VhdlType* m_returnTypep = nullptr;  // Result type of the enclosing function
     // Values a call site fixed, for the copy of a subprogram being made now
     std::vector<VhdlValue> m_specValues;
+    // What each parameter of a copy being made stands for, where the call
+    // hands it a generic whose value only elaboration settles; null where
+    // nothing (specializeSubprogram)
+    std::vector<AstNodeVhdlExpr*> m_specStandIns;
     // A package body continues the package declaration's declarative region
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
@@ -2013,6 +2017,8 @@ public:
         }
     }
 
+    // What the next copy's parameters stand for (m_specStandIns)
+    void specStandIns(const std::vector<AstNodeVhdlExpr*>& standIns) { m_specStandIns = standIns; }
     // Give a subprogram the parameter subtypes one call site supplies, and
     // analyze it as if it had been written that way (see specialize())
     VhdlSymbol* specializeSubprogram(AstVhdlSubprogDecl* originalp, VhdlScope* regionp,
@@ -6080,6 +6086,46 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
         VhdlScope::hide2008(savedHide);
     }
     m_specValues.clear();
+    // A parameter the call hands a generic of the region the subprogram is
+    // declared in is that generic wherever the copy reads it, bounds of its
+    // declarations included -- which is what lets the result's subtype be
+    // read off the body below as one the instance settles
+    if (!m_specStandIns.empty()) {
+        std::map<const VhdlSymbol*, const VhdlSymbol*> stands;
+        size_t k = 0;
+        for (AstNode* p = firstp; p; p = p->nextp(), ++k) {
+            const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            if (k >= m_specStandIns.size() || !m_specStandIns[k] || !ifp->vhdlSymp()) continue;
+            const VhdlSymbol* const genp = m_specStandIns[k]->vhdlSymp()->resolved();
+            std::vector<VhdlSymbol*> found;
+            regionp->lookup(genp->name(), found);
+            if (found.size() != 1 || found[0]->resolved() != genp) continue;
+            stands.emplace(ifp->vhdlSymp(), genp);
+        }
+        if (!stands.empty()) {
+            std::vector<AstVhdlName*> refs;
+            const auto collect = [&](AstNode* listp) {
+                for (AstNode* np = listp; np; np = np->nextp()) {
+                    np->foreach([&](AstVhdlName* namep) {
+                        if (namep->vhdlSymp() && stands.count(namep->vhdlSymp())) {
+                            refs.push_back(namep);
+                        }
+                    });
+                }
+            };
+            collect(copyp->declsp());
+            collect(copyp->stmtsp());
+            for (AstVhdlName* const namep : refs) {
+                VhdlSymbol* const genp
+                    = const_cast<VhdlSymbol*>(stands.find(namep->vhdlSymp())->second);
+                AstVhdlName* const newp = new AstVhdlName{namep->fileline(), genp->name()};
+                newp->vhdlSymp(genp);
+                newp->vhdlTypep(genp->typep());
+                namep->replaceWith(newp);
+                VL_DO_DANGLING(pushDeletep(namep), namep);
+            }
+        }
+    }
     m_scopep = savedp;
     m_returnTypep = savedReturnp;
     // Now that the body has been analyzed with the lengths this call site
@@ -6934,6 +6980,7 @@ private:
         const bool byValue = resultIsUnconstrained(symp) || bodyNeedsParamValues(symp);
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
+        std::vector<AstNodeVhdlExpr*> standIns;
         for (size_t i = 0; i < nparams; ++i) {
             // A formal the call named part by part, down a path its own
             // subtype already gives the bounds for: the copy is made for
@@ -6982,6 +7029,18 @@ private:
             }
             if (byValue) {
                 actualValues.push_back(copyValue(V3VhdlEval::eval(actp), symp->paramTypes()[i]));
+                // A generic whose value only elaboration settles: the copy
+                // reads it where it reads the parameter, so that a bound the
+                // body writes in terms of the parameter is one the instance
+                // settles (issue820's "t_arr_property(0 to g_num_arr - 1)")
+                const VhdlSymbol* const asymp
+                    = actp->vhdlSymp() ? actp->vhdlSymp()->resolved() : nullptr;
+                if (!actualValues.back().known() && VN_IS(actp, VhdlName) && asymp
+                    && asymp->kind() == VhdlSymKind::GENERIC && symp->paramTypes()[i]
+                    && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::INTEGER) {
+                    standIns.resize(nparams, nullptr);
+                    standIns[i] = actp;
+                }
             }
             VhdlType* typep = actp->vhdlTypep();
             // A formal named by a slice of itself is as long as that slice
@@ -7087,6 +7146,12 @@ private:
         for (const VhdlValue& val : actualValues) {
             key += val.isInt() ? ("=" + std::to_string(val.toInt())) : "=?";
         }
+        for (const AstNodeVhdlExpr* const standp : standIns) {
+            key += standp ? "@"
+                                + std::to_string(
+                                    reinterpret_cast<uintptr_t>(standp->vhdlSymp()->resolved()))
+                          : "@";
+        }
         const auto it = m_specializations.find(key);
         if (it != m_specializations.end()) {
             // The copy for this key is the one whose body is being analyzed
@@ -7131,8 +7196,10 @@ private:
         // reaches the calls the body makes -- and one of those may be to the
         // subprogram being copied, which is this same copy and not another
         m_specializations.emplace(key, nullptr);
+        m_sem.specStandIns(standIns);
         VhdlSymbol* const newp
             = m_sem.specializeSubprogram(bodyp, regionp, actualTypes, actualValues, name);
+        m_sem.specStandIns({});
         if (newp) {
             m_specializations[key] = newp;
         } else {
@@ -7805,13 +7872,23 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // recursion on data-dependent lengths, which has no static answer.
     VhdlSpecVisitor specializer{visitor};
     visitor.specializer(&specializer);
-    for (int round = 0; round < 20; ++round) {
-        if (!specializer.pass(unitsp)) break;
-    }
     // A constant whose bounds came from a call now has them, and another
-    // constant may take its own bounds from that one, so repeat
-    for (int round = 0; round < 8; ++round) {
-        if (!visitor.reconstrainDecls(unitsp)) break;
+    // constant may take its own bounds from that one, so repeat -- and a call
+    // whose actual is such a constant is one more to specialize, on the
+    // bounds it has now: issue820's "f_bit_low(C_WIDTH_ARR)"
+    for (int outer = 0; outer < 8; ++outer) {
+        bool made = false;
+        for (int round = 0; round < 20; ++round) {
+            if (!specializer.pass(unitsp)) break;
+            made = true;
+        }
+        if (outer > 0 && !made) break;
+        bool settled = false;
+        for (int round = 0; round < 8; ++round) {
+            if (!visitor.reconstrainDecls(unitsp)) break;
+            settled = true;
+        }
+        if (!settled) break;
     }
     visitor.rebindOpenGenerics();
     visitor.spreadElabConstants(unitsp);
@@ -12181,9 +12258,54 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
     // directly, whether it says its length as a number or as an expression
     // elaboration settles
     VhdlType* const valueTypep = valuep->vhdlTypep();
+    // -- including one marked unconstrained only because its bounds name a
+    // generic and so are not numbers here: the result of a copy made for a
+    // call that handed a parameter a generic (issue820)
+    // Only bounds that name generics and constants, which mean the same
+    // where the object is declared: a copy's result written in terms of the
+    // copy's own parameter -- "int_vec(1 to n)" -- says nothing outside it
+    const auto writtenBounds = [](const VhdlType* tp) {
+        if (tp->indexTypes().empty()) return false;
+        for (size_t i = 0; i < tp->indexTypes().size(); ++i) {
+            const VhdlType* const idxp = tp->indexTypes()[i];
+            if (tp->dimOpen(i) || !idxp || !VN_IS(idxp->boundsp(), VhdlRange)) return false;
+            bool settled = true;
+            idxp->boundsp()->foreach([&](const AstNodeVhdlExpr* np) {
+                const VhdlSymbol* const symp
+                    = np->vhdlSymp() ? np->vhdlSymp()->resolved() : nullptr;
+                if (!symp) return;
+                switch (symp->kind()) {
+                case VhdlSymKind::GENERIC:
+                case VhdlSymKind::ENUM_LITERAL:
+                case VhdlSymKind::PHYSICAL_UNIT: break;
+                case VhdlSymKind::CONSTANT: {
+                    // Not one a subprogram declares, which is elaborated
+                    // afresh on each call
+                    for (const AstNode* up = symp->declp(); up; up = up->backp()) {
+                        if (VN_IS(up, VhdlSubprogDecl)) {
+                            settled = false;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                case VhdlSymKind::FUNCTION: {
+                    if (symp->predefined()) break;
+                    const AstVhdlSubprogDecl* declp = symp->bodyp();
+                    if (!declp) declp = VN_CAST(symp->declp(), VhdlSubprogDecl);
+                    if (!declp || !declp->vhdlPure()) settled = false;
+                    break;
+                }
+                default: settled = false;
+                }
+            });
+            if (!settled) return false;
+        }
+        return true;
+    };
     if (valueTypep && valueTypep->base()->kind() == VhdlTypeKind::ARRAY
-        && !valueTypep->unconstrained() && valueTypep->lengthEmittable()
-        && valueTypep->dimensions() == typep->dimensions()) {
+        && (!valueTypep->unconstrained() || writtenBounds(valueTypep))
+        && valueTypep->lengthEmittable() && valueTypep->dimensions() == typep->dimensions()) {
         VhdlType* const outp = cloneSubtype(typep, flp);
         outp->clearIndexTypes();
         for (VhdlType* const idxp : valueTypep->indexTypes()) outp->addIndexType(idxp);
@@ -12362,14 +12484,16 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
                     markIn(p, ignored, true);
                 }
             });
-            // A slice in a concurrent signal assignment is a part the back
-            // end settles when it elaborates the design, so a constant its
+            // A slice a signal assignment names is a part the back end
+            // settles when it elaborates the design, so a constant its
             // bounds name -- "dout(c_l(i) + c_w(i) - 1 downto c_l(i))" in a
-            // generate -- is settled with it. In a process or a subprogram a
-            // slice whose bounds only running decides is handled as one.
+            // generate -- is settled with it. A concurrent assignment is a
+            // process by now, so a process's are taken too; a subprogram's
+            // are not, being run once per call. Lowering keeps one whose
+            // value does not fold an object all the same.
             unitp->foreach([&](AstVhdlSigAssign* asp) {
                 for (const AstNode* up = asp->backp(); up; up = up->backp()) {
-                    if (VN_IS(up, VhdlProcess) || VN_IS(up, VhdlSubprogDecl)) return;
+                    if (VN_IS(up, VhdlSubprogDecl)) return;
                     if (VN_IS(up, NodeVhdlUnit)) break;
                 }
                 asp->foreach([&](AstVhdlCall* callp) {
