@@ -16299,7 +16299,22 @@ private:
         // leave it holding nothing
         VhdlType* const ltypep = concatOperandType(nodep->lhsp(), lhsp);
         VhdlType* const rtypep = concatOperandType(nodep->rhsp(), rhsp);
-        if (!canExpand(ltypep, lhsp) || !canExpand(rtypep, rhsp)) return nullptr;
+        // An operand of the element type is one element of the result
+        // (9.2.5): "a & b & (0 => 4)" of INTEGERs is three
+        const VhdlType* const restypep = nodep->vhdlTypep();
+        const VhdlType* const relemp
+            = restypep && restypep->base()->kind() == VhdlTypeKind::ARRAY
+                  ? (restypep->elementp() ? restypep->elementp() : restypep->base()->elementp())
+                  : nullptr;
+        const auto isElement = [&](const VhdlType* typep) {
+            return typep && relemp && typep->base() == relemp->base()
+                   && typep->base() != restypep->base();
+        };
+        const bool lElem = isElement(ltypep);
+        const bool rElem = isElement(rtypep);
+        if ((!lElem && !canExpand(ltypep, lhsp)) || (!rElem && !canExpand(rtypep, rhsp))) {
+            return nullptr;
+        }
         // What a call gives back is read once per element, so it is worked
         // out once into an object and the elements are read from that
         AstNode* heldp = nullptr;
@@ -16310,10 +16325,12 @@ private:
                 heldp, static_cast<AstNode*>(new AstAssign{flp, wr(tmpp, flp), loweredp}));
             return rd(tmpp, flp);
         };
-        lhsp = hold(ltypep, lhsp);
-        rhsp = hold(rtypep, rhsp);
-        AstNode* const leftMembersp = concatMembers(ltypep, lhsp, flp);
-        AstNode* const rightMembersp = concatMembers(rtypep, rhsp, flp);
+        if (!lElem) lhsp = hold(ltypep, lhsp);
+        if (!rElem) rhsp = hold(rtypep, rhsp);
+        AstNode* const leftMembersp = lElem ? new AstPatMember{flp, lhsp, nullptr, nullptr}
+                                            : concatMembers(ltypep, lhsp, flp);
+        AstNode* const rightMembersp = rElem ? new AstPatMember{flp, rhsp, nullptr, nullptr}
+                                             : concatMembers(rtypep, rhsp, flp);
         UASSERT_OBJ(leftMembersp && rightMembersp, nodep, "Expansion asked about and refused");
         if (heldp) {
             // The object is given its value as the first element is read
@@ -16338,8 +16355,10 @@ private:
     // anything is taken apart
     bool canExpand(const VhdlType* typep, AstNodeExpr* loweredp) {
         if (!loweredp) return false;
-        if (const AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
+        if (AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
             if (!patp->itemsp()) return false;
+            const AstPatMember* const firstp = VN_CAST(patp->itemsp(), PatMember);
+            if (firstp && firstp->keyp()) return !keyedInOrder(typep, patp).empty();
             for (AstNode* p = patp->itemsp(); p; p = p->nextp()) {
                 const AstPatMember* const memberp = VN_CAST(p, PatMember);
                 if (!memberp || memberp->isDefault() || memberp->keyp() || memberp->repp()) {
@@ -16362,11 +16381,51 @@ private:
         return count > 0 && count <= 4096;
     }
 
+    // The members of an aggregate written with named choices, in the order
+    // its own index range runs (9.3.3.3), where every choice is a number and
+    // together they name each index of one range once; empty otherwise
+    std::vector<AstPatMember*> keyedInOrder(const VhdlType* typep, AstPattern* patp) {
+        std::map<int64_t, AstPatMember*> byKey;
+        for (AstNode* p = patp->itemsp(); p; p = p->nextp()) {
+            AstPatMember* const memberp = VN_CAST(p, PatMember);
+            if (!memberp || memberp->isDefault() || memberp->repp() || !memberp->keyp()) return {};
+            const AstConst* const keyp = VN_CAST(memberp->keyp(), Const);
+            if (!keyp || !memberp->lhssp() || memberp->lhssp()->nextp()) return {};
+            if (!byKey.emplace(keyp->toSInt(), memberp).second) return {};
+        }
+        if (byKey.empty()) return {};
+        if (byKey.rbegin()->first - byKey.begin()->first + 1
+            != static_cast<int64_t>(byKey.size())) {
+            return {};
+        }
+        const VhdlType* const idxp = typep ? indexSubtype(typep, 0) : nullptr;
+        const bool ascending = !idxp || !idxp->bounded() || idxp->ascending();
+        std::vector<AstPatMember*> outp;
+        for (const auto& pair : byKey) outp.push_back(pair.second);
+        if (!ascending) std::reverse(outp.begin(), outp.end());
+        return outp;
+    }
+
     // Every element of one operand of such a concatenation, in index order.
     // An aggregate has already become a pattern, and its members are taken as
     // they stand; anything else is indexed, which needs its length.
     AstNode* concatMembers(const VhdlType* typep, AstNodeExpr* loweredp, FileLine* flp) {
         if (AstPattern* const patp = VN_CAST(loweredp, Pattern)) {
+            // One written with named choices is put in the order its own
+            // index range runs, and the members lose the indices they name
+            const AstPatMember* const firstp = VN_CAST(patp->itemsp(), PatMember);
+            if (firstp && firstp->keyp()) {
+                AstNode* outp = nullptr;
+                for (AstPatMember* const memberp : keyedInOrder(typep, patp)) {
+                    memberp->unlinkFrBack();
+                    if (AstNode* const keyp = memberp->keyp()) {
+                        VL_DO_DANGLING(keyp->unlinkFrBack()->deleteTree(), keyp);
+                    }
+                    outp = AstNode::addNextNull(outp, static_cast<AstNode*>(memberp));
+                }
+                VL_DO_DANGLING(patp->deleteTree(), patp);
+                return outp;
+            }
             // An aggregate is already written out element by element
             AstNode* const outp = patp->itemsp()->unlinkFrBackWithNext();
             VL_DO_DANGLING(patp->deleteTree(), patp);
