@@ -1365,6 +1365,7 @@ AstVhdlEntitySpec* V3VhdlParse::parseEntitySpec(bool componentForm) {
     } else if (check(VhdlTokType::KWD_ALL)) {
         nodep->all(true);
     } else {
+        int nameIndex = 0;
         do {
             AstNodeVhdlExpr* namep = nullptr;
             if (peekType() == VhdlTokType::STRING_LIT
@@ -1387,11 +1388,14 @@ AstVhdlEntitySpec* V3VhdlParse::parseEntitySpec(bool componentForm) {
                                            " by its simple name, and this is not one");
             }
             if (peekType() == VhdlTokType::LBRACKET) {
-                // An overloaded designator is disambiguated by a signature
+                // An overloaded designator is disambiguated by a signature,
+                // kept beside the names with the place of the one it follows
                 AstVhdlSignature* const sigp = parseSignature();
-                VL_DO_DANGLING(sigp->deleteTree(), sigp);
+                sigp->forName(nameIndex);
+                nodep->addSignaturesp(sigp);
             }
             nodep->addNamesp(namep);
+            ++nameIndex;
         } while (check(VhdlTokType::COMMA));
         if (!nodep->namesp()) {
             flp->v3error("An entity specification names at least one declaration, or says"

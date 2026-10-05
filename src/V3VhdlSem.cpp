@@ -3916,7 +3916,9 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
         }
         return;
     }
+    int nameIndex = -1;
     for (AstNode* p = specp->namesp(); p; p = p->nextp()) {
+        ++nameIndex;
         AstNodeVhdlExpr* const namep = VN_AS(p, NodeVhdlExpr);
         std::vector<std::string> parts;
         if (!flatten(namep, parts) || parts.empty()) continue;
@@ -3973,6 +3975,43 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
         {
             const AstVhdlName* const litp = VN_CAST(namep, VhdlName);
             lookup(litp && litp->isChar() ? vhdlCharLitName(parts.back()) : parts.back(), found);
+        }
+        // A signature after the name says which of its overloads -- one
+        // subprogram, or one enumeration literal -- is decorated (7.2):
+        // "increment [bit_vector return bit_vector] : function"
+        for (AstNode* sp = specp->signaturesp(); sp; sp = sp->nextp()) {
+            AstVhdlSignature* const sigp = VN_AS(sp, VhdlSignature);
+            if (sigp->forName() != nameIndex) continue;
+            std::vector<VhdlType*> wantParams;
+            for (AstNode* tp = sigp->paramTypesp(); tp; tp = tp->nextp()) {
+                wantParams.push_back(resolveTypeMark(VN_AS(tp, NodeVhdlExpr)));
+            }
+            VhdlType* const wantReturnp
+                = sigp->returnTypep() ? resolveTypeMark(sigp->returnTypep()) : nullptr;
+            std::vector<VhdlSymbol*> matching;
+            for (VhdlSymbol* const symp : found) {
+                const VhdlSymbol* const realp = symp->resolved();
+                if (realp->paramTypes().size() != wantParams.size()) continue;
+                bool ok = true;
+                for (size_t i = 0; i < wantParams.size() && ok; ++i) {
+                    const VhdlType* const havep = realp->paramTypes()[i];
+                    ok = havep && wantParams[i] && havep->base() == wantParams[i]->base();
+                }
+                const VhdlType* const haveRetp
+                    = realp->returnTypep() ? realp->returnTypep() : realp->typep();
+                if (ok && wantReturnp) ok = haveRetp && haveRetp->base() == wantReturnp->base();
+                if (ok && !wantReturnp && realp->kind() == VhdlSymKind::FUNCTION) ok = false;
+                if (ok) matching.push_back(symp);
+            }
+            if (matching.empty() && !found.empty() && !m_inSpecialized) {
+                err(sigp->fileline(), "No declaration of '" + parts.back()
+                                          + "' matches the signature of this attribute"
+                                            " specification");
+                found.clear();
+            } else {
+                found.swap(matching);
+            }
+            break;
         }
         // It names something declared already (7.2). Only the classes the
         // symbol table holds by simple name are asked: a label is declared

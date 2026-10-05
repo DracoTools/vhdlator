@@ -371,6 +371,7 @@ class AstVhdlEntitySpec final : public AstNodeVhdl {
     // entity_specification (7.2) or component_specification (7.3.1):
     // the instantiation/entity name list plus its class
     // @astgen op1 := namesp : List[AstNodeVhdlExpr]  // Empty means "others" or "all"
+    // @astgen op2 := signaturesp : List[AstVhdlSignature]  // Each says which name it follows
     bool m_others = false;
     bool m_all = false;
     std::string m_entityClass;  // "signal", "component", ... or empty
@@ -544,10 +545,13 @@ class AstVhdlSignature final : public AstNodeVhdl {
     // signature (4.5.3), disambiguating overloaded names in aliases and specs
     // @astgen op1 := paramTypesp : List[AstNodeVhdlExpr]
     // @astgen op2 := returnTypep : Optional[AstNodeVhdlExpr]
+    int m_forName = -1;  // In an entity specification, which of its names it follows
 public:
     explicit AstVhdlSignature(FileLine* fl)
         : ASTGEN_SUPER_VhdlSignature(fl) {}
     ASTGEN_MEMBERS_AstVhdlSignature;
+    int forName() const { return m_forName; }
+    void forName(int index) { m_forName = index; }
 };
 
 class AstVhdlSubtypeInd final : public AstNodeVhdl {
