@@ -8913,7 +8913,8 @@ private:
             const VhdlType* const vtypep = nodep->argp()->vhdlTypep();
             if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp, true)) return namep;
             if (AstNodeExpr* const realp = realImage(valuep, vtypep, flp)) return realp;
-            return new AstSFormatF{flp, formatFor(vtypep, true), false, valuep};
+            return new AstSFormatF{flp, formatFor(vtypep, true), false,
+                                   signedPhysical(valuep, vtypep)};
         }
         // "t'value(s)" is the value whose image is s (16.2.3)
         if (attr == "value" && nodep->argp()) {
@@ -9186,17 +9187,30 @@ private:
             return funcp;
         }
         // An integer, or the abstract part of a physical literal. An
-        // underscore is a separator and no part of the value (15.5.2).
-        AstVar* const rp = newFuncLocal("r", intDTypep->cloneTree(false), flp);
+        // underscore is a separator and no part of the value (15.5.2). A
+        // physical value is counted in 64 bits, and "1.5 ns" or "1e3 ps"
+        // writes its abstract part as a decimal literal with a point or an
+        // exponent, which is read as a real and scaled (15.5.2, 5.2.4)
+        AstVar* const rp = newFuncLocal("r",
+                                        isPhys ? new AstBasicDType{flp, VBasicDTypeKwd::LONGINT}
+                                               : intDTypep->cloneTree(false),
+                                        flp);
         AstVar* const negp = newFuncLocal("neg", newLogicDType(flp, 1), flp);
         AstVar* const ip = newFuncLocal("i", intDTypep->cloneTree(false), flp);
         AstVar* const donep = newFuncLocal("done", newLogicDType(flp, 1), flp);
         AstVar* const cp = newFuncLocal("c", newLogicDType(flp, 8), flp);
+        AstVar* const realp = newFuncLocal("isreal", newLogicDType(flp, 1), flp);
+        AstVar* const startp = newFuncLocal("start", intDTypep->cloneTree(false), flp);
         funcp->addStmtsp(rp);
         funcp->addStmtsp(negp);
         funcp->addStmtsp(ip);
         funcp->addStmtsp(donep);
         funcp->addStmtsp(cp);
+        funcp->addStmtsp(realp);
+        funcp->addStmtsp(startp);
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{flp, wr(realp, flp),
+                                                       new AstConst{flp, AstConst::BitFalse{}}}));
         bodyp = AstNode::addNext(bodyp, static_cast<AstNode*>(
                                             new AstAssign{flp, wr(rp, flp), i32(0, flp)}));
         bodyp = AstNode::addNext(bodyp, static_cast<AstNode*>(new AstAssign{
@@ -9225,21 +9239,52 @@ private:
                       new AstAssign{flp, wr(ip, flp),
                                     new AstAdd{flp, rd(ip, flp), i32(1, flp)}}}};
         bodyp = AstNode::addNext(bodyp, signp);
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{flp, wr(startp, flp), rd(ip, flp)}));
+        // A point, or an exponent -- an E followed by a digit or a sign --
+        // makes the literal a real one; the digits around them are read by
+        // the real conversion once the end of the literal is known
+        const auto nextIs = [&](char lo, char hi) -> AstNodeExpr* {
+            AstNodeExpr* const nextp
+                = new AstGetcN{flp, rd(sp, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}};
+            return new AstLogAnd{flp, new AstGte{flp, nextp, i32(lo, flp)},
+                                 new AstLte{flp, nextp->cloneTree(false), i32(hi, flp)}};
+        };
+        AstNode* const exponentp = new AstIf{
+            flp,
+            new AstLogAnd{flp,
+                          new AstLogOr{flp, new AstEq{flp, rd(cp, flp), i32('e', flp)},
+                                       new AstEq{flp, rd(cp, flp), i32('E', flp)}},
+                          new AstLogAnd{flp, new AstLt{flp, rd(ip, flp), rd(hip, flp)},
+                                        new AstLogOr{flp, nextIs('0', '9'),
+                                                     new AstLogOr{flp, nextIs('+', '+'),
+                                                                  nextIs('-', '-')}}}},
+            AstNode::addNext(static_cast<AstNode*>(new AstAssign{
+                                 flp, wr(realp, flp), new AstConst{flp, AstConst::BitTrue{}}}),
+                             static_cast<AstNode*>(new AstAssign{
+                                 flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(2, flp)}})),
+            new AstAssign{flp, wr(donep, flp), new AstConst{flp, AstConst::BitTrue{}}}};
+        AstNode* const pointp = new AstIf{
+            flp, new AstEq{flp, rd(cp, flp), i32('.', flp)},
+            AstNode::addNext(static_cast<AstNode*>(new AstAssign{
+                                 flp, wr(realp, flp), new AstConst{flp, AstConst::BitTrue{}}}),
+                             static_cast<AstNode*>(new AstAssign{
+                                 flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}})),
+            exponentp};
         AstNode* const digitp = new AstIf{
             flp, new AstEq{flp, rd(cp, flp), i32('_', flp)},
             new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}},
-            new AstIf{
-                flp,
-                new AstLogAnd{flp, new AstGte{flp, rd(cp, flp), i32('0', flp)},
-                              new AstLte{flp, rd(cp, flp), i32('9', flp)}},
-                AstNode::addNext(
-                    static_cast<AstNode*>(new AstAssign{
-                        flp, wr(rp, flp),
-                        new AstAdd{flp, new AstMul{flp, rd(rp, flp), i32(10, flp)},
-                                   new AstSub{flp, rd(cp, flp), i32('0', flp)}}}),
-                    static_cast<AstNode*>(new AstAssign{
-                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}})),
-                new AstAssign{flp, wr(donep, flp), new AstConst{flp, AstConst::BitTrue{}}}}};
+            new AstIf{flp,
+                      new AstLogAnd{flp, new AstGte{flp, rd(cp, flp), i32('0', flp)},
+                                    new AstLte{flp, rd(cp, flp), i32('9', flp)}},
+                      AstNode::addNext(
+                          static_cast<AstNode*>(new AstAssign{
+                              flp, wr(rp, flp),
+                              new AstAdd{flp, new AstMul{flp, rd(rp, flp), i32(10, flp)},
+                                         new AstSub{flp, rd(cp, flp), i32('0', flp)}}}),
+                          static_cast<AstNode*>(new AstAssign{
+                              flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}})),
+                      pointp}};
         AstNode* loopBodyp = new AstAssign{flp, wr(cp, flp),
                                            new AstGetcN{flp, rd(sp, flp), rd(ip, flp)}};
         loopBodyp = AstNode::addNext(loopBodyp, digitp);
@@ -9248,8 +9293,28 @@ private:
                              new AstLogAnd{flp, new AstLte{flp, rd(ip, flp), rd(hip, flp)},
                                            new AstLogNot{flp, rd(donep, flp)}},
                              loopBodyp));
-        AstNodeExpr* valuep = new AstCond{flp, rd(negp, flp),
-                                          new AstNegate{flp, rd(rp, flp)}, rd(rp, flp)};
+        // The real reading of the literal, from where its digits start to
+        // where they ended
+        AstVar* const dp = newFuncLocal("d", new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE}, flp);
+        funcp->addStmtsp(dp);
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstIf{
+                       flp, rd(realp, flp),
+                       new AstAssign{
+                           flp, wr(dp, flp),
+                           new AstAtoN{flp,
+                                       new AstSubstrN{flp, rd(sp, flp), rd(startp, flp),
+                                                      new AstSub{flp, rd(ip, flp), i32(1, flp)}},
+                                       AstAtoN::ATOREAL}}}));
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::REALCVT, true);
+        AstNodeExpr* valuep = nullptr;
+        if (!isPhys) {
+            valuep = new AstCond{flp, rd(realp, flp), new AstRToIRoundS{cflp, rd(dp, flp)},
+                                 rd(rp, flp)};
+            valuep = new AstCond{flp, rd(negp, flp), new AstNegate{flp, valuep},
+                                 valuep->cloneTree(false)};
+        }
         if (isPhys) {
             // The unit name follows the number, and says what the value is
             // counted in (15.8). It reads without regard to case.
@@ -9269,16 +9334,29 @@ private:
                     flp, wr(unitp, flp),
                     new AstToLowerN{flp, new AstSubstrN{flp, rd(sp, flp), rd(ip, flp),
                                                         rd(hip, flp)}}}));
-            AstNodeExpr* scalep = i32(1, flp);
+            AstNodeExpr* scalep = new AstConst{flp, AstConst::Unsized64{}, 1};
             for (const auto& unit : basep->units()) {
                 scalep = new AstCond{
                     flp,
-                    new AstEqN{flp, rd(unitp, flp),
-                               new AstConst{flp, AstConst::String{},
-                                            VString::downcase(unit.first)}},
-                    i32(unit.second, flp), scalep};
+                    new AstEqN{
+                        flp, rd(unitp, flp),
+                        new AstConst{flp, AstConst::String{}, VString::downcase(unit.first)}},
+                    new AstConst{flp, AstConst::Unsized64{}, static_cast<uint64_t>(unit.second)},
+                    scalep};
             }
-            valuep = new AstMul{flp, valuep, scalep};
+            // The scale held in a variable of its own, read by both readings
+            AstVar* const scalevp
+                = newFuncLocal("scale", new AstBasicDType{flp, VBasicDTypeKwd::LONGINT}, flp);
+            funcp->addStmtsp(scalevp);
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{flp, wr(scalevp, flp), scalep}));
+            AstRToIRoundS* const scaledp = new AstRToIRoundS{
+                cflp, new AstMulD{cflp, rd(dp, flp), new AstIToRD{cflp, rd(scalevp, flp)}}};
+            scaledp->dtypeSetLogicSized(64, VSigning::SIGNED);
+            AstNodeExpr* const magp = new AstCond{flp, rd(realp, flp), scaledp,
+                                                  new AstMul{flp, rd(rp, flp), rd(scalevp, flp)}};
+            valuep = new AstCond{flp, rd(negp, flp), new AstNegate{flp, magp},
+                                 magp->cloneTree(false)};
         }
         bodyp = AstNode::addNext(
             bodyp, static_cast<AstNode*>(new AstAssign{
@@ -17076,7 +17154,8 @@ private:
             }
             if (AstNodeExpr* const namep = enumImage(valuep, vtypep, flp, false)) return namep;
             if (AstNodeExpr* const realp = realImage(valuep, vtypep, flp)) return realp;
-            return new AstSFormatF{flp, formatFor(vtypep, false), false, valuep};
+            return new AstSFormatF{flp, formatFor(vtypep, false), false,
+                                   signedPhysical(valuep, vtypep)};
         }
         // An edge test is the shape a clocked process is recognised by, but
         // it may be written anywhere; compiling std_logic_1164's own body for
@@ -30944,7 +31023,9 @@ private:
                 }
             }
         }
-        AstNodeExpr* textp = new AstSFormatF{flp, format, false, valuep};
+        AstNodeExpr* textp = new AstSFormatF{
+            flp, format, false,
+            radix.empty() ? signedPhysical(valuep, args[1]->vhdlTypep()) : valuep};
         // VHDL writes hexadecimal in upper case (16.4)
         if (radix == "%h") textp = new AstToUpperN{flp, textp};
         return appendItem(linep, textp, flp);
@@ -32428,7 +32509,14 @@ private:
             return realp;
         }
         format += formatFor(valuep->vhdlTypep(), isImage);
-        return exprp;
+        return signedPhysical(exprp, valuep->vhdlTypep());
+    }
+
+    // A physical value is held as an unsigned count of its primary unit,
+    // but counts below zero as well (5.2.4): written out, it is read signed
+    static AstNodeExpr* signedPhysical(AstNodeExpr* valuep, const VhdlType* typep) {
+        if (!valuep || !typep || typep->base()->kind() != VhdlTypeKind::PHYSICAL) return valuep;
+        return new AstSigned{valuep->fileline(), valuep};
     }
 
     static FileLine* flOf(AstNode* nodep) { return nodep->fileline(); }
@@ -32705,7 +32793,12 @@ private:
             // TO_STRING of a physical value is its image (5.7), so the unit is
             // written either way -- unlike an enumeration, where only the
             // image keeps the apostrophes a character literal is written with.
-            return "%0t fs";
+            // The count is written as a number, signed (signedPhysical): as
+            // a time it would be read unsigned and scaled.
+            for (const auto& unit : basep->units()) {
+                if (unit.second == 1) return "%0d " + VString::downcase(unit.first);
+            }
+            return "%0d fs";
         case VhdlTypeKind::ARRAY:
             // A STRING is text, and is written as it stands. Asked for as a
             // number it came out right only where it had characters: one of
