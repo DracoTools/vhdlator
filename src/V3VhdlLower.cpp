@@ -19600,6 +19600,9 @@ private:
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             VhdlSymbol* const symp = ifp->vhdlSymp();
             if (!symp) continue;
+            // A generic type is the type analysis bound it to, and has no
+            // value to hand over
+            if (ifp->kind() == VhdlIfaceKind::TYPE) continue;
             FileLine* const flp = ifp->fileline();
             AstNodeVhdlExpr* actualp = nullptr;
             AstNodeVhdlExpr* outConvp = nullptr;  // "f(port) => actual" (6.5.7.1)

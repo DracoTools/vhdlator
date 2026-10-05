@@ -4543,6 +4543,31 @@ void VhdlSemVisitor::visit(AstVhdlBlock* nodep) {
     if (nodep->headerp()) {
         m_ifacePos = 0;
         rejectGenericObjects(nodep->headerp()->genericsp());
+        // A block's generic type is the type its generic map names, as an
+        // entity's is the one the instance names (6.5.3); the map is read
+        // where the block appears (11.2)
+        VL_RESTORER_COPY(m_boundGenTypes);
+        {
+            size_t position = 0;
+            for (AstNode* gp = nodep->headerp()->genericsp(); gp; gp = gp->nextp(), ++position) {
+                const AstVhdlIfaceDecl* const ifp = VN_CAST(gp, VhdlIfaceDecl);
+                if (!ifp || ifp->kind() != VhdlIfaceKind::TYPE) continue;
+                size_t i = 0;
+                for (AstNode* ap = nodep->headerp()->genericMapp(); ap; ap = ap->nextp(), ++i) {
+                    AstVhdlAssoc* const asp = VN_AS(ap, VhdlAssoc);
+                    const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName);
+                    if (namep ? namep->name() != ifp->name() : (asp->formalp() || i != position)) {
+                        continue;
+                    }
+                    if (!asp->actualp()) break;
+                    m_scopep = outerp;
+                    VhdlType* const typep = resolveTypeActual(asp->actualp());
+                    m_scopep = innerp;
+                    if (typep && !typep->isError()) m_boundGenTypes[ifp->name()] = typep;
+                    break;
+                }
+            }
+        }
         iterateAndNextNull(nodep->headerp()->genericsp());
         m_ifacePos = 0;
         iterateAndNextNull(nodep->headerp()->portsp());
