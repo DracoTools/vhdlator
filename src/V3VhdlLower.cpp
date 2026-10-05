@@ -10158,7 +10158,7 @@ private:
             if (m_forced.count(symp)) continue;
             const auto varIt = m_vars.find(symp);
             if (varIt == m_vars.end()) continue;
-            AstVar* const sigp = varIt->second;
+            AstVar* sigp = varIt->second;
             VL_RESTORER(m_ftaskp);
             m_ftaskp = nullptr;
             VhdlForced fc;
@@ -10167,7 +10167,20 @@ private:
             FileLine* const mflp = new FileLine{flp};
             mflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
             AstNodeDType* const dtypep = lowerType(symp->typep(), flp);
-            if (m_extForceSyms.count(symp)) {
+            // An input is written by the unit that instantiates this one, so
+            // the port is what a force of it stands against -- force mode in
+            // overrides the effective value (10.5.2.1) -- and what this unit
+            // reads is a copy that takes one or the other
+            if (sigp->direction() == VDirection::INPUT) {
+                fc.drvp = sigp;
+                sigp = newTempVar(base + "__eff", dtypep, mflp);
+                varIt->second = sigp;
+                fc.valp = newTempVar(base + "__val", lowerType(symp->typep(), flp), mflp);
+                fc.enp = newTempVar(base + "__en", newLogicDType(flp, 1), flp);
+                if (AstNodeExpr* const defp = defaultValueFor(symp->typep(), flp, true)) {
+                    fc.valp->valuep(defp);
+                }
+            } else if (m_extForceSyms.count(symp)) {
                 // Named so that a force from another unit reaches them
                 const auto named = [&](const char* suffix, AstNodeDType* dtp, FileLine* vflp) {
                     AstVar* const varp = new AstVar{vflp, VVarType::VAR, symp->name() + suffix,
@@ -10191,7 +10204,9 @@ private:
             // reader may be moved inside the function that reads it, and
             // these two have to keep what they hold from one evaluation to
             // the next.
-            if (sigp->varType() == VVarType::TRIWIRE) {
+            if (fc.drvp->direction() == VDirection::INPUT) {
+                // The port holds what the instantiating unit gives it
+            } else if (sigp->varType() == VVarType::TRIWIRE) {
                 // A signal with several drivers is a net they are resolved
                 // onto. Forced, it is what the force and the resolved value
                 // are chosen between, written from a process -- so the net

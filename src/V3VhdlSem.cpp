@@ -14090,6 +14090,16 @@ void VhdlSemVisitor::checkAssignTarget(const AstNodeVhdlExpr* targetp, bool sign
                                      + " assignment must be " + objClassName(want) + ", but '"
                                      + name + "' is " + objClassName(info.cls));
     } else if (info.modeIn) {
+        // A force or release of a port or signal parameter of mode in
+        // overrides its effective value, which is what force mode in means
+        // and what such a target is given when no mode is written
+        // (10.5.2.1)
+        const AstVhdlSigAssign* sap = nullptr;
+        for (const AstNode* upp = parentOf(targetp); upp && !sap; upp = parentOf(upp)) {
+            sap = VN_CAST(upp, VhdlSigAssign);
+            if (!VN_IS(upp, VhdlElemAssoc) && !VN_IS(upp, VhdlAggregate)) break;
+        }
+        if (sap && (sap->force() || sap->release()) && sap->forceMode() != "out") return;
         err(targetp->fileline(), "'" + name + "' is of mode in, so nothing can assign it");
     }
 }

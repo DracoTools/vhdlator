@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_forcein_bad.vhd:18:5: 's' is of mode in, so nothing can assign it
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_forcein_bad.vhd:23:5: 'i' is of mode in, so nothing can assign it
+%Error: t/t_vhdl_forcein_bad.vhd:24:5: 'i' is of mode in, so nothing can assign it
+%Error: Exiting due to
