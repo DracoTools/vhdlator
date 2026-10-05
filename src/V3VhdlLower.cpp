@@ -17843,7 +17843,21 @@ private:
             memberp->isDefault(true);
             return new AstPattern{flp, memberp};
         }
-        if (count > 65536) {
+        // An unpacked array with "others" writes out only the elements named
+        // before the last one, and "others" as one default member (below):
+        // a table of a million words of which the design gives 256 is 257
+        // values (GHDL gna issue50). What is kept per index while they are
+        // sorted out is a few bytes.
+        bool sparse = false;
+        if (count > 65536 && count <= (int64_t{1} << 24) && !asString
+            && !(typep->base()->elementp() && elementPacks(typep->base()->elementp()))) {
+            for (AstNode* p = nodep->elemsp(); p && !sparse; p = p->nextp()) {
+                for (AstNode* cp = VN_AS(p, VhdlElemAssoc)->choicesp(); cp; cp = cp->nextp()) {
+                    if (VN_AS(cp, VhdlChoice)->isOthers()) sparse = true;
+                }
+            }
+        }
+        if (count > 65536 && !sparse) {
             // One value repeated is one node, however long the range is;
             // it is writing out a hundred thousand of them that is not on
             if (AstNodeExpr* const outp = othersOfDynamicLength(nodep, typep, flp, count)) {
