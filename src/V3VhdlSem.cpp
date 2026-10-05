@@ -6151,6 +6151,42 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
             }
         }
         m_scopep = innerp;
+        // An actual naming several overloads denotes the one that conforms
+        // to the formal's profile (6.5.7.2): "generic map (f, f)" binds
+        // "g(b : bit) return boolean" and "g(b : boolean) return bit" each
+        // to its own f. The profile is read in the copy, where the generic
+        // types ahead of it stand for what this instance gave them.
+        if (found.size() > 1 && formalp->kind() == VhdlIfaceKind::SUBPROGRAM
+            && formalp->profilep()) {
+            AstVhdlSubprogDecl* const profp = formalp->profilep()->cloneTree(false);
+            VhdlUnanalyzeVisitor{static_cast<AstNode*>(profp)};
+            std::vector<VhdlType*> paramTypes;
+            for (AstNode* p = profp->paramsp(); p; p = p->nextp()) {
+                const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+                paramTypes.push_back(ifp->subtypep() ? resolveSubtype(ifp->subtypep()) : nullptr);
+            }
+            VhdlType* const retp
+                = profp->returnTypep() ? resolveTypeMark(profp->returnTypep()) : nullptr;
+            const bool isFunction = profp->isFunction();
+            VL_DO_DANGLING(profp->deleteTree(), profp);
+            const auto sameBase = [](const VhdlType* ap, const VhdlType* bp) {
+                return !ap || !bp || ap->isError() || bp->isError() || ap->base() == bp->base();
+            };
+            std::vector<VhdlSymbol*> conforming;
+            for (VhdlSymbol* const targetp : found) {
+                if (targetp->paramTypes().size() != paramTypes.size()) continue;
+                if (targetp->kind()
+                    == (isFunction ? VhdlSymKind::PROCEDURE : VhdlSymKind::FUNCTION)) {
+                    continue;
+                }
+                bool same = sameBase(targetp->returnTypep(), retp);
+                for (size_t i = 0; same && i < paramTypes.size(); ++i) {
+                    same = sameBase(targetp->paramTypes()[i], paramTypes[i]);
+                }
+                if (same) conforming.push_back(targetp);
+            }
+            if (!conforming.empty()) found = conforming;
+        }
         for (VhdlSymbol* const targetp : found) {
             VhdlSymbol* const symp
                 = VhdlSymTab::newSymbol(targetp->kind(), formalp->name(), formalp);
