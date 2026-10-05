@@ -2503,6 +2503,15 @@ private:
     };
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
     void candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
+    // Whether a selected name's prefix is, at its root, a call of a function
+    // with more than one overload -- "f(3).a.b" or "f.a" -- whose result the
+    // element selected after it may be what decides (12.5)
+    bool overloadedCallRoot(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    // The candidate types of a selected name's prefix that are records, or
+    // access values of records, with an element of that name whose subtype
+    // fits what is wanted of the selection
+    static std::vector<VhdlType*> typesSelecting(const CandSet& cands, const std::string& elem,
+                                                 const VhdlType* wantp) VL_MT_DISABLED;
     // What candidateTypes found for each operator node while one expression
     // is being analyzed. Analysis asks again of every operand as it goes
     // down, so a chain of "&" sixteen thousand long asked each link sixteen
@@ -8659,6 +8668,25 @@ void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out
             }
         }
     }
+    // An element of what an overloaded function returns, "f.a" or
+    // "f(3).a": each result that has the element gives its subtype (12.5)
+    if (AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+        const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+        if (sufp && !sufp->isChar() && overloadedCallRoot(selp->prefixp())) {
+            CandSet pcands;
+            candidateTypes(selp->prefixp(), pcands);
+            for (VhdlType* const typep : typesSelecting(pcands, sufp->name(), nullptr)) {
+                const VhdlType* recp = typep;
+                if (recp->kind() == VhdlTypeKind::ACCESS) recp = recp->designatedp();
+                for (VhdlSymbol* const elemp : recp->base()->elements()) {
+                    if (elemp->name() == sufp->name()) out.types.push_back(elemp->typep());
+                }
+            }
+            std::sort(out.types.begin(), out.types.end());
+            out.types.erase(std::unique(out.types.begin(), out.types.end()), out.types.end());
+            if (!out.types.empty()) return;
+        }
+    }
     // An operator or a call has as many possible types as it has applicable
     // overloads. Gathering them without committing is what lets the context
     // settle a whole expression at once rather than each operand separately.
@@ -8754,6 +8782,52 @@ void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out
         }
     }
     out.types.push_back(analyzeExpr(nodep, nullptr));
+}
+
+bool VhdlSemVisitor::overloadedCallRoot(AstNodeVhdlExpr* nodep) {
+    AstNodeVhdlExpr* rootp = nodep;
+    for (int depth = 0; depth < 64; ++depth) {
+        AstVhdlSelected* const selp = VN_CAST(rootp, VhdlSelected);
+        if (!selp || !selp->suffixp()) break;
+        rootp = selp->prefixp();
+    }
+    const bool called = VN_IS(rootp, VhdlCall);
+    if (AstVhdlCall* const callp = VN_CAST(rootp, VhdlCall)) rootp = callp->prefixp();
+    const AstVhdlName* const namep = VN_CAST(rootp, VhdlName);
+    if (!namep || namep->isChar()) return false;
+    // Inside a subprogram its own name prefixes what it declares -- "f.v",
+    // '"+".bias' -- which is an expanded name, not a call (8.3)
+    if (!called && m_scopep && m_scopep->findNamed(namep->name())) return false;
+    std::vector<VhdlSymbol*> found;
+    lookup(namep->name(), found);
+    dropUninstantiated(found);
+    int functions = 0;
+    for (const VhdlSymbol* const symp : found) {
+        const VhdlSymKind kind = symp->resolved()->kind();
+        if (kind == VhdlSymKind::FUNCTION) {
+            ++functions;
+        } else if (kind != VhdlSymKind::PROCEDURE) {
+            return false;
+        }
+    }
+    return functions > 1;
+}
+
+std::vector<VhdlType*> VhdlSemVisitor::typesSelecting(const CandSet& cands,
+                                                      const std::string& elem,
+                                                      const VhdlType* wantp) {
+    std::vector<VhdlType*> out;
+    for (VhdlType* const typep : cands.types) {
+        const VhdlType* recp = typep;
+        if (recp && recp->kind() == VhdlTypeKind::ACCESS) recp = recp->designatedp();
+        if (!recp || recp->kind() != VhdlTypeKind::RECORD) continue;
+        for (const VhdlSymbol* const elemp : recp->base()->elements()) {
+            if (elemp->name() != elem) continue;
+            if (!wantp || typesMatch(elemp->typep(), wantp)) out.push_back(typep);
+            break;
+        }
+    }
+    return out;
 }
 
 bool VhdlSemVisitor::anyMatches(const CandSet& cands, const VhdlType* wantp) {
@@ -9658,7 +9732,19 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
                                " and a value written out in place is neither");
         return V3VhdlStd::errorType();
     }
-    VhdlType* const prefixp = analyzeExpr(nodep->prefixp(), nullptr);
+    // Functions that differ only in their result are told apart by the
+    // element selected from it, "fun(true).field0" calling the one whose
+    // record has a field0 (12.5)
+    VhdlType* prefixWantp = nullptr;
+    if (const AstVhdlName* const sufp = VN_CAST(nodep->suffixp(), VhdlName)) {
+        if (!sufp->isChar() && overloadedCallRoot(nodep->prefixp())) {
+            CandSet cands;
+            candidateTypes(nodep->prefixp(), cands);
+            const std::vector<VhdlType*> fitting = typesSelecting(cands, sufp->name(), wantp);
+            if (fitting.size() == 1) prefixWantp = fitting[0];
+        }
+    }
+    VhdlType* const prefixp = analyzeExpr(nodep->prefixp(), prefixWantp);
     if (!prefixp || prefixp->isError()) return V3VhdlStd::errorType();
     // Of an object: a type has elements, but no values to select them from.
     // Asking an attribute of one -- "rec_t.field'length" -- is what nvc
