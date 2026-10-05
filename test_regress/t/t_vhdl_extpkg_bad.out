@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_extpkg_bad.vhd:22:12: External name: 'work.no_such_pkg' is not a package
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_extpkg_bad.vhd:23:12: External name: package 't_vhdl_extpkg_bad_pkg' declares no object 'nothing'
+%Error: Exiting due to

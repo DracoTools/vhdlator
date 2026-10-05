@@ -13770,6 +13770,41 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
         resultp = wantp ? wantp : V3VhdlStd::errorType();
     } else if (AstVhdlExternalName* const p = VN_CAST(nodep, VhdlExternalName)) {
         resultp = resolveSubtype(p->subtypep());
+        // "<< signal @work.my_pkg.sig : natural >>" names an object a
+        // package declares (8.7): the library, the package, and the object
+        // in it, found here where the packages are known
+        if (p->package() && !m_inSpecialized) {
+            std::vector<std::string> parts;
+            for (AstNode* pp = p->pathp(); pp; pp = pp->nextp()) {
+                std::vector<std::string> sub;
+                if (!flatten(VN_AS(pp, NodeVhdlExpr), sub)) {
+                    parts.clear();
+                    break;
+                }
+                parts.insert(parts.end(), sub.begin(), sub.end());
+            }
+            if (parts.size() == 3) {
+                const std::string lib = lower(parts[0]) == "work" ? m_libname : lower(parts[0]);
+                const auto it = m_unitScopes.find(lib + "." + lower(parts[1]));
+                VhdlSymbol* objp = nullptr;
+                if (it != m_unitScopes.end()) {
+                    std::vector<VhdlSymbol*> found;
+                    it->second->lookupLocal(lower(parts[2]), found);
+                    for (VhdlSymbol* const symp : found) {
+                        if (symp->resolved()->isObject()) objp = symp->resolved();
+                    }
+                }
+                if (it == m_unitScopes.end()) {
+                    err(p->fileline(),
+                        "External name: '" + parts[0] + "." + parts[1] + "' is not a package");
+                } else if (!objp) {
+                    err(p->fileline(), "External name: package '" + parts[1]
+                                           + "' declares no object '" + parts[2] + "'");
+                } else {
+                    p->vhdlSymp(objp);
+                }
+            }
+        }
         // The index of a generate's iteration in the pathname is an
         // expression of where the name is written: "g(N)" with N a generic
         // of this entity (8.7)

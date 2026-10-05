@@ -12893,8 +12893,19 @@ private:
     AstNodeExpr* lowerExternalName(AstVhdlExternalName* nodep, bool write) {
         FileLine* const flp = nodep->fileline();
         if (nodep->package()) {
-            unsup(flp, "external name of an object in a package");
-            return nullptr;
+            // The object the package declares, which analysis found: read
+            // and written as that object is anywhere (8.7)
+            VhdlSymbol* const objp = nodep->vhdlSymp();
+            if (!objp) {
+                unsup(flp, "external name of an object in a package");
+                return nullptr;
+            }
+            AstVhdlName* const namep = new AstVhdlName{flp, objp->name()};
+            namep->vhdlSymp(objp);
+            namep->vhdlTypep(objp->typep());
+            AstNodeExpr* const outp = lowerExpr(namep);
+            VL_DO_DANGLING(namep->deleteTree(), namep);
+            return outp;
         }
         // Carets that climb no further than the blocks and generates this
         // is written in stay in this module, where what follows is found
