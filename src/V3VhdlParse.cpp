@@ -2669,7 +2669,18 @@ AstNodeVhdlExpr* V3VhdlParse::parseFactor() {
     consume();
     AstNodeVhdlExpr* const operandp = parsePrimary();
     if (!operandp) return nullptr;
-    return new AstVhdlUnary{flp, op, operandp};
+    AstNodeVhdlExpr* const unaryp = new AstVhdlUnary{flp, op, operandp};
+    // "abs (x * 5.0) ** 2": the grammar gives ABS a primary and no
+    // exponent, but nvc 1.22.1 and GHDL 7.0.0-dev take one (Questa 2025.2
+    // does not), and |x| ** n is |x ** n| either way (nvc parse issue805)
+    if (op == VhdlUnaryOp::ABS && peekType() == VhdlTokType::DOUBLE_STAR) {
+        FileLine* const pflp = here();
+        consume();
+        AstNodeVhdlExpr* const rhsp = parsePrimary();
+        if (!rhsp) return unaryp;
+        return new AstVhdlBinary{pflp, VhdlBinaryOp::POW, unaryp, rhsp};
+    }
+    return unaryp;
 }
 
 AstNodeVhdlExpr* V3VhdlParse::parseLiteral() {
