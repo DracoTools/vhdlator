@@ -8917,6 +8917,34 @@ void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out
                     }
                     if (fits && symp->returnTypep()) out.types.push_back(symp->returnTypep());
                 }
+                // "get2(0)", where every parameter of get2 has a default and
+                // it returns an array, is also the result of calling it with
+                // none, indexed by 0 (4.2.2.1, 8.4): its element type is one
+                // more reading, which "get2(0) = '0'" needs (nvc sem afunc)
+                bool positional = !assocs.empty();
+                for (const AstVhdlAssoc* const asp : assocs) {
+                    if (asp->formalp()) positional = false;
+                }
+                for (VhdlSymbol* const symp : found) {
+                    const VhdlSymbol* const fp = symp->resolved();
+                    if (!positional || fp->kind() != VhdlSymKind::FUNCTION) continue;
+                    if (!fp->paramTypes().empty() && !allParamsDefaulted(fp)) continue;
+                    const VhdlType* const retp = fp->returnTypep();
+                    if (!retp || retp->base()->kind() != VhdlTypeKind::ARRAY
+                        || retp->dimensions() != assocs.size()) {
+                        continue;
+                    }
+                    // Each argument has to be able to index it
+                    bool indexes = true;
+                    const std::vector<VhdlType*>& idx = retp->base()->indexTypes();
+                    for (size_t i = 0; i < argCands.size() && indexes; ++i) {
+                        indexes = i < idx.size() && idx[i] && anyMatches(argCands[i], idx[i]);
+                    }
+                    if (!indexes) continue;
+                    VhdlType* const elemp
+                        = retp->elementp() ? retp->elementp() : retp->base()->elementp();
+                    if (elemp) out.types.push_back(elemp);
+                }
                 std::sort(out.types.begin(), out.types.end());
                 out.types.erase(std::unique(out.types.begin(), out.types.end()),
                                 out.types.end());
