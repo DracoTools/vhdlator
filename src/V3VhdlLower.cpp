@@ -23202,6 +23202,8 @@ private:
         }
         std::map<std::string, std::vector<std::string>> renamed;  // Component port -> entity's
         bool anyRenamed = false;
+        // Entity ports the binding gives a value of its own -- "c => '1'"
+        std::vector<std::pair<std::string, AstNodeVhdlExpr*>> boundValues;
         if (bindingp && bindingp->portMapp()) {
             // Written positionally, the Nth association names the Nth port of
             // the entity, whose names need not be the component's (7.3.2.2)
@@ -23214,6 +23216,14 @@ private:
                 if (!asp || !asp->actualp()) continue;
                 std::vector<std::string> fparts;
                 std::vector<std::string> aparts;
+                // A formal that names part of the entity's port, or converts
+                // it, is not one port renamed: each part would need its own
+                // connection, which nothing here makes
+                if (asp->formalp() && !VN_IS(asp->formalp(), VhdlName)) {
+                    unsup(flp, "binding indication that associates part of a port, or"
+                               " converts it");
+                    return;
+                }
                 if (asp->formalp()) {
                     if (!flattenName(asp->formalp(), fparts) || fparts.empty()) continue;
                 } else if (portIt != m_entityPortNames.end() && at < portIt->second.size()) {
@@ -23223,8 +23233,15 @@ private:
                 }
                 if (asp->isOpen() || VN_IS(asp->actualp(), VhdlOpen)) continue;
                 if (!flattenName(asp->actualp(), aparts) || aparts.empty()) {
-                    unsup(flp, "binding indication whose actual is not a port name");
-                    return;
+                    // A value for the entity's port, which the component does
+                    // not have: it is that port's connection (7.3.2.2)
+                    if (!asp->actualp()->vhdlTypep()) {
+                        unsup(flp, "binding indication whose actual is not a port name");
+                        return;
+                    }
+                    boundValues.emplace_back(fparts.back(), asp->actualp());
+                    anyRenamed = true;
+                    continue;
                 }
                 renamed[aparts.back()].push_back(fparts.back());
                 if (aparts.back() != fparts.back()) anyRenamed = true;
@@ -23861,6 +23878,11 @@ private:
                     paramsp = AstNode::addNextNull(
                         paramsp, new AstPin{flp, ++pinNum, typeGenBoundName(gsymp, i), valp});
                 }
+            }
+        }
+        for (const auto& pair : boundValues) {
+            if (AstNodeExpr* const valp = lowerExpr(pair.second)) {
+                pinsp = AstNode::addNextNull(pinsp, new AstPin{flp, ++pinNum, pair.first, valp});
             }
         }
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));

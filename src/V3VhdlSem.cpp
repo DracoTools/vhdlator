@@ -15157,6 +15157,28 @@ void VhdlSemVisitor::visit(AstVhdlConfigSpec* nodep) {
     std::vector<std::string> parts;
     if (!flatten(unitNamep, parts) || parts.empty()) return;
     const std::string entity = parts.back();
+    // An entity port the binding gives a value rather than one of the
+    // component's ports -- "c => '1'" (7.3.2.2) -- has that value read as
+    // one of the port's type
+    if (bindingp->portMapp()) {
+        std::string lib = parts.size() >= 2 ? lower(parts[parts.size() - 2]) : m_libname;
+        if (lib == "work") lib = m_libname;
+        const auto scopeIt = m_unitScopes.find(lib + "." + lower(entity));
+        VhdlScope* const entScopep = scopeIt == m_unitScopes.end() ? nullptr : scopeIt->second;
+        for (AstNode* p = bindingp->portMapp(); p && entScopep; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            const AstVhdlName* const formalp = asp ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+            AstNodeVhdlExpr* const actualp = asp ? asp->actualp() : nullptr;
+            if (!formalp || !actualp || VN_IS(actualp, VhdlName) || VN_IS(actualp, VhdlOpen)
+                || asp->isOpen()) {
+                continue;
+            }
+            std::vector<VhdlSymbol*> found;
+            entScopep->lookupLocal(formalp->name(), found);
+            if (found.empty() || found[0]->kind() != VhdlSymKind::PORT) continue;
+            analyzeExpr(actualp, found[0]->typep());
+        }
+    }
     if (!compName.empty()) {
         m_specBindings[names.back()] = entity;
         names.pop_back();
