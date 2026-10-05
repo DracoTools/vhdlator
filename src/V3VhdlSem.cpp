@@ -2502,6 +2502,21 @@ private:
         std::string chars;
     };
     void candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
+    void candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out) VL_MT_DISABLED;
+    // What candidateTypes found for each operator node while one expression
+    // is being analyzed. Analysis asks again of every operand as it goes
+    // down, so a chain of "&" sixteen thousand long asked each link sixteen
+    // thousand times over (GHDL gna issue3002). An entry remembers the
+    // operands it was worked out for, so a node whose address was reused
+    // is not answered for the old one.
+    struct BinCands final {
+        const AstNode* lhsp;
+        const AstNode* rhsp;
+        VhdlBinaryOp op;
+        CandSet cands;
+    };
+    std::unordered_map<const AstNodeVhdlExpr*, BinCands> m_binCands;
+    int m_exprDepth = 0;  // How deep analyzeExpr is nested
     int flavourOf(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
     static void dropUninstantiated(std::vector<VhdlSymbol*>& found) VL_MT_DISABLED;
     VhdlType* attrTypeQuiet(AstVhdlAttrName* nodep) VL_MT_DISABLED;
@@ -8479,6 +8494,23 @@ void VhdlSemVisitor::dropUninstantiated(std::vector<VhdlSymbol*>& found) {
 }
 
 void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
+    AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary);
+    if (!binp || m_exprDepth == 0 || !out.types.empty() || !out.chars.empty()
+        || out.need != CandSet::Need::ANY) {
+        candidateTypesUncached(nodep, out);
+        return;
+    }
+    const auto it = m_binCands.find(binp);
+    if (it != m_binCands.end() && it->second.lhsp == binp->lhsp()
+        && it->second.rhsp == binp->rhsp() && it->second.op == binp->op()) {
+        out = it->second.cands;
+        return;
+    }
+    candidateTypesUncached(nodep, out);
+    m_binCands[binp] = BinCands{binp->lhsp(), binp->rhsp(), binp->op(), out};
+}
+
+void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out) {
     if (!nodep) return;
     if (nodep->vhdlTypep()) {
         out.types.push_back(nodep->vhdlTypep());
@@ -13346,6 +13378,18 @@ void VhdlSemVisitor::checkAggregate(AstVhdlAggregate* nodep, VhdlType* typep,
 VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
     if (!nodep) return V3VhdlStd::errorType();
     if (nodep->vhdlTypep()) return nodep->vhdlTypep();  // Already settled
+    // The operator candidates remembered while this expression is analyzed
+    // are forgotten once the outermost one is done (m_binCands)
+    struct DepthGuard final {
+        VhdlSemVisitor& m_v;
+        explicit DepthGuard(VhdlSemVisitor& v)
+            : m_v{v} {
+            ++m_v.m_exprDepth;
+        }
+        ~DepthGuard() {
+            if (--m_v.m_exprDepth == 0) m_v.m_binCands.clear();
+        }
+    } depthGuard{*this};
 
     VhdlType* resultp = V3VhdlStd::errorType();
     if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) {
