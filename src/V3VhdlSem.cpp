@@ -6359,6 +6359,12 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
     m_scopep = outerp;
     analyzeExpr(actualp, typep);
     const VhdlValue val = V3VhdlEval::eval(actualp);
+    // A generic constant of an unconstrained array type takes its bounds
+    // from the actual (6.5.6.2), so "MAX'range" in the copy is the range of
+    // 10D"999" (nvc regress vhpi10)
+    if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY && !typep->lengthEmittable()) {
+        typep = constrainFromValue(typep, actualp, flp);
+    }
     m_scopep = innerp;
     VhdlSymbol* const symp
         = VhdlSymTab::newSymbol(VhdlSymKind::CONSTANT, formalp->name(), formalp);
