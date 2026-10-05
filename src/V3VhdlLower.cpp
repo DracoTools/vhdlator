@@ -22672,8 +22672,30 @@ private:
     // event control does not run at time zero, so the statements are emitted
     // twice: once to start, once to react.
     void emitWaveformProcess(AstNode* stmtsp, AstNodeExpr* readsp, FileLine* flp) {
-        AstSenTree* const senp = readsp ? sensitivityOfExpr(readsp, flp) : nullptr;
+        AstSenTree* senp = readsp ? sensitivityOfExpr(readsp, flp) : nullptr;
         if (readsp) VL_DO_DANGLING(readsp->deleteTree(), readsp);
+        // A generic never changes once elaborated, so waiting on one is
+        // waiting for nothing: "o <= value after 0.5 ns" with value a
+        // generic runs once (11.6), and a change item on a constant -- one
+        // of 'Z's, which makes the port a tristate -- is a sensitivity the
+        // back end refuses (GHDL gna bug03)
+        if (senp) {
+            std::vector<AstSenItem*> constItems;
+            for (AstSenItem* itemp = senp->sensesp(); itemp;
+                 itemp = VN_AS(itemp->nextp(), SenItem)) {
+                bool onlyParams = true;
+                bool anyRef = false;
+                itemp->foreach([&](const AstNodeVarRef* refp) {
+                    anyRef = true;
+                    if (!refp->varp() || !refp->varp()->isParam()) onlyParams = false;
+                });
+                if (anyRef && onlyParams) constItems.push_back(itemp);
+            }
+            for (AstSenItem* const itemp : constItems) {
+                VL_DO_DANGLING(itemp->unlinkFrBack()->deleteTree(), itemp);
+            }
+            if (!senp->sensesp()) VL_DO_DANGLING(senp->deleteTree(), senp);
+        }
         if (senp) {
             addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp->cloneTree(true)});
         }
