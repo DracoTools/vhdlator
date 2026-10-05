@@ -19166,6 +19166,30 @@ private:
         // else keeps.
         bool schedules = false;
         bodyp->foreachAndNext([&schedules](const AstAssignDly*) { schedules = true; });
+        // So does one that reports or stops: a concurrent assertion says so
+        // each time what it reads changes and the condition is false (11.5),
+        // and a combinational block runs whenever the scheduler settles it --
+        // again for a change of a signal it never reads, and not at all for a
+        // change it cannot see through a function's argument
+        bool reports = false;
+        bodyp->foreachAndNext([&reports](const AstNodeStmt* stmtp) {
+            if (VN_IS(stmtp, Display) || VN_IS(stmtp, Stop) || VN_IS(stmtp, Finish)) {
+                reports = true;
+            }
+        });
+        // One that only reports runs once and then waits on what it reads,
+        // over and over -- the process it is equivalent to (11.5). An event
+        // control at the head of a block would also wake as the design
+        // starts, and report a second time what the first run did.
+        if (reports && !schedules && writtenp.empty() && allKnown
+            && v3Global.opt.timing().isTrue()) {
+            if (AstSenTree* const senp = sensitivityOfBody(bodyp, flp)) {
+                AstNode* const loopp = AstNode::addNext(
+                    bodyp, static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
+                return new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, loopp};
+            }
+        }
+        schedules = schedules || reports;
         // Reading one element by a fixed index is a rule about when the
         // statement runs, not about the delta, and it holds however the rest
         // of the architecture is written -- so such a statement keeps its
