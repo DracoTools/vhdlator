@@ -12987,6 +12987,16 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
         }
         if (written) return constrainElementFromValue(typep, valuep, flp);
     }
+    // The predefined "not" of an array has its operand's bounds (9.2.2), so
+    // "constant b : boolean_vector := not (true, false)" is as long as the
+    // aggregate is, which the operator's own result type does not say
+    if (const AstVhdlUnary* const unp = VN_CAST(valuep, VhdlUnary)) {
+        const VhdlSymbol* const opp = unp->vhdlSymp();
+        if (unp->op() == VhdlUnaryOp::NOT && opp && opp->predefined() && unp->lhsp()
+            && (!valuep->vhdlTypep() || !valuep->vhdlTypep()->lengthEmittable())) {
+            return constrainFromValue(typep, unp->lhsp(), flp);
+        }
+    }
     // A value that is itself constrained hands over its index ranges
     // directly, whether it says its length as a number or as an expression
     // elaboration settles

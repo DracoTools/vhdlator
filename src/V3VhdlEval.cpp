@@ -1001,6 +1001,19 @@ private:
                 }
                 return VhdlValue::mkStr(out, resp);
             }
+            // "not (true, false)": an array of BOOLEAN or BIT, element by
+            // element, with the operand's bounds (9.2.2)
+            if (val.isArray()) {
+                std::vector<VhdlValue> elems;
+                elems.reserve(val.elements());
+                for (size_t i = 0; i < val.elements(); ++i) {
+                    const VhdlValue& ev = val.elementAt(i);
+                    if (!ev.isInt() || ev.toInt() < 0 || ev.toInt() > 1) return VhdlValue{};
+                    elems.push_back(VhdlValue::mkInt(ev.toInt() ^ 1, ev.typep()));
+                }
+                return VhdlValue::mkArray(std::move(elems), val.arrayLeft(), val.arrayAscending(),
+                                          resp);
+            }
             if (!val.isInt() || val.toInt() < 0 || val.toInt() > 1) return VhdlValue{};
             return VhdlValue::mkInt(val.toInt() ^ 1, resp);
         case VhdlUnaryOp::COND_CONV:
