@@ -3804,6 +3804,43 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
             m_scopep->insert(litAliasp);
         }
     }
+    // ... and its predefined operations, "=" and TO_STRING among them,
+    // where they are not visible already: they were declared where the
+    // type was, which need not be visible here at all (6.6.3)
+    if (targetp && targetp->kind() == VhdlSymKind::TYPE && targetp->typep()
+        && !targetp->typep()->isError()) {
+        VhdlType* const basep = targetp->typep()->base();
+        std::vector<VhdlSymbol*> eqs;
+        lookup("=", eqs);
+        bool visible = false;
+        for (const VhdlSymbol* const eqp : eqs) {
+            const VhdlSymbol* const realp = eqp->resolved();
+            if (realp->predefined() && realp->paramTypes().size() == 2 && realp->paramTypes()[0]
+                && realp->paramTypes()[0]->base() == basep) {
+                visible = true;
+                break;
+            }
+        }
+        if (!visible) V3VhdlStd::addImplicitOperators(m_scopep, basep);
+    }
+    // ... and a physical type's units, "5 kilothing" through
+    // "alias t_phys is work.test_pkg.t_phys" (6.6.3; nvc parse issue776)
+    if (targetp && targetp->kind() == VhdlSymKind::TYPE && targetp->typep()
+        && targetp->typep()->base()->kind() == VhdlTypeKind::PHYSICAL && targetp->declScopep()) {
+        for (const auto& unit : targetp->typep()->base()->units()) {
+            std::vector<VhdlSymbol*> found;
+            targetp->declScopep()->lookupLocal(lower(unit.first), found);
+            for (VhdlSymbol* const unitp : found) {
+                if (unitp->kind() != VhdlSymKind::PHYSICAL_UNIT) continue;
+                VhdlSymbol* const unitAliasp
+                    = VhdlSymTab::newSymbol(VhdlSymKind::ALIAS, unitp->name(), nodep);
+                unitAliasp->aliasp(unitp);
+                unitAliasp->typep(unitp->typep());
+                m_scopep->insert(unitAliasp);
+                break;
+            }
+        }
+    }
 }
 
 void VhdlSemVisitor::visit(AstVhdlAttrDecl* nodep) {
@@ -9445,9 +9482,12 @@ VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp)
                 std::vector<VhdlSymbol*> found;
                 lookup(parts.back(), found);
                 for (VhdlSymbol* const symp : found) {
-                    if (symp->kind() == VhdlSymKind::PHYSICAL_UNIT) {
-                        unitp->vhdlSymp(symp);
-                        return symp->typep();
+                    // A unit may be named through the alias of its type
+                    // declares for it (6.6.3)
+                    VhdlSymbol* const realp = symp->resolved();
+                    if (realp->kind() == VhdlSymKind::PHYSICAL_UNIT) {
+                        unitp->vhdlSymp(realp);
+                        return realp->typep();
                     }
                 }
                 err(nodep->fileline(), "'" + parts.back() + "' is not a physical unit");
