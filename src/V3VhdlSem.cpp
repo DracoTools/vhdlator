@@ -2657,8 +2657,15 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
             // what that region declares and also what a use clause there has
             // made visible -- potential visibility does not chain on its own
             declp->typep()->scopep()->addUse(m_scopep);
-            for (VhdlScope* const usedp : m_scopep->uses()) {
-                declp->typep()->scopep()->addUse(usedp);
+            // ... and in every region around it: the context clause of a
+            // package body opens a region of its own around the body's
+            // declarations, so what "use work.other_pkg.all" written before
+            // "package body" makes visible is visible here too (nvc sem
+            // issue276)
+            for (VhdlScope* sp = m_scopep; sp; sp = sp->parentp()) {
+                for (VhdlScope* const usedp : sp->uses()) {
+                    declp->typep()->scopep()->addUse(usedp);
+                }
             }
             m_scopep = declp->typep()->scopep();
             iterateAndNextNull(protp->declsp());
