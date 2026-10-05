@@ -11348,6 +11348,17 @@ private:
         if (bit != m_bindExprs.end()) return lowerExpr(bit->second);
         // One element of an array signal, at the index this call passed
         const auto dit = m_bindDynSigs.find(symp);
+        if (dit != m_bindDynSigs.end() && dit->second.arrayp && dit->second.slice
+            && dit->second.idxps.size() == 1 && dit->second.idxps[0]) {
+            // The slice from the left end this call passed, as many
+            // elements long as the formal is
+            AstNodeExpr* const fromp = new AstVarRef{flp, dit->second.arrayp, VAccess::READ};
+            AstNodeExpr* const leftp = new AstVarRef{flp, dit->second.idxps[0], VAccess::READ};
+            AstConst* const widthp = new AstConst{flp, AstConst::Unsized32{},
+                                                  static_cast<uint32_t>(dit->second.width)};
+            if (dit->second.downto) return new AstSelMinus{flp, fromp, leftp, widthp};
+            return new AstSelPlus{flp, fromp, leftp, widthp};
+        }
         if (dit != m_bindDynSigs.end() && dit->second.arrayp && !dit->second.idxps.empty()) {
             AstNodeExpr* outp = new AstVarRef{flp, dit->second.arrayp, VAccess::READ};
             for (AstVar* const idxp : dit->second.idxps) {
@@ -20349,6 +20360,49 @@ private:
     // "s(i)" where i is not static: the array is a signal of its own and the
     // index is an expression the caller can work out. True where the actual
     // is exactly that -- one index of a plain signal name, nothing further.
+    // A slice of a packed signal whose ends are not numbers here but are a
+    // fixed distance apart, as long as the formal it is given to, and
+    // running the way the signal does. Null otherwise.
+    AstVhdlRange* dynamicSliceOf(AstNodeVhdlExpr* actualp, const VhdlSymbol* rootp,
+                                 const VhdlType* formalTypep, int64_t& width) {
+        AstVhdlCall* const callp = VN_CAST(actualp, VhdlCall);
+        if (!callp || !callp->prefixp() || !VN_IS(callp->prefixp(), VhdlName)) return nullptr;
+        if (callp->prefixp()->vhdlSymp() != rootp || !rootp) return nullptr;
+        AstVhdlRange* const rp = VN_CAST(callp->argsp(), VhdlRange);
+        if (!rp || rp->nextp() || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) {
+            return nullptr;
+        }
+        const VhdlType* const sigTypep = rootp->typep();
+        if (!sigTypep || !sigTypep->isConstrainedArray() || sigTypep->dimensions() != 1) {
+            return nullptr;
+        }
+        const VhdlType* const elemp
+            = sigTypep->elementp() ? sigTypep->elementp() : sigTypep->base()->elementp();
+        if (!elemp || !elementPacks(elemp)) return nullptr;
+        const VhdlType* const sigIdxp = sigTypep->indexTypes()[0];
+        if (!sigIdxp || !sigIdxp->bounded()
+            || sigIdxp->ascending() != (rp->dir() == VhdlDir::TO)) {
+            return nullptr;
+        }
+        if (!formalTypep || !formalTypep->isConstrainedArray() || formalTypep->dimensions() != 1) {
+            return nullptr;
+        }
+        width = formalTypep->dimLength(0);
+        if (width <= 0) return nullptr;
+        LinearForm span;
+        linearAdd(span, rp->leftp(), 1, 0, true);
+        linearAdd(span, rp->rightp(), -1, 0, true);
+        bool fixed = span.ok;
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0) fixed = false;
+        }
+        const int64_t distance = span.konst;
+        span.clear();
+        if (!fixed) return nullptr;
+        const int64_t length = (rp->dir() == VhdlDir::DOWNTO ? distance : -distance) + 1;
+        return length == width ? rp : nullptr;
+    }
+
     static bool dynamicElementOf(AstNodeVhdlExpr* actualp, const VhdlSymbol* rootp,
                                  std::vector<AstNodeVhdlExpr*>& idxps) {
         AstVhdlCall* const callp = VN_CAST(actualp, VhdlCall);
@@ -28946,6 +29000,9 @@ private:
                 if (dynIt != m_bindDynSigs.end() && !dynIt->second.idxps.empty()) {
                     DynSigBind dyn;
                     dyn.arrayp = dynIt->second.arrayp;
+                    dyn.slice = dynIt->second.slice;
+                    dyn.downto = dynIt->second.downto;
+                    dyn.width = dynIt->second.width;
                     key += "|dynon"
                            + std::to_string(reinterpret_cast<uintptr_t>(dyn.arrayp));
                     for (size_t d = 0; d < dynIt->second.idxps.size(); ++d) {
@@ -29124,6 +29181,30 @@ private:
                            + std::to_string(partIdx);
                 }
                 if (!staticSelectKey(actualp, path)) {
+                    // A slice of a packed signal as long as the formal,
+                    // whose ends only the elaboration settles --
+                    // "rx_data(32*(i+1)-1 downto 32*i)" in a for generate:
+                    // the copy takes the left end as a parameter
+                    int64_t sliceWidth = 0;
+                    AstVhdlRange* const slicep
+                        = carried.empty()
+                              ? dynamicSliceOf(actualp, rootp, formals[i]->vhdlSymp()->typep(),
+                                               sliceWidth)
+                              : nullptr;
+                    if (slicep) {
+                        DynSigBind dyn;
+                        dyn.arrayp = m_vars[rootp];
+                        dyn.slice = true;
+                        dyn.downto = slicep->dir() == VhdlDir::DOWNTO;
+                        dyn.width = sliceWidth;
+                        dyn.argNames.push_back("__Vsiglft__" + formals[i]->name());
+                        passed.push_back(AstVhdlExprPair{dyn.argNames[0], slicep->leftp()});
+                        dynBind.emplace(formals[i]->vhdlSymp(), dyn);
+                        key += "|dynslice"
+                               + std::to_string(reinterpret_cast<uintptr_t>(dyn.arrayp))
+                               + (dyn.downto ? "d" : "u") + std::to_string(sliceWidth);
+                        continue;
+                    }
                     // One element of an array signal, at an index the call
                     // works out: the copy takes the index as a parameter
                     std::vector<AstNodeVhdlExpr*> idxExprps;
@@ -32580,6 +32661,11 @@ private:
         // The copy's own parameters holding the indices, one per dimension
         std::vector<AstVar*> idxps;
         std::vector<std::string> argNames;  // What the caller passes them as
+        // A slice of a fixed length rather than one element: its one
+        // parameter is the slice's left end
+        bool slice = false;
+        bool downto = true;  // Which way the slice runs, as the signal does
+        int64_t width = 0;  // How many elements it has
     };
     std::map<const VhdlSymbol*, DynSigBind> m_bindDynSigs;
     // A signal-class formal bound to a signal several processes drive. An
