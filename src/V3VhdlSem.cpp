@@ -1056,6 +1056,17 @@ class VhdlSemVisitor final : public VNVisitor {
         std::string why;
         const VhdlValue val = V3VhdlEval::eval(nodep, &why);
         if (!why.empty()) {
+            // An integer divided by zero where the statement holding it is
+            // what runs into it is a run-time error, which is where nvc
+            // 1.22.1 and GHDL 7.0.0-dev report "1 mod 0" in a variable
+            // assignment (nvc simp cfold); a REAL one is refused at analysis
+            // by nvc and Questa 2025.2 alike
+            const VhdlType* const vtypep = nodep->vhdlTypep();
+            if (!atAnalysis && vtypep && vtypep->base()->kind() == VhdlTypeKind::INTEGER) {
+                nodep->fileline()->v3warn(VHDLBOUNDS, why + ", so no value of " + what
+                                                          + " results when it runs");
+                return;
+            }
             err(nodep->fileline(), why + ", so no value of " + what + " results");
             return;
         }

@@ -14521,6 +14521,26 @@ private:
             unsup(flp, "user-defined operator \"" + symp->name() + "\"");
             return nullptr;
         }
+        // An integer divided by a zero this can see is an error once it is
+        // evaluated (9.2.7), where nvc 1.22.1 and GHDL 7.0.0-dev stop the run;
+        // the back end's own division would quietly give a number
+        if (symp && symp->predefined()
+            && (nodep->op() == VhdlBinaryOp::DIV || nodep->op() == VhdlBinaryOp::MOD
+                || nodep->op() == VhdlBinaryOp::REM)
+            && rtypep && rtypep->base()->kind() == VhdlTypeKind::INTEGER) {
+            const VhdlValue divisor = V3VhdlEval::eval(nodep->rhsp());
+            if (divisor.isInt() && divisor.toInt() == 0) {
+                AstNode* const displayp = new AstDisplay{flp, VDisplayType::DT_ERROR,
+                                                         "Division by zero", nullptr, nullptr};
+                displayp->addNext(new AstStop{flp, true});
+                AstNodeExpr* const valuep = lowerExpr(nodep->lhsp());
+                if (!valuep) {
+                    VL_DO_DANGLING(displayp->deleteTree(), displayp);
+                    return nullptr;
+                }
+                return new AstExprStmt{flp, displayp, valuep};
+            }
+        }
         // numeric_std and numeric_bit answer a comparison with a null operand
         // without comparing anything -- "/=" is TRUE and the other five are
         // FALSE, each with a warning -- and their _unsigned forms call
