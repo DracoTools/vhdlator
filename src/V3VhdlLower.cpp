@@ -17742,6 +17742,9 @@ private:
         // the rest are marked as spoken for.
         std::vector<AstNodeVhdlExpr*> byIndex(static_cast<size_t>(count), nullptr);
         std::vector<int64_t> spanAt(static_cast<size_t>(count), 1);
+        // Where the value is of the aggregate's own type, even a run of one
+        // element: "(0 => 1)" in "((0 => 1), (0 => 200))" is no INTEGER
+        std::vector<bool> runAt(static_cast<size_t>(count), false);
         AstNodeVhdlExpr* othersp = nullptr;
         int64_t positional = 0;
         for (AstNode* p = nodep->elemsp(); p; p = p->nextp()) {
@@ -17768,6 +17771,9 @@ private:
                 positional += span;
                 if (slot >= 0 && slot < count) {
                     byIndex[static_cast<size_t>(slot)] = eap->valuep();
+                    if (vtypep && vtypep->base() == typep->base()) {
+                        runAt[static_cast<size_t>(slot)] = true;
+                    }
                     if (span > 1 && slot + span <= count) {
                         spanAt[static_cast<size_t>(slot)] = span;
                         for (int64_t k = 1; k < span; ++k) {
@@ -17907,7 +17913,8 @@ private:
                     continue;
                 }
             }
-            if (spanAt[static_cast<size_t>(i)] > 1 && !packed && !asString) {
+            if ((spanAt[static_cast<size_t>(i)] > 1 || runAt[static_cast<size_t>(i)]) && !packed
+                && !asString) {
                 // A value of the aggregate's own type standing for several
                 // elements at once (9.3.3.3) is written out an element at a
                 // time, the way an operand of a concatenation is
