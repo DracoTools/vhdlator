@@ -1370,6 +1370,83 @@ private:
         }
     }
 
+    // A VHDL function may call a procedure, and a constant it settles is
+    // still folded (IEEE 1076-2008 9.4.3), so in a parameter the task such a
+    // procedure became is run where it is called. Its ports are copied in,
+    // and those it may write are copied back to their actuals once it
+    // returns. A SystemVerilog constant function calls no tasks (IEEE
+    // 1800-2023 13.4.4), so a task written in Verilog keeps being refused.
+    void visit(AstTaskRef* nodep) override {
+        if (jumpingOver()) return;
+        if (!optimizable()) return;  // Accelerate
+        checkNodeInfo(nodep);
+        AstNodeFTask* taskp = nodep->taskp();
+        if (!m_params || !taskp || !taskp->fileline()->language().vhdl() || taskp->recursive()
+            || taskp->dpiImport()) {
+            badNodeType(nodep);
+            return;
+        }
+        V3Width::widthParamsEdit(taskp);
+        VL_DANGLING(taskp);  // Make sure we've sized the task
+        taskp = nodep->taskp();
+        UASSERT_OBJ(taskp, nodep, "Not linked");
+        const V3TaskConnects tconnects = V3Task::taskConnects(nodep, taskp->stmtsp());
+        std::vector<std::pair<AstVar*, AstNodeExpr*>> portValues;
+        std::vector<std::pair<AstVar*, AstNodeExpr*>> outPins;  // Port, its actual
+        for (const auto& it : tconnects) {
+            AstVar* const portp = it.first;
+            AstNodeExpr* const pinp = it.second->exprp();
+            if (!pinp) continue;
+            if (portp->isWritable()) outPins.emplace_back(portp, pinp);
+            // What an output starts with is its default, not the actual
+            if (portp->direction() == VDirection::OUTPUT) continue;
+            // An actual the task may write is a target here, but what goes
+            // in is its value, read from a copy of it
+            AstNodeExpr* readp = pinp;
+            if (portp->isWritable()) {
+                readp = pinp->cloneTree(false);
+                readp->foreach([](AstVarRef* refp) { refp->access(VAccess::READ); });
+                m_reclaimValuesp.push_back(readp);
+            }
+            iterateConst(readp);
+            if (!optimizable()) return;
+            if (!m_checkOnly) {
+                portValues.emplace_back(portp, newTrackedClone(fetchValue(readp)));
+            }
+        }
+        if (!m_checkOnly) {
+            taskp->foreach([this](AstVar* varp) {
+                if (varp->lifetime().isAutomatic() && !varp->isIO()) initVar(varp);
+            });
+            for (const auto& it : outPins) {
+                if (it.first->direction() == VDirection::OUTPUT) initVar(it.first);
+            }
+            for (const auto& it : portValues) newValue(it.first, it.second);
+        }
+        iterateConst(taskp);
+        if (!optimizable()) return;
+        for (const auto& it : outPins) {
+            // The port's value, read through a reference that the copy
+            // back can take it from as from any expression
+            AstVarRef* const fromp = new AstVarRef{nodep->fileline(), it.first, VAccess::READ};
+            m_reclaimValuesp.push_back(fromp);
+            if (!m_checkOnly) {
+                AstNodeExpr* const valuep = fetchValueNull(it.first);
+                if (!valuep) {
+                    clearOptimizable(it.first, "Output of a task was never given a value");
+                    return;
+                }
+                newValue(fromp, valuep);
+            }
+            AstAssign* const assignp = new AstAssign{
+                nodep->fileline(), new AstVarRef{nodep->fileline(), it.first, VAccess::WRITE},
+                new AstVarRef{nodep->fileline(), it.first, VAccess::READ}};
+            m_reclaimValuesp.push_back(assignp);
+            handleAssignRecurse(assignp, it.second, fromp);
+            if (!optimizable()) return;
+        }
+    }
+
     void visit(AstVar* nodep) override {
         if (jumpingOver()) return;
         if (!m_params) {
