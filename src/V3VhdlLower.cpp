@@ -9076,9 +9076,7 @@ private:
         const bool isInt = kind == VhdlTypeKind::INTEGER
                            || kind == VhdlTypeKind::UNIVERSAL_INTEGER;
         if (!isEnum && !isReal && !isPhys && !isInt) return nullptr;
-        if (isEnum && (basep->literals().empty() || basep->literals().size() > 256)) {
-            return nullptr;
-        }
+        if (isEnum && basep->literals().empty()) return nullptr;
         const auto it = m_valueFuncs.find(basep);
         if (it != m_valueFuncs.end() && usableHelper(it->second)) return it->second;
 
@@ -9147,23 +9145,28 @@ private:
             bodyp = AstNode::addNext(
                 bodyp, static_cast<AstNode*>(new AstAssign{
                            flp, wr(up, flp), new AstToLowerN{flp, rd(tp, flp)}}));
-            const std::vector<VhdlSymbol*>& literals = basep->literals();
-            AstNodeExpr* outp = i32(0, flp);
-            for (size_t i = literals.size(); i-- > 0;) {
-                const std::string& litName = literals[i]->name();
+            // One test per literal, side by side rather than nested, so an
+            // enumeration of any size makes a reader of the same depth. No
+            // two literals read the same, so at most one of them matches.
+            AstVar* const retp = VN_AS(funcp->fvarp(), Var);
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, new AstVarRef{flp, retp, VAccess::WRITE}, i32(0, flp)}));
+            for (const VhdlSymbol* const litp : basep->literals()) {
+                const std::string& litName = litp->name();
                 const bool isChar = litName.size() >= 2 && litName.front() == '\'';
                 AstNodeExpr* const gotp
                     = isChar ? rd(tp, flp) : rd(up, flp);
-                outp = new AstCond{
-                    flp,
-                    new AstEqN{flp, gotp,
-                               new AstConst{flp, AstConst::String{},
-                                            isChar ? litName : VString::downcase(litName)}},
-                    i32(literals[i]->position(), flp), outp};
+                bodyp = AstNode::addNext(
+                    bodyp,
+                    static_cast<AstNode*>(new AstIf{
+                        flp,
+                        new AstEqN{flp, gotp,
+                                   new AstConst{flp, AstConst::String{},
+                                                isChar ? litName : VString::downcase(litName)}},
+                        new AstAssign{flp, new AstVarRef{flp, retp, VAccess::WRITE},
+                                      i32(litp->position(), flp)}}));
             }
-            bodyp = AstNode::addNext(
-                bodyp, static_cast<AstNode*>(new AstAssign{
-                           flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, outp}));
             funcp->addStmtsp(bodyp);
             addHelperFunc(funcp);
             m_valueFuncs.insert_or_assign(basep, funcp);
@@ -32491,7 +32494,18 @@ private:
         // so it needs no table at all -- see formatFor
         if (basep == V3VhdlStd::characterType()) return nullptr;
         const std::vector<VhdlSymbol*>& literals = basep->literals();
-        if (literals.empty() || literals.size() > 256) return nullptr;
+        if (literals.empty()) return nullptr;
+        // Past a few hundred literals the choice is made in a function of
+        // its own, one test after another, rather than by a nested choice
+        // as deep as the type is long
+        if (literals.size() > 256) {
+            AstNodeFTask* const funcp = enumImageFunc(basep, isImage, flp);
+            if (!funcp) return nullptr;
+            AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), nullptr};
+            refp->taskp(VN_AS(funcp, Func));
+            refp->addArgsp(new AstArg{flp, "", exprp});
+            return refp;
+        }
         // The value is tested once per literal, so one that calls something
         // -- "boolean'image(f(x))" -- is worked out once, into a temporary:
         // an impure function reporting as it goes reported twice
@@ -32516,6 +32530,52 @@ private:
         VL_DO_DANGLING(exprp->deleteTree(), exprp);
         if (setp) return new AstExprStmt{flp, setp, outp};
         return outp;
+    }
+
+    // The image of a value of an enumeration type too long to choose
+    // between its literals in one expression: a function, one per type,
+    // tests the position against each literal in turn
+    std::map<std::pair<const VhdlType*, bool>, AstNodeFTask*> m_imageFuncs;
+    AstNodeFTask* enumImageFunc(const VhdlType* basep, bool isImage, FileLine* origFlp) {
+        if (!m_modp) return nullptr;
+        const auto key = std::make_pair(basep, isImage);
+        const auto it = m_imageFuncs.find(key);
+        if (it != m_imageFuncs.end() && usableHelper(it->second)) return it->second;
+        FileLine* const flp = new FileLine{origFlp};
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        const std::string name = "__Vimage" + std::to_string(++m_nameNum) + "__"
+                                 + VString::downcase(basep->prettyName());
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        AstVar* const retp
+            = newReturnVar(name, new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
+        funcp->fvarp(retp);
+        AstVar* const posp = new AstVar{flp, VVarType::PORT, "pos", VFlagChildDType{},
+                                        lowerType(const_cast<VhdlType*>(basep), flp)};
+        posp->direction(VDirection::INPUT);
+        posp->declDirection(VDirection::INPUT);
+        posp->funcLocal(true);
+        posp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        posp->trace(false);
+        funcp->addStmtsp(posp);
+        AstNode* bodyp = new AstAssign{flp, new AstVarRef{flp, retp, VAccess::WRITE},
+                                       new AstConst{flp, AstConst::String{}, "?"}};
+        for (const VhdlSymbol* const litp : basep->literals()) {
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstIf{
+                           flp,
+                           new AstEq{flp, rd(posp, flp),
+                                     new AstConst{flp, AstConst::Unsized32{},
+                                                  static_cast<uint32_t>(litp->position())}},
+                           new AstAssign{flp, new AstVarRef{flp, retp, VAccess::WRITE},
+                                         new AstConst{flp, AstConst::String{},
+                                                      literalText(litp->name(), isImage)}}}));
+        }
+        funcp->addStmtsp(bodyp);
+        addHelperFunc(funcp);
+        m_imageFuncs.insert_or_assign(key, funcp);
+        return funcp;
     }
 
     // Text that goes into a format string must not be read as a conversion
