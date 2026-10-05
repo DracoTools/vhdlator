@@ -8729,6 +8729,26 @@ void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out
             }
         }
     }
+    // A method of a protected object named without arguments, "x.f", has
+    // as many possible types as the methods of that name callable so: two
+    // that differ only in their result are told apart by the expression
+    // around them, "x.f + 25.0" (12.5)
+    if (AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+        const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+        VhdlScope* methScopep = nullptr;
+        if (sufp && !sufp->isChar() && protectedObject(selp->prefixp(), methScopep)) {
+            std::vector<VhdlSymbol*> methods;
+            methScopep->lookupLocal(sufp->name(), methods);
+            for (const VhdlSymbol* const mp : methods) {
+                if (mp->kind() != VhdlSymKind::FUNCTION || !mp->returnTypep()) continue;
+                if (!mp->paramTypes().empty() && !allParamsDefaulted(mp)) continue;
+                out.types.push_back(mp->returnTypep());
+            }
+            std::sort(out.types.begin(), out.types.end());
+            out.types.erase(std::unique(out.types.begin(), out.types.end()), out.types.end());
+            if (!out.types.empty()) return;
+        }
+    }
     // An element of what an overloaded function returns, "f.a" or
     // "f(3).a": each result that has the element gives its subtype (12.5)
     if (AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
@@ -8789,7 +8809,25 @@ void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out
         // about to resolve -- "v := not f(3, 0)" picks f by way of "not".
         std::vector<std::string> parts;
         std::vector<VhdlSymbol*> found;
-        if (flatten(callp->prefixp(), parts) && !parts.empty()) lookup(parts.back(), found);
+        // "params.get(5)" calls a method of the object, whose overloads are
+        // the protected type's declarations of that name (5.6.2)
+        bool method = false;
+        if (AstVhdlSelected* const selp = VN_CAST(callp->prefixp(), VhdlSelected)) {
+            const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+            VhdlScope* methScopep = nullptr;
+            if (sufp && !sufp->isChar() && protectedObject(selp->prefixp(), methScopep)) {
+                std::vector<VhdlSymbol*> methods;
+                methScopep->lookupLocal(sufp->name(), methods);
+                for (VhdlSymbol* const mp : methods) {
+                    const AstVhdlSubprogDecl* const dp = VN_CAST(mp->declp(), VhdlSubprogDecl);
+                    if (dp && !dp->hasBody()) found.push_back(mp);
+                }
+                method = !found.empty();
+            }
+        }
+        if (!method && flatten(callp->prefixp(), parts) && !parts.empty()) {
+            lookup(parts.back(), found);
+        }
         dropUninstantiated(found);
         // A name that also denotes a type or an object makes this a
         // conversion or an indexed name, which the ordinary path settles.
