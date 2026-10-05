@@ -22996,16 +22996,30 @@ private:
             if (AstVhdlRange* const rp = chp->rangep()) {
                 const VhdlValue lo = V3VhdlEval::eval(rp->leftp());
                 const VhdlValue hi = V3VhdlEval::eval(rp->rightp());
-                if (!lo.known() || !hi.known()) {
+                AstNodeExpr* lop = nullptr;
+                AstNodeExpr* hip = nullptr;
+                if (lo.known() && hi.known()) {
+                    lop = lowerValue(lo, lo.typep(), flp);
+                    hip = lowerValue(hi, hi.typep(), flp);
+                } else if (comparableRange(rp)) {
+                    // Bounds the frontend cannot fold are compared as the
+                    // statement runs (see caseWantsChain)
+                    const bool asc = rp->dir() == VhdlDir::TO;
+                    lop = lowerExpr(asc ? rp->leftp() : rp->rightp());
+                    hip = lowerExpr(asc ? rp->rightp() : rp->leftp());
+                } else {
                     unsup(flp, "non-static range choice");
                     return nullptr;
                 }
                 AstNodeExpr* const sel1p = lowerExpr(selp);
                 AstNodeExpr* const sel2p = lowerExpr(selp);
-                if (!sel1p || !sel2p) return nullptr;
-                onep = new AstAnd{flp,
-                                  new AstGteS{flp, sel1p, lowerValue(lo, lo.typep(), flp)},
-                                  new AstLteS{flp, sel2p, lowerValue(hi, hi.typep(), flp)}};
+                if (!sel1p || !sel2p || !lop || !hip) {
+                    for (AstNodeExpr* const ep : {sel1p, sel2p, lop, hip}) {
+                        if (ep) ep->deleteTree();
+                    }
+                    return nullptr;
+                }
+                onep = new AstAnd{flp, new AstGteS{flp, sel1p, lop}, new AstLteS{flp, sel2p, hip}};
             } else if (chp->valuep()) {
                 AstNodeExpr* const selValp = lowerExpr(selp);
                 AstNodeExpr* const chValp = lowerExpr(chp->valuep());
@@ -27375,7 +27389,11 @@ private:
 
     // Whether any choice of this case covers more values than listing them
     // one by one can stand. A subtype of INTEGER reaches two billion, and
-    // "when too_high =>" is an ordinary thing to write (10.9).
+    // "when too_high =>" is an ordinary thing to write (10.9). So does one
+    // whose bounds the frontend cannot fold, which can still be compared
+    // against: "to_integer(unsigned'(\"0000\")) to to_integer(...)" calls
+    // NUMERIC_STD, which 9.4.2 counts as locally static and nvc and Questa
+    // take as a choice.
     static bool caseWantsChain(AstVhdlCase* nodep) {
         if (nodep->matching()) return false;  // "case?" matches bit patterns
         for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
@@ -27385,11 +27403,20 @@ private:
                 int64_t low = 0;
                 int64_t high = 0;
                 VhdlType* typep = nullptr;
-                if (!staticRange(chp->rangep(), low, high, typep)) continue;
+                if (!staticRange(chp->rangep(), low, high, typep)) {
+                    if (comparableRange(chp->rangep())) return true;
+                    continue;
+                }
                 if (high - low > 4096) return true;
             }
         }
         return false;
+    }
+
+    // A range choice written with both its bounds, in a known direction,
+    // whose bounds can be read as the statement runs
+    static bool comparableRange(const AstVhdlRange* rp) {
+        return rp && rp->leftp() && rp->rightp() && !rp->attrp() && !rp->dirUnknown();
     }
 
     // A case whose choices span too many values to list becomes an if-chain
@@ -27419,15 +27446,27 @@ private:
                     int64_t low = 0;
                     int64_t high = 0;
                     VhdlType* typep = nullptr;
+                    AstNodeExpr* lop = nullptr;
+                    AstNodeExpr* hip = nullptr;
                     if (!staticRange(rp, low, high, typep)) {
-                        unsup(chp->fileline(), "non-static range choice");
+                        if (!comparableRange(rp)) {
+                            unsup(chp->fileline(), "non-static range choice");
+                            continue;
+                        }
+                        // Compared as the case runs: the low end is the left
+                        // one of an ascending range
+                        const bool asc = rp->dir() == VhdlDir::TO;
+                        lop = lowerExpr(asc ? rp->leftp() : rp->rightp());
+                        hip = lowerExpr(asc ? rp->rightp() : rp->leftp());
+                    } else {
+                        lop = lowerValue(VhdlValue::mkInt(low, typep), typep, chp->fileline());
+                        hip = lowerValue(VhdlValue::mkInt(high, typep), typep, chp->fileline());
+                    }
+                    if (!lop || !hip) {
+                        if (lop) VL_DO_DANGLING(lop->deleteTree(), lop);
+                        if (hip) VL_DO_DANGLING(hip->deleteTree(), hip);
                         continue;
                     }
-                    AstNodeExpr* const lop
-                        = lowerValue(VhdlValue::mkInt(low, typep), typep, chp->fileline());
-                    AstNodeExpr* const hip
-                        = lowerValue(VhdlValue::mkInt(high, typep), typep, chp->fileline());
-                    if (!lop || !hip) continue;
                     AstNodeExpr* const gep
                         = sgn ? static_cast<AstNodeExpr*>(new AstGteS{flp, sel(), lop})
                               : static_cast<AstNodeExpr*>(new AstGte{flp, sel(), lop});
