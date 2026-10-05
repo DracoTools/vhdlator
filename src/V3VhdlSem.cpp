@@ -8556,6 +8556,41 @@ void VhdlSemVisitor::candidateTypes(AstNodeVhdlExpr* nodep, CandSet& out) {
         out.types.erase(std::unique(out.types.begin(), out.types.end()), out.types.end());
         if (!out.types.empty()) return;
     }
+    // The same through a package, "pe.start", where two enumeration types of
+    // that package both declare the literal: every declaration it denotes
+    // there is a reading, as for a simple name (4.9, 12.3)
+    if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+        std::vector<std::string> parts;
+        if (flatten(selp, parts) && parts.size() >= 2) {
+            VhdlScope* scopep = m_scopep;
+            for (size_t i = 0; i + 1 < parts.size() && scopep; ++i) {
+                scopep = scopep->findNamed(parts[i]);
+            }
+            if (scopep) {
+                const AstVhdlName* const sufNamep = VN_CAST(selp->suffixp(), VhdlName);
+                const std::string key = sufNamep && sufNamep->isChar()
+                                            ? vhdlCharLitName(sufNamep->name())
+                                            : parts.back();
+                std::vector<VhdlSymbol*> found;
+                scopep->lookupLocal(key, found);
+                bool allLiterals = !found.empty();
+                for (const VhdlSymbol* const symp : found) {
+                    if (symp->resolved()->kind() != VhdlSymKind::ENUM_LITERAL) allLiterals = false;
+                }
+                if (allLiterals) {
+                    for (const VhdlSymbol* const symp : found) {
+                        if (VhdlType* const typep = symp->resolved()->typep()) {
+                            out.types.push_back(typep);
+                        }
+                    }
+                    std::sort(out.types.begin(), out.types.end());
+                    out.types.erase(std::unique(out.types.begin(), out.types.end()),
+                                    out.types.end());
+                    if (!out.types.empty()) return;
+                }
+            }
+        }
+    }
     // An operator or a call has as many possible types as it has applicable
     // overloads. Gathering them without committing is what lets the context
     // settle a whole expression at once rather than each operand separately.
