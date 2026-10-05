@@ -431,6 +431,11 @@ class VhdlSemVisitor final : public VNVisitor {
     // (4.9), so neither is a redeclaration of the other and every call in it
     // means what it meant there.
     bool m_inPackageInstance = false;
+    // What an attribute specification gives a statement label (7.2). A
+    // label is declared by the statement it labels, which comes after the
+    // specification and declares no symbol, so the value is kept on a symbol
+    // of its own, by region and label, that "label'attr" finds (16.2)
+    std::map<std::pair<const VhdlScope*, std::string>, VhdlSymbol*> m_labelBearers;
     // Which subprogram each call of the template resolved to, keyed by the
     // copy's own node
     std::map<const AstNode*, const VhdlSymbol*> m_templateSyms;
@@ -4055,6 +4060,14 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
                                        + "' in the declarative part that declares it, and"
                                          " this is not that one");
             continue;
+        }
+        if (cls == "label" && !anyOfClass) {
+            VhdlSymbol*& bearerp = m_labelBearers[std::make_pair(
+                static_cast<const VhdlScope*>(m_scopep), lower(parts.back()))];
+            if (!bearerp) {
+                bearerp = VhdlSymTab::newSymbol(VhdlSymKind::LABEL, lower(parts.back()), namep);
+            }
+            found.assign(1, bearerp);
         }
         for (VhdlSymbol* const symp : found) {
             VhdlSymbol* const realp = symp->resolved();
@@ -10110,6 +10123,17 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
                     if (ok) matched.push_back(candp);
                 }
                 if (matched.size() == 1) bearers.swap(matched);
+            }
+            // A statement label declares no symbol: what was given it is
+            // kept by region, the innermost first (7.2)
+            if (bearers.empty() && prefs.empty() && !prefixIsBearer
+                && VN_IS(nodep->prefixp(), VhdlName)) {
+                for (const VhdlScope* sp = m_scopep; sp && bearers.empty(); sp = sp->parentp()) {
+                    const auto it = m_labelBearers.find(std::make_pair(sp, lower(parts.back())));
+                    if (it != m_labelBearers.end() && it->second->userAttr(attrName)) {
+                        bearers.push_back(it->second);
+                    }
+                }
             }
             // Where more than one bears it and nothing chooses between them,
             // the name is ambiguous and saying so is the right answer
