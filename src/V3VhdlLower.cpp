@@ -1267,8 +1267,17 @@ private:
                                    const VhdlType** typepp = nullptr) {
         if (!objNamep) return nullptr;
         VhdlSymbol* const objp = objNamep->vhdlSymp();
-        if (!objp || !objp->isObject() || !objp->typep()) return nullptr;
+        if (!objp || !objp->typep()) return nullptr;
         if (objp->typep()->base()->kind() != VhdlTypeKind::PROTECTED) return nullptr;
+        // An alias of an external name of a shared variable elsewhere in the
+        // design: the object is reached through the hierarchy (8.7)
+        if (objp->kind() == VhdlSymKind::ALIAS) {
+            const AstVhdlAliasDecl* const aliasp = VN_CAST(objp->declp(), VhdlAliasDecl);
+            if (!aliasp || !VN_IS(aliasp->targetp(), VhdlExternalName)) return nullptr;
+            if (typepp) *typepp = objp->typep()->base();
+            return lowerExpr(objNamep);
+        }
+        if (!objp->isObject()) return nullptr;
         if (typepp) *typepp = objp->typep()->base();
         AstVar* const varp = objectVar(objp, objNamep->fileline());
         return varp ? new AstVarRef{objNamep->fileline(), varp, VAccess::READ} : nullptr;

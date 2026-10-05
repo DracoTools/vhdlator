@@ -599,7 +599,16 @@ class VhdlSemVisitor final : public VNVisitor {
             // An alias is another name for the object, and a method is
             // reached through it just as well (6.6.1)
             VhdlSymbol* const realp = symp->resolved();
-            if (!realp->isObject()) continue;
+            // An alias of an external name of a shared variable denotes an
+            // object elsewhere in the design, whose methods are as callable
+            // through it (8.7)
+            const AstVhdlAliasDecl* const aliasDeclp
+                = realp->kind() == VhdlSymKind::ALIAS && realp->objectAlias()
+                      ? VN_CAST(realp->declp(), VhdlAliasDecl)
+                      : nullptr;
+            const AstVhdlExternalName* const extp
+                = aliasDeclp ? VN_CAST(aliasDeclp->targetp(), VhdlExternalName) : nullptr;
+            if (!realp->isObject() && !(extp && extp->objClass() == "variable")) continue;
             VhdlType* typep = realp->typep();
             if (typep && typep->kind() == VhdlTypeKind::ACCESS) typep = typep->designatedp();
             if (!typep || typep->base()->kind() != VhdlTypeKind::PROTECTED) continue;
