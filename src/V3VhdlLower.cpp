@@ -4795,6 +4795,44 @@ private:
         return displayp;
     }
 
+    // Converted to an unconstrained array type, a value keeps its bounds,
+    // converted to the target's index type (9.3.6). Where a bound is a
+    // number outside the target's index subtype -- "bit_vector(x)" of an x
+    // indexed "31 downto -32", a BIT_VECTOR being indexed by NATURAL -- the
+    // conversion is an error once it runs, which is where nvc 1.22.1 and
+    // GHDL 7.0.0-dev stop it; null where nothing is wrong
+    static AstNode* conversionBoundsFailure(const VhdlType* top, const VhdlType* fromp,
+                                            FileLine* flp) {
+        if (!top || !fromp || top->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (!top->unconstrained() || fromp->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        if (!fromp->isConstrainedArray()) return nullptr;
+        const std::vector<VhdlType*>& toIdx = top->base()->indexTypes();
+        const std::vector<VhdlType*>& fromIdx = fromp->indexTypes();
+        if (toIdx.size() != fromIdx.size()) return nullptr;
+        for (size_t d = 0; d < toIdx.size(); ++d) {
+            const VhdlType* const tip = toIdx[d];
+            const VhdlType* const fip = fromIdx[d];
+            if (!tip || !fip || !tip->bounded() || !fip->bounded()) continue;
+            if (tip->base()->kind() != VhdlTypeKind::INTEGER
+                || fip->base()->kind() != VhdlTypeKind::INTEGER) {
+                continue;
+            }
+            // A null range has no element whose index could be out of range
+            if (fip->length() <= 0) continue;
+            if (fip->low() >= tip->low() && fip->high() <= tip->high()) continue;
+            AstNode* const displayp = new AstDisplay{
+                flp, VDisplayType::DT_ERROR,
+                "Bound check failure: the converted value is indexed "
+                    + std::to_string(fip->left()) + (fip->ascending() ? " to " : " downto ")
+                    + std::to_string(fip->right()) + ", outside the index range of "
+                    + top->base()->prettyName(),
+                nullptr, nullptr};
+            displayp->addNext(new AstStop{flp, true});
+            return displayp;
+        }
+        return nullptr;
+    }
+
     std::map<std::pair<const VhdlType*, int64_t>, AstNodeFTask*> m_dynToFuncs;
 
     // A value that carries its own bounds, copied into one whose subtype
@@ -16594,6 +16632,9 @@ private:
         VhdlType* const fromp = argp->vhdlTypep();
         const VhdlTypeKind toKind = top->base()->kind();
         const VhdlTypeKind fromKind = fromp ? fromp->base()->kind() : toKind;
+        if (AstNode* const failp = conversionBoundsFailure(top, fromp, flp)) {
+            return new AstExprStmt{flp, failp, valuep};
+        }
         if (toKind == VhdlTypeKind::FLOATING && fromKind != VhdlTypeKind::FLOATING) {
             // Written as a cast rather than as the conversion itself: the
             // back end settles what an operand is worth before it decides
