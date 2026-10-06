@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_genpkgnone_bad.vhd:38:7: Generic package 'slv_pkg' of the instantiated entity 't_vhdl_genpkgnone_ent' is given no package
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

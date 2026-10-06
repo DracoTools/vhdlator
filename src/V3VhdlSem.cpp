@@ -15755,7 +15755,16 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
         }
         if (generics[i]->kind() != VhdlIfaceKind::PACKAGE) continue;
         // A generic package is given a package that has been instantiated,
-        // so that its types and constants are settled (6.5.5)
+        // so that its types and constants are settled (6.5.5). It has no
+        // default to fall back on, so an instance that says nothing of it --
+        // a component that does not declare it -- gives it none: Questa
+        // 2025.2 refuses that too (GHDL gna issue2749)
+        if (!actuals[i]) {
+            err(nodep->fileline(), "Generic package '" + generics[i]->name()
+                                       + "' of the instantiated entity '" + entp->name()
+                                       + "' is given no package");
+            return nullptr;
+        }
         VhdlScope* scopep = nullptr;
         if (actuals[i]) {
             std::vector<std::string> aparts;
