@@ -22682,7 +22682,16 @@ private:
                                      deliverp});
         AstFork* const forkp = new AstFork{tflp, VJoinType::JOIN_NONE, ""};
         forkp->addForksp(new AstBegin{tflp, "", forkBodyp, false});
-        laterp->addNext(forkp);
+        // A transaction due after TIME'HIGH never comes: the simulation is
+        // complete before then (14.7.5.1). Scheduled anyway, the clock
+        // would wrap round to a time already gone -- "clk <= not clk after
+        // 100 ms" runs to the end of time (GHDL gna issue1994)
+        {
+            AstNodeExpr* const delayp = rd(dp, tflp);
+            laterp->addNext(
+                new AstIf{tflp, new AstLogNot{tflp, pastTimeHigh(delayp, tflp)}, forkp, nullptr});
+            VL_DO_DANGLING(delayp->deleteTree(), delayp);
+        }
         taskp->addStmtsp(new AstIf{
             tflp,
             new AstEq{tflp, rd(dp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 0}},
@@ -22954,6 +22963,16 @@ private:
             AstNode* stmtsp
                 = waveformStmts(nodep->targetp(), nodep->wavesp(), readsp, flp, nodep->delay());
             if (!stmtsp) return;
+            // A waveform due after TIME'HIGH never comes (14.7.5.1), and
+            // scheduled anyway would wrap the clock round. Its elements are
+            // in increasing order, so the first says it for all of them.
+            if (nodep->wavesp()->afterp()) {
+                if (AstNodeExpr* const firstp = lowerExpr(nodep->wavesp()->afterp())) {
+                    stmtsp = new AstIf{flp, new AstLogNot{flp, pastTimeHigh(firstp, flp)}, stmtsp,
+                                       nullptr};
+                    VL_DO_DANGLING(firstp->deleteTree(), firstp);
+                }
+            }
             // "s <= guarded w" schedules the waveform only while GUARD is
             // true, and turns its driver off when GUARD goes false (11.6)
             if (const VhdlDriver* const gdrvp = nodep->guarded() && guardVarFor(nodep)
@@ -25945,8 +25964,15 @@ private:
             if (!valuep) return nullptr;
             AstNode* const markp
                 = transactionMark(nodep->targetp(), delayp, sequential, valuep, flp);
-            return AstNode::addNextNull(
+            // A transaction due after TIME'HIGH never comes (14.7.5.1), and
+            // scheduled anyway would wrap the clock round
+            AstNodeExpr* const pastp = sequential && VN_IS(delayp, Delay)
+                                           ? pastTimeHigh(VN_AS(delayp, Delay)->lhsp(), flp)
+                                           : nullptr;
+            AstNode* const outp = AstNode::addNextNull(
                 driveResolved(nodep, nodep->targetp(), valuep, delayp, sequential, flp), markp);
+            if (!pastp || !outp) return outp;
+            return new AstIf{flp, new AstLogNot{flp, pastp}, outp, nullptr};
         }
         if (sequential && isRunningSlice(nodep->targetp())) {
             AstNode* const outp = runningSliceDrive(nodep->targetp(), wfp->valuep(), delayp, flp);
