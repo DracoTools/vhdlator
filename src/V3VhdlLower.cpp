@@ -24890,6 +24890,14 @@ private:
     }
 
     AstNode* lowerStmt(AstNodeVhdlStmt* nodep) {
+        // A call in a statement that runs is not folded where it would report
+        const bool savedKeep = V3VhdlEval::s_keepReports;
+        V3VhdlEval::s_keepReports = true;
+        AstNode* const outp = lowerStmtInner(nodep);
+        V3VhdlEval::s_keepReports = savedKeep;
+        return outp;
+    }
+    AstNode* lowerStmtInner(AstNodeVhdlStmt* nodep) {
         FileLine* const flp = nodep->fileline();
         if (AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
             return lowerSeqAssign(asgp, true);

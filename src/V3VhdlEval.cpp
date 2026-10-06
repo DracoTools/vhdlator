@@ -1676,11 +1676,20 @@ private:
             }
             return Flow::RETURNED;
         }
-        if (VN_IS(nodep, VhdlAssert)) {
+        if (AstVhdlAssert* const ap = VN_CAST(nodep, VhdlAssert)) {
             // An assertion produces no value. Raising it here would put the
             // message out once for every expression that folds a call to
             // this function rather than once for every execution, so the
-            // check is left to the code the back end emits.
+            // check is left to the code the back end emits -- which exists
+            // only if the call is not folded. In a statement that runs, one
+            // that holds says nothing and the call folds; one that reports --
+            // a report statement, or an assertion whose condition is false --
+            // is output the run has to produce, so the call is left to run
+            // (GHDL gna issue321). See s_keepReports.
+            if (!V3VhdlEval::s_keepReports) return Flow::NORMAL;
+            if (ap->isReport()) return bail();
+            const VhdlValue condv = eval(ap->condp());
+            if (condv.isInt() && condv.toInt() == 0) return bail();
             return Flow::NORMAL;
         }
         if (AstVhdlVarAssign* const p = VN_CAST(nodep, VhdlVarAssign)) {
@@ -2446,6 +2455,7 @@ private:
 // Entry points
 
 bool V3VhdlEval::s_sharedInitValues = false;
+bool V3VhdlEval::s_keepReports = false;
 std::set<const VhdlSymbol*> V3VhdlEval::s_archShared;
 std::set<const VhdlSymbol*> V3VhdlEval::s_elabWritten;
 std::set<const VhdlSymbol*> V3VhdlEval::s_elabObjects;

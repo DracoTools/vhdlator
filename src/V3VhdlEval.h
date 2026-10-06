@@ -63,6 +63,12 @@ public:
     // shared_spec_cov_config.max_requirement_lines)" -- is that value.
     // Anywhere else a shared variable's value is whatever running made it.
     static bool s_sharedInitValues;
+    // While a statement that runs is lowered: a call there that would
+    // report is left to run rather than folded, since folding would lose
+    // what it says. In a declaration -- a bound worked out once as the
+    // design is elaborated -- the call still folds, its value being needed
+    // there and its report being one elaboration would make.
+    static bool s_keepReports;
     // While an architecture's own declarations elaborate, the shared
     // variables it declared, which an impure function called there reads
     // and writes in the order the declarations elaborate (14.4.2): each
