@@ -2915,7 +2915,19 @@ AstNodeVhdlExpr* V3VhdlParse::parseNameSuffixes(AstNodeVhdlExpr* prefixp) {
             if (peekType() != VhdlTokType::RPAREN) {
                 do {
                     if (looksLikeRange()) {
-                        AstNodeVhdl* const rangep = parseDiscreteRange();
+                        AstNodeVhdl* rangep = parseDiscreteRange();
+                        // "msg(positive range 1 to 5)" slices over the range
+                        // the indication's constraint gives, the type mark
+                        // only saying what it is a range of (8.5, 5.3.2.1)
+                        // (GHDL gna issue877)
+                        if (AstVhdlSubtypeInd* const sip = VN_CAST(rangep, VhdlSubtypeInd)) {
+                            AstVhdlRange* const crp = VN_CAST(sip->constraintp(), VhdlRange);
+                            if (crp && !crp->attrp() && crp->leftp() && crp->rightp()) {
+                                crp->unlinkFrBack();
+                                VL_DO_DANGLING(sip->deleteTree(), sip);
+                                rangep = crp;
+                            }
+                        }
                         if (rangep) callp->addArgsp(rangep);
                         continue;
                     }
