@@ -137,8 +137,8 @@ class VhdlLowerVisitor final {
     VhdlType* m_retFixedp = nullptr;  // Its result, where that has a length
     VhdlType* m_retCarrier2p = nullptr;  // Its result, where that is held two levels deep
     std::map<const AstNodeFTask*, VhdlType*> m_retTypeOf;  // What each one gives back
-    const AstVhdlAggregate* m_retAggp = nullptr;  // Record aggregate being returned
-    const VhdlType* m_retAggTypep = nullptr;  // What the function gives it back as
+    const AstVhdlAggregate* m_retAggp = nullptr;  // Record aggregate returned or passed
+    const VhdlType* m_retAggTypep = nullptr;  // The shape it is given back or passed as
     std::map<const VhdlSymbol*, AstNodeFTask*> m_funcs;  // Subprogram -> what it became
     std::set<const VhdlSymbol*> m_emitting;  // Subprograms being emitted, to stop recursion
     // A signal driven from more than one place is resolved (6.5.2). Each
@@ -668,6 +668,25 @@ private:
                     if (formalp && !carriedDynamically(formalp) && !isDyn2Type(formalp)
                         && formalp->base()->kind() == VhdlTypeKind::ARRAY) {
                         onep = dynAsFixed(asp->actualp(), formalp, asp->fileline());
+                    }
+                }
+                // A record aggregate handed to a parameter is built in the
+                // shape the parameter is held in, which may carry an element
+                // the aggregate gives as bits: "is_0(v.a => '1', v.w => a)"
+                // with v.w of an open array type (GHDL synth func03)
+                if (!onep && symp) {
+                    AstVhdlAggregate* const aggp = VN_CAST(asp->actualp(), VhdlAggregate);
+                    const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
+                    VhdlType* const formalp
+                        = at >= 0 && at < static_cast<int>(symp->paramTypes().size())
+                              ? symp->paramTypes()[at]
+                              : nullptr;
+                    if (aggp && formalp && formalp->base()->kind() == VhdlTypeKind::RECORD) {
+                        VL_RESTORER(m_retAggp);
+                        VL_RESTORER(m_retAggTypep);
+                        m_retAggp = aggp;
+                        m_retAggTypep = formalp;
+                        onep = lowerExpr(aggp);
                     }
                 }
                 // A record in one shape handed to a parameter of the other
