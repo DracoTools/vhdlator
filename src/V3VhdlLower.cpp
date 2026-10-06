@@ -15021,26 +15021,31 @@ private:
         // An array of a non-packed element compares lexicographically, which
         // no operator of the emitted language does
         if (AstNodeExpr* const lexp = lexArrayCompare(nodep, flp)) return lexp;
+        const VhdlType* const rightTypep = nodep->rhsp()->vhdlTypep();
+        const bool rightIsArray = rightTypep && rightTypep->base()->kind() == VhdlTypeKind::ARRAY;
         switch (nodep->op()) {
         // On BOOLEAN and BIT, and only there, these four are short-circuit
         // operations: the right operand is evaluated only if the left has not
         // already decided the answer (9.2.2). It is not an optimisation --
         // "i <= v'high and v(i) = '1'" depends on it, and so does any impure
-        // function written on the right.
+        // function written on the right. Not with an array on the right:
+        // "e and a" with e a BIT and a a BIT_VECTOR is VHDL-2008's
+        // scalar-array form, element by element (9.2.2; GHDL synth
+        // issue2327)
         case VhdlBinaryOp::AND:
-            if (shortCircuits(ltypep)) return new AstLogAnd{flp, lhsp, rhsp};
+            if (shortCircuits(ltypep) && !rightIsArray) return new AstLogAnd{flp, lhsp, rhsp};
             return new AstAnd{flp, lhsp, rhsp};
         case VhdlBinaryOp::OR:
-            if (shortCircuits(ltypep)) return new AstLogOr{flp, lhsp, rhsp};
+            if (shortCircuits(ltypep) && !rightIsArray) return new AstLogOr{flp, lhsp, rhsp};
             return new AstOr{flp, lhsp, rhsp};
         case VhdlBinaryOp::XOR: return new AstXor{flp, lhsp, rhsp};
         case VhdlBinaryOp::NAND:
-            if (shortCircuits(ltypep)) {
+            if (shortCircuits(ltypep) && !rightIsArray) {
                 return new AstLogNot{flp, new AstLogAnd{flp, lhsp, rhsp}};
             }
             return new AstNot{flp, new AstAnd{flp, lhsp, rhsp}};
         case VhdlBinaryOp::NOR:
-            if (shortCircuits(ltypep)) {
+            if (shortCircuits(ltypep) && !rightIsArray) {
                 return new AstLogNot{flp, new AstLogOr{flp, lhsp, rhsp}};
             }
             return new AstNot{flp, new AstOr{flp, lhsp, rhsp}};
