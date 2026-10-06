@@ -8996,7 +8996,17 @@ private:
                                         static_cast<int32_t>(val)};
                 }
             }
-            if (dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
+            // A scalar subtype whose range is not a number here --
+            // "natural range ram_type'range" over an array a generic sizes
+            // -- answers from that range, as written (GHDL synth issue1645)
+            bool scalarRange = false;
+            if (typep && typep->base()->kind() != VhdlTypeKind::ARRAY && !argp) {
+                AstVhdlRange* const brp
+                    = VN_CAST(const_cast<AstNode*>(typep->boundsp()), VhdlRange);
+                if (brp) { scalarRange = rangeParts(brp, leftp, rightp, ascending, dirKnown); }
+            }
+            if (scalarRange
+                || dynamicBounds(typep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                 if (!dirKnown) {
                     // The bounds arrive with the instance, and so does which
