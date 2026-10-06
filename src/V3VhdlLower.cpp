@@ -20723,6 +20723,57 @@ private:
             bool high = true;
             if (!levelTest(VN_AS(p, VhdlAlternative)->condp(), high)) return nullptr;
         }
+        // Nor where a reset branch reads a signal the process is sensitive
+        // to beside its clock and its resets: "out1 <= state" under the
+        // reset of a "process (all)" runs again whenever state changes while
+        // the reset holds, which an edge-triggered block never would (GHDL
+        // synth issue2850)
+        std::set<const VhdlSymbol*> listed;
+        for (AstNode* p = nodep->sensp(); p; p = p->nextp()) {
+            const AstNodeVhdlExpr* const sp = VN_CAST(p, NodeVhdlExpr);
+            if (sp && sp->vhdlSymp()) listed.insert(sp->vhdlSymp()->resolved());
+        }
+        std::set<const VhdlSymbol*> controls;
+        if (clockp->vhdlSymp()) controls.insert(clockp->vhdlSymp()->resolved());
+        for (AstNode* p = ifp->altsp(); p && p != lastp; p = p->nextp()) {
+            bool high = true;
+            const AstNodeVhdlExpr* const resetp
+                = levelTest(VN_AS(p, VhdlAlternative)->condp(), high);
+            if (resetp && resetp->vhdlSymp()) controls.insert(resetp->vhdlSymp()->resolved());
+        }
+        // What the branches assign is not what they read: a target named
+        // there is no reason to wake
+        std::set<const AstNode*> targetNames;
+        for (AstNode* p = ifp->altsp(); p && p != lastp; p = p->nextp()) {
+            const AstNode* const stmtsp = VN_AS(p, VhdlAlternative)->stmtsp();
+            if (!stmtsp) continue;
+            stmtsp->foreachAndNext([&](const AstVhdlSigAssign* asp) {
+                if (const AstVhdlName* const tp = VN_CAST(asp->targetp(), VhdlName)) {
+                    targetNames.insert(tp);
+                }
+            });
+            stmtsp->foreachAndNext([&](const AstVhdlVarAssign* asp) {
+                if (const AstVhdlName* const tp = VN_CAST(asp->targetp(), VhdlName)) {
+                    targetNames.insert(tp);
+                }
+            });
+        }
+        bool readsListed = false;
+        for (AstNode* p = ifp->altsp(); p && p != lastp; p = p->nextp()) {
+            const AstNode* const stmtsp = VN_AS(p, VhdlAlternative)->stmtsp();
+            if (!stmtsp) continue;
+            stmtsp->foreachAndNext([&](const AstVhdlName* namep) {
+                if (targetNames.count(namep)) return;
+                const VhdlSymbol* const symp
+                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                if (!symp || controls.count(symp)) return;
+                if (symp->kind() != VhdlSymKind::SIGNAL && symp->kind() != VhdlSymKind::PORT) {
+                    return;
+                }
+                if (nodep->sensAll() || listed.count(symp)) readsListed = true;
+            });
+        }
+        if (readsListed) return nullptr;
         return ifp;
     }
 
