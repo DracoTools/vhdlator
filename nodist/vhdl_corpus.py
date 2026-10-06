@@ -665,8 +665,11 @@ def run_one(args):
         else:
             # "-work" applies to the files that follow it, so each source goes
             # in beside the library the corpus analyzes it into
+            # A companion looked for in "work" is in the source's own
+            # library, whichever that turned out to be: ch_19_fork-b is in
+            # qsim, and asked for "work.fork" before the run knew that
             for other, lib in companions:
-                command += ['-work', lib, other]
+                command += ['-work', target_lib if lib == 'work' else lib, other]
             command += ['-work', target_lib, path]
         try:
             stdout, returncode = run_group(command, timeout)
