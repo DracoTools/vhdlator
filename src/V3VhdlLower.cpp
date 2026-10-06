@@ -22000,6 +22000,62 @@ private:
         // the array handed to the function is filled only by the arm that
         // uses it. Nothing is held from a previous run, so it is no latch.
         if (nullFtaskp) wflp->warnOff(V3ErrorCode::LATCH, true);
+        // A resolution function that reports is called exactly when the
+        // language calls it -- once at initialization and once per cycle a
+        // driver changes in (14.7.3.2) -- which a combinational block is
+        // not: the scheduler may settle it again with nothing changed, and
+        // each extra call reports again (GHDL gna bug21487 printed its
+        // initial resolution twice). Such a one remembers the driver values
+        // it last resolved, and calls only for new ones. A pure one --
+        // std_logic's -- is left as it was.
+        bool reports = false;
+        if (bodyp) {
+            bodyp->foreachAndNext([&reports](const AstNodeFTaskRef* refp) {
+                if (!refp->taskp()) return;
+                refp->taskp()->foreach([&reports](const AstNodeStmt* stmtp) {
+                    if (VN_IS(stmtp, Display) || VN_IS(stmtp, Stop) || VN_IS(stmtp, Finish)) {
+                        reports = true;
+                    }
+                });
+            });
+        }
+        if (reports && bodyp) {
+            // What it remembers is read before it is written, and the block
+            // depends on itself through it, both on purpose
+            FileLine* const rflp = new FileLine{flp};
+            rflp->warnOff(V3ErrorCode::LATCH, true);
+            rflp->warnOff(V3ErrorCode::ALWCOMBORDER, true);
+            rflp->warnOff(V3ErrorCode::UNOPTFLAT, true);
+            AstVar* const donep
+                = new AstVar{rflp, VVarType::VAR, "__Vresdone__" + m_prefix + symp->name(),
+                             VFlagChildDType{}, new AstBasicDType{rflp, VBasicDTypeKwd::BIT}};
+            donep->valuep(new AstConst{rflp, AstConst::BitFalse{}});
+            addStmt(donep);
+            AstNodeExpr* newp = new AstLogNot{rflp, new AstVarRef{rflp, donep, VAccess::READ}};
+            AstNode* rememberp = new AstAssign{rflp, new AstVarRef{rflp, donep, VAccess::WRITE},
+                                               new AstConst{rflp, AstConst::BitTrue{}}};
+            int n = 0;
+            for (const VhdlDriver& drv : drivers) {
+                for (AstVar* const varp : {drv.valp, drv.connp}) {
+                    if (!varp) continue;
+                    AstVar* const lastp = new AstVar{
+                        rflp, VVarType::VAR,
+                        "__Vreslast" + std::to_string(n++) + "__" + m_prefix + symp->name(),
+                        VFlagChildDType{}, varp->childDTypep()->cloneTree(false)};
+                    addStmt(lastp);
+                    newp = new AstLogOr{rflp, newp,
+                                        new AstNeq{rflp, new AstVarRef{rflp, varp, VAccess::READ},
+                                                   new AstVarRef{rflp, lastp, VAccess::READ}}};
+                    rememberp->addNext(new AstAssign{rflp,
+                                                     new AstVarRef{rflp, lastp, VAccess::WRITE},
+                                                     new AstVarRef{rflp, varp, VAccess::READ}});
+                }
+            }
+            bodyp = new AstIf{rflp, newp, AstNode::addNext(rememberp, bodyp), nullptr};
+            wflp->warnOff(V3ErrorCode::LATCH, true);
+            wflp->warnOff(V3ErrorCode::ALWCOMBORDER, true);
+            wflp->warnOff(V3ErrorCode::UNOPTFLAT, true);
+        }
         addStmt(new AstAlways{wflp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
         m_drivers.emplace(symp, drivers);
     }
