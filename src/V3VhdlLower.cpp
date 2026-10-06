@@ -8207,7 +8207,20 @@ private:
     // replaces at once, and where the length names a generic there may be no
     // value to write at all.
     bool startsAtItsLeft(const VhdlType* typep) const {
-        if (!typep || typep->isError() || !typep->bounded()) return false;
+        if (!typep || typep->isError()) return false;
+        // An array of such values too: an out port's actual starts at what
+        // the port's driver starts at, and with the actual's own default in
+        // its place a summator's "sum => z" changes at delta 1 although
+        // nothing changed it, or fails to (GHDL gna issue2536). Only one
+        // dimension of a scalar element, whose length is written out
+        if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+            return typep->dimensions() == 1 && typep->lengthEmittable()
+                   && !lengthOnlyRunningDecides(typep) && elemp && elemp->isScalar()
+                   && startsAtItsLeft(elemp);
+        }
+        if (!typep->bounded()) return false;
         switch (typep->base()->kind()) {
         case VhdlTypeKind::INTEGER:
         case VhdlTypeKind::PHYSICAL:
@@ -23555,7 +23568,46 @@ private:
         m_logicPosPins.clear();
     }
 
+    // A signal whose one source is an out port of an instance has, at
+    // initialization, the value that port's driver starts at -- the port's
+    // default, or its subtype's left -- and not its own declared default,
+    // which no driver of it gives (14.7.3.2, 6.5.6.3). With its own, a
+    // summator's "sum => z" changed at delta 1 although nothing did, or
+    // failed to where the references see an event (GHDL gna issue2536).
+    // Only a whole signal of this unit with a single driver, and a port
+    // with no default, whose driver therefore starts at its left.
+    void startAtOutPortDriver(const VhdlSymbol* formalp, const AstNodeVhdlExpr* actualp,
+                              FileLine* flp) {
+        const AstVhdlIfaceDecl* const ifp = VN_CAST(formalp->resolved()->declp(), VhdlIfaceDecl);
+        if (!ifp || ifp->defaultp()) return;
+        if (ifp->mode() != VhdlMode::OUT && ifp->mode() != VhdlMode::BUFFER) return;
+        const AstVhdlName* const namep = VN_CAST(actualp, VhdlName);
+        const VhdlSymbol* const asymp
+            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        if (!asymp || asymp->kind() != VhdlSymKind::SIGNAL) return;
+        if (drivenThroughDriver(asymp)) return;
+        const auto it = m_vars.find(asymp);
+        if (it == m_vars.end() || !it->second) return;
+        VhdlType* const typep = asymp->typep();
+        if (!startsAtItsLeft(typep)) return;
+        AstNodeExpr* const leftp = defaultValueFor(typep, flp);
+        if (!leftp) return;
+        AstVar* const varp = it->second;
+        if (varp->valuep()) {
+            AstNode* const oldp = varp->valuep()->unlinkFrBack();
+            VL_DO_DANGLING(oldp->deleteTree(), oldp);
+        }
+        varp->valuep(leftp);
+    }
+
     void lowerInstance(AstVhdlInstance* nodep) {
+        for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
+            const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            const AstVhdlName* const fnamep = asp ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+            if (fnamep && fnamep->vhdlSymp() && asp->actualp()) {
+                startAtOutPortDriver(fnamep->vhdlSymp(), asp->actualp(), asp->fileline());
+            }
+        }
         FileLine* const flp = nodep->fileline();
         dropLogicPosPins();
         std::vector<std::string> parts;
