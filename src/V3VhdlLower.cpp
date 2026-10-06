@@ -344,24 +344,32 @@ public:
     // makes one per set of generics -- and so does a helper that calls it.
     void addHelperFunc(AstNodeFTask* funcp) {
         bool ofModule = namesGeneric(funcp);
-        // A helper calling a function of the module stays beside it too: a
-        // bound written as "PIPELINE_BITS-1" names the architecture's own
-        // function (GHDL gna issue2065)
+        // A helper calling a function of the module, or naming one of its
+        // objects, stays beside it too: a bound written as "PIPELINE_BITS-1"
+        // names the architecture's own function, and "DATA_BITS" a constant
+        // worked out from it, which no generic shows (GHDL gna issue2065)
         if (!ofModule) {
-            funcp->foreach([&](AstNodeFTaskRef* refp) {
-                if (!refp->taskp()) return;
-                if (m_helperMod.count(refp->taskp())) ofModule = true;
-                // Either in the module already or among the statements the
-                // module is still to be given
-                const AstNode* lastp = refp->taskp();
-                for (const AstNode* up = lastp; up; up = up->backp()) {
+            // Either in the module already or among the statements the
+            // module is still to be given
+            const auto inModule = [&](const AstNode* nodep) {
+                const AstNode* lastp = nodep;
+                for (const AstNode* up = nodep; up; up = up->backp()) {
                     if (const AstNodeModule* const modp = VN_CAST(up, NodeModule)) {
-                        if (m_modp && modp == m_modp) ofModule = true;
-                        return;
+                        return m_modp && modp == m_modp;
                     }
                     lastp = up;
                 }
-                if (m_stmtsp && lastp == m_stmtsp) ofModule = true;
+                return m_stmtsp && lastp == m_stmtsp;
+            };
+            funcp->foreach([&](AstNodeFTaskRef* refp) {
+                if (!refp->taskp()) return;
+                if (m_helperMod.count(refp->taskp()) || inModule(refp->taskp())) {
+                    ofModule = true;
+                }
+            });
+            funcp->foreach([&](AstVarRef* refp) {
+                const AstVar* const varp = refp->varp();
+                if (varp && !varp->isFuncLocal() && inModule(varp)) ofModule = true;
             });
         }
         // As does one that takes or makes a carrier the module declares
