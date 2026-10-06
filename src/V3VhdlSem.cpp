@@ -16305,7 +16305,13 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
         // more often than "to", which is the answer this had before an
         // instance was asked, and it keeps a binding this does not reach
         // giving no answer at all
-        if (dflt) genp->defaultp(new AstVhdlName{flp, dflt});
+        if (dflt && std::isdigit(static_cast<unsigned char>(dflt[0]))) {
+            AstVhdlLiteral* const litp = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, dflt};
+            litp->intVal(std::stoll(dflt));
+            genp->defaultp(litp);
+        } else if (dflt) {
+            genp->defaultp(new AstVhdlName{flp, dflt});
+        }
         if (ifp->kind() == VhdlIfaceKind::CONSTANT) {
             // A generic constrained by these must see them declared first, so
             // they go in ahead of it
@@ -16352,13 +16358,35 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
     if (typep->unconstrained() && !isString) {
         consp = new AstVhdlIndexConstraint{flp};
         const size_t dims = basep->indexTypes().size();
+        // A port nothing is associated with is as long as its default --
+        // which at the top of the design is every port: "input : in
+        // unsigned := "0011"" is four elements, from the index subtype's
+        // own left bound and in its direction (9.3.2) (GHDL gna issue1128)
+        std::string leftDflt, rightDflt;
+        const char* ascDflt = "false";
+        if (path.empty() && dims == 1 && ifp->kind() != VhdlIfaceKind::CONSTANT) {
+            const AstVhdlLiteral* const litp = VN_CAST(ifp->defaultp(), VhdlLiteral);
+            const VhdlType* const idxp = basep->indexTypes()[0];
+            if (litp
+                && (litp->kind() == VhdlLitKind::STRING || litp->kind() == VhdlLitKind::BITSTRING)
+                && !litp->text().empty() && idxp && idxp->bounded()) {
+                const int64_t len = static_cast<int64_t>(litp->text().size());
+                const int64_t left = idxp->left();
+                const int64_t right = idxp->ascending() ? left + len - 1 : left - len + 1;
+                if (left >= 0 && right >= 0) {
+                    leftDflt = std::to_string(left);
+                    rightDflt = std::to_string(right);
+                    ascDflt = idxp->ascending() ? "true" : "false";
+                }
+            }
+        }
         for (size_t d = 0; d < dims; ++d) {
             const std::string leftName = "__vl" + mangled(d);
             const std::string rightName = "__vr" + mangled(d);
             const std::string ascName = "__va" + mangled(d);
-            makeGeneric(leftName);
-            makeGeneric(rightName);
-            makeGeneric(ascName, "boolean", "false");
+            makeGeneric(leftName, "integer", leftDflt.empty() ? nullptr : leftDflt.c_str());
+            makeGeneric(rightName, "integer", rightDflt.empty() ? nullptr : rightDflt.c_str());
+            makeGeneric(ascName, "boolean", ascDflt);
             AstVhdlRange* const rangep
                 = new AstVhdlRange{flp, new AstVhdlName{flp, leftName}, VhdlDir::TO,
                                    new AstVhdlName{flp, rightName}};
