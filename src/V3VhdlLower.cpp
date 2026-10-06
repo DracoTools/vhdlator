@@ -344,9 +344,24 @@ public:
     // makes one per set of generics -- and so does a helper that calls it.
     void addHelperFunc(AstNodeFTask* funcp) {
         bool ofModule = namesGeneric(funcp);
+        // A helper calling a function of the module stays beside it too: a
+        // bound written as "PIPELINE_BITS-1" names the architecture's own
+        // function (GHDL gna issue2065)
         if (!ofModule) {
             funcp->foreach([&](AstNodeFTaskRef* refp) {
-                if (refp->taskp() && m_helperMod.count(refp->taskp())) ofModule = true;
+                if (!refp->taskp()) return;
+                if (m_helperMod.count(refp->taskp())) ofModule = true;
+                // Either in the module already or among the statements the
+                // module is still to be given
+                const AstNode* lastp = refp->taskp();
+                for (const AstNode* up = lastp; up; up = up->backp()) {
+                    if (const AstNodeModule* const modp = VN_CAST(up, NodeModule)) {
+                        if (m_modp && modp == m_modp) ofModule = true;
+                        return;
+                    }
+                    lastp = up;
+                }
+                if (m_stmtsp && lastp == m_stmtsp) ofModule = true;
             });
         }
         // As does one that takes or makes a carrier the module declares
@@ -4604,6 +4619,24 @@ private:
         return refp;
     }
 
+    // The subtype of the vector a shift or rotate of numeric_std is given,
+    // where that one is not carried: the result is as long as it
+    VhdlType* shiftedOperandType(AstNodeVhdlExpr* nodep) const {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        const VhdlSymbol* const symp
+            = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (!symp || !inArithmeticPackage(symp)) return nullptr;
+        const std::string& name = symp->name();
+        if (name != "shift_left" && name != "shift_right" && name != "rotate_left"
+            && name != "rotate_right") {
+            return nullptr;
+        }
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (!asp || !asp->actualp() || isDynValue(asp->actualp())) return nullptr;
+        VhdlType* const argTypep = asp->actualp()->vhdlTypep();
+        return argTypep && argTypep->lengthEmittable() ? argTypep : nullptr;
+    }
+
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerDynValue(nodep, carrierTypep, flp);
@@ -4660,6 +4693,13 @@ private:
         // call site makes it, which the call's own type does not say
         if (!typep || !typep->isConstrainedArray()) {
             if (VhdlType* const emp = emittedArrayType(nodep)) typep = emp;
+        }
+        // A shift or rotate of numeric_std is as long as the vector it
+        // shifts, which is where the length is written when the call's own
+        // subtype is open: "x and shift_left(ones_reg, n)" (GHDL gna
+        // issue2065)
+        if (!typep || !typep->lengthEmittable()) {
+            if (VhdlType* const shiftedp = shiftedOperandType(nodep)) typep = shiftedp;
         }
         // One value over one range whose ends are not numbers here -- "(d'range
         // => v)" in a copy made for a signal a generic sizes, as VUnit's

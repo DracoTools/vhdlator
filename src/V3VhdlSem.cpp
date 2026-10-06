@@ -13242,46 +13242,77 @@ void VhdlSemVisitor::spreadElabConstants(const std::vector<AstNodeVhdlUnit*>& un
     // hands a generic such a value is handed it as data instead, which
     // lowering decides.
     const auto markIn = [](AstNode* exprp, bool& changed, bool foldableOnly = false) {
-        exprp->foreach([&](AstNodeVhdlExpr* refp) {
-            const VhdlSymbol* const symp = refp->vhdlSymp();
-            if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
-            if (foldableOnly) {
-                // Only a record: a handle a verification library builds is
-                // one, and elaboration folds the widths it carries into the
-                // bounds that name it, so it need not be a parameter. Any
-                // other constant is marked as it was before -- an array of
-                // handles still says how many there are, and a bound that
-                // counts them is read from the object.
-                const VhdlType* const typep = symp->typep();
-                if (typep && typep->base()->kind() == VhdlTypeKind::RECORD) {
-                    // A deferred constant is written twice and only the body
-                    // carries the value, so the one that has it is the one
-                    // to ask. Where neither does, nothing is known against
-                    // it and the constant is marked as it was before.
-                    const AstVhdlObjectDecl* valuep = VN_CAST(symp->declp(), VhdlObjectDecl);
-                    if (!valuep || !valuep->defaultp()) {
-                        const AstVhdlObjectDecl* const fullp
-                            = VN_CAST(symp->fullDeclp(), VhdlObjectDecl);
-                        if (fullp && fullp->defaultp()) valuep = fullp;
-                    }
-                    if (valuep && valuep->defaultp()
-                        && !V3VhdlEval::backEndFolds(valuep->defaultp())) {
+        // A function the design unit declares, called where a value has to
+        // be settled, is a constant function there, and the constants its
+        // body reads are settled with it: "signed(PIPELINE_BITS-1 downto 0)"
+        // over "return BITS + NUM_STAGES" (GHDL gna issue2065). A package's
+        // function is not followed, its constants being the package's.
+        std::vector<AstNode*> work{exprp};
+        std::set<const VhdlSymbol*> followed;
+        const auto follow = [&](const VhdlSymbol* symp) {
+            if (!followed.insert(symp).second) return;
+            for (AstNode* const declp : {symp->declp(), symp->fullDeclp()}) {
+                const AstVhdlSubprogDecl* const subp = VN_CAST(declp, VhdlSubprogDecl);
+                if (!subp || (!subp->declsp() && !subp->stmtsp())) continue;
+                for (const AstNode* up = subp->backp(); up; up = up->backp()) {
+                    if (VN_IS(up, VhdlPackage) || VN_IS(up, VhdlPackageBody)
+                        || VN_IS(up, VhdlPackageInst)) {
                         return;
                     }
+                    if (VN_IS(up, NodeVhdlUnit)) break;
                 }
+                for (AstNode* p = subp->declsp(); p; p = p->nextp()) work.push_back(p);
+                for (AstNode* p = subp->stmtsp(); p; p = p->nextp()) work.push_back(p);
             }
-            AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
-            // A deferred constant is written twice: once in the package with
-            // no value and once in the body with one. Both say the same
-            // constant, so both have to know it is settled by elaboration.
-            AstVhdlObjectDecl* const fullp = VN_CAST(symp->fullDeclp(), VhdlObjectDecl);
-            if ((!otherp || otherp->isElabConstant()) && (!fullp || fullp->isElabConstant())) {
-                return;
-            }
-            if (otherp) otherp->elabConstant(true);
-            if (fullp) fullp->elabConstant(true);
-            changed = true;
-        });
+        };
+        while (!work.empty()) {
+            AstNode* const nodep = work.back();
+            work.pop_back();
+            nodep->foreach([&](AstNodeVhdlExpr* refp) {
+                const VhdlSymbol* const symp = refp->vhdlSymp();
+                if (symp && symp->resolved()->kind() == VhdlSymKind::FUNCTION) {
+                    follow(symp->resolved());
+                    return;
+                }
+                if (!symp || symp->kind() != VhdlSymKind::CONSTANT) return;
+                if (foldableOnly) {
+                    // Only a record: a handle a verification library builds is
+                    // one, and elaboration folds the widths it carries into the
+                    // bounds that name it, so it need not be a parameter. Any
+                    // other constant is marked as it was before -- an array of
+                    // handles still says how many there are, and a bound that
+                    // counts them is read from the object.
+                    const VhdlType* const typep = symp->typep();
+                    if (typep && typep->base()->kind() == VhdlTypeKind::RECORD) {
+                        // A deferred constant is written twice and only the body
+                        // carries the value, so the one that has it is the one
+                        // to ask. Where neither does, nothing is known against
+                        // it and the constant is marked as it was before.
+                        const AstVhdlObjectDecl* valuep = VN_CAST(symp->declp(), VhdlObjectDecl);
+                        if (!valuep || !valuep->defaultp()) {
+                            const AstVhdlObjectDecl* const fullp
+                                = VN_CAST(symp->fullDeclp(), VhdlObjectDecl);
+                            if (fullp && fullp->defaultp()) valuep = fullp;
+                        }
+                        if (valuep && valuep->defaultp()
+                            && !V3VhdlEval::backEndFolds(valuep->defaultp())) {
+                            return;
+                        }
+                    }
+                }
+                AstVhdlObjectDecl* const otherp = VN_CAST(symp->declp(), VhdlObjectDecl);
+                // A deferred constant is written twice: once in the package with
+                // no value and once in the body with one. Both say the same
+                // constant, so both have to know it is settled by elaboration.
+                AstVhdlObjectDecl* const fullp = VN_CAST(symp->fullDeclp(), VhdlObjectDecl);
+                if ((!otherp || otherp->isElabConstant()) && (!fullp || fullp->isElabConstant())) {
+                    return;
+                }
+                if (otherp) otherp->elabConstant(true);
+                if (fullp) fullp->elabConstant(true);
+                changed = true;
+            });
+        }
     };
     // A constant a constraint names decides how long an object is, and the
     // back end folds a length rather than reading one, so such a constant is
