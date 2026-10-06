@@ -1295,14 +1295,36 @@ private:
         return up + name + ":";
     }
 
+    // The type mark a parameter was declared with, as written: a signature
+    // names "natural" for "t : natural range 0 to 4", whose subtype has no
+    // name of its own (16.2.5); empty where the declaration does not say
+    static std::string declaredMark(const VhdlSymbol* symp, size_t index) {
+        const AstVhdlSubprogDecl* const dp
+            = symp ? VN_CAST(symp->declp(), VhdlSubprogDecl) : nullptr;
+        if (!dp) return "";
+        const AstNode* p = dp->paramsp();
+        for (int g = 0; g < dp->genericCount() && p; ++g) p = p->nextp();
+        for (size_t i = 0; p && i < index; ++i) p = p->nextp();
+        const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+        const AstVhdlSubtypeInd* const sip = ifp ? ifp->subtypep() : nullptr;
+        const AstNodeVhdlExpr* markp = sip ? sip->typeMarkp() : nullptr;
+        while (const AstVhdlSelected* const selp = VN_CAST(markp, VhdlSelected)) {
+            markp = selp->suffixp();
+        }
+        const AstVhdlName* const namep = VN_CAST(markp, VhdlName);
+        if (!namep || !sip->constraintp()) return "";
+        return namep->name();
+    }
     // "[bit, bit return integer]", the parameter and result type profile
     static std::string signatureOf(const VhdlSymbol* symp) {
         std::string out = "[";
         bool first = true;
+        size_t index = 0;
         for (const VhdlType* const typep : symp->paramTypes()) {
             if (!first) out += ",";
             first = false;
-            out += typep ? typep->prettyName() : "";
+            const std::string mark = declaredMark(symp, index++);
+            out += !mark.empty() ? mark : typep ? typep->prettyName() : "";
         }
         if (symp->returnTypep()) out += " return " + symp->returnTypep()->prettyName();
         return out + "]";
