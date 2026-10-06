@@ -137,6 +137,8 @@ class VhdlLowerVisitor final {
     VhdlType* m_retFixedp = nullptr;  // Its result, where that has a length
     VhdlType* m_retCarrier2p = nullptr;  // Its result, where that is held two levels deep
     std::map<const AstNodeFTask*, VhdlType*> m_retTypeOf;  // What each one gives back
+    const AstVhdlAggregate* m_retAggp = nullptr;  // Record aggregate being returned
+    const VhdlType* m_retAggTypep = nullptr;  // What the function gives it back as
     std::map<const VhdlSymbol*, AstNodeFTask*> m_funcs;  // Subprogram -> what it became
     std::set<const VhdlSymbol*> m_emitting;  // Subprograms being emitted, to stop recursion
     // A signal driven from more than one place is resolved (6.5.2). Each
@@ -18878,6 +18880,16 @@ private:
                                 && elems[i]->typep()->base() == givenp->base();
             if (retype) valuep->vhdlTypep(elems[i]->typep());
             AstNodeExpr* memberp = recordAsShape(valuep, elems[i]->typep(), flp);
+            // An element the function's result holds as a carrier is given
+            // one, however long the value is: "return (data => to_slv(x))"
+            // hands over a vector of a fixed length (GHDL gna issue3034).
+            // Only the result as emitted says which elements those are: a
+            // copy whose return statements fix every length holds bits.
+            if (!memberp && !packed && nodep == m_retAggp && m_retAggTypep
+                && m_retAggTypep->elements().size() == elems.size()
+                && carriedIn(m_retAggTypep, m_retAggTypep->elements()[i]->typep())) {
+                memberp = asDynCarrier(valuep, m_retAggTypep->elements()[i]->typep(), flp);
+            }
             if (!memberp) memberp = lowerExpr(valuep);
             if (!memberp) {
                 if (retype) valuep->vhdlTypep(givenp);
@@ -24966,6 +24978,18 @@ private:
             return new AstIf{flp, lowerCondition(nextp->condp()), jumpp, nullptr};
         }
         if (AstVhdlReturn* const retp = VN_CAST(nodep, VhdlReturn)) {
+            // A record aggregate returned is built in the shape the emitted
+            // function gives back
+            VL_RESTORER(m_retAggp);
+            VL_RESTORER(m_retAggTypep);
+            if (AstVhdlAggregate* const aggp = VN_CAST(retp->valuep(), VhdlAggregate)) {
+                const auto rit = m_retTypeOf.find(m_ftaskp);
+                if (rit != m_retTypeOf.end() && rit->second
+                    && rit->second->base()->kind() == VhdlTypeKind::RECORD) {
+                    m_retAggp = aggp;
+                    m_retAggTypep = rit->second;
+                }
+            }
             // A guard returning a null value, where the result the copy was
             // given has a length ("if arg'length < 1 then return NSLV"). The
             // caller can do nothing with a value of no elements, so the
