@@ -610,8 +610,13 @@ def missing_companions(path, output, already):
         found = [other for other in index.get(name.lower(), [])
                  if other != path and os.path.basename(other) not in seen]
         # Only a file the corpus expects to be accepted: one that is there to
-        # be refused would report its errors as this source's
-        found = [other for other in found if expected_outcome(other) == 'accept']
+        # be refused would report its errors as this source's. Nor one its
+        # own runner leaves out: GHDL's list never analyzes ch_19_random-b
+        # ("no math_real.uniform"), so the sources it lists beside it are
+        # analyzed without that body, and are not to be refused for it
+        unrun = vests_unrun(os.path.dirname(path)) if '/vests/' in path else set()
+        found = [other for other in found if expected_outcome(other) == 'accept'
+                 and os.path.basename(other) not in unrun]
         # The library the source asked for is what says which file was meant,
         # where the list analyzes one into work and another into a library of
         # its own. A missing module reaches the linker with no library named,
@@ -636,7 +641,8 @@ def missing_companions(path, output, already):
             # declaration's own file needs none beside it
             bodies = [body for body in body_index(os.path.dirname(path)).get(name.lower(), [])
                       if body != path and os.path.basename(body) not in seen
-                      and expected_outcome(body) == 'accept']
+                      and expected_outcome(body) == 'accept'
+                      and os.path.basename(body) not in unrun]
             if choice in body_index(os.path.dirname(path)).get(name.lower(), []):
                 bodies = []
             body = order_choice(path, bodies, want) or (bodies[0] if len(bodies) == 1 else None)
