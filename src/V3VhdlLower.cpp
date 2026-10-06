@@ -20162,6 +20162,48 @@ private:
                 addStmt(new AstInitial{flp, initialp});
             }
         } else {
+            // A postponed process that waits on its signals first and then
+            // only reads -- "wait on c, z; report ...;" -- is the read-only
+            // form below with no run at the start: it suspends before doing
+            // anything (10.2). Resumed by its wait it would run a time step
+            // late, as 388hy found for one with a sensitivity list (GHDL gna
+            // issue2536)
+            AstVhdlWait* const firstWaitp = VN_CAST(nodep->stmtsp(), VhdlWait);
+            if (m_postponed && !nodep->hasSensList() && firstWaitp && firstWaitp->sensp()
+                && !firstWaitp->condp() && !firstWaitp->timeoutp()
+                && v3Global.opt.timing().isTrue()) {
+                bool onlyReads = true;
+                for (AstNode* sp = firstWaitp->nextp(); sp && onlyReads; sp = sp->nextp()) {
+                    if (VN_IS(sp, VhdlWait) || VN_IS(sp, VhdlSigAssign)) onlyReads = false;
+                    sp->foreach([&](const AstVhdlSigAssign*) { onlyReads = false; });
+                    sp->foreach([&](const AstVhdlWait*) { onlyReads = false; });
+                    sp->foreach([&](const AstVhdlProcCall*) { onlyReads = false; });
+                }
+                AstSenTree* const wsenp
+                    = onlyReads ? sensitivityOf(firstWaitp->sensp(), flp) : nullptr;
+                if (wsenp) {
+                    AstNode* const restp
+                        = firstWaitp->nextp() ? lowerStmts(firstWaitp->nextp()) : nullptr;
+                    FileLine* const pflp = new FileLine{flp};
+                    pflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    AstVar* const pendp = newTempVar("__Vpostpend", newLogicDType(pflp, 1), pflp);
+                    pendp->valuep(new AstConst{pflp, AstConst::BitFalse{}});
+                    AstNode* const wakep = new AstEventControl{pflp, wsenp, nullptr};
+                    wakep->addNext(new AstAssign{pflp, new AstVarRef{pflp, pendp, VAccess::WRITE},
+                                                 new AstConst{pflp, AstConst::BitTrue{}}});
+                    // Kept inside a block of its own, as for any process
+                    // whose first statement is a wait (see below)
+                    addStmt(new AstAlways{pflp, VAlwaysKwd::ALWAYS, nullptr,
+                                          new AstBegin{pflp, "", wakep, false}});
+                    AstNode* const runp
+                        = new AstAssign{pflp, new AstVarRef{pflp, pendp, VAccess::WRITE},
+                                        new AstConst{pflp, AstConst::BitFalse{}}};
+                    if (restp) runp->addNext(restp);
+                    addStmt(new AstAlwaysPostponed{
+                        pflp, new AstIf{pflp, new AstVarRef{pflp, pendp, VAccess::READ}, runp}});
+                    return;
+                }
+            }
             sentreep = sensitivity(nodep);
             bodyp = lowerStmts(nodep->stmtsp());
             // "process (all)" is sensitive to every signal it reads (11.3).
@@ -20227,7 +20269,12 @@ private:
                     AstNode* const wakep = new AstEventControl{pflp, sentreep, nullptr};
                     wakep->addNext(new AstAssign{pflp, new AstVarRef{pflp, pendp, VAccess::WRITE},
                                                  new AstConst{pflp, AstConst::BitTrue{}}});
-                    addStmt(new AstAlways{pflp, VAlwaysKwd::ALWAYS, nullptr, wakep});
+                    // Kept inside a block of its own: as the block's first
+                    // statement the back end reads the wait as what the block
+                    // is sensitive to, and a change of a value wider than a
+                    // bit then never wakes it
+                    addStmt(new AstAlways{pflp, VAlwaysKwd::ALWAYS, nullptr,
+                                          new AstBegin{pflp, "", wakep, false}});
                     AstNode* const runp
                         = new AstAssign{pflp, new AstVarRef{pflp, pendp, VAccess::WRITE},
                                         new AstConst{pflp, AstConst::BitFalse{}}};
