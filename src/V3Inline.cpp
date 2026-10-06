@@ -525,9 +525,11 @@ class InlineRelinkVisitor final : public VNVisitor {
         // 1800-2023 23.2.2.4), which applies only where the port is left
         // unconnected. The port is connected here, so the initializer must not
         // be retargeted onto the connected variable, whose own initial value
-        // it would overwrite.
-        if (m_inInitialStatic && !nodep->access().isReadOnly()
-            && m_inputPorts.count(nodep->varp())) {
+        // it would overwrite. The top module's ports are the exception: what
+        // they are connected to in the wrapper is the model's own I/O, which
+        // no design drives, so a top-level input keeps its default there.
+        if (m_inInitialStatic && !nodep->access().isReadOnly() && m_inputPorts.count(nodep->varp())
+            && !m_modp->isTop()) {
             replaceWithPlaceholder(nodep);
             return;
         }
