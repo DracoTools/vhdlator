@@ -724,6 +724,20 @@ class VhdlSemVisitor final : public VNVisitor {
             info.unbounded = VN_IS(sip->constraintp(), VhdlBox);
             info.valid = true;
             takeBoundsFrom(info, info.typep);
+            // "positive range out_arc'range": the constraint is a range a
+            // name gives, which may be one only elaboration settles -- an
+            // open port's -- and is then what the plain "out_arc'range"
+            // would give, the type mark saying only what it is a range of
+            // (5.3.2.1; VESTS ashenden ch_19_fork-b)
+            const AstVhdlRange* const crp = VN_CAST(sip->constraintp(), VhdlRange);
+            if (crp && crp->attrp() && info.typep && !info.typep->isError()
+                && !info.typep->bounded()) {
+                const RangeInfo inner = analyzeRange(sip->constraintp(), info.typep->base());
+                if (inner.valid && inner.typep && !inner.typep->isError()
+                    && inner.typep->base() == info.typep->base()) {
+                    return inner;
+                }
+            }
             return info;
         }
         // "v'range" written where a range is expected reaches here as the
