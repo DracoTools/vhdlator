@@ -6417,6 +6417,22 @@ private:
             }
             if (args >= 2) return operandCarries;
         }
+        // The shifts and rotates are emitted over their operand's own bits,
+        // so the result carries its bounds exactly where the operand does:
+        // "shift_left(to_signed(1, w'length), 2)" is as wide as the vector
+        // it shifts, whatever subtype analysis gave the call (GHDL gna
+        // bug24064)
+        // A rotate is emitted so only where the length is known here, and
+        // is otherwise the package's own body
+        if ((name == "shift_left" || name == "shift_right" || name == "rotate_left"
+             || name == "rotate_right")
+            && inArithmeticPackage(symp) && depth < 8) {
+            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            const bool rotate = name == "rotate_left" || name == "rotate_right";
+            if (asp && asp->actualp() && (!rotate || exprVectorWidth(asp->actualp()) > 0)) {
+                return isDynValue(asp->actualp(), depth + 1);
+            }
+        }
         // A conversion between the logic families keeps the same bits and is
         // emitted as nothing at all, so what it gives back is worth exactly
         // what it was handed. Recognised the same way the lowering of it is,
@@ -17540,8 +17556,11 @@ private:
             const int width = exprVectorWidth(args[0]);
             AstNodeExpr* const placesp = lowerExpr(args[1]);
             if (width <= 0 || !placesp) {
+                // The package's own body rotates a vector of any length, and
+                // is called instead: "rotate_left(to_unsigned(i, ADDR_BITS),
+                // n)" over a width a generic gives (GHDL gna issue2065)
                 if (placesp) VL_DO_DANGLING(placesp->deleteTree(), placesp);
-                unsup(flp, "'" + name + "' of a vector whose length is not known here");
+                VL_DO_DANGLING(firstp->deleteTree(), firstp);
                 return nullptr;
             }
             return rotateOf(firstp, placesp, width, name == "rotate_left", flp);
