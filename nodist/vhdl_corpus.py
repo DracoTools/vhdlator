@@ -459,6 +459,10 @@ MISSING_UNIT_RE = re.compile(r"Design unit '([^'.]*)\.([^'.]+)' not found")
 # A component instantiation whose entity nothing supplied reaches the linker
 # rather than the library, and says so in Verilog's words
 MISSING_MODULE_RE = re.compile(r"Cannot find file containing module: '([^']+)'")
+# A configuration's binding indication that names an entity no source given
+# declared: "for state_reg : reg use entity work.reg(gate_level)" in VESTS'
+# ch_13_fg_13_12, whose reg is another source's
+MISSING_BINDING_RE = re.compile(r"The binding names entity '([^']+)', which is not in library (\w+)")
 # "build_compliant_test ch_13_fg_13_01.vhd LIBRARY=star_lib" -- a VESTS test
 # analyzed into a library of its own, so the reg4 it declares never competes
 # with the one in work
@@ -601,6 +605,7 @@ def missing_companions(path, output, already):
     seen = {os.path.basename(other) for other, _lib in already}
     wanted = [(lib.lower(), unit) for lib, unit in MISSING_UNIT_RE.findall(output)]
     wanted += [('', unit) for unit in MISSING_MODULE_RE.findall(output)]
+    wanted += [(lib.lower(), unit) for unit, lib in MISSING_BINDING_RE.findall(output)]
     for lib, name in dict.fromkeys(wanted):
         found = [other for other in index.get(name.lower(), [])
                  if other != path and os.path.basename(other) not in seen]
@@ -675,7 +680,8 @@ def run_one(args):
         except OSError as exc:
             return Result(path, False, time.time() - start, 'EXEC: %s' % exc, expected, False)
         if ok or ('not found, needed by' not in output
-                  and 'Cannot find file containing module' not in output):
+                  and 'Cannot find file containing module' not in output
+                  and not MISSING_BINDING_RE.search(output)):
             break
         more = missing_companions(path, output, companions)
         if not more:
