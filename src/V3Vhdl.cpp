@@ -273,7 +273,37 @@ void V3Vhdl::parseFile(FileLine* fl, const string& filename, const string& libna
         return;
     }  // LCOV_EXCL_STOP
     std::string text;
-    for (const std::string& line : lines) text += line;
+    for (const std::string& chunk : lines) text += chunk;
+    // The IEEE library is the 2008 edition (below), and the sources it was
+    // taken from mark what that edition leaves out: a line ending in
+    // "--!V08", and a block between "--START-!V08" and "--END-!V08" --
+    // std_logic_misc's STD_LOGIC_VECTOR overloads, homographs of the
+    // STD_ULOGIC_VECTOR ones once the first is a subtype of the second
+    // (GHDL synth issue2850). They are blanked rather than removed, so
+    // that line numbers stay what the file says. What was read is not
+    // split at lines, so the text is.
+    if (libname == "ieee" && text.find("!V08") != std::string::npos) {
+        std::string kept;
+        bool dropping = false;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t eol = text.find('\n', pos);
+            if (eol == std::string::npos) eol = text.size() - 1;
+            const std::string line = text.substr(pos, eol - pos + 1);
+            pos = eol + 1;
+            const bool start = line.find("--START-!V08") != std::string::npos;
+            const bool stop = line.find("--END-!V08") != std::string::npos;
+            const bool marked = line.find("--!V08") != std::string::npos;
+            if (start) dropping = true;
+            if (dropping || marked) {
+                if (stop) dropping = false;
+                if (line.back() == '\n') kept += '\n';
+                continue;
+            }
+            kept += line;
+        }
+        text = kept;
+    }
 
     FileLine* const flp = new FileLine{foundname};
     // The IEEE and STD libraries Verilator ships are the 2008 editions and
