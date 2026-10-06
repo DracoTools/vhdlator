@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_attropen_bad.vhd:26:29: Attribute 'low asks about the bounds of type unsigned, which leaves its index range open
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_attropen_bad.vhd:27:22: Attribute 'length asks about the bounds of type bit_vector, which leaves its index range open
+%Error: t/t_vhdl_attropen_bad.vhd:28:20: Attribute 'right asks about the bounds of type word_arr, which leaves its index range open
+%Error: Exiting due to

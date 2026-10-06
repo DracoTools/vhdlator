@@ -10052,10 +10052,23 @@ void VhdlSemVisitor::checkAttrPrefix(AstVhdlAttrName* nodep, const VhdlType* pre
         }
         return;
     }
-    if (isArray) return;
     const bool ofRange = attr == "left" || attr == "right" || attr == "high" || attr == "low"
                          || attr == "ascending";
     const bool ofArray = attr == "length" || attr == "range" || attr == "reverse_range";
+    // A type mark that leaves its index range open has no bounds to ask
+    // about (16.2.3): "unsigned'low" is refused by GHDL 7.0.0-dev and Questa
+    // 2025.2, where nvc 1.22.1 answers with the index subtype's (NVC
+    // issue352). It was refused here too, but as not lowered yet.
+    if (isArray && (ofRange || ofArray) && objectOfName(nodep->prefixp()).cls == ObjClass::UNKNOWN
+        && nodep->prefixp()->vhdlSymp()
+        && nodep->prefixp()->vhdlSymp()->resolved()->kind() == VhdlSymKind::TYPE
+        && markLeavesIndexOpen(nodep->prefixp()->vhdlSymp())) {
+        err(nodep->fileline(), "Attribute '" + attr + " asks about the bounds of type "
+                                   + prefixTypep->prettyName()
+                                   + ", which leaves its index range open");
+        return;
+    }
+    if (isArray) return;
     const bool ofType = attr == "base" || attr == "pos" || attr == "val" || attr == "succ"
                         || attr == "pred" || attr == "leftof" || attr == "rightof"
                         || attr == "image" || attr == "value";
