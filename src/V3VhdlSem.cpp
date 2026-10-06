@@ -4477,6 +4477,29 @@ static bool isSubprogramParam(const AstNode* declp);
 // read (6.5.2); VHDL-2008 lets both be read. A port of mode linkage is read
 // only by being given to another of mode linkage, in any revision (6.5.2).
 void VhdlSemVisitor::checkOutReads(AstNodeVhdlUnit* unitp) {
+    // Nor is a subtype an attribute denotes: "resize(din, dout'subtype)"
+    // hands RESIZE a subtype where it takes a value (4.2.2, 16.2.2); GHDL
+    // gna issue2100, which GHDL refuses ("no overloaded function"). It was
+    // refused, but only because nothing could lower it.
+    unitp->foreach([&](const AstVhdlAttrName* attrp) {
+        if (m_inSpecialized) return;
+        const std::string attr = lower(attrp->name());
+        if (attr != "subtype" && attr != "base" && attr != "element") return;
+        // "fmt'subtype(input)" is a type conversion to that subtype, a
+        // value (9.3.6) -- the parser holds it as the attribute with an
+        // argument (GHDL gna issue2097, nvc ieee9)
+        if (attrp->argp()) return;
+        const AstVhdlAssoc* const asp = VN_CAST(parentOf(attrp), VhdlAssoc);
+        const AstVhdlCall* const callp
+            = asp && asp->actualp() == attrp ? VN_CAST(parentOf(asp), VhdlCall) : nullptr;
+        const VhdlSymbol* const subp
+            = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (subp
+            && (subp->kind() == VhdlSymKind::FUNCTION || subp->kind() == VhdlSymKind::PROCEDURE)) {
+            err(attrp->fileline(),
+                "A subprogram is given values, and '" + attr + " denotes a subtype");
+        }
+    });
     unitp->foreach([&](const AstVhdlName* namep) {
         // A subprogram is given values, and a type is not one (4.2.2)
         if (namep->vhdlSymp() && namep->vhdlSymp()->resolved()->kind() == VhdlSymKind::TYPE

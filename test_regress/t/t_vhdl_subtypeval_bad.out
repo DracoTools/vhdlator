@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_subtypeval_bad.vhd:26:27: A subprogram is given values, and 'subtype denotes a subtype
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_subtypeval_bad.vhd:30:19: A subprogram is given values, and 'base denotes a subtype
+%Error: Exiting due to
