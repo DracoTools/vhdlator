@@ -1,0 +1,5 @@
+%Error: t/t_vhdl_pkgnomember_bad.vhd:36:27: Package 't_vhdl_pkgnomember_pkg' declares nothing named 'nosuch'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_pkgnomember_bad.vhd:37:32: Package 't_vhdl_pkgnomember_pkg' declares nothing named 'nosuchf'
+%Error: t/t_vhdl_pkgnomember_bad.vhd:38:32: Package 't_vhdl_pkgnomember_pkg' declares nothing named 'nosuch2'
+%Error: Exiting due to

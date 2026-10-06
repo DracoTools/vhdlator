@@ -9852,6 +9852,7 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
     std::vector<std::string> parts;
     if (flatten(nodep, parts) && parts.size() >= 2) {
         VhdlScope* scopep = m_scopep;
+        VhdlScope* outerp = nullptr;  // Where the prefix's last name is declared
         bool viaScope = true;
         for (size_t i = 0; i + 1 < parts.size() && viaScope; ++i) {
             VhdlScope* const nextp = scopep ? scopep->findNamed(parts[i]) : nullptr;
@@ -9859,6 +9860,7 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
                 viaScope = false;
                 break;
             }
+            outerp = scopep;
             scopep = nextp;
         }
         if (viaScope && scopep) {
@@ -9889,6 +9891,42 @@ VhdlType* VhdlSemVisitor::analyzeSelected(AstVhdlSelected* nodep, VhdlType* want
                 if (callables.empty()) callables = found;
                 return pick(nodep, callables, wantp,
                             "declaration of '" + parts.back() + "'");
+            }
+            // A package declares what it declares, and nothing else is
+            // reached through its name (4.7, 8.3): "math_real.uniform" of a
+            // math_real that has no uniform -- VESTS ashenden
+            // ch_19_random-b -- was let through to the lowering, which could
+            // only say it did not know how to call it
+            std::vector<VhdlSymbol*> prefixSyms;
+            if (parts.size() == 2) {
+                lookup(parts[0], prefixSyms);
+            } else if (outerp) {
+                outerp->lookupLocal(parts[parts.size() - 2], prefixSyms);
+            }
+            bool isPackage = false;
+            for (const VhdlSymbol* const psymp : prefixSyms) {
+                if (psymp->resolved()->kind() == VhdlSymKind::PACKAGE
+                    && psymp->resolved()->innerp() == scopep) {
+                    isPackage = true;
+                }
+            }
+            // "work.p.nosuch": a library holds its units by name, not as
+            // symbols, so the unit is asked whether it is a package
+            if (!isPackage && parts.size() > 2) {
+                for (const auto& unit : m_unitScopes) {
+                    if (unit.second != scopep) continue;
+                    const auto primIt = m_primaryUnits.find(unit.first);
+                    if (primIt != m_primaryUnits.end()
+                        && (VN_IS(primIt->second, VhdlPackage)
+                            || VN_IS(primIt->second, VhdlPackageInst))) {
+                        isPackage = true;
+                    }
+                }
+            }
+            if (isPackage && !m_inSpecialized) {
+                err(nodep->fileline(), "Package '" + parts[parts.size() - 2]
+                                           + "' declares nothing named '" + parts.back() + "'");
+                return V3VhdlStd::errorType();
             }
         }
     }
