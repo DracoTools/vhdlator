@@ -11164,7 +11164,9 @@ private:
                 if (attr == "last_active") {
                     return sinceOf(happeningp, evp->timep, evp->everp, flp);
                 }
-                return steadyForOf(happeningp, evp->timep, evp->everp, argp, flp);
+                return wokenAtEnd(nodep,
+                                  steadyForOf(happeningp, evp->timep, evp->everp, argp, flp),
+                                  eventOf(prefixp, evp, flp), flp);
             }
             if (attr == "transaction") {
                 return new AstVarRef{flp, acp->togglep, VAccess::READ};
@@ -11173,7 +11175,9 @@ private:
             if (attr == "last_active") {
                 return sinceOf(activeOf(acp, flp), acp->timep, acp->everp, flp);
             }
-            return steadyForOf(activeOf(acp, flp), acp->timep, acp->everp, argp, flp);
+            return wokenAtEnd(nodep,
+                              steadyForOf(activeOf(acp, flp), acp->timep, acp->everp, argp, flp),
+                              activeOf(acp, flp), flp);
         }
         const VhdlShadow* shp = shadowFor(prefixp, flp);
         if (!shp) shp = shadowOfImplicit(prefixp, flp);
@@ -11196,9 +11200,33 @@ private:
         if (attr == "stable") {
             AstNodeExpr* const evp = eventOf(prefixp, shp, flp);
             if (!evp) return nullptr;
-            return steadyForOf(evp, shp->timep, shp->everp, argp, flp);
+            return wokenAtEnd(nodep, steadyForOf(evp, shp->timep, shp->everp, argp, flp),
+                              eventOf(prefixp, shp, flp), flp);
         }
         return nullptr;
+    }
+
+    // S'STABLE(T) and S'QUIET(T) are signals, and they become TRUE again T
+    // after the last event or transaction of S (16.2.4) -- which nothing
+    // that only reads the time of that last one notices: a block port
+    // mapped to "s'quiet(10 ns)", or a process sensitive to it, never woke
+    // then (GHDL gna bug086). The same value, but reading the bit that the
+    // implicit signal's 'ACTIVE flips at that instant, so what is sensitive
+    // to the value is woken by it. The added term is TRUE only when the
+    // value already is, and changes nothing that is read.
+    AstNodeExpr* wokenAtEnd(AstVhdlAttrName* nodep, AstNodeExpr* valuep, AstNodeExpr* happeningp,
+                            FileLine* flp) {
+        if (!valuep || !happeningp) {
+            if (happeningp) VL_DO_DANGLING(happeningp->deleteTree(), happeningp);
+            return valuep;
+        }
+        AstNodeExpr* const activep = implicitActiveOf(nodep, flp);
+        if (!activep) {
+            VL_DO_DANGLING(happeningp->deleteTree(), happeningp);
+            return valuep;
+        }
+        return new AstLogOr{flp, valuep,
+                            new AstLogAnd{flp, activep, new AstLogNot{flp, happeningp}}};
     }
 
     // A condition is of type BOOLEAN, which is one bit here
@@ -19486,6 +19514,16 @@ private:
         if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
             return isSignalActual(selp->prefixp());
         }
+        // S'STABLE(T), S'QUIET(T), S'DELAYED(T) and S'TRANSACTION are
+        // signals, implicit ones (16.2.4): "q => s'quiet(10 ns)" associates
+        // the port with that signal, which is TRUE from the start, not with
+        // an expression delivered a delta later (GHDL gna bug086)
+        if (const AstVhdlAttrName* const attrp = VN_CAST(nodep, VhdlAttrName)) {
+            const std::string attr = VString::downcase(attrp->name());
+            return (attr == "stable" || attr == "quiet" || attr == "delayed"
+                    || attr == "transaction")
+                   && isSignalActual(attrp->prefixp());
+        }
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->argsp() || callp->argsp()->nextp()) return false;
         // A call written on a signal is an index or a slice of it (8.1), and
@@ -20106,6 +20144,15 @@ private:
                 if (ifp->mode() == VhdlMode::OUT || ifp->mode() == VhdlMode::BUFFER) {
                     addStmt(new AstAlways{new AstAssignW{flp, valuep, convRefp}});
                 } else {
+                    // S'STABLE(T) and S'QUIET(T) are TRUE from the start
+                    // (16.2.4), and a process run at initialization reads
+                    // that rather than the type's default
+                    if (const AstVhdlAttrName* const attrp = VN_CAST(actualp, VhdlAttrName)) {
+                        const std::string attr = VString::downcase(attrp->name());
+                        if (attr == "stable" || attr == "quiet") {
+                            varp->valuep(new AstConst{flp, AstConst::BitTrue{}});
+                        }
+                    }
                     addStmt(new AstAlways{new AstAssignW{flp, convRefp, valuep}});
                 }
                 continue;
