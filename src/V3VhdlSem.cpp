@@ -3131,6 +3131,12 @@ void VhdlSemVisitor::visit(AstVhdlIfaceDecl* nodep) {
     if (nodep->kind() == VhdlIfaceKind::SUBPROGRAM && nodep->profilep()) {
         iterate(nodep->profilep());
         nodep->vhdlSymp(nodep->profilep()->vhdlSymp());
+        // A default written as a name denotes the subprogram visible here,
+        // where the generic is declared, not where an instance is written
+        // (6.5.6.2): GHDL gna issue2736's instance does not see it
+        if (nodep->defaultp() && !nodep->defaultp()->vhdlSymp()) {
+            resolveSubprogramActual(nodep->defaultp(), nodep);
+        }
         return;
     }
     VhdlSymKind kind = VhdlSymKind::CONSTANT;
@@ -15719,7 +15725,9 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
         } else {
             index = position++;
         }
-        if (index < generics.size()) {
+        // "open" says the same as leaving the formal out: it takes its
+        // default (6.5.7.1)
+        if (index < generics.size() && !VN_IS(asp->actualp(), VhdlOpen)) {
             actuals[index] = asp->actualp();
             assocs[index] = asp;
         }
@@ -15743,6 +15751,14 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
             // 6.5.6.3) -- which is not where the entity is written, so the
             // copy cannot be left to find it on its own
             if (!actuals[i]) {
+                // A default named where the generic is declared is the one
+                // that entity saw (6.5.6.2)
+                if (generics[i]->defaultp() && generics[i]->defaultp()->vhdlSymp()) {
+                    VhdlSymbol* const subp = generics[i]->defaultp()->vhdlSymp()->resolved();
+                    defaultSubs[i] = subp;
+                    actualSubs.push_back(subp);
+                    continue;
+                }
                 if (VhdlSymbol* const subp = defaultSubprogramFor(generics[i], chosenTypes)) {
                     defaultSubs[i] = subp;
                     actualSubs.push_back(subp);

@@ -636,6 +636,11 @@ AstVhdlIfaceDecl* V3VhdlParse::parseInterfaceElement(VhdlIfaceKind dflt) {
         } else if (subp) {
             VL_DO_DANGLING(subp->deleteTree(), subp);
         }
+        // "is drive_sig_default" names the subprogram the generic stands for
+        // where the instance gives it none ("is <>" was taken above) (6.5.4)
+        if (check(VhdlTokType::KWD_IS)) {
+            if (AstNodeVhdlExpr* const defp = parseName()) nodep->defaultp(defp);
+        }
         return nodep;
     }
     if (check(VhdlTokType::KWD_PACKAGE)) {
