@@ -6441,6 +6441,21 @@ private:
         const std::string& name = symp->name();
         if ((name == "to_unsigned" || name == "to_signed" || name == "resize")
             && inArithmeticPackage(symp)) {
+            // A SIZE_RES overload is as long as its second argument, and is
+            // emitted at that length where the length is a number
+            const VhdlType* const sizeParamp
+                = symp->paramTypes().size() >= 2 ? symp->paramTypes()[1] : nullptr;
+            if (sizeParamp && sizeParamp->base()->kind() == VhdlTypeKind::ARRAY) {
+                const AstVhdlAssoc* const firstAsp = VN_CAST(callp->argsp(), VhdlAssoc);
+                const AstVhdlAssoc* const sizeAsp
+                    = firstAsp ? VN_CAST(firstAsp->nextp(), VhdlAssoc) : nullptr;
+                const VhdlType* const sizep
+                    = sizeAsp && sizeAsp->actualp() ? sizeAsp->actualp()->vhdlTypep() : nullptr;
+                if (sizep && sizep->isConstrainedArray() && sizep->dimensions() == 1
+                    && sizep->dimLength(0) >= 0) {
+                    return false;
+                }
+            }
             return carriedDynamically(callp->vhdlTypep());
         }
         // MAXIMUM and MINIMUM over two arrays give one of the two back
@@ -17440,7 +17455,23 @@ private:
         if ((name == "to_unsigned" || name == "to_signed" || name == "resize")
             && inArithmeticPackage(symp)) {
             if (args.size() < 2) return nullptr;
-            const VhdlValue widthVal = V3VhdlEval::eval(args[1]);
+            VhdlValue widthVal = V3VhdlEval::eval(args[1]);
+            // The SIZE_RES overloads of VHDL-2008 (16.6): the second
+            // argument is a vector, and the result is as long as it, not as
+            // its value says -- "to_unsigned(1, bin)" is four elements long
+            // for a four-element bin (GHDL synth issue2667). Where its length
+            // is not a number here the package's own body is called.
+            const VhdlType* const sizeParamp
+                = symp->paramTypes().size() >= 2 ? symp->paramTypes()[1] : nullptr;
+            if (sizeParamp && sizeParamp->base()->kind() == VhdlTypeKind::ARRAY) {
+                const VhdlType* const sizep = args[1]->vhdlTypep();
+                if (!sizep || !sizep->isConstrainedArray() || sizep->dimensions() != 1
+                    || sizep->dimLength(0) < 0) {
+                    VL_DO_DANGLING(firstp->deleteTree(), firstp);
+                    return nullptr;
+                }
+                widthVal = VhdlValue::mkInt(sizep->dimLength(0), V3VhdlStd::integerType());
+            }
             AstNodeExpr* sized = firstp;
             // A value that carries its own bounds, resized to a width that is
             // a number: made that long as a carrier, then taken out of it --
