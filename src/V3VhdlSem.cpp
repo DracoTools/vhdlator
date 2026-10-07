@@ -16277,6 +16277,43 @@ static bool recordWouldPack(const VhdlType* typep, int depth = 0) {
     return true;
 }
 
+// Whether an instance can settle a record's open elements: either it packs,
+// or it is an unpacked structure whose open elements are arrays of scalars.
+// Such a record is declared as a structure inside a class whose parameters
+// are those elements' bounds, so the port's structure and the actual's are
+// the one specialization of it (NVC range2, GHDL gna issue2562).
+static bool recordOpenSettles(const VhdlType* typep, int depth = 0) {
+    if (recordWouldPack(typep)) return true;
+    if (!typep || depth > 16) return false;
+    bool open = false;
+    for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+        const VhdlType* const etypep = elemp->typep();
+        if (!etypep) return false;
+        switch (etypep->base()->kind()) {
+        case VhdlTypeKind::ENUM:
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::UNIVERSAL_INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+        case VhdlTypeKind::FLOATING: break;
+        case VhdlTypeKind::ARRAY: {
+            if (isStdStringType(etypep)) return false;
+            if (etypep->base()->indexTypes().size() != 1) return false;
+            const VhdlType* const ep = etypep->base()->elementp();
+            if (!ep) return false;
+            const VhdlTypeKind ek = ep->base()->kind();
+            if (ek != VhdlTypeKind::ENUM && ek != VhdlTypeKind::INTEGER
+                && ek != VhdlTypeKind::PHYSICAL && ek != VhdlTypeKind::FLOATING) {
+                return false;
+            }
+            if (etypep->base()->unconstrained()) open = true;
+            break;
+        }
+        default: return false;
+        }
+    }
+    return open;
+}
+
 void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlScope* scopep) {
     AstVhdlEntity* const entp = VN_CAST(unitp, VhdlEntity);
     AstVhdlComponentDecl* const compp = VN_CAST(unitp, VhdlComponentDecl);
@@ -16299,9 +16336,10 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
             VhdlSymbol* const rsymp = lookupTypeQuiet(markp->prefixp());
             VhdlType* const rtypep = rsymp ? rsymp->typep() : nullptr;
             if (!rtypep || rtypep->base()->kind() != VhdlTypeKind::RECORD
-                || !recordWouldPack(rtypep)) {
+                || !recordOpenSettles(rtypep)) {
                 continue;
             }
+            if (!recordWouldPack(rtypep)) rtypep->base()->portShaped(true);
             const auto isOpen = [](const AstNode* ap) {
                 if (VN_IS(ap, VhdlOpen)) return true;
                 const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
@@ -16373,8 +16411,11 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
         // per instance -- which the actual, whose length the text fixed, is
         // not. That one keeps the message it had.
         if (typep->base()->kind() != VhdlTypeKind::ARRAY
-            && !(typep->base()->kind() == VhdlTypeKind::RECORD && recordWouldPack(typep))) {
+            && !(typep->base()->kind() == VhdlTypeKind::RECORD && recordOpenSettles(typep))) {
             continue;
+        }
+        if (typep->base()->kind() == VhdlTypeKind::RECORD && !recordWouldPack(typep)) {
+            typep->base()->portShaped(true);
         }
         std::vector<std::string> path;
         if (AstVhdlIndexConstraint* const consp

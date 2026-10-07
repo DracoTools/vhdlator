@@ -2032,6 +2032,88 @@ private:
     // A record that does not pack becomes a C++ structure, which has to be
     // declared once and named -- so it is a typedef of the module, and every
     // use of the record refers to it by name.
+    // A record whose open elements an instance settles through a port, as
+    // the structure "t" of a class whose parameters are those elements'
+    // bounds: "rec#(1, 5)::t" where the actual is declared and "rec#(l, r)::t"
+    // on the port are the one specialization once the instance's generics
+    // are known, and so one C++ type, which a structure per module is not
+    std::map<const VhdlType*, AstClass*> m_recClasses;
+    AstNodeDType* recordClassRef(VhdlType* typep, FileLine* flp) {
+        VhdlType* const basep = typep->base();
+        const std::vector<VhdlSymbol*>& baseElems = basep->elements();
+        const std::vector<VhdlSymbol*>& thisElems = typep->elements();
+        if (thisElems.size() != baseElems.size()) return nullptr;
+        const auto isOpen = [](const VhdlType* bep) {
+            return bep && bep->base()->kind() == VhdlTypeKind::ARRAY && bep->unconstrained()
+                   && bep->base()->indexTypes().size() == 1;
+        };
+        AstPin* pinsp = nullptr;
+        int pinNum = 0;
+        for (size_t i = 0; i < baseElems.size(); ++i) {
+            if (!isOpen(baseElems[i]->typep())) continue;
+            const VhdlType* const etp = thisElems[i]->typep();
+            const VhdlType* const idxp
+                = etp && !etp->indexTypes().empty() ? etp->indexTypes()[0] : nullptr;
+            AstRange* const rangep
+                = idxp && !etp->dimOpen(0) ? anyBoundsRange(idxp, flp) : nullptr;
+            if (!rangep) {
+                if (pinsp) VL_DO_DANGLING(pinsp->deleteTree(), pinsp);
+                return nullptr;
+            }
+            const std::string n = std::to_string(i);
+            pinsp = AstNode::addNextNull(
+                pinsp, new AstPin{flp, ++pinNum, "L" + n, rangep->leftp()->unlinkFrBack()});
+            pinsp = AstNode::addNextNull(
+                pinsp, new AstPin{flp, ++pinNum, "R" + n, rangep->rightp()->unlinkFrBack()});
+            VL_DO_DANGLING(rangep->deleteTree(), rangep);
+        }
+        AstClass*& classp = m_recClasses[basep];
+        if (!classp) {
+            classp
+                = new AstClass{flp, "__Vrecc" + std::to_string(++m_nameNum) + "__" + basep->name(),
+                               m_modp ? m_modp->libname() : ""};
+            classp->hasParameterList(true);
+            AstStructDType* const structp = new AstStructDType{flp, VSigning::NOSIGN};
+            structp->name("t");
+            structp->classOrPackagep(classp);
+            for (size_t i = 0; i < baseElems.size(); ++i) {
+                VhdlType* const bep = baseElems[i]->typep();
+                AstNodeDType* memberp = nullptr;
+                if (isOpen(bep)) {
+                    const std::string n = std::to_string(i);
+                    AstVar* bounds[2];
+                    for (int b = 0; b < 2; ++b) {
+                        bounds[b] = new AstVar{flp, VVarType::GPARAM, (b ? "R" : "L") + n,
+                                               VFlagChildDType{}, newIntDType(flp)};
+                        bounds[b]->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+                        // In the class's parameter port list, not its body
+                        bounds[b]->ansi(true);
+                        classp->addMembersp(bounds[b]);
+                    }
+                    VhdlType* const elemp = bep->base()->elementp();
+                    AstNodeDType* const edtp = lowerType(elemp, flp);
+                    AstRange* const rp
+                        = new AstRange{flp, new AstVarRef{flp, bounds[0], VAccess::READ},
+                                       new AstVarRef{flp, bounds[1], VAccess::READ}};
+                    if (elementPacks(elemp)) {
+                        memberp = new AstPackArrayDType{flp, VFlagChildDType{}, edtp, rp};
+                    } else {
+                        memberp = new AstUnpackArrayDType{flp, VFlagChildDType{}, edtp, rp};
+                    }
+                } else {
+                    memberp = memberDType(bep, flp, true);
+                }
+                structp->addMembersp(new AstMemberDType{flp, baseElems[i]->name(),
+                                                        VFlagChildDType{}, memberp, nullptr});
+            }
+            classp->addMembersp(new AstTypedef{flp, "t", nullptr, VFlagChildDType{}, structp});
+            v3Global.setHasClasses();
+            m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
+        }
+        return new AstRefDType{
+            flp, "t", new AstClassOrPackageRef{flp, classp->name(), classp, pinsp}, nullptr};
+    }
+
     AstNodeDType* unpackedRecordRef(VhdlType* typep, FileLine* flp) {
         // One structure per record *type*, not per subtype of it: two values
         // are assignment-compatible when they share a base type (5.2), so the
@@ -2069,6 +2151,11 @@ private:
         // running sizes, is carried where the port's own shape is not, so it
         // is a structure of its own
         const bool carryHere = recordMayCarry(typep) && !recordMayCarry(typep->base());
+        // A record a port's instance settles is one structure in the module
+        // that declares the port and in the one that connects it
+        if (openElement && !carryHere && typep->base()->portShaped()) {
+            if (AstNodeDType* const refp = recordClassRef(typep, flp)) return refp;
+        }
         VhdlType* keyp = openElement || carryHere ? typep : typep->base();
         // Two subtypes that constrain the open elements alike are one shape,
         // and values of them are assigned to one another -- "v := (a =>

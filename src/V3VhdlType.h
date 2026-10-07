@@ -117,6 +117,10 @@ class VhdlType final {
     bool m_openDimsKnown = false;
     // RECORD: its elements, in declaration order
     std::vector<VhdlSymbol*> m_elements;
+    // RECORD: an instance settles its open elements through a port, and it
+    // does not pack, so every shape of it is one structure the instance and
+    // the actual share
+    bool m_portShaped = false;
     // ACCESS, FILE: the designated type
     VhdlType* m_designatedp = nullptr;
     // PHYSICAL: unit names and their values in the primary unit
@@ -303,6 +307,8 @@ public:
     void unconstrained(bool flag) { m_unconstrained = flag; }
     bool aggRow() const { return m_aggRow; }
     void aggRow(bool flag) { m_aggRow = flag; }
+    bool portShaped() const { return m_portShaped; }
+    void portShaped(bool flag) { m_portShaped = flag; }
     // Whether this dimension is the one nothing constrained
     bool dimOpen(size_t dim) const {
         if (!m_unconstrained) return false;
