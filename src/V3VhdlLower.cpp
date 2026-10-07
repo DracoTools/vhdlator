@@ -21481,6 +21481,24 @@ private:
                 typep = typep->elementp() ? typep->elementp() : typep->base()->elementp();
             }
         }
+        // Or whose body reads an entity's generic: the copy of a package's
+        // subprogram made for a call that hands it the instance's generic,
+        // "weights(n)", reads the generic where it read the parameter, so
+        // that a variable the parameter sized is sized per instance
+        if (const AstVhdlSubprogDecl* const bodyp = symp->bodyp()) {
+            bool foreign = false;
+            bodyp->foreach([&](const AstVhdlName* namep) {
+                if (foreign) return;
+                const VhdlSymbol* const gp
+                    = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                if (gp && gp->kind() == VhdlSymKind::GENERIC && gp->declScopep()
+                    && gp->declScopep()->designRoot() && !m_vars.count(gp)
+                    && !m_bindExprs.count(gp)) {
+                    foreign = true;
+                }
+            });
+            if (foreign) return true;
+        }
         return false;
     }
 

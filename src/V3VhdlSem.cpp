@@ -6561,9 +6561,23 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
             const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             if (k >= m_specStandIns.size() || !m_specStandIns[k] || !ifp->vhdlSymp()) continue;
             const VhdlSymbol* const genp = m_specStandIns[k]->vhdlSymp()->resolved();
+            // A generic of the instance calling a package's subprogram is not
+            // visible where the subprogram is declared, and the names below
+            // are bound to it directly, so that is no obstacle: the copy is
+            // then emitted where the call is (namesForeignGeneric). Only a
+            // name that means something else there is left alone -- and a
+            // protected type's method, which is one class however many
+            // instances call it, so cannot read any one instance's generic.
             std::vector<VhdlSymbol*> found;
             regionp->lookup(genp->name(), found);
-            if (found.size() != 1 || found[0]->resolved() != genp) continue;
+            if (!found.empty() && (found.size() != 1 || found[0]->resolved() != genp)) continue;
+            if (found.empty()) {
+                bool inProtected = false;
+                for (const AstNode* np = originalp; np && !inProtected; np = np->backp()) {
+                    if (VN_IS(np, VhdlProtectedType)) inProtected = true;
+                }
+                if (inProtected) continue;
+            }
             stands.emplace(ifp->vhdlSymp(), genp);
         }
         if (!stands.empty()) {
@@ -16451,9 +16465,14 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
         return out + "__" + std::to_string(d);
     };
     const auto makeGeneric = [&](const std::string& name, const char* mark = "integer",
-                                const char* dflt = nullptr) {
+                                 const char* dflt = nullptr,
+                                 AstNodeVhdlExpr* dfltExprp = nullptr) {
         AstVhdlIfaceDecl* const genp = new AstVhdlIfaceDecl{flp, name, VhdlIfaceKind::CONSTANT};
         genp->subtypep(new AstVhdlSubtypeInd{flp, new AstVhdlName{flp, mark}});
+        if (dfltExprp) {
+            genp->defaultp(dfltExprp);
+            dflt = nullptr;
+        }
         // The two bounds have no sensible default -- an instance must say
         // them -- but the direction does: a vector is written "downto" far
         // more often than "to", which is the answer this had before an
@@ -16538,9 +16557,21 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
             const std::string leftName = "__vl" + mangled(d);
             const std::string rightName = "__vr" + mangled(d);
             const std::string ascName = "__va" + mangled(d);
-            makeGeneric(leftName, "integer", leftDflt.empty() ? nullptr : leftDflt.c_str());
-            makeGeneric(rightName, "integer", rightDflt.empty() ? nullptr : rightDflt.c_str());
-            makeGeneric(ascName, "boolean", ascDflt);
+            // A generic nothing is associated with is its default, bounds
+            // and all (6.5.6.2): "t : integer_vector := ramp(dim)" left out
+            // of an instance's map is as long as ramp makes it
+            const auto boundOfDefault = [&](const char* attr) -> AstNodeVhdlExpr* {
+                if (!path.empty() || dims != 1 || ifp->kind() != VhdlIfaceKind::CONSTANT
+                    || !ifp->defaultp() || !leftDflt.empty()) {
+                    return nullptr;
+                }
+                return new AstVhdlAttrName{flp, ifp->defaultp()->cloneTree(false), attr};
+            };
+            makeGeneric(leftName, "integer", leftDflt.empty() ? nullptr : leftDflt.c_str(),
+                        boundOfDefault("left"));
+            makeGeneric(rightName, "integer", rightDflt.empty() ? nullptr : rightDflt.c_str(),
+                        boundOfDefault("right"));
+            makeGeneric(ascName, "boolean", ascDflt, boundOfDefault("ascending"));
             AstVhdlRange* const rangep
                 = new AstVhdlRange{flp, new AstVhdlName{flp, leftName}, VhdlDir::TO,
                                    new AstVhdlName{flp, rightName}};
