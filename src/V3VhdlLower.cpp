@@ -12686,6 +12686,14 @@ private:
                           offsetp};
     }
 
+    // Whether a one-dimensional array subtype's range is two numbers here
+    static bool numericallyBounded(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return true;
+        if (typep->dimensions() != 1 || !typep->indexTypes()[0]) return true;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        return idxp->bounded() && !idxp->boundsp();
+    }
+
     // Whether an alias indexes the same way what it denotes does
     static bool aliasKeepsRange(const VhdlSymbol* symp, const AstVhdlAliasDecl* declp) {
         const VhdlType* const atp = symp->typep();
@@ -12765,13 +12773,65 @@ private:
         int64_t fromLeft = 0;
         int64_t toLeft = 0;
         int step = 1;
+        // Where the two left bounds are not numbers here -- an alias of
+        // "w(dim / 2 to dim - 1)", dim a generic -- the expressions written
+        // for them, lowered afresh wherever the shift is applied
+        AstNodeVhdlExpr* fromLeftVp = nullptr;
+        AstNodeVhdlExpr* toLeftVp = nullptr;
     };
-    static AstNodeExpr* applyShifts(const std::vector<IndexShift>& shifts, AstNodeExpr* idxp,
-                                    FileLine* flp) {
+    AstNodeExpr* applyShifts(const std::vector<IndexShift>& shifts, AstNodeExpr* idxp,
+                             FileLine* flp) {
         for (const IndexShift& shift : shifts) {
+            if (!idxp) return nullptr;
+            if (shift.fromLeftVp && shift.toLeftVp) {
+                AstNodeExpr* const fromp = lowerExpr(shift.fromLeftVp);
+                AstNodeExpr* const top = fromp ? lowerExpr(shift.toLeftVp) : nullptr;
+                if (!top) {
+                    if (fromp) VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                    VL_DO_DANGLING(idxp->deleteTree(), idxp);
+                    return nullptr;
+                }
+                AstNodeExpr* offsetp = new AstSub{flp, idxp, fromp};
+                if (shift.step < 0) offsetp = new AstNegate{flp, offsetp};
+                idxp = new AstAdd{flp, top, offsetp};
+                continue;
+            }
             idxp = shiftIndex(idxp, shift.fromLeft, shift.toLeft, shift.step, flp);
         }
         return idxp;
+    }
+
+    // The same mapping as aliasMapping, as expressions: an alias whose own
+    // subtype and whose slice both write their range, with bounds that only
+    // elaboration settles (6.6.2, 8.5)
+    static bool aliasMappingExpr(const VhdlSymbol* symp, const AstVhdlAliasDecl* declp,
+                                 IndexShift& shift) {
+        const AstVhdlSubtypeInd* const subp = declp->subtypep();
+        if (!subp) return false;
+        const AstVhdlIndexConstraint* const icp
+            = VN_CAST(subp->constraintp(), VhdlIndexConstraint);
+        AstVhdlRange* arp = icp ? VN_CAST(icp->rangesp(), VhdlRange) : nullptr;
+        if (!arp) {
+            if (const AstVhdlCall* const callp = VN_CAST(subp->typeMarkp(), VhdlCall)) {
+                arp = VN_CAST(callp->argsp(), VhdlRange);
+            }
+        }
+        // A subtype named by a mark, "alias hi : half_t is ...": its range
+        // is the one its declaration writes
+        if (!arp) {
+            const VhdlType* const atp = symp->typep();
+            const VhdlType* const aidx
+                = atp && atp->dimensions() == 1 ? atp->indexTypes()[0] : nullptr;
+            arp = aidx ? VN_CAST(aidx->boundsp(), VhdlRange) : nullptr;
+        }
+        const AstVhdlCall* const tcallp = VN_CAST(declp->targetp(), VhdlCall);
+        const AstVhdlRange* const trp = tcallp ? VN_CAST(tcallp->argsp(), VhdlRange) : nullptr;
+        if (!arp || arp->nextp() || !trp || trp->nextp()) return false;
+        if (!arp->leftp() || !arp->rightp() || !trp->leftp() || !trp->rightp()) return false;
+        shift.fromLeftVp = arp->leftp();
+        shift.toLeftVp = trp->leftp();
+        shift.step = (arp->dir() == VhdlDir::DOWNTO) == (trp->dir() == VhdlDir::DOWNTO) ? 1 : -1;
+        return true;
     }
     // Whether the shifts turn the direction round an odd number of times
     static bool shiftsReverse(const std::vector<IndexShift>& shifts) {
@@ -12840,6 +12900,11 @@ private:
                 targetp = declp->targetp();
                 targetTypep = targetp->vhdlTypep();
                 shifted = aliasMapping(symp, declp, shift.fromLeft, shift.toLeft, shift.step);
+                // Bounds that are not numbers here leave the two numberings
+                // to be related by the ranges as written
+                if (!shifted && !numericallyBounded(symp->typep())) {
+                    shifted = aliasMappingExpr(symp, declp, shift);
+                }
             } else {
                 // Every signal formal of the copies being made has its
                 // actual's subtype here, those of a copy further out too:
@@ -14764,6 +14829,29 @@ private:
                 VL_DO_DANGLING(condp->deleteTree(), condp);
                 return new AstCond{flp, whenp, cmp(thenp, patp->cloneTree(false)),
                                    cmp(elsep, patp)};
+            }
+        }
+        // A comparison is no context that gives an assignment pattern a type:
+        // one compared with an object takes the object's, but two of them --
+        // an aggregate, and a slice whose ends only elaboration settles,
+        // "g(n / 2 to n / 2 + 1)" -- have none between them, so both are
+        // given one subtype, the left operand's where it has a length
+        {
+            AstPattern* const lpatp = VN_CAST(lhsp, Pattern);
+            AstPattern* const rpatp = VN_CAST(rhsp, Pattern);
+            const auto usable = [&](const VhdlType* typep) {
+                return typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                       && typep->isConstrainedArray() && typep->lengthEmittable()
+                       && !lengthOnlyRunningDecides(typep);
+            };
+            if (lpatp && rpatp && !lpatp->childDTypep() && !rpatp->childDTypep()) {
+                const VhdlType* typep = nodep->lhsp()->vhdlTypep();
+                if (!usable(typep)) typep = nodep->rhsp()->vhdlTypep();
+                if (usable(typep)) {
+                    VhdlType* const tp = const_cast<VhdlType*>(typep);
+                    lpatp->childDTypep(lowerType(tp, flp));
+                    rpatp->childDTypep(lowerType(tp, flp));
+                }
             }
         }
         return equal ? static_cast<AstNodeExpr*>(new AstEq{flp, lhsp, rhsp})
