@@ -2412,6 +2412,20 @@ V3Number& V3Number::opAssignNonXZ(const V3Number& lhs, bool ignoreXZ) {
             setZero();
         } else if (lhs.isDouble()) {
             setDouble(lhs.toDouble());
+        } else if (lhs.width() == width() && !isDouble()) {
+            // A word at a time: V3Simulate copies a variable's whole value on
+            // every assignment to part of it, so a bit at a time made a loop
+            // filling a wide value element by element quadratic in its width
+            ValueAndX* const outp = m_data.num();
+            const ValueAndX* const inp = lhs.m_data.num();
+            for (int i = 0; i < words(); ++i) {
+                if (ignoreXZ) {
+                    outp[i].m_value = inp[i].m_value & ~inp[i].m_valueX;
+                    outp[i].m_valueX = 0;
+                } else {
+                    outp[i] = inp[i];
+                }
+            }
         } else {
             for (int bit = 0; bit < this->width(); ++bit) {
                 setBit(bit, ignoreXZ ? lhs.bitIs1(bit) : lhs.bitIs(bit));
