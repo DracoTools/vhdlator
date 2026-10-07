@@ -12031,22 +12031,30 @@ private:
             return dynNewp ? allocatedValue(nodep, dynNewp, flp) : outp;
         }
         // A record whose element carries its own bounds is held with that
-        // element in a carrier, and neither a value nor a constraint is
-        // turned into that shape here yet
+        // element in a carrier, so what the allocator gives is built in that
+        // shape: an aggregate as a returned one is, and a constrained
+        // subtype's default converted from the shape the constraint fixes
+        VhdlType* carriedRecp = nullptr;
         {
             const VhdlType* const accp = nodep->vhdlTypep();
-            const VhdlType* const desigp = accp && accp->base()->kind() == VhdlTypeKind::ACCESS
-                                               ? accp->base()->designatedp()
-                                               : nullptr;
+            VhdlType* const desigp = accp && accp->base()->kind() == VhdlTypeKind::ACCESS
+                                         ? accp->base()->designatedp()
+                                         : nullptr;
             if (desigp && desigp->base()->kind() == VhdlTypeKind::RECORD
                 && recordCarriesElement(desigp->base())) {
-                unsup(flp, "allocator of a record whose element carries its own bounds");
-                return nullptr;
+                carriedRecp = desigp;
             }
         }
         AstNew* const newp = new AstNew{flp};
         AstNodeExpr* valuep = nullptr;
-        if (nodep->valuep()) {
+        if (carriedRecp) {
+            valuep = carriedRecordValue(nodep, carriedRecp, flp);
+            if (!valuep) {
+                unsup(flp, "allocator of a record whose element carries its own bounds");
+                VL_DO_DANGLING(newp->deleteTree(), newp);
+                return nullptr;
+            }
+        } else if (nodep->valuep()) {
             valuep = lowerExpr(nodep->valuep());
         } else if (nodep->subtypep()) {
             // "new t" gives the designated subtype's default (9.3.7). An
@@ -12075,6 +12083,63 @@ private:
         // object is made into a temporary first, and the temporary is the
         // expression's value.
         return allocatedValue(nodep, newp, flp);
+    }
+    // What "new rec_t'(...)" or "new rec_t(data(7 downto 0))" holds, where
+    // rec_t carries an element: the value in the shape the access's object
+    // keeps (9.3.7)
+    AstNodeExpr* carriedRecordValue(AstVhdlAllocator* nodep, VhdlType* recp, FileLine* flp) {
+        if (AstNodeVhdlExpr* const valuep = nodep->valuep()) {
+            AstNodeVhdlExpr* innerp = valuep;
+            while (AstVhdlQualified* const qp = VN_CAST(innerp, VhdlQualified)) {
+                innerp = qp->valuep();
+            }
+            if (AstVhdlAggregate* const aggp = VN_CAST(innerp, VhdlAggregate)) {
+                VL_RESTORER(m_retAggp);
+                VL_RESTORER(m_retAggTypep);
+                m_retAggp = aggp;
+                m_retAggTypep = recp;
+                return lowerExpr(valuep);
+            }
+            if (AstNodeExpr* const shapedp = recordAsShape(valuep, recp, flp)) return shapedp;
+            if (shapeTypeOf(valuep) && recordShapesDiffer(shapeTypeOf(valuep), recp)) {
+                return nullptr;
+            }
+            return lowerExpr(valuep);
+        }
+        if (!nodep->subtypep()) return nullptr;
+        VhdlType* const subp = nodep->subtypep()->vhdlTypep();
+        if (!subp) return nullptr;
+        // A constraint only running settles is carried as an object of the
+        // subtype is: every other element at its default, and the carried
+        // ones given their bounds and room
+        if (!recordShapesDiffer(subp, recp)) {
+            AstVar* const tmpp = newTempVar("__Vallocrec", lowerType(recp, flp), flp);
+            AstNode* stmtsp = nullptr;
+            for (const VhdlSymbol* const elemp : subp->elements()) {
+                if (!elemp || elementCarried(elemp->typep())) continue;
+                AstNodeExpr* const dfltp = defaultValueFor(elemp->typep(), flp, true);
+                if (!dfltp) continue;
+                stmtsp = AstNode::addNextNull(
+                    stmtsp,
+                    new AstAssign{
+                        flp, dynPart(new AstVarRef{flp, tmpp, VAccess::WRITE}, elemp->name(), flp),
+                        dfltp});
+            }
+            AstNode* const initp = dynRecordInit(tmpp, subp, flp);
+            if (!initp) {
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                return nullptr;
+            }
+            stmtsp = AstNode::addNextNull(stmtsp, initp);
+            return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
+        }
+        AstNodeFTask* const funcp = recordShapeFunc(subp, recp, flp);
+        if (!funcp) return nullptr;
+        AstNodeExpr* const dfltp = defaultValueFor(subp, flp, true);
+        if (!dfltp) return nullptr;
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", dfltp}};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
     }
     AstNodeExpr* allocatedValue(AstVhdlAllocator* nodep, AstNew* newp, FileLine* flp) {
         if (!allocatorIsAssigned(nodep)) {
@@ -27047,7 +27112,32 @@ private:
     // The assignment one value stands for, which is what each branch of a
     // conditional or selected variable assignment reduces to
     AstNode* lowerVarValue(AstVhdlVarAssign* nodep, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        // A record aggregate is built in the shape its target holds, which
+        // may carry an element the aggregate gives as bits: "p.all := (n =>
+        // 1, data => "101")" through an access to a record with an open one
+        VL_RESTORER(m_retAggp);
+        VL_RESTORER(m_retAggTypep);
+        VhdlType* keepRecp = nodep->targetp()->vhdlTypep();
+        if (!keepRecp || keepRecp->base()->kind() != VhdlTypeKind::RECORD
+            || !recordCarriesElement(keepRecp) || !valuep) {
+            keepRecp = nullptr;
+        }
+        if (keepRecp) {
+            AstNodeVhdlExpr* innerp = valuep;
+            while (AstVhdlQualified* const qp = VN_CAST(innerp, VhdlQualified)) {
+                innerp = qp->valuep();
+            }
+            if (AstVhdlAggregate* const aggp = VN_CAST(innerp, VhdlAggregate)) {
+                m_retAggp = aggp;
+                m_retAggTypep = keepRecp;
+            }
+        }
         AstNode* const outp = lowerVarValueAs(nodep, valuep, flp);
+        // So does an element of a record written whole: "p.all := (n => 1,
+        // data => x)" leaves p.data with the bounds it was allocated with
+        if (keepRecp) {
+            if (AstNode* const keptp = recordKeepingBounds(outp, keepRecp, flp)) return keptp;
+        }
         // An object that carries its bounds keeps them when it is written
         // whole: the value's elements go into its places in order, however
         // the value's own range ran (10.6.2.1). What was built hands the
@@ -27069,6 +27159,31 @@ private:
         asgp->lhsp(dynPart(asgp->lhsp()->unlinkFrBack(), "q", flp));
         asgp->rhsp(dynPart(new AstVarRef{flp, tmpp, VAccess::READ}, "q", flp));
         return AstNode::addNext(keepp, static_cast<AstNode*>(asgp));
+    }
+    // A whole record assigned to one whose elements carry their bounds, as
+    // an assignment per element that takes only the carried ones' elements
+    AstNode* recordKeepingBounds(AstNode* outp, VhdlType* recp, FileLine* flp) {
+        AstAssign* const asgp = VN_CAST(outp, Assign);
+        if (!asgp || asgp->nextp()) return nullptr;
+        AstNodeExpr* const tgtp = asgp->lhsp()->unlinkFrBack();
+        AstNodeExpr* const srcp = asgp->rhsp()->unlinkFrBack();
+        AstVar* const tmpp = newTempVar("__Vreckeep", lowerType(recp, flp), flp);
+        AstNode* stmtsp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, srcp};
+        for (const VhdlSymbol* const elemp : recp->elements()) {
+            if (!elemp) continue;
+            AstNodeExpr* lhsp = dynPart(tgtp->cloneTree(false), elemp->name(), flp);
+            AstNodeExpr* rhsp
+                = dynPart(new AstVarRef{flp, tmpp, VAccess::READ}, elemp->name(), flp);
+            if (elementCarried(elemp->typep())) {
+                lhsp = dynPart(lhsp, "q", flp);
+                rhsp = dynPart(rhsp, "q", flp);
+            }
+            stmtsp
+                = AstNode::addNext(stmtsp, static_cast<AstNode*>(new AstAssign{flp, lhsp, rhsp}));
+        }
+        VL_DO_DANGLING(tgtp->deleteTree(), tgtp);
+        VL_DO_DANGLING(outp->deleteTree(), outp);
+        return stmtsp;
     }
     AstNode* lowerVarValueAs(AstVhdlVarAssign* nodep, AstNodeVhdlExpr* valuep, FileLine* flp) {
         if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {

@@ -9,12 +9,16 @@
 
 import vltest_bootstrap
 
-test.scenarios('linter')
+test.scenarios('vlt')
 
-test.top_filename = "t/t_vhdl_accrecopen_unsup.vhd"
+# Allocators of a record whose element carries its own bounds
+test.top_filename = "t/t_vhdl_accrecopen.vhd"
 
-test.lint(fails=True,
-          verilator_flags2=["--top-module t_vhdl_accrecopen_unsup"],
-          expect_filename=test.golden_filename)
+test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
+             verilator_flags2=["--timing", "--top-module t_vhdl_accrecopen"],
+             make_top_shell=False,
+             make_main=False)
+
+test.execute()
 
 test.passes()

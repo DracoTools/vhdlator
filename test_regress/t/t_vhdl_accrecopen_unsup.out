@@ -1,4 +1,0 @@
-%Error: t/t_vhdl_accrecopen_unsup.vhd:27:14: Unsupported: VHDL allocator of a record whose element carries its own bounds cannot be lowered yet
-        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_accrecopen_unsup.vhd:31:14: Unsupported: VHDL allocator of a record whose element carries its own bounds cannot be lowered yet
-%Error: Exiting due to
