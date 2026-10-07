@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_workdep_bad.vhd:15:1: Design unit 'work.nosuch_pkg' not found, needed by 'work.t_vhdl_workdep_bad(test)'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

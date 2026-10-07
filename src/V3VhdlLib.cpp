@@ -285,6 +285,20 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
                 }
             }
         }
+        // Every unit names WORK without writing it (13.2), so "work.pkg.c"
+        // needs work.pkg as well. What an instance or a binding names
+        // through it, though, may be a Verilog module, or an entity written
+        // later and left to elaboration (VHDLELABORDER), unless a library
+        // clause says WORK is meant.
+        std::set<const AstNode*> unitNames;
+        const auto addUnitName = [&](const AstNode* namep) {
+            if (const AstVhdlCall* const callp = VN_CAST(namep, VhdlCall)) {
+                namep = callp->prefixp();
+            }
+            if (namep) unitNames.insert(namep);
+        };
+        unitp->foreach([&](const AstVhdlInstance* instp) { addUnitName(instp->unitp()); });
+        unitp->foreach([&](const AstVhdlBinding* bindp) { addUnitName(bindp->unitp()); });
         // "ieee.numeric_bit.to_unsigned(x, 8)" names a package no context
         // clause need mention (12.3), and it has to be analyzed first
         unitp->foreach([&](const AstVhdlSelected* selp) {
@@ -299,7 +313,8 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
             if (isPredefinedLib(libp->name())) {
                 // Read on demand, so its absence here says nothing
                 unit.softDependsOn.push_back(primaryKey(lower(libp->name()), pkgp->name()));
-            } else if (namedLibs.count(lower(libp->name()))) {
+            } else if (namedLibs.count(lower(libp->name()))
+                       || (lower(libp->name()) == "work" && !unitNames.count(selp))) {
                 // "alias e is qsim.qsim_types.token_type" needs qsim.qsim_types
                 // as much as a use clause would, and if it is not there the
                 // design unit is missing -- which is worth saying here, since
@@ -308,7 +323,18 @@ void V3VhdlLib::addFile(AstVhdlDesignFile* filep) {
                 // "library work;" names the working library, whatever it is
                 // called (13.2)
                 const std::string lib = lower(libp->name());
-                unit.dependsOn.push_back(primaryKey(lib == "work" ? work : lib, pkgp->name()));
+                const std::string key = primaryKey(lib == "work" ? work : lib, pkgp->name());
+                if (key == unit.key) {
+                    // A unit is put in its library when its analysis ends
+                    // (13.1), so inside p itself "work.p.c" names nothing;
+                    // "p.c" is the expanded name to write there (8.3)
+                    selp->v3error("Design unit '"
+                                  << key
+                                  << "' is named here through its library,"
+                                     " but it is not in the library until it has been analyzed");
+                    return;
+                }
+                unit.dependsOn.push_back(key);
             }
         });
 

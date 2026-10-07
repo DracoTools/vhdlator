@@ -349,7 +349,7 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp, VInFilter* filterp) {
     loadBundledLibraries(filterp);
 
     // Order the design units so each follows what it depends on (13.5)
-    V3VhdlLib::computeOrder();
+    const bool ordered = V3VhdlLib::computeOrder();
     const std::vector<AstNodeVhdlUnit*>& order = V3VhdlLib::ordered();
     if (v3Global.opt.dumpLevel("vhdl-units") != 0) {
         for (const AstNodeVhdlUnit* const unitp : order) {
@@ -364,8 +364,9 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp, VInFilter* filterp) {
 
     // Then rewrite it as the AST the rest of Verilator works on. Lowering a
     // tree that failed analysis would report the same problems a second time
-    // in less useful terms, so it only runs on a clean one.
-    if (analyzed) {
+    // in less useful terms, so it only runs on a clean one -- and one whose
+    // units were all found, since a name in a missing one denotes nothing.
+    if (analyzed && ordered) {
         // An entity with a generic type was copied once per type the design
         // gave it, and those copies are design units the back end has to
         // build. They did not exist when the order was computed, and each
