@@ -1211,7 +1211,14 @@ private:
         if (!optimizable()) return;
 
         size_t iterCount = 0;
-        const size_t iterLimit = v3Global.opt.unrollLimit();
+        // VHDL elaboration runs a constant function however long its loops
+        // are, and a table it fills is often tens of thousands of elements
+        // (IEEE 1076-2008 14.4.2), so a loop from VHDL source is allowed more
+        static constexpr size_t VHDL_LOOP_LIMIT = size_t{1} << 22;
+        const size_t iterLimit
+            = nodep->fileline()->language().vhdl()
+                  ? std::max<size_t>(v3Global.opt.unrollLimit(), VHDL_LOOP_LIMIT)
+                  : v3Global.opt.unrollLimit();
         while (true) {
             if (iterCount > iterLimit) {
                 clearOptimizable(nodep, "Loop simulation took too long; probably this is an "
