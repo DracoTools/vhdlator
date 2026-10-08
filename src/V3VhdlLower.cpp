@@ -1167,6 +1167,7 @@ private:
         const AstNodeVhdlExpr* accp = callp->prefixp();
         // An object held two levels deep, or a call giving one back, indexed
         if (VN_IS(accp, VhdlName) && isDyn2Value(accp)) return true;
+        if (carriedTwoElementType(accp)) return true;
         if (dyn2ResultCall(accp)) return true;
         if (const AstVhdlSelected* const selp = VN_CAST(accp, VhdlSelected)) {
             if (selp->isAll()) accp = selp->prefixp();
@@ -1961,7 +1962,40 @@ private:
     // bounds, exactly as a value of that type does anywhere else (5.3.3)
     AstNodeDType* memberDType(VhdlType* etp, FileLine* flp, bool noCarry = false) {
         if (!noCarry && elementCarried(etp)) return dynCarrierRef(etp, flp);
+        if (!noCarry && elementCarriedTwo(etp)) return dyn2CarrierRef(etp, flp);
         return lowerType(etp, flp);
+    }
+    // A record element that is an array of arrays open at both levels --
+    // "data : data_t" with data_t "array (natural range <>) of bit_vector"
+    // -- is carried two levels deep, as a parameter of that type is
+    // The type the record's own declaration gives an element, which a
+    // subtype of the record may constrain
+    static VhdlType* baseElementType(const VhdlType* recp, const VhdlSymbol* elemp) {
+        for (const VhdlSymbol* const bep : recp->base()->elements()) {
+            if (bep && bep->name() == elemp->name()) return bep->typep();
+        }
+        return elemp->typep();
+    }
+    // The type an element has in this record type or subtype itself
+    static VhdlType* elementTypeIn(const VhdlType* recp, const VhdlSymbol* elemp) {
+        for (const VhdlSymbol* const ep : recp->elements()) {
+            if (ep && ep->name() == elemp->name()) return ep->typep();
+        }
+        return baseElementType(recp, elemp);
+    }
+    // Whether an object holding an element of this subtype holds it two
+    // levels deep (memberDType)
+    bool heldTwoDeep(const VhdlType* etp) const {
+        return etp && !elementCarried(etp) && elementCarriedTwo(etp);
+    }
+    bool elementCarriedTwo(const VhdlType* etp) const {
+        if (!etp || etp->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!etp->base()->unconstrained()) return false;
+        if (etp->isConstrainedArray() && etp->lengthEmittable()) {
+            const VhdlType* const elemp = etp->elementp();
+            if (elemp && elemp->lengthEmittable()) return false;
+        }
+        return isDyn2Type(etp);
     }
 
     // Whether a record element is one that carries its own bounds. The base
@@ -2862,7 +2896,7 @@ private:
                 new AstArg{flp, "", new AstSelBit{flp, dynPart(sr(), "q", flp), k()}}};
             elemRefp->taskp(VN_AS(elemFuncp, Func));
             loopp->addStmtsp(
-                new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
+                new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), k(), flp), elemRefp});
         } else {
             // The element's bounds, its places counted from its left, and
             // each place read by its own index
@@ -2904,7 +2938,7 @@ private:
                                             new AstAdd{flp, j(), num(1)}});
             loopp->addStmtsp(innerp);
             loopp->addStmtsp(
-                new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, cr()});
+                new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), k(), flp), cr()});
         }
         loopp->addContsp(
             new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
@@ -2984,7 +3018,7 @@ private:
                           new AstNewDynamic{flp, num(count), nullptr}});
         for (size_t i = 0; i < elems.size(); ++i) {
             const int64_t offset = asc ? elems[i].first - left : left - elems[i].first;
-            add(new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), num(offset)},
+            add(new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), num(offset), flp),
                               values[i]});
         }
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
@@ -3038,7 +3072,7 @@ private:
         loopp->addStmtsp(
             new AstLoopTest{flp, loopp, new AstLtS{flp, k(), dynCarrierLength(sr(), flp)}});
         loopp->addStmtsp(
-            new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
+            new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), k(), flp), elemRefp});
         loopp->addContsp(
             new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
                           new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
@@ -3122,7 +3156,7 @@ private:
         loopp->addStmtsp(new AstLoopTest{
             flp, loopp, new AstLtS{flp, k(), new AstVarRef{flp, nVarp, VAccess::READ}}});
         loopp->addStmtsp(
-            new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
+            new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), k(), flp), elemRefp});
         loopp->addContsp(
             new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
                           new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
@@ -3195,11 +3229,42 @@ private:
             return it != m_vars.end() && isDyn2Var(it->second);
         }
         if (dyn2ResultCall(nodep)) return true;
+        // An element of a record held two levels deep, the record named or
+        // designated by an access value: "container.data"
+        if (VN_IS(nodep, VhdlSelected)) {
+            const VhdlType* const etp = carriedTwoElementType(nodep);
+            if (etp) return true;
+        }
         if (!isAccessAll(nodep)) return false;
         const AstNodeVhdlExpr* const accp = VN_AS(nodep, VhdlSelected)->prefixp();
         const VhdlType* typep = accp->vhdlTypep();
         if (!typep && accp->vhdlSymp()) typep = accp->vhdlSymp()->typep();
         return typep && openCarriedElement(typep->base()->designatedp());
+    }
+
+    // The declared type of the record element a selected name denotes, where
+    // the record holds it two levels deep. Null otherwise.
+    VhdlType* carriedTwoElementType(const AstNodeVhdlExpr* nodep) const {
+        const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected);
+        if (!selp || selp->isAll()) return nullptr;
+        const VhdlType* ptypep = selp->prefixp() ? selp->prefixp()->vhdlTypep() : nullptr;
+        const bool viaAccess
+            = ptypep && ptypep->base()->kind() == VhdlTypeKind::ACCESS && !isLineType(ptypep);
+        if (viaAccess) ptypep = ptypep->base()->designatedp();
+        // A named object's subtype says how it holds its elements; what a
+        // call returns is held as the copy made for it settles, which the
+        // analysis's subtype does not say
+        if (!viaAccess && !VN_IS(selp->prefixp(), VhdlName)) return nullptr;
+        const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
+        if (!ptypep || !sufp || ptypep->base()->kind() != VhdlTypeKind::RECORD
+            || !recordMayCarry(ptypep)) {
+            return nullptr;
+        }
+        // Held as the element's own subtype makes it, which is how its member
+        // was declared (memberDType): a constrained record object holds a
+        // fixed array of fixed arrays, an access's object the open type
+        VhdlType* const etp = selp->vhdlTypep();
+        return heldTwoDeep(etp) ? etp : nullptr;
     }
 
     // A call to a function that gives back such a value: nothing about the
@@ -3291,6 +3356,14 @@ private:
         if (typep && !typep->isConstrainedArray()) {
             if (const VhdlType* const boundp = boundTypeOf(nodep)) typep = boundp;
         }
+        return dyn2OfFixed(typep, arrayTypep, [&]() { return lowerExpr(nodep); }, flp);
+    }
+
+    // An array whose own length and its elements' are fixed, made into one
+    // held two levels deep: each element made a carrier of its own. The
+    // value is lowered by sourcep, once the bounds are known to be usable.
+    AstNodeExpr* dyn2OfFixed(const VhdlType* typep, VhdlType* arrayTypep,
+                             const std::function<AstNodeExpr*()>& sourcep, FileLine* flp) {
         VhdlType* const elemCarrp = openCarriedElement(arrayTypep);
         if (!typep || !elemCarrp || typep->dimensions() != 1 || !typep->indexTypes()[0]) {
             return nullptr;
@@ -3351,7 +3424,7 @@ private:
                 return nullptr;
             }
         }
-        AstNodeExpr* const srcp = lowerExpr(nodep);
+        AstNodeExpr* const srcp = sourcep();
         if (!srcp) {
             dropEnds();
             if (elemRangep) VL_DO_DANGLING(elemRangep->deleteTree(), elemRangep);
@@ -3390,7 +3463,7 @@ private:
                 = new AstFuncRef{flp, elemFuncp->name(), new AstArg{flp, "", elemp}};
             elemRefp->taskp(VN_AS(elemFuncp, Func));
             loopp->addStmtsp(
-                new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, elemRefp});
+                new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), k(), flp), elemRefp});
         } else {
             // The element's bounds, its places counted from its left, and
             // each place read by its own index
@@ -3424,13 +3497,13 @@ private:
                       ? static_cast<AstNodeExpr*>(new AstAdd{flp, dynPart(cr(), "lft", flp), j()})
                       : new AstSub{flp, dynPart(cr(), "lft", flp), j()};
             innerp->addStmtsp(
-                new AstAssign{flp, new AstSelBit{flp, dynPart(cw(), "q", flp), j()},
+                new AstAssign{flp, writtenSel(dynPart(cw(), "q", flp), j(), flp),
                               new AstSelBit{flp, new AstVarRef{flp, ep, VAccess::READ}, eatp}});
             innerp->addContsp(new AstAssign{flp, new AstVarRef{flp, jp, VAccess::WRITE},
                                             new AstAdd{flp, j(), num(1)}});
             loopp->addStmtsp(innerp);
             loopp->addStmtsp(
-                new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()}, cr()});
+                new AstAssign{flp, writtenSel(dynPart(tw(), "q", flp), k(), flp), cr()});
         }
         loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
                                        new AstAdd{flp, k(), num(1)}});
@@ -3438,6 +3511,14 @@ private:
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
     }
 
+    // A place in a carrier's array that is written. Marked so here, since
+    // what builds it may end up an argument of a class's constructor, which
+    // is not walked for the places it writes until the class is known
+    static AstNodeExpr* writtenSel(AstNodeExpr* fromp, AstNodeExpr* indexp, FileLine* flp) {
+        AstSelBit* const selp = new AstSelBit{flp, fromp, indexp};
+        selp->access(VAccess::WRITE);
+        return selp;
+    }
     // The parts of a carrier
     static AstNodeExpr* dynPart(AstNodeExpr* fromp, const std::string& part, FileLine* flp) {
         return new AstMemberSel{flp, fromp, VFlagChildDType{}, part};
@@ -3502,9 +3583,29 @@ private:
     // The same for a record whose elements carry their own bounds: each of
     // them is given its bounds where the object is declared, since the
     // subtype that constrains the record is what says how long they are
-    AstNode* dynRecordInit(AstVar* varp, const VhdlType* typep, FileLine* flp) {
+    AstNode* dynRecordInit(AstVar* varp, const VhdlType* typep, FileLine* flp,
+                           const VhdlType* shapep = nullptr) {
         AstNode* outp = nullptr;
+        // The type the object is held as, which an allocator's object takes
+        // from the designated type rather than from the constraint
+        if (!shapep) shapep = typep;
         for (const VhdlSymbol* const elemp : typep->elements()) {
+            // One held two levels deep starts as its subtype's default, each
+            // element a carrier of the length the subtype gives it. How it is
+            // held is the object's type's to say: "data(1 to k)(3 downto 0)"
+            // is open at one level only, yet the object of an access to the
+            // record holds data two levels deep
+            const VhdlType* const heldp = elemp ? elementTypeIn(shapep, elemp) : nullptr;
+            if (heldTwoDeep(heldp)) {
+                VhdlType* const etp = elemp->typep();
+                VhdlType* const declp = baseElementType(typep, elemp);
+                if (AstNode* const initp = dyn2InitOn(
+                        dynPart(new AstVarRef{flp, varp, VAccess::WRITE}, elemp->name(), flp), etp,
+                        declp, flp)) {
+                    outp = AstNode::addNextNull(outp, initp);
+                }
+                continue;
+            }
             if (!elemp || !elementCarried(elemp->typep())) continue;
             AstNode* const onep = dynCarrierInitOn(
                 dynPart(new AstVarRef{flp, varp, VAccess::WRITE}, elemp->name(), flp),
@@ -3603,12 +3704,15 @@ private:
     bool recordCarriesElement(const VhdlType* typep) const {
         if (!recordMayCarry(typep)) return false;
         for (const VhdlSymbol* const elemp : typep->elements()) {
-            if (elemp && elementCarried(elemp->typep())) return true;
+            if (elemp && (elementCarried(elemp->typep()) || elementCarriedTwo(elemp->typep()))) {
+                return true;
+            }
         }
         return false;
     }
 
-    AstNode* dynCarrierInitOn(AstNodeExpr* protop, const VhdlType* typep, FileLine* flp) {
+    AstNode* dynCarrierInitOn(AstNodeExpr* protop, const VhdlType* typep, FileLine* flp,
+                              bool fill = true) {
         const VhdlType* const idxp
             = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
         AstNodeExpr* leftp = nullptr;
@@ -3684,10 +3788,54 @@ private:
         // zeros, not INTEGER'LEFT. UVVM's coverage database compares the
         // bins it loads -- whose unused values are INTEGER'LEFT -- with
         // those it made, and none matched.
-        if (AstNode* const fillp = dynDefaultFill(protop, typep, flp)) {
+        if (AstNode* const fillp = fill ? dynDefaultFill(protop, typep, flp) : nullptr) {
             outp = AstNode::addNext(outp, fillp);
         }
         VL_DO_DANGLING(protop->deleteTree(), protop);
+        return outp;
+    }
+
+    // The same two levels deep, for an array of arrays whose subtype
+    // constrains both levels, constant or not -- "data(1 to k)(3 downto 0)":
+    // the array's bounds and room, then each element a carrier of the
+    // element subtype's bounds, holding its default
+    AstNode* dyn2InitOn(AstNodeExpr* protop, const VhdlType* typep, VhdlType* declTypep,
+                        FileLine* flp) {
+        VhdlType* const innerp = typep->elementp();
+        VhdlType* const elemCarrp = openCarriedElement(declTypep);
+        if (!innerp || innerp->indexTypes().empty() || !elemCarrp) {
+            VL_DO_DANGLING(protop->deleteTree(), protop);
+            return nullptr;
+        }
+        AstNode* outp = dynCarrierInitOn(protop->cloneTree(false), typep, flp, false);
+        if (!outp) {
+            VL_DO_DANGLING(protop->deleteTree(), protop);
+            return nullptr;
+        }
+        AstVar* const elemTmpp = newTempVar("__Vdyn2i", dynCarrierRef(elemCarrp, flp), flp);
+        AstNode* const elemInitp
+            = dynCarrierInitOn(new AstVarRef{flp, elemTmpp, VAccess::WRITE}, innerp, flp);
+        if (!elemInitp) {
+            VL_DO_DANGLING(outp->deleteTree(), outp);
+            VL_DO_DANGLING(protop->deleteTree(), protop);
+            return nullptr;
+        }
+        AstVar* const kVarp = newTempVar("__Vdyn2ik", newIntDType(flp), flp);
+        kVarp->usedLoopIdx(true);
+        const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(new AstAssign{
+                                          flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                                          new AstConst{flp, AstConst::Signed32{}, 0}}));
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp, new AstLtS{flp, k(), dynCarrierLength(protop->cloneTree(false), flp)}});
+        loopp->addStmtsp(elemInitp);
+        loopp->addStmtsp(new AstAssign{flp, writtenSel(dynPart(protop, "q", flp), k(), flp),
+                                       new AstVarRef{flp, elemTmpp, VAccess::READ}});
+        loopp->addContsp(
+            new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                          new AstAdd{flp, k(), new AstConst{flp, AstConst::Signed32{}, 1}}});
+        outp = AstNode::addNext(outp, static_cast<AstNode*>(loopp));
         return outp;
     }
 
@@ -5918,6 +6066,9 @@ private:
             if (VN_IS(accp, VhdlName) && isDyn2Value(accp)) {
                 return openCarriedElement(accp->vhdlSymp()->resolved()->typep());
             }
+            if (VhdlType* const twop = carriedTwoElementType(accp)) {
+                return openCarriedElement(twop);
+            }
             if (dyn2ResultCall(accp)) {
                 return openCarriedElement(emittedReturnType(accp->vhdlSymp()->resolved()));
             }
@@ -6646,7 +6797,8 @@ private:
                 ptypep = ptypep->base()->designatedp();
             }
             if (ptypep && ptypep->base()->kind() == VhdlTypeKind::RECORD) {
-                return recordMayCarry(ptypep) && elementCarried(selp->vhdlTypep());
+                return recordMayCarry(ptypep)
+                       && (elementCarried(selp->vhdlTypep()) || carriedTwoElementType(selp));
             }
         }
         return false;
@@ -12198,12 +12350,18 @@ private:
         if (!subp) return nullptr;
         // A constraint only running settles is carried as an object of the
         // subtype is: every other element at its default, and the carried
-        // ones given their bounds and room
-        if (!recordShapesDiffer(subp, recp)) {
+        // ones given their bounds and room. So is any constraint of an
+        // element held two levels deep.
+        bool twoLevel = false;
+        for (const VhdlSymbol* const ep : recp->elements()) {
+            if (ep && heldTwoDeep(elementTypeIn(recp, ep))) twoLevel = true;
+        }
+        if (twoLevel || !recordShapesDiffer(subp, recp)) {
             AstVar* const tmpp = newTempVar("__Vallocrec", lowerType(recp, flp), flp);
             AstNode* stmtsp = nullptr;
             for (const VhdlSymbol* const elemp : subp->elements()) {
                 if (!elemp || elementCarried(elemp->typep())) continue;
+                if (heldTwoDeep(elementTypeIn(recp, elemp))) continue;
                 AstNodeExpr* const dfltp = defaultValueFor(elemp->typep(), flp, true);
                 if (!dfltp) continue;
                 stmtsp = AstNode::addNextNull(
@@ -12212,7 +12370,7 @@ private:
                         flp, dynPart(new AstVarRef{flp, tmpp, VAccess::WRITE}, elemp->name(), flp),
                         dfltp});
             }
-            AstNode* const initp = dynRecordInit(tmpp, subp, flp);
+            AstNode* const initp = dynRecordInit(tmpp, subp, flp, recp);
             if (!initp) {
                 if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
                 return nullptr;
@@ -19302,6 +19460,13 @@ private:
                 && m_retAggTypep->elements().size() == elems.size()
                 && carriedIn(m_retAggTypep, m_retAggTypep->elements()[i]->typep())) {
                 memberp = asDynCarrier(valuep, m_retAggTypep->elements()[i]->typep(), flp);
+            }
+            // One held two levels deep is made such a carrier as it stands
+            if (!memberp && !packed && nodep == m_retAggp && m_retAggTypep
+                && m_retAggTypep->elements().size() == elems.size()
+                && recordMayCarry(m_retAggTypep)) {
+                VhdlType* const declp = elementTypeIn(m_retAggTypep, m_retAggTypep->elements()[i]);
+                if (heldTwoDeep(declp)) memberp = asDyn2Carrier(valuep, declp, flp);
             }
             if (!memberp) memberp = lowerExpr(valuep);
             if (!memberp) {
@@ -27415,14 +27580,19 @@ private:
                 VL_DO_DANGLING(strValp->deleteTree(), strValp);
             }
         }
-        if (valuep && isDynTarget(nodep->targetp())) {
-            return lowerDynCopy(nodep->targetp(), valuep, flp);
-        }
         // An object held two levels deep, written whole: it keeps its own
         // bounds and its elements' (10.6.2.1), and takes the value's
-        // elements in order
-        if (valuep && VN_IS(nodep->targetp(), VhdlName) && isDyn2Value(nodep->targetp())) {
-            VhdlType* const ttypep = nodep->targetp()->vhdlSymp()->resolved()->typep();
+        // elements in order. A record's element held that way too:
+        // "container.data := (0 to 3 => x"ff")"
+        VhdlType* const twoTypep = valuep ? carriedTwoElementType(nodep->targetp()) : nullptr;
+        if (valuep && !twoTypep && isDynTarget(nodep->targetp())) {
+            return lowerDynCopy(nodep->targetp(), valuep, flp);
+        }
+        if (valuep
+            && (twoTypep
+                || (VN_IS(nodep->targetp(), VhdlName) && isDyn2Value(nodep->targetp())))) {
+            VhdlType* const ttypep
+                = twoTypep ? twoTypep : nodep->targetp()->vhdlSymp()->resolved()->typep();
             AstNodeExpr* const srcp = asDyn2Carrier(valuep, ttypep, flp);
             if (!srcp) {
                 unsup(flp, "value of a length only running decides copied from this expression");
