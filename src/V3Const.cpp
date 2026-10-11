@@ -3318,6 +3318,12 @@ class ConstVisitor final : public VNVisitor {
             if (VN_IS(itemp, Const)) {
                 const V3Number& num = VN_AS(itemp, Const)->num();
                 VL_DO_DANGLING(replaceNum(nodep, num), nodep);
+            } else if (m_params && (VN_IS(itemp, InitArray) || VN_IS(itemp, ConsPackUOrStruct))) {
+                // A row of an array of arrays, as a parameter's value
+                nodep->replaceWithKeepDType(const_cast<AstNode*>(itemp)->cloneTree(false));
+                VL_DO_DANGLING(pushDeletep(nodep), nodep);
+                m_selp = nullptr;
+                return;
             }
         }
         m_selp = nullptr;
@@ -3447,6 +3453,13 @@ class ConstVisitor final : public VNVisitor {
                         const V3Number& num = VN_AS(itemp, Const)->num();
                         // UINFO(2, "constVisit " << cvtToHex(valuep) << " " << num);
                         VL_DO_DANGLING(replaceNum(nodep, num), nodep);
+                        did = true;
+                    } else if (m_params) {
+                        // An element that is itself an array or a structure: the
+                        // whole value, which the select then takes the element of
+                        AstNode* const newp = valuep->cloneTree(false);
+                        nodep->replaceWithKeepDType(newp);
+                        VL_DO_DANGLING(pushDeletep(nodep), nodep);
                         did = true;
                     }
                 } else if (m_params && VN_IS(valuep, InitArray)) {
