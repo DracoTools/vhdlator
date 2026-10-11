@@ -4894,6 +4894,59 @@ private:
     // width only running settles is: taken from the object's subtype, it
     // was as long as the whole object (VESTS ch_10_chkmult, where bv_addu
     // saw eight elements in a slice of four).
+    // A slice of an object a generic sizes, with ends only the instance
+    // settles -- "img(v(v'low + 1 to v'high))" in a copy made for an array
+    // whose length is a generic, recursing down to a null slice -- is cut
+    // from the whole object made a carrier, which keeps the slice's own
+    // length, none at all for a null range (5.2.1)
+    AstNodeExpr* sliceOfGenericCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep,
+                                       FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        AstVhdlRange* const rp = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rp || !callp->prefixp() || !carrierTypep || !rp->leftp() || !rp->rightp()) {
+            return nullptr;
+        }
+        // A plain name: an alias numbers its elements its own way
+        const VhdlSymbol* const psymp = callp->prefixp()->vhdlSymp();
+        if (!VN_IS(callp->prefixp(), VhdlName) || !psymp || psymp->kind() == VhdlSymKind::ALIAS) {
+            return nullptr;
+        }
+        VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        if (!objTypep || objTypep->base()->kind() != VhdlTypeKind::ARRAY
+            || objTypep->isConstrainedArray() || !objTypep->lengthEmittable()
+            || objTypep->indexTypes().size() != 1 || carriedDynamically(objTypep)) {
+            return nullptr;
+        }
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        AstNodeExpr* dscp = nullptr;
+        AstNodeFTask* const funcp
+            = rangeParts(rp, leftp, rightp, asc, dirKnown, &dscp) && (dirKnown || dscp)
+                  ? dynSliceFunc(carrierTypep, flp)
+                  : nullptr;
+        AstNodeExpr* const objp
+            = funcp ? asDynCarrier(callp->prefixp(), carrierTypep, flp) : nullptr;
+        if (!objp) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            if (dscp) VL_DO_DANGLING(dscp->deleteTree(), dscp);
+            return nullptr;
+        }
+        AstArg* const argsp = new AstArg{flp, "", objp};
+        argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+        argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
+        argsp->addNext(new AstArg{
+            flp, "",
+            dscp ? dscp
+                 : static_cast<AstNodeExpr*>(new AstConst{flp, AstConst::BitTrue{}, !asc})});
+        argsp->addNext(new AstArg{flp, "", new AstConst{flp, AstConst::BitTrue{}, true}});
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
+    }
+
     AstNodeExpr* movingSliceCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep,
                                     FileLine* flp) {
         AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
@@ -5005,6 +5058,9 @@ private:
         }
         if (AstNodeExpr* const movingp = movingSliceCarrier(nodep, carrierTypep, flp)) {
             return movingp;
+        }
+        if (AstNodeExpr* const cutp = sliceOfGenericCarrier(nodep, carrierTypep, flp)) {
+            return cutp;
         }
         VhdlType* typep = nodep->vhdlTypep();
         // One element of the array standing where an array is wanted, which
