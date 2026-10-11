@@ -23281,6 +23281,30 @@ private:
         return false;
     }
 
+    // Whether a value names nothing that can change once elaborated:
+    // generics, constants, literals and the predefined operations on them
+    static bool namesOnlyStatic(const AstNodeVhdlExpr* valuep) {
+        bool only = true;
+        valuep->foreach([&](const AstNodeVhdlExpr* np) {
+            const VhdlSymbol* const symp = np->vhdlSymp();
+            if (!only || !symp) return;
+            switch (symp->kind()) {
+            case VhdlSymKind::GENERIC:
+            case VhdlSymKind::CONSTANT:
+            case VhdlSymKind::ENUM_LITERAL:
+            case VhdlSymKind::PHYSICAL_UNIT:
+            case VhdlSymKind::TYPE:
+            case VhdlSymKind::RECORD_ELEMENT:
+            case VhdlSymKind::GENERATE_PARAMETER: break;
+            case VhdlSymKind::FUNCTION:
+                if (!symp->resolved()->predefined()) only = false;
+                break;
+            default: only = false;
+            }
+        });
+        return only;
+    }
+
     // The whole signal an assignment's target names, if that is what it is
     static const VhdlSymbol* wholeSignalOf(const AstNodeVhdlExpr* targetp) {
         if (!VN_IS(targetp, VhdlName)) return nullptr;
@@ -23299,6 +23323,16 @@ private:
         if (!stmtsp) return;
         const auto onep = [&](const AstVhdlSigAssign* ap) {
             if (ap->force() || ap->release() || !schedulesAhead(ap)) return;
+            // A concurrent assignment of one value nothing changes -- a
+            // generic, a constant, a literal -- runs once and schedules one
+            // transaction, which nothing can preempt. A delayed assignment
+            // delivers it as well, and keeps a 'Z' in it as the queue of
+            // pending values, which is not a tristate, does not (GHDL gna
+            // bug03 under --x-assign unique)
+            if (stmtsp == procp && !ap->altsp() && ap->wavesp() && !ap->wavesp()->nextp()
+                && ap->wavesp()->valuep() && namesOnlyStatic(ap->wavesp()->valuep())) {
+                return;
+            }
             if (const VhdlSymbol* const symp = wholeSignalOf(ap->targetp())) {
                 m_waveSigs.insert(symp);
             }
