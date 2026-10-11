@@ -713,6 +713,16 @@ class EmitCSyms final : EmitCBaseVisitorConst {
         }
     }
 
+    static bool isTopInstance(const AstNode* nodep) {
+        if (const AstScope* const scopep = VN_CAST(nodep, Scope)) {
+            return scopep->aboveScopep() && scopep->aboveScopep()->isTop();
+        }
+        if (const AstCellInlineScope* const inlp = VN_CAST(nodep, CellInlineScope)) {
+            return inlp->scopep()->isTop() && inlp->name().find("__DOT__") == std::string::npos
+                   && inlp->name().find('.') == std::string::npos;
+        }
+        return false;
+    }
     void buildVpiHierarchy() {
         for (const auto& itpair : m_scopeNames) {
             const std::string symName = itpair.second.m_symName;
@@ -738,7 +748,17 @@ class EmitCSyms final : EmitCBaseVisitorConst {
         iterateChildrenConst(nodep);
         varsExpand();
 
-        if (v3Global.opt.vpi()) buildVpiHierarchy();
+        if (v3Global.opt.vpi()) {
+            // A top-level instance is the root of the hierarchy a VPI
+            // application walks, so it is visible whether or not anything
+            // in it is public
+            for (const auto& pair : m_vpiScopeCandidates) {
+                if (pair.second.m_type != "SCOPE_MODULE") continue;
+                if (!isTopInstance(pair.second.m_nodep)) continue;
+                m_scopeNames.emplace(pair.first, pair.second);
+            }
+            buildVpiHierarchy();
+        }
 
         if (v3Global.dpi()) {
             // add dpi scopes to m_scopeNames if not already there
