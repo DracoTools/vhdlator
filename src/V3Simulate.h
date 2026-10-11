@@ -749,6 +749,28 @@ private:
         }
     }
 
+    // The value an unpacked array variable holds, as the initializer it is kept as
+    AstInitArray* arrayValue(AstNodeAssign* nodep, AstNode* vscp, AstUnpackArrayDType* arrayp,
+                             AstBasicDType* basicp) {
+        if (AstInitArray* const vscpnump = VN_CAST(fetchOutValueNull(vscp), InitArray)) {
+            return vscpnump;
+        }
+        if (AstInitArray* const vscpnump = VN_CAST(fetchValueNull(vscp), InitArray)) {
+            return vscpnump;
+        }
+        // Assignment to unassigned variable, all bits are X
+        // TODO generic initialization which builds X/arrays by recursion
+        AstConst* const outconstp
+            = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, basicp->widthMin(), 0};
+        if (basicp->isZeroInit()) {
+            outconstp->num().setAllBits0();
+        } else {
+            outconstp->num().setAllBitsX();
+        }
+        AstInitArray* const initp = new AstInitArray{nodep->fileline(), arrayp, outconstp};
+        m_reclaimValuesp.push_back(initp);
+        return initp;
+    }
     void handleAssignArray(AstNodeAssign* nodep, AstArraySel* selp, AstNodeExpr* valueFromp) {
         // At present we only handle single dimensional assignments
         // To do better, we need the concept of lvalues, or similar, to know where/how to insert
@@ -769,24 +791,7 @@ private:
         }
         if (m_checkOnly || !optimizable()) return;
         AstNode* const vscp = varOrScope(varrefp);
-        AstInitArray* initp = nullptr;
-        if (AstInitArray* const vscpnump = VN_CAST(fetchOutValueNull(vscp), InitArray)) {
-            initp = vscpnump;
-        } else if (AstInitArray* const vscpnump = VN_CAST(fetchValueNull(vscp), InitArray)) {
-            initp = vscpnump;
-        } else {  // Assignment to unassigned variable, all bits are X
-            // TODO generic initialization which builds X/arrays by recursion
-            AstConst* const outconstp
-                = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, basicp->widthMin(), 0};
-            if (basicp->isZeroInit()) {
-                outconstp->num().setAllBits0();
-            } else {
-                outconstp->num().setAllBitsX();
-            }
-
-            initp = new AstInitArray{nodep->fileline(), arrayp, outconstp};
-            m_reclaimValuesp.push_back(initp);
-        }
+        AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, basicp);
         const uint32_t index = fetchConst(selp->bitp())->toUInt();
         AstNodeExpr* const valuep = newTrackedClone(fetchValue(valueFromp));
         UINFO(9, "     set val[" << index << "] = " << valuep);
@@ -798,12 +803,46 @@ private:
     }
     void handleAssignSel(AstNodeAssign* nodep, AstSel* selp, AstNodeExpr* valueFromp) {
         AstVarRef* varrefp = nullptr;
+        AstArraySel* arraySelp = nullptr;
         V3Number lsb{nodep};
-        handleAssignSelRecurse(nodep, selp, varrefp /*ref*/, lsb /*ref*/, 0);
+        handleAssignSelRecurse(nodep, selp, varrefp /*ref*/, arraySelp /*ref*/, lsb /*ref*/, 0);
         if (m_checkOnly || !optimizable()) return;
         UASSERT_OBJ(varrefp, nodep,
                     "Indicated optimizable, but no variable found on RHS of select");
         AstNode* const vscp = varOrScope(varrefp);
+        if (arraySelp) {
+            // Part of an element of an unpacked array: the element with the
+            // part written into it, then the element written back
+            AstUnpackArrayDType* const arrayp
+                = VN_AS(varrefp->varp()->dtypeSkipRefp(), UnpackArrayDType);
+            AstBasicDType* const basicp = VN_AS(arrayp->subDTypep()->skipRefp(), BasicDType);
+            AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, basicp);
+            const uint32_t index = fetchConst(arraySelp->bitp())->toUInt();
+            AstConst* const elemp
+                = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, basicp->widthMin(), 0};
+            m_reclaimValuesp.push_back(elemp);
+            if (const AstConst* const oldp
+                = VN_CAST(initp->getIndexDefaultedValuep(index), Const)) {
+                elemp->num().opAssign(oldp->num());
+            } else {
+                elemp->num().setAllBitsX();
+            }
+            elemp->num().opSelInto(fetchConst(valueFromp)->num(), lsb, selp->widthConst());
+            // Where the variable already holds an array value now and one
+            // to come, the element is written into both in place: copying
+            // the whole array for each write makes filling a table a part
+            // at a time quadratic in its size
+            AstInitArray* const curp = VN_CAST(fetchValueNull(vscp), InitArray);
+            AstInitArray* const outp = VN_CAST(fetchOutValueNull(vscp), InitArray);
+            if (!VN_IS(nodep, AssignDly) && curp && outp && curp != outp) {
+                curp->addIndexValuep(index, newTrackedClone(elemp));
+                outp->addIndexValuep(index, newTrackedClone(elemp));
+                return;
+            }
+            initp->addIndexValuep(index, newTrackedClone(elemp));
+            assignOutValue(nodep, vscp, initp);
+            return;
+        }
         AstConst* outconstp = nullptr;
         if (AstConst* const vscpnump = fetchOutConstNull(vscp)) {
             outconstp = vscpnump;
@@ -823,7 +862,7 @@ private:
         assignOutValue(nodep, vscp, outconstp);
     }
     void handleAssignSelRecurse(AstNodeAssign* nodep, AstSel* selp, AstVarRef*& outVarrefpRef,
-                                V3Number& lsbRef, int depth) {
+                                AstArraySel*& outArraySelpRef, V3Number& lsbRef, int depth) {
         // Recurse down to find final variable being set (outVarrefp), with
         // lsb to be eventually set on lsbRef
         checkNodeInfo(selp);
@@ -833,9 +872,24 @@ private:
             lsbRef = fetchConst(selp->lsbp())->num();
             return;  // And presumably still optimizable()
         }
+        // An element of an unpacked array of a basic type, written in part
+        if (AstArraySel* const arraySelp = VN_CAST(selp->fromp(), ArraySel)) {
+            AstVarRef* const varrefp = VN_CAST(arraySelp->fromp(), VarRef);
+            const AstUnpackArrayDType* const arrayp
+                = varrefp ? VN_CAST(varrefp->varp()->dtypeSkipRefp(), UnpackArrayDType) : nullptr;
+            if (arrayp && VN_IS(arrayp->subDTypep()->skipRefp(), BasicDType)) {
+                checkNodeInfo(arraySelp);
+                iterateAndNextConstNull(arraySelp->bitp());  // Element index
+                outVarrefpRef = varrefp;
+                outArraySelpRef = arraySelp;
+                if (optimizable()) lsbRef = fetchConst(selp->lsbp())->num();
+                return;
+            }
+        }
         if (AstSel* const subselp = VN_CAST(selp->fromp(), Sel)) {
             V3Number sublsb{nodep};
-            handleAssignSelRecurse(nodep, subselp, outVarrefpRef, sublsb /*ref*/, depth + 1);
+            handleAssignSelRecurse(nodep, subselp, outVarrefpRef, outArraySelpRef, sublsb /*ref*/,
+                                   depth + 1);
             if (optimizable()) {
                 lsbRef = sublsb;
                 lsbRef.opAdd(sublsb, fetchConst(selp->lsbp())->num());
