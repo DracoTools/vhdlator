@@ -41,6 +41,7 @@
 #include "V3Task.h"
 #include "V3Width.h"
 
+#include <algorithm>
 #include <deque>
 #include <sstream>
 #include <stack>
@@ -751,7 +752,7 @@ private:
 
     // The value an unpacked array variable holds, as the initializer it is kept as
     AstInitArray* arrayValue(AstNodeAssign* nodep, AstNode* vscp, AstUnpackArrayDType* arrayp,
-                             AstBasicDType* basicp) {
+                             AstNodeDType* elemDTypep) {
         if (AstInitArray* const vscpnump = VN_CAST(fetchOutValueNull(vscp), InitArray)) {
             return vscpnump;
         }
@@ -759,17 +760,31 @@ private:
             return vscpnump;
         }
         // Assignment to unassigned variable, all bits are X
-        // TODO generic initialization which builds X/arrays by recursion
-        AstConst* const outconstp
-            = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, basicp->widthMin(), 0};
-        if (basicp->isZeroInit()) {
-            outconstp->num().setAllBits0();
-        } else {
-            outconstp->num().setAllBitsX();
-        }
-        AstInitArray* const initp = new AstInitArray{nodep->fileline(), arrayp, outconstp};
+        AstInitArray* const initp
+            = new AstInitArray{nodep->fileline(), arrayp, unsetValue(nodep, elemDTypep)};
         m_reclaimValuesp.push_back(initp);
         return initp;
+    }
+    // What a variable of this type holds before anything is assigned to it:
+    // X, or zero for a type that starts there, an element at a time
+    AstNodeExpr* unsetValue(AstNode* nodep, AstNodeDType* dtypep) {
+        dtypep = dtypep->skipRefp();
+        if (AstUnpackArrayDType* const arrayp = VN_CAST(dtypep, UnpackArrayDType)) {
+            return new AstInitArray{nodep->fileline(), arrayp,
+                                    unsetValue(nodep, arrayp->subDTypep())};
+        }
+        if (AstNodeUOrStructDType* const structp = VN_CAST(dtypep, NodeUOrStructDType)) {
+            if (!structp->packed()) return new AstConsPackUOrStruct{nodep->fileline(), structp};
+        }
+        AstConst* const constp
+            = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, dtypep->widthMin(), 0};
+        const AstBasicDType* const basicp = VN_CAST(dtypep, BasicDType);
+        if (basicp && basicp->isZeroInit()) {
+            constp->num().setAllBits0();
+        } else {
+            constp->num().setAllBitsX();
+        }
+        return constp;
     }
     void handleAssignArray(AstNodeAssign* nodep, AstArraySel* selp, AstNodeExpr* valueFromp) {
         // At present we only handle single dimensional assignments
@@ -784,14 +799,14 @@ private:
         AstUnpackArrayDType* const arrayp
             = VN_AS(varrefp->varp()->dtypeSkipRefp(), UnpackArrayDType);
         UASSERT_OBJ(arrayp, nodep, "Array select of non-array dtype");
-        AstBasicDType* const basicp = VN_CAST(arrayp->subDTypep()->skipRefp(), BasicDType);
-        if (!basicp) {
+        AstNodeDType* const elemDTypep = arrayp->subDTypep()->skipRefp();
+        if (!VN_IS(elemDTypep, BasicDType) && !elemDTypep->isIntegralOrPacked()) {
             clearOptimizable(nodep, "Array of non-basic dtype (e.g. array-of-array)");
             return;
         }
         if (m_checkOnly || !optimizable()) return;
         AstNode* const vscp = varOrScope(varrefp);
-        AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, basicp);
+        AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, elemDTypep);
         const uint32_t index = fetchConst(selp->bitp())->toUInt();
         AstNodeExpr* const valuep = newTrackedClone(fetchValue(valueFromp));
         UINFO(9, "     set val[" << index << "] = " << valuep);
@@ -816,7 +831,7 @@ private:
             AstUnpackArrayDType* const arrayp
                 = VN_AS(varrefp->varp()->dtypeSkipRefp(), UnpackArrayDType);
             AstBasicDType* const basicp = VN_AS(arrayp->subDTypep()->skipRefp(), BasicDType);
-            AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, basicp);
+            AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, basicp);  // A basic type
             const uint32_t index = fetchConst(arraySelp->bitp())->toUInt();
             AstConst* const elemp
                 = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, basicp->widthMin(), 0};
@@ -960,8 +975,148 @@ private:
         consp->addMembersp(new AstConsPackMember{nodep->fileline(), memberp, valuep});
         assignOutValue(nodep, vscp, consp);
     }
+    // Whether a written place is reached through more than one level of
+    // unpacked structure or array -- a member of an element of a member --
+    // which the handlers above, each taking one level over a variable, do
+    // not cover. A part select of one element of an array of a basic type is
+    // handleAssignSel's own case, written in place.
+    static bool nestedLhs(const AstNodeExpr* lhsp) {
+        int steps = 0;
+        bool composite = false;
+        const AstNodeExpr* p = lhsp;
+        while (true) {
+            if (const AstArraySel* const selp = VN_CAST(p, ArraySel)) {
+                composite = true;
+                p = selp->fromp();
+            } else if (const AstStructSel* const selp = VN_CAST(p, StructSel)) {
+                composite = true;
+                p = selp->fromp();
+            } else if (const AstSel* const selp = VN_CAST(p, Sel)) {
+                p = selp->fromp();
+            } else {
+                break;
+            }
+            ++steps;
+        }
+        if (!composite || !VN_IS(p, VarRef) || steps < 2) return false;
+        const AstNodeExpr* q = lhsp;
+        while (const AstSel* const selp = VN_CAST(q, Sel)) q = selp->fromp();
+        if (const AstArraySel* const selp = VN_CAST(q, ArraySel)) {
+            if (VN_IS(selp->fromp(), VarRef) && q != lhsp) return false;
+        }
+        return true;
+    }
+    // The value a variable holds with the place at steps[k..] given valuep,
+    // made of the value it holds now, or of nothing yet where curp is null
+    AstNodeExpr* withPart(AstNodeAssign* nodep, AstNodeExpr* curp, AstNodeDType* dtypep,
+                          const std::vector<AstNodeExpr*>& steps, size_t k, AstNodeExpr* valuep) {
+        if (k == steps.size()) return newTrackedClone(valuep);
+        dtypep = dtypep->skipRefp();
+        AstNodeExpr* const stepp = steps[k];
+        if (const AstArraySel* const selp = VN_CAST(stepp, ArraySel)) {
+            AstUnpackArrayDType* const arrayp = VN_CAST(dtypep, UnpackArrayDType);
+            if (!arrayp) {
+                clearOptimizable(stepp, "Array select of a value that is not an unpacked array");
+                return nullptr;
+            }
+            AstInitArray* initp = VN_CAST(curp, InitArray);
+            initp = initp ? VN_AS(newTrackedClone(initp), InitArray)
+                          : new AstInitArray{nodep->fileline(), arrayp,
+                                             unsetValue(nodep, arrayp->subDTypep())};
+            if (!VN_IS(curp, InitArray)) m_reclaimValuesp.push_back(initp);
+            const uint32_t index = fetchConst(selp->bitp())->toUInt();
+            AstNodeExpr* const elemp = withPart(nodep, initp->getIndexDefaultedValuep(index),
+                                                arrayp->subDTypep(), steps, k + 1, valuep);
+            if (!elemp) return nullptr;
+            initp->addIndexValuep(index, elemp);
+            return initp;
+        }
+        if (const AstStructSel* const selp = VN_CAST(stepp, StructSel)) {
+            AstNodeUOrStructDType* const structp = VN_CAST(dtypep, NodeUOrStructDType);
+            AstMemberDType* const memberp = structp ? memberOf(structp, selp->name()) : nullptr;
+            if (!structp || structp->packed() || !memberp) {
+                clearOptimizable(stepp, "Struct member select of non-unpacked-struct");
+                return nullptr;
+            }
+            AstConsPackUOrStruct* consp = VN_CAST(curp, ConsPackUOrStruct);
+            consp = consp ? VN_AS(newTrackedClone(consp), ConsPackUOrStruct)
+                          : new AstConsPackUOrStruct{nodep->fileline(), structp};
+            if (!VN_IS(curp, ConsPackUOrStruct)) m_reclaimValuesp.push_back(consp);
+            AstConsPackMember* const oldp = consMemberOf(consp, selp->name());
+            AstNodeExpr* const memValp = withPart(nodep, oldp ? oldp->rhsp() : nullptr,
+                                                  memberp->subDTypep(), steps, k + 1, valuep);
+            if (!memValp) return nullptr;
+            if (oldp) VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+            consp->addMembersp(
+                new AstConsPackMember{nodep->fileline(), memberp, memValp->cloneTree(false)});
+            return consp;
+        }
+        // Selects of selects -- a field of a packed member, then a part of
+        // it -- add up to one select of the bits, the last one's width
+        V3Number lsb{nodep, 32, 0};
+        const AstSel* selp = nullptr;
+        for (size_t j = k; j < steps.size(); ++j) {
+            selp = VN_CAST(steps[j], Sel);
+            if (!selp) break;
+            V3Number sum{nodep, 32, 0};
+            sum.opAdd(lsb, fetchConst(selp->lsbp())->num());
+            lsb = sum;
+        }
+        if (!selp || !VN_IS(valuep, Const)) {
+            clearOptimizable(stepp, "Select of a value that is not a constant");
+            return nullptr;
+        }
+        AstConst* const outp
+            = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, dtypep->widthMin(), 0};
+        m_reclaimValuesp.push_back(outp);
+        if (const AstConst* const oldp = VN_CAST(curp, Const)) {
+            outp->num().opAssign(oldp->num());
+        } else {
+            outp->num().setAllBitsX();
+        }
+        outp->num().opSelInto(VN_AS(valuep, Const)->num(), lsb, selp->widthConst());
+        return outp;
+    }
+    void handleAssignPath(AstNodeAssign* nodep, AstNodeExpr* lhsp, AstNodeExpr* valueFromp) {
+        // The places from the variable out to the one written
+        std::vector<AstNodeExpr*> steps;
+        AstNodeExpr* p = lhsp;
+        while (!VN_IS(p, VarRef)) {
+            checkNodeInfo(p);
+            steps.push_back(p);
+            if (AstArraySel* const selp = VN_CAST(p, ArraySel)) {
+                iterateAndNextConstNull(selp->bitp());
+                p = selp->fromp();
+            } else if (AstStructSel* const selp = VN_CAST(p, StructSel)) {
+                p = selp->fromp();
+            } else {
+                AstSel* const bitSelp = VN_AS(p, Sel);
+                iterateAndNextConstNull(bitSelp->lsbp());
+                p = bitSelp->fromp();
+            }
+        }
+        std::reverse(steps.begin(), steps.end());
+        if (m_checkOnly || !optimizable()) return;
+        AstVarRef* const varrefp = VN_AS(p, VarRef);
+        AstNode* const vscp = varOrScope(varrefp);
+        AstNodeExpr* curp = fetchOutValueNull(vscp);
+        if (!curp) curp = fetchValueNull(vscp);
+        AstNodeExpr* const fromValuep = fetchValueNull(valueFromp);
+        if (!fromValuep) {
+            clearOptimizable(valueFromp, "Assigned a value not computed");
+            return;
+        }
+        AstNodeExpr* const newp
+            = withPart(nodep, curp, varrefp->varp()->dtypep(), steps, 0, fromValuep);
+        if (!newp) return;
+        assignOutValue(nodep, vscp, newp);
+    }
     void handleAssignRecurse(AstNodeAssign* nodep, AstNodeExpr* lhsp, AstNodeExpr* valueFromp) {
         if (!optimizable()) return;
+        if (m_params && nestedLhs(lhsp)) {
+            handleAssignPath(nodep, lhsp, valueFromp);
+            return;
+        }
         if (AstArraySel* const selp = VN_CAST(lhsp, ArraySel)) {
             if (!m_params) {
                 clearOptimizable(lhsp, "Assign LHS has select");
