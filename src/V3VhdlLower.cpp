@@ -190,6 +190,7 @@ class VhdlLowerVisitor final {
     std::map<const VhdlSymbol*, AstNodeFTask*> m_pkgFuncs;
     bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
     bool m_asTarget = false;  // Lowering what an assignment writes, not what it reads
+    bool m_inStmts = false;  // Lowering the statements of a process or subprogram
     const AstVhdlCall* m_dirReportedp = nullptr;  // Slice whose direction check is made
     bool m_emitForUnit = false;  // Building something the unit will hold
     // The names those classes have been given. A generic package instantiated
@@ -5193,6 +5194,60 @@ private:
                                                  "Array lengths do not match", nullptr, nullptr};
         displayp->addNext(new AstStop{flp, true});
         return displayp;
+    }
+
+    // An index outside its array's range is an error once it is evaluated
+    // (8.4), where nvc, GHDL and Questa end the run. Checking every index
+    // costs every design something, so it is done under --vhdl-bound-check:
+    // an index into an array whose range is a number here, in a statement,
+    // and not already kept within that range by its own subtype -- a loop
+    // over 'RANGE is not checked.
+    AstNodeExpr* checkedIndex(const AstNodeVhdlExpr* actualp, AstNodeExpr* indexp,
+                              const VhdlType* arrayTypep, int dim, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts || VN_IS(indexp, Const)) return indexp;
+        if (!arrayTypep || arrayTypep->base()->kind() != VhdlTypeKind::ARRAY
+            || !arrayTypep->isConstrainedArray() || stringBehind(arrayTypep)) {
+            return indexp;
+        }
+        const VhdlType* const idxp = indexSubtype(arrayTypep, dim);
+        if (!idxp || !idxp->bounded() || arrayTypep->dimOpen(dim)
+            || idxp->base()->kind() != VhdlTypeKind::INTEGER) {
+            return indexp;
+        }
+        // A null range has nothing in it, and every index is outside it
+        const int64_t lo = idxp->ascending() ? idxp->left() : idxp->right();
+        const int64_t hi = idxp->ascending() ? idxp->right() : idxp->left();
+        if (lo < INT32_MIN || hi > INT32_MAX || lo > INT32_MAX || hi < INT32_MIN) return indexp;
+        const VhdlType* const ownp = actualp ? actualp->vhdlTypep() : nullptr;
+        if (ownp && ownp->bounded() && ownp->base()->kind() == VhdlTypeKind::INTEGER && lo <= hi) {
+            const int64_t olo = ownp->ascending() ? ownp->left() : ownp->right();
+            const int64_t ohi = ownp->ascending() ? ownp->right() : ownp->left();
+            if (olo >= lo && ohi <= hi) return indexp;
+        }
+        // Read once, where reading it twice could differ
+        AstNode* setp = nullptr;
+        AstNodeExpr* valp = indexp;
+        if (!VN_IS(indexp, VarRef)) {
+            AstVar* const tmpp = newTempVar("__Vidx", newIntDType(flp), flp);
+            setp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, indexp};
+            valp = new AstVarRef{flp, tmpp, VAccess::READ};
+        }
+        const auto intConst = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        AstNodeExpr* const condp
+            = new AstLogOr{flp, new AstLtS{flp, valp->cloneTree(false), intConst(lo)},
+                           new AstGtS{flp, valp->cloneTree(false), intConst(hi)}};
+        const std::string range = std::to_string(idxp->left())
+                                  + (idxp->ascending() ? " to " : " downto ")
+                                  + std::to_string(idxp->right());
+        AstNode* const reportp
+            = new AstDisplay{flp, VDisplayType::DT_ERROR,
+                             "Index %0d is outside of the range " + range + " of the array",
+                             nullptr, valp->cloneTree(false)};
+        reportp->addNext(new AstStop{flp, true});
+        setp = AstNode::addNextNull(setp, new AstIf{flp, condp, reportp});
+        return new AstExprStmt{flp, setp, valp};
     }
 
     // Converted to an unconstrained array type, a value keeps its bounds,
@@ -16518,6 +16573,8 @@ private:
                     VL_DO_DANGLING(outp->deleteTree(), outp);
                     return nullptr;
                 }
+                indexp = checkedIndex(asp->actualp(), indexp, nodep->prefixp()->vhdlTypep(),
+                                      static_cast<int>(dim), flp);
                 if (dim == 0) indexp = applyShifts(shifts, indexp, flp);
                 const VhdlType* const idxTypep = ownerTypep;
                 indexp = stringIndex(idxTypep, indexp, flp);
@@ -25874,6 +25931,8 @@ private:
     }
 
     AstNode* lowerStmts(AstNode* stmtsp) {
+        VL_RESTORER(m_inStmts);
+        m_inStmts = true;
         AstNode* outp = nullptr;
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
             const int before = V3Error::errorCount();

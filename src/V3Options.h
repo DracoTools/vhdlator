@@ -309,6 +309,7 @@ private:
     bool m_traceUnderscore = false; // main switch: --trace-underscore
     bool m_underlineZero = false;   // main switch: --underline-zero; undocumented old Verilator 2
     bool m_verilate = true;         // main switch: --verilate
+    bool m_vhdlBoundCheck = false;  // main switch: --vhdl-bound-check
     bool m_vpi = false;             // main switch: --vpi
     bool m_waiverMultiline = false;  // main switch: --waiver-multiline
     bool m_xInitialEdge = false;    // main switch: --x-initial-edge
@@ -616,6 +617,7 @@ public:
     bool reportUnoptflat() const { return m_reportUnoptflat; }
     bool verilate() const { return m_verilate; }
     bool vpi() const { return m_vpi; }
+    bool vhdlBoundCheck() const { return m_vhdlBoundCheck; }
     bool waiverMultiline() const { return m_waiverMultiline; }
     bool xInitialEdge() const { return m_xInitialEdge; }
     bool serializeOnly() const { return m_jsonOnly; }

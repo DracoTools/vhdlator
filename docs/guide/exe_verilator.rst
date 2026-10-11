@@ -2121,6 +2121,16 @@ Summary:
 
    Displays program version and exits.
 
+.. option:: --vhdl-bound-check
+
+   Check, while the model runs, that each index into a VHDL array whose
+   range is known at elaboration lies inside that range, and stop with an
+   error where it does not, as IEEE 1076 requires. Indexes that cannot fall
+   outside the range, such as the variable of a loop over the array's
+   ``'RANGE``, are not checked. Without this option, an index outside its
+   array reads and writes what the equivalent Verilog select would, and the
+   model runs on. The check costs some speed. Defaults to off.
+
 .. option:: --vhdl-std <std>
 
    Selects which revision of the VHDL standard (IEEE 1076) applies to VHDL
