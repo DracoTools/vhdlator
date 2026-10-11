@@ -439,6 +439,14 @@ protected:
 
     // CONSTRUCTORS
     VerilatedImpData() = default;
+    // A model destroyed by an exit handler after this -- a model held at
+    // file scope, ended by $stop or $fatal -- must find nothing to update
+    ~VerilatedImpData() { gone() = true; }
+    // Whether the data has been destroyed; a plain flag, which nothing destroys
+    static bool& gone() VL_MT_SAFE {
+        static bool s_gone = false;
+        return s_gone;
+    }
 };
 
 class VerilatedImp final {
@@ -515,12 +523,14 @@ public:
     // METHODS - hierarchy - only for verilated*.cpp
     static void hierarchyAdd(const VerilatedScope* fromp, const VerilatedScope* top) VL_MT_SAFE {
         // Slow ok - called at construction for VPI accessible elements
+        if (VerilatedImpData::gone()) return;
         const VerilatedLockGuard lock{s().m_hierMapMutex};
         s().m_hierMap[fromp].push_back(top);
     }
     static void hierarchyRemove(const VerilatedScope* fromp,
                                 const VerilatedScope* top) VL_MT_SAFE {
         // Slow ok - called at destruction for VPI accessible elements
+        if (VerilatedImpData::gone()) return;
         const VerilatedLockGuard lock{s().m_hierMapMutex};
         VerilatedHierarchyMap& map = s().m_hierMap;
         if (map.find(fromp) == map.end()) return;
@@ -529,6 +539,7 @@ public:
         if (it != scopes.end()) scopes.erase(it);
     }
     static void hierarchyClear() VL_MT_SAFE {
+        if (VerilatedImpData::gone()) return;
         const VerilatedLockGuard lock{s().m_hierMapMutex};
         VerilatedHierarchyMap& map = s().m_hierMap;
         map.clear();
