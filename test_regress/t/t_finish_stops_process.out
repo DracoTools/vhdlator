@@ -1,0 +1,9 @@
+initial before
+tk before 1
+f before 1
+f after 1
+tk after 1
+m after 1
+tk before 2
+f before 2
+final

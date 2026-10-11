@@ -38,6 +38,7 @@
 #include "V3UniqueNames.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -57,6 +58,11 @@ class LinkJumpVisitor final : public VNVisitor {
     // STATE
     AstNodeModule* m_modp = nullptr;  // Current module
     AstNodeFTask* m_ftaskp = nullptr;  // Current function/task
+    AstNodeProcedure* m_procp = nullptr;  // Current initial/always, not final
+    bool m_inAssert = false;  // Under an assertion, whose actions may move elsewhere
+    std::unordered_set<const AstNodeFTask*> m_mayFinish;  // Function/tasks that may $finish
+    std::unordered_set<std::string> m_mayFinishNames;  // Their names, for unbound method calls
+    std::unordered_set<const AstNode*> m_finishChecked;  // Statements followed by a check
     AstNode* m_loopp = nullptr;  // Current loop
     AstRandSequence* m_randsequencep = nullptr;  // Current randsequence
     bool m_loopInc = false;  // In loop increment
@@ -111,6 +117,9 @@ class LinkJumpVisitor final : public VNVisitor {
                 underp = nodep;
                 under_and_next = false;  // IE we skip the entire loop
             }
+        } else if (AstNodeProcedure* const procp = VN_CAST(nodep, NodeProcedure)) {
+            UASSERT_OBJ(!endOfIter, nodep, "No endOfIter for procedure");
+            underp = procp->stmtsp();
         } else {
             nodep->v3fatalSrc("Unknown jump point for break/disable/continue");
             return nullptr;
@@ -622,12 +631,96 @@ class LinkJumpVisitor final : public VNVisitor {
         nodep->unlinkFrBack();
         VL_DO_DANGLING(pushDeletep(nodep), nodep);
     }
+    // $finish ends the simulation where it is called (IEEE 1800-2023 20.2):
+    // nothing after it in the calling process runs. The runtime only records
+    // that the run is to end, so the process is left here: a function or
+    // task returns at once, and a statement that called one that may have
+    // finished is followed by a check of whether the run has ended. A
+    // procedure is left by jumping to the end of its body, which also ends
+    // a suspendable always, as its loop runs only until the run has ended.
+    // A VHDL process or subprogram is left by the frontend itself, which
+    // knows where its process waits for good.
+    AstNode* finishExitp(FileLine* flp) {
+        if (m_inFork || m_inAssert || m_randsequencep) return nullptr;
+        if (m_ftaskp) {
+            if (m_ftaskp->fileline()->language().vhdl()) return nullptr;
+            return new AstJumpGo{flp, getJumpBlock(m_ftaskp, false)};
+        }
+        if (m_procp && !m_procp->fileline()->language().vhdl()) {
+            return new AstJumpGo{flp, getJumpBlock(m_procp, false)};
+        }
+        return nullptr;
+    }
+    void findMayFinish(AstNetlist* netlistp) {
+        // Callers of each function/task, then what reaches a $finish
+        // A method called through an object is not bound to its task until
+        // V3Width, so such a call is matched by name
+        std::unordered_map<const AstNodeFTask*, std::vector<const AstNodeFTask*>> callers;
+        std::unordered_map<std::string, std::vector<const AstNodeFTask*>> nameCallers;
+        std::vector<const AstNodeFTask*> work;
+        netlistp->foreach([&](const AstNodeFTask* ftaskp) {
+            ftaskp->foreach([&](const AstNodeFTaskRef* refp) {
+                if (refp->taskp() && refp->taskp() != ftaskp) {
+                    callers[refp->taskp()].push_back(ftaskp);
+                } else if (!refp->taskp()) {
+                    nameCallers[refp->name()].push_back(ftaskp);
+                }
+            });
+            if (ftaskp->exists([](const AstFinish*) { return true; })) {
+                if (m_mayFinish.insert(ftaskp).second) work.push_back(ftaskp);
+            }
+        });
+        while (!work.empty()) {
+            const AstNodeFTask* const ftaskp = work.back();
+            work.pop_back();
+            m_mayFinishNames.insert(ftaskp->name());
+            for (const AstNodeFTask* const callerp : callers[ftaskp]) {
+                if (m_mayFinish.insert(callerp).second) work.push_back(callerp);
+            }
+            for (const AstNodeFTask* const callerp : nameCallers[ftaskp->name()]) {
+                if (m_mayFinish.insert(callerp).second) work.push_back(callerp);
+            }
+        }
+    }
+    void visit(AstNodeProcedure* nodep) override {
+        VL_RESTORER(m_procp);
+        m_procp = VN_IS(nodep, Final) ? nullptr : nodep;
+        iterateChildren(nodep);
+    }
+    void visit(AstNodeCoverOrAssert* nodep) override {
+        VL_RESTORER(m_inAssert);
+        m_inAssert = true;
+        iterateChildren(nodep);
+    }
+    void visit(AstNodeFTaskRef* nodep) override {
+        iterateChildren(nodep);
+        if (nodep->taskp() ? !m_mayFinish.count(nodep->taskp())
+                           : !m_mayFinishNames.count(nodep->name())) {
+            return;
+        }
+        // The statement the call is part of
+        AstNode* stmtp = nodep;
+        while (stmtp && !VN_IS(stmtp, NodeStmt)) {
+            if (VN_IS(stmtp, NodeFTask) || VN_IS(stmtp, NodeProcedure)) return;
+            stmtp = stmtp->aboveLoopp();
+        }
+        if (!stmtp || m_finishChecked.count(stmtp)) return;
+        FileLine* const flp = nodep->fileline();
+        AstNode* const exitp = finishExitp(flp);
+        if (!exitp) return;
+        m_finishChecked.insert(stmtp);
+        stmtp->addNextHere(new AstIf{
+            flp, new AstCExpr{flp, "VL_UNLIKELY(vlSymsp->_vm_contextp__->gotFinish())", 1},
+            exitp});
+    }
     void visit(AstFinish* nodep) override {
         if (nodep->user1SetOnce()) return;  // Process once
         iterateChildren(nodep);
         if (m_inFork) {
             nodep->replaceWith(new AstFinishFork{nodep->fileline()});
             VL_DO_DANGLING(nodep->deleteTree(), nodep);
+        } else if (AstNode* const exitp = finishExitp(nodep->fileline())) {
+            nodep->addNextHere(exitp);
         } else if (m_loopp) {
             // Jump to the end of the loop (post-finish)
             AstJumpBlock* const blockp = getJumpBlock(m_loopp, false);
@@ -642,7 +735,10 @@ class LinkJumpVisitor final : public VNVisitor {
 
 public:
     // CONSTRUCTORS
-    explicit LinkJumpVisitor(AstNetlist* nodep) { iterate(nodep); }
+    explicit LinkJumpVisitor(AstNetlist* nodep) {
+        findMayFinish(nodep);
+        iterate(nodep);
+    }
     ~LinkJumpVisitor() override = default;
 };
 
