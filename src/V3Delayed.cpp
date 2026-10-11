@@ -137,6 +137,7 @@ class DelayedVisitor final : public VNVisitor {
         UnsupportedCompoundArrayInLoop,
         ShadowVar,
         ShadowVarMasked,
+        ShadowVarCopied,
         FlagShared,
         FlagUnique,
         ValueQueueWhole,
@@ -172,6 +173,10 @@ class DelayedVisitor final : public VNVisitor {
                 AstVarScope* vscp;  // The shadow variable
                 AstVarScope* maskp;  // The mask variable
             } m_shadowVarMaskedKit;
+            struct {  // Stuff needed for Scheme::ShadowVarCopied
+                AstVarScope* vscp;  // The shadow variable
+                AstVarScope* copiedp;  // Whether it holds the variable's value yet
+            } m_shadowVarCopiedKit;
             struct {  // Stuff needed for Scheme::FlagShared
                 AstActive* activep;  // The active block for the Pre/Post logic
                 AstAlwaysPost* postp;  // The post block for commiting results
@@ -200,6 +205,10 @@ class DelayedVisitor final : public VNVisitor {
         auto& shadowVarMaskedKit() {
             UASSERT(m_scheme == Scheme::ShadowVarMasked, "Inconsistent Scheme");
             return m_kitUnion.m_shadowVarMaskedKit;
+        }
+        auto& shadowVarCopiedKit() {
+            UASSERT(m_scheme == Scheme::ShadowVarCopied, "Inconsistent Scheme");
+            return m_kitUnion.m_shadowVarCopiedKit;
         }
         auto& flagSharedKit() {
             UASSERT(m_scheme == Scheme::FlagShared, "Inconsistent Scheme");
@@ -291,6 +300,7 @@ class DelayedVisitor final : public VNVisitor {
     // STATE - Statistic tracking
     VDouble0 m_nSchemeShadowVar;  // Number of variables using Scheme::ShadowVar
     VDouble0 m_nSchemeShadowVarMasked;  // Number of variabels using Scheme::ShadowVarMasked
+    VDouble0 m_nSchemeShadowVarCopied;  // Number of variabels using Scheme::ShadowVarCopied
     VDouble0 m_nSchemeFlagShared;  // Number of variables using Scheme::FlagShared
     VDouble0 m_nSchemeFlagUnique;  // Number of variables using Scheme::FlagUnique
     VDouble0 m_nSchemeValueQueuesWhole;  //  Number of variables using Scheme::ValueQueueWhole
@@ -451,10 +461,10 @@ class DelayedVisitor final : public VNVisitor {
                     // whole: for elements that are values, as an unpacked
                     // structure or array is
                     const AstNodeDType* const elemDTypep = uaDTypep->subDTypep()->skipRefp();
-                    if (!vscpInfo.m_inSuspOrFork
-                        && (VN_IS(elemDTypep, NodeUOrStructDType)
-                            || VN_IS(elemDTypep, UnpackArrayDType))) {
-                        return Scheme::ShadowVar;
+                    if (VN_IS(elemDTypep, NodeUOrStructDType)
+                        || VN_IS(elemDTypep, UnpackArrayDType)) {
+                        return vscpInfo.m_inSuspOrFork ? Scheme::ShadowVarCopied
+                                                       : Scheme::ShadowVar;
                     }
                     return Scheme::UnsupportedCompoundArrayInLoop;
                 }
@@ -490,6 +500,17 @@ class DelayedVisitor final : public VNVisitor {
             if (isIntegralOrPacked
                 && ((vscpInfo.m_inLoop && vscpInfo.m_partial) || vscpInfo.m_nSites > 1)) {
                 return Scheme::ShadowVarMasked;
+            }
+            // An unpacked structure written a part at a time in a loop has
+            // no mask, and a unique flag would commit only the last part:
+            // the shadow takes the variable's value at the first write of
+            // the time step instead, and gathers every part written after
+            // (a member or an element of one is not a Sel, so whether a
+            // site writes only part of it is whether it writes less than all)
+            if (!isIntegralOrPacked && vscpInfo.m_inLoop
+                && vscpInfo.m_nWholeSites < vscpInfo.m_nSites
+                && VN_IS(dtypep->skipRefp(), NodeUOrStructDType)) {
+                return Scheme::ShadowVarCopied;
             }
             return Scheme::FlagUnique;
         }
@@ -734,6 +755,58 @@ class DelayedVisitor final : public VNVisitor {
         AstConst* const onesp = new AstConst{flp, AstConst::DTyped{}, lhsClonep->dtypep()};
         onesp->num().setAllBits1();
         nodep->addNextHere(new AstAssign{flp, lhsClonep, onesp});
+    }
+
+    // Scheme::ShadowVarCopied
+    void prepareSchemeShadowVarCopied(AstVarScope* vscp, VarScopeInfo& vscpInfo) {
+        UASSERT_OBJ(vscpInfo.m_scheme == Scheme::ShadowVarCopied, vscp, "Inconsistent NBA scheme");
+        FileLine* const flp = vscp->fileline();
+        AstScope* const scopep = vscp->scopep();
+        // Create the shadow variable, and the flag saying it holds the value
+        const std::string shadowName = "__Vdly__" + vscp->varp()->shortName();
+        AstVarScope* const shadowVscp = createTemp(flp, scopep, shadowName, vscp->dtypep());
+        vscpInfo.shadowVarCopiedKit().vscp = shadowVscp;
+        AstVarScope* const copiedVscp
+            = createTemp(flp, scopep, "__VdlyCopied__" + vscp->varp()->shortName(), 1);
+        copiedVscp->varp()->setIgnorePostWrite();
+        vscpInfo.shadowVarCopiedKit().copiedp = copiedVscp;
+        // Add 'Post' scheduled process for the commit and flag clear
+        AstActive* const activep
+            = new AstActive{flp, "nba-shadow-var-copied", vscpInfo.senTreep()};
+        activep->senTreeStorep(vscpInfo.senTreep());
+        scopep->addBlocksp(activep);
+        AstAlwaysPost* const postp = new AstAlwaysPost{flp};
+        activep->addStmtsp(postp);
+        // if (copied) { vscp = shadow; copied = 0; }
+        AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, copiedVscp, VAccess::READ}};
+        ifp->addThensp(new AstAssign{flp, new AstVarRef{flp, vscp, VAccess::WRITE},
+                                     new AstVarRef{flp, shadowVscp, VAccess::READ}});
+        ifp->addThensp(new AstAssign{flp, new AstVarRef{flp, copiedVscp, VAccess::WRITE},
+                                     new AstConst{flp, AstConst::BitFalse{}}});
+        postp->addStmtsp(ifp);
+        vscp->varp()->setIgnorePostRead();
+    }
+    void convertSchemeShadowVarCopied(AstAssignDly* nodep, AstVarScope* vscp,
+                                      VarScopeInfo& vscpInfo) {
+        UASSERT_OBJ(vscpInfo.m_scheme == Scheme::ShadowVarCopied, vscp, "Inconsistent NBA scheme");
+        AstVarScope* const shadowVscp = vscpInfo.shadowVarCopiedKit().vscp;
+        AstVarScope* const copiedVscp = vscpInfo.shadowVarCopiedKit().copiedp;
+        FileLine* const flp = nodep->fileline();
+        // The first write of the time step copies the variable into the shadow
+        AstIf* const ifp
+            = new AstIf{flp, new AstLogNot{flp, new AstVarRef{flp, copiedVscp, VAccess::READ}}};
+        ifp->addThensp(new AstAssign{flp, new AstVarRef{flp, shadowVscp, VAccess::WRITE},
+                                     new AstVarRef{flp, vscp, VAccess::READ}});
+        ifp->addThensp(new AstAssign{flp, new AstVarRef{flp, copiedVscp, VAccess::WRITE},
+                                     new AstConst{flp, AstConst::BitTrue{}}});
+        nodep->addHereThisAsNext(ifp);
+        // Replace the write ref on the LHS with the shadow variable
+        nodep->lhsp()->foreach([&](AstVarRef* const refp) {
+            if (!refp->access().isWriteOnly()) return;
+            UASSERT_OBJ(refp->varScopep() == vscp, nodep, "NBA not setting expected variable");
+            refp->varScopep(shadowVscp);
+            refp->varp(shadowVscp->varp());
+        });
     }
 
     // Scheme::FlagShared
@@ -1080,6 +1153,11 @@ class DelayedVisitor final : public VNVisitor {
                 prepareSchemeShadowVarMasked(vscp, vscpInfo);
                 break;
             }
+            case Scheme::ShadowVarCopied: {
+                ++m_nSchemeShadowVarCopied;
+                prepareSchemeShadowVarCopied(vscp, vscpInfo);
+                break;
+            }
             case Scheme::FlagShared: {
                 ++m_nSchemeFlagShared;
                 prepareSchemeFlagShared(vscp, vscpInfo);
@@ -1125,6 +1203,10 @@ class DelayedVisitor final : public VNVisitor {
             }
             case Scheme::ShadowVarMasked: {
                 convertSchemeShadowVarMasked(nbap, vscp, vscpInfo);
+                break;
+            }
+            case Scheme::ShadowVarCopied: {
+                convertSchemeShadowVarCopied(nbap, vscp, vscpInfo);
                 break;
             }
             case Scheme::FlagShared: {
@@ -1434,6 +1516,7 @@ public:
     ~DelayedVisitor() override {
         V3Stats::addStat("NBA, variables using ShadowVar scheme", m_nSchemeShadowVar);
         V3Stats::addStat("NBA, variables using ShadowVarMasked scheme", m_nSchemeShadowVarMasked);
+        V3Stats::addStat("NBA, variables using ShadowVarCopied scheme", m_nSchemeShadowVarCopied);
         V3Stats::addStat("NBA, variables using FlagShared scheme", m_nSchemeFlagShared);
         V3Stats::addStat("NBA, variables using FlagUnique scheme", m_nSchemeFlagUnique);
         V3Stats::addStat("NBA, variables using ValueQueueWhole scheme", m_nSchemeValueQueuesWhole);
