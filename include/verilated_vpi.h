@@ -64,6 +64,9 @@ public:
     static void clearEvalNeeded() VL_MT_UNSAFE_ONE;
     /// Perform inertially delayed puts
     static void doInertialPuts() VL_MT_UNSAFE_ONE;
+    /// Called by the model once variables have their declared initial values,
+    /// which value change callbacks then take as the values they start from
+    static void staticInitDone() VL_MT_UNSAFE_ONE;
 
     // Self test, for internal use only
     static void selfTest() VL_MT_UNSAFE_ONE;

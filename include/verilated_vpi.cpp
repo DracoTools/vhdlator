@@ -1256,6 +1256,14 @@ public:
             // LCOV_EXCL_STOP
         }
     }
+    static void staticInitDone() VL_MT_UNSAFE_ONE {
+        // A variable's declared initial value is set before any process runs
+        // (IEEE 1800-2023 6.8), not as a change in the time step
+        for (VerilatedVpiCbHolder& ho : s().m_cbCurrentLists[cbValueChange]) {
+            if (ho.invalid()) continue;
+            updatePrev(reinterpret_cast<VerilatedVpioVar*>(ho.cb_datap()->obj));
+        }
+    }
     static bool callValueCbs() VL_MT_UNSAFE_ONE {
         assertOneCheck();
         VpioCbList& cbObjList = s().m_cbCurrentLists[cbValueChange];
@@ -1425,6 +1433,8 @@ bool VerilatedVpi::hasCbs(uint32_t reason) VL_MT_UNSAFE_ONE {
 void VerilatedVpi::callTimedCbs() VL_MT_UNSAFE_ONE { VerilatedVpiImp::callCbs(cbAfterDelay); }
 
 bool VerilatedVpi::callValueCbs() VL_MT_UNSAFE_ONE { return VerilatedVpiImp::callValueCbs(); }
+
+void VerilatedVpi::staticInitDone() VL_MT_UNSAFE_ONE { VerilatedVpiImp::staticInitDone(); }
 
 QData VerilatedVpi::cbNextDeadline() VL_MT_UNSAFE_ONE { return VerilatedVpiImp::cbNextDeadline(); }
 

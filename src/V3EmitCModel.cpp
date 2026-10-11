@@ -418,6 +418,8 @@ class EmitCModel final : public EmitCFunc {
         puts("if (VL_UNLIKELY(!vlSymsp->__Vm_didInit)) {\n");
         puts("VL_DEBUG_IF(VL_DBG_MSGF(\"+ Initial\\n\"););\n");
         puts(topModNameProtected + "__" + protect("_eval_static") + "(&(vlSymsp->TOP));\n");
+        // A declaration's initial value is not a change a VPI callback reports
+        if (v3Global.opt.vpi()) puts("VerilatedVpi::staticInitDone();\n");
         puts(topModNameProtected + "__" + protect("_eval_initial") + "(&(vlSymsp->TOP));\n");
         puts(topModNameProtected + "__" + protect("_eval_settle") + "(&(vlSymsp->TOP));\n");
         puts("vlSymsp->__Vm_didInit = true;\n");
@@ -645,6 +647,7 @@ class EmitCModel final : public EmitCFunc {
         puts("#include \"" + EmitCUtil::pchClassName() + ".h\"\n");
         for (const string& base : v3Global.opt.traceSourceLangs())
             puts("#include \"" + base + ".h\"\n");
+        if (v3Global.opt.vpi()) puts("#include \"verilated_vpi.h\"\n");
 
         emitConstructorImplementation(modp);
         emitDestructorImplementation();
