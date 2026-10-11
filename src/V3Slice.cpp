@@ -375,10 +375,23 @@ class SliceVisitor final : public VNVisitor {
         revp->dtypep(dtypep);
         return revp;
     }
+    // Whether a slice is all of the array it is taken from, which is then
+    // that array; a part of one is nothing stored to copy whole
+    static bool wholeSlice(const AstSliceSel* slicep) {
+        const AstUnpackArrayDType* const fromDtp
+            = VN_CAST(slicep->fromp()->dtypep()->skipRefp(), UnpackArrayDType);
+        const AstConst* const lop = VN_CAST(slicep->op2p(), Const);
+        const AstConst* const countp = VN_CAST(slicep->op3p(), Const);
+        return fromDtp && lop && countp && countp->toSInt() == fromDtp->elementsConst()
+               && lop->toSInt() == fromDtp->lo();
+    }
     // Whether an assignment's value can be copied whole into an array of
     // dtypep, reversed first where that puts it right
     static bool copiesWhole(AstNodeExpr* rhsp, const AstNodeDType* dtypep, bool& reverse) {
         reverse = false;
+        if (const AstSliceSel* const slicep = VN_CAST(rhsp, SliceSel)) {
+            if (!wholeSlice(slicep)) return false;
+        }
         if (VN_IS(rhsp, InitArray)) return true;  // Made for the target, index by index
         if (const AstCond* const condp = VN_CAST(rhsp, Cond)) {
             bool thenReverse;
@@ -421,8 +434,17 @@ class SliceVisitor final : public VNVisitor {
         // SystemC arrays keep the outer count, having to be expanded otherwise
         const int64_t size = hasSc ? elements : totalElements(arrayp);
         bool reverse = false;
-        if (elementLimit > 0 && size > elementLimit
+        const AstSliceSel* const lhsSlicep = VN_CAST(nodep->lhsp(), SliceSel);
+        if (elementLimit > 0 && size > elementLimit && (!lhsSlicep || wholeSlice(lhsSlicep))
             && copiesWhole(nodep->rhsp(), arrayp, reverse)) {
+            // A slice of all of an array, which is left whole, is the array
+            for (AstNodeExpr* const sidep : {nodep->lhsp(), nodep->rhsp()}) {
+                if (AstSliceSel* const slicep = VN_CAST(sidep, SliceSel)) {
+                    AstNodeExpr* const fromp = slicep->fromp()->unlinkFrBack();
+                    slicep->replaceWith(fromp);
+                    VL_DO_DANGLING(pushDeletep(slicep), slicep);
+                }
+            }
             if (reverse) {
                 AstNodeExpr* const rhsp = nodep->rhsp()->unlinkFrBack();
                 nodep->rhsp(reversedCopy(rhsp, nodep->lhsp()->dtypep()));
