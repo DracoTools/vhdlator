@@ -638,12 +638,30 @@ class LinkJumpVisitor final : public VNVisitor {
     // finished is followed by a check of whether the run has ended. A
     // procedure is left by jumping to the end of its body, which also ends
     // a suspendable always, as its loop runs only until the run has ended.
+    // Whether anything can run after a statement on the way to the end of
+    // its function, task or process: a statement after it, or a loop
+    // around it that may go round again. Where nothing can, the jump that
+    // would leave is not needed, and the body is left as it was.
+    static bool somethingFollows(const AstNode* stmtp) {
+        for (const AstNode* p = stmtp; p;) {
+            if (VN_IS(p, NodeFTask) || VN_IS(p, NodeProcedure)) return false;
+            if (p->nextp()) return true;
+            const AstNode* const upp = p->aboveLoopp();
+            if (VN_IS(upp, Loop) || VN_IS(upp, NodeForeach)) return true;
+            p = upp;
+        }
+        return true;
+    }
     // A VHDL process or subprogram is left by the frontend itself, which
     // knows where its process waits for good.
     AstNode* finishExitp(FileLine* flp) {
         if (m_inFork || m_inAssert || m_randsequencep) return nullptr;
         if (m_ftaskp) {
-            if (m_ftaskp->fileline()->language().vhdl()) return nullptr;
+            // A constructor's body is not wrapped: what it calls first,
+            // super.new, has to stay its first statement (IEEE 1800-2023 8.15)
+            if (m_ftaskp->fileline()->language().vhdl() || m_ftaskp->isConstructor()) {
+                return nullptr;
+            }
             return new AstJumpGo{flp, getJumpBlock(m_ftaskp, false)};
         }
         if (m_procp && !m_procp->fileline()->language().vhdl()) {
@@ -709,7 +727,7 @@ class LinkJumpVisitor final : public VNVisitor {
             }
             stmtp = stmtp->aboveLoopp();
         }
-        if (!stmtp || m_finishChecked.count(stmtp)) return;
+        if (!stmtp || m_finishChecked.count(stmtp) || !somethingFollows(stmtp)) return;
         // A variable's initialization is not part of the body's run, and is
         // moved out of it later
         for (const AstNode* up = stmtp; up && !VN_IS(up, NodeFTask) && !VN_IS(up, NodeProcedure);
@@ -730,6 +748,8 @@ class LinkJumpVisitor final : public VNVisitor {
         if (m_inFork) {
             nodep->replaceWith(new AstFinishFork{nodep->fileline()});
             VL_DO_DANGLING(nodep->deleteTree(), nodep);
+        } else if (!somethingFollows(nodep)) {
+            // Nothing after it to leave
         } else if (AstNode* const exitp = finishExitp(nodep->fileline())) {
             nodep->addNextHere(exitp);
         } else if (m_loopp) {
