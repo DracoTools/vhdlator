@@ -662,7 +662,7 @@ class LinkJumpVisitor final : public VNVisitor {
             ftaskp->foreach([&](const AstNodeFTaskRef* refp) {
                 if (refp->taskp() && refp->taskp() != ftaskp) {
                     callers[refp->taskp()].push_back(ftaskp);
-                } else if (!refp->taskp()) {
+                } else if (!refp->taskp() && VN_IS(refp, MethodCall)) {
                     nameCallers[refp->name()].push_back(ftaskp);
                 }
             });
@@ -694,17 +694,28 @@ class LinkJumpVisitor final : public VNVisitor {
     }
     void visit(AstNodeFTaskRef* nodep) override {
         iterateChildren(nodep);
-        if (nodep->taskp() ? !m_mayFinish.count(nodep->taskp())
-                           : !m_mayFinishNames.count(nodep->name())) {
+        if (nodep->taskp()
+                ? !m_mayFinish.count(nodep->taskp())
+                : (!VN_IS(nodep, MethodCall) || !m_mayFinishNames.count(nodep->name()))) {
             return;
         }
-        // The statement the call is part of
+        // The statement the call is part of. A variable's initial value is
+        // not a statement of the body the jump leaves, which keeps its
+        // variables outside the block it jumps to the end of.
         AstNode* stmtp = nodep;
         while (stmtp && !VN_IS(stmtp, NodeStmt)) {
-            if (VN_IS(stmtp, NodeFTask) || VN_IS(stmtp, NodeProcedure)) return;
+            if (VN_IS(stmtp, NodeFTask) || VN_IS(stmtp, NodeProcedure) || VN_IS(stmtp, Var)) {
+                return;
+            }
             stmtp = stmtp->aboveLoopp();
         }
         if (!stmtp || m_finishChecked.count(stmtp)) return;
+        // A variable's initialization is not part of the body's run, and is
+        // moved out of it later
+        for (const AstNode* up = stmtp; up && !VN_IS(up, NodeFTask) && !VN_IS(up, NodeProcedure);
+             up = up->aboveLoopp()) {
+            if (VN_IS(up, InitialStaticStmt) || VN_IS(up, InitialAutomaticStmt)) return;
+        }
         FileLine* const flp = nodep->fileline();
         AstNode* const exitp = finishExitp(flp);
         if (!exitp) return;
