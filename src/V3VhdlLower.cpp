@@ -1040,6 +1040,13 @@ private:
         }
         return false;
     }
+    // A slice of a name whose ends are numbers, which an expansion reads an
+    // element at a time as it reads the name itself
+    static bool constSliceOfName(const AstNodeExpr* nodep) {
+        const AstSelExtract* const selp = VN_CAST(nodep, SelExtract);
+        return selp && repeatable(selp->fromp()) && VN_IS(selp->leftp(), Const)
+               && VN_IS(selp->rightp(), Const);
+    }
 
     // The bounds of the array an access value points at, which the object
     // carries because its type does not (5.4.1). Each reads the object
@@ -1661,6 +1668,40 @@ private:
                     unsup(flp, "unconstrained array '" + typep->prettyName() + "'");
                     return dtypep;
                 }
+                // An unpacked null array is held as one element, as one
+                // that folds here is below, so the end an instance settles
+                // is kept from running past the other: "t(g'range)" with g
+                // a generic of no elements, connected to an object whose
+                // null range folded (NVC issue1420). A vector keeps the ends
+                // it was written with, which its fills are counted over.
+                const AstVhdlRange* const vrp
+                    = packed ? nullptr : VN_CAST(idxp->boundsp(), VhdlRange);
+                AstNodeExpr* const ascp
+                    = vrp && vrp->dirUnknown() ? boundsAscendingExpr(idxp, flp) : nullptr;
+                if (vrp && (!vrp->dirUnknown() || ascp)
+                    && !(VN_IS(rangep->leftp(), Const) && VN_IS(rangep->rightp(), Const))) {
+                    AstNodeExpr* const lp = rangep->leftp();
+                    AstNodeExpr* const rp = rangep->rightp()->unlinkFrBack();
+                    // The right end, kept from running past the left one way
+                    const auto keptp = [&](bool ascending) {
+                        AstNodeExpr* const pastp
+                            = ascending
+                                  ? static_cast<AstNodeExpr*>(new AstLtS{flp, rp->cloneTree(false),
+                                                                         lp->cloneTree(false)})
+                                  : static_cast<AstNodeExpr*>(new AstGtS{flp, rp->cloneTree(false),
+                                                                         lp->cloneTree(false)});
+                        return new AstCond{flp, pastp, lp->cloneTree(false), rp->cloneTree(false)};
+                    };
+                    // Which way an open port's range runs is the instance's
+                    // to say, as a generic of its own
+                    rangep->rightp(
+                        ascp ? static_cast<AstNodeExpr*>(
+                                   new AstCond{flp, ascp, keptp(true), keptp(false)})
+                             : static_cast<AstNodeExpr*>(keptp(vrp->dir() == VhdlDir::TO)));
+                    VL_DO_DANGLING(rp->deleteTree(), rp);
+                } else if (ascp) {
+                    VL_DO_DANGLING(ascp->deleteTree(), ascp);
+                }
             } else {
                 // An array whose index subtype is NATURAL, and which nothing
                 // has constrained, would be four billion elements long. That
@@ -1946,16 +1987,11 @@ private:
         // A STRING is text here rather than a vector of characters, so an
         // array of them is an array of objects, not of bits (16.3)
         if (isStringType(typep)) return false;
-        const VhdlType* const basep = typep->base();
-        switch (basep->kind()) {
-        case VhdlTypeKind::ENUM: return true;
-        case VhdlTypeKind::ARRAY: return basep->elementp() && elementPacks(basep->elementp());
-        // An array of records is a packed array of packed structures where
-        // every element of the record packs, which is what lets a port of one
-        // connect by width rather than by C++ structure type
-        case VhdlTypeKind::RECORD: return recordPacks(typep);
-        default: return false;
-        }
+        // An array of arrays or of records is a memory -- words that are
+        // read and written one at a time -- and is unpacked, as Verilog
+        // writes "logic [31:0] mem [0:1023]". Packed, every write to one
+        // word would be a masked insert across the whole memory.
+        return typep->base()->kind() == VhdlTypeKind::ENUM;
     }
 
     // A record element whose length nothing here settles carries its own
@@ -2081,25 +2117,38 @@ private:
             return bep && bep->base()->kind() == VhdlTypeKind::ARRAY && bep->unconstrained()
                    && bep->base()->indexTypes().size() == 1;
         };
+        // An open element that is an array of arrays, whose own element is
+        // open as well: "array (natural range <>) of std_logic_vector"
+        const auto innerOpen = [&](const VhdlType* bep) {
+            const VhdlType* const ep = isOpen(bep) ? bep->base()->elementp() : nullptr;
+            return ep && isOpen(ep) && !isStringType(ep);
+        };
         AstPin* pinsp = nullptr;
         int pinNum = 0;
-        for (size_t i = 0; i < baseElems.size(); ++i) {
-            if (!isOpen(baseElems[i]->typep())) continue;
-            const VhdlType* const etp = thisElems[i]->typep();
+        const auto addPins = [&](const VhdlType* etp, const std::string& n) {
             const VhdlType* const idxp
                 = etp && !etp->indexTypes().empty() ? etp->indexTypes()[0] : nullptr;
             AstRange* const rangep
                 = idxp && !etp->dimOpen(0) ? anyBoundsRange(idxp, flp) : nullptr;
-            if (!rangep) {
-                if (pinsp) VL_DO_DANGLING(pinsp->deleteTree(), pinsp);
-                return nullptr;
-            }
-            const std::string n = std::to_string(i);
+            if (!rangep) return false;
             pinsp = AstNode::addNextNull(
                 pinsp, new AstPin{flp, ++pinNum, "L" + n, rangep->leftp()->unlinkFrBack()});
             pinsp = AstNode::addNextNull(
                 pinsp, new AstPin{flp, ++pinNum, "R" + n, rangep->rightp()->unlinkFrBack()});
             VL_DO_DANGLING(rangep->deleteTree(), rangep);
+            return true;
+        };
+        for (size_t i = 0; i < baseElems.size(); ++i) {
+            if (!isOpen(baseElems[i]->typep())) continue;
+            const VhdlType* const etp = thisElems[i]->typep();
+            const std::string n = std::to_string(i);
+            bool ok = addPins(etp, n);
+            // The element's own bounds, which the subtype gives its element
+            if (ok && innerOpen(baseElems[i]->typep())) ok = addPins(etp->elementp(), n + "_1");
+            if (!ok) {
+                if (pinsp) VL_DO_DANGLING(pinsp->deleteTree(), pinsp);
+                return nullptr;
+            }
         }
         AstClass*& classp = m_recClasses[basep];
         if (!classp) {
@@ -2115,24 +2164,47 @@ private:
                 AstNodeDType* memberp = nullptr;
                 if (isOpen(bep)) {
                     const std::string n = std::to_string(i);
-                    AstVar* bounds[2];
-                    for (int b = 0; b < 2; ++b) {
-                        bounds[b] = new AstVar{flp, VVarType::GPARAM, (b ? "R" : "L") + n,
-                                               VFlagChildDType{}, newIntDType(flp)};
-                        bounds[b]->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
-                        // In the class's parameter port list, not its body
-                        bounds[b]->ansi(true);
-                        classp->addMembersp(bounds[b]);
-                    }
+                    // An array over two class parameters, its bounds
+                    const auto boundedArray = [&](const std::string& suffix, VhdlType* elemp,
+                                                  AstNodeDType* edtp) -> AstNodeDType* {
+                        AstVar* bounds[2];
+                        for (int b = 0; b < 2; ++b) {
+                            bounds[b] = new AstVar{flp, VVarType::GPARAM, (b ? "R" : "L") + suffix,
+                                                   VFlagChildDType{}, newIntDType(flp)};
+                            bounds[b]->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+                            // In the class's parameter port list, not its body
+                            bounds[b]->ansi(true);
+                            classp->addMembersp(bounds[b]);
+                        }
+                        AstRange* const rp
+                            = new AstRange{flp, new AstVarRef{flp, bounds[0], VAccess::READ},
+                                           new AstVarRef{flp, bounds[1], VAccess::READ}};
+                        if (elementPacks(elemp)) {
+                            return new AstPackArrayDType{flp, VFlagChildDType{}, edtp, rp};
+                        }
+                        return new AstUnpackArrayDType{flp, VFlagChildDType{}, edtp, rp};
+                    };
                     VhdlType* const elemp = bep->base()->elementp();
-                    AstNodeDType* const edtp = lowerType(elemp, flp);
-                    AstRange* const rp
-                        = new AstRange{flp, new AstVarRef{flp, bounds[0], VAccess::READ},
-                                       new AstVarRef{flp, bounds[1], VAccess::READ}};
-                    if (elementPacks(elemp)) {
-                        memberp = new AstPackArrayDType{flp, VFlagChildDType{}, edtp, rp};
-                    } else {
+                    AstNodeDType* edtp = nullptr;
+                    if (innerOpen(bep)) {
+                        VhdlType* const innerp = elemp->base()->elementp();
+                        // The outer bounds first, as the pins give them
+                        AstVar* const lp = new AstVar{flp, VVarType::GPARAM, "L" + n,
+                                                      VFlagChildDType{}, newIntDType(flp)};
+                        AstVar* const rgp = new AstVar{flp, VVarType::GPARAM, "R" + n,
+                                                       VFlagChildDType{}, newIntDType(flp)};
+                        for (AstVar* const bp : {lp, rgp}) {
+                            bp->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+                            bp->ansi(true);
+                            classp->addMembersp(bp);
+                        }
+                        edtp = boundedArray(n + "_1", innerp, lowerType(innerp, flp));
+                        AstRange* const rp
+                            = new AstRange{flp, new AstVarRef{flp, lp, VAccess::READ},
+                                           new AstVarRef{flp, rgp, VAccess::READ}};
                         memberp = new AstUnpackArrayDType{flp, VFlagChildDType{}, edtp, rp};
+                    } else {
+                        memberp = boundedArray(n, elemp, lowerType(elemp, flp));
                     }
                 } else {
                     memberp = memberDType(bep, flp, true);
@@ -2146,6 +2218,21 @@ private:
         }
         return new AstRefDType{
             flp, "t", new AstClassOrPackageRef{flp, classp->name(), classp, pinsp}, nullptr};
+    }
+
+    // Whether a type leaves a bound open somewhere inside it: itself, its
+    // element, or an element of a record, at any depth
+    static bool partlyOpen(const VhdlType* tp, int depth = 0) {
+        if (!tp || depth > 8) return false;
+        if (tp->base()->kind() == VhdlTypeKind::RECORD) {
+            for (const VhdlSymbol* const elemp : tp->base()->elements()) {
+                if (elemp && partlyOpen(elemp->typep(), depth + 1)) return true;
+            }
+            return false;
+        }
+        if (tp->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (tp->unconstrained()) return true;
+        return partlyOpen(tp->elementp() ? tp->elementp() : tp->base()->elementp(), depth + 1);
     }
 
     AstNodeDType* unpackedRecordRef(VhdlType* typep, FileLine* flp) {
@@ -2170,13 +2257,22 @@ private:
         // one another without conversion.
         const std::vector<VhdlSymbol*>& baseElems = typep->base()->elements();
         const std::vector<VhdlSymbol*>& thisElems = typep->elements();
+        // An element open at some level: itself, or its own element --
+        // "array (10 downto 0) of t_rec_uarray", which the subtype of the
+        // record constrains as "(open)(1 downto 0)" (NVC issue1273)
         bool openElement = false;
         for (size_t i = 0; i < baseElems.size(); ++i) {
             VhdlType* const bep = baseElems[i] ? baseElems[i]->typep() : nullptr;
             if (!bep) continue;
             VhdlType* const etp
                 = i < thisElems.size() && thisElems[i] ? thisElems[i]->typep() : bep;
-            if (bep->base()->kind() == VhdlTypeKind::ARRAY && bep->unconstrained()
+            // A record element with an open element of its own, which the
+            // subtype of this record may constrain: "nest_type(sub(points(1
+            // to 2)))" (NVC alias14)
+            if (bep->base()->kind() == VhdlTypeKind::RECORD && etp != bep && partlyOpen(bep)) {
+                openElement = true;
+            }
+            if (bep->base()->kind() == VhdlTypeKind::ARRAY && partlyOpen(bep)
                 && !isStringType(bep)) {
                 if (!recordMayCarry(typep) || !elementCarried(etp)) openElement = true;
             }
@@ -16381,6 +16477,22 @@ private:
                             const int32_t first = static_cast<int32_t>(ownIdxp->left());
                             VL_DO_DANGLING(leftp->deleteTree(), leftp);
                             VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                            // Written, a slice of no elements is given
+                            // nothing (10.6.2.1): a place nothing reads
+                            if (m_asTarget) {
+                                VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                                AstVar* const nullp = newTempVar(
+                                    "__Vnullsl",
+                                    new AstUnpackArrayDType{
+                                        nflp, VFlagChildDType{},
+                                        lowerType(ownerTypep->elementp()
+                                                      ? ownerTypep->elementp()
+                                                      : const_cast<VhdlType*>(ownElemp),
+                                                  nflp),
+                                        new AstRange{nflp, first, first}},
+                                    nflp);
+                                return new AstVarRef{nflp, nullp, VAccess::WRITE};
+                            }
                             return new AstSelExtract{
                                 nflp, fromp, new AstConst{nflp, AstConst::Signed32{}, first},
                                 new AstConst{nflp, AstConst::Signed32{}, first}};
@@ -17058,7 +17170,9 @@ private:
         // out once into an object and the elements are read from that
         AstNode* heldp = nullptr;
         const auto hold = [&](VhdlType* typep, AstNodeExpr* loweredp) -> AstNodeExpr* {
-            if (VN_IS(loweredp, Pattern) || repeatable(loweredp)) return loweredp;
+            if (VN_IS(loweredp, Pattern) || repeatable(loweredp) || constSliceOfName(loweredp)) {
+                return loweredp;
+            }
             AstVar* const tmpp = newTempVar("__Vcat", lowerType(typep, flp), flp);
             heldp = AstNode::addNextNull(
                 heldp, static_cast<AstNode*>(new AstAssign{flp, wr(tmpp, flp), loweredp}));
@@ -17105,6 +17219,14 @@ private:
                 }
             }
             return true;
+        }
+        // A slice whose ends are numbers is as long as they say, whatever
+        // the analysis gave it as its type
+        if (constSliceOfName(loweredp)) {
+            const AstSelExtract* const selp = VN_AS(loweredp, SelExtract);
+            const AstConst* const lp = VN_AS(selp->leftp(), Const);
+            const AstConst* const rp = VN_AS(selp->rightp(), Const);
+            return std::abs(rp->toSInt() - lp->toSInt()) + 1 <= 4096;
         }
         // A call is held in an object first; anything else that cannot be
         // read twice is left as it was
@@ -17169,6 +17291,30 @@ private:
             AstNode* const outp = patp->itemsp()->unlinkFrBackWithNext();
             VL_DO_DANGLING(patp->deleteTree(), patp);
             return outp;
+        }
+        // A slice with numbers for ends, an element at a time from the end
+        // it names first, in the numbering of the object it is taken from
+        if (AstSelExtract* const selp = VN_CAST(loweredp, SelExtract)) {
+            const AstConst* const lp = VN_CAST(selp->leftp(), Const);
+            const AstConst* const rp = VN_CAST(selp->rightp(), Const);
+            if (lp && rp) {
+                const int64_t left = lp->toSInt();
+                const int64_t right = rp->toSInt();
+                const int64_t step = left <= right ? 1 : -1;
+                AstNode* outp = nullptr;
+                for (int64_t at = left;; at += step) {
+                    outp = AstNode::addNextNull(
+                        outp,
+                        new AstPatMember{flp,
+                                         new AstSelBit{flp, selp->fromp()->cloneTree(false),
+                                                       new AstConst{flp, AstConst::Signed32{},
+                                                                    static_cast<int32_t>(at)}},
+                                         nullptr, nullptr});
+                    if (at == right) break;
+                }
+                VL_DO_DANGLING(loweredp->deleteTree(), loweredp);
+                return outp;
+            }
         }
         // Anything else is read once per element, so it has to be a name
         // rather than something that would be worked out again each time
@@ -18698,9 +18844,16 @@ private:
                 AstNodeExpr* runp = lowerExpr(valuep);
                 VhdlType* const runTypep = runp ? concatOperandType(valuep, runp) : nullptr;
                 int64_t have = -1;
+                const AstSelExtract* const runSelp = VN_CAST(runp, SelExtract);
                 if (const AstPattern* const patp = VN_CAST(runp, Pattern)) {
                     have = 0;
                     for (AstNode* ip = patp->itemsp(); ip; ip = ip->nextp()) ++have;
+                } else if (runSelp && VN_IS(runSelp->leftp(), Const)
+                           && VN_IS(runSelp->rightp(), Const)) {
+                    // A slice with numbers for ends is as long as they say
+                    have = std::abs(VN_AS(runSelp->rightp(), Const)->toSInt()
+                                    - VN_AS(runSelp->leftp(), Const)->toSInt())
+                           + 1;
                 } else if (runTypep && runTypep->isConstrainedArray()) {
                     const VhdlType* const ridxp = indexSubtype(runTypep, 0);
                     if (ridxp && ridxp->bounded()) have = ridxp->length();
@@ -18711,7 +18864,7 @@ private:
                     return nullptr;
                 }
                 AstNode* heldp = nullptr;
-                if (!VN_IS(runp, Pattern) && !repeatable(runp)) {
+                if (!VN_IS(runp, Pattern) && !repeatable(runp) && !constSliceOfName(runp)) {
                     AstVar* const tmpp = newTempVar("__Vrun", lowerType(runTypep, flp), flp);
                     heldp = new AstAssign{flp, wr(tmpp, flp), runp};
                     runp = rd(tmpp, flp);
@@ -23599,7 +23752,18 @@ private:
             = nodep->kind() == VhdlAssignKind::SIMPLE
                   ? nodep->wavesp() && !nodep->wavesp()->nextp() && !nodep->wavesp()->afterp()
                   : !anyWaveformDelay(nodep);
-        if (oneUndelayed && runningSliceTarget(nodep->targetp())) {
+        // So is an aggregate target whose value is an array of elements that
+        // do not pack: no concatenation of such names can be written to
+        // ("(o, d) <= d & i when rising_edge(clk)", GHDL gna issue1914)
+        const auto unpackedAggTarget = [&]() {
+            if (!VN_IS(nodep->targetp(), VhdlAggregate)) return false;
+            const VhdlType* const ttypep = nodep->targetp()->vhdlTypep();
+            const VhdlType* const elemp = ttypep && ttypep->base()->kind() == VhdlTypeKind::ARRAY
+                                              ? ttypep->base()->elementp()
+                                              : nullptr;
+            return elemp && !elementPacks(elemp);
+        };
+        if (oneUndelayed && (runningSliceTarget(nodep->targetp()) || unpackedAggTarget())) {
             FileLine* const sflp = new FileLine{flp};
             sflp->warnOff(V3ErrorCode::COMBDLY, true);
             sflp->warnOff(V3ErrorCode::LATCH, true);
@@ -27018,8 +27182,15 @@ private:
             const VhdlType* const nameTypep = assocs[i]->valuep()->vhdlTypep();
             const bool runOfOne
                 = nameTypep && typep && nameTypep->base() == typep->base() && !isString;
-            const bool oneElement
-                = span == 1 && !VN_IS(assocs[i]->valuep(), VhdlAggregate) && !runOfOne;
+            // An aggregate of the element's type is one element, spread over
+            // the names inside it: "(b(1 to 2), (q, r))" of an array of
+            // two-bit vectors gives (q, r) the second vector
+            const bool aggOfElement = VN_IS(assocs[i]->valuep(), VhdlAggregate) && nameTypep
+                                      && elemp && nameTypep->base() == elemp->base()
+                                      && nameTypep->base() != typep->base();
+            const bool oneElement = span == 1
+                                    && (!VN_IS(assocs[i]->valuep(), VhdlAggregate) || aggOfElement)
+                                    && !runOfOne;
             if (oneElement) {
                 VL_DO_DANGLING(lastIdxp->deleteTree(), lastIdxp);
                 fromp = new AstSelBit{flp, srcp->cloneTree(false),

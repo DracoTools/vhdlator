@@ -16249,13 +16249,8 @@ static bool isStdStringType(const VhdlType* typep) {
 static bool packableElement(const VhdlType* typep, int depth = 0) {
     if (!typep || depth > 16) return false;
     if (isStdStringType(typep)) return false;
-    const VhdlType* const basep = typep->base();
-    switch (basep->kind()) {
-    case VhdlTypeKind::ENUM: return true;
-    case VhdlTypeKind::ARRAY:
-        return basep->elementp() && packableElement(basep->elementp(), depth + 1);
-    default: return false;
-    }
+    // An array of arrays is unpacked, as V3VhdlLower's elementPacks says
+    return typep->base()->kind() == VhdlTypeKind::ENUM;
 }
 
 // Whether a record whose open elements an instance would settle can be a
@@ -16312,8 +16307,15 @@ static bool recordOpenSettles(const VhdlType* typep, int depth = 0) {
         case VhdlTypeKind::ARRAY: {
             if (isStdStringType(etypep)) return false;
             if (etypep->base()->indexTypes().size() != 1) return false;
-            const VhdlType* const ep = etypep->base()->elementp();
+            const VhdlType* ep = etypep->base()->elementp();
             if (!ep) return false;
+            // An array of arrays of scalars -- "array (natural range <>) of
+            // std_logic_vector" -- is open at one level or both
+            if (ep->base()->kind() == VhdlTypeKind::ARRAY) {
+                if (isStdStringType(ep) || ep->base()->indexTypes().size() != 1) return false;
+                ep = ep->base()->elementp();
+                if (!ep) return false;
+            }
             const VhdlTypeKind ek = ep->base()->kind();
             if (ek != VhdlTypeKind::ENUM && ek != VhdlTypeKind::INTEGER
                 && ek != VhdlTypeKind::PHYSICAL && ek != VhdlTypeKind::FLOATING) {
