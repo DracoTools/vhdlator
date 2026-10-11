@@ -441,11 +441,21 @@ class DelayedVisitor final : public VNVisitor {
             const AstBasicDType* const basicp = uaDTypep->basicp();
             // If used in a loop, we must have a dynamic commit queue. (Also works in suspendables)
             if (vscpInfo.m_inLoop) {
-                // Arrays with compound element types are currently not supported in loops
+                // Arrays with compound element types have no commit queue
                 if (!basicp
                     || !(basicp->isIntegralOrPacked()  //
                          || basicp->isDouble()  //
                          || basicp->isString())) {
+                    // Outside a suspendable or fork every write in the loop
+                    // goes into the one shadow copy, which is committed
+                    // whole: for elements that are values, as an unpacked
+                    // structure or array is
+                    const AstNodeDType* const elemDTypep = uaDTypep->subDTypep()->skipRefp();
+                    if (!vscpInfo.m_inSuspOrFork
+                        && (VN_IS(elemDTypep, NodeUOrStructDType)
+                            || VN_IS(elemDTypep, UnpackArrayDType))) {
+                        return Scheme::ShadowVar;
+                    }
                     return Scheme::UnsupportedCompoundArrayInLoop;
                 }
                 if (vscpInfo.m_partial) return Scheme::ValueQueuePartial;
