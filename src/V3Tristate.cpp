@@ -1515,7 +1515,10 @@ class TristateVisitor final : public TristateBaseVisitor {
             // parameter is a variable, and a variable a tristate net is read
             // into already loses the z here -- so it is left as the constant
             // it is, which is what a z written into $display is left as too.
-            if (!m_alhs && nodep->num().hasZ() && !VN_IS(nodep->backp(), Arg)) {
+            // So is an element of an unpacked array's value: such an array is
+            // never a tristate net, so the z is data there as well.
+            if (!m_alhs && nodep->num().hasZ() && !VN_IS(nodep->backp(), Arg)
+                && !VN_IS(nodep->backp(), InitItem) && !VN_IS(nodep->backp(), InitArray)) {
                 m_tgraph.setTristate(nodep);
             }
         } else {
