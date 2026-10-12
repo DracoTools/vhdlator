@@ -486,6 +486,8 @@ class TristateVisitor final : public TristateBaseVisitor {
     // What each procedural assignment drives, of what it assigns; none where
     // it assigns no high impedance and so drives all it writes
     std::unordered_map<const AstNodeAssign*, AstNodeExpr*> m_procEnables;
+    // Reference -> the element of an unpacked array it drives, at a fixed index
+    std::map<AstNodeVarRef*, AstArraySel*> m_elemDrives;
     std::unordered_set<const AstVar*> m_taskVars;  // What that task declares
     std::unordered_map<const AstVar*, bool> m_ownedHere;  // Var -> in m_modp
     // Whether a task's statement leaves this variable out of the
@@ -548,11 +550,30 @@ class TristateVisitor final : public TristateBaseVisitor {
     void associateLogic(AstNode* fromp, AstNode* top) {
         if (m_logicp) m_tgraph.associate(fromp, top);
     }
-    AstConst* newAllZerosOrOnes(AstNode* nodep, bool ones) {
+    AstNodeExpr* newAllZerosOrOnes(AstNode* nodep, bool ones) {
+        // An unpacked array's is that value in every element
+        if (nodep->dtypep()) {
+            if (AstUnpackArrayDType* const arrp
+                = VN_CAST(nodep->dtypep()->skipRefp(), UnpackArrayDType)) {
+                return newAllZerosOrOnesOf(nodep, arrp, ones);
+            }
+        }
         V3Number num{nodep, nodep->width()};
         if (ones) num.setAllBits1();
         AstConst* const newp = new AstConst{nodep->fileline(), num};
         return newp;
+    }
+    static AstNodeExpr* newAllZerosOrOnesOf(AstNode* ctxp, AstNodeDType* dtypep, bool ones) {
+        FileLine* const fl = ctxp->fileline();
+        AstNodeDType* const skipp = dtypep->skipRefp();
+        if (AstUnpackArrayDType* const arrp = VN_CAST(skipp, UnpackArrayDType)) {
+            return new AstInitArray{fl, arrp, newAllZerosOrOnesOf(ctxp, arrp->subDTypep(), ones)};
+        }
+        V3Number num{ctxp, skipp->width()};
+        if (ones) num.setAllBits1();
+        AstConst* const constp = new AstConst{fl, num};
+        constp->dtypeFrom(skipp);
+        return constp;
     }
     // Create AstVarXRef with inlinedDots copied from a source xref
     AstVarXRef* newVarXRef(FileLine* fl, AstVar* varp, const string& dotted, VAccess access,
@@ -691,6 +712,18 @@ class TristateVisitor final : public TristateBaseVisitor {
             AstNodeExpr* const enFromp = getEnExprBasedOnOriginalp(fromp);
             enSelp->fromp(enFromp);
             return enSelp;
+        } else if (AstArraySel* const aselp = VN_CAST(nodep, ArraySel)) {
+            // The same element of the array's enable
+            AstNodeExpr* const fromp = aselp->fromp()->unlinkFrBack();
+            AstArraySel* const enSelp = aselp->cloneTree(false);
+            aselp->fromp(fromp);
+            AstNodeExpr* const enFromp = getEnExprBasedOnOriginalp(fromp);
+            if (!enFromp) {
+                VL_DO_DANGLING(enSelp->deleteTree(), enSelp);
+                return nullptr;
+            }
+            enSelp->fromp(enFromp);
+            return enSelp;
         } else {
             nodep->v3warn(E_UNSUPPORTED,
                           "Unsupported tristate construct: " << nodep->prettyTypeName()
@@ -813,7 +846,7 @@ class TristateVisitor final : public TristateBaseVisitor {
             UINFO(8, "  Adding driver to var " << varp);
             const AstPull* const pullp = m_varAux(varp).pullp;
             const bool pullValue = pullp && pullp->direction() == 1;
-            AstConst* const constp = newAllZerosOrOnes(varp, pullValue);
+            AstNodeExpr* const constp = newAllZerosOrOnes(varp, pullValue);
             AstVarRef* const varrefp = new AstVarRef{varp->fileline(), varp, VAccess::WRITE};
             AstAssignW* const newp = new AstAssignW{varp->fileline(), varrefp, constp};
             UINFO(9, "       newoev " << newp);
@@ -1054,9 +1087,23 @@ class TristateVisitor final : public TristateBaseVisitor {
             UINFO(9, "       newenlhsp " << newEnLhsp);
             nodep->addStmtsp(newEnLhsp);
 
-            AstAssignW* const enLhspAssignp = new AstAssignW{
-                refp->fileline(), new AstVarRef{refp->fileline(), newEnLhsp, VAccess::WRITE},
-                getEnp(refp)};
+            // An element of an unpacked array drives that element alone: the
+            // rest of this driver's enable stays zero
+            AstNodeExpr* enTargetp = new AstVarRef{refp->fileline(), newEnLhsp, VAccess::WRITE};
+            AstNodeExpr* enValuep = nullptr;
+            const auto elemIt = m_elemDrives.find(refp);
+            if (elemIt != m_elemDrives.end()) {
+                AstArraySel* const elemp = elemIt->second;
+                enTargetp = new AstArraySel{refp->fileline(), enTargetp,
+                                            elemp->bitp()->cloneTreePure(false)};
+                enValuep = refp->user1p() ? VN_AS(refp->user1p(), NodeExpr)
+                                          : newAllZerosOrOnes(elemp, true);
+                refp->user1p(nullptr);
+            } else {
+                enValuep = getEnp(refp);
+            }
+            AstAssignW* const enLhspAssignp
+                = new AstAssignW{refp->fileline(), enTargetp, enValuep};
             if (it->m_delayp) { enLhspAssignp->timingControlp(it->m_delayp->cloneTree(false)); }
             UINFO(9, "       newenlhspAssignp " << enLhspAssignp);
             nodep->addStmtsp(new AstAlways{enLhspAssignp});
@@ -1278,7 +1325,7 @@ class TristateVisitor final : public TristateBaseVisitor {
                 undrivenp = newAllZerosOrOnes(invarp, true);  // LCOV_EXCL_LINE
             }
 
-            AstConst* pullConstp;
+            AstNodeExpr* pullConstp;
             if (hasPerBitPulls(lhsp)) {
                 pullConstp = createPerBitPullConst(lhsp);
             } else {
@@ -1642,6 +1689,53 @@ class TristateVisitor final : public TristateBaseVisitor {
                     m_tgraph.didProcess(nodep);
                 }
             }
+        }
+    }
+
+    // One element of an unpacked array, at a fixed index. Driven, it is that
+    // element of the driver's own output and enable, the rest of which drive
+    // nothing; read, its enable is the same element of the array's enable.
+    void visit(AstArraySel* nodep) override {
+        if (m_graphing) {
+            iterateChildren(nodep);
+            if (m_alhs) {
+                associateLogic(nodep, nodep->fromp());
+            } else {
+                associateLogic(nodep->fromp(), nodep);
+            }
+            return;
+        }
+        if (m_alhs) {
+            UINFO(9, dbgState() << nodep);
+            AstNodeVarRef* const refp = VN_CAST(nodep->fromp(), NodeVarRef);
+            if (!refp || !VN_IS(nodep->bitp(), Const)) {
+                checkUnhandled(nodep);
+                iterateChildren(nodep);
+                return;
+            }
+            // The element's enable rides on the reference, and the element
+            // says where it goes (aggregateTriSameStrength)
+            if (nodep->user1p()) {
+                refp->user1p(nodep->user1p());
+                nodep->user1p(nullptr);
+                m_tgraph.didProcess(nodep);
+            }
+            m_elemDrives[refp] = nodep;
+            iterateChildren(nodep);
+            return;
+        }
+        iterateChildren(nodep);
+        UINFO(9, dbgState() << nodep);
+        if (nodep->bitp()->user1p()) {
+            nodep->v3warn(E_UNSUPPORTED,
+                          "Unsupported RHS tristate construct: " << nodep->prettyTypeName());
+        }
+        if (nodep->fromp()->user1p()) {  // ARRAYSEL(VARREF, index)
+            AstNodeExpr* const en1p = getEnp(nodep->fromp());
+            AstNodeExpr* const enp
+                = new AstArraySel{nodep->fileline(), en1p, nodep->bitp()->cloneTreePure(true)};
+            nodep->user1p(enp);
+            m_tgraph.didProcess(nodep);
         }
     }
 
@@ -2251,9 +2345,14 @@ class TristateVisitor final : public TristateBaseVisitor {
             // Therefore, create the enable, output and separate input pin,
             // then pinReconnectSimple all
             // Create the output enable pin, connect to new signal
-            AstVar* const enVarp = new AstVar{nodep->fileline(), VVarType::MODULETEMP,
-                                              nodep->name() + "__en" + cvtToStr(m_unique++),
-                                              VFlagBitPacked{}, enModVarp->width()};
+            // An unpacked array's enable is an unpacked array of the same shape
+            AstVar* const enVarp = VN_IS(enModVarp->dtypeSkipRefp(), UnpackArrayDType)
+                                       ? new AstVar{nodep->fileline(), VVarType::MODULETEMP,
+                                                    nodep->name() + "__en" + cvtToStr(m_unique++),
+                                                    enModVarp->dtypep()}
+                                       : new AstVar{nodep->fileline(), VVarType::MODULETEMP,
+                                                    nodep->name() + "__en" + cvtToStr(m_unique++),
+                                                    VFlagBitPacked{}, enModVarp->width()};
             if (inDeclProcessing) {  // __en(from-resolver-const) or __en(from-resolver-wire)
                 enModVarp->varType2In();
             } else {
@@ -2451,6 +2550,16 @@ class TristateVisitor final : public TristateBaseVisitor {
                 }
                 UASSERT_OBJ(!nodep->access().isRW(), nodep, "Tristate unexpected on R/W access");
                 m_tgraph.didProcess(nodep);
+                // An initial value is no driver (visit(AstInitialStatic)): one
+                // driving for ever what it held at the start would keep an
+                // element nothing else drives from ever floating
+                if (m_inStaticInit) {
+                    if (AstNode* const enp = nodep->user1p()) {
+                        nodep->user1p(nullptr);
+                        if (!enp->backp()) pushDeletep(enp);
+                    }
+                    return;
+                }
                 mapInsertLhsVarRef(nodep);
             } else if (nodep->access().isReadOnly()
                        // Not already processed, nor varref from visit(AstPin) creation
