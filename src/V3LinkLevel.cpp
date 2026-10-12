@@ -163,6 +163,22 @@ void V3LinkLevel::timescaling(const ModVec& mods) {
 //######################################################################
 // Wrapping
 
+// The value a module's variable is given by its declaration, where that is
+// a constant: the static initialization V3LinkParse made of it
+static AstNodeExpr* constInitialOf(AstNodeModule* modp, const AstVar* varp) {
+    for (AstNode* stmtp = modp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+        const AstInitialStatic* const initp = VN_CAST(stmtp, InitialStatic);
+        if (!initp) continue;
+        const AstAssign* const assp = VN_CAST(initp->stmtsp(), Assign);
+        if (!assp || assp->nextp()) continue;
+        const AstVarRef* const refp = VN_CAST(assp->lhsp(), VarRef);
+        if (!refp || refp->varp() != varp) continue;
+        if (!VN_IS(assp->rhsp(), Const)) return nullptr;
+        return assp->rhsp();
+    }
+    return nullptr;
+}
+
 void V3LinkLevel::wrapTop(AstNetlist* rootp) {
     UINFO(2, __FUNCTION__ << ":");
     // We do ONLY the top module
@@ -309,6 +325,21 @@ void V3LinkLevel::wrapTopCell(AstNetlist* rootp) {
                     }
 
                     if (v3Global.opt.noTraceTop() && varp->isIO()) varp->trace(false);
+
+                    // An output the design gives an initial value has that
+                    // value outside too from the start: the copy is
+                    // otherwise only made equal by the first evaluation, which
+                    // a VPI client sees as a change at time zero
+                    if (oldvarp->isWritable() && !oldvarp->isInout()) {
+                        if (AstNodeExpr* const initp = constInitialOf(oldmodp, oldvarp)) {
+                            FileLine* const ifl = new FileLine{initp->fileline()};
+                            ifl->warnOff(V3ErrorCode::PROCASSWIRE, true);
+                            ifl->warnOff(V3ErrorCode::E_CONSTWRITTEN, true);
+                            newmodp->addStmtsp(new AstInitialStatic{
+                                ifl, new AstAssign{ifl, new AstVarRef{ifl, varp, VAccess::WRITE},
+                                                   initp->cloneTree(false)}});
+                        }
+                    }
 
                     AstPin* const pinp = new AstPin{
                         oldvarp->fileline(), 0, varp->name(),
