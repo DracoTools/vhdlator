@@ -1,0 +1,6 @@
+%Error-UNSUPPORTED: t/t_tri_eqwild_unsup.v:13:36: Unsupported LHS tristate construct: EQWILD
+                                                : ... note: In instance 't'
+   13 |   assign y = ((en ? 2'b01 : 2'bzz) ==? 2'b0x);
+      |                                    ^~~
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error: Exiting due to
