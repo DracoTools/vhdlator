@@ -2123,13 +2123,17 @@ Summary:
 
 .. option:: --vhdl-bound-check
 
-   Check, while the model runs, that each index into a VHDL array whose
-   range is known at elaboration lies inside that range, and stop with an
-   error where it does not, as IEEE 1076 requires. Indexes that cannot fall
+.. option:: --no-vhdl-bound-check
+
+   Enables/disables checking, while the model runs, that each index into a
+   VHDL array, and the first index of each slice, lies inside the array's
+   range, including a range that a generic gives; where it does not, the
+   model stops with an error, as IEEE 1076 requires. Indexes that cannot fall
    outside the range, such as the variable of a loop over the array's
-   ``'RANGE``, are not checked. Without this option, an index outside its
-   array reads and writes what the equivalent Verilog select would, and the
-   model runs on. The check costs some speed. Defaults to off.
+   ``'RANGE``, are not checked. With :vlopt:`--no-vhdl-bound-check`, an index
+   outside its array reads and writes what the equivalent Verilog select
+   would, and the model runs on; this saves the cost of the checks, about 10%
+   in a loop that does little but index arrays. Defaults to enabled.
 
 .. option:: --vhdl-std <std>
 

@@ -5366,7 +5366,16 @@ private:
         if (!dynamicBounds(arrayTypep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
             return false;
         }
-        if (!dirKnown || !leftp->isPure() || !rightp->isPure()) {
+        // Only generics: a bound that names a variable or a parameter of a
+        // subprogram -- the result of "get32(n)", "k - 1 downto 0" with k
+        // get32's own parameter -- means nothing where the index is written
+        const auto genericsOnly = [](const AstNodeExpr* np) {
+            return !np->exists([](const AstNodeVarRef* refp) {
+                return !refp->varp() || !refp->varp()->isParam();
+            });
+        };
+        if (!dirKnown || !leftp->isPure() || !rightp->isPure() || !genericsOnly(leftp)
+            || !genericsOnly(rightp)) {
             VL_DO_DANGLING(leftp->deleteTree(), leftp);
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return false;
@@ -5433,6 +5442,22 @@ private:
         if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return sliceLeftp;
         if (VN_IS(sliceLeftp, Const) && VN_IS(sliceRightp, Const)) return sliceLeftp;
         if (!sliceRightp->isPure()) return sliceLeftp;
+        // Ends that read only generics are settled when the instance is, and
+        // the back end wants them folded to numbers: a call around one would
+        // stop that ("Slice of non-constant bounds")
+        const auto elabOnly = [](const AstNodeExpr* np) {
+            return !np->exists([](const AstNodeVarRef* refp) {
+                return !refp->varp() || !refp->varp()->isParam();
+            }) && !np->exists([](const AstNodeFTaskRef*) { return true; });
+        };
+        if (elabOnly(sliceLeftp) && elabOnly(sliceRightp)) return sliceLeftp;
+        // A slice of an unpacked array builds only where its ends fold to
+        // numbers, an unrolled loop's say, and the back end checks those
+        // then; a call around one would keep it from folding
+        if (arrayTypep && arrayTypep->base()->kind() == VhdlTypeKind::ARRAY) {
+            const VhdlType* const elemp = elementOf(arrayTypep);
+            if (elemp && !elementPacks(elemp)) return sliceLeftp;
+        }
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool ascending = true;
@@ -16137,6 +16162,13 @@ private:
                 if (AstNodeExpr* const outp = boundsConcat(nodep, lhsp, rhsp, flp)) {
                     return outp;
                 }
+                if (!lhsp || !rhsp) {
+                    if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                    if (rhsp) VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+                    unsup(flp, "concatenation of an operand whose length an instance settles"
+                               " with one of this shape");
+                    return nullptr;
+                }
             }
             // A character joined to text becomes a string of one, and a 0
             // byte made a string in SystemVerilog is no character at all
@@ -17632,7 +17664,9 @@ private:
                 startp = pselp->rhsp();
                 part.down = VN_IS(loweredp, SelMinus);
             }
-            if (!rp || rp->dirUnknown() || !repeatable(fromp) || !startp->isPure()) return false;
+            // The start may be a call -- the bound check of the slice -- and
+            // is worked out once, ahead of the loop that reads it
+            if (!rp || rp->dirUnknown() || !repeatable(fromp)) return false;
             AstNodeExpr* leftp = nullptr;
             AstNodeExpr* rightp = nullptr;
             bool asc = true;
@@ -17763,6 +17797,14 @@ private:
                                        new AstAdd{flp, rk(), intConst(1)}});
         AstNode* const stmtsp
             = new AstAssign{flp, new AstVarRef{flp, kp, VAccess::WRITE}, intConst(0)};
+        // A start that is a call is made once, before the loop reads it
+        for (ConcatPart& part : parts) {
+            if (!part.leftp || part.leftp->isPure()) continue;
+            AstVar* const startp = newTempVar("__Vcats", newIntDType(flp), flp);
+            stmtsp->addHereThisAsNext(
+                new AstAssign{flp, new AstVarRef{flp, startp, VAccess::WRITE}, part.leftp});
+            part.leftp = new AstVarRef{flp, startp, VAccess::READ};
+        }
         stmtsp->addNext(loopp);
         for (ConcatPart& part : parts) {
             VL_DO_DANGLING(part.valuep->deleteTree(), part.valuep);

@@ -1,0 +1,4 @@
+t/t_vhdl_boundcheck_bad.vhd:27:5:@1000000:(report note): before
+t/t_vhdl_boundcheck_bad.vhd:29:5:@1000000:(report failure): after
+%Error: t/t_vhdl_boundcheck_bad.vhd:29: Verilog $stop
+Aborting...

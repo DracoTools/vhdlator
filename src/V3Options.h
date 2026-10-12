@@ -309,7 +309,7 @@ private:
     bool m_traceUnderscore = false; // main switch: --trace-underscore
     bool m_underlineZero = false;   // main switch: --underline-zero; undocumented old Verilator 2
     bool m_verilate = true;         // main switch: --verilate
-    bool m_vhdlBoundCheck = false;  // main switch: --vhdl-bound-check
+    bool m_vhdlBoundCheck = true;  // main switch: --vhdl-bound-check
     bool m_vpi = false;             // main switch: --vpi
     bool m_waiverMultiline = false;  // main switch: --waiver-multiline
     bool m_xInitialEdge = false;    // main switch: --x-initial-edge
