@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_protsigout_bad.vhd:41:5: Unsupported: VHDL call to 'late', a method that drives a signal parameter after a delay, while waiting, or through its attributes cannot be lowered yet
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_protsigout_bad.vhd:42:5: Unsupported: VHDL call to 'now', a method that drives a signal parameter, with that actual cannot be lowered yet
+%Error: Exiting due to

@@ -8678,8 +8678,8 @@ private:
             // kind: what its formal names, and so what that formal's history
             // attributes answer from, is only known at a call site, so a copy
             // is made there instead (4.2.2.3)
-            if (subp->vhdlSymp() && hasSignalParam(subp->vhdlSymp())
-                && subp->hasBody()) {
+            if (subp->vhdlSymp() && hasSignalParam(subp->vhdlSymp()) && subp->hasBody()
+                && !(m_protClassp && copyOutMethod(subp->vhdlSymp()))) {
                 return;
             }
             // A copy made for a call whose parameter's subtype names a
@@ -26709,6 +26709,25 @@ private:
     // is exactly what Verilator's non-blocking assignment region means
     AstNode* lowerSeqAssign(AstVhdlSigAssign* nodep, bool sequential) {
         FileLine* const flp = nodep->fileline();
+        // A copied-out formal of a method is an output of it, assigned at
+        // once, and the flag beside it says so (copyOutMethod)
+        if (!m_copyOutFlags.empty() && m_ftaskp) {
+            const VhdlSymbol* const fsymp = rootSymOf(nodep->targetp());
+            auto it = fsymp ? m_copyOutFlags.find(fsymp) : m_copyOutFlags.end();
+            if (it == m_copyOutFlags.end() && fsymp) it = m_copyOutFlags.find(fsymp->resolved());
+            if (it != m_copyOutFlags.end() && nodep->wavesp() && nodep->wavesp()->valuep()) {
+                AstNodeExpr* const lhsp = lowerTarget(nodep->targetp());
+                AstNodeExpr* const rhsp = lhsp ? lowerExpr(nodep->wavesp()->valuep()) : nullptr;
+                if (!rhsp) {
+                    if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                    return nullptr;
+                }
+                AstNode* const outp = new AstAssign{flp, lhsp, rhsp};
+                outp->addNext(new AstAssign{flp, new AstVarRef{flp, it->second, VAccess::WRITE},
+                                            new AstConst{flp, AstConst::BitTrue{}}});
+                return outp;
+            }
+        }
         // "s <= force v" drives the signal regardless of what else does,
         // until "s <= release" hands it back (10.5.2.1, VHDL-2008)
         if (nodep->release() || nodep->force()) {
@@ -29933,6 +29952,72 @@ private:
         return AstNode::addNext(outp, new AstIf{flp, enterp, wrappedp, nullptr});
     }
 
+    // A call of a method whose signal formals are copied out: each is handed
+    // an object of the call's and a flag, and the actual is driven from the
+    // object after the call where the flag says the method assigned it
+    AstNode* copyOutCall(AstMethodCall* mcallp, AstVhdlCall* callp, VhdlSymbol* symp,
+                         FileLine* flp) {
+        AstVhdlSubprogDecl* const declp = declOf(symp->resolved());
+        std::vector<const AstVhdlIfaceDecl*> formals;
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
+            formals.push_back(VN_AS(p, VhdlIfaceDecl));
+        }
+        std::vector<AstArg*> args;
+        for (AstNode* p = mcallp->argsp(); p; p = p->nextp()) args.push_back(VN_AS(p, Arg));
+        AstNode* postp = nullptr;
+        bool ok = true;
+        for (size_t i = 0; i < formals.size() && ok; ++i) {
+            const AstVhdlIfaceDecl* const ifp = formals[i];
+            if (ifp->kind() != VhdlIfaceKind::SIGNAL) continue;
+            // The association for this formal, by name or by position
+            AstArg* argp = nullptr;
+            AstNodeVhdlExpr* actp = nullptr;
+            size_t k = 0;
+            for (AstNode* p = callp->argsp(); p; p = p->nextp(), ++k) {
+                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                const AstVhdlName* const fnamep
+                    = asp ? VN_CAST(asp->formalp(), VhdlName) : nullptr;
+                if ((fnamep && VString::downcase(fnamep->name()) == VString::downcase(ifp->name()))
+                    || (!fnamep && asp && !asp->formalp() && k == i)) {
+                    actp = asp->actualp();
+                    if (k < args.size()) argp = args[k];
+                    break;
+                }
+            }
+            const VhdlSymbol* const asymp = actp ? objectBehind(rootSymOf(actp)) : nullptr;
+            if (!argp || !actp || !actp->vhdlTypep() || !asymp
+                || (asymp->kind() != VhdlSymKind::SIGNAL && asymp->kind() != VhdlSymKind::PORT)
+                || drivenThroughDriver(asymp)) {
+                ok = false;
+                break;
+            }
+            AstVar* const tmpp = newTempVar("__Vcpo", lowerType(actp->vhdlTypep(), flp), flp);
+            AstVar* const flagp = newTempVar("__Vcposet", newLogicDType(flp, 1), flp);
+            AstNodeExpr* const oldp = argp->exprp()->unlinkFrBack();
+            VL_DO_DANGLING(oldp->deleteTree(), oldp);
+            argp->exprp(new AstVarRef{flp, tmpp, VAccess::WRITE});
+            mcallp->addArgsp(new AstArg{flp, ifp->name() + "__Vset",
+                                        new AstVarRef{flp, flagp, VAccess::WRITE}});
+            AstNodeExpr* const lhsp = lowerExpr(actp);
+            if (!lhsp) {
+                ok = false;
+                break;
+            }
+            postp = AstNode::addNextNull(
+                postp,
+                static_cast<AstNode*>(new AstIf{
+                    flp, new AstVarRef{flp, flagp, VAccess::READ},
+                    assignOf(lhsp, new AstVarRef{flp, tmpp, VAccess::READ}, true, true, flp)}));
+        }
+        if (!ok) {
+            unsup(flp, "call to '" + symp->name()
+                           + "', a method that drives a signal parameter, with that actual");
+            VL_DO_DANGLING(mcallp->deleteTree(), mcallp);
+            if (postp) VL_DO_DANGLING(postp->deleteTree(), postp);
+            return nullptr;
+        }
+        return AstNode::addNext(static_cast<AstNode*>(new AstStmtExpr{flp, mcallp}), postp);
+    }
 
     AstNode* lowerProcCall(AstVhdlProcCall* nodep) {
         FileLine* const flp = nodep->fileline();
@@ -29995,9 +30080,20 @@ private:
             const VhdlType* protTypep = nullptr;
             if (AstNodeExpr* const instp
                 = selp ? protectedInstance(selp->prefixp(), &protTypep) : nullptr) {
+                // A method that drives a signal parameter in a way a copy
+                // out cannot carry -- after a delay, while waiting, through
+                // the formal's attributes -- has no class method to call
+                if (drivesSignalParam(symp) && !copyOutMethod(symp)) {
+                    unsup(flp, "call to '" + symp->name()
+                                   + "', a method that drives a signal parameter after a delay,"
+                                     " while waiting, or through its attributes");
+                    VL_DO_DANGLING(instp->deleteTree(), instp);
+                    return nullptr;
+                }
                 AstMethodCall* const mcallp
                     = new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
                 addCallArgs(mcallp, callp, symp);
+                if (callp && copyOutMethod(symp)) return copyOutCall(mcallp, callp, symp, flp);
                 return new AstStmtExpr{flp, mcallp};
             }
         }
@@ -30876,6 +30972,49 @@ private:
         }
         return false;
     }
+
+    // A procedure of a protected type whose signal parameters are all of
+    // mode out, assigned with no delay, never asked about, never passed on,
+    // in a body that does not wait (NVC issue675). The class it belongs to is
+    // shared by every object and cannot reach a module's signal, so each such
+    // formal is copied out: the method assigns an output and sets a flag, and
+    // the caller drives its signal from them when the flag is set -- the
+    // last assignment in the delta, which is what VHDL gives (bugs.md 388le)
+    static bool copyOutMethod(VhdlSymbol* symp) {
+        if (!symp) return false;
+        symp = symp->resolved();
+        AstVhdlSubprogDecl* const declp = declOf(symp);
+        if (!declp || declp->isFunction() || !declp->hasBody()) return false;
+        std::set<const VhdlSymbol*> formals;
+        for (AstNode* p = firstParamOf(declp); p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            if (ifp->kind() != VhdlIfaceKind::SIGNAL) continue;
+            if (ifp->mode() != VhdlMode::OUT) return false;
+            if (ifp->vhdlSymp()) formals.insert(ifp->vhdlSymp());
+        }
+        if (formals.empty() || hasWait(declp->stmtsp())) return false;
+        const auto isFormal = [&](const AstNode* np) {
+            const VhdlSymbol* const fsymp = rootSymOf(np);
+            return fsymp && (formals.count(fsymp) || formals.count(fsymp->resolved()));
+        };
+        bool ok = true;
+        declp->foreach([&](const AstVhdlAttrName* attrp) {
+            if (attrp->prefixp() && isFormal(attrp->prefixp())) ok = false;
+        });
+        declp->foreach([&](const AstVhdlSigAssign* sap) {
+            if (!isFormal(sap->targetp())) return;
+            if (sap->force() || sap->release() || sap->altsp() || !sap->wavesp()
+                || sap->wavesp()->nextp() || sap->wavesp()->afterp() || !sap->wavesp()->valuep()) {
+                ok = false;
+            }
+        });
+        declp->foreach([&](const AstVhdlAssoc* asp) {
+            if (asp->actualp() && isFormal(asp->actualp())) ok = false;
+        });
+        return ok;
+    }
+    // The flag each copied-out formal of the method being emitted sets
+    std::map<const VhdlSymbol*, AstVar*> m_copyOutFlags;
 
     // Whether any parameter is a signal the subprogram may drive. Such a
     // formal has to *be* the caller's own signal: handing over its value
@@ -34998,11 +35137,13 @@ private:
         // analyzed with no design to instantiate it reaches every such
         // procedure and binds none of them, which is not a gap in the
         // library but the absence of a call.
+        // A method whose signal formals are copied out drives nothing itself
+        const bool copyOut = m_protClassp && copyOutMethod(symp);
         for (size_t i = 0; i < paramIfaces.size(); ++i) {
             if (boundHere(i)) continue;
             const AstVhdlIfaceDecl* const ifp = paramIfaces[i];
             if (ifp->kind() != VhdlIfaceKind::SIGNAL) continue;
-            if (ifp->mode() != VhdlMode::IN) return nullptr;
+            if (ifp->mode() != VhdlMode::IN && !copyOut) return nullptr;
         }
         // The same where only the *result* has no length of its own: the
         // copies made for the call sites carry the lengths their bodies
@@ -35073,6 +35214,7 @@ private:
             }
         }
         m_prefix.clear();
+        std::vector<AstVar*> copyOutResets;  // Flags cleared as the body starts
         for (AstNode* p = firstParamOf(nodep); p; p = p->nextp()) {
             AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             VhdlSymbol* const psymp = ifp->vhdlSymp();
@@ -35179,6 +35321,16 @@ private:
             }
             varp->declDirection(varp->direction());
             varp->funcLocal(true);
+            // Beside a copied-out signal formal, whether the body assigned it
+            if (copyOut && ifp->kind() == VhdlIfaceKind::SIGNAL) {
+                AstVar* const flagp = new AstVar{flp, VVarType::PORT, ifp->name() + "__Vset",
+                                                 VFlagChildDType{}, newLogicDType(flp, 1)};
+                flagp->direction(VDirection::OUTPUT);
+                flagp->declDirection(VDirection::OUTPUT);
+                flagp->funcLocal(true);
+                m_copyOutFlags[psymp] = flagp;
+                copyOutResets.push_back(flagp);
+            }
             // A parameter with a default value may be left out of a call
             // (4.2.2.1), which is what an initial value on the port means here
             if (ifp->defaultp() && !defaultCannotApply(ifp->defaultp(), psymp->typep())) {
@@ -35224,6 +35376,9 @@ private:
                 captureVars.emplace_back(capp, varp);
             }
         }
+        // The flags of copied-out formals last, past every positional one,
+        // and named at the call
+        for (AstVar* const flagp : copyOutResets) ftaskp->addStmtsp(flagp);
         // Inside the body the captured name means the parameter
         std::vector<std::pair<VhdlSymbol*, AstVar*>> savedCaps;
         for (const auto& pair : captureVars) {
@@ -35244,6 +35399,11 @@ private:
                 planCaptures(subp);
             }
             lowerDecl(p);
+        }
+        // Nothing is copied out unless the body assigns it
+        for (AstVar* const flagp : copyOutResets) {
+            ftaskp->addStmtsp(new AstAssign{flp, new AstVarRef{flp, flagp, VAccess::WRITE},
+                                            new AstConst{flp, AstConst::BitFalse{}}});
         }
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
         // Each file this subprogram declared is closed as its scope is left
