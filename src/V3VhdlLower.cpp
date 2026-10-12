@@ -23900,6 +23900,35 @@ private:
         return symp;
     }
 
+    // The signal an assignment's target names a fixed part of: one element
+    // or a slice of a one-dimensional array signal, at indices the text or
+    // the elaboration fixes -- "s(3)", "s(7 downto 4)"
+    static const VhdlSymbol* partSignalOf(const AstNodeVhdlExpr* targetp) {
+        const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        if (!callp || !callp->argsp() || callp->argsp()->nextp()) return nullptr;
+        const VhdlSymbol* const symp = wholeSignalOf(callp->prefixp());
+        if (!symp || !symp->typep() || symp->typep()->base()->kind() != VhdlTypeKind::ARRAY
+            || symp->typep()->dimensions() != 1) {
+            return nullptr;
+        }
+        const AstNode* argp = callp->argsp();
+        if (const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
+            if (asp->formalp()) return nullptr;
+            argp = asp->actualp();
+        }
+        if (const AstVhdlRange* const rp = VN_CAST(argp, VhdlRange)) {
+            if (!rp->leftp() || !rp->rightp() || rp->dirUnknown()) return nullptr;
+            if (!V3VhdlEval::eval(rp->leftp()).isInt()) return nullptr;
+            if (!V3VhdlEval::eval(rp->rightp()).isInt()) return nullptr;
+            return symp;
+        }
+        const AstNodeVhdlExpr* const idxp = VN_CAST(argp, NodeVhdlExpr);
+        if (!idxp || !V3VhdlEval::eval(const_cast<AstNodeVhdlExpr*>(idxp)).isInt()) {
+            return nullptr;
+        }
+        return symp;
+    }
+
     // The signals of a process some assignment in it schedules ahead of time
     void collectWaveSigs(const AstNode* procp, AstNode* stmtsp) {
         m_waveProcp = procp;
@@ -23919,6 +23948,9 @@ private:
             }
             if (const VhdlSymbol* const symp = wholeSignalOf(ap->targetp())) {
                 m_waveSigs.insert(symp);
+            } else if (const VhdlSymbol* const psymp = partSignalOf(ap->targetp())) {
+                // A part is driven by the same driver, element by element
+                m_waveSigs.insert(psymp);
             }
         };
         if (stmtsp == procp) {
@@ -23963,17 +23995,24 @@ private:
         if (m_ftaskp || m_protClassp || !m_waveProcp || !v3Global.opt.timing().isTrue()) {
             return nullptr;
         }
-        const VhdlSymbol* const symp = wholeSignalOf(targetp);
+        const VhdlSymbol* symp = wholeSignalOf(targetp);
+        AstNodeVhdlExpr* sigNamep = targetp;
+        if (!symp) {
+            symp = partSignalOf(targetp);
+            if (symp) sigNamep = VN_AS(targetp, VhdlCall)->prefixp();
+        }
         if (!symp || !m_waveSigs.count(symp)) return nullptr;
         if (drivenThroughDriver(symp)) return nullptr;
         const std::pair<int, int> shape = waveShape(symp->typep());
         const int nElems = shape.first;
         const int elemWidth = shape.second;
         if (nElems < 1) return nullptr;
+        // A part of a scalar is no part of it
+        if (sigNamep != targetp && !elemWidth) return nullptr;
         const auto key = std::make_pair(m_waveProcp, symp);
         const auto it = m_waveTasks.find(key);
         if (it != m_waveTasks.end()) return it->second;
-        AstNodeExpr* const lhsp = lowerDriveTarget(targetp);
+        AstNodeExpr* const lhsp = lowerDriveTarget(sigNamep);
         AstVarRef* const lhsRefp = VN_CAST(lhsp, VarRef);
         if (!lhsRefp) {
             if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
@@ -24033,6 +24072,9 @@ private:
         AstVar* const vp = port("v", lowerType(typep, tflp));
         AstVar* const dp = port("d", time64());
         AstVar* const rp = port("r", time64());
+        // Which elements this transaction drives: all of them for the whole
+        // signal, those of the part a target names otherwise (14.7.2)
+        AstVar* const wp = port("w", elemWidth ? lowerType(typep, tflp) : newLogicDType(tflp, 1));
         const auto local = [&](const std::string& lname, AstNodeDType* dtypep) {
             AstVar* const varp = newFuncLocal(lname, dtypep, tflp);
             taskp->addStmtsp(varp);
@@ -24082,16 +24124,61 @@ private:
             return new AstSel{tflp, valp, new AstMul{tflp, rd(ep, tflp), num(elemWidth)},
                               elemWidth};
         };
+        // Whether this transaction drives element e
+        const auto drv = [&]() -> AstNodeExpr* {
+            if (!elemWidth) return bit(true);
+            return new AstNeq{tflp,
+                              new AstSel{tflp, rd(wp, tflp),
+                                         new AstMul{tflp, rd(ep, tflp), num(elemWidth)},
+                                         elemWidth},
+                              new AstConst{tflp, V3Number{tflp, elemWidth, 0}}};
+        };
+        const auto allOnes = [&]() {
+            V3Number ones{tflp, elemWidth ? nElems * elemWidth : 1, 0};
+            ones.setAllBits1();
+            return new AstConst{tflp, ones};
+        };
         // When the new transaction is due
         taskp->addStmtsp(new AstAssign{
             tflp, wr(tp, tflp),
             new AstAdd{tflp, new AstTime{tflp, VTimescale{VTimescale::TS_1FS}}, rd(dp, tflp)}});
-        // What is due at or after it is deleted
-        taskp->addStmtsp(
-            whileLoop(new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
-                                    new AstGteS{tflp, at(qtp, new AstSub{tflp, size(), num(1)}),
-                                                rd(tp, tflp)}},
-                      onAll("pop_back")));
+        // What is due at or after it is deleted, for the elements it drives:
+        // a pending transaction keeps the elements it alone still drives
+        {
+            AstNode* const clearp = new AstIf{
+                tflp, drv(),
+                new AstAssign{tflp,
+                              new AstSel{tflp,
+                                         new AstSelBit{tflp, wr(qmp, tflp),
+                                                       new AstSub{tflp, rd(kp, tflp), num(1)}},
+                                         rd(ep, tflp), 1},
+                              bit(false)},
+                nullptr};
+            clearp->addNext(incr(ep, 1));
+            AstNode* const perEntryp = new AstAssign{tflp, wr(ep, tflp), num(0)};
+            perEntryp->addNext(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, clearp));
+            perEntryp->addNext(incr(kp, -1));
+            AstNode* const partsp = new AstAssign{tflp, wr(kp, tflp), size()};
+            partsp->addNext(whileLoop(
+                new AstLogAnd{tflp, new AstGtS{tflp, rd(kp, tflp), num(0)},
+                              new AstGteS{tflp, at(qtp, new AstSub{tflp, rd(kp, tflp), num(1)}),
+                                          rd(tp, tflp)}},
+                perEntryp));
+            // The whole signal deletes whole entries, as it always did
+            AstNode* const wholep = whileLoop(
+                new AstLogAnd{
+                    tflp, new AstGtS{tflp, size(), num(0)},
+                    new AstGteS{tflp, at(qtp, new AstSub{tflp, size(), num(1)}), rd(tp, tflp)}},
+                onAll("pop_back"));
+            taskp->addStmtsp(
+                new AstIf{tflp, new AstEq{tflp, rd(wp, tflp), allOnes()}, wholep, partsp});
+            // Those that drive nothing any more are gone
+            taskp->addStmtsp(
+                whileLoop(new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
+                                        new AstEq{tflp, at(qmp, new AstSub{tflp, size(), num(1)}),
+                                                  new AstConst{tflp, V3Number{tflp, nElems, 0}}}},
+                          onAll("pop_back")));
+        }
         // Element by element, of what is due within the rejection limit
         // before it, the run just before it of the value it carries stays
         // and the rest is deleted
@@ -24119,58 +24206,103 @@ private:
                               new AstGteS{tflp, at(qtp, new AstSub{tflp, rd(kp, tflp), num(1)}),
                                           new AstSub{tflp, rd(tp, tflp), rd(rp, tflp)}}},
                 innerp));
-            perElemp->addNext(incr(ep, 1));
+            AstNode* const guardedp = new AstIf{tflp, drv(), perElemp, nullptr};
+            guardedp->addNext(incr(ep, 1));
             taskp->addStmtsp(new AstAssign{tflp, wr(ep, tflp), num(0)});
-            taskp->addStmtsp(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, perElemp));
+            taskp->addStmtsp(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, guardedp));
         }
+        // The elements a transaction carries, put on the signal at the end of
+        // this delta: the whole value where it drives all of them, else each
+        // one it drives, so that two parts given in one delta both arrive
+        const auto putOn = [&](AstNodeExpr* valp, AstNodeExpr* drivesp,
+                               std::function<AstNodeExpr*()> drvOf) -> AstNode* {
+            if (!elemWidth) {
+                VL_DO_DANGLING(drivesp->deleteTree(), drivesp);
+                return new AstAssignDly{tflp, wr(sigVarp, tflp), valp};
+            }
+            AstNode* const stepp = new AstIf{
+                tflp, drvOf(),
+                new AstAssignDly{
+                    tflp,
+                    new AstSel{tflp, wr(sigVarp, tflp),
+                               new AstMul{tflp, rd(ep, tflp), num(elemWidth)}, elemWidth},
+                    new AstSel{tflp, valp->cloneTree(false),
+                               new AstMul{tflp, rd(ep, tflp), num(elemWidth)}, elemWidth}},
+                nullptr};
+            stepp->addNext(incr(ep, 1));
+            AstNode* const partp = new AstAssign{tflp, wr(ep, tflp), num(0)};
+            partp->addNext(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, stepp));
+            return new AstIf{tflp, drivesp, new AstAssignDly{tflp, wr(sigVarp, tflp), valp},
+                             partp};
+        };
         // A transaction for now is the next delta's, and has preempted
-        // everything that was pending
-        AstNode* const nowp = new AstAssignDly{tflp, wr(sigVarp, tflp), rd(vp, tflp)};
-        // A later one waits its turn, and is delivered -- the elements it
-        // still drives -- if it is still the first pending when it comes
+        // everything that was pending for the elements it drives
+        AstNode* const nowp = putOn(rd(vp, tflp), new AstEq{tflp, rd(wp, tflp), allOnes()}, drv);
+        // A later one waits its turn, in the order of when it is due, and is
+        // delivered -- the elements it still drives -- when it comes
         AstNode* laterp = new AstAssign{
             tflp, wr(seqp, tflp),
             new AstAdd{tflp, rd(seqp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 1}}};
         laterp->addNext(new AstAssign{tflp, wr(sp, tflp), rd(seqp, tflp)});
-        laterp->addNext(stmt(qtp, "push_back", rd(tp, tflp)));
-        laterp->addNext(stmt(qsp, "push_back", rd(sp, tflp)));
-        laterp->addNext(stmt(qvp, "push_back", rd(vp, tflp)));
         {
-            V3Number allOnes{tflp, nElems, 0};
-            allOnes.setAllBits1();
-            laterp->addNext(stmt(qmp, "push_back", new AstConst{tflp, allOnes}));
-        }
-        AstNode* const deliverp = new AstAssign{tflp, wr(mp, tflp), at(qmp, num(0))};
-        deliverp->addNext(onAll("pop_front"));
-        if (!elemWidth) {
-            deliverp->addNext(new AstIf{tflp, rd(mp, tflp),
-                                        new AstAssignDly{tflp, wr(sigVarp, tflp), rd(vp, tflp)},
-                                        nullptr});
-        } else {
-            // The elements it no longer drives keep what the signal has
-            AstNode* const mergep = new AstAssign{tflp, wr(nvp, tflp), rd(sigVarp, tflp)};
-            mergep->addNext(new AstAssign{tflp, wr(ep, tflp), num(0)});
-            AstNode* const stepp = new AstIf{
-                tflp, new AstSel{tflp, rd(mp, tflp), rd(ep, tflp), 1},
-                new AstAssign{tflp,
-                              new AstSel{tflp, wr(nvp, tflp),
-                                         new AstMul{tflp, rd(ep, tflp), num(elemWidth)},
-                                         elemWidth},
-                              elem(rd(vp, tflp))},
+            // Which elements it drives, one bit each
+            laterp->addNext(
+                new AstAssign{tflp, wr(mp, tflp), new AstConst{tflp, V3Number{tflp, nElems, 0}}});
+            AstNode* const markp = new AstIf{
+                tflp, drv(),
+                new AstAssign{tflp, new AstSel{tflp, wr(mp, tflp), rd(ep, tflp), 1}, bit(true)},
                 nullptr};
-            stepp->addNext(incr(ep, 1));
-            mergep->addNext(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, stepp));
-            mergep->addNext(new AstAssignDly{tflp, wr(sigVarp, tflp), rd(nvp, tflp)});
-            deliverp->addNext(new AstIf{
-                tflp,
-                new AstNeq{tflp, rd(mp, tflp), new AstConst{tflp, V3Number{tflp, nElems, 0}}},
-                mergep, nullptr});
+            markp->addNext(incr(ep, 1));
+            laterp->addNext(new AstAssign{tflp, wr(ep, tflp), num(0)});
+            laterp->addNext(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, markp));
+            // Behind every one due no later; what is due later drives other
+            // elements, the ones this drives having been deleted above
+            laterp->addNext(new AstAssign{tflp, wr(kp, tflp), size()});
+            laterp->addNext(whileLoop(
+                new AstLogAnd{tflp, new AstGtS{tflp, rd(kp, tflp), num(0)},
+                              new AstGtS{tflp, at(qtp, new AstSub{tflp, rd(kp, tflp), num(1)}),
+                                         rd(tp, tflp)}},
+                incr(kp, -1)));
+            const auto insert = [&](AstVar* qp, AstNodeExpr* valp) {
+                AstArg* const argsp = new AstArg{tflp, "", rd(kp, tflp)};
+                argsp->addNext(new AstArg{tflp, "", valp});
+                return new AstStmtExpr{tflp,
+                                       new AstMethodCall{tflp, rd(qp, tflp), "insert", argsp}};
+            };
+            laterp->addNext(insert(qtp, rd(tp, tflp)));
+            laterp->addNext(insert(qsp, rd(sp, tflp)));
+            laterp->addNext(insert(qvp, rd(vp, tflp)));
+            laterp->addNext(insert(qmp, rd(mp, tflp)));
+        }
+        // Everything due by now is delivered, oldest first, whichever of the
+        // processes waiting for those times wakes first
+        AstNode* deliverp = nullptr;
+        {
+            AstNode* const onep = new AstAssign{tflp, wr(mp, tflp), at(qmp, num(0))};
+            onep->addNext(new AstAssign{tflp, wr(nvp, tflp), at(qvp, num(0))});
+            onep->addNext(onAll("pop_front"));
+            V3Number allElems{tflp, nElems, 0};
+            allElems.setAllBits1();
+            const auto elemDrv = [&]() -> AstNodeExpr* {
+                return new AstSel{tflp, rd(mp, tflp), rd(ep, tflp), 1};
+            };
+            if (!elemWidth) {
+                onep->addNext(new AstIf{tflp, rd(mp, tflp),
+                                        new AstAssignDly{tflp, wr(sigVarp, tflp), rd(nvp, tflp)},
+                                        nullptr});
+            } else {
+                onep->addNext(putOn(rd(nvp, tflp),
+                                    new AstEq{tflp, rd(mp, tflp), new AstConst{tflp, allElems}},
+                                    elemDrv));
+            }
+            deliverp = whileLoop(
+                new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
+                              new AstLteS{tflp, at(qtp, num(0)),
+                                          new AstTime{tflp, VTimescale{VTimescale::TS_1FS}}}},
+                onep);
         }
         AstNode* const forkBodyp = new AstDelay{tflp, rd(dp, tflp), false};
-        forkBodyp->addNext(new AstIf{tflp,
-                                     new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
-                                                   new AstEq{tflp, at(qsp, num(0)), rd(sp, tflp)}},
-                                     deliverp});
+        forkBodyp->addNext(deliverp);
         AstFork* const forkp = new AstFork{tflp, VJoinType::JOIN_NONE, ""};
         forkp->addForksp(new AstBegin{tflp, "", forkBodyp, false});
         // A transaction due after TIME'HIGH never comes: the simulation is
@@ -24189,8 +24321,10 @@ private:
             nowp, laterp});
         addStmt(taskp);
         m_waveTasks.emplace(key, taskp);
+        m_waveMaskWidths.emplace(taskp, elemWidth ? nElems * elemWidth : 1);
         return taskp;
     }
+    std::map<const AstTask*, int> m_waveMaskWidths;  // Bits of each task's "w"
 
     // One element of a waveform handed to its driver's task: the value, the
     // delay, and how far before it the transactions it preempts reach. That
@@ -24199,8 +24333,66 @@ private:
     // nothing for "transport", or for the elements after the first, which
     // preempt only what is due at or after them (10.5.2.2)
     AstNode* waveCall(AstTask* taskp, VhdlDelayKind kind, AstVhdlWaveform* wfp, bool first,
-                      AstNodeExpr* valuep, FileLine* flp) {
+                      AstNodeExpr* valuep, FileLine* flp, AstNodeVhdlExpr* targetp) {
         const auto zero = [&]() { return new AstConst{flp, AstConst::WidthedValue{}, 64, 0}; };
+        // Which elements the transaction drives. A part of the signal is put
+        // into a value of the whole signal's shape at its own place, and the
+        // same place of a mask is set; the elements outside it are not read
+        AstNode* prep = nullptr;
+        AstNodeExpr* maskp = nullptr;
+        const VhdlSymbol* const partSymp
+            = wholeSignalOf(targetp) ? nullptr : partSignalOf(targetp);
+        if (partSymp) {
+            AstNodeExpr* const partp = lowerDriveTarget(targetp);
+            AstVarRef* sigRefp = nullptr;
+            if (partp) {
+                partp->foreach([&](AstVarRef* refp) {
+                    if (!sigRefp) sigRefp = refp;
+                });
+            }
+            if (!partp || !sigRefp) {
+                if (partp) VL_DO_DANGLING(partp->deleteTree(), partp);
+                VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                return nullptr;
+            }
+            AstNodeDType* const sigDtp = lowerType(partSymp->typep(), flp);
+            AstVar* const tvp = newTempVar("__Vwavev", sigDtp, flp);
+            AstVar* const twp = newTempVar("__Vwavew", sigDtp->cloneTree(false), flp);
+            const auto partOf = [&](AstVar* varp, VAccess access) {
+                AstNodeExpr* const newp = partp->cloneTree(false);
+                AstVarRef* innerp = nullptr;
+                newp->foreach([&](AstVarRef* refp) {
+                    if (!innerp) innerp = refp;
+                });
+                AstVarRef* const repp = new AstVarRef{flp, varp, access};
+                if (innerp == newp) {
+                    VL_DO_DANGLING(newp->deleteTree(), newp);
+                    return static_cast<AstNodeExpr*>(repp);
+                }
+                innerp->replaceWith(repp);
+                VL_DO_DANGLING(innerp->deleteTree(), innerp);
+                return newp;
+            };
+            // Cleared whole: zero, widened to the signal
+            FileLine* const zflp = new FileLine{flp};
+            zflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+            prep = new AstAssign{zflp, new AstVarRef{zflp, tvp, VAccess::WRITE},
+                                 new AstConst{zflp, AstConst::BitFalse{}}};
+            prep->addNext(new AstAssign{flp, partOf(tvp, VAccess::WRITE), valuep});
+            prep->addNext(new AstAssign{zflp, new AstVarRef{zflp, twp, VAccess::WRITE},
+                                        new AstConst{zflp, AstConst::BitFalse{}}});
+            prep->addNext(new AstAssign{flp, partOf(twp, VAccess::WRITE),
+                                        new AstNot{flp, partOf(twp, VAccess::READ)}});
+            VL_DO_DANGLING(partp->deleteTree(), partp);
+            valuep = new AstVarRef{flp, tvp, VAccess::READ};
+            maskp = new AstVarRef{flp, twp, VAccess::READ};
+        } else {
+            // The whole signal: every element, all ones as wide as the mask
+            const auto widthIt = m_waveMaskWidths.find(taskp);
+            V3Number ones{flp, widthIt != m_waveMaskWidths.end() ? widthIt->second : 1, 0};
+            ones.setAllBits1();
+            maskp = new AstConst{flp, ones};
+        }
         AstNodeExpr* const dp = wfp->afterp() ? lowerExpr(wfp->afterp()) : zero();
         AstNodeExpr* rp = nullptr;
         if (!first || kind == VhdlDelayKind::TRANSPORT) {
@@ -24219,9 +24411,10 @@ private:
         AstArg* const argsp = new AstArg{flp, "", valuep};
         argsp->addNext(new AstArg{flp, "", dp});
         argsp->addNext(new AstArg{flp, "", rp});
+        argsp->addNext(new AstArg{flp, "", maskp});
         AstTaskRef* const refp = new AstTaskRef{flp, taskp->name(), argsp};
         refp->taskp(taskp);
-        return new AstStmtExpr{flp, refp};
+        return AstNode::addNextNull(prep, static_cast<AstNode*>(new AstStmtExpr{flp, refp}));
     }
 
     // The statements one waveform becomes: each element assigned at its own
@@ -24262,7 +24455,8 @@ private:
                 if (!valuep) return nullptr;
                 readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
                                 : valuep->cloneTree(false);
-                AstNode* const callp = waveCall(wtaskp, kind, p, p == wavesp, valuep, flp);
+                AstNode* const callp
+                    = waveCall(wtaskp, kind, p, p == wavesp, valuep, flp, targetp);
                 if (!callp) return nullptr;
                 stmtsp = AstNode::addNextNull(stmtsp, callp);
             }
@@ -27482,8 +27676,8 @@ private:
                     AstNode* const markp
                         = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
                     if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
-                    outp = AstNode::addNextNull(
-                        outp, waveCall(wtaskp, nodep->delay(), p, p == wfp, rhsp, flp));
+                    outp = AstNode::addNextNull(outp, waveCall(wtaskp, nodep->delay(), p, p == wfp,
+                                                               rhsp, flp, nodep->targetp()));
                     outp = AstNode::addNextNull(outp, markp);
                 }
                 return outp;
@@ -27550,8 +27744,8 @@ private:
             AstNode* const markp
                 = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
             if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
-            return AstNode::addNextNull(waveCall(wtaskp, nodep->delay(), wfp, true, rhsp, flp),
-                                        markp);
+            return AstNode::addNextNull(
+                waveCall(wtaskp, nodep->delay(), wfp, true, rhsp, flp, nodep->targetp()), markp);
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp = lowerDriveValue(nodep->targetp(), wfp->valuep(), flp);
