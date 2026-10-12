@@ -223,6 +223,26 @@ class SliceVisitor final : public VNVisitor {
                                          : elemIdx));
             newp = new AstArraySel{nodep->fileline(), snodep->fromp()->cloneTree(false, needPure),
                                    leOffset};
+        } else if (VN_IS(nodep, And) || VN_IS(nodep, Or) || VN_IS(nodep, Xor)) {
+            // Bitwise over whole unpacked arrays, as V3Tristate resolves an
+            // unpacked net: the operation of each pair of elements
+            UINFO(9, "  cloneBitwise(" << elements << "," << elemIdx << ") " << nodep);
+            AstNodeBiop* const biopp = VN_AS(nodep, NodeBiop);
+            AstNodeExpr* const lp = cloneAndSel(biopp->lhsp(), elements, elemIdx, needPure);
+            AstNodeExpr* const rp = cloneAndSel(biopp->rhsp(), elements, elemIdx, needPure);
+            FileLine* const flp = nodep->fileline();
+            AstNodeBiop* const newbp
+                = VN_IS(nodep, And)  ? static_cast<AstNodeBiop*>(new AstAnd{flp, lp, rp})
+                  : VN_IS(nodep, Or) ? static_cast<AstNodeBiop*>(new AstOr{flp, lp, rp})
+                                     : static_cast<AstNodeBiop*>(new AstXor{flp, lp, rp});
+            newbp->dtypeFrom(arrayp->subDTypep());
+            return newbp;
+        } else if (const AstNot* const snodep = VN_CAST(nodep, Not)) {
+            UINFO(9, "  cloneNot(" << elements << "," << elemIdx << ") " << nodep);
+            AstNot* const newnp = new AstNot{
+                snodep->fileline(), cloneAndSel(snodep->lhsp(), elements, elemIdx, needPure)};
+            newnp->dtypeFrom(arrayp->subDTypep());
+            return newnp;
         } else if (const AstSampled* const snodep = VN_CAST(nodep, Sampled)) {
             UINFO(9, "  cloneSliceSel(" << elements << "," << elemIdx << ") " << nodep);
             AstNodeExpr* const exprp = VN_AS(snodep->exprp(), NodeExpr);
