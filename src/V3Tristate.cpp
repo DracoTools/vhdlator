@@ -2550,10 +2550,12 @@ class TristateVisitor final : public TristateBaseVisitor {
                 }
                 UASSERT_OBJ(!nodep->access().isRW(), nodep, "Tristate unexpected on R/W access");
                 m_tgraph.didProcess(nodep);
-                // An initial value is no driver (visit(AstInitialStatic)): one
-                // driving for ever what it held at the start would keep an
-                // element nothing else drives from ever floating
-                if (m_inStaticInit) {
+                // An unpacked array's initial value is no driver
+                // (visit(AstInitialStatic)): one driving for ever what it held
+                // at the start would keep an element nothing else drives from
+                // ever floating. A packed variable's is still taken for one,
+                // as before: a resolved VHDL signal's driver starts there.
+                if (m_inStaticInit && VN_IS(nodep->varp()->dtypeSkipRefp(), UnpackArrayDType)) {
                     if (AstNode* const enp = nodep->user1p()) {
                         nodep->user1p(nullptr);
                         if (!enp->backp()) pushDeletep(enp);
