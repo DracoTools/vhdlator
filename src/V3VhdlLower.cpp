@@ -196,6 +196,8 @@ class VhdlLowerVisitor final {
     std::map<const VhdlSymbol*, AstNodeFTask*> m_pkgFuncs;
     bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
     bool m_asTarget = false;  // Lowering what an assignment writes, not what it reads
+    // Lowering a built-in procedure's actuals, any of which it may write
+    bool m_checkAsCall = false;
     bool m_inStmts = false;  // Lowering the statements of a process or subprogram
     const AstVhdlCall* m_dirReportedp = nullptr;  // Slice whose direction check is made
     bool m_emitForUnit = false;  // Building something the unit will hold
@@ -5367,7 +5369,11 @@ private:
             return true;
         }
         // Ends a generic gives: the instance settles them, and they are
-        // numbers by the time anything runs
+        // numbers by the time anything runs. Asked of the bounds as written
+        // before anything is lowered: lowering one that names something else
+        // -- "values'range" of a parameter -- may itself be refused, and a
+        // check is no reason to refuse a design
+        if (!boundsNameOnlyGenerics(idxp->boundsp())) return false;
         bool dirKnown = true;
         if (!dynamicBounds(arrayTypep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
             return false;
@@ -5388,9 +5394,51 @@ private:
         }
         return true;
     }
+    // Whether a range as written names generics, literals and operators on
+    // them, and nothing else: no attribute, no object, no call
+    static bool boundsNameOnlyGenerics(const AstNode* boundsp) {
+        const AstVhdlRange* const rp = VN_CAST(boundsp, VhdlRange);
+        if (!rp || !rp->leftp() || !rp->rightp()) return false;
+        bool ok = true;
+        const auto check = [&](const AstNode* np) {
+            np->foreach([&](const AstNode* subp) {
+                if (VN_IS(subp, VhdlAttrName) || VN_IS(subp, VhdlCall)) {
+                    // A call of a predefined operator is how "n - 1" is held
+                    const AstVhdlCall* const callp = VN_CAST(subp, VhdlCall);
+                    const VhdlSymbol* const csymp
+                        = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+                    if (!csymp || !csymp->predefined()) ok = false;
+                    return;
+                }
+                const AstNodeVhdlExpr* const ep = VN_CAST(subp, NodeVhdlExpr);
+                const VhdlSymbol* const symp
+                    = ep && ep->vhdlSymp() ? ep->vhdlSymp()->resolved() : nullptr;
+                if (!symp) return;
+                switch (symp->kind()) {
+                case VhdlSymKind::GENERIC:
+                case VhdlSymKind::ENUM_LITERAL:
+                case VhdlSymKind::FUNCTION: break;  // An operator's symbol
+                default: ok = false;
+                }
+            });
+        };
+        check(rp->leftp());
+        check(rp->rightp());
+        return ok;
+    }
+    // An expression that reads only generics and generate indices: settled
+    // when the instance is, folded to a number by the back end, which checks
+    // it then. A run-time check around one would keep it from folding where
+    // a number is needed, a generate's subtype bound say
+    static bool elabOnly(const AstNodeExpr* np) {
+        return !np->exists([](const AstNodeVarRef* refp) {
+            return !refp->varp() || !(refp->varp()->isParam() || refp->varp()->isGenVar());
+        }) && !np->exists([](const AstNodeFTaskRef*) { return true; });
+    }
     AstNodeExpr* checkedIndex(const AstNodeVhdlExpr* actualp, AstNodeExpr* indexp,
                               const VhdlType* arrayTypep, int dim, FileLine* flp) {
         if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts || VN_IS(indexp, Const)) return indexp;
+        if (elabOnly(indexp)) return indexp;
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool ascending = true;
@@ -5412,7 +5460,9 @@ private:
         }
         // A place written to: a call that gives the index back, which stands
         // where an index can, in a target too
-        if (m_asTarget) return checkCall(false, indexp, nullptr, leftp, rightp, ascending, flp);
+        if (m_asTarget || m_checkAsCall) {
+            return checkCall(false, indexp, nullptr, leftp, rightp, ascending, flp);
+        }
         // Read: the check in line, the index read once where reading it
         // twice could differ
         AstNode* setp = nullptr;
@@ -5451,11 +5501,6 @@ private:
         // Ends that read only generics are settled when the instance is, and
         // the back end wants them folded to numbers: a call around one would
         // stop that ("Slice of non-constant bounds")
-        const auto elabOnly = [](const AstNodeExpr* np) {
-            return !np->exists([](const AstNodeVarRef* refp) {
-                return !refp->varp() || !refp->varp()->isParam();
-            }) && !np->exists([](const AstNodeFTaskRef*) { return true; });
-        };
         if (elabOnly(sliceLeftp) && elabOnly(sliceRightp)) return sliceLeftp;
         // A slice of an unpacked array builds only where its ends fold to
         // numbers, an unrolled loop's say, and the back end checks those
@@ -31101,6 +31146,11 @@ private:
                     }
                     if (!formal.empty()) m_txtArgs[VString::downcase(formal)] = asp->actualp();
                 }
+                // Its out actuals are lowered as reads are, so an index into
+                // one is checked by a call, which stands where an index can
+                // in a target too
+                VL_RESTORER(m_checkAsCall);
+                m_checkAsCall = true;
                 if (AstNode* const outp = lowerTextioProc(symp->name(), args, flp)) return outp;
             }
         }
@@ -34547,14 +34597,21 @@ private:
         const bool isStr = isStringType(valTypep);
         AstNodeExpr* const filep = lowerExpr(args[0]);
         if (!filep) return nullptr;
+        // What a read fills is written: an index into it is checked as a
+        // target's is
+        const auto lowerArg = [&](AstNodeVhdlExpr* argp) {
+            VL_RESTORER(m_asTarget);
+            m_asTarget = reading;
+            return lowerExpr(argp);
+        };
         if (isStr) {
-            AstNodeExpr* const valuep = lowerExpr(args[1]);
+            AstNodeExpr* const valuep = lowerArg(args[1]);
             if (!valuep) return nullptr;
             AstVar* idxp = nullptr;
             AstNode* outp = lowerFileString(reading, filep, valuep, valTypep, flp, &idxp);
             if (!reading) return outp;
             if (args.size() == 3) {
-                AstNodeExpr* const outLenp = lowerExpr(args[2]);
+                AstNodeExpr* const outLenp = lowerArg(args[2]);
                 if (!outLenp) return nullptr;
                 outp = AstNode::addNext(
                     outp, static_cast<AstNode*>(new AstAssign{
@@ -34573,7 +34630,7 @@ private:
                 return nullptr;
             }
             const int64_t count = valTypep->dimLength(0);
-            AstNodeExpr* basep = lowerExpr(args[1]);
+            AstNodeExpr* basep = lowerArg(args[1]);
             if (!basep) return nullptr;
             AstNode* outp = nullptr;
             // A value that is not a name cannot be indexed one element at a
@@ -34612,7 +34669,7 @@ private:
             VL_DO_DANGLING(basep->deleteTree(), basep);
             VL_DO_DANGLING(filep->deleteTree(), filep);
             if (reading && args.size() == 3) {
-                AstNodeExpr* const outLenp = lowerExpr(args[2]);
+                AstNodeExpr* const outLenp = lowerArg(args[2]);
                 if (!outLenp) return nullptr;
                 outp = AstNode::addNext(
                     outp, static_cast<AstNode*>(new AstAssign{
@@ -34620,7 +34677,7 @@ private:
             }
             return outp;
         }
-        AstNodeExpr* const valuep = lowerExpr(args[1]);
+        AstNodeExpr* const valuep = lowerArg(args[1]);
         if (!valuep) return nullptr;
         return lowerFileValue(reading, filep, valuep, valTypep, flp);
     }

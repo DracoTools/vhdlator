@@ -1,0 +1,4 @@
+t/t_vhdl_boundcheck_outarg_bad.vhd:69:5:@0:(report note): before
+%Error: t/t_vhdl_boundcheck_outarg_bad.vhd:72: Index 9 is outside of the range 0 to 3 of the array
+%Error: t/t_vhdl_boundcheck_outarg_bad.vhd:72: Verilog $stop
+Aborting...
