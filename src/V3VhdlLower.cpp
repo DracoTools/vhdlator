@@ -16480,6 +16480,37 @@ private:
                     return new AstSubstrN{flp, fromp, stringIndex(ownerTypep, leftp, flp),
                                           stringIndex(ownerTypep, rightp, flp)};
                 }
+                // A slice whose ends move together and are always the wrong
+                // way round for its direction is null whatever they are --
+                // "v(n - 4 downto n)" -- and is held, as a null slice with
+                // numbers for ends is below, as the object's first element:
+                // a value no one reads
+                if (sliceDirKnown && staticallyNull(rp) && ownerTypep
+                    && ownerTypep->isConstrainedArray() && !shifts.size()) {
+                    const VhdlType* const ownIdxp = indexSubtype(ownerTypep, 0);
+                    if (ownIdxp && ownIdxp->bounded()) {
+                        FileLine* const nflp = new FileLine{flp};
+                        nflp->warnOff(V3ErrorCode::SELRANGE, true);
+                        nflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                        nflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        const int32_t first = static_cast<int32_t>(ownIdxp->left());
+                        VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                        if (m_asTarget && !elementPacksOf(ownerTypep)) {
+                            VL_DO_DANGLING(fromp->deleteTree(), fromp);
+                            AstVar* const nullp = newTempVar(
+                                "__Vnullsl",
+                                new AstUnpackArrayDType{nflp, VFlagChildDType{},
+                                                        lowerType(elementOf(ownerTypep), nflp),
+                                                        new AstRange{nflp, first, first}},
+                                nflp);
+                            return new AstVarRef{nflp, nullp, VAccess::WRITE};
+                        }
+                        return new AstSelExtract{nflp, fromp,
+                                                 new AstConst{nflp, AstConst::Signed32{}, first},
+                                                 new AstConst{nflp, AstConst::Signed32{}, first}};
+                    }
+                }
                 // A slice whose bounds move together but keep their width --
                 // v(i + 7 downto i) -- is Verilog's indexed part select. VHDL
                 // writes both ends, so the width has to be recovered from
@@ -17199,6 +17230,29 @@ private:
     // How many elements lie between a slice's ends, where that is a number
     // here rather than something only the elaboration or the run settles.
     // Zero where it is not.
+    // Whether a range's ends differ by a number that makes it null (5.2.1)
+    bool staticallyNull(AstVhdlRange* rp) {
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return false;
+        LinearForm span;
+        linearAdd(span, rp->leftp(), 1, 0);
+        linearAdd(span, rp->rightp(), -1, 0);
+        bool ok = span.ok;
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0) ok = false;
+        }
+        const int64_t sign = rp->dir() == VhdlDir::DOWNTO ? 1 : -1;
+        const int64_t out = sign * span.konst + 1;
+        span.clear();
+        return ok && out <= 0;
+    }
+    // An array type's element, and whether it packs
+    static VhdlType* elementOf(const VhdlType* typep) {
+        return typep->elementp() ? typep->elementp() : typep->base()->elementp();
+    }
+    bool elementPacksOf(const VhdlType* typep) const {
+        const VhdlType* const elemp = elementOf(typep);
+        return elemp && elementPacks(elemp);
+    }
     int64_t constSliceSpan(AstVhdlRange* rp) {
         if (!rp || !rp->leftp() || !rp->rightp()) return 0;
         LinearForm span;
