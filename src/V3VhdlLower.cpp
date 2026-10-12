@@ -2108,22 +2108,38 @@ private:
     // bounds: "rec#(1, 5)::t" where the actual is declared and "rec#(l, r)::t"
     // on the port are the one specialization once the instance's generics
     // are known, and so one C++ type, which a structure per module is not
+    // An element of a record a port leaves open, open at its own top level
+    static bool isOpen(const VhdlType* bep) {
+        return bep && bep->base()->kind() == VhdlTypeKind::ARRAY && bep->unconstrained()
+               && bep->base()->indexTypes().size() == 1;
+    }
+    // An open element that is an array of arrays, whose own element is open
+    // as well: "array (natural range <>) of std_logic_vector"
+    static bool innerOpen(const VhdlType* bep) {
+        const VhdlType* const ep = isOpen(bep) ? bep->base()->elementp() : nullptr;
+        return ep && isOpen(ep) && !isStringType(ep);
+    }
+    // A record element whose own elements are open, a class of its own
+    static bool nestedOpen(const VhdlType* bep) {
+        return bep && bep->base()->kind() == VhdlTypeKind::RECORD && bep->base()->portShaped()
+               && partlyOpen(bep);
+    }
+    // The class reference, with its bounds as pins, a subtype of a nested
+    // record element takes. Null where its bounds cannot be given.
+    AstClassOrPackageRef* innerClassPins(VhdlType* etp, FileLine* flp) {
+        AstRefDType* const refp = VN_CAST(recordClassRef(etp, flp), RefDType);
+        if (!refp) return nullptr;
+        AstClassOrPackageRef* const cprefp = VN_CAST(refp->classOrPackageOpp(), ClassOrPackageRef);
+        if (cprefp) cprefp->unlinkFrBack();
+        VL_DO_DANGLING(refp->deleteTree(), refp);
+        return cprefp;
+    }
     std::map<const VhdlType*, AstClass*> m_recClasses;
     AstNodeDType* recordClassRef(VhdlType* typep, FileLine* flp) {
         VhdlType* const basep = typep->base();
         const std::vector<VhdlSymbol*>& baseElems = basep->elements();
         const std::vector<VhdlSymbol*>& thisElems = typep->elements();
         if (thisElems.size() != baseElems.size()) return nullptr;
-        const auto isOpen = [](const VhdlType* bep) {
-            return bep && bep->base()->kind() == VhdlTypeKind::ARRAY && bep->unconstrained()
-                   && bep->base()->indexTypes().size() == 1;
-        };
-        // An open element that is an array of arrays, whose own element is
-        // open as well: "array (natural range <>) of std_logic_vector"
-        const auto innerOpen = [&](const VhdlType* bep) {
-            const VhdlType* const ep = isOpen(bep) ? bep->base()->elementp() : nullptr;
-            return ep && isOpen(ep) && !isStringType(ep);
-        };
         AstPin* pinsp = nullptr;
         int pinNum = 0;
         const auto addPins = [&](const VhdlType* etp, const std::string& n) {
@@ -2140,9 +2156,25 @@ private:
             return true;
         };
         for (size_t i = 0; i < baseElems.size(); ++i) {
+            const std::string n = std::to_string(i);
+            if (nestedOpen(baseElems[i]->typep())) {
+                // A record element open inside: the bounds its own class
+                // takes, which this one takes in turn, named after the place
+                AstClassOrPackageRef* const innerRefp = innerClassPins(thisElems[i]->typep(), flp);
+                if (!innerRefp) {
+                    if (pinsp) VL_DO_DANGLING(pinsp->deleteTree(), pinsp);
+                    return nullptr;
+                }
+                for (AstPin* ip = innerRefp->paramsp(); ip; ip = VN_AS(ip->nextp(), Pin)) {
+                    pinsp = AstNode::addNextNull(pinsp,
+                                                 new AstPin{flp, ++pinNum, ip->name() + "__" + n,
+                                                            ip->exprp()->unlinkFrBack()});
+                }
+                VL_DO_DANGLING(innerRefp->deleteTree(), innerRefp);
+                continue;
+            }
             if (!isOpen(baseElems[i]->typep())) continue;
             const VhdlType* const etp = thisElems[i]->typep();
-            const std::string n = std::to_string(i);
             bool ok = addPins(etp, n);
             // The element's own bounds, which the subtype gives its element
             if (ok && innerOpen(baseElems[i]->typep())) ok = addPins(etp->elementp(), n + "_1");
@@ -2151,6 +2183,14 @@ private:
                 return nullptr;
             }
         }
+        AstClass* const classp = recordClassOf(basep, flp);
+        return new AstRefDType{
+            flp, "t", new AstClassOrPackageRef{flp, classp->name(), classp, pinsp}, nullptr};
+    }
+
+    // The class a record's base is declared as, made once
+    AstClass* recordClassOf(VhdlType* basep, FileLine* flp) {
+        const std::vector<VhdlSymbol*>& baseElems = basep->elements();
         AstClass*& classp = m_recClasses[basep];
         if (!classp) {
             classp
@@ -2207,6 +2247,29 @@ private:
                     } else {
                         memberp = boundedArray(n, elemp, lowerType(elemp, flp));
                     }
+                } else if (nestedOpen(bep)) {
+                    // The element's own class, its parameters this class's
+                    // own, named after the place
+                    AstClass* const innerp = recordClassOf(bep->base(), flp);
+                    AstPin* innerPinsp = nullptr;
+                    int innerNum = 0;
+                    for (AstNode* mp = innerp->membersp(); mp; mp = mp->nextp()) {
+                        const AstVar* const ivp = VN_CAST(mp, Var);
+                        if (!ivp || ivp->varType() != VVarType::GPARAM) continue;
+                        AstVar* const outerp = new AstVar{flp, VVarType::GPARAM,
+                                                          ivp->name() + "__" + std::to_string(i),
+                                                          VFlagChildDType{}, newIntDType(flp)};
+                        outerp->valuep(new AstConst{flp, AstConst::Signed32{}, 0});
+                        outerp->ansi(true);
+                        classp->addMembersp(outerp);
+                        innerPinsp = AstNode::addNextNull(
+                            innerPinsp, new AstPin{flp, ++innerNum, ivp->name(),
+                                                   new AstVarRef{flp, outerp, VAccess::READ}});
+                    }
+                    memberp = new AstRefDType{
+                        flp, "t",
+                        new AstClassOrPackageRef{flp, innerp->name(), innerp, innerPinsp},
+                        nullptr};
                 } else {
                     memberp = memberDType(bep, flp, true);
                 }
@@ -2217,8 +2280,7 @@ private:
             v3Global.setHasClasses();
             m_netlistp->dollarUnitPkgAddp()->addStmtsp(classp);
         }
-        return new AstRefDType{
-            flp, "t", new AstClassOrPackageRef{flp, classp->name(), classp, pinsp}, nullptr};
+        return classp;
     }
 
     // Whether a type leaves a bound open somewhere inside it: itself, its

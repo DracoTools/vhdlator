@@ -16324,10 +16324,32 @@ static bool recordOpenSettles(const VhdlType* typep, int depth = 0) {
             if (etypep->base()->unconstrained()) open = true;
             break;
         }
+        case VhdlTypeKind::RECORD: {
+            // A record element whose own open elements settle the same way:
+            // its structure is the class of its own, given its bounds by
+            // this one's
+            if (recordWouldPack(etypep)) break;
+            if (!recordOpenSettles(etypep, depth + 1)) return false;
+            open = true;
+            break;
+        }
         default: return false;
         }
     }
     return open;
+}
+
+// Mark a record a port leaves open, and every record element inside it, as
+// the class-shaped structure recordOpenSettles describes
+static void markPortShaped(VhdlType* typep, int depth = 0) {
+    if (!typep || depth > 16 || recordWouldPack(typep)) return;
+    typep->base()->portShaped(true);
+    for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+        VhdlType* const etypep = elemp->typep();
+        if (etypep && etypep->base()->kind() == VhdlTypeKind::RECORD) {
+            markPortShaped(etypep, depth + 1);
+        }
+    }
 }
 
 void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlScope* scopep) {
@@ -16355,7 +16377,7 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
                 || !recordOpenSettles(rtypep)) {
                 continue;
             }
-            if (!recordWouldPack(rtypep)) rtypep->base()->portShaped(true);
+            markPortShaped(rtypep);
             const auto isOpen = [](const AstNode* ap) {
                 if (VN_IS(ap, VhdlOpen)) return true;
                 const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
@@ -16430,9 +16452,7 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
             && !(typep->base()->kind() == VhdlTypeKind::RECORD && recordOpenSettles(typep))) {
             continue;
         }
-        if (typep->base()->kind() == VhdlTypeKind::RECORD && !recordWouldPack(typep)) {
-            typep->base()->portShaped(true);
-        }
+        if (typep->base()->kind() == VhdlTypeKind::RECORD) markPortShaped(typep);
         std::vector<std::string> path;
         if (AstVhdlIndexConstraint* const consp
             = openConstraintFor(typep, ifp, entp, compp, scopep, path)) {
