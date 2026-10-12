@@ -164,6 +164,12 @@ class VhdlLowerVisitor final {
         // into the variables above; an assignment that takes effect now
         // goes to the package directly (see driveResolved)
         AstVar* latep = nullptr;
+        // Where a process schedules this driver's transactions through its
+        // projected waveform, the elements of its value that are 'Z', which
+        // the queue of values cannot hold; the resolution reads the value
+        // through them. Made when first needed, from the read below.
+        AstVar* zp = nullptr;
+        AstVarRef* resolveValRefp = nullptr;  // The resolution's read of valp
     };
     std::map<const VhdlSymbol*, std::vector<VhdlDriver>> m_drivers;
     std::map<const VhdlSymbol*, int> m_driverCount;
@@ -21592,10 +21598,12 @@ private:
             = nodep->label().empty() ? "__Vprocess" + std::to_string(++m_processNum)
                                      : nodep->label();
         m_prefix = label + "__";
-        for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
+        // Before the declarations: a procedure the process declares drives
+        // through the process's own driver (14.7.2)
         VL_RESTORER(m_waveProcp);
         VL_RESTORER_COPY(m_waveSigs);
         collectWaveSigs(nodep, nodep->stmtsp());
+        for (AstNode* p = nodep->declsp(); p; p = p->nextp()) lowerDecl(p);
 
         bool rising = false;
         AstNodeVhdlExpr* clockp = nullptr;
@@ -22608,7 +22616,7 @@ private:
                              new AstNot{flp, new AstVarRef{flp, drv.weakp, VAccess::READ}}};
             forcingp = forcingp ? new AstOr{flp, forcingp, onep} : onep;
         }
-        for (const VhdlDriver& drv : drivers) {
+        for (VhdlDriver& drv : drivers) {
             // A forcing driver is always heard; a weak one only while nothing
             // forces. That is the strength ordering of the resolution table
             // (16.8.2): a forcing '0' beats a weak 'H', and two weak drivers
@@ -22617,10 +22625,11 @@ private:
                 flp, new AstVarRef{flp, drv.enp, VAccess::READ},
                 new AstOr{flp, new AstNot{flp, new AstVarRef{flp, drv.weakp, VAccess::READ}},
                           new AstNot{flp, forcingp->cloneTreePure(false)}}};
-            addStmt(new AstAlways{new AstAssignW{
-                flp, new AstVarRef{flp, netp, VAccess::WRITE},
-                new AstCond{flp, heardp, new AstVarRef{flp, drv.valp, VAccess::READ},
-                            new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
+            drv.resolveValRefp = new AstVarRef{flp, drv.valp, VAccess::READ};
+            addStmt(new AstAlways{
+                new AstAssignW{flp, new AstVarRef{flp, netp, VAccess::WRITE},
+                               new AstCond{flp, heardp, drv.resolveValRefp,
+                                           new AstConst{flp, AstConst::StringToParse{}, "\'z"}}}});
         }
         VL_DO_DANGLING(forcingp->deleteTree(), forcingp);
         if (initConstp) VL_DO_DANGLING(initConstp->deleteTree(), initConstp);
@@ -23953,6 +23962,55 @@ private:
         return symp;
     }
 
+    // Whether a value says by itself which of its elements are 'Z': it folds,
+    // or it writes no 'Z' and reads nothing that could hand one over -- a
+    // resolved signal or a port
+    static bool zStaticValue(AstNodeVhdlExpr* valuep) {
+        if (!valuep) return false;
+        std::string chars;
+        if (logicCharsOf(valuep, chars)) return true;
+        bool ok = true;
+        valuep->foreach([&](const AstVhdlLiteral* litp) {
+            if ((litp->kind() == VhdlLitKind::CHARACTER || litp->kind() == VhdlLitKind::STRING
+                 || litp->kind() == VhdlLitKind::BITSTRING)
+                && (litp->text().find('Z') != std::string::npos
+                    || litp->text().find('z') != std::string::npos)) {
+                ok = false;
+            }
+        });
+        valuep->foreach([&](const AstNodeVhdlExpr* np) {
+            const VhdlSymbol* const symp = np->vhdlSymp() ? np->vhdlSymp()->resolved() : nullptr;
+            if (!symp) return;
+            if (symp->kind() == VhdlSymKind::PORT
+                || (symp->kind() == VhdlSymKind::SIGNAL && isResolvedSignal(symp))) {
+                ok = false;
+            }
+        });
+        return ok;
+    }
+    void filterResolvedWaveSigs(const AstNode* procp, AstNode* stmtsp) {
+        std::set<const VhdlSymbol*> drop;
+        const auto onep = [&](const AstVhdlSigAssign* ap) {
+            const VhdlSymbol* const symp = rootSymOf(ap->targetp());
+            if (!symp || !m_waveSigs.count(symp) || !drivenThroughDriver(symp)) return;
+            if (ap->force() || ap->release() || ap->altsp()) {
+                drop.insert(symp);
+                return;
+            }
+            for (const AstVhdlWaveform* wp = ap->wavesp(); wp;
+                 wp = VN_CAST(wp->nextp(), VhdlWaveform)) {
+                if (!wp->valuep() || !zStaticValue(wp->valuep())) drop.insert(symp);
+            }
+        };
+        stmtsp->foreachAndNext(onep);
+        if (const AstVhdlProcess* const procNodep = VN_CAST(procp, VhdlProcess)) {
+            for (AstNode* dp = procNodep->declsp(); dp; dp = dp->nextp()) {
+                if (VN_IS(dp, VhdlSubprogDecl)) dp->foreach(onep);
+            }
+        }
+        for (const VhdlSymbol* const symp : drop) m_waveSigs.erase(symp);
+    }
+
     // The signal an assignment's target names a fixed part of: one element
     // or a slice of a one-dimensional array signal, at indices the text or
     // the elaboration fixes -- "s(3)", "s(7 downto 4)"
@@ -23969,17 +24027,447 @@ private:
             if (asp->formalp()) return nullptr;
             argp = asp->actualp();
         }
+        // At indices fixed or only running decides: which elements the
+        // transaction drives is worked out where it is scheduled
         if (const AstVhdlRange* const rp = VN_CAST(argp, VhdlRange)) {
             if (!rp->leftp() || !rp->rightp() || rp->dirUnknown()) return nullptr;
-            if (!V3VhdlEval::eval(rp->leftp()).isInt()) return nullptr;
-            if (!V3VhdlEval::eval(rp->rightp()).isInt()) return nullptr;
             return symp;
         }
-        const AstNodeVhdlExpr* const idxp = VN_CAST(argp, NodeVhdlExpr);
-        if (!idxp || !V3VhdlEval::eval(const_cast<AstNodeVhdlExpr*>(idxp)).isInt()) {
+        if (!VN_IS(argp, NodeVhdlExpr)) return nullptr;
+        return symp;
+    }
+
+    // One step down a record signal: an element, or an index of an array
+    struct WavePathStep final {
+        std::string name;  // The element's name, or empty for an index
+        int64_t index = 0;
+        bool operator==(const WavePathStep& o) const { return name == o.name && index == o.index; }
+    };
+    using WavePath = std::vector<WavePathStep>;
+    // Each scalar subelement of a type, as the path down to it, up to "limit"
+    // of them; false where one is not a scalar this can compare, or where
+    // there are more
+    static bool waveLeaves(const VhdlType* typep, WavePath& prefix, std::vector<WavePath>& out,
+                           size_t limit) {
+        if (!typep) return false;
+        const VhdlType* const basep = typep->base();
+        switch (basep->kind()) {
+        case VhdlTypeKind::ENUM:
+        case VhdlTypeKind::INTEGER:
+        case VhdlTypeKind::PHYSICAL:
+            if (out.size() >= limit) return false;
+            out.push_back(prefix);
+            return true;
+        case VhdlTypeKind::RECORD:
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                if (!elemp) return false;
+                prefix.push_back(WavePathStep{elemp->name(), 0});
+                const bool ok = waveLeaves(elemp->typep(), prefix, out, limit);
+                prefix.pop_back();
+                if (!ok) return false;
+            }
+            return true;
+        case VhdlTypeKind::ARRAY: {
+            if (isStringType(typep) || !typep->isConstrainedArray() || typep->dimensions() != 1) {
+                return false;
+            }
+            const VhdlType* const idxp = typep->indexTypes()[0];
+            if (!idxp || !idxp->bounded()) return false;
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : basep->elementp();
+            const int64_t step = idxp->ascending() ? 1 : -1;
+            for (int64_t i = idxp->left();; i += step) {
+                prefix.push_back(WavePathStep{"", i});
+                const bool ok = waveLeaves(elemp, prefix, out, limit);
+                prefix.pop_back();
+                if (!ok) return false;
+                if (i == idxp->right()) break;
+            }
+            return true;
+        }
+        default: return false;
+        }
+    }
+    // The record signal a target names a fixed part of -- "r.a", "r.v(3)",
+    // "r.n.code" -- and the path down to that part
+    static const VhdlSymbol* recordPartOf(const AstNodeVhdlExpr* targetp, WavePath& path) {
+        if (const AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
+            const AstVhdlName* const namep = VN_CAST(selp->suffixp(), VhdlName);
+            if (!namep) return nullptr;
+            const VhdlSymbol* const symp = recordPartOf(selp->prefixp(), path);
+            if (!symp) return nullptr;
+            path.push_back(WavePathStep{namep->name(), 0});
+            return symp;
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+            if (!callp->argsp() || callp->argsp()->nextp()) return nullptr;
+            const AstNode* argp = callp->argsp();
+            if (const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
+                if (asp->formalp()) return nullptr;
+                argp = asp->actualp();
+            }
+            if (VN_IS(argp, VhdlRange)) return nullptr;
+            AstNodeVhdlExpr* const idxp
+                = const_cast<AstNodeVhdlExpr*>(VN_CAST(argp, NodeVhdlExpr));
+            if (!idxp) return nullptr;
+            const VhdlValue val = V3VhdlEval::eval(idxp);
+            if (!val.isInt()) return nullptr;
+            const VhdlSymbol* const symp = recordPartOf(callp->prefixp(), path);
+            if (!symp) return nullptr;
+            path.push_back(WavePathStep{"", val.toInt()});
+            return symp;
+        }
+        const VhdlSymbol* const symp = wholeSignalOf(targetp);
+        if (!symp || !symp->typep() || symp->typep()->base()->kind() != VhdlTypeKind::RECORD) {
             return nullptr;
         }
         return symp;
+    }
+    // The leaf a path names, built on an expression of the whole record
+    static AstNodeExpr* leafOf(AstNodeExpr* basep, const WavePath& path, FileLine* flp) {
+        AstNodeExpr* outp = basep;
+        for (const WavePathStep& step : path) {
+            if (!step.name.empty()) {
+                outp = new AstMemberSel{flp, outp, VFlagChildDType{}, step.name};
+            } else {
+                outp = new AstSelBit{
+                    flp, outp,
+                    new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(step.index)}};
+            }
+        }
+        return outp;
+    }
+    std::map<const AstTask*, std::vector<WavePath>> m_waveRecordLeaves;
+
+    // The projected waveform of a record signal's driver (14.7.2): each of
+    // its scalar subelements has one, so a transaction preempts and rejects
+    // per subelement. As the vector form (waveTaskFor), with each loop over
+    // the elements written out for each subelement in turn.
+    AstTask* recordWaveTaskFor(AstNodeVhdlExpr* targetp, const VhdlSymbol* symp, FileLine* flp) {
+        WavePath prefix;
+        std::vector<WavePath> leaves;
+        if (!waveLeaves(symp->typep(), prefix, leaves, 64) || leaves.empty()) return nullptr;
+        if (!wholeSignalOf(targetp)) {
+            WavePath path;
+            if (!recordPartOf(targetp, path)) return nullptr;
+            if (!selectOfRecord(targetp)) return nullptr;
+        }
+        const auto key = std::make_pair(m_waveProcp, symp);
+        const auto it = m_waveTasks.find(key);
+        if (it != m_waveTasks.end()) return it->second;
+        AstNodeVhdlExpr* const namep = rootNameOf(targetp);
+        AstNodeExpr* const lhsp = namep ? lowerDriveTarget(namep) : nullptr;
+        AstVarRef* const lhsRefp = VN_CAST(lhsp, VarRef);
+        if (!lhsRefp) {
+            if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            return nullptr;
+        }
+        AstVar* const sigVarp = lhsRefp->varp();
+        VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+        {
+            FileLine* const vflp = new FileLine{sigVarp->fileline()};
+            vflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            sigVarp->fileline(vflp);
+        }
+        const int nLeaves = static_cast<int>(leaves.size());
+        FileLine* const tflp = new FileLine{flp};
+        tflp->warnOff(V3ErrorCode::ZERODLY, true);
+        tflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        tflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        tflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        const std::string base = "__Vwave" + std::to_string(++m_nameNum) + "__" + symp->name();
+        VhdlType* const typep = symp->typep();
+        const auto time64
+            = [&]() { return new AstBasicDType{tflp, VBasicDTypeKwd::LONGINT, VSigning::SIGNED}; };
+        const auto maskDType = [&]() { return newLogicDType(tflp, nLeaves); };
+        const auto modVar = [&](const std::string& name, AstNodeDType* dtypep) {
+            AstVar* const varp
+                = new AstVar{tflp, VVarType::VAR, base + name, VFlagChildDType{}, dtypep};
+            varp->trace(false);
+            addStmt(varp);
+            return varp;
+        };
+        const auto queueOf = [&](AstNodeDType* dtypep) {
+            return new AstQueueDType{tflp, VFlagChildDType{}, dtypep, nullptr};
+        };
+        AstVar* const qtp = modVar("__t", queueOf(time64()));
+        AstVar* const qsp = modVar("__s", queueOf(time64()));
+        AstVar* const qvp = modVar("__v", queueOf(lowerType(typep, tflp)));
+        AstVar* const qmp = modVar("__m", queueOf(maskDType()));
+        AstVar* const seqp = modVar("__n", time64());
+        seqp->valuep(new AstConst{tflp, AstConst::WidthedValue{}, 64, 0});
+        AstTask* const taskp = new AstTask{tflp, base, nullptr};
+        taskp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        const auto port = [&](const std::string& pname, AstNodeDType* dtypep) {
+            AstVar* const argp
+                = new AstVar{tflp, VVarType::PORT, pname, VFlagChildDType{}, dtypep};
+            argp->direction(VDirection::INPUT);
+            argp->declDirection(VDirection::INPUT);
+            argp->funcLocal(true);
+            argp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            argp->trace(false);
+            taskp->addStmtsp(argp);
+            return argp;
+        };
+        AstVar* const vp = port("v", lowerType(typep, tflp));
+        AstVar* const dp = port("d", time64());
+        AstVar* const rp = port("r", time64());
+        AstVar* const wp = port("w", maskDType());  // Which subelements it drives
+        const auto local = [&](const std::string& lname, AstNodeDType* dtypep) {
+            AstVar* const varp = newFuncLocal(lname, dtypep, tflp);
+            taskp->addStmtsp(varp);
+            return varp;
+        };
+        AstVar* const tp = local("t", time64());
+        AstVar* const sp = local("s", time64());
+        AstVar* const kp = local("k", newIntDType(tflp));
+        AstVar* const runp = local("run", newLogicDType(tflp, 1));
+        AstVar* const mp = local("m", maskDType());
+        AstVar* const nvp = local("nv", lowerType(typep, tflp));
+        const auto num = [&](int32_t v) { return new AstConst{tflp, AstConst::Signed32{}, v}; };
+        const auto bit
+            = [&](bool v) { return new AstConst{tflp, AstConst::WidthedValue{}, 1, v ? 1U : 0U}; };
+        const auto call = [&](AstVar* qp, const std::string& method, AstNodeExpr* argp) {
+            return new AstMethodCall{tflp, rd(qp, tflp), method,
+                                     argp ? new AstArg{tflp, "", argp} : nullptr};
+        };
+        const auto stmt = [&](AstVar* qp, const std::string& method, AstNodeExpr* argp) {
+            return new AstStmtExpr{tflp, call(qp, method, argp)};
+        };
+        const auto onAll = [&](const std::string& method) {
+            AstNode* outp = nullptr;
+            for (AstVar* const qp : {qtp, qsp, qvp, qmp}) {
+                outp
+                    = AstNode::addNextNull(outp, static_cast<AstNode*>(stmt(qp, method, nullptr)));
+            }
+            return outp;
+        };
+        const auto at = [&](AstVar* qp, AstNodeExpr* idxp) {
+            return new AstSelBit{tflp, rd(qp, tflp), idxp};
+        };
+        const auto size = [&]() { return call(qtp, "size", nullptr); };
+        const auto whileLoop = [&](AstNodeExpr* condp, AstNode* bodyp) {
+            AstLoop* const loopp = new AstLoop{tflp};
+            loopp->addStmtsp(new AstLoopTest{tflp, loopp, condp});
+            loopp->addStmtsp(bodyp);
+            return loopp;
+        };
+        const auto incr = [&](AstVar* varp, int32_t by) {
+            return new AstAssign{tflp, wr(varp, tflp), new AstAdd{tflp, rd(varp, tflp), num(by)}};
+        };
+        const auto bitOf
+            = [&](AstNodeExpr* maskp, int j) { return new AstSel{tflp, maskp, j, 1}; };
+        V3Number allNum{tflp, nLeaves, 0};
+        allNum.setAllBits1();
+        const auto allOnes = [&]() { return new AstConst{tflp, allNum}; };
+        const auto zeros = [&]() { return new AstConst{tflp, V3Number{tflp, nLeaves, 0}}; };
+        // When the new transaction is due
+        taskp->addStmtsp(new AstAssign{
+            tflp, wr(tp, tflp),
+            new AstAdd{tflp, new AstTime{tflp, VTimescale{VTimescale::TS_1FS}}, rd(dp, tflp)}});
+        // What is due at or after it is deleted, for the subelements it drives
+        {
+            AstNode* clearp = nullptr;
+            for (int j = 0; j < nLeaves; ++j) {
+                clearp = AstNode::addNextNull(
+                    clearp,
+                    static_cast<AstNode*>(new AstIf{
+                        tflp, bitOf(rd(wp, tflp), j),
+                        new AstAssign{
+                            tflp,
+                            new AstSel{tflp,
+                                       new AstSelBit{tflp, wr(qmp, tflp),
+                                                     new AstSub{tflp, rd(kp, tflp), num(1)}},
+                                       j, 1},
+                            bit(false)},
+                        nullptr}));
+            }
+            clearp->addNext(incr(kp, -1));
+            AstNode* const partsp = new AstAssign{tflp, wr(kp, tflp), size()};
+            partsp->addNext(whileLoop(
+                new AstLogAnd{tflp, new AstGtS{tflp, rd(kp, tflp), num(0)},
+                              new AstGteS{tflp, at(qtp, new AstSub{tflp, rd(kp, tflp), num(1)}),
+                                          rd(tp, tflp)}},
+                clearp));
+            AstNode* const wholep = whileLoop(
+                new AstLogAnd{
+                    tflp, new AstGtS{tflp, size(), num(0)},
+                    new AstGteS{tflp, at(qtp, new AstSub{tflp, size(), num(1)}), rd(tp, tflp)}},
+                onAll("pop_back"));
+            taskp->addStmtsp(
+                new AstIf{tflp, new AstEq{tflp, rd(wp, tflp), allOnes()}, wholep, partsp});
+            taskp->addStmtsp(whileLoop(
+                new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
+                              new AstEq{tflp, at(qmp, new AstSub{tflp, size(), num(1)}), zeros()}},
+                onAll("pop_back")));
+        }
+        // Subelement by subelement, of what is due within the rejection limit
+        // before it, the run just before it of the value it carries stays
+        for (int j = 0; j < nLeaves; ++j) {
+            const WavePath& path = leaves[j];
+            AstNodeExpr* const samep = new AstLogAnd{
+                tflp, rd(runp, tflp),
+                new AstEq{tflp,
+                          leafOf(at(qvp, new AstSub{tflp, rd(kp, tflp), num(1)}), path, tflp),
+                          leafOf(rd(vp, tflp), path, tflp)}};
+            AstNode* const killp
+                = new AstAssign{tflp,
+                                new AstSel{tflp,
+                                           new AstSelBit{tflp, wr(qmp, tflp),
+                                                         new AstSub{tflp, rd(kp, tflp), num(1)}},
+                                           j, 1},
+                                bit(false)};
+            killp->addNext(new AstAssign{tflp, wr(runp, tflp), bit(false)});
+            AstNode* const innerp
+                = new AstIf{tflp, bitOf(at(qmp, new AstSub{tflp, rd(kp, tflp), num(1)}), j),
+                            new AstIf{tflp, new AstLogNot{tflp, samep}, killp, nullptr}, nullptr};
+            innerp->addNext(incr(kp, -1));
+            AstNode* const perp = new AstAssign{tflp, wr(runp, tflp), bit(true)};
+            perp->addNext(new AstAssign{tflp, wr(kp, tflp), size()});
+            perp->addNext(whileLoop(
+                new AstLogAnd{tflp, new AstGtS{tflp, rd(kp, tflp), num(0)},
+                              new AstGteS{tflp, at(qtp, new AstSub{tflp, rd(kp, tflp), num(1)}),
+                                          new AstSub{tflp, rd(tp, tflp), rd(rp, tflp)}}},
+                innerp));
+            taskp->addStmtsp(new AstIf{tflp, bitOf(rd(wp, tflp), j), perp, nullptr});
+        }
+        // The subelements a transaction carries, put on the signal at the end
+        // of this delta: the whole value where it drives them all
+        const auto putOn = [&](AstVar* valVarp, AstNodeExpr* drivesp, AstVar* maskVarp) {
+            AstNode* partp = nullptr;
+            for (int j = 0; j < nLeaves; ++j) {
+                partp = AstNode::addNextNull(
+                    partp, static_cast<AstNode*>(new AstIf{
+                               tflp, bitOf(rd(maskVarp, tflp), j),
+                               new AstAssignDly{tflp, leafOf(wr(sigVarp, tflp), leaves[j], tflp),
+                                                leafOf(rd(valVarp, tflp), leaves[j], tflp)},
+                               nullptr}));
+            }
+            return new AstIf{tflp, drivesp,
+                             new AstAssignDly{tflp, wr(sigVarp, tflp), rd(valVarp, tflp)}, partp};
+        };
+        AstNode* const nowp = putOn(vp, new AstEq{tflp, rd(wp, tflp), allOnes()}, wp);
+        AstNode* laterp = new AstAssign{
+            tflp, wr(seqp, tflp),
+            new AstAdd{tflp, rd(seqp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 1}}};
+        laterp->addNext(new AstAssign{tflp, wr(sp, tflp), rd(seqp, tflp)});
+        laterp->addNext(new AstAssign{tflp, wr(kp, tflp), size()});
+        laterp->addNext(whileLoop(
+            new AstLogAnd{
+                tflp, new AstGtS{tflp, rd(kp, tflp), num(0)},
+                new AstGtS{tflp, at(qtp, new AstSub{tflp, rd(kp, tflp), num(1)}), rd(tp, tflp)}},
+            incr(kp, -1)));
+        const auto insert = [&](AstVar* qp, AstNodeExpr* valp) {
+            AstArg* const argsp = new AstArg{tflp, "", rd(kp, tflp)};
+            argsp->addNext(new AstArg{tflp, "", valp});
+            return new AstStmtExpr{tflp, new AstMethodCall{tflp, rd(qp, tflp), "insert", argsp}};
+        };
+        laterp->addNext(insert(qtp, rd(tp, tflp)));
+        laterp->addNext(insert(qsp, rd(sp, tflp)));
+        laterp->addNext(insert(qvp, rd(vp, tflp)));
+        laterp->addNext(insert(qmp, rd(wp, tflp)));
+        // Everything due by now is delivered, oldest first
+        AstNode* const onep = new AstAssign{tflp, wr(mp, tflp), at(qmp, num(0))};
+        onep->addNext(new AstAssign{tflp, wr(nvp, tflp), at(qvp, num(0))});
+        onep->addNext(onAll("pop_front"));
+        onep->addNext(putOn(nvp, new AstEq{tflp, rd(mp, tflp), allOnes()}, mp));
+        AstNode* const deliverp = whileLoop(
+            new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
+                          new AstLteS{tflp, at(qtp, num(0)),
+                                      new AstTime{tflp, VTimescale{VTimescale::TS_1FS}}}},
+            onep);
+        AstNode* const forkBodyp = new AstDelay{tflp, rd(dp, tflp), false};
+        forkBodyp->addNext(deliverp);
+        AstFork* const forkp = new AstFork{tflp, VJoinType::JOIN_NONE, ""};
+        forkp->addForksp(new AstBegin{tflp, "", forkBodyp, false});
+        {
+            AstNodeExpr* const delayp = rd(dp, tflp);
+            laterp->addNext(
+                new AstIf{tflp, new AstLogNot{tflp, pastTimeHigh(delayp, tflp)}, forkp, nullptr});
+            VL_DO_DANGLING(delayp->deleteTree(), delayp);
+        }
+        taskp->addStmtsp(new AstIf{
+            tflp,
+            new AstEq{tflp, rd(dp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 0}},
+            nowp, laterp});
+        addStmt(taskp);
+        m_waveTasks.emplace(key, taskp);
+        m_waveMaskWidths.emplace(taskp, nLeaves);
+        m_waveRecordLeaves.emplace(taskp, leaves);
+        return taskp;
+    }
+    // The name a record part target starts from
+    static AstNodeVhdlExpr* rootNameOf(AstNodeVhdlExpr* targetp) {
+        while (true) {
+            if (AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
+                targetp = selp->prefixp();
+            } else if (AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall)) {
+                targetp = callp->prefixp();
+            } else {
+                return targetp;
+            }
+        }
+    }
+    // Whether a record part target lowers to selects of its signal alone
+    bool selectOfRecord(AstNodeVhdlExpr* targetp) {
+        AstNodeExpr* const partp = lowerDriveTarget(targetp);
+        if (!partp) return false;
+        const bool ok = rootRefOf(partp) && rootRefOf(partp) != partp;
+        VL_DO_DANGLING(partp->deleteTree(), partp);
+        return ok;
+    }
+    // The variable at the root of a chain of selects, member selects too
+    static AstVarRef* rootRefOf(AstNodeExpr* np) {
+        while (true) {
+            if (AstSel* const selp = VN_CAST(np, Sel)) {
+                np = selp->fromp();
+            } else if (AstNodePreSel* const pselp = VN_CAST(np, NodePreSel)) {
+                np = pselp->fromp();
+            } else if (AstMemberSel* const mselp = VN_CAST(np, MemberSel)) {
+                np = mselp->fromp();
+            } else if (AstStructSel* const sselp = VN_CAST(np, StructSel)) {
+                np = sselp->fromp();
+            } else {
+                return VN_CAST(np, VarRef);
+            }
+        }
+    }
+
+    // A part of a signal formal the copy is bound to, with one index or range
+    static bool partSignalOfBound(const AstVhdlCall* callp) {
+        if (!callp->argsp() || callp->argsp()->nextp()) return false;
+        const AstNode* argp = callp->argsp();
+        if (const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
+            if (asp->formalp()) return false;
+            argp = asp->actualp();
+        }
+        if (const AstVhdlRange* const rp = VN_CAST(argp, VhdlRange)) {
+            return rp->leftp() && rp->rightp() && !rp->dirUnknown();
+        }
+        return VN_IS(argp, NodeVhdlExpr);
+    }
+
+    // Whether a part target lowers to selects of its signal alone: one
+    // reference to a variable, at the root of a chain of selects
+    bool selectOfSignal(AstNodeVhdlExpr* targetp) {
+        AstNodeExpr* const partp = lowerDriveTarget(targetp);
+        if (!partp) return false;
+        int refs = 0;
+        partp->foreach([&](const AstVarRef*) { ++refs; });
+        const AstNode* rootp = partp;
+        while (true) {
+            if (const AstSel* const selp = VN_CAST(rootp, Sel)) {
+                rootp = selp->fromp();
+            } else if (const AstNodePreSel* const pselp = VN_CAST(rootp, NodePreSel)) {
+                rootp = pselp->fromp();
+            } else {
+                break;
+            }
+        }
+        // The indices may read variables: only the root counts as the signal
+        const bool ok = rootp != partp && VN_IS(rootp, VarRef) && refs >= 1;
+        VL_DO_DANGLING(partp->deleteTree(), partp);
+        return ok;
     }
 
     // The signals of a process some assignment in it schedules ahead of time
@@ -24004,6 +24492,11 @@ private:
             } else if (const VhdlSymbol* const psymp = partSignalOf(ap->targetp())) {
                 // A part is driven by the same driver, element by element
                 m_waveSigs.insert(psymp);
+            } else {
+                std::vector<WavePathStep> path;
+                if (const VhdlSymbol* const rsymp = recordPartOf(ap->targetp(), path)) {
+                    m_waveSigs.insert(rsymp);
+                }
             }
         };
         if (stmtsp == procp) {
@@ -24011,6 +24504,58 @@ private:
         } else {
             stmtsp->foreachAndNext(onep);
         }
+        // A procedure the process declares drives the process's signals
+        // through the process's own driver
+        if (const AstVhdlProcess* const procNodep = VN_CAST(procp, VhdlProcess)) {
+            for (AstNode* dp = procNodep->declsp(); dp; dp = dp->nextp()) {
+                if (VN_IS(dp, VhdlSubprogDecl)) dp->foreach(onep);
+            }
+        }
+        // A resolved signal's driver is scheduled here only where what this
+        // process gives it says by itself which elements are 'Z': the queue
+        // keeps that beside the value (driverZPlane)
+        if (stmtsp != procp) filterResolvedWaveSigs(procp, stmtsp);
+        // A procedure called with a signal for a signal formal it schedules
+        // ahead on drives that signal through the caller's driver (4.2.2.3)
+        if (stmtsp == procp) return;
+        stmtsp->foreachAndNext([&](const AstVhdlProcCall* pcallp) {
+            const AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+            VhdlSymbol* const namedp = callp ? callp->vhdlSymp() : nullptr;
+            VhdlSymbol* const csymp = namedp ? namedp->resolved() : nullptr;
+            AstVhdlSubprogDecl* const declp = csymp ? declOf(csymp) : nullptr;
+            if (!declp || !declp->hasBody()) return;
+            std::vector<const AstVhdlIfaceDecl*> formals;
+            for (AstNode* fp = firstParamOf(declp); fp; fp = fp->nextp()) {
+                formals.push_back(VN_AS(fp, VhdlIfaceDecl));
+            }
+            for (size_t i = 0; i < formals.size(); ++i) {
+                const AstVhdlIfaceDecl* const ifp = formals[i];
+                if (ifp->kind() != VhdlIfaceKind::SIGNAL || !ifp->vhdlSymp()) continue;
+                bool ahead = false;
+                declp->foreach([&](const AstVhdlSigAssign* ap) {
+                    const VhdlSymbol* const tsymp = rootSymOf(ap->targetp());
+                    if (tsymp && (tsymp == ifp->vhdlSymp() || tsymp->resolved() == ifp->vhdlSymp())
+                        && schedulesAhead(ap)) {
+                        ahead = true;
+                    }
+                });
+                if (!ahead) continue;
+                // The actual: named, or by position
+                size_t k = 0;
+                for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++k) {
+                    const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                    if (!asp || !asp->actualp()) continue;
+                    const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+                    const bool mine = fnamep ? VString::downcase(fnamep->name())
+                                                   == VString::downcase(ifp->name())
+                                             : (!asp->formalp() && k == i);
+                    if (!mine) continue;
+                    if (const VhdlSymbol* const sigp = wholeSignalOf(asp->actualp())) {
+                        m_waveSigs.insert(sigp);
+                    }
+                }
+            }
+        });
     }
 
     // How a driver of this type keeps its projected waveform: as how many
@@ -24045,34 +24590,85 @@ private:
     // signal a target names, built the first time it is asked for. Null
     // where the driver is not one that keeps its projected waveform here.
     AstTask* waveTaskFor(AstNodeVhdlExpr* targetp, FileLine* flp) {
-        if (m_ftaskp || m_protClassp || !m_waveProcp || !v3Global.opt.timing().isTrue()) {
-            return nullptr;
-        }
-        const VhdlSymbol* symp = wholeSignalOf(targetp);
+        if (m_protClassp || !m_waveProcp || !v3Global.opt.timing().isTrue()) return nullptr;
+        // Inside a procedure the process calls or declares, the driver is
+        // still the process's, and a signal formal is the actual it is bound
+        // to (4.2.2.3); the task and its queues belong to the module
         AstNodeVhdlExpr* sigNamep = targetp;
+        AstVhdlCall* const partCallp = VN_CAST(targetp, VhdlCall);
+        AstNodeVhdlExpr* const rootNamep = partCallp ? partCallp->prefixp() : targetp;
+        const VhdlSymbol* symp = nullptr;
+        if (m_ftaskp && VN_IS(rootNamep, VhdlName) && rootNamep->vhdlSymp()) {
+            const auto bindIt = m_bindSymbols.find(rootNamep->vhdlSymp());
+            const VhdlSymbol* const boundp
+                = bindIt != m_bindSymbols.end() ? bindIt->second : nullptr;
+            if (boundp
+                && (boundp->kind() == VhdlSymKind::SIGNAL
+                    || boundp->kind() == VhdlSymKind::PORT)) {
+                // A resolved signal through a formal is not filtered for
+                // 'Z' (filterResolvedWaveSigs), so it keeps its own path
+                if (drivenThroughDriver(boundp)) return nullptr;
+                symp = boundp;
+                if (partCallp) {
+                    if (!partSignalOfBound(partCallp)) return nullptr;
+                    sigNamep = rootNamep;
+                }
+            }
+        }
+        if (!symp) symp = wholeSignalOf(targetp);
         if (!symp) {
             symp = partSignalOf(targetp);
             if (symp) sigNamep = VN_AS(targetp, VhdlCall)->prefixp();
         }
+        if (!symp) {
+            std::vector<WavePathStep> path;
+            symp = recordPartOf(targetp, path);
+        }
+        VL_RESTORER(m_ftaskp);
+        m_ftaskp = nullptr;
         if (!symp || !m_waveSigs.count(symp)) return nullptr;
-        if (drivenThroughDriver(symp)) return nullptr;
+        // A resolved signal: the transactions are this process's driver's,
+        // whose value the resolution reads through the elements that are 'Z'
+        VhdlDriver* resolvedDrvp = nullptr;
+        if (drivenThroughDriver(symp)) {
+            resolvedDrvp = const_cast<VhdlDriver*>(driverFor(targetp));
+            if (!resolvedDrvp || !resolvedDrvp->enp || resolvedDrvp->xp || resolvedDrvp->connp
+                || (!resolvedDrvp->resolveValRefp && !resolvedDrvp->zp)) {
+                return nullptr;
+            }
+        }
+        // A record: each scalar subelement has a projected waveform of its own
+        if (symp->typep() && symp->typep()->base()->kind() == VhdlTypeKind::RECORD) {
+            if (resolvedDrvp) return nullptr;
+            return recordWaveTaskFor(targetp, symp, flp);
+        }
         const std::pair<int, int> shape = waveShape(symp->typep());
         const int nElems = shape.first;
         const int elemWidth = shape.second;
         if (nElems < 1) return nullptr;
         // A part of a scalar is no part of it
         if (sigNamep != targetp && !elemWidth) return nullptr;
+        // A part is put in place through the select its target lowers to,
+        // which has to be a select of the signal and of nothing else
+        if (sigNamep != targetp && !selectOfSignal(targetp)) return nullptr;
         const auto key = std::make_pair(m_waveProcp, symp);
         const auto it = m_waveTasks.find(key);
         if (it != m_waveTasks.end()) return it->second;
-        AstNodeExpr* const lhsp = lowerDriveTarget(sigNamep);
-        AstVarRef* const lhsRefp = VN_CAST(lhsp, VarRef);
-        if (!lhsRefp) {
-            if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
-            return nullptr;
+        AstVar* sigVarp = nullptr;
+        AstVar* zVarp = nullptr;  // The driver's 'Z' plane, for a resolved signal
+        if (resolvedDrvp) {
+            sigVarp = resolvedDrvp->valp;
+            zVarp = driverZPlane(*resolvedDrvp, symp, flp);
+        } else {
+            AstNodeExpr* const lhsp = lowerDriveTarget(sigNamep);
+            AstVarRef* const lhsRefp = VN_CAST(lhsp, VarRef);
+            if (!lhsRefp) {
+                if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+                return nullptr;
+            }
+            sigVarp = lhsRefp->varp();
+            VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
         }
-        AstVar* const sigVarp = lhsRefp->varp();
-        VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
         // A concurrent statement is emitted to start and again to react, and
         // both schedule through the one task; they are the same driver
         {
@@ -24107,6 +24703,7 @@ private:
         AstVar* const qsp = modVar("__s", queueOf(time64()));
         AstVar* const qvp = modVar("__v", queueOf(lowerType(typep, tflp)));
         AstVar* const qmp = modVar("__m", queueOf(maskDType()));
+        AstVar* const qzp = zVarp ? modVar("__z", queueOf(lowerType(typep, tflp))) : nullptr;
         AstVar* const seqp = modVar("__n", time64());
         seqp->valuep(new AstConst{tflp, AstConst::WidthedValue{}, 64, 0});
         AstTask* const taskp = new AstTask{tflp, base, nullptr};
@@ -24128,6 +24725,8 @@ private:
         // Which elements this transaction drives: all of them for the whole
         // signal, those of the part a target names otherwise (14.7.2)
         AstVar* const wp = port("w", elemWidth ? lowerType(typep, tflp) : newLogicDType(tflp, 1));
+        // Which elements of the value are 'Z', for a resolved signal's driver
+        AstVar* const zp = zVarp ? port("z", lowerType(typep, tflp)) : nullptr;
         const auto local = [&](const std::string& lname, AstNodeDType* dtypep) {
             AstVar* const varp = newFuncLocal(lname, dtypep, tflp);
             taskp->addStmtsp(varp);
@@ -24140,6 +24739,7 @@ private:
         AstVar* const runp = local("run", newLogicDType(tflp, 1));
         AstVar* const mp = local("m", maskDType());
         AstVar* const nvp = local("nv", lowerType(typep, tflp));
+        AstVar* const nzp = zVarp ? local("nz", lowerType(typep, tflp)) : nullptr;
         const auto num = [&](int32_t v) { return new AstConst{tflp, AstConst::Signed32{}, v}; };
         const auto bit
             = [&](bool v) { return new AstConst{tflp, AstConst::WidthedValue{}, 1, v ? 1U : 0U}; };
@@ -24152,7 +24752,8 @@ private:
         };
         const auto onAll = [&](const std::string& method) {
             AstNode* outp = nullptr;
-            for (AstVar* const qp : {qtp, qsp, qvp, qmp}) {
+            for (AstVar* const qp : {qtp, qsp, qvp, qmp, qzp}) {
+                if (!qp) continue;
                 outp
                     = AstNode::addNextNull(outp, static_cast<AstNode*>(stmt(qp, method, nullptr)));
             }
@@ -24267,17 +24868,17 @@ private:
         // The elements a transaction carries, put on the signal at the end of
         // this delta: the whole value where it drives all of them, else each
         // one it drives, so that two parts given in one delta both arrive
-        const auto putOn = [&](AstNodeExpr* valp, AstNodeExpr* drivesp,
-                               std::function<AstNodeExpr*()> drvOf) -> AstNode* {
+        const auto putOnTo = [&](AstVar* targetVarp, AstNodeExpr* valp, AstNodeExpr* drivesp,
+                                 std::function<AstNodeExpr*()> drvOf) -> AstNode* {
             if (!elemWidth) {
                 VL_DO_DANGLING(drivesp->deleteTree(), drivesp);
-                return new AstAssignDly{tflp, wr(sigVarp, tflp), valp};
+                return new AstAssignDly{tflp, wr(targetVarp, tflp), valp};
             }
             AstNode* const stepp = new AstIf{
                 tflp, drvOf(),
                 new AstAssignDly{
                     tflp,
-                    new AstSel{tflp, wr(sigVarp, tflp),
+                    new AstSel{tflp, wr(targetVarp, tflp),
                                new AstMul{tflp, rd(ep, tflp), num(elemWidth)}, elemWidth},
                     new AstSel{tflp, valp->cloneTree(false),
                                new AstMul{tflp, rd(ep, tflp), num(elemWidth)}, elemWidth}},
@@ -24285,12 +24886,22 @@ private:
             stepp->addNext(incr(ep, 1));
             AstNode* const partp = new AstAssign{tflp, wr(ep, tflp), num(0)};
             partp->addNext(whileLoop(new AstLtS{tflp, rd(ep, tflp), num(nElems)}, stepp));
-            return new AstIf{tflp, drivesp, new AstAssignDly{tflp, wr(sigVarp, tflp), valp},
+            return new AstIf{tflp, drivesp, new AstAssignDly{tflp, wr(targetVarp, tflp), valp},
                              partp};
+        };
+        // The value, and for a resolved signal's driver which of it is 'Z'
+        const auto putOn
+            = [&](AstNodeExpr* valp, AstNodeExpr* drivesp, std::function<AstNodeExpr*()> drvOf,
+                  AstNodeExpr* zvalp) -> AstNode* {
+            AstNode* const outp
+                = putOnTo(sigVarp, valp, zvalp ? drivesp->cloneTree(false) : drivesp, drvOf);
+            if (zvalp) outp->addNext(putOnTo(zVarp, zvalp, drivesp, drvOf));
+            return outp;
         };
         // A transaction for now is the next delta's, and has preempted
         // everything that was pending for the elements it drives
-        AstNode* const nowp = putOn(rd(vp, tflp), new AstEq{tflp, rd(wp, tflp), allOnes()}, drv);
+        AstNode* const nowp = putOn(rd(vp, tflp), new AstEq{tflp, rd(wp, tflp), allOnes()}, drv,
+                                    zp ? rd(zp, tflp) : nullptr);
         // A later one waits its turn, in the order of when it is due, and is
         // delivered -- the elements it still drives -- when it comes
         AstNode* laterp = new AstAssign{
@@ -24326,6 +24937,7 @@ private:
             laterp->addNext(insert(qsp, rd(sp, tflp)));
             laterp->addNext(insert(qvp, rd(vp, tflp)));
             laterp->addNext(insert(qmp, rd(mp, tflp)));
+            if (qzp) laterp->addNext(insert(qzp, rd(zp, tflp)));
         }
         // Everything due by now is delivered, oldest first, whichever of the
         // processes waiting for those times wakes first
@@ -24333,6 +24945,7 @@ private:
         {
             AstNode* const onep = new AstAssign{tflp, wr(mp, tflp), at(qmp, num(0))};
             onep->addNext(new AstAssign{tflp, wr(nvp, tflp), at(qvp, num(0))});
+            if (qzp) onep->addNext(new AstAssign{tflp, wr(nzp, tflp), at(qzp, num(0))});
             onep->addNext(onAll("pop_front"));
             V3Number allElems{tflp, nElems, 0};
             allElems.setAllBits1();
@@ -24340,13 +24953,13 @@ private:
                 return new AstSel{tflp, rd(mp, tflp), rd(ep, tflp), 1};
             };
             if (!elemWidth) {
-                onep->addNext(new AstIf{tflp, rd(mp, tflp),
-                                        new AstAssignDly{tflp, wr(sigVarp, tflp), rd(nvp, tflp)},
-                                        nullptr});
+                AstNode* const putp = new AstAssignDly{tflp, wr(sigVarp, tflp), rd(nvp, tflp)};
+                if (nzp) putp->addNext(new AstAssignDly{tflp, wr(zVarp, tflp), rd(nzp, tflp)});
+                onep->addNext(new AstIf{tflp, rd(mp, tflp), putp, nullptr});
             } else {
                 onep->addNext(putOn(rd(nvp, tflp),
                                     new AstEq{tflp, rd(mp, tflp), new AstConst{tflp, allElems}},
-                                    elemDrv));
+                                    elemDrv, nzp ? rd(nzp, tflp) : nullptr));
             }
             deliverp = whileLoop(
                 new AstLogAnd{tflp, new AstGtS{tflp, size(), num(0)},
@@ -24374,10 +24987,56 @@ private:
             nowp, laterp});
         addStmt(taskp);
         m_waveTasks.emplace(key, taskp);
+        if (zVarp) m_waveZTasks.insert(taskp);
         m_waveMaskWidths.emplace(taskp, elemWidth ? nElems * elemWidth : 1);
         return taskp;
     }
     std::map<const AstTask*, int> m_waveMaskWidths;  // Bits of each task's "w"
+    std::set<const AstTask*> m_waveZTasks;  // Tasks that also take a "z"
+
+    // Whether the driver drives weakly, given as the assignment is made, as
+    // every assignment to a resolved signal's driver gives it
+    AstNode* resolvedWeakStmt(AstVhdlSigAssign* nodep, FileLine* flp) {
+        const VhdlDriver* const drvp = driverFor(nodep->targetp());
+        if (!drvp || !drvp->weakp) return nullptr;
+        return new AstAssignDly{flp, new AstVarRef{flp, drvp->weakp, VAccess::WRITE},
+                                driveFlagOf(nodep, true, flp)};
+    }
+
+    // The plane of a resolved signal's driver saying which elements of its
+    // value are 'Z', made when a process first schedules through it: the
+    // resolution then reads the value through it, so a 'Z' that the queue of
+    // values could not hold still releases the element (10.5.2.2)
+    AstVar* driverZPlane(VhdlDriver& drv, const VhdlSymbol* symp, FileLine* flp) {
+        if (drv.zp) return drv.zp;
+        FileLine* const zflp = new FileLine{drv.valp->fileline()};
+        zflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        zflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        drv.zp = new AstVar{zflp, VVarType::VAR, drv.valp->name() + "__z", VFlagChildDType{},
+                            lowerType(symp->typep(), flp)};
+        // The driver is on from the start and says per element what it
+        // drives: a driver that was off holds 'Z' everywhere, which is the
+        // same, until its first transaction arrives -- the enable the other
+        // drivers keep is set as an assignment is made, not as it arrives
+        const AstConst* const enInitp = VN_CAST(drv.enp->valuep(), Const);
+        const bool wasOn = enInitp && !enInitp->num().isEqZero();
+        drv.zp->valuep(new AstConst{zflp, AstConst::StringToParse{}, wasOn ? "'0" : "'1"});
+        if (AstNode* const oldInitp = drv.enp->valuep()) {
+            oldInitp->unlinkFrBack();
+            VL_DO_DANGLING(oldInitp->deleteTree(), oldInitp);
+        }
+        drv.enp->valuep(new AstConst{zflp, AstConst::WidthedValue{}, 1, 1U});
+        if (m_modp) m_modp->addStmtsp(drv.zp);
+        AstVarRef* const oldp = drv.resolveValRefp;
+        FileLine* const rflp = oldp->fileline();
+        AstNodeExpr* const bufp
+            = new AstBufIf1{rflp, new AstNot{rflp, new AstVarRef{rflp, drv.zp, VAccess::READ}},
+                            new AstVarRef{rflp, drv.valp, VAccess::READ}};
+        oldp->replaceWith(bufp);
+        VL_DO_DANGLING(oldp->deleteTree(), oldp);
+        drv.resolveValRefp = nullptr;
+        return drv.zp;
+    }
 
     // One element of a waveform handed to its driver's task: the value, the
     // delay, and how far before it the transactions it preempts reach. That
@@ -24393,15 +25052,69 @@ private:
         // same place of a mask is set; the elements outside it are not read
         AstNode* prep = nullptr;
         AstNodeExpr* maskp = nullptr;
+        AstNodeExpr* zargp = nullptr;  // Which elements are 'Z', for a resolved signal
+        const bool wantZ = m_waveZTasks.count(taskp);
+        // The 'Z' elements of a value that folds, leftmost first; none where
+        // it does not, which is a value read from somewhere (collectWaveSigs)
+        const auto zConstOf = [&](int width) -> AstNodeExpr* {
+            std::string chars;
+            V3Number num{flp, std::max(width, 1), 0};
+            if (wfp && wfp->valuep() && logicCharsOf(wfp->valuep(), chars)
+                && static_cast<int>(chars.size()) == width) {
+                for (int i = 0; i < width; ++i) {
+                    const char c = chars[i];
+                    if (c == 'Z' || c == 'z') num.setBit(width - 1 - i, 1);
+                }
+            }
+            return new AstConst{flp, num};
+        };
         const VhdlSymbol* const partSymp
             = wholeSignalOf(targetp) ? nullptr : partSignalOf(targetp);
-        if (partSymp) {
+        const auto recIt = m_waveRecordLeaves.find(taskp);
+        if (recIt != m_waveRecordLeaves.end() && !wholeSignalOf(targetp)) {
+            // A part of a record: the subelements under it, and the value put
+            // in place in a copy of what the signal holds now
+            WavePath path;
+            const VhdlSymbol* const recSymp = recordPartOf(targetp, path);
+            const std::vector<WavePath>& leaves = recIt->second;
+            V3Number mnum{flp, static_cast<int>(leaves.size()), 0};
+            for (size_t j = 0; j < leaves.size(); ++j) {
+                if (leaves[j].size() >= path.size()
+                    && std::equal(path.begin(), path.end(), leaves[j].begin())) {
+                    mnum.setBit(static_cast<int>(j), 1);
+                }
+            }
+            AstNodeExpr* const partp = recSymp ? lowerDriveTarget(targetp) : nullptr;
+            AstVarRef* const rootp = partp ? rootRefOf(partp) : nullptr;
+            if (!partp || !rootp || rootp == partp) {
+                if (partp) VL_DO_DANGLING(partp->deleteTree(), partp);
+                VL_DO_DANGLING(valuep->deleteTree(), valuep);
+                return nullptr;
+            }
+            AstVar* const tvp = newTempVar("__Vwavev", lowerType(recSymp->typep(), flp), flp);
+            prep = new AstAssign{flp, new AstVarRef{flp, tvp, VAccess::WRITE},
+                                 new AstVarRef{flp, rootp->varp(), VAccess::READ}};
+            AstVarRef* const newRootp = new AstVarRef{flp, tvp, VAccess::WRITE};
+            rootp->replaceWith(newRootp);
+            VL_DO_DANGLING(rootp->deleteTree(), rootp);
+            prep->addNext(new AstAssign{flp, partp, valuep});
+            valuep = new AstVarRef{flp, tvp, VAccess::READ};
+            maskp = new AstConst{flp, mnum};
+        } else if (partSymp) {
             AstNodeExpr* const partp = lowerDriveTarget(targetp);
             AstVarRef* sigRefp = nullptr;
             if (partp) {
-                partp->foreach([&](AstVarRef* refp) {
-                    if (!sigRefp) sigRefp = refp;
-                });
+                AstNodeExpr* np = partp;
+                while (true) {
+                    if (AstSel* const selp = VN_CAST(np, Sel)) {
+                        np = selp->fromp();
+                    } else if (AstNodePreSel* const pselp = VN_CAST(np, NodePreSel)) {
+                        np = pselp->fromp();
+                    } else {
+                        break;
+                    }
+                }
+                if (np != partp) sigRefp = VN_CAST(np, VarRef);
             }
             if (!partp || !sigRefp) {
                 if (partp) VL_DO_DANGLING(partp->deleteTree(), partp);
@@ -24411,12 +25124,22 @@ private:
             AstNodeDType* const sigDtp = lowerType(partSymp->typep(), flp);
             AstVar* const tvp = newTempVar("__Vwavev", sigDtp, flp);
             AstVar* const twp = newTempVar("__Vwavew", sigDtp->cloneTree(false), flp);
+            // The signal is the root of the chain of selects; the indices
+            // may read variables of their own
+            const auto rootRef = [](AstNodeExpr* np) -> AstVarRef* {
+                while (true) {
+                    if (AstSel* const selp = VN_CAST(np, Sel)) {
+                        np = selp->fromp();
+                    } else if (AstNodePreSel* const pselp = VN_CAST(np, NodePreSel)) {
+                        np = pselp->fromp();
+                    } else {
+                        return VN_CAST(np, VarRef);
+                    }
+                }
+            };
             const auto partOf = [&](AstVar* varp, VAccess access) {
                 AstNodeExpr* const newp = partp->cloneTree(false);
-                AstVarRef* innerp = nullptr;
-                newp->foreach([&](AstVarRef* refp) {
-                    if (!innerp) innerp = refp;
-                });
+                AstVarRef* const innerp = rootRef(newp);
                 AstVarRef* const repp = new AstVarRef{flp, varp, access};
                 if (innerp == newp) {
                     VL_DO_DANGLING(newp->deleteTree(), newp);
@@ -24436,6 +25159,22 @@ private:
                                         new AstConst{zflp, AstConst::BitFalse{}}});
             prep->addNext(new AstAssign{flp, partOf(twp, VAccess::WRITE),
                                         new AstNot{flp, partOf(twp, VAccess::READ)}});
+            if (wantZ) {
+                AstVar* const tzp = newTempVar("__Vwavez", sigDtp->cloneTree(false), flp);
+                prep->addNext(new AstAssign{zflp, new AstVarRef{zflp, tzp, VAccess::WRITE},
+                                            new AstConst{zflp, AstConst::BitFalse{}}});
+                const VhdlType* const vtp
+                    = wfp && wfp->valuep() ? wfp->valuep()->vhdlTypep() : nullptr;
+                const int partWidth = vtp && vtp->isConstrainedArray() && vtp->dimensions() == 1
+                                          ? static_cast<int>(vtp->dimLength(0))
+                                          : 1;
+                FileLine* const pzflp = new FileLine{flp};
+                pzflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                pzflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                prep->addNext(
+                    new AstAssign{pzflp, partOf(tzp, VAccess::WRITE), zConstOf(partWidth)});
+                zargp = new AstVarRef{flp, tzp, VAccess::READ};
+            }
             VL_DO_DANGLING(partp->deleteTree(), partp);
             valuep = new AstVarRef{flp, tvp, VAccess::READ};
             maskp = new AstVarRef{flp, twp, VAccess::READ};
@@ -24445,6 +25184,7 @@ private:
             V3Number ones{flp, widthIt != m_waveMaskWidths.end() ? widthIt->second : 1, 0};
             ones.setAllBits1();
             maskp = new AstConst{flp, ones};
+            if (wantZ) zargp = zConstOf(ones.width());
         }
         AstNodeExpr* const dp = wfp->afterp() ? lowerExpr(wfp->afterp()) : zero();
         AstNodeExpr* rp = nullptr;
@@ -24465,6 +25205,7 @@ private:
         argsp->addNext(new AstArg{flp, "", dp});
         argsp->addNext(new AstArg{flp, "", rp});
         argsp->addNext(new AstArg{flp, "", maskp});
+        if (zargp) argsp->addNext(new AstArg{flp, "", zargp});
         AstTaskRef* const refp = new AstTaskRef{flp, taskp->name(), argsp};
         refp->taskp(taskp);
         return AstNode::addNextNull(prep, static_cast<AstNode*>(new AstStmtExpr{flp, refp}));
@@ -27707,6 +28448,27 @@ private:
                 return nullptr;
             }
             AstNode* outp = nullptr;
+            // A resolved signal whose driver keeps its projected waveform here
+            if (sequential && drivenThroughDriver(rootSymOf(nodep->targetp()))) {
+                if (AstTask* const wtaskp = waveTaskFor(nodep->targetp(), flp)) {
+                    for (AstVhdlWaveform* p = wfp; p; p = VN_AS(p->nextp(), VhdlWaveform)) {
+                        AstNodeExpr* const rhsp
+                            = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
+                        if (!rhsp) return outp;
+                        AstNode* const delayp
+                            = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false}
+                                          : nullptr;
+                        AstNode* const markp
+                            = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
+                        if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+                        outp = AstNode::addNextNull(outp,
+                                                    waveCall(wtaskp, nodep->delay(), p, p == wfp,
+                                                             rhsp, flp, nodep->targetp()));
+                        outp = AstNode::addNextNull(outp, markp);
+                    }
+                    return AstNode::addNextNull(outp, resolvedWeakStmt(nodep, flp));
+                }
+            }
             // Each element is a transaction on this process's driver, as a
             // single one is, and not on the signal its drivers resolve to
             if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
@@ -27772,6 +28534,23 @@ private:
                 = lowerAggregateTarget(aggp, wfp->valuep(), true, sequential, flp, delayp);
             if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
             return outp;
+        }
+        // A resolved signal whose driver keeps its projected waveform here
+        if (sequential && drivenThroughDriver(rootSymOf(nodep->targetp()))) {
+            if (AstTask* const wtaskp = waveTaskFor(nodep->targetp(), flp)) {
+                AstNodeExpr* const rhsp = lowerDriveValue(nodep->targetp(), wfp->valuep(), flp);
+                if (!rhsp) {
+                    if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+                    return nullptr;
+                }
+                AstNode* const markp
+                    = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
+                if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+                AstNode* outp
+                    = waveCall(wtaskp, nodep->delay(), wfp, true, rhsp, flp, nodep->targetp());
+                outp = AstNode::addNextNull(outp, markp);
+                return AstNode::addNextNull(outp, resolvedWeakStmt(nodep, flp));
+            }
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             AstNodeExpr* const valuep
@@ -31441,6 +32220,11 @@ private:
         // share one copy -- so a call would run the other one's body (4.5.2)
         std::string key
             = symp->name() + "@" + std::to_string(reinterpret_cast<uintptr_t>(declp));
+        // A copy that schedules on a signal does so through the calling
+        // process's driver, so each process gets its own
+        if (m_waveProcp && !m_waveSigs.empty()) {
+            key += "#p" + std::to_string(reinterpret_cast<uintptr_t>(m_waveProcp));
+        }
         for (size_t i = 0; i < formals.size(); ++i) {
             AstNodeVhdlExpr* actualp = nullptr;
             // The elements of this formal that the call named one at a time
