@@ -7610,6 +7610,17 @@ private:
                 // it is not a number here, and the copy carries it as written.
                 if (length < 0 && !lengthTravels(typep)) return;
             }
+            // A record aggregate says how long its elements are by the values
+            // it gives them: "l * complex'(re => r, im => from_real(0.0,
+            // r))" over a record of two open sfixed (NVC issue810)
+            if (symp->paramTypes()[i]
+                && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::RECORD
+                && !VhdlSemVisitor::fullyConstrainedRecord(typep)) {
+                if (VhdlType* const aggTypep
+                    = aggregateRecordSubtype(symp->paramTypes()[i], actp)) {
+                    typep = aggTypep;
+                }
+            }
             // The same for a record with an element of an unconstrained array
             // type: only an actual that says how long its elements are is
             // worth making a copy for (5.3.3)
@@ -7741,6 +7752,46 @@ private:
             }
         }
         m_within.pop_back();
+    }
+
+    // The subtype a record aggregate has from the values it gives its open
+    // elements, where each of them says its length. Null otherwise.
+    VhdlType* aggregateRecordSubtype(VhdlType* recTypep, AstNodeVhdlExpr* actp) {
+        while (AstVhdlQualified* const qp = VN_CAST(actp, VhdlQualified)) actp = qp->valuep();
+        AstVhdlAggregate* const aggp = VN_CAST(actp, VhdlAggregate);
+        if (!aggp) return nullptr;
+        const std::vector<VhdlSymbol*>& elems = recTypep->base()->elements();
+        std::vector<AstNodeVhdlExpr*> byPos(elems.size(), nullptr);
+        size_t pos = 0;
+        for (AstNode* p = aggp->elemsp(); p; p = p->nextp()) {
+            AstVhdlElemAssoc* const eap = VN_CAST(p, VhdlElemAssoc);
+            if (!eap) return nullptr;
+            if (!eap->choicesp()) {
+                if (pos >= byPos.size()) return nullptr;
+                byPos[pos++] = eap->valuep();
+                continue;
+            }
+            for (AstNode* cp = eap->choicesp(); cp; cp = cp->nextp()) {
+                const AstVhdlChoice* const chp = VN_CAST(cp, VhdlChoice);
+                const AstVhdlName* const namep = chp ? VN_CAST(chp->valuep(), VhdlName) : nullptr;
+                if (!namep) return nullptr;  // "others" settles no one length
+                bool found = false;
+                for (size_t k = 0; k < elems.size(); ++k) {
+                    if (VString::downcase(elems[k]->name()) != VString::downcase(namep->name())) {
+                        continue;
+                    }
+                    byPos[k] = eap->valuep();
+                    found = true;
+                }
+                if (!found) return nullptr;
+            }
+        }
+        for (AstNodeVhdlExpr* const vp : byPos) {
+            if (!vp) return nullptr;
+        }
+        VhdlType* const madep = m_sem.constrainRecordFromParts(recTypep, byPos, actp->fileline());
+        if (!madep || !VhdlSemVisitor::fullyConstrainedRecord(madep)) return nullptr;
+        return madep;
     }
 
     // The copy's result has a length where the original's had none, so the

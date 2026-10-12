@@ -17571,6 +17571,17 @@ private:
     // the element type. Null where none has.
     static VhdlType* settledElement(VhdlType* elemp, const VhdlType* arrayp,
                                     const std::vector<VhdlType*>& typeps) {
+        // A record whose elements are open -- "complex" of two "sfixed" --
+        // is settled by a subtype that constrains them
+        if (elemp->base()->kind() == VhdlTypeKind::RECORD) {
+            if (!partlyOpen(elemp) || elemp != elemp->base()) return elemp;
+            for (VhdlType* const tp : typeps) {
+                if (!tp) continue;
+                VhdlType* const ep = tp->base() == arrayp->base() ? tp->elementp() : tp;
+                if (ep && ep->base() == elemp->base() && ep != ep->base()) return ep;
+            }
+            return nullptr;
+        }
         if (elemp->base()->kind() != VhdlTypeKind::ARRAY || elemp->isConstrainedArray()) {
             return elemp;
         }
@@ -26797,7 +26808,13 @@ private:
             // function gives back
             VL_RESTORER(m_retAggp);
             VL_RESTORER(m_retAggTypep);
-            if (AstVhdlAggregate* const aggp = VN_CAST(retp->valuep(), VhdlAggregate)) {
+            // Written as one, or qualified by the record's type: "return
+            // complex'(re => r, im => ...)"
+            AstVhdlAggregate* retAggp = VN_CAST(retp->valuep(), VhdlAggregate);
+            if (const AstVhdlQualified* const qualp = VN_CAST(retp->valuep(), VhdlQualified)) {
+                retAggp = VN_CAST(qualp->valuep(), VhdlAggregate);
+            }
+            if (AstVhdlAggregate* const aggp = retAggp) {
                 const auto rit = m_retTypeOf.find(m_ftaskp);
                 if (rit != m_retTypeOf.end() && rit->second
                     && rit->second->base()->kind() == VhdlTypeKind::RECORD) {
