@@ -399,6 +399,8 @@ public:
         : VerilatedVpioVarBase{varp, scopep} {
         m_entSize = varp->entSize();
         m_varDatap = varp->datap();
+        // A field of a packed VHDL record is these bits of the record's own
+        m_bitOffset = varp->bitOffset();
         if (_vl_vpi_find_unescaped_dot(varp->name())) {
             m_name = _vl_vpi_member_local_name(varp->name());
         }
@@ -408,6 +410,7 @@ public:
         : VerilatedVpioVarBase{varp, scopep} {
         m_entSize = varp->entSize();
         m_varDatap = datap;
+        m_bitOffset = varp->bitOffset();
         m_name = name;
         m_fullNameOverride = fullname;
     }
@@ -529,6 +532,10 @@ public:
         case VLVT_UNION: type = varp()->isNet() ? vpiUnionNet : vpiUnionVar; break;
         default: type = varp()->isBitVar() ? vpiBitVar : vpiReg; break;
         }
+        // A VHDL record is a structure, though its bits are held packed
+        if (varp()->isRecord()) type = varp()->isNet() ? vpiStructNet : vpiStructVar;
+        // And a VHDL integer an integer, though its bits are held as a vector
+        if (varp()->isInteger() && m_partselBits < 0 && index().empty()) type = vpiIntegerVar;
         if (isIndexedDimUnpacked())
             return isStructOrUnion() && varp()->isNet() ? vpiNetArray : vpiRegArray;
         return type;
@@ -1196,14 +1203,21 @@ public:
                                     varop->fullname(), *(static_cast<CData*>(varop->varDatap())),
                                     *(varop->prevDatap()), varop->varDatap(), varop->prevDatap(),
                                     varop->entSize()););
-        if (varop->bitSize() == 1) {
+        // A handle on part of the data -- one bit, a part select, a field of
+        // a packed VHDL record -- changes only when its own bits do
+        const size_t bits = varop->bitSize();
+        if (bits == 1 || varop->bitOffset() != 0 || bits < 8 * varop->entSize()) {
             T* const prevDatap = reinterpret_cast<T*>(
                 varop->prevDatap());  // Was malloced when we added the callback
-            const VarAccessInfo<T> currInfo
-                = vl_vpi_var_access_info<T>(varop, varop->bitSize(), 0);
-            VarAccessInfo<T> prevInfo = currInfo;
-            prevInfo.m_datap = prevDatap;
-            return vl_vpi_get_word_gen(currInfo) != vl_vpi_get_word_gen(prevInfo);
+            constexpr size_t wordBits = 8 * sizeof(T);
+            for (size_t at = 0; at < bits; at += wordBits) {
+                const size_t n = std::min(wordBits, bits - at);
+                const VarAccessInfo<T> currInfo = vl_vpi_var_access_info<T>(varop, n, at);
+                VarAccessInfo<T> prevInfo = currInfo;
+                prevInfo.m_datap = prevDatap;
+                if (vl_vpi_get_word_gen(currInfo) != vl_vpi_get_word_gen(prevInfo)) return true;
+            }
+            return false;
         }
         return std::memcmp(varop->prevDatap(), varop->varDatap(), varop->entSize()) != 0;
     }
@@ -3107,7 +3121,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle object) {
     }
     case vpiMember: {
         const VerilatedVpioVar* const vop = VerilatedVpioVar::castp(object);
-        if (!vop || !vop->isStructOrUnion()) return nullptr;
+        if (!vop || !(vop->isStructOrUnion() || vop->varp()->isRecord())) return nullptr;
         return ((new VerilatedVpioMemberIter{vop})->castVpiHandle());
     }
     case vpiParameter: {
@@ -3204,7 +3218,7 @@ PLI_INT32 vpi_get(PLI_INT32 property, vpiHandle object) {
     }
     case vpiPacked: {
         const VerilatedVpioVarBase* const vop = VerilatedVpioVarBase::castp(object);
-        if (VL_LIKELY(vop && vop->isStructOrUnion())) return 0;
+        if (VL_LIKELY(vop && (vop->isStructOrUnion() || vop->varp()->isRecord()))) return 0;
         [[fallthrough]];
     }
     default:

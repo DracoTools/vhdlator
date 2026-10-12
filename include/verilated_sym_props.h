@@ -165,6 +165,7 @@ public:
         return bits;
     }
     bool isPublicRW() const { return ((m_vlflags & VLVF_PUB_RW) != 0); }
+    int vlflagsRaw() const { return static_cast<int>(m_vlflags); }
     bool isForceable() const { return ((m_vlflags & VLVF_FORCEABLE) != 0); }
     bool isContinuously() const { return ((m_vlflags & VLVF_CONTINUOUSLY) != 0); }
     // DPI compatible C standard layout
@@ -266,6 +267,7 @@ class VerilatedVar final : public VerilatedVarProps {
     const char* const m_namep;  // Name - slowpath
     std::unique_ptr<const VerilatedForceControlSignals>
         m_forceControlSignals;  // Force control signals
+    uint32_t m_bitOffset = 0;  // Where in the data its bits start: a field of a packed record
 
 protected:
     const bool m_isParam;
@@ -286,6 +288,9 @@ public:
     void* datap() const { return m_datap; }
     const char* name() const { return m_namep; }
     bool isParam() const { return m_isParam; }
+    uint32_t bitOffset() const { return m_bitOffset; }
+    bool isRecord() const { return (vlflagsRaw() & VLVF_RECORD) != 0; }
+    bool isInteger() const { return (vlflagsRaw() & VLVF_INTEGER) != 0; }
     const VerilatedForceControlSignals* forceControlSignals() const {
         return m_forceControlSignals.get();
     }

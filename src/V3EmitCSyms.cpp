@@ -308,7 +308,8 @@ class EmitCSyms final : EmitCBaseVisitorConst {
 
     static std::string insertVarStatement(const ScopeVarData& svd, const AstScope* const scopep,
                                           const AstVar* const varp, const int udim, const int pdim,
-                                          const std::string& bounds) {
+                                          const std::string& bounds,
+                                          const std::string& extraFlags = "") {
         const std::string varName = VIdProtect::protectIf(scopep->nameDotless(), scopep->protect())
                                     + "." + protect(varp->name());
         const std::string vlEnumType = varp->vlEnumType();
@@ -338,8 +339,70 @@ class EmitCSyms final : EmitCBaseVisitorConst {
                                         ? "sizeof(" + varName + ") / "
                                               + std::to_string(getUnpackedElements(varp->dtypep()))
                                         : "";
-        appendVarProperties(stmt, vlEnumType, varp->vlEnumDir(), udim, pdim, bounds, entSize);
+        appendVarProperties(stmt, vlEnumType,
+                            varp->vlEnumDir() + extraFlags + vhdlIntegerFlag(varp, varp->dtypep()),
+                            udim, pdim, bounds, entSize);
         return stmt;
+    }
+
+    // A VHDL integer is held as a vector of bits, but it is an integer object,
+    // as nvc and GHDL show one: so it reads as one over VPI
+    static std::string vhdlIntegerFlag(const AstVar* const varp,
+                                       const AstNodeDType* const dtypep) {
+        if (!varp->fileline()->language().vhdl()) return "";
+        const AstBasicDType* const basicp = VN_CAST(dtypep->skipRefp(), BasicDType);
+        if (!basicp) return "";
+        if (basicp->keyword() == VBasicDTypeKwd::INT
+            || basicp->keyword() == VBasicDTypeKwd::INTEGER) {
+            return "|VLVF_INTEGER";
+        }
+        return "";
+    }
+
+    // A VHDL record is held as a packed structure, but VHDL has no packed
+    // records: it is reported as a structure whose elements are members, as
+    // nvc and GHDL show one, each member a part of the variable's own bits
+    static bool isVhdlRecord(const AstVar* const varp) {
+        if (!varp->fileline()->language().vhdl()) return false;
+        const AstNodeUOrStructDType* const sdtypep
+            = VN_CAST(varp->dtypeSkipRefp(), NodeUOrStructDType);
+        return sdtypep && sdtypep->packed() && VN_IS(sdtypep, StructDType);
+    }
+    static void
+    addPackedRecordMemberVars(std::vector<std::string>& stmts, const ScopeVarData& svd,
+                              const AstScope* const scopep, const std::string& prettyPrefix,
+                              const std::string& storageName, const std::string& storageType,
+                              const AstNodeUOrStructDType* const sdtypep, int baseLsb) {
+        const std::string scopeVar = protect("__Vscopep_" + svd.m_scopeName);
+        for (const AstMemberDType* itemp = sdtypep->membersp(); itemp;
+             itemp = VN_AS(itemp->nextp(), MemberDType)) {
+            const AstNodeDType* const itemDTypep = itemp->dtypep();
+            const std::string prettyName
+                = prettyPrefix + "." + AstNode::vpiName(itemp->shortName());
+            const int lsb = baseLsb + itemp->lsb();
+            const AstNodeUOrStructDType* const subp
+                = VN_CAST(itemDTypep->skipRefp(), NodeUOrStructDType);
+            VarDims dims = getVarDims(itemDTypep);
+            // A record inside is as wide as its own bits
+            if (subp && subp->packed() && !dims.pdim) {
+                dims.packedLR.emplace_back(itemDTypep->width() - 1, 0);
+                ++dims.pdim;
+            }
+            std::string flags = memberVlEnumDir(svd.m_varp, itemDTypep);
+            if (subp && subp->packed()) flags += "|VLVF_RECORD";
+            flags += vhdlIntegerFlag(svd.m_varp, itemDTypep);
+            // The parent's storage, read from this member's own bit
+            std::string stmt
+                = scopeVar + "->varInsertPart(\"" + V3OutFormatter::quoteNameControls(prettyName)
+                  + "\", &(" + storageName + "), " + storageType + ", " + flags + ", sizeof("
+                  + storageName + "), " + std::to_string(lsb) + ", " + std::to_string(dims.udim)
+                  + ", " + std::to_string(dims.pdim) + boundsString(dims) + ")";
+            stmts.emplace_back(stmt + ";");
+            if (subp && subp->packed()) {
+                addPackedRecordMemberVars(stmts, svd, scopep, prettyName, storageName, storageType,
+                                          subp, lsb);
+            }
+        }
     }
 
     // tryBuildTableEntry() classifies each public var once, so the caller does
@@ -375,7 +438,7 @@ class EmitCSyms final : EmitCBaseVisitorConst {
         // emitted struct field: a primary I/O port keeps its unprotected name
         // under --protect-ids, whereas protect() would always hash it.
         const std::string member = varp->nameProtect();
-        const std::string dir = varp->vlEnumDir();
+        const std::string dir = varp->vlEnumDir() + vhdlIntegerFlag(varp, varp->dtypep());
         // Flat dim (left,right) ints in varInsert() order: unpacked then packed.
         std::vector<int> dv;
         for (const std::pair<int, int>& lr : dims.flatten()) {
@@ -1347,8 +1410,10 @@ std::vector<std::string> EmitCSyms::getSymCtorStmts() {
                 }
 
                 std::string row;
+                const bool vhdlRecord = isVhdlRecord(varp);
                 const TableEntryKind kind
-                    = tryBuildTableEntry(svd, varp, scopep, modClassName, dims, row);
+                    = vhdlRecord ? TableEntryKind::PLAIN_RESIDUAL
+                                 : tryBuildTableEntry(svd, varp, scopep, modClassName, dims, row);
                 switch (kind) {
                 case TableEntryKind::TABLE_ROW: rows.emplace_back(row); break;
                 case TableEntryKind::FORCEABLE_RESIDUAL: {
@@ -1360,10 +1425,20 @@ std::vector<std::string> EmitCSyms::getSymCtorStmts() {
                 }
                 case TableEntryKind::PLAIN_RESIDUAL: {
                     const std::string bounds = boundsString(dims);
-                    residual.emplace_back(
-                        insertVarStatement(svd, scopep, varp, dims.udim, dims.pdim, bounds) + ";");
-                    if (const AstNodeUOrStructDType* const sdtypep
-                        = VN_CAST(varp->dtypeSkipRefp(), NodeUOrStructDType)) {
+                    residual.emplace_back(insertVarStatement(svd, scopep, varp, dims.udim,
+                                                             dims.pdim, bounds,
+                                                             vhdlRecord ? "|VLVF_RECORD" : "")
+                                          + ";");
+                    if (vhdlRecord) {
+                        const std::string storageName
+                            = VIdProtect::protectIf(scopep->nameDotless(), scopep->protect()) + "."
+                              + protect(varp->name());
+                        addPackedRecordMemberVars(residual, svd, scopep, svd.m_varBasePretty,
+                                                  storageName, varp->vlEnumType(),
+                                                  VN_AS(varp->dtypeSkipRefp(), NodeUOrStructDType),
+                                                  0);
+                    } else if (const AstNodeUOrStructDType* const sdtypep
+                               = VN_CAST(varp->dtypeSkipRefp(), NodeUOrStructDType)) {
                         if (!sdtypep->packed()) {
                             addUOrStructMemberVars(residual, svd, scopep, svd.m_varBasePretty,
                                                    protect(varp->name()), sdtypep);

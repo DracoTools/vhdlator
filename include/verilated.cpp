@@ -4232,6 +4232,31 @@ VerilatedVar* VerilatedScope::varInsert(const char* namep, void* datap, bool isP
     return &(m_varsp->find(namep)->second);
 }
 
+VerilatedVar* VerilatedScope::varInsertPart(const char* namep, void* datap,
+                                            VerilatedVarType vltype, int vlflags, uint32_t entSize,
+                                            uint32_t bitOffset, int udims,
+                                            int pdims...) VL_MT_UNSAFE {
+    if (!m_varsp) m_varsp = new VerilatedVarNameMap;
+    // The whole variable's size, so its own data is what a change is
+    // compared on, and the member's own range, read from its first bit
+    VerilatedVar var(namep, datap, vltype, static_cast<VerilatedVarFlags>(vlflags), udims, pdims,
+                     false, entSize);
+    var.m_bitOffset = bitOffset;
+    va_list ap;
+    va_start(ap, pdims);
+    for (int i = 0; i < udims; ++i) {
+        var.m_unpacked[i].m_left = va_arg(ap, int);
+        var.m_unpacked[i].m_right = va_arg(ap, int);
+    }
+    for (int i = 0; i < pdims; ++i) {
+        var.m_packed[i].m_left = va_arg(ap, int);
+        var.m_packed[i].m_right = va_arg(ap, int);
+    }
+    va_end(ap);
+    m_varsp->emplace(namep, std::move(var));
+    return &(m_varsp->find(namep)->second);
+}
+
 void VerilatedScope::varsInsertFromTable(const VlVarTableEntry* entp, size_t n,
                                          void* basep) VL_MT_UNSAFE {
     // Table-driven equivalent of a run of varInsert()/varInsertSized() calls; see VlVarTableEntry.

@@ -157,7 +157,9 @@ enum VerilatedVarFlags : uint32_t {
     VLVF_FORCEABLE = (1 << 12),  // Forceable
     VLVF_SIGNED = (1 << 13),  // Signed integer
     VLVF_BITVAR = (1 << 14),  // Four state bit (vs two state logic)
-    VLVF_NET = (1 << 15)  // Net object
+    VLVF_NET = (1 << 15),  // Net object
+    VLVF_RECORD = (1 << 16),  // VHDL record, held packed: a structure with its fields as members
+    VLVF_INTEGER = (1 << 17)  // VHDL integer: an integer object, not a vector of bits
 };
 
 // One VPI-visible variable, consumed by VerilatedScope::varsInsertFromTable();
@@ -855,6 +857,11 @@ public:  // But internals only - called from verilated modules, VerilatedSyms
     int8_t timeunit() const VL_MT_SAFE_POSTINIT { return m_timeunit; }
     VerilatedSyms* symsp() const VL_MT_SAFE_POSTINIT { return m_symsp; }
     VerilatedVar* varFind(const char* namep) const VL_MT_SAFE_POSTINIT;
+    // A member that is part of another variable's own bits -- a field of a
+    // packed VHDL record -- over the whole variable's data, from bitOffset
+    VerilatedVar* varInsertPart(const char* namep, void* datap, VerilatedVarType vltype,
+                                int vlflags, uint32_t entSize, uint32_t bitOffset, int udims,
+                                int pdims...) VL_MT_UNSAFE;
     VerilatedVarNameMap* varsp() const VL_MT_SAFE_POSTINIT { return m_varsp; }
     void scopeDump() const;
     void* exportFindError(int funcnum) const VL_MT_SAFE;
