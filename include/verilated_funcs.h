@@ -223,6 +223,20 @@ inline QData VL_SET_QW(WDataInP lwp) VL_PURE {
 
 // Return FILE* from IData
 extern FILE* VL_CVT_I_FP(IData lhs) VL_MT_SAFE;
+// $fgetc, $ungetc and $feof; a descriptor that names no open file, a closed
+// one say, reads as EOF
+inline IData VL_FGETC_I(IData fpi) VL_MT_SAFE {
+    FILE* const fp = VL_CVT_I_FP(fpi);
+    return VL_LIKELY(fp) ? static_cast<IData>(std::fgetc(fp)) : ~0U;
+}
+inline IData VL_FUNGETC_I(IData fpi, IData c) VL_MT_SAFE {
+    FILE* const fp = VL_CVT_I_FP(fpi);
+    return VL_LIKELY(fp) && std::ungetc(static_cast<int>(c), fp) >= 0 ? 0 : ~0U;
+}
+inline IData VL_FEOF_I(IData fpi) VL_MT_SAFE {
+    FILE* const fp = VL_CVT_I_FP(fpi);
+    return VL_LIKELY(fp) ? (std::feof(fp) ? 1 : 0) : 1;
+}
 
 // clang-format off
 // Use a union to avoid cast-to-different-size warnings
