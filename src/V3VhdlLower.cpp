@@ -1040,12 +1040,41 @@ private:
         // same object each time so long as which element it is cannot change
         // between the reads, which are next to each other in what is emitted
         if (const AstSelBit* const selp = VN_CAST(nodep, SelBit)) {
-            return repeatable(selp->fromp()) && selp->bitp()
-                   && const_cast<AstNodeExpr*>(selp->bitp())->isPure();
+            return repeatable(selp->fromp()) && selp->bitp() && pureButChecks(selp->bitp());
         }
         if (const AstArraySel* const selp = VN_CAST(nodep, ArraySel)) {
-            return repeatable(selp->fromp()) && selp->bitp()
-                   && const_cast<AstNodeExpr*>(selp->bitp())->isPure();
+            return repeatable(selp->fromp()) && selp->bitp() && pureButChecks(selp->bitp());
+        }
+        return false;
+    }
+    // Pure but for the bound checks in it, which give the same value each
+    // time or stop the run: "{ __Vidx = i; if (out of range) stop; __Vidx }"
+    // in a read, "__VidxchkN(i, l, r)" in a target
+    static bool pureButChecks(const AstNodeExpr* nodep) {
+        if (const_cast<AstNodeExpr*>(nodep)->isPure()) return true;
+        if (const AstExprStmt* const esp = VN_CAST(nodep, ExprStmt)) {
+            if (!VN_IS(esp->resultp(), VarRef)) return false;
+            for (const AstNode* stmtp = esp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+                if (const AstAssign* const asp = VN_CAST(stmtp, Assign)) {
+                    if (!VN_IS(asp->lhsp(), VarRef) || !pureButChecks(asp->rhsp())) return false;
+                } else if (const AstIf* const ifp = VN_CAST(stmtp, If)) {
+                    if (ifp->elsesp() || !pureButChecks(ifp->condp())) return false;
+                    for (const AstNode* sp = ifp->thensp(); sp; sp = sp->nextp()) {
+                        if (!VN_IS(sp, Display) && !VN_IS(sp, Stop)) return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (const AstFuncRef* const refp = VN_CAST(nodep, FuncRef)) {
+            if (!refp->taskp() || refp->taskp()->name().rfind("__Vidxchk", 0) != 0) return false;
+            for (const AstNode* argp = refp->argsp(); argp; argp = argp->nextp()) {
+                const AstArg* const ap = VN_CAST(argp, Arg);
+                if (!ap || !ap->exprp() || !pureButChecks(ap->exprp())) return false;
+            }
+            return true;
         }
         return false;
     }
@@ -5490,6 +5519,31 @@ private:
         stmtsp->addNext(new AstStop{flp, true});
         setp = AstNode::addNextNull(setp, new AstIf{flp, condp, stmtsp});
         return new AstExprStmt{flp, setp, valp};
+    }
+    // The statements of the index checks in an expression -- each
+    // "{ __Vidx = i; if (out of range) stop; __Vidx }" -- taken out, in
+    // order, leaving their values: for an expression read more than once
+    // where its checks are to be made once
+    static AstNode* hoistIndexChecks(AstNodeExpr*& exprp) {
+        std::vector<AstExprStmt*> stmtps;
+        exprp->foreach([&](AstExprStmt* esp) {
+            for (AstNode* upp = esp; upp != exprp; upp = upp->aboveLoopp()) {
+                if (upp != esp && VN_IS(upp, ExprStmt)) return;  // Moves with the outer one
+            }
+            stmtps.push_back(esp);
+        });
+        AstNode* outp = nullptr;
+        for (AstExprStmt* const esp : stmtps) {
+            outp = AstNode::addNextNull(outp, esp->stmtsp()->unlinkFrBackWithNext());
+            AstNodeExpr* const valp = esp->resultp()->unlinkFrBack();
+            if (esp == exprp) {
+                exprp = valp;
+            } else {
+                esp->replaceWith(valp);
+            }
+            VL_DO_DANGLING(esp->deleteTree(), esp);
+        }
+        return outp;
     }
     // A slice whose ends are not both numbers: the left end, once the slice
     // is checked; the right end is read again, so it has to be pure
@@ -29961,13 +30015,26 @@ private:
         } else {
             objNodep = dynAccessObj(VN_AS(targetp, VhdlSelected), dynp);
         }
-        AstNodeExpr* const dstp = objNodep ? lowerExpr(objNodep) : nullptr;
+        AstNodeExpr* dstp = objNodep ? lowerExpr(objNodep) : nullptr;
         if (!dstp) return nullptr;
+        // The object is named again for each element; an index check in its
+        // name is made once, before the copy
+        AstNode* const checksp = hoistIndexChecks(dstp);
         if (!repeatable(dstp)) {
             VL_DO_DANGLING(dstp->deleteTree(), dstp);
+            if (checksp) VL_DO_DANGLING(checksp->deleteTree(), checksp);
             unsup(flp, "assignment to an access value that is not a name");
             return nullptr;
         }
+        AstNode* const copyp = lowerDynCopyTo(dstp, dynp, objNodep, rangep, valuep, flp);
+        if (!copyp) {
+            if (checksp) VL_DO_DANGLING(checksp->deleteTree(), checksp);
+            return nullptr;
+        }
+        return AstNode::addNextNull(checksp, copyp);
+    }
+    AstNode* lowerDynCopyTo(AstNodeExpr* dstp, const DynAccess* dynp, AstNodeVhdlExpr* objNodep,
+                            AstVhdlRange* rangep, AstNodeVhdlExpr* valuep, FileLine* flp) {
         AstNodeExpr* countp = nullptr;
         AstNodeExpr* basep = nullptr;
         if (rangep) {
