@@ -18403,13 +18403,22 @@ private:
                 while (pos < spec.size() && std::isdigit(spec[pos])) ++pos;
             }
             const char conv = ok && pos + 1 == spec.size() ? spec[pos] : '\0';
-            if (!conv || !std::strchr("eEfFgG", conv)) {
-                unsup(flp, "TO_STRING of a real with a format that is not a static e, f or g "
+            if (!conv || !std::strchr("eEfFgGaA", conv)) {
+                unsup(flp, "TO_STRING of a real with a format that is not a static a, e, f or g "
                            "conversion");
                 return nullptr;
             }
             AstNodeExpr* const valuep = lowerExpr(args[0]);
             if (!valuep) return nullptr;
+            // Hexadecimal, "0x1.8p+0", which Verilog's formatting does not
+            // have: C's own, the specification having been checked above
+            if (conv == 'a' || conv == 'A') {
+                AstCExpr* const fmtp = new AstCExpr{flp, AstCExpr::Pure{}, "VL_VHDL_REAL_FORMAT("};
+                fmtp->add(valuep);
+                fmtp->add(", \"" + spec + "\")");
+                fmtp->dtypeSetString();
+                return fmtp;
+            }
             const char lower = static_cast<char>(std::tolower(conv));
             AstNodeExpr* const outp
                 = new AstSFormatF{flp, spec.substr(0, pos) + lower, false, valuep};
@@ -18429,7 +18438,13 @@ private:
             }
             AstNodeExpr* const valuep = lowerExpr(args[0]);
             if (!valuep) return nullptr;
-            if (digitsv.toInt() == 0) return new AstSFormatF{flp, "%g", false, valuep};
+            // DIGITS of 0 is TO_STRING (VALUE) itself, the image (5.7)
+            if (digitsv.toInt() == 0) {
+                if (AstNodeExpr* const imgp = realImage(valuep, args[0]->vhdlTypep(), flp)) {
+                    return imgp;
+                }
+                return new AstSFormatF{flp, "%g", false, valuep};
+            }
             return new AstSFormatF{
                 flp, "%0." + std::to_string(digitsv.toInt()) + "f", false, valuep};
         }

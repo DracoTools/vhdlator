@@ -2508,11 +2508,22 @@ std::string V3VhdlEval::image(const VhdlValue& val) {
             if (prec == 16) VL_SNPRINTF(buf, sizeof(buf), "%.17g", v);
         }
         std::string out{buf};
-        if (out.find('.') == std::string::npos && out.find('e') == std::string::npos
-            && out.find("inf") == std::string::npos && out.find("nan") == std::string::npos) {
-            out += ".0";
+        if (out.find("inf") != std::string::npos || out.find("nan") != std::string::npos) {
+            return out;
         }
-        return out;
+        // An exponent written as a VHDL literal writes one (15.5.2), "2.5e7"
+        // and "1.0e-15" -- as VL_VHDL_REAL_IMAGE writes it while running
+        const size_t epos = out.find('e');
+        std::string mant = out.substr(0, epos);
+        if (mant.find('.') == std::string::npos) mant += ".0";
+        if (epos == std::string::npos) return mant;
+        const bool neg = out[epos + 1] == '-';
+        size_t dpos = epos + 1;
+        while (dpos < out.size() && (out[dpos] == '+' || out[dpos] == '-' || out[dpos] == '0')) {
+            ++dpos;
+        }
+        const std::string digits = dpos < out.size() ? out.substr(dpos) : "0";
+        return mant + (neg ? "e-" : "e") + digits;
     }
     case VhdlValKind::INT: break;
     }

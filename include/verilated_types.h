@@ -236,6 +236,7 @@ extern std::string VL_TO_STRING(double lhs);
 // value accurately -- so the shortest decimal that reads back as the same
 // value. Verilog's %g is six significant digits and is right for Verilog.
 extern std::string VL_VHDL_REAL_IMAGE(double lhs) VL_PURE;
+extern std::string VL_VHDL_REAL_FORMAT(double lhs, const char* specp) VL_PURE;
 // VHDL's TO_STRING of a physical value in a unit: the number of that unit it
 // is, as an integer or real literal (IEEE 1076-2008 5.2.6). A unit that is a
 // power of ten of the primary one gives an exact decimal; any other a real.

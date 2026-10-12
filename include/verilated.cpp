@@ -2499,12 +2499,30 @@ std::string VL_VHDL_REAL_IMAGE(double lhs) VL_PURE {
         if (prec == 16) VL_SNPRINTF(buf, sizeof(buf), "%.17g", lhs);
     }
     std::string out{buf};
+    if (out.find("inf") != std::string::npos || out.find("nan") != std::string::npos) return out;
     // An image always shows a decimal point, so that it reads back through
-    // 'VALUE (16.2.6)
-    if (out.find('.') == std::string::npos && out.find('e') == std::string::npos
-        && out.find("inf") == std::string::npos && out.find("nan") == std::string::npos) {
-        out += ".0";
+    // 'VALUE (16.2.6), and an exponent is written as a VHDL literal writes
+    // one (15.5.2): "2.5e7" and "1.0e-15", not C's "2.5e+07" and "1e-15"
+    const size_t epos = out.find('e');
+    std::string mant = out.substr(0, epos);
+    if (mant.find('.') == std::string::npos) mant += ".0";
+    if (epos == std::string::npos) return mant;
+    const bool neg = out[epos + 1] == '-';
+    size_t dpos = epos + 1;
+    while (dpos < out.size() && (out[dpos] == '+' || out[dpos] == '-' || out[dpos] == '0')) {
+        ++dpos;
     }
+    const std::string digits = dpos < out.size() ? out.substr(dpos) : "0";
+    return mant + (neg ? "e-" : "e") + digits;
+}
+std::string VL_VHDL_REAL_FORMAT(double lhs, const char* specp) VL_PURE {
+    // One conversion specification the frontend has already checked; a
+    // width or precision may ask for more than any fixed buffer holds
+    const int len = std::snprintf(nullptr, 0, specp, lhs);
+    if (len <= 0) return "";
+    std::string out(static_cast<size_t>(len) + 1, '\0');
+    std::snprintf(&out[0], out.size(), specp, lhs);
+    out.resize(static_cast<size_t>(len));
     return out;
 }
 std::string VL_VHDL_PHYS_IMAGE(int64_t value, int64_t scale) VL_PURE {
