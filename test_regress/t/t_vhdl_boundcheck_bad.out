@@ -1,4 +1,4 @@
 t/t_vhdl_boundcheck_bad.vhd:27:5:@1000000:(report note): before
-[1000000] %Error: t_vhdl_boundcheck_bad.vhd:28: Assertion failed in t_vhdl_boundcheck_bad: Index 16 is outside of the range 0 to 15 of the array
+%Error: t/t_vhdl_boundcheck_bad.vhd:28: Index 16 is outside of the range 0 to 15 of the array
 %Error: t/t_vhdl_boundcheck_bad.vhd:28: Verilog $stop
 Aborting...

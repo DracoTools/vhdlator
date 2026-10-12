@@ -1,0 +1,4 @@
+t/t_vhdl_boundcheck_slice_bad.vhd:22:5:@0:(report note): before
+%Error: t/t_vhdl_boundcheck_slice_bad.vhd:23: Slice 9 downto 6 is outside of the range 7 downto 0 of the array
+%Error: t/t_vhdl_boundcheck_slice_bad.vhd:23: Verilog $stop
+Aborting...

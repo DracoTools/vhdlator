@@ -5253,57 +5253,182 @@ private:
     }
 
     // An index outside its array's range is an error once it is evaluated
-    // (8.4), where nvc, GHDL and Questa end the run. Checking every index
-    // costs every design something, so it is done under --vhdl-bound-check:
-    // an index into an array whose range is a number here, in a statement,
-    // and not already kept within that range by its own subtype -- a loop
-    // over 'RANGE is not checked.
+    // (8.4), and so is a slice that is not null and does not lie inside it
+    // (8.5), where nvc, GHDL and Questa end the run. Checking costs every
+    // design something, so it is done under --vhdl-bound-check: indexes and
+    // slices in statements, into arrays whose range is a number here or one
+    // a generic gives, and not already kept within that range by the index's
+    // own subtype -- a loop over 'RANGE is not checked.
+    // The range a check is against: its two ends as expressions, and which
+    // way it runs. False where there is no such range to check against.
+    bool checkRange(const VhdlType* arrayTypep, int dim, FileLine* flp, AstNodeExpr*& leftp,
+                    AstNodeExpr*& rightp, bool& ascending, const VhdlType*& idxpr) {
+        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return false;
+        if (!arrayTypep || arrayTypep->base()->kind() != VhdlTypeKind::ARRAY
+            || stringBehind(arrayTypep) || arrayTypep->dimOpen(dim)) {
+            return false;
+        }
+        const VhdlType* const idxp = indexSubtype(arrayTypep, dim);
+        if (!idxp || idxp->base()->kind() != VhdlTypeKind::INTEGER) return false;
+        idxpr = idxp;
+        const auto intConst = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        if (idxp->bounded()) {
+            if (!arrayTypep->isConstrainedArray()) return false;
+            const int64_t lo = std::min(idxp->left(), idxp->right());
+            const int64_t hi = std::max(idxp->left(), idxp->right());
+            if (lo < INT32_MIN || hi > INT32_MAX) return false;
+            leftp = intConst(idxp->left());
+            rightp = intConst(idxp->right());
+            ascending = idxp->ascending();
+            return true;
+        }
+        // Ends a generic gives: the instance settles them, and they are
+        // numbers by the time anything runs
+        bool dirKnown = true;
+        if (!dynamicBounds(arrayTypep, dim, flp, leftp, rightp, ascending, &dirKnown)) {
+            return false;
+        }
+        if (!dirKnown || !leftp->isPure() || !rightp->isPure()) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return false;
+        }
+        return true;
+    }
     AstNodeExpr* checkedIndex(const AstNodeVhdlExpr* actualp, AstNodeExpr* indexp,
                               const VhdlType* arrayTypep, int dim, FileLine* flp) {
         if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts || VN_IS(indexp, Const)) return indexp;
-        if (!arrayTypep || arrayTypep->base()->kind() != VhdlTypeKind::ARRAY
-            || !arrayTypep->isConstrainedArray() || stringBehind(arrayTypep)) {
-            return indexp;
-        }
-        const VhdlType* const idxp = indexSubtype(arrayTypep, dim);
-        if (!idxp || !idxp->bounded() || arrayTypep->dimOpen(dim)
-            || idxp->base()->kind() != VhdlTypeKind::INTEGER) {
-            return indexp;
-        }
-        // A null range has nothing in it, and every index is outside it
-        const int64_t lo = idxp->ascending() ? idxp->left() : idxp->right();
-        const int64_t hi = idxp->ascending() ? idxp->right() : idxp->left();
-        if (lo < INT32_MIN || hi > INT32_MAX || lo > INT32_MAX || hi < INT32_MIN) return indexp;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        const VhdlType* idxp = nullptr;
+        if (!checkRange(arrayTypep, dim, flp, leftp, rightp, ascending, idxp)) return indexp;
+        // An index whose own subtype lies inside the range needs no check
         const VhdlType* const ownp = actualp ? actualp->vhdlTypep() : nullptr;
-        if (ownp && ownp->bounded() && ownp->base()->kind() == VhdlTypeKind::INTEGER && lo <= hi) {
+        if (idxp->bounded() && ownp && ownp->bounded()
+            && ownp->base()->kind() == VhdlTypeKind::INTEGER && idxp->length() > 0) {
+            const int64_t lo = std::min(idxp->left(), idxp->right());
+            const int64_t hi = std::max(idxp->left(), idxp->right());
             const int64_t olo = ownp->ascending() ? ownp->left() : ownp->right();
             const int64_t ohi = ownp->ascending() ? ownp->right() : ownp->left();
-            if (olo >= lo && ohi <= hi) return indexp;
+            if (olo >= lo && ohi <= hi) {
+                VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return indexp;
+            }
         }
-        // Read once, where reading it twice could differ
+        // A place written to: a call that gives the index back, which stands
+        // where an index can, in a target too
+        if (m_asTarget) return checkCall(false, indexp, nullptr, leftp, rightp, ascending, flp);
+        // Read: the check in line, the index read once where reading it
+        // twice could differ
         AstNode* setp = nullptr;
         AstNodeExpr* valp = indexp;
         if (!VN_IS(indexp, VarRef)) {
             AstVar* const tmpp = newTempVar("__Vidx", newIntDType(flp), flp);
-            setp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, indexp};
+            setp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE},
+                                 intBound(indexp, flp)};
             valp = new AstVarRef{flp, tmpp, VAccess::READ};
         }
-        const auto intConst = [&](int64_t v) {
-            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
-        };
+        AstNodeExpr* const lop = ascending ? leftp : rightp;
+        AstNodeExpr* const hip = ascending ? rightp : leftp;
         AstNodeExpr* const condp
-            = new AstLogOr{flp, new AstLtS{flp, valp->cloneTree(false), intConst(lo)},
-                           new AstGtS{flp, valp->cloneTree(false), intConst(hi)}};
-        const std::string range = std::to_string(idxp->left())
-                                  + (idxp->ascending() ? " to " : " downto ")
-                                  + std::to_string(idxp->right());
-        AstNode* const reportp
-            = new AstDisplay{flp, VDisplayType::DT_ERROR,
-                             "Index %0d is outside of the range " + range + " of the array",
+            = new AstLogOr{flp, new AstLtS{flp, valp->cloneTree(false), lop->cloneTree(false)},
+                           new AstGtS{flp, valp->cloneTree(false), hip->cloneTree(false)}};
+        AstDisplay* const reportp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                             "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                                 + ": Index %0d is outside of the range %0d"
+                                 + (ascending ? " to " : " downto ") + "%0d of the array",
                              nullptr, valp->cloneTree(false)};
-        reportp->addNext(new AstStop{flp, true});
-        setp = AstNode::addNextNull(setp, new AstIf{flp, condp, reportp});
+        reportp->fmtp()->exprsp()->addNext(leftp);
+        reportp->fmtp()->exprsp()->addNext(rightp);
+        AstNode* const stmtsp = reportp;
+        stmtsp->addNext(new AstStop{flp, true});
+        setp = AstNode::addNextNull(setp, new AstIf{flp, condp, stmtsp});
         return new AstExprStmt{flp, setp, valp};
+    }
+    // A slice whose ends are not both numbers: the left end, once the slice
+    // is checked; the right end is read again, so it has to be pure
+    AstNodeExpr* checkedSliceLeft(AstNodeExpr* sliceLeftp, AstNodeExpr* sliceRightp,
+                                  const VhdlType* arrayTypep, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return sliceLeftp;
+        if (VN_IS(sliceLeftp, Const) && VN_IS(sliceRightp, Const)) return sliceLeftp;
+        if (!sliceRightp->isPure()) return sliceLeftp;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        const VhdlType* idxp = nullptr;
+        if (!checkRange(arrayTypep, 0, flp, leftp, rightp, ascending, idxp)) return sliceLeftp;
+        return checkCall(true, sliceLeftp, sliceRightp->cloneTree(false), leftp, rightp, ascending,
+                         flp);
+    }
+    // "__VidxchkN(i, left, right)" or "__VslchkN(l, r, left, right)": i or l,
+    // once checked. One per place and direction, so the report's text is a
+    // constant of the function and a call passes numbers only.
+    std::map<std::string, AstNodeFTask*> m_idxChkFuncs;
+    AstNodeExpr* checkCall(bool slice, AstNodeExpr* indexp, AstNodeExpr* sliceRightp,
+                           AstNodeExpr* leftp, AstNodeExpr* rightp, bool ascending,
+                           FileLine* flp) {
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        const std::string dir = ascending ? " to " : " downto ";
+        const std::string key = where + (slice ? "|s" : "|i") + dir;
+        AstNodeFTask*& funcpr = m_idxChkFuncs[key];
+        if (!funcpr || !usableHelper(funcpr)) {
+            FileLine* const hflp = dynFl(flp);
+            const std::string name
+                = (slice ? "__Vslchk" : "__Vidxchk") + std::to_string(++m_nameNum);
+            AstFunc* const funcp = new AstFunc{hflp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            funcp->fvarp(newReturnVar(name, newIntDType(hflp), hflp));
+            AstVar* const ip = dynArg(funcp, "i", newIntDType(hflp), hflp);
+            AstVar* const jp = slice ? dynArg(funcp, "j", newIntDType(hflp), hflp) : nullptr;
+            AstVar* const lp = dynArg(funcp, "l", newIntDType(hflp), hflp);
+            AstVar* const rp = dynArg(funcp, "r", newIntDType(hflp), hflp);
+            // The array's own low and high ends
+            AstVar* const lop = ascending ? lp : rp;
+            AstVar* const hip = ascending ? rp : lp;
+            const auto outside = [&](AstVar* vp) {
+                return new AstLogOr{hflp, new AstLtS{hflp, rd(vp, hflp), rd(lop, hflp)},
+                                    new AstGtS{hflp, rd(vp, hflp), rd(hip, hflp)}};
+            };
+            AstNodeExpr* condp = outside(ip);
+            std::string text = "%%Error: " + where + ": Index %0d is outside of the range %0d"
+                               + dir + "%0d of the array";
+            if (slice) {
+                // A slice that is not null and does not lie inside the range
+                AstNodeExpr* const notNullp
+                    = ascending ? static_cast<AstNodeExpr*>(
+                                      new AstLteS{hflp, rd(ip, hflp), rd(jp, hflp)})
+                                : static_cast<AstNodeExpr*>(
+                                      new AstGteS{hflp, rd(ip, hflp), rd(jp, hflp)});
+                condp = new AstLogAnd{hflp, notNullp, new AstLogOr{hflp, condp, outside(jp)}};
+                text = "%%Error: " + where + ": Slice %0d" + dir
+                       + "%0d is outside of the range %0d" + dir + "%0d of the array";
+            }
+            AstDisplay* const reportp
+                = new AstDisplay{hflp, VDisplayType::DT_DISPLAY, text, nullptr, rd(ip, hflp)};
+            if (slice) reportp->fmtp()->exprsp()->addNext(rd(jp, hflp));
+            reportp->fmtp()->exprsp()->addNext(rd(lp, hflp));
+            reportp->fmtp()->exprsp()->addNext(rd(rp, hflp));
+            AstNode* const stmtsp = reportp;
+            stmtsp->addNext(new AstStop{hflp, true});
+            funcp->addStmtsp(new AstIf{hflp, condp, stmtsp});
+            funcp->addStmtsp(new AstAssign{
+                hflp, new AstVarRef{hflp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                rd(ip, hflp)});
+            addHelperFunc(funcp);
+            funcpr = funcp;
+        }
+        AstArg* const argsp = new AstArg{flp, "", intBound(indexp, flp)};
+        if (slice) argsp->addNext(new AstArg{flp, "", intBound(sliceRightp, flp)});
+        argsp->addNext(new AstArg{flp, "", intBound(leftp, flp)});
+        argsp->addNext(new AstArg{flp, "", intBound(rightp, flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, funcpr->name(), argsp};
+        refp->taskp(VN_AS(funcpr, Func));
+        return refp;
     }
 
     // Converted to an unconstrained array type, a value keeps its bounds,
@@ -16427,6 +16552,7 @@ private:
                     if (!rp->leftp() || !rp->rightp()) unsup(flp, "slice by an attribute range");
                     return nullptr;
                 }
+                leftp = checkedSliceLeft(leftp, rightp, nodep->prefixp()->vhdlTypep(), flp);
                 leftp = applyShifts(shifts, leftp, flp);
                 rightp = applyShifts(shifts, rightp, flp);
                 // A name numbered the other way round from the object it

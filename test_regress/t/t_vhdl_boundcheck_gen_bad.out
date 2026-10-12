@@ -1,0 +1,4 @@
+t/t_vhdl_boundcheck_gen_bad.vhd:21:9:@6000000:(report note): before
+%Error: t/t_vhdl_boundcheck_gen_bad.vhd:23: Index 6 is outside of the range 0 to 5 of the array
+%Error: t/t_vhdl_boundcheck_gen_bad.vhd:23: Verilog $stop
+Aborting...
