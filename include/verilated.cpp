@@ -2518,10 +2518,10 @@ std::string VL_VHDL_REAL_IMAGE(double lhs) VL_PURE {
 std::string VL_VHDL_REAL_FORMAT(double lhs, const char* specp) VL_PURE {
     // One conversion specification the frontend has already checked; a
     // width or precision may ask for more than any fixed buffer holds
-    const int len = std::snprintf(nullptr, 0, specp, lhs);
+    const int len = VL_SNPRINTF(nullptr, 0, specp, lhs);
     if (len <= 0) return "";
     std::string out(static_cast<size_t>(len) + 1, '\0');
-    std::snprintf(&out[0], out.size(), specp, lhs);
+    VL_SNPRINTF(&out[0], out.size(), specp, lhs);
     out.resize(static_cast<size_t>(len));
     return out;
 }
