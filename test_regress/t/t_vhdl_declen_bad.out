@@ -1,0 +1,4 @@
+t/t_vhdl_declen_bad.vhd:26:5:@0:(report note): before
+[0] %Error: t_vhdl_declen_bad.vhd:18: Assertion failed in t_vhdl_declen_bad.f__V1: Array lengths do not match
+%Error: t/t_vhdl_declen_bad.vhd:18: Verilog $stop
+Aborting...

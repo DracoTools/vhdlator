@@ -5242,6 +5242,20 @@ private:
         return refp;
     }
 
+    // Whether two one-dimensional array subtypes both have a length that is
+    // a number here, and the numbers differ
+    static bool staticLengthsDiffer(const VhdlType* ap, const VhdlType* bp) {
+        const auto lengthOf = [](const VhdlType* tp) -> int64_t {
+            if (!tp || tp->base()->kind() != VhdlTypeKind::ARRAY || !tp->isConstrainedArray()
+                || tp->indexTypes().size() != 1) {
+                return -1;
+            }
+            return std::max<int64_t>(tp->indexTypes()[0]->length(), 0);
+        };
+        const int64_t a = lengthOf(ap);
+        const int64_t b = lengthOf(bp);
+        return a >= 0 && b >= 0 && a != b;
+    }
     // Lengths that do not match, where only running can tell, are an error
     // that ends the run (5.3.2.2, 10.6.2.1), as nvc 1.22.1 and GHDL 7.0.0-dev
     // end it
@@ -8402,6 +8416,16 @@ private:
                 // else it is elaborated once, before the design runs, and a
                 // statement cannot stand loose among a module's own
                 addStmt(setp ? (m_ftaskp ? setp : new AstInitial{flp, setp}) : nullptr);
+                return;
+            }
+            // In a subprogram, an initial value whose length differs from the
+            // object's -- as the copy made for one call can make them -- is an
+            // error once the declaration is elaborated (5.3.2.2, 14.6), where
+            // nvc, GHDL and Questa stop the run (NVC bounds45)
+            if (m_ftaskp && objp->defaultp()
+                && staticLengthsDiffer(symp->typep(), objp->defaultp()->vhdlTypep())) {
+                addStmt(varp);
+                addStmt(lengthMismatch(flp));
                 return;
             }
             if (objp->defaultp()) {
