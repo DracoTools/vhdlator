@@ -10630,14 +10630,48 @@ private:
         if (!refp || refp->varp()->isIO() || m_elemAliased.count(refp->varp())) return false;
         const AstNodeDType* const actDtp
             = refp->varp()->childDTypep() ? refp->varp()->childDTypep() : refp->varp()->dtypep();
-        const AstNodeDType* const partDtp = partDType(partp);
         std::string actKind;
         std::string partKind;
         std::vector<std::pair<int64_t, int64_t>> actDims;
         std::vector<std::pair<int64_t, int64_t>> partDims;
-        return actDtp && partDtp && packedShape(actDtp, actKind, actDims)
-               && packedShape(partDtp, partKind, partDims) && actKind == partKind
+        return actDtp && packedShape(actDtp, actKind, actDims)
+               && partShape(partp, partKind, partDims) && actKind == partKind
                && actDims == partDims;
+    }
+    // The shape of a part of a port: a name or a record element, an element
+    // of an unpacked array at a fixed index -- "io_a(0)" of an array of
+    // vectors (GHDL gna bug17759) -- or one bit of a vector, "io_a(1)(0)"
+    static bool partShape(const AstNodeExpr* partp, std::string& kindr,
+                          std::vector<std::pair<int64_t, int64_t>>& dimsr) {
+        const AstSelBit* const selp = VN_CAST(partp, SelBit);
+        if (!selp) {
+            const AstNodeDType* const dtp = partDType(partp);
+            return dtp && packedShape(dtp, kindr, dimsr);
+        }
+        if (!VN_IS(selp->bitp(), Const)) return false;
+        // What the index selects from: an unpacked array, or a vector
+        const AstSelBit* const innerp = VN_CAST(selp->fromp(), SelBit);
+        const AstNodeDType* fromDtp = nullptr;
+        if (innerp) {
+            if (!VN_IS(innerp->bitp(), Const)) return false;
+            const AstUnpackArrayDType* const arrp
+                = VN_CAST(partDType(innerp->fromp()), UnpackArrayDType);
+            if (!arrp) return false;
+            fromDtp = arrp->childDTypep() ? arrp->childDTypep() : arrp->subDTypep();
+        } else {
+            fromDtp = partDType(selp->fromp());
+        }
+        if (const AstUnpackArrayDType* const arrp = VN_CAST(fromDtp, UnpackArrayDType)) {
+            if (innerp) return false;  // An element of an element: not this shape
+            const AstNodeDType* const subp
+                = arrp->childDTypep() ? arrp->childDTypep() : arrp->subDTypep();
+            return subp && packedShape(subp, kindr, dimsr);
+        }
+        // One bit of a vector is a scalar of the vector's kind
+        const AstBasicDType* const bdtp = VN_CAST(fromDtp, BasicDType);
+        if (!bdtp || !(bdtp->rangep() || bdtp->nrange().ranged())) return false;
+        kindr = bdtp->keyword().ascii();
+        return true;
     }
     // Every name of such a signal becomes the element; the signal itself
     // follows it, for a name another unit reaches it by
