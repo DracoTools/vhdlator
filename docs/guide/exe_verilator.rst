@@ -2135,15 +2135,27 @@ Summary:
 
 .. option:: --no-vhdl-bound-check
 
-   Enables/disables checking, while the model runs, that each index into a
-   VHDL array, and the first index of each slice, lies inside the array's
-   range, including a range that a generic gives; where it does not, the
-   model stops with an error, as IEEE 1076 requires. Indexes that cannot fall
-   outside the range, such as the variable of a loop over the array's
-   ``'RANGE``, are not checked. With :vlopt:`--no-vhdl-bound-check`, an index
-   outside its array reads and writes what the equivalent Verilog select
-   would, and the model runs on; this saves the cost of the checks, about 10%
-   in a loop that does little but index arrays. Defaults to enabled.
+   Enables/disables the VHDL checks made while the model runs, where IEEE
+   1076 makes a value an error when it is evaluated or assigned; where one
+   fails, the model stops with an error, as other VHDL simulators stop it:
+
+   - each index into an array, and the first index of each slice, lies
+     inside the array's range, including a range that a generic gives;
+   - a value assigned to a variable or a signal, or returned by a function,
+     lies inside its scalar subtype's range (``natural``, ``my_int range 1
+     to 10``, ``delay_length``);
+   - an array value has the length of what it is assigned to, of the
+     constrained formal it is passed to, or of an alias of it;
+   - an INTEGER or physical division, ``mod`` or ``rem`` is not by zero;
+   - a delay in ``after`` or ``wait for`` is not negative;
+   - a function does not end without a ``return``.
+
+   Values that cannot fail a check, such as the variable of a loop over the
+   array's ``'RANGE`` used as its index, are not checked. With
+   :vlopt:`--no-vhdl-bound-check`, an index outside its array reads and
+   writes what the equivalent Verilog select would, and the model runs on;
+   this saves the cost of the checks, about 10% in a loop that does little
+   but index arrays. Defaults to enabled.
 
 .. option:: --vhdl-std <std>
 

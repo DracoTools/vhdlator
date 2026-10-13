@@ -1,0 +1,3 @@
+[0] %Error: t_vhdl_lenchk_init_bad.vhd:20: Assertion failed in t_vhdl_lenchk_init_bad: Array lengths do not match
+%Error: t/t_vhdl_lenchk_init_bad.vhd:20: Verilog $stop
+Aborting...

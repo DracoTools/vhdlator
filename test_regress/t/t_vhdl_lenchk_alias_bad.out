@@ -1,0 +1,4 @@
+t/t_vhdl_lenchk_alias_bad.vhd:24:5:@0:(report note): three fits
+[0] %Error: t_vhdl_lenchk_alias_bad.vhd:14: Assertion failed in t_vhdl_lenchk_alias_bad.get__V2: Array lengths do not match
+%Error: t/t_vhdl_lenchk_alias_bad.vhd:14: Verilog $stop
+Aborting...

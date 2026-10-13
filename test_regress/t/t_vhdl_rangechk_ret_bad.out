@@ -1,0 +1,4 @@
+t/t_vhdl_rangechk_ret_bad.vhd:19:5:@0:(report note): three fits
+%Error: t/t_vhdl_rangechk_ret_bad.vhd:20: Value -3 is outside of the range 0 to 2147483647 of subtype natural
+%Error: t/t_vhdl_rangechk_ret_bad.vhd:20: Verilog $stop
+Aborting...

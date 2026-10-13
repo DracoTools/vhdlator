@@ -679,6 +679,24 @@ private:
                         onep = dynAsFixed(asp->actualp(), formalp, asp->fileline());
                     }
                 }
+                // An actual whose length differs from a constrained formal's,
+                // where only the copy made for this call settles the actual's:
+                // an error when the call is made (4.2.2.1), where nvc, GHDL
+                // and Questa stop the run (NVC bounds18). Written directly,
+                // analysis refuses it.
+                if (!onep && symp && m_ftaskp && v3Global.opt.vhdlBoundCheck()) {
+                    const int at = namep ? symp->paramIndex(namep->name()) : static_cast<int>(pos);
+                    const VhdlType* const formalp
+                        = at >= 0 && at < static_cast<int>(symp->paramTypes().size())
+                              ? symp->paramTypes()[at]
+                              : nullptr;
+                    if (staticLengthsDiffer(formalp, asp->actualp()->vhdlTypep())) {
+                        if (AstNodeExpr* const valp = lowerExpr(asp->actualp())) {
+                            onep = new AstExprStmt{asp->fileline(),
+                                                   lengthMismatch(asp->fileline()), valp};
+                        }
+                    }
+                }
                 // A record aggregate handed to a parameter is built in the
                 // shape the parameter is held in, which may carry an element
                 // the aggregate gives as bits: "is_0(v.a => '1', v.w => a)"
@@ -5552,6 +5570,230 @@ private:
         }
         return outp;
     }
+    // A value assigned to an object of a scalar subtype narrower than its
+    // type has to lie in that subtype's range (5.2.1, 10.6.2, 14.7.3.3), and
+    // one that does not is an error when it is assigned, where nvc, GHDL and
+    // Questa stop the run: "value 11 outside of MY_INT range 1 to 10". The
+    // value is handed back, or the run stops. Under --vhdl-bound-check, for
+    // subtypes whose bounds are numbers here; a value whose own subtype lies
+    // inside the range, or a number that does, is not checked. INTEGER
+    // itself needs none, being exactly what it is held as; REAL is checked,
+    // for the infinities arithmetic can give.
+    std::map<std::string, AstNodeFTask*> m_rangeChkFuncs;
+    AstNodeExpr* rangeChecked(AstNodeExpr* valp, const VhdlType* typep,
+                              const AstNodeVhdlExpr* valuep, FileLine* flp) {
+        if (!valp || !typep || !v3Global.opt.vhdlBoundCheck() || !m_inStmts) return valp;
+        const VhdlType* const basep = typep->base();
+        const VhdlTypeKind kind = basep->kind();
+        const bool real = kind == VhdlTypeKind::FLOATING;
+        if (kind != VhdlTypeKind::INTEGER && kind != VhdlTypeKind::PHYSICAL
+            && kind != VhdlTypeKind::ENUM && !real) {
+            return valp;
+        }
+        if (kind == VhdlTypeKind::ENUM && enumIsLogic(basep)) return valp;
+        if (!typep->bounded() || typep->isNull()) return valp;
+        // A type whose range is all its values can hold needs no check:
+        // INTEGER, TIME, an enumeration type. One declared with a range of
+        // its own -- "type my_int is range 1 to 10" -- does.
+        if (!real && typep == basep
+            && (kind == VhdlTypeKind::ENUM || kind == VhdlTypeKind::PHYSICAL)) {
+            return valp;
+        }
+        const bool wide = kind == VhdlTypeKind::INTEGER && needsWideInt(basep);
+        if (kind == VhdlTypeKind::INTEGER && typep->low() <= (wide ? INT64_MIN : INT32_MIN)
+            && typep->high() >= (wide ? INT64_MAX : INT32_MAX)) {
+            return valp;
+        }
+        // Inside the range already: an object of a subtype inside it, which
+        // holds only values of that subtype, or a value that is a number
+        // inside it. Not a conversion or a call by the subtype it names: a
+        // conversion checks its result (9.3.6), and a call elaboration
+        // folded never ran the check of its return
+        const VhdlType* const ownp
+            = valuep && (VN_IS(valuep, VhdlName) || VN_IS(valuep, VhdlSelected))
+                  ? valuep->vhdlTypep()
+                  : nullptr;
+        if (ownp && ownp->bounded() && ownp->base() == basep && !ownp->isNull()) {
+            if (real ? (ownp->lowReal() >= typep->lowReal()
+                        && ownp->highReal() <= typep->highReal())
+                     : (ownp->low() >= typep->low() && ownp->high() <= typep->high())) {
+                return valp;
+            }
+        }
+        if (VN_IS(valp, Const)) {
+            const VhdlValue val
+                = valuep ? V3VhdlEval::eval(const_cast<AstNodeVhdlExpr*>(valuep)) : VhdlValue{};
+            if (val.known() && V3VhdlEval::inRange(val, typep)) return valp;
+        }
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        const std::string lo
+            = real ? std::to_string(typep->lowReal()) : std::to_string(typep->low());
+        const std::string hi
+            = real ? std::to_string(typep->highReal()) : std::to_string(typep->high());
+        // In line, the value held once: "{ t = v; if (t < lo || t > hi) stop; t }"
+        AstVar* const tmpp
+            = newTempVar("__Vrng", lowerType(const_cast<VhdlType*>(basep), flp), flp);
+        const auto rdt = [&]() { return new AstVarRef{flp, tmpp, VAccess::READ}; };
+        AstNode* const setp = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, valp};
+        AstNodeExpr* condp = nullptr;
+        if (real) {
+            condp = new AstLogOr{
+                flp,
+                new AstLtD{flp, rdt(),
+                           new AstConst{flp, AstConst::RealDouble{}, typep->lowReal()}},
+                new AstGtD{flp, rdt(),
+                           new AstConst{flp, AstConst::RealDouble{}, typep->highReal()}}};
+        } else {
+            AstNodeExpr* const lop
+                = lowerValue(VhdlValue::mkInt(typep->low(), const_cast<VhdlType*>(typep)),
+                             const_cast<VhdlType*>(basep), flp);
+            AstNodeExpr* const hip
+                = lowerValue(VhdlValue::mkInt(typep->high(), const_cast<VhdlType*>(typep)),
+                             const_cast<VhdlType*>(basep), flp);
+            // A bound at the end of what the held type can hold cannot be
+            // passed: NATURAL's high end, POSITIVE's
+            const bool repType = kind == VhdlTypeKind::INTEGER;
+            const bool loNeeded = !repType || typep->low() > (wide ? INT64_MIN : INT32_MIN);
+            const bool hiNeeded = !repType || typep->high() < (wide ? INT64_MAX : INT32_MAX);
+            AstNodeExpr* const belowp
+                = !loNeeded ? nullptr
+                  : kind == VhdlTypeKind::ENUM
+                      ? static_cast<AstNodeExpr*>(new AstLt{flp, rdt(), lop})
+                      : static_cast<AstNodeExpr*>(new AstLtS{flp, rdt(), lop});
+            AstNodeExpr* const abovep
+                = !hiNeeded ? nullptr
+                  : kind == VhdlTypeKind::ENUM
+                      ? static_cast<AstNodeExpr*>(new AstGt{flp, rdt(), hip})
+                      : static_cast<AstNodeExpr*>(new AstGtS{flp, rdt(), hip});
+            if (!loNeeded) VL_DO_DANGLING(lop->deleteTree(), lop);
+            if (!hiNeeded) VL_DO_DANGLING(hip->deleteTree(), hip);
+            condp = belowp && abovep ? new AstLogOr{flp, belowp, abovep}
+                                     : (belowp ? belowp : abovep);
+        }
+        AstNode* const stmtsp = new AstDisplay{
+            flp, VDisplayType::DT_DISPLAY,
+            "%%Error: " + where + ": Value " + (real ? "%g" : "%0d") + " is outside of the range "
+                + lo + " to " + hi + " of subtype " + typep->prettyName(),
+            nullptr, rdt()};
+        stmtsp->addNext(new AstStop{flp, true});
+        setp->addNext(new AstIf{flp, condp, stmtsp});
+        return new AstExprStmt{flp, setp, rdt()};
+    }
+    // An INTEGER or physical "/", "mod" or "rem" by zero is an error when
+    // it is evaluated (9.2.7), where nvc, GHDL and Questa stop the run. The
+    // divisor is handed back, or the run stops. Under --vhdl-bound-check,
+    // and not for a divisor that is a number other than zero.
+    AstNodeExpr* divisorChecked(AstNodeExpr* rhsp, VhdlType* rtypep, FileLine* flp) {
+        if (!rhsp || !rtypep || !v3Global.opt.vhdlBoundCheck() || !m_inStmts) return rhsp;
+        const VhdlTypeKind kind = rtypep->base()->kind();
+        if (kind != VhdlTypeKind::INTEGER && kind != VhdlTypeKind::PHYSICAL) return rhsp;
+        if (const AstConst* const constp = VN_CAST(rhsp, Const)) {
+            if (!constp->num().isEqZero()) return rhsp;
+        }
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        const std::string key = where + "|div|" + rtypep->base()->name();
+        AstNodeFTask*& funcpr = m_rangeChkFuncs[key];
+        if (!funcpr || !usableHelper(funcpr)) {
+            FileLine* const hflp = dynFl(flp);
+            const std::string name = "__Vdivchk" + std::to_string(++m_nameNum);
+            AstFunc* const funcp = new AstFunc{hflp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            funcp->fvarp(newReturnVar(name, lowerType(rtypep->base(), hflp), hflp));
+            AstVar* const vp = dynArg(funcp, "v", lowerType(rtypep->base(), hflp), hflp);
+            AstNode* const stmtsp
+                = new AstDisplay{hflp, VDisplayType::DT_DISPLAY,
+                                 "%%Error: " + where + ": Division by zero", nullptr, nullptr};
+            stmtsp->addNext(new AstStop{hflp, true});
+            funcp->addStmtsp(new AstIf{
+                hflp, new AstEq{hflp, rd(vp, hflp), new AstConst{hflp, AstConst::All0{}}},
+                stmtsp});
+            funcp->addStmtsp(new AstAssign{
+                hflp, new AstVarRef{hflp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                rd(vp, hflp)});
+            addHelperFunc(funcp);
+            funcpr = funcp;
+        }
+        AstFuncRef* const refp = new AstFuncRef{flp, funcpr->name(), new AstArg{flp, "", rhsp}};
+        refp->taskp(VN_AS(funcpr, Func));
+        return refp;
+    }
+    // A negative delay in an "after" or a "wait for" is an error when it is
+    // evaluated (10.2, 10.5.2.1), where nvc, GHDL and Questa stop the run:
+    // "illegal negative delay -1 ns". The delay is handed back, or the run
+    // stops. Under --vhdl-bound-check, and not for a delay that is a number
+    // of zero or more.
+    AstNodeExpr* delayChecked(AstNodeExpr* timep, FileLine* flp) {
+        if (!timep || !v3Global.opt.vhdlBoundCheck()) return timep;
+        if (const AstConst* const constp = VN_CAST(timep, Const)) {
+            if (!constp->num().isNegative()) return timep;
+        }
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        const std::string key = where + "|delay";
+        AstNodeFTask*& funcpr = m_rangeChkFuncs[key];
+        if (!funcpr || !usableHelper(funcpr)) {
+            FileLine* const hflp = dynFl(flp);
+            const std::string name = "__Vdlychk" + std::to_string(++m_nameNum);
+            AstFunc* const funcp = new AstFunc{hflp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            const auto timeType = [&]() {
+                return new AstBasicDType{hflp, VBasicDTypeKwd::LOGIC, VSigning::SIGNED,
+                                         VNumRange{63, 0}, -1};
+            };
+            funcp->fvarp(newReturnVar(name, timeType(), hflp));
+            AstVar* const vp = dynArg(funcp, "v", timeType(), hflp);
+            AstNode* const stmtsp = new AstDisplay{
+                hflp, VDisplayType::DT_DISPLAY, "%%Error: " + where + ": Negative delay of %0d fs",
+                nullptr, rd(vp, hflp)};
+            stmtsp->addNext(new AstStop{hflp, true});
+            funcp->addStmtsp(new AstIf{
+                hflp, new AstLtS{hflp, rd(vp, hflp), new AstConst{hflp, AstConst::Signed32{}, 0}},
+                stmtsp});
+            funcp->addStmtsp(new AstAssign{
+                hflp, new AstVarRef{hflp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                rd(vp, hflp)});
+            addHelperFunc(funcp);
+            funcpr = funcp;
+        }
+        AstFuncRef* const refp = new AstFuncRef{flp, funcpr->name(), new AstArg{flp, "", timep}};
+        refp->taskp(VN_AS(funcpr, Func));
+        return refp;
+    }
+    // The error an initial value elaboration folds makes, where it does not
+    // fit the object's subtype: null where it fits, or does not fold
+    AstNode* initValueFailure(AstNodeVhdlExpr* valuep, const VhdlType* typep, FileLine* flp) {
+        if (!valuep || !typep) return nullptr;
+        const VhdlType* const basep = typep->base();
+        const VhdlTypeKind kind = basep->kind();
+        const bool scalar = kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::PHYSICAL
+                            || kind == VhdlTypeKind::FLOATING
+                            || (kind == VhdlTypeKind::ENUM && !enumIsLogic(basep));
+        const bool vector = kind == VhdlTypeKind::ARRAY && typep->isConstrainedArray()
+                            && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
+                            && typep->indexTypes()[0]->bounded();
+        if (!scalar && !vector) return nullptr;
+        if (scalar && !typep->bounded()) return nullptr;
+        // A call whose copy was made for these arguments gives back a value
+        // of a length that is a number, though it does not fold
+        if (vector && staticLengthsDiffer(typep, shapeTypeOf(valuep))) return lengthMismatch(flp);
+        const VhdlValue val = V3VhdlEval::eval(valuep);
+        if (!val.known()) return nullptr;
+        if (vector) {
+            if (!val.isStr() && !val.isArray()) return nullptr;
+            const int64_t have = val.isStr() ? static_cast<int64_t>(val.toStr().size())
+                                             : static_cast<int64_t>(val.elements());
+            const int64_t want = std::max<int64_t>(typep->indexTypes()[0]->length(), 0);
+            return have == want ? nullptr : lengthMismatch(flp);
+        }
+        if (V3VhdlEval::inRange(val, typep)) return nullptr;
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        AstNode* const stmtsp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                             "%%Error: " + where + ": Initial value " + V3VhdlEval::image(val)
+                                 + " is outside of the range of subtype " + typep->prettyName(),
+                             nullptr, nullptr};
+        stmtsp->addNext(new AstStop{flp, true});
+        return stmtsp;
+    }
     // A slice whose ends are not both numbers: the left end, once the slice
     // is checked; the right end is read again, so it has to be pure
     AstNodeExpr* checkedSliceLeft(AstNodeExpr* sliceLeftp, AstNodeExpr* sliceRightp,
@@ -8657,6 +8899,19 @@ private:
                 addStmt(lengthMismatch(flp));
                 return;
             }
+            // Anywhere, an initial value elaboration folds that does not fit
+            // its object -- another length, or a number outside its subtype
+            // -- is an error once the declaration is elaborated (5.3.2.2,
+            // 14.6), where nvc, GHDL and Questa stop the run: "(init): value
+            // length 12 does not match variable X length 8" (NVC bounds17)
+            if (objp->defaultp() && v3Global.opt.vhdlBoundCheck()) {
+                if (AstNode* const failp
+                    = initValueFailure(objp->defaultp(), symp->typep(), flp)) {
+                    addStmt(varp);
+                    addStmt(m_ftaskp ? failp : new AstInitial{flp, failp});
+                    return;
+                }
+            }
             if (objp->defaultp()) {
                 // A value that carries its own bounds, given to an object
                 // whose subtype fixes them, is copied into one of those --
@@ -8832,6 +9087,16 @@ private:
             return;  // Nothing to emit: analysis already used these
         }
         if (AstVhdlAliasDecl* const aliasp = VN_CAST(nodep, VhdlAliasDecl)) {
+            // An alias whose subtype's length differs from the object's, where
+            // only the copy made for this call settles the object's: an error
+            // when the alias is elaborated (6.6.2), where nvc and GHDL stop
+            // the run (NVC alias12). Written directly, analysis refuses it.
+            if (m_ftaskp && v3Global.opt.vhdlBoundCheck() && aliasp->subtypep()
+                && aliasp->vhdlSymp() && aliasp->targetp()
+                && staticLengthsDiffer(aliasp->vhdlSymp()->typep(),
+                                       aliasp->targetp()->vhdlTypep())) {
+                addStmt(lengthMismatch(flp));
+            }
             aliasCarrier(aliasp);
             return;  // Names, not storage
         }
@@ -16174,6 +16439,7 @@ private:
                          : static_cast<AstNodeExpr*>(new AstMul{flp, lhsp, rhsp});
         case VhdlBinaryOp::DIV:
             if (real) return new AstDivD{flp, lhsp, rhsp};
+            rhsp = divisorChecked(rhsp, rtypep, flp);
             // A physical value and an INTEGER are of two widths here, TIME
             // the wider, and the product or quotient is a physical value:
             // the INTEGER is widened as it should be, and that is not worth
@@ -16195,9 +16461,11 @@ private:
         case VhdlBinaryOp::REM:
             // VHDL's rem takes the sign of its left operand, which is what
             // the truncating remainder gives (9.2.7)
+            rhsp = divisorChecked(rhsp, rtypep, flp);
             return signd ? static_cast<AstNodeExpr*>(new AstModDivS{flp, lhsp, rhsp})
                          : static_cast<AstNodeExpr*>(new AstModDiv{flp, lhsp, rhsp});
         case VhdlBinaryOp::MOD:
+            rhsp = divisorChecked(rhsp, rtypep, flp);
             if (!signd) return new AstModDiv{flp, lhsp, rhsp};
             // mod takes the sign of its right operand (9.2.7): a remainder
             // of the other sign moves by one divisor. Only then -- "(a rem
@@ -25351,7 +25619,8 @@ private:
             maskp = new AstConst{flp, ones};
             if (wantZ) zargp = zConstOf(ones.width());
         }
-        AstNodeExpr* const dp = wfp->afterp() ? lowerExpr(wfp->afterp()) : zero();
+        AstNodeExpr* const dp
+            = wfp->afterp() ? delayChecked(lowerExpr(wfp->afterp()), wfp->fileline()) : zero();
         AstNodeExpr* rp = nullptr;
         if (!first || kind == VhdlDelayKind::TRANSPORT) {
             rp = zero();
@@ -25838,7 +26107,7 @@ private:
             unsup(wfp->fileline(), "'after' delay without --timing");
             return nullptr;
         }
-        AstNodeExpr* const timep = lowerExpr(wfp->afterp());
+        AstNodeExpr* const timep = delayChecked(lowerExpr(wfp->afterp()), wfp->fileline());
         return timep ? new AstDelay{wfp->fileline(), timep, false} : nullptr;
     }
 
@@ -27846,7 +28115,17 @@ private:
                 && !isStringType(vtypep) && isLogicish(velemp)) {
                 return new AstReturn{flp, new AstConst{flp, AstConst::All0{}}};
             }
-            return new AstReturn{flp, retp->valuep() ? lowerExpr(retp->valuep()) : nullptr};
+            // A function's result is of its return subtype: "return -3" from
+            // one returning NATURAL is an error when it returns (4.2.1),
+            // where GHDL and Questa stop the run
+            AstNodeExpr* valp = retp->valuep() ? lowerExpr(retp->valuep()) : nullptr;
+            if (valp) {
+                const auto rit = m_retTypeOf.find(m_ftaskp);
+                if (rit != m_retTypeOf.end()) {
+                    valp = rangeChecked(valp, rit->second, retp->valuep(), flp);
+                }
+            }
+            return new AstReturn{flp, valp};
         }
         if (AstVhdlWait* const waitp = VN_CAST(nodep, VhdlWait)) {
             AstNode* const outp = lowerWait(waitp);
@@ -28583,7 +28862,9 @@ private:
             }
             if (AstNodeExpr* const outp = recordAsShape(valuep, shapep, flp)) return outp;
         }
-        return lowerExpr(valuep);
+        if (!valuep) return nullptr;
+        return rangeChecked(lowerExpr(valuep), targetp ? targetp->vhdlTypep() : nullptr, valuep,
+                            flp);
     }
 
     AstNode* lowerSeqWaveform(AstVhdlSigAssign* nodep, AstVhdlWaveform* wfp, bool sequential) {
@@ -28597,7 +28878,7 @@ private:
             if (!drvp) return nullptr;
             AstNode* delayp = nullptr;
             if (wfp->afterp() && v3Global.opt.timing().isTrue()) {
-                delayp = new AstDelay{flp, lowerExpr(wfp->afterp()), false};
+                delayp = new AstDelay{flp, delayChecked(lowerExpr(wfp->afterp()), flp), false};
             }
             AstNode* const outp = connectStmt(drvp, false, delayp, sequential, flp);
             if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
@@ -28692,7 +28973,7 @@ private:
                 unsup(flp, "'after' delay without --timing");
                 return nullptr;
             }
-            delayp = new AstDelay{flp, lowerExpr(wfp->afterp()), false};
+            delayp = new AstDelay{flp, delayChecked(lowerExpr(wfp->afterp()), flp), false};
         }
         if (AstVhdlAggregate* const aggp = VN_CAST(nodep->targetp(), VhdlAggregate)) {
             AstNode* const outp
@@ -29839,7 +30120,9 @@ private:
             }
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
-        AstNodeExpr* const rhsp = valuep ? lowerExpr(valuep) : nullptr;
+        AstNodeExpr* const rhsp
+            = valuep ? rangeChecked(lowerExpr(valuep), nodep->targetp()->vhdlTypep(), valuep, flp)
+                     : nullptr;
         if (!lhsp || !rhsp) return nullptr;
         if (textLengthUnsettled(nodep->targetp(), valuep, lhsp)) {
             return lengthCheckedTextAssign(VN_AS(lhsp, VarRef), rhsp, flp);
@@ -34122,7 +34405,7 @@ private:
             // "wait until C for T" resumes on whichever comes first, so both
             // are run as branches of a join_any and the loser is dropped
             AstNode* const condp = lowerWaitCond(nodep, flp);
-            AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
+            AstNodeExpr* const timep = delayChecked(lowerExpr(nodep->timeoutp()), flp);
             if (!condp || !timep) {
                 if (condp) VL_DO_DANGLING(condp->deleteTree(), condp);
                 if (timep) VL_DO_DANGLING(timep->deleteTree(), timep);
@@ -34146,7 +34429,7 @@ private:
             // "wait on S for T" resumes on whichever comes first (10.2), the
             // same shape as a condition with a timeout
             AstSenTree* const sensp = sensitivityOf(nodep->sensp(), flp);
-            AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
+            AstNodeExpr* const timep = delayChecked(lowerExpr(nodep->timeoutp()), flp);
             if (!sensp || !timep) {
                 if (sensp) VL_DO_DANGLING(sensp->deleteTree(), sensp);
                 if (timep) VL_DO_DANGLING(timep->deleteTree(), timep);
@@ -34159,7 +34442,7 @@ private:
             return AstNode::addNext(static_cast<AstNode*>(forkp), new AstDisableFork{flp});
         }
         if (nodep->timeoutp()) {
-            AstNodeExpr* const timep = lowerExpr(nodep->timeoutp());
+            AstNodeExpr* const timep = delayChecked(lowerExpr(nodep->timeoutp()), flp);
             return timep ? lowerTimeout(timep, flp) : nullptr;
         }
         if (nodep->sensp()) {
@@ -36757,6 +37040,18 @@ private:
                                             new AstConst{flp, AstConst::BitFalse{}}});
         }
         ftaskp->addStmtsp(lowerStmts(nodep->stmtsp()));
+        // A function whose body ends without a return statement is an error
+        // when that end is reached (4.2.1), where nvc, GHDL and Questa stop
+        // the run: "function NORET did not return a value"
+        if (VN_IS(ftaskp, Func) && v3Global.opt.vhdlBoundCheck()) {
+            AstNode* const stmtsp = new AstDisplay{
+                flp, VDisplayType::DT_DISPLAY,
+                "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                    + ": Function '" + nodep->name() + "' did not return a value",
+                nullptr, nullptr};
+            stmtsp->addNext(new AstStop{flp, true});
+            ftaskp->addStmtsp(stmtsp);
+        }
         // Each file this subprogram declared is closed as its scope is left
         // (5.5.2): at the end of the body, and before every return that
         // leaves it earlier

@@ -1,0 +1,4 @@
+t/t_vhdl_rangechk_sig_bad.vhd:19:5:@1000000:(report note): five fits
+%Error: t/t_vhdl_rangechk_sig_bad.vhd:20: Value -3000000 is outside of the range 0 to 10000000 of subtype small_time
+%Error: t/t_vhdl_rangechk_sig_bad.vhd:20: Verilog $stop
+Aborting...

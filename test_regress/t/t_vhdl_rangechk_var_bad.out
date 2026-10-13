@@ -1,0 +1,4 @@
+t/t_vhdl_rangechk_var_bad.vhd:18:5:@0:(report note): ten fits
+%Error: t/t_vhdl_rangechk_var_bad.vhd:20: Value 11 is outside of the range 1 to 10 of subtype my_int
+%Error: t/t_vhdl_rangechk_var_bad.vhd:20: Verilog $stop
+Aborting...

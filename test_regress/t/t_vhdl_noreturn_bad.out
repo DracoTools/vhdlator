@@ -1,0 +1,4 @@
+t/t_vhdl_noreturn_bad.vhd:23:5:@0:(report note): one returns
+%Error: t/t_vhdl_noreturn_bad.vhd:11: Function 'noret' did not return a value
+%Error: t/t_vhdl_noreturn_bad.vhd:11: Verilog $stop
+Aborting...

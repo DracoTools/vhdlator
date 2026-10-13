@@ -1,0 +1,4 @@
+t/t_vhdl_negdelay_bad.vhd:24:5:@1000000:(report note): one ns fits
+%Error: t/t_vhdl_negdelay_bad.vhd:26: Negative delay of -1000000 fs
+%Error: t/t_vhdl_negdelay_bad.vhd:26: Verilog $stop
+Aborting...

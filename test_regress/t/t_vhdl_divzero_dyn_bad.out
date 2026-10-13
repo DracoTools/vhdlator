@@ -1,0 +1,4 @@
+t/t_vhdl_divzero_dyn_bad.vhd:24:5:@0:(report note): five fits
+%Error: t/t_vhdl_divzero_dyn_bad.vhd:26: Division by zero
+%Error: t/t_vhdl_divzero_dyn_bad.vhd:26: Verilog $stop
+Aborting...
