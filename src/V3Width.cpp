@@ -7488,7 +7488,7 @@ class WidthVisitor final : public VNVisitor {
         }
         if (nodep->fileline()->timingOn()) {
             AstNodeModule* const classp = nodep->classOrPackagep();
-            if (nodep->name() == "self" && classp->name() == "process") {
+            if (nodep->name() == "self" && classp && classp->name() == "process") {
                 // Find if package the class is in is std::
                 AstPackage* const packagep = getItemPackage(classp);
                 if (packagep && packagep->name() == "std") {
