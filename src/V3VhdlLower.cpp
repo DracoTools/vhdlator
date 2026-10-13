@@ -35854,15 +35854,17 @@ private:
         }
         static const char* const LEVELS[] = {"note", "warning", "error", "failure"};
         const char* const levelp = LEVELS[severity < 0 || severity > 3 ? 2 : severity];
-        // The shape simulators print, so that a run can be diffed against one
+        // The shape GHDL prints, so that a run can be diffed against one:
+        // "(report note)" for a report, "(assertion error)" for an assertion
         std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
-                             + std::to_string(flp->firstColumn()) + ":@%0t:(report "
-                             + levelp + "): ";
+                             + std::to_string(flp->firstColumn()) + ":@%0t:("
+                             + (nodep->isReport() ? "report " : "assertion ") + levelp + "): ";
         AstNodeExpr* argsp = new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
         if (nodep->reportp()) {
             argsp = AstNode::addNext(argsp, lowerMessage(nodep->reportp(), format));
         } else {
-            format += "Assertion violation";
+            // The default message (10.3)
+            format += "Assertion violation.";
         }
         AstNode* actionp
             = new AstDisplay{flp, VDisplayType::DT_DISPLAY, format, nullptr, argsp};
