@@ -22121,6 +22121,20 @@ private:
                         readsp = callsp;
                     }
                 }
+                // A subprogram the process declares is part of the process
+                // statement, and what it reads is read by the process (11.3):
+                // "if tready = '1'" in a procedure the body calls (GHDL gna
+                // bug0129)
+                for (AstNode* const localBodyp : localSubprogramBodies(nodep, bodyp)) {
+                    AstSenTree* const subp = sensitivityOfBody(localBodyp, flp, nullptr, true);
+                    if (!subp) continue;
+                    if (readsp) {
+                        readsp->addSensesp(subp->sensesp()->unlinkFrBackWithNext());
+                        VL_DO_DANGLING(subp->deleteTree(), subp);
+                    } else {
+                        readsp = subp;
+                    }
+                }
                 if (sentreep) VL_DO_DANGLING(sentreep->deleteTree(), sentreep);
                 if (!readsp) {
                     // It reads no signal at all, so nothing can ever wake it:
@@ -24316,14 +24330,35 @@ private:
         return outp;
     }
 
-    // Whether any waveform of a conditional assignment schedules a
-    // transaction at a time of its own, or more than one
+    // Whether any waveform of a conditional or selected assignment schedules
+    // a transaction at a time of its own, or more than one -- or is
+    // "unaffected", which schedules none (10.5.2.1): such an assignment is a
+    // process choosing a waveform, since one expression cannot say "nothing"
     static bool anyWaveformDelay(AstVhdlSigAssign* nodep) {
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            AstVhdlWaveform* const wavesp = VN_AS(p, VhdlAlternative)->wavesp();
+            if (wavesp && (wavesp->nextp() || wavesp->afterp())) return true;
+            if (wavesp && !wavesp->valuep() && !wavesp->nullTxn()) return true;
+        }
+        return false;
+    }
+    // Whether any waveform schedules at a time of its own, or more than once
+    static bool anyWaveformTime(AstVhdlSigAssign* nodep) {
         for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
             AstVhdlWaveform* const wavesp = VN_AS(p, VhdlAlternative)->wavesp();
             if (wavesp && (wavesp->nextp() || wavesp->afterp())) return true;
         }
         return false;
+    }
+    // The statements of one alternative's waveform, where "unaffected" is a
+    // statement that does nothing rather than none at all
+    AstNode* alternativeStmts(AstNodeVhdlExpr* targetp, AstVhdlAlternative* altp,
+                              AstNodeExpr*& readsp, FileLine* flp, VhdlDelayKind kind) {
+        AstVhdlWaveform* const wavesp = altp->wavesp();
+        if (wavesp && !wavesp->nextp() && !wavesp->valuep() && !wavesp->nullTxn()) {
+            return new AstComment{altp->fileline(), "unaffected"};
+        }
+        return waveformStmts(targetp, wavesp, readsp, flp, kind);
     }
 
     // The projected output waveform of a driver (10.5.2.2). Each process
@@ -25786,6 +25821,16 @@ private:
             }
             if (!senp->sensesp()) VL_DO_DANGLING(senp->deleteTree(), senp);
         }
+        // With timing, one block: the statements, then a wait on what they
+        // read, as a process with a sensitivity list is (11.3) -- so what
+        // they write has one driving block, not two
+        if (senp && v3Global.opt.timing().isTrue()) {
+            AstNode* const bodyp = stmtsp;
+            bodyp->addNext(new AstEventControl{flp, senp, nullptr});
+            addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr,
+                                  new AstBegin{flp, "", bodyp, false}});
+            return;
+        }
         if (senp) {
             addStmt(new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, stmtsp->cloneTree(true)});
         }
@@ -25919,7 +25964,7 @@ private:
         }
         // The same, where which waveform is scheduled depends on a condition
         if (nodep->kind() == VhdlAssignKind::CONDITIONAL && anyWaveformDelay(nodep)) {
-            if (!v3Global.opt.timing().isTrue()) {
+            if (!v3Global.opt.timing().isTrue() && anyWaveformTime(nodep)) {
                 unsup(flp, "waveform with more than one element without --timing");
                 return;
             }
@@ -25930,8 +25975,8 @@ private:
             AstNode* outp = nullptr;
             AstNodeExpr* readsp = nullptr;
             for (size_t i = alts.size(); i-- > 0;) {
-                AstNode* const bodyp = waveformStmts(nodep->targetp(), alts[i]->wavesp(), readsp,
-                                                     flp, nodep->delay());
+                AstNode* const bodyp
+                    = alternativeStmts(nodep->targetp(), alts[i], readsp, flp, nodep->delay());
                 if (!bodyp) return;
                 if (!alts[i]->condp()) {
                     outp = bodyp;  // The trailing "else"
@@ -25953,7 +25998,7 @@ private:
         // arrived at once.
         if (nodep->kind() == VhdlAssignKind::SELECTED && anyWaveformDelay(nodep)
             && nodep->selectorp()) {
-            if (!v3Global.opt.timing().isTrue()) {
+            if (!v3Global.opt.timing().isTrue() && anyWaveformTime(nodep)) {
                 unsup(flp, "waveform with more than one element without --timing");
                 return;
             }
@@ -25964,8 +26009,8 @@ private:
             AstNode* outp = nullptr;
             AstNodeExpr* readsp = nullptr;
             for (size_t i = alts.size(); i-- > 0;) {
-                AstNode* const bodyp = waveformStmts(nodep->targetp(), alts[i]->wavesp(), readsp,
-                                                     flp, nodep->delay());
+                AstNode* const bodyp
+                    = alternativeStmts(nodep->targetp(), alts[i], readsp, flp, nodep->delay());
                 if (!bodyp) return;
                 AstNodeExpr* testp
                     = choiceTest(alts[i]->choicesp(), nodep->selectorp(), nodep->matching());
@@ -34130,7 +34175,43 @@ private:
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
-    AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp, bool* anyPartp = nullptr) {
+    // The bodies of the subprograms a process declares that its body calls,
+    // and those they call in turn: a copy made for a call is one of them
+    std::vector<AstNode*> localSubprogramBodies(AstVhdlProcess* nodep, AstNode* bodyp) {
+        std::set<std::string> localNames;
+        for (AstNode* dp = nodep->declsp(); dp; dp = dp->nextp()) {
+            const AstVhdlSubprogDecl* const subp = VN_CAST(dp, VhdlSubprogDecl);
+            if (!subp || !subp->vhdlSymp()) continue;
+            const auto it = m_funcs.find(subp->vhdlSymp()->resolved());
+            if (it != m_funcs.end() && it->second) localNames.insert(it->second->name());
+        }
+        std::vector<AstNode*> out;
+        if (localNames.empty()) return out;
+        const auto isLocal = [&](const AstNodeFTask* taskp) {
+            for (const std::string& name : localNames) {
+                if (taskp->name() == name || taskp->name().rfind(name + "__V", 0) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        std::set<const AstNodeFTask*> seen;
+        std::vector<AstNode*> work{bodyp};
+        while (!work.empty()) {
+            AstNode* const fromp = work.back();
+            work.pop_back();
+            fromp->foreachAndNext([&](const AstNodeFTaskRef* refp) {
+                AstNodeFTask* const taskp = refp->taskp();
+                if (!taskp || !taskp->stmtsp() || !isLocal(taskp)) return;
+                if (!seen.insert(taskp).second) return;
+                out.push_back(taskp->stmtsp());
+                work.push_back(taskp->stmtsp());
+            });
+        }
+        return out;
+    }
+    AstSenTree* sensitivityOfBody(AstNode* bodyp, FileLine* flp, bool* anyPartp = nullptr,
+                                  bool signalsOnly = false) {
         if (!bodyp) return nullptr;
         std::set<const AstVar*> signals;
         for (const auto& pair : m_vars) {
@@ -34156,6 +34237,9 @@ private:
             if (isToggleFlipRead(refp)) return;
             AstVar* const varp = refp->varp();
             if (!nameableRead(varp)) return;
+            // In a subprogram's body, its own variables and formals are not
+            // what the process waits on
+            if (signalsOnly && !signals.count(varp)) return;
             // Only a signal held as one value can be shadowed a part at a
             // time: a record, or an array of them, is read through a
             // selection that has no shadow of its own. What an attribute
