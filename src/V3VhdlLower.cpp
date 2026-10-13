@@ -18791,6 +18791,9 @@ private:
             AstVar* const backp = newTempVar("__Veofu", newIntDType(flp), flp);
             AstNode* stmtsp
                 = new AstAssign{flp, new AstVarRef{flp, fdp, VAccess::WRITE}, firstp};
+            AstNodeExpr* const fdRefp = new AstVarRef{flp, fdp, VAccess::READ};
+            stmtsp = AstNode::addNext(stmtsp, fileNotOpenCheck(fdRefp, true, flp));
+            VL_DO_DANGLING(fdRefp->deleteTree(), fdRefp);
             stmtsp = AstNode::addNext(
                 stmtsp,
                 static_cast<AstNode*>(new AstAssign{
@@ -34351,7 +34354,15 @@ private:
         if (name == "file_open") return lowerFileOpen(args, flp);
         if (name == "file_close" && args.size() == 1) {
             AstNodeExpr* const filep = lowerExpr(args[0]);
-            return filep ? new AstFClose{flp, filep} : nullptr;
+            if (!filep) return nullptr;
+            // Closed, the file is not open: its descriptor goes back to 0, which
+            // the operations on it check
+            AstNode* outp = new AstFClose{flp, filep};
+            if (const AstVarRef* const refp = VN_CAST(filep, VarRef)) {
+                outp->addNext(new AstAssign{flp, new AstVarRef{flp, refp->varp(), VAccess::WRITE},
+                                            new AstConst{flp, AstConst::WidthedValue{}, 32, 0}});
+            }
+            return outp;
         }
         if (name == "flush" && args.size() == 1) {
             AstNodeExpr* const filep = lowerExpr(args[0]);
@@ -34364,8 +34375,8 @@ private:
             AstNodeExpr* const filep = lowerExpr(args[0]);
             AstNodeExpr* const linep = lowerExpr(args[1]);
             if (!filep || !linep) return nullptr;
-            AstNode* outp
-                = new AstStmtExpr{flp, new AstFGetS{flp, linep->cloneTree(false), filep}};
+            AstNode* outp = fileNotOpenCheck(filep, true, flp);
+            outp->addNext(new AstStmtExpr{flp, new AstFGetS{flp, linep->cloneTree(false), filep}});
             // A LINE holds the line without its end of line (16.4), which
             // $fgets keeps
             AstNodeExpr* const lastp
@@ -34391,8 +34402,9 @@ private:
             AstNodeExpr* const linep = lowerExpr(args[1]);
             if (!filep || !linep) return nullptr;
             // Write the buffer, then empty it, as writeline does (16.4)
-            AstNode* const outp = new AstDisplay{flp, VDisplayType::DT_WRITE, "%s\n", filep,
-                                                 linep->cloneTree(false)};
+            AstNode* const outp = fileNotOpenCheck(filep, false, flp);
+            outp->addNext(new AstDisplay{flp, VDisplayType::DT_WRITE, "%s\n", filep,
+                                         linep->cloneTree(false)});
             return AstNode::addNext(
                 outp, static_cast<AstNode*>(
                           new AstAssign{flp, linep, new AstConst{flp, AstConst::String{}, ""}}));
@@ -34804,9 +34816,38 @@ private:
     // file holds is the values themselves: a file of CHARACTER is bytes, a
     // file of STRING the characters one after another, and an array whose
     // elements do not pack goes element by element.
+    // Reading or writing a file that is not open is an error (5.5.2), where
+    // nvc, GHDL and Questa stop the run. A file is not open until FILE_OPEN,
+    // and after FILE_CLOSE, which leaves its descriptor at 0.
+    static AstNode* fileNotOpenCheck(AstNodeExpr* filep, bool reading, FileLine* flp) {
+        AstNode* const msgp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                             "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                                 + (reading ? ": Read from a file that is not open"
+                                            : ": Write to a file that is not open"),
+                             nullptr, nullptr};
+        msgp->addNext(new AstStop{flp, true});
+        return new AstIf{flp,
+                         new AstEq{flp, filep->cloneTree(false),
+                                   new AstConst{flp, AstConst::WidthedValue{}, 32, 0}},
+                         msgp};
+    }
     AstNode* lowerFileReadWrite(bool reading, std::vector<AstNodeVhdlExpr*>& args,
                                 FileLine* flp) {
         if (args.size() < 2 || args.size() > 3) return nullptr;
+        AstNodeExpr* const fileChkp = lowerExpr(args[0]);
+        if (!fileChkp) return nullptr;
+        AstNode* const checkp = fileNotOpenCheck(fileChkp, reading, flp);
+        VL_DO_DANGLING(fileChkp->deleteTree(), fileChkp);
+        AstNode* const bodyp = lowerFileReadWriteBody(reading, args, flp);
+        if (!bodyp) {
+            VL_DO_DANGLING(checkp->deleteTree(), checkp);
+            return nullptr;
+        }
+        return AstNode::addNext(checkp, bodyp);
+    }
+    AstNode* lowerFileReadWriteBody(bool reading, std::vector<AstNodeVhdlExpr*>& args,
+                                    FileLine* flp) {
         VhdlType* const valTypep = args[1]->vhdlTypep();
         const bool isStr = isStringType(valTypep);
         AstNodeExpr* const filep = lowerExpr(args[0]);

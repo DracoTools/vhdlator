@@ -1,0 +1,4 @@
+t/t_vhdl_fileclosed_bad.vhd:29:5:@0:(report note): closed
+%Error: t/t_vhdl_fileclosed_bad.vhd:30: Read from a file that is not open
+%Error: t/t_vhdl_fileclosed_bad.vhd:30: Verilog $stop
+Aborting...
