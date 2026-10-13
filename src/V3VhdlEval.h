@@ -117,6 +117,11 @@ public:
 
     // The value as 'IMAGE would give it (16.2.6)
     static std::string image(const VhdlValue& val) VL_MT_DISABLED;
+    // The image of an enumeration literal held under this name: the name,
+    // with an extended identifier's backslashes put back, its own doubled
+    // ("\Weird\\Name\", 15.4.3). Ordinary identifiers are held in lower
+    // case, so a name with any other character came from the extended form.
+    static std::string literalImage(const std::string& name) VL_MT_DISABLED;
     // The inverse, as 'VALUE would give it. Returns UNKNOWN if the text does
     // not denote a value of that type.
     static VhdlValue fromImage(const std::string& text, VhdlType* typep) VL_MT_DISABLED;

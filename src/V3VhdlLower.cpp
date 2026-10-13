@@ -24779,7 +24779,6 @@ private:
             return new AstIf{tflp, drivesp,
                              new AstAssignDly{tflp, wr(sigVarp, tflp), rd(valVarp, tflp)}, partp};
         };
-        AstNode* const nowp = putOn(vp, new AstEq{tflp, rd(wp, tflp), allOnes()}, wp);
         AstNode* laterp = new AstAssign{
             tflp, wr(seqp, tflp),
             new AstAdd{tflp, rd(seqp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 1}}};
@@ -24819,10 +24818,11 @@ private:
                 new AstIf{tflp, new AstLogNot{tflp, pastTimeHigh(delayp, tflp)}, forkp, nullptr});
             VL_DO_DANGLING(delayp->deleteTree(), delayp);
         }
-        taskp->addStmtsp(new AstIf{
-            tflp,
-            new AstEq{tflp, rd(dp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 0}},
-            nowp, laterp});
+        // A transaction for now waits in the queue too, delivered once the
+        // process suspends: until then a later assignment of the same run
+        // may still preempt it -- "s <= 1; s <= 2 after 1 us" leaves only
+        // the second (10.5.2.2, GHDL gna ticket11)
+        taskp->addStmtsp(laterp);
         addStmt(taskp);
         m_waveTasks.emplace(key, taskp);
         m_waveMaskWidths.emplace(taskp, nLeaves);
@@ -25331,11 +25331,7 @@ private:
             if (zvalp) outp->addNext(putOnTo(zVarp, zvalp, drivesp, drvOf));
             return outp;
         };
-        // A transaction for now is the next delta's, and has preempted
-        // everything that was pending for the elements it drives
-        AstNode* const nowp = putOn(rd(vp, tflp), new AstEq{tflp, rd(wp, tflp), allOnes()}, drv,
-                                    zp ? rd(zp, tflp) : nullptr);
-        // A later one waits its turn, in the order of when it is due, and is
+        // A transaction waits its turn, in the order of when it is due, and is
         // delivered -- the elements it still drives -- when it comes
         AstNode* laterp = new AstAssign{
             tflp, wr(seqp, tflp),
@@ -25414,10 +25410,11 @@ private:
                 new AstIf{tflp, new AstLogNot{tflp, pastTimeHigh(delayp, tflp)}, forkp, nullptr});
             VL_DO_DANGLING(delayp->deleteTree(), delayp);
         }
-        taskp->addStmtsp(new AstIf{
-            tflp,
-            new AstEq{tflp, rd(dp, tflp), new AstConst{tflp, AstConst::WidthedValue{}, 64, 0}},
-            nowp, laterp});
+        // A transaction for now waits in the queue too, delivered once the
+        // process suspends: until then a later assignment of the same run
+        // may still preempt it -- "s <= 1; s <= 2 after 1 us" leaves only
+        // the second (10.5.2.2, GHDL gna ticket11)
+        taskp->addStmtsp(laterp);
         addStmt(taskp);
         m_waveTasks.emplace(key, taskp);
         if (zVarp) m_waveZTasks.insert(taskp);
@@ -28902,8 +28899,10 @@ private:
                             = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
                         if (!rhsp) return outp;
                         AstNode* const delayp
-                            = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false}
-                                          : nullptr;
+                            = p->afterp()
+                                  ? new AstDelay{flp, delayChecked(lowerExpr(p->afterp()), flp),
+                                                 false}
+                                  : nullptr;
                         AstNode* const markp
                             = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
                         if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
@@ -28923,7 +28922,9 @@ private:
                         = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
                     if (!valuep) return outp;
                     AstNode* const delayp
-                        = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                        = p->afterp()
+                              ? new AstDelay{flp, delayChecked(lowerExpr(p->afterp()), flp), false}
+                              : nullptr;
                     AstNode* const markp
                         = transactionMark(nodep->targetp(), delayp, sequential, valuep, flp);
                     outp
@@ -28939,7 +28940,9 @@ private:
                     AstNodeExpr* const rhsp = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
                     if (!rhsp) return outp;
                     AstNode* const delayp
-                        = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                        = p->afterp()
+                              ? new AstDelay{flp, delayChecked(lowerExpr(p->afterp()), flp), false}
+                              : nullptr;
                     AstNode* const markp
                         = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
                     if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
@@ -28955,7 +28958,9 @@ private:
                     = lowerDriveValue(nodep->targetp(), p->valuep(), flp);
                 if (!lhsp || !rhsp) return outp;
                 AstNode* const delayp
-                    = p->afterp() ? new AstDelay{flp, lowerExpr(p->afterp()), false} : nullptr;
+                    = p->afterp()
+                          ? new AstDelay{flp, delayChecked(lowerExpr(p->afterp()), flp), false}
+                          : nullptr;
                 AstNode* const markp
                     = transactionMark(nodep->targetp(), delayp, sequential, rhsp, flp);
                 outp = AstNode::addNextNull(
@@ -34760,7 +34765,13 @@ private:
         // way and read back with READ of a BOOLEAN, which wants the word.
         if (radix.empty() && args[1]->vhdlTypep()
             && args[1]->vhdlTypep()->base() != V3VhdlStd::bitType()) {
-            if (AstNodeExpr* const imagep = enumImage(valuep, args[1]->vhdlTypep(), flp, false)) {
+            if (AstNodeExpr* imagep = enumImage(valuep, args[1]->vhdlTypep(), flp, false)) {
+                // Before VHDL-2008, textio wrote a BOOLEAN in capitals, "TRUE"
+                // and "FALSE", as GHDL and Questa still do in those revisions
+                if (args[1]->vhdlTypep()->base() == V3VhdlStd::booleanType()
+                    && flp->language() < V3LangCode::L1076_2008) {
+                    imagep = new AstToUpperN{flp, imagep};
+                }
                 return appendItem(linep, imagep, flp);
             }
         }
@@ -36316,8 +36327,10 @@ private:
     // How an enumeration literal reads. 'IMAGE writes the literal the way it
     // is written in the source, so a character literal keeps its apostrophes;
     // TO_STRING gives the character alone (5.7).
+    // An extended identifier keeps its backslashes in its image (15.4.3,
+    // 16.2), as GHDL and Questa write it; TO_STRING gives the name alone.
     static std::string literalText(const std::string& name, bool isImage) {
-        if (isImage) return name;
+        if (isImage) return V3VhdlEval::literalImage(name);
         if (name.size() >= 3 && name.front() == '\'' && name.back() == '\'') {
             return name.substr(1, name.size() - 2);
         }

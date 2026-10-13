@@ -2528,7 +2528,7 @@ std::string V3VhdlEval::image(const VhdlValue& val) {
         if (val.toInt() >= 0 && val.toInt() < static_cast<int64_t>(lits.size())) {
             // A character literal is already named with its quotes, which is
             // exactly how 'IMAGE spells it (16.2.6)
-            return lits[val.toInt()]->name();
+            return literalImage(lits[val.toInt()]->name());
         }
         return "";
     }
@@ -2537,6 +2537,20 @@ std::string V3VhdlEval::image(const VhdlValue& val) {
         out += " " + basep->units().front().first;
     }
     return out;
+}
+
+std::string V3VhdlEval::literalImage(const std::string& name) {
+    const bool charLit = name.size() >= 3 && name.front() == '\'' && name.back() == '\'';
+    const bool extended = !charLit && std::any_of(name.begin(), name.end(), [](char c) {
+        return !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_');
+    });
+    if (!extended) return name;
+    std::string out = "\\";
+    for (const char c : name) {
+        out += c;
+        if (c == '\\') out += c;
+    }
+    return out + "\\";
 }
 
 VhdlValue V3VhdlEval::fromImage(const std::string& text, VhdlType* typep) {
