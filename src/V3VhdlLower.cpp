@@ -20680,14 +20680,30 @@ private:
         // with the first element most significant. An unpacked one has to be
         // written member by member, which only an assignment pattern can do.
         const bool packed = recordPacks(typep);
-        // Whether this aggregate gives one element of an array aggregate
-        bool inArrayAggregate = false;
+        // The element subtype of the array aggregate this one gives an
+        // element of, if it is one: that subtype says how the record is held
+        const VhdlType* outerElemp = nullptr;
         if (const AstNode* const assocp = nodep->aboveLoopp()) {
             const AstVhdlAggregate* const outerp
                 = VN_IS(assocp, VhdlElemAssoc) ? VN_CAST(assocp->aboveLoopp(), VhdlAggregate)
                                                : nullptr;
-            inArrayAggregate = outerp && outerp->vhdlTypep()
-                               && outerp->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY;
+            const VhdlType* otp = outerp ? outerp->vhdlTypep() : nullptr;
+            // An operand of a comparison takes its own subtype from its
+            // choices and the base type's element; the other operand is what
+            // says how the records are held: "s.f = (1 => ("10", 1), ...)"
+            // compares with f's two-bit x (NVC record34)
+            if (const AstVhdlBinary* const binp
+                = outerp ? VN_CAST(outerp->aboveLoopp(), VhdlBinary) : nullptr) {
+                const AstNodeVhdlExpr* const otherp
+                    = binp->lhsp() == outerp ? binp->rhsp() : binp->lhsp();
+                const VhdlType* const ctxp = otherp->vhdlTypep();
+                if (otp && ctxp && ctxp->base() == otp->base() && !VN_IS(otherp, VhdlAggregate)) {
+                    otp = ctxp;
+                }
+            }
+            if (otp && otp->base()->kind() == VhdlTypeKind::ARRAY) {
+                outerElemp = otp->elementp() ? otp->elementp() : otp->base()->elementp();
+            }
         }
         AstNodeExpr* outp = nullptr;
         AstNode* itemsp = nullptr;
@@ -20730,12 +20746,15 @@ private:
                 VhdlType* const declp = elementTypeIn(m_retAggTypep, m_retAggTypep->elements()[i]);
                 if (heldTwoDeep(declp)) memberp = asDyn2Carrier(valuep, declp, flp);
             }
-            // A record that is an element of an array whose element type
+            // A record that is an element of an array whose element subtype
             // holds this element as a carrier: "(("01", 1), ("10", 2))" for
             // a constant array of records with an open bit_vector (GHDL gna
-            // issue2051). Elsewhere the record's own context says its shape:
-            // "s = (x => "000")" compares with a record whose x is three bits
-            if (!memberp && !packed && inArrayAggregate && carriedIn(typep, elems[i]->typep())
+            // issue2051). Not where that subtype constrains it -- "s.f = (1
+            // => ("10", 1), ...)" with f's x two bits (NVC record34) -- nor
+            // outside an array: "s = (x => "000")" compares with a record
+            // whose x is three bits
+            if (!memberp && !packed && outerElemp && outerElemp->base() == typep->base()
+                && carriedIn(outerElemp, elementTypeIn(outerElemp, elems[i]))
                 && !isDynValue(valuep)) {
                 memberp = asDynCarrier(valuep, elems[i]->typep(), flp);
             }
