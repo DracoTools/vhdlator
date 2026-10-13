@@ -14404,6 +14404,16 @@ bool VhdlSemVisitor::targetRangeOpen(const AstNodeVhdlExpr* targetp) {
         return markLeavesIndexOpen(sip->typeMarkp()->vhdlSymp());
     }
     if (const AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
+        // "p.all", whose subtype is the designated one: an unconstrained
+        // array type, whatever bounds the object p points at has (9.3.3.3)
+        if (selp->isAll()) {
+            const VhdlType* const accp = selp->prefixp() ? selp->prefixp()->vhdlTypep() : nullptr;
+            const VhdlType* const desigp = accp && accp->base()->kind() == VhdlTypeKind::ACCESS
+                                               ? accp->base()->designatedp()
+                                               : nullptr;
+            return desigp && desigp->base()->kind() == VhdlTypeKind::ARRAY
+                   && desigp->unconstrained();
+        }
         const AstVhdlSubtypeInd* const sip = declaredSubtype(VN_CAST(selp->prefixp(), VhdlName));
         const AstVhdlName* const elemNamep = VN_CAST(selp->suffixp(), VhdlName);
         if (!writtenBare(sip) || !elemNamep) return false;
