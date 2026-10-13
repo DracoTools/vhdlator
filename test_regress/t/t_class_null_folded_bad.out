@@ -1,0 +1,3 @@
+before
+%Error: t/t_class_null_folded_bad.v:19: Null pointer dereferenced
+Aborting...

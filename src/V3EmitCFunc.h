@@ -1641,7 +1641,28 @@ public:
         emitOpName(nodep, nodep->emitC(), nodep->lhsp(), nodep->matchp(), nullptr);
     }
     void visit(AstMemberSel* nodep) override {
-        iterateAndNextConstNull(nodep->fromp());
+        // A handle an optimization found to be null, folded to the constant:
+        // "null" has no members in C++, so it is written as an empty ref of
+        // the member's class, which VL_NULL_CHECK then reports while running
+        const AstNullCheck* const checkp = VN_CAST(nodep->fromp(), NullCheck);
+        const AstConst* const nullp = checkp ? VN_CAST(checkp->lhsp(), Const) : nullptr;
+        const AstClass* classp = nullptr;
+        if (nullp && nullp->isNull() && !nodep->varp()->isIfaceRef()) {
+            for (const AstNode* np = nodep->varp(); np && !classp; np = np->aboveLoopp()) {
+                classp = VN_CAST(np, Class);
+            }
+        }
+        if (classp) {
+            putns(checkp,
+                  "VL_NULL_CHECK(VlClassRef<" + EmitCUtil::prefixNameProtect(classp) + ">{}, ");
+            // Where the dereference is: the constant's line is the assignment's
+            putsQuoted(protect(nodep->fileline()->filename()));
+            puts(", ");
+            puts(cvtToStr(nodep->fileline()->lineno()));
+            puts(")");
+        } else {
+            iterateAndNextConstNull(nodep->fromp());
+        }
         putnbs(nodep, "->");
         if (nodep->varp()->isIfaceRef()) {
             // varp is the __Viftop companion (e.g. "tx__Viftop"); use the
