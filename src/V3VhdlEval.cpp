@@ -692,16 +692,21 @@ private:
     }
 
     // What a generic of the design's root entity is elaborated with: the value
-    // the command line gives it -- text between quotes, a number as digits --
-    // or else its default (14.2). A generic of any other entity is given its
-    // value by the instance, which hands it in as a binding.
+    // the command line gives it (fromGenericText) or else its default (14.2).
+    // A generic of any other entity is given its value by the instance, which
+    // hands it in as a binding.
     VhdlValue rootGenericValue(const VhdlSymbol* symp) {
         const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl);
         if (!ifp) return VhdlValue{};
         const bool text = isTextType(symp->typep());
         const bool number
             = symp->typep() && symp->typep()->base()->kind() == VhdlTypeKind::INTEGER;
-        if (!text && !(number && m_rootNumbers)) return VhdlValue{};
+        // A vector the command line gives, whose length may be only that
+        // value's: "-gparameter=1001" for an unconstrained std_logic_vector
+        const bool givenVector = symp->typep()
+                                 && symp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                                 && v3Global.opt.hasParameterCaseless(symp->name());
+        if (!text && !givenVector && !(number && m_rootNumbers)) return VhdlValue{};
         const AstVhdlEntity* entp = nullptr;
         for (const AstNode* up = ifp->backp(); up && !entp; up = up->backp()) {
             entp = VN_CAST(up, VhdlEntity);
@@ -710,20 +715,9 @@ private:
         if (!entp || top.empty() || VString::downcase(entp->name()) != VString::downcase(top)) {
             return VhdlValue{};
         }
-        const std::string given = v3Global.opt.peekParameterCaseless(symp->name());
-        if (!given.empty()) {
-            if (number) {
-                // Decimal digits, as the command line writes a number
-                char* endp = nullptr;
-                const long long v = std::strtoll(given.c_str(), &endp, 10);
-                if (!endp || *endp || endp == given.c_str()) return VhdlValue{};
-                return VhdlValue::mkInt(v, symp->typep());
-            }
-            if (given.size() < 2 || given.front() != '"' || given.back() != '"') {
-                return VhdlValue{};
-            }
-            return VhdlValue::mkStrAt(given.substr(1, given.size() - 2), typeLeft(symp->typep()),
-                                      true, symp->typep());
+        if (v3Global.opt.hasParameterCaseless(symp->name())) {
+            return V3VhdlEval::fromGenericText(v3Global.opt.peekParameterCaseless(symp->name()),
+                                               symp->typep());
         }
         return ifp->defaultp() ? eval(ifp->defaultp()) : VhdlValue{};
     }
@@ -2582,6 +2576,41 @@ VhdlValue V3VhdlEval::fromImage(const std::string& text, VhdlType* typep) {
     }
     default: return VhdlValue{};
     }
+}
+
+VhdlValue V3VhdlEval::fromGenericText(const std::string& text, VhdlType* typep) {
+    if (!typep) return VhdlValue{};
+    VhdlType* const basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::ARRAY) {
+        const VhdlType* const elemp = basep->elementp();
+        if (!elemp || elemp->base()->kind() != VhdlTypeKind::ENUM || basep->dimensions() != 1) {
+            return VhdlValue{};
+        }
+        std::string body = text;
+        if (body.size() >= 2 && body.front() == '"' && body.back() == '"') {
+            body = body.substr(1, body.size() - 2);
+        }
+        // Every character a character literal of the element type
+        for (const char c : body) {
+            const std::string lit = std::string{"'"} + c + "'";
+            const std::vector<VhdlSymbol*>& lits = elemp->base()->literals();
+            if (std::none_of(lits.begin(), lits.end(),
+                             [&](const VhdlSymbol* symp) { return symp->name() == lit; })) {
+                return VhdlValue{};
+            }
+        }
+        const std::vector<VhdlType*>& idx
+            = typep->indexTypes().empty() ? basep->indexTypes() : typep->indexTypes();
+        const VhdlType* const idxp = idx.empty() ? nullptr : idx[0];
+        if (typep->isConstrainedArray() && idxp && idxp->bounded()
+            && idxp->length() != static_cast<int64_t>(body.size())) {
+            return VhdlValue{};
+        }
+        const int64_t left = idxp && idxp->bounded() ? idxp->left() : 1;
+        return VhdlValue::mkStrAt(body, left, !idxp || idxp->ascending(), typep);
+    }
+    const VhdlValue val = fromImage(text, typep);
+    return val.known() && inRange(val, typep) ? val : VhdlValue{};
 }
 
 bool V3VhdlEval::inRange(const VhdlValue& val, const VhdlType* typep) {

@@ -909,6 +909,16 @@ Summary:
      on the command line, e.g., as ``-GSTR="\"My String\""`` or
      ``-GSTR='"My String"'``.
 
+   VHDL generics
+     A generic of the VHDL entity named by :vlopt:`--top-module` takes its
+     value the way GHDL's and NVC's ``-g`` do, as a VHDL value of the
+     generic's type: a scalar as its image, as ``'VALUE`` reads it (e.g.
+     ``-GN=-159``, ``-GFLAG=true``, ``-GC="'A'"``, ``-GLEVEL=warning``), and
+     a string or a vector of characters as its characters, quoted or not
+     (``-GSTR=Hello``, ``-GV=1001``; an unconstrained vector takes its length
+     from the value). The name matches without regard to case. A value that
+     is not one of the generic's subtype is an error.
+
 .. option:: --gate-stmts <value>
 
    Rarely needed. Set the maximum number of statements present in an

@@ -16636,6 +16636,26 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
                 }
             }
         }
+        // A generic of the root entity the command line gives is as long as
+        // that value: "-gparameter=1001" (GHDL gna issue1386)
+        if (leftDflt.empty() && path.empty() && dims == 1 && ifp->kind() == VhdlIfaceKind::CONSTANT
+            && entp && !v3Global.opt.topModule().empty()
+            && VString::downcase(entp->name()) == VString::downcase(v3Global.opt.topModule())
+            && v3Global.opt.hasParameterCaseless(ifp->name())) {
+            std::string text = v3Global.opt.peekParameterCaseless(ifp->name());
+            if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+                text = text.substr(1, text.size() - 2);
+            }
+            const VhdlType* const idxp = basep->indexTypes()[0];
+            if (!text.empty() && idxp && idxp->bounded()) {
+                const int64_t len = static_cast<int64_t>(text.size());
+                const int64_t left = idxp->left();
+                const int64_t right = idxp->ascending() ? left + len - 1 : left - len + 1;
+                leftDflt = std::to_string(left);
+                rightDflt = std::to_string(right);
+                ascDflt = idxp->ascending() ? "true" : "false";
+            }
+        }
         for (size_t d = 0; d < dims; ++d) {
             const std::string leftName = "__vl" + mangled(d);
             const std::string rightName = "__vr" + mangled(d);

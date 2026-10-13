@@ -120,6 +120,12 @@ public:
     // The inverse, as 'VALUE would give it. Returns UNKNOWN if the text does
     // not denote a value of that type.
     static VhdlValue fromImage(const std::string& text, VhdlType* typep) VL_MT_DISABLED;
+    // The value of a generic given on the command line (-G), written as
+    // GHDL's -g and nvc's -g take it: a scalar as its image, as 'VALUE reads
+    // it (16.2.6); an array of characters -- a string, a bit or logic vector
+    // -- as its characters, quoted or not. Unknown where the text is not a
+    // value of the type, or one outside its range or of another length.
+    static VhdlValue fromGenericText(const std::string& text, VhdlType* typep) VL_MT_DISABLED;
 
     // Whether a value lies within a type's range. True when either the value
     // or the range is unknown, so that only real violations are reported.

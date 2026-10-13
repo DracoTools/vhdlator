@@ -7364,6 +7364,17 @@ private:
     // METHODS - constants
 
     // A folded value as the constant it stands for
+    // Whether a generic is one of the design's root entity, named by
+    // --top-module: the one whose generics the command line may give
+    static bool rootEntityGeneric(const AstNode* declp) {
+        const std::string top = v3Global.opt.topModule();
+        if (top.empty()) return false;
+        const AstVhdlEntity* entp = nullptr;
+        for (const AstNode* up = declp->backp(); up && !entp; up = up->backp()) {
+            entp = VN_CAST(up, VhdlEntity);
+        }
+        return entp && VString::downcase(entp->name()) == VString::downcase(top);
+    }
     AstNodeExpr* lowerValue(const VhdlValue& val, VhdlType* typep, FileLine* flp) {
         if (!val.known()) return nullptr;
         // A record or an array value is what elaboration worked out, element
@@ -7781,7 +7792,25 @@ private:
                 // A generic is a parameter, so V3Param clones a module per set
                 // of values exactly as VHDL elaboration would
                 AstVar* const varp = newVar(symp, VVarType::GPARAM, flp);
-                if (nodep->defaultp()) {
+                // A generic of the root entity the command line gives: the
+                // value read as a VHDL one of its type, as GHDL's and nvc's
+                // -g read it ("-gstr=hello", "-gc='A'", "-gv=1001"), and
+                // taken here so that the Verilog reading of -G does not see it
+                const bool given
+                    = rootEntityGeneric(nodep) && v3Global.opt.hasParameterCaseless(symp->name());
+                if (given) {
+                    const std::string text = v3Global.opt.parameterCaseless(symp->name());
+                    const VhdlValue val = V3VhdlEval::fromGenericText(text, symp->typep());
+                    AstNodeExpr* const valuep
+                        = val.known() ? lowerValue(val, symp->typep(), flp) : nullptr;
+                    if (!valuep) {
+                        flp->v3error("Value given on the command line for generic '"
+                                     << symp->name() << "' is not one of its subtype: '" << text
+                                     << "'");
+                    } else {
+                        varp->valuep(valuep);
+                    }
+                } else if (nodep->defaultp()) {
                     varp->valuep(lowerExpr(nodep->defaultp()));
                 } else if (v3Global.opt.lintOnly()) {
                     // A generic with no default is how VHDL says the
@@ -7806,8 +7835,9 @@ private:
                 // VUnit's axi_stream_master asks whether a generic still has
                 // its default of 'X', which the two-state value cannot say
                 if (isNineValued(symp->typep())) {
-                    AstNodeExpr* posValp
-                        = nodep->defaultp() ? logicPosOf(nodep->defaultp(), flp) : nullptr;
+                    AstNodeExpr* posValp = nodep->defaultp() && !given
+                                               ? logicPosOf(nodep->defaultp(), flp)
+                                               : nullptr;
                     if (!posValp)
                         posValp = logicPosFromValue(new AstVarRef{flp, varp, VAccess::READ}, flp);
                     AstVar* const posp = new AstVar{flp, VVarType::GPARAM, varp->name() + "__Vpos",

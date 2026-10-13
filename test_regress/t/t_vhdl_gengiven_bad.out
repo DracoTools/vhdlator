@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_gengiven.vhd:14:5: Value given on the command line for generic 'num' is not one of its subtype: '500'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_gengiven.vhd:17:5: Value given on the command line for generic 'flag' is not one of its subtype: 'maybe'
+%Error: Exiting due to
