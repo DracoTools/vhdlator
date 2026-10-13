@@ -2609,7 +2609,17 @@ VhdlValue V3VhdlEval::fromGenericText(const std::string& text, VhdlType* typep) 
         const int64_t left = idxp && idxp->bounded() ? idxp->left() : 1;
         return VhdlValue::mkStrAt(body, left, !idxp || idxp->ascending(), typep);
     }
-    const VhdlValue val = fromImage(text, typep);
+    VhdlValue val = fromImage(text, typep);
+    // An enumeration given by its position, as a Verilog -G writes a value:
+    // "-GENABLED=1" for a BOOLEAN, which earlier versions took that way
+    if (!val.known() && basep->kind() == VhdlTypeKind::ENUM && !text.empty()
+        && std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; })
+        && text.size() < 10) {
+        const int64_t pos = std::stoll(text);
+        if (pos < static_cast<int64_t>(basep->literals().size())) {
+            val = VhdlValue::mkInt(pos, typep);
+        }
+    }
     return val.known() && inRange(val, typep) ? val : VhdlValue{};
 }
 
