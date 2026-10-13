@@ -40,6 +40,8 @@
 #include "V3Stats.h"
 
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -74,6 +76,10 @@ class DeadVisitor final : public VNVisitor {
     std::vector<AstClass*> m_classesp;
     std::vector<AstTypedef*> m_typedefsp;
     std::queue<AstNodeFTask*> m_tasksp;  // All the tasks that could be removed if not called
+    std::vector<AstNodeFTask*> m_removableTasksp;  // The same, kept for the reachability pass
+    // Tasks each task calls, other than itself
+    std::unordered_map<const AstNodeFTask*, std::vector<AstNodeFTask*>> m_taskCalls;
+    std::unordered_set<const AstNodeFTask*> m_calledOutsideTasks;  // Called from no task
     AssignMap m_assignMap;  // List of all simple assignments for each variable
     bool m_sideEffect = false;  // Side effects discovered in assign RHS
 
@@ -81,6 +87,7 @@ class DeadVisitor final : public VNVisitor {
     bool m_inAssign = false;  // Currently in an assign
     AstNodeDType* m_curDTypep = nullptr;  // Current NodeDType
     AstNodeModule* m_modp = nullptr;  // Current module
+    const AstNodeFTask* m_ftaskp = nullptr;  // Task or function being visited
     AstForeachHeader* m_foreachHeaderp = nullptr;  // Current foreach header
 
     // STATE - Statistic tracking
@@ -175,7 +182,15 @@ class DeadVisitor final : public VNVisitor {
         iterateChildren(nodep);
         if (!m_sideEffect && !nodep->isPure()) m_sideEffect = true;
         checkAll(nodep);
-        if (nodep->taskp()) nodep->taskp()->user1Inc();
+        // A call of a function from inside itself does not keep it alive
+        if (nodep->taskp() && nodep->taskp() != m_ftaskp) {
+            nodep->taskp()->user1Inc();
+            if (m_ftaskp) {
+                m_taskCalls[m_ftaskp].push_back(nodep->taskp());
+            } else {
+                m_calledOutsideTasks.insert(nodep->taskp());
+            }
+        }
         if (nodep->classOrPackagep()) {
             if (m_elimCells) {
                 nodep->classOrPackagep(nullptr);
@@ -187,7 +202,10 @@ class DeadVisitor final : public VNVisitor {
     void visit(AstModportFTaskRef* nodep) override {
         iterateChildren(nodep);
         checkAll(nodep);
-        if (nodep->ftaskp()) nodep->ftaskp()->user1Inc();
+        if (nodep->ftaskp()) {
+            nodep->ftaskp()->user1Inc();
+            m_calledOutsideTasks.insert(nodep->ftaskp());
+        }
     }
     void visit(AstRefDType* nodep) override {
         iterateChildren(nodep);
@@ -327,13 +345,18 @@ class DeadVisitor final : public VNVisitor {
         if (assignInAssign) m_sideEffect = true;  // Parent assign shouldn't optimize
     }
     void visit(AstNodeFTask* nodep) override {
-        iterateChildren(nodep);
+        {
+            VL_RESTORER(m_ftaskp);
+            m_ftaskp = nodep;
+            iterateChildren(nodep);
+        }
         checkAll(nodep);
         if (nodep->taskPublic() || nodep->dpiExport() || nodep->dpiImport()) {
             if (m_modp && !m_modp->dead() && !m_modp->verilatorLib())
                 m_modp->user1Inc();  // Keep container
         } else {
             m_tasksp.push(nodep);
+            m_removableTasksp.push_back(nodep);
         }
         if (nodep->classOrPackagep()) {
             if (m_elimCells) {
@@ -378,9 +401,9 @@ class DeadVisitor final : public VNVisitor {
             AstNodeFTask* taskp = m_tasksp.front();
             m_tasksp.pop();
             if (taskp->user1() == 0 && !taskp->classMethod()) {
-                taskp->foreach([this](AstNodeFTaskRef* ftaskrefp) {
+                taskp->foreach([this, taskp](AstNodeFTaskRef* ftaskrefp) {
                     AstNodeFTask* task2p = ftaskrefp->taskp();
-                    if (!task2p) return;
+                    if (!task2p || task2p == taskp) return;  // Self calls were not counted
                     task2p->user1Inc(-1);
                     if (task2p->user1() == 0) m_tasksp.push(task2p);
                 });
@@ -388,6 +411,35 @@ class DeadVisitor final : public VNVisitor {
                 deleting(taskp);
                 ++m_statFTasksDeadified;
             }
+        }
+        // Tasks that call only one another, and that nothing else calls, are
+        // dead too: kept are those reachable from a call outside any task, or
+        // from a task kept for another reason
+        std::unordered_set<const AstNodeFTask*> removable;
+        for (const AstNodeFTask* const taskp : m_removableTasksp) {
+            if (!taskp->classMethod()) removable.insert(taskp);
+        }
+        std::unordered_set<const AstNodeFTask*> reached;
+        std::vector<const AstNodeFTask*> work;
+        const auto reach = [&](const AstNodeFTask* taskp) {
+            if (reached.insert(taskp).second) work.push_back(taskp);
+        };
+        for (const AstNodeFTask* const taskp : m_calledOutsideTasks) reach(taskp);
+        for (const auto& it : m_taskCalls) {
+            if (!removable.count(it.first)) reach(it.first);
+        }
+        while (!work.empty()) {
+            const AstNodeFTask* const taskp = work.back();
+            work.pop_back();
+            const auto it = m_taskCalls.find(taskp);
+            if (it == m_taskCalls.end()) continue;
+            for (const AstNodeFTask* const calleep : it->second) reach(calleep);
+        }
+        for (AstNodeFTask* const taskp : m_removableTasksp) {
+            if (taskp->user1() < 0 || taskp->classMethod() || reached.count(taskp)) continue;
+            taskp->user1(-1);
+            deleting(taskp);
+            ++m_statFTasksDeadified;
         }
     }
 
