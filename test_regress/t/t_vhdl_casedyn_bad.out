@@ -1,0 +1,4 @@
+t/t_vhdl_casedyn_bad.vhd:23:5:@0:(report note): before
+[0] %Error: t_vhdl_casedyn_bad.vhd:24: Assertion failed in t_vhdl_casedyn_bad: Array lengths do not match
+%Error: t/t_vhdl_casedyn_bad.vhd:24: Verilog $stop
+Aborting...

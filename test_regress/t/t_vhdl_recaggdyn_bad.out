@@ -1,0 +1,4 @@
+t/t_vhdl_recaggdyn_bad.vhd:25:5:@1000000:(report note): three fit
+[1000000] %Error: t_vhdl_recaggdyn_bad.vhd:22: Assertion failed in $unit.__Vdynto1__bit_vector: Array lengths do not match
+%Error: t/t_vhdl_recaggdyn_bad.vhd:22: Verilog $stop
+Aborting...

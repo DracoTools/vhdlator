@@ -20379,6 +20379,15 @@ private:
         // with the first element most significant. An unpacked one has to be
         // written member by member, which only an assignment pattern can do.
         const bool packed = recordPacks(typep);
+        // Whether this aggregate gives one element of an array aggregate
+        bool inArrayAggregate = false;
+        if (const AstNode* const assocp = nodep->aboveLoopp()) {
+            const AstVhdlAggregate* const outerp
+                = VN_IS(assocp, VhdlElemAssoc) ? VN_CAST(assocp->aboveLoopp(), VhdlAggregate)
+                                               : nullptr;
+            inArrayAggregate = outerp && outerp->vhdlTypep()
+                               && outerp->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY;
+        }
         AstNodeExpr* outp = nullptr;
         AstNode* itemsp = nullptr;
         for (size_t i = 0; i < elems.size(); ++i) {
@@ -20419,6 +20428,23 @@ private:
                 && recordMayCarry(m_retAggTypep)) {
                 VhdlType* const declp = elementTypeIn(m_retAggTypep, m_retAggTypep->elements()[i]);
                 if (heldTwoDeep(declp)) memberp = asDyn2Carrier(valuep, declp, flp);
+            }
+            // A record that is an element of an array whose element type
+            // holds this element as a carrier: "(("01", 1), ("10", 2))" for
+            // a constant array of records with an open bit_vector (GHDL gna
+            // issue2051). Elsewhere the record's own context says its shape:
+            // "s = (x => "000")" compares with a record whose x is three bits
+            if (!memberp && !packed && inArrayAggregate && carriedIn(typep, elems[i]->typep())
+                && !isDynValue(valuep)) {
+                memberp = asDynCarrier(valuep, elems[i]->typep(), flp);
+            }
+            // A value whose length only running decides, for an element whose
+            // length is fixed: converted, and its length checked as it is
+            // (GHDL's "value length 4 does not match", NVC bounds32)
+            if (!memberp && isDynValue(valuep) && !carriedIn(typep, elems[i]->typep())
+                && elems[i]->typep() && elems[i]->typep()->isConstrainedArray()
+                && elems[i]->typep()->lengthEmittable()) {
+                memberp = dynAsFixed(valuep, elems[i]->typep(), flp);
             }
             if (!memberp) memberp = lowerExpr(valuep);
             if (!memberp) {
@@ -30588,9 +30614,21 @@ private:
     AstNode* lowerCaseAsChain(AstVhdlCase* nodep, AstNodeExpr* exprp, FileLine* flp) {
         VhdlType* const selTypep = nodep->exprp()->vhdlTypep();
         const bool sgn = isSignedType(selTypep);
-        AstVar* const selp = newTempVar("__Vcasesel", lowerType(selTypep, flp), flp);
+        // A selector that carries its own bounds is held as it is, and
+        // compared as values of its type are (9.2.3)
+        VhdlType* const carrp
+            = isDynValue(nodep->exprp()) ? dynValueType(nodep->exprp()) : nullptr;
+        AstNodeFTask* const eqFuncp = carrp ? dynEqFunc(carrp, flp) : nullptr;
+        if (isDynValue(nodep->exprp()) && !eqFuncp) {
+            VL_DO_DANGLING(exprp->deleteTree(), exprp);
+            unsup(flp, "case expression whose length only running decides");
+            return nullptr;
+        }
+        AstVar* const selp = newTempVar(
+            "__Vcasesel", carrp ? dynCarrierRef(carrp, flp) : lowerType(selTypep, flp), flp);
         AstNode* outp = new AstAssign{flp, new AstVarRef{flp, selp, VAccess::WRITE}, exprp};
         const auto sel = [&]() { return new AstVarRef{flp, selp, VAccess::READ}; };
+        bool lengthChecked = false;
         AstIf* firstp = nullptr;
         AstIf* lastp = nullptr;
         AstNode* othersp = nullptr;
@@ -30637,6 +30675,29 @@ private:
                         = sgn ? static_cast<AstNodeExpr*>(new AstLteS{flp, sel(), hip})
                               : static_cast<AstNodeExpr*>(new AstLte{flp, sel(), hip});
                     thisp = new AstLogAnd{flp, gep, lep};
+                } else if (chp->valuep() && eqFuncp) {
+                    AstNodeExpr* const cvp = asDynCarrier(chp->valuep(), carrp, flp);
+                    if (!cvp) {
+                        unsup(chp->fileline(), "choice of a case expression whose length only"
+                                               " running decides");
+                        continue;
+                    }
+                    // Every choice has the expression's length, so the first
+                    // one says what that must be
+                    if (!lengthChecked) {
+                        lengthChecked = true;
+                        outp = AstNode::addNext(
+                            outp, static_cast<AstNode*>(new AstIf{
+                                      flp,
+                                      new AstNeq{flp, dynCarrierLength(sel(), flp),
+                                                 dynCarrierLength(cvp->cloneTree(false), flp)},
+                                      lengthMismatch(flp), nullptr}));
+                    }
+                    AstFuncRef* const refp = new AstFuncRef{
+                        flp, eqFuncp->name(),
+                        AstNode::addNext(new AstArg{flp, "", sel()}, new AstArg{flp, "", cvp})};
+                    refp->taskp(VN_AS(eqFuncp, Func));
+                    thisp = refp;
                 } else if (chp->valuep()) {
                     if (AstNodeExpr* const cvp = lowerExpr(chp->valuep())) {
                         thisp = new AstEq{flp, sel(), cvp};
@@ -30677,7 +30738,12 @@ private:
         FileLine* const flp = nodep->fileline();
         AstNodeExpr* const exprp = lowerExpr(nodep->exprp());
         if (!exprp) return nullptr;
-        if (caseWantsChain(nodep)) return lowerCaseAsChain(nodep, exprp, flp);
+        // An expression whose length only running decides is compared with
+        // each choice in turn, after its length is checked against theirs
+        // (10.9): "case get_bits(n, b) is when "111" =>"
+        if (caseWantsChain(nodep) || isDynValue(nodep->exprp())) {
+            return lowerCaseAsChain(nodep, exprp, flp);
+        }
         AstCaseItem* itemsp = nullptr;
         // A choice may name 'Z', or '-' in a matching case, and those reach
         // the emitted case as the Verilog values they stand for. Verilator
@@ -34347,6 +34413,12 @@ private:
             if (AstNodeExpr* const dtextp = dynTextOf(args[1], flp)) {
                 return appendItem(linep, dtextp, flp);
             }
+        } else if (isDynValue(args[1])) {
+            // HWRITE and OWRITE write what TO_HSTRING and TO_OSTRING give (16.4)
+            AstNodeExpr* dtextp = dynRadixTextOf(args[1], radix == "%h" ? 4 : 3, flp);
+            if (!dtextp) return nullptr;
+            if (radix == "%h") dtextp = new AstToUpperN{flp, dtextp};
+            return appendItem(linep, dtextp, flp);
         }
         // A physical value is written in a unit, NS unless the call names one
         if (radix.empty() && args[1]->vhdlTypep()
