@@ -7959,9 +7959,11 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
 }
 }  // namespace
 
-// An enumeration of the nine logic values, or an array of them
+// An enumeration of the nine logic values, or an array of them, where those
+// are held as bits and resolved natively. Under --vhdl-metavalues the nine
+// values are an enumeration like any other, resolved by RESOLVED itself.
 bool VhdlSemVisitor::isLogicValued(const VhdlType* typep) {
-    if (!typep) return false;
+    if (!typep || v3Global.opt.vhdlMetavalues()) return false;
     const VhdlType* basep = typep->base();
     if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
         basep = basep->elementp()->base();

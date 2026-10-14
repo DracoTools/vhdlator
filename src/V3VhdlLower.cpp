@@ -65,20 +65,38 @@ char enumLitChar(const VhdlSymbol* litp) {
 // where each of its values stays distinct. Only the two shapes the standard
 // itself declares are logic, and their positions are fixed, so a type written
 // ('1','0') is not BIT however much it looks like it.
+// Whether an enumeration has the shape of STD_ULOGIC, whatever it lowers to
+bool enumIsStdUlogic(const VhdlType* typep) {
+    if (!typep || typep->base()->kind() != VhdlTypeKind::ENUM) return false;
+    const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
+    if (lits.size() != 9) return false;
+    static const char* const stdUlogic = "UX01ZWLH-";
+    for (size_t i = 0; i < lits.size(); ++i) {
+        if (enumLitChar(lits[i]) != stdUlogic[i]) return false;
+    }
+    return true;
+}
+
 bool enumIsLogic(const VhdlType* typep) {
     if (!typep || typep->base()->kind() != VhdlTypeKind::ENUM) return false;
     const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
     if (lits.size() == 2) {  // BIT
         return enumLitChar(lits[0]) == '0' && enumLitChar(lits[1]) == '1';
     }
-    if (lits.size() == 9) {  // STD_ULOGIC
-        static const char* const stdUlogic = "UX01ZWLH-";
-        for (size_t i = 0; i < lits.size(); ++i) {
-            if (enumLitChar(lits[i]) != stdUlogic[i]) return false;
-        }
-        return true;
+    // STD_ULOGIC, unless its nine values are kept apart: then it is an
+    // enumeration like any other, held as its position
+    return !v3Global.opt.vhdlMetavalues() && enumIsStdUlogic(typep);
+}
+
+// Whether a type is STD_ULOGIC held as the position of each of its nine
+// values (--vhdl-metavalues), or an array of it
+bool nineValued(const VhdlType* typep) {
+    if (!typep || !v3Global.opt.vhdlMetavalues()) return false;
+    const VhdlType* basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
+        basep = basep->elementp()->base();
     }
-    return false;
+    return enumIsStdUlogic(basep);
 }
 
 // What one literal of such a type means
@@ -4409,6 +4427,7 @@ private:
     // it is transparent here, and so is a qualified expression.
     bool isDynValue(const AstNodeVhdlExpr* nodep, int depth = 0) const {
         if (!nodep || depth > 8) return false;
+        if (ninePlanned(nodep)) return false;
         if (isDynObj(nodep)) return true;
         if (carriedElementRead(nodep)) return true;
         if (isAccessAll(nodep)) return true;
@@ -4872,10 +4891,19 @@ private:
         AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
         funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
         funcp->fvarp(newReturnVar(name, dynCarrierRef(carrierTypep, flp), flp));
-        AstVar* const vp = new AstVar{
-            flp, VVarType::PORT, "v", VFlagChildDType{},
-            new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::UNSIGNED,
-                              static_cast<int>(count), static_cast<int>(count)}};
+        // Each element as many bits as its type holds: one for a logic type,
+        // its position's width for another enumeration -- STD_ULOGIC under
+        // --vhdl-metavalues -- as lowerBitString writes the literal
+        const VhdlType* const litElemp = carrierTypep->base()->elementp();
+        const int elemBits = litElemp && litElemp->base()->kind() == VhdlTypeKind::ENUM
+                                     && !enumIsLogic(litElemp->base())
+                                 ? bitsFor(litElemp->base()->literals().size())
+                                 : 1;
+        AstVar* const vp
+            = new AstVar{flp, VVarType::PORT, "v", VFlagChildDType{},
+                         new AstBasicDType{flp, VBasicDTypeKwd::LOGIC, VSigning::UNSIGNED,
+                                           static_cast<int>(count * elemBits),
+                                           static_cast<int>(count * elemBits)}};
         vp->direction(VDirection::INPUT);
         vp->declDirection(VDirection::INPUT);
         vp->funcLocal(true);
@@ -4909,9 +4937,13 @@ private:
             // bit range to select from
             AstNodeExpr* const srcp
                 = count == 1 ? static_cast<AstNodeExpr*>(rd(vp, flp))
-                             : new AstSelBit{flp, rd(vp, flp),
-                                             new AstConst{flp, AstConst::Signed32{},
-                                                          static_cast<int32_t>(count - 1 - k)}};
+                  : elemBits > 1
+                      ? static_cast<AstNodeExpr*>(
+                            new AstSel{flp, rd(vp, flp),
+                                       static_cast<int>((count - 1 - k) * elemBits), elemBits})
+                      : new AstSelBit{flp, rd(vp, flp),
+                                      new AstConst{flp, AstConst::Signed32{},
+                                                   static_cast<int32_t>(count - 1 - k)}};
             funcp->addStmtsp(new AstAssign{
                 flp,
                 new AstSelBit{flp, dynPart(out(), "q", flp),
@@ -5651,10 +5683,18 @@ private:
                 = lowerValue(VhdlValue::mkInt(typep->high(), const_cast<VhdlType*>(typep)),
                              const_cast<VhdlType*>(basep), flp);
             // A bound at the end of what the held type can hold cannot be
-            // passed: NATURAL's high end, POSITIVE's
+            // passed: NATURAL's high end, POSITIVE's, an enumeration
+            // subtype's first position, which is held unsigned
             const bool repType = kind == VhdlTypeKind::INTEGER;
-            const bool loNeeded = !repType || typep->low() > (wide ? INT64_MIN : INT32_MIN);
-            const bool hiNeeded = !repType || typep->high() < (wide ? INT64_MAX : INT32_MAX);
+            const bool enumType = kind == VhdlTypeKind::ENUM;
+            const int64_t enumMax
+                = enumType ? (int64_t{1} << bitsFor(basep->literals().size())) - 1 : 0;
+            const bool loNeeded = enumType
+                                      ? typep->low() > 0
+                                      : !repType || typep->low() > (wide ? INT64_MIN : INT32_MIN);
+            const bool hiNeeded = enumType
+                                      ? typep->high() < enumMax
+                                      : !repType || typep->high() < (wide ? INT64_MAX : INT32_MAX);
             AstNodeExpr* const belowp
                 = !loNeeded ? nullptr
                   : kind == VhdlTypeKind::ENUM
@@ -6550,14 +6590,20 @@ private:
         if (!m_modp) return nullptr;
         const VhdlType* const elemp = basep->elementp();
         // Only a vector of logic reads as text one element at a time; an
-        // array of anything else has no such image in the language either
-        if (!elemp || !enumIsLogic(elemp->base())) return nullptr;
+        // array of anything else has no such image in the language either.
+        // Of the nine values each element is the character it stands for.
+        const bool nine = elemp && nineValued(elemp);
+        if (!elemp || (!enumIsLogic(elemp->base()) && !nine)) return nullptr;
         AstFunc* const funcp = newDynFunc("__Vdyntext", typep,
                                           new AstBasicDType{flp, VBasicDTypeKwd::STRING}, flp);
         AstVar* const cp = dynArg(funcp, "c", dynCarrierRef(typep, flp), flp);
         AstVar* const lenp = newFuncLocal("len", newIntDType(flp), flp);
         AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
         for (AstVar* const vp : {lenp, ip}) funcp->addStmtsp(vp);
+        AstVar* const ep
+            = nine ? newFuncLocal("e", lowerType(const_cast<VhdlType*>(elemp), flp), flp)
+                   : nullptr;
+        if (ep) funcp->addStmtsp(ep);
         const auto out
             = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
         const auto acc
@@ -6567,13 +6613,18 @@ private:
         funcp->addStmtsp(
             new AstAssign{flp, out(), new AstConst{flp, AstConst::String{}, ""}});
         funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
-        AstNode* bodyp = new AstAssign{
-            flp, out(),
-            new AstConcatN{flp, acc(),
-                           new AstSFormatF{flp, "%b", false,
-                                           new AstSelBit{flp,
-                                                         dynPart(rd(cp, flp), "q", flp),
-                                                         rd(ip, flp)}}}};
+        AstNodeExpr* const elemValp
+            = new AstSelBit{flp, dynPart(rd(cp, flp), "q", flp), rd(ip, flp)};
+        AstNode* bodyp = nullptr;
+        if (ep) {
+            bodyp = new AstAssign{flp, wr(ep, flp), elemValp};
+            bodyp->addNext(
+                new AstAssign{flp, out(), new AstConcatN{flp, acc(), nineCharText(ep, flp)}});
+        } else {
+            bodyp = new AstAssign{
+                flp, out(),
+                new AstConcatN{flp, acc(), new AstSFormatF{flp, "%b", false, elemValp}}};
+        }
         bodyp = AstNode::addNext(
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}}));
@@ -6581,6 +6632,37 @@ private:
         addHelperFunc(funcp);
         m_dynTextFuncs.insert_or_assign(carrierKeyOf(typep), funcp);
         return funcp;
+    }
+
+    // The character one of the nine values is written with, as text
+    static AstNodeExpr* nineCharText(AstVar* ep, FileLine* flp) {
+        static const char* const nine = "UX01ZWLH-";
+        AstNodeExpr* outp = new AstConst{flp, AstConst::String{}, "-"};
+        for (int pos = 7; pos >= 0; --pos) {
+            outp = new AstCond{flp,
+                               new AstEq{flp, rd(ep, flp),
+                                         new AstConst{flp, AstConst::WidthedValue{}, 4,
+                                                      static_cast<uint32_t>(pos)}},
+                               new AstConst{flp, AstConst::String{}, std::string(1, nine[pos])},
+                               outp};
+        }
+        return outp;
+    }
+
+    // The text of a vector of the nine values: its characters, one an
+    // element, written by the helper that writes one whose length only
+    // running decides, whatever its length. Null where it is not one.
+    AstNodeExpr* nineTextOf(AstNodeVhdlExpr* nodep, FileLine* flp) {
+        const VhdlType* const vtypep = nodep ? nodep->vhdlTypep() : nullptr;
+        if (!nineValued(vtypep) || vtypep->base()->kind() != VhdlTypeKind::ARRAY) return nullptr;
+        VhdlType* const carrp = vtypep->base();
+        AstNodeFTask* const funcp = dynTextFunc(carrp, flp);
+        if (!funcp) return nullptr;
+        AstNodeExpr* const cvp = asDynCarrier(nodep, carrp, flp);
+        if (!cvp) return nullptr;
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", cvp}};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
     }
 
     // The text of an expression whose length only running decides. Null
@@ -7456,6 +7538,7 @@ private:
     }
 
     bool dynResultCall(const AstNodeVhdlExpr* nodep, int depth = 0) const {
+        if (ninePlanned(nodep)) return false;
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
         if (!callp || !callp->vhdlSymp()) return false;
         const VhdlSymbol* const symp = callp->vhdlSymp()->resolved();
@@ -7715,6 +7798,30 @@ private:
         // the empty string and not the one place a null vector is given
         if (isStringType(typep)) return new AstConst{flp, AstConst::String{}, bits};
         if (bits.empty()) return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
+        // An array of an enumeration of characters that is not held as bits
+        // -- STD_ULOGIC under --vhdl-metavalues -- holds each element as the
+        // position of its character, the leftmost character the most
+        // significant element
+        const VhdlType* const elemp
+            = typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                  ? (typep->elementp() ? typep->elementp() : typep->base()->elementp())
+                  : nullptr;
+        if (elemp && elemp->base()->kind() == VhdlTypeKind::ENUM && !enumIsLogic(elemp->base())) {
+            const std::vector<VhdlSymbol*>& lits = elemp->base()->literals();
+            const int width = bitsFor(lits.size());
+            V3Number num{flp, width * static_cast<int>(bits.size()), 0};
+            num.setAllBits0();
+            for (size_t i = 0; i < bits.size(); ++i) {
+                size_t pos = 0;
+                while (pos < lits.size() && enumLitChar(lits[pos]) != bits[i]) ++pos;
+                if (pos == lits.size()) return nullptr;
+                const int at = static_cast<int>(bits.size() - 1 - i) * width;
+                for (int b = 0; b < width; ++b) {
+                    if ((pos >> b) & 1) num.setBit(at + b, '1');
+                }
+            }
+            return new AstConst{flp, num};
+        }
         V3Number num{flp, static_cast<int>(bits.size()), 0};
         num.setAllBits0();
         for (size_t i = 0; i < bits.size(); ++i) {
@@ -9051,6 +9158,10 @@ private:
                         || (symp->driverCount() == 1 && m_zAssigned.count(symp->resolved()))) {
                         makeResolved(symp, varp, flp);
                     }
+                } else if (symp->resolverp() && symp->driverCount() <= 1 && !guardedSignal(symp)
+                           && ieeeResolved(symp->resolverp())) {
+                    // STD_LOGIC_1164's RESOLVED gives one driver's value back
+                    // as it is, so a signal with one driver is that driver
                 } else if (symp->resolverp()) {
                     // A guarded signal goes through its own function however
                     // few drivers it has and whatever its type: only the
@@ -12413,7 +12524,16 @@ private:
     AstNodeExpr* lowerCondition(AstNodeVhdlExpr* nodep) {
         AstNodeExpr* const exprp = lowerExpr(nodep);
         if (!exprp) return new AstConst{nodep->fileline(), AstConst::BitFalse{}};
-        return exprp;
+        return nineTruth(exprp, nodep->vhdlTypep(), nodep->fileline());
+    }
+
+    // A condition of one of the nine values is TRUE where it is '1' or 'H'
+    // (9.2.9): as a position, (v | 4) is 7 for those two and for no other
+    static AstNodeExpr* nineTruth(AstNodeExpr* exprp, const VhdlType* typep, FileLine* flp) {
+        if (!nineValued(typep) || typep->base()->kind() != VhdlTypeKind::ENUM) return exprp;
+        return new AstEq{flp,
+                         new AstOr{flp, exprp, new AstConst{flp, AstConst::WidthedValue{}, 4, 4}},
+                         new AstConst{flp, AstConst::WidthedValue{}, 4, 7}};
     }
 
     // What an object became. An object declared in a package is not emitted
@@ -14708,6 +14828,10 @@ private:
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
         VhdlType* const otypep = nodep->lhsp()->vhdlTypep();
+        if (AstNodeExpr* const outp
+            = nineOperator(symp, vhdlUnaryOpName(nodep->op()), {nodep->lhsp()}, flp)) {
+            return outp;
+        }
         // std_logic_1164 declares "not" for STD_ULOGIC itself, so an operator
         // over a logic type is one of the intrinsics even when it is explicit
         if (symp && !symp->predefined() && !isIeeeOperator(symp, otypep, nullptr)) {
@@ -14759,7 +14883,8 @@ private:
             return orIdentity(nodep->lhsp(), new AstNot{flp, new AstRedOr{flp, lhsp}}, true, flp);
         case VhdlUnaryOp::XNOR:
             return orIdentity(nodep->lhsp(), new AstNot{flp, new AstRedXor{flp, lhsp}}, true, flp);
-        case VhdlUnaryOp::COND_CONV: return lhsp;  // Already one bit
+        case VhdlUnaryOp::COND_CONV:  // Already one bit, unless of the nine values
+            return nineTruth(lhsp, otypep, flp);
         }
         unsup(flp, "unary operator");
         return nullptr;
@@ -15420,6 +15545,7 @@ private:
     // Whether an operator gives back a value that carries its own bounds
     // because one of its operands does
     bool dynBinaryCarries(const AstVhdlBinary* nodep) const {
+        if (ninePlanned(nodep)) return false;
         // An operator the design declares is a call of its own copy (4.5.2),
         // and gives back what that copy returns, carried or not, whatever
         // its operands are (GHDL gna issue2536)
@@ -15941,11 +16067,985 @@ private:
         return lenp;
     }
 
+    // METHODS - the nine logic values, held as positions
+    //
+    // Under --vhdl-metavalues an element of STD_ULOGIC is four bits, its
+    // position: 'U' 0, 'X' 1, '0' 2, '1' 3, 'Z' 4, 'W' 5, 'L' 6, 'H' 7, '-' 8.
+    // The operations of std_logic_1164 and numeric_std that designs use most
+    // are emitted here over every element of a vector at once, as masks over
+    // the four bits of each element -- a lane -- on whole machine words,
+    // rather than compiled from their bodies one element at a time. Bit 0 of
+    // a lane is the value of '0', '1', 'L' and 'H', which are exactly the
+    // lanes whose bit 1 is set and bit 3 clear (metavalue_design.md).
+
+    // Where the nodes of a native operation are made: their constants are
+    // narrower than what they are combined with on purpose, and widened with
+    // zeros as Verilog widens them
+    static FileLine* nineFl(FileLine* flp) {
+        FileLine* const nflp = new FileLine{flp};
+        nflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        nflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        nflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+        return nflp;
+    }
+
+    // How many elements a value of a nine-value type has, as an expression:
+    // one for a scalar. Null where only running says, or where there are
+    // none, which the bodies answer with a null array of their own.
+    AstNodeExpr* nineCount(const VhdlType* typep, FileLine* flp) {
+        if (!nineValued(typep)) return nullptr;
+        if (typep->base()->kind() == VhdlTypeKind::ENUM) return i32(1, flp);
+        // A length a generic gives is a length, folded with the instance
+        if (typep->dimensions() != 1 || !typep->lengthEmittable()
+            || lengthOnlyRunningDecides(typep)) {
+            return nullptr;
+        }
+        if (const int width = vectorWidth(typep)) return i32(width, flp);
+        AstNodeExpr* const lenp = boundsLength(typep, flp);
+        return lenp ? declaredPlaces(lenp, flp) : nullptr;
+    }
+
+    // A lane of four bits, as many times over as there are elements
+    static AstNodeExpr* laneMask(uint32_t pattern, const AstNodeExpr* countp, FileLine* flp) {
+        AstNodeExpr* const lanep = new AstConst{flp, AstConst::WidthedValue{}, 4, pattern};
+        if (const AstConst* const constp = VN_CAST(countp, Const)) {
+            if (constp->toSInt() == 1) return lanep;
+        }
+        FileLine* const rflp = new FileLine{flp};
+        rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+        return new AstReplicate{rflp, lanep, const_cast<AstNodeExpr*>(countp)->cloneTree(false)};
+    }
+    static AstNodeExpr* laneShr(AstNodeExpr* exprp, uint32_t by, FileLine* flp) {
+        return new AstShiftR{flp, exprp, new AstConst{flp, AstConst::WidthedValue{}, 32, by}};
+    }
+
+    // An operand read several times over: a name or a constant as it stands,
+    // anything else once into a temporary, which only statements can hold
+    struct NineArg final {
+        AstVar* varp = nullptr;
+        AstNodeExpr* exprp = nullptr;  // Cloned for each read
+        AstNodeExpr* countp = nullptr;  // How many elements
+    };
+    static AstNodeExpr* nineRead(const NineArg& arg, FileLine* flp) {
+        return arg.varp ? rd(arg.varp, flp) : arg.exprp->cloneTree(false);
+    }
+    static void nineDrop(NineArg& arg) {
+        if (arg.exprp) VL_DO_DANGLING(arg.exprp->deleteTree(), arg.exprp);
+        if (arg.countp) VL_DO_DANGLING(arg.countp->deleteTree(), arg.countp);
+    }
+    bool nineArg(AstNodeVhdlExpr* nodep, NineArg& arg, AstNode*& stmtsp, FileLine* flp) {
+        arg.countp = nineCount(nodep->vhdlTypep(), flp);
+        if (!arg.countp) return false;
+        if (isDynValue(nodep)) return false;
+        AstNodeExpr* const valp = lowerExpr(nodep);
+        if (!valp) return false;
+        // Outside statements nothing can hold it, so it is read again where
+        // it is needed, which an operand of these operations may be
+        if (VN_IS(valp, VarRef) || VN_IS(valp, Const) || !m_inStmts) {
+            arg.exprp = valp;
+            return true;
+        }
+        arg.varp = newTempVar("__Vnine", lowerType(nodep->vhdlTypep(), flp), flp);
+        stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), valp});
+        return true;
+    }
+
+    // The classes of each lane of a value, as bit 0 of the lane: '0', '1',
+    // 'L' or 'H' (defined), and of those the ones that are one or zero; 'U'
+    static AstNodeExpr* laneDefined(const NineArg& a, FileLine* flp) {
+        return new AstAnd{flp,
+                          new AstAnd{flp, laneShr(nineRead(a, flp), 1, flp),
+                                     new AstNot{flp, laneShr(nineRead(a, flp), 3, flp)}},
+                          laneMask(1, a.countp, flp)};
+    }
+    static AstNodeExpr* laneOne(const NineArg& a, FileLine* flp) {
+        return new AstAnd{flp, laneDefined(a, flp), nineRead(a, flp)};
+    }
+    static AstNodeExpr* laneZero(const NineArg& a, FileLine* flp) {
+        return new AstAnd{flp, laneDefined(a, flp), new AstNot{flp, nineRead(a, flp)}};
+    }
+    static AstNodeExpr* laneU(const NineArg& a, FileLine* flp) {
+        return new AstAnd{
+            flp,
+            new AstNot{
+                flp,
+                new AstOr{flp, new AstOr{flp, nineRead(a, flp), laneShr(nineRead(a, flp), 1, flp)},
+                          new AstOr{flp, laneShr(nineRead(a, flp), 2, flp),
+                                    laneShr(nineRead(a, flp), 3, flp)}}},
+            laneMask(1, a.countp, flp)};
+    }
+    // Where a lane is '-' (8, 1000)
+    static AstNodeExpr* laneDash(const NineArg& a, FileLine* flp) {
+        return new AstAnd{flp, laneShr(nineRead(a, flp), 3, flp), laneMask(1, a.countp, flp)};
+    }
+    // One element made of whether any lane, or every lane, is in a class
+    static AstNodeExpr* anyLane(AstNodeExpr* lanesp) {
+        return new AstRedOr{lanesp->fileline(), lanesp};
+    }
+    static AstNodeExpr* everyLane(AstNodeExpr* lanesp, const AstNodeExpr* countp, FileLine* flp) {
+        return new AstEq{flp, lanesp, laneMask(1, countp, flp)};
+    }
+    // One element: '0' where zerop holds, else '1' where onep does, else 'U'
+    // where up does, else 'X'
+    static AstNodeExpr* elementOf(AstNodeExpr* zerop, AstNodeExpr* onep, AstNodeExpr* up,
+                                  FileLine* flp) {
+        const auto lit
+            = [&](uint32_t pos) { return new AstConst{flp, AstConst::WidthedValue{}, 4, pos}; };
+        return new AstCond{flp, zerop, lit(2),
+                           new AstCond{flp, onep, lit(3), new AstCond{flp, up, lit(0), lit(1)}}};
+    }
+
+    // "a ?= b" as one element (9.2.3): per lane, '-' on either side matches;
+    // else 'U' where either is 'U'; '1' or '0' where both are '0', '1', 'L'
+    // or 'H'; else 'X'; and a vector is '1' where every lane is
+    static AstNodeExpr* nineMatchElement(const NineArg& a, const NineArg& b,
+                                         const AstNodeExpr* countp, bool negate, FileLine* flp) {
+        AstNodeExpr* const dashp = new AstOr{flp, laneDash(a, flp), laneDash(b, flp)};
+        AstNodeExpr* const bothp = new AstAnd{flp, laneDefined(a, flp), laneDefined(b, flp)};
+        AstNodeExpr* const diffp = new AstXor{flp, nineRead(a, flp), nineRead(b, flp)};
+        AstNodeExpr* const eqOnep = new AstOr{
+            flp, dashp->cloneTree(false),
+            new AstAnd{flp, bothp->cloneTree(false), new AstNot{flp, diffp->cloneTree(false)}}};
+        AstNodeExpr* const eqZerop = new AstAnd{flp, new AstNot{flp, dashp->cloneTree(false)},
+                                                new AstAnd{flp, bothp, diffp}};
+        AstNodeExpr* const eqUp = new AstAnd{flp, new AstNot{flp, dashp},
+                                             new AstOr{flp, laneU(a, flp), laneU(b, flp)}};
+        AstNodeExpr* zp = anyLane(eqZerop);
+        AstNodeExpr* op1 = everyLane(eqOnep, countp, flp);
+        if (negate) std::swap(zp, op1);
+        return elementOf(zp, op1, anyLane(eqUp), flp);
+    }
+
+    // A matching case over the nine values (10.9): the alternative whose
+    // choice the expression matches with "?=" giving '1', in order
+    AstNode* lowerNineMatchingCase(AstVhdlCase* nodep, AstNodeExpr* exprp, FileLine* flp) {
+        VhdlType* const selTypep = nodep->exprp()->vhdlTypep();
+        flp = nineFl(flp);
+        NineArg sel;
+        sel.countp = nineCount(selTypep, flp);
+        if (!sel.countp) return nullptr;
+        sel.varp = newTempVar("__Vcasesel", lowerType(selTypep, flp), flp);
+        AstNode* outp = new AstAssign{flp, wr(sel.varp, flp), exprp};
+        AstIf* firstp = nullptr;
+        AstIf* lastp = nullptr;
+        AstNode* othersp = nullptr;
+        bool hasOthers = false;
+        for (AstNode* p = nodep->altsp(); p; p = p->nextp()) {
+            AstVhdlAlternative* const altp = VN_AS(p, VhdlAlternative);
+            AstNodeExpr* condp = nullptr;
+            bool others = false;
+            for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
+                AstVhdlChoice* const chp = VN_AS(cp, VhdlChoice);
+                if (chp->isOthers()) {
+                    others = true;
+                    continue;
+                }
+                if (!chp->valuep()) {
+                    unsup(chp->fileline(), "range choice in a matching case of logic values");
+                    continue;
+                }
+                NineArg ch;
+                ch.exprp = lowerExpr(chp->valuep());
+                if (!ch.exprp) continue;
+                ch.countp = sel.countp->cloneTree(false);
+                AstNodeExpr* const matchp
+                    = new AstEq{flp, nineMatchElement(sel, ch, sel.countp, false, flp),
+                                new AstConst{flp, AstConst::WidthedValue{}, 4, 3}};
+                nineDrop(ch);
+                condp = condp ? new AstLogOr{flp, condp, matchp} : matchp;
+            }
+            AstNode* const stmtsp = lowerStmts(altp->stmtsp());
+            if (others) {
+                hasOthers = true;
+                othersp = stmtsp;
+                if (condp) VL_DO_DANGLING(condp->deleteTree(), condp);
+                continue;
+            }
+            if (!condp) {
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                continue;
+            }
+            AstIf* const ifp = new AstIf{flp, condp, stmtsp, nullptr};
+            if (lastp) {
+                lastp->addElsesp(ifp);
+            } else {
+                firstp = ifp;
+            }
+            lastp = ifp;
+        }
+        if (hasOthers) {
+            if (lastp) {
+                if (othersp) lastp->addElsesp(othersp);
+            } else if (othersp) {
+                outp->addNext(othersp);
+            }
+        }
+        if (firstp) outp->addNext(firstp);
+        nineDrop(sel);
+        return outp;
+    }
+
+    // The lanes of a result made of where it is one, zero and 'U' -- 'X'
+    // everywhere else: '1' is 0011, '0' 0010, 'U' 0000 and 'X' 0001
+    static AstNodeExpr* laneResult(AstNodeExpr* onep, AstNodeExpr* zerop, AstNodeExpr* up,
+                                   const AstNodeExpr* countp, FileLine* flp) {
+        AstNodeExpr* const definedp = new AstOr{flp, onep->cloneTree(false), zerop};
+        AstNodeExpr* const xp
+            = new AstAnd{flp, new AstNot{flp, new AstOr{flp, definedp->cloneTree(false), up}},
+                         laneMask(1, countp, flp)};
+        return new AstOr{
+            flp,
+            new AstOr{
+                flp,
+                new AstShiftL{flp, definedp, new AstConst{flp, AstConst::WidthedValue{}, 32, 1}},
+                onep},
+            xp};
+    }
+
+    // The logical operators of std_logic_1164 over the nine values (9.2.2,
+    // and the tables of std_logic_1164): one lane at a time, as the tables
+    // say, a scalar beside a vector standing for every one of its elements
+    AstNodeExpr* nineLogical(const std::string& op, const std::vector<AstNodeVhdlExpr*>& args,
+                             FileLine* flp) {
+        flp = nineFl(flp);
+        AstNode* stmtsp = nullptr;
+        std::vector<NineArg> ops(args.size());
+        const auto fail = [&]() -> AstNodeExpr* {
+            for (NineArg& arg : ops) nineDrop(arg);
+            if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+            return nullptr;
+        };
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (!nineArg(args[i], ops[i], stmtsp, flp)) return fail();
+        }
+        const AstNodeExpr* countp = ops[0].countp;
+        if (ops.size() == 2) {
+            const bool lScalar = args[0]->vhdlTypep()->base()->kind() == VhdlTypeKind::ENUM;
+            const bool rScalar = args[1]->vhdlTypep()->base()->kind() == VhdlTypeKind::ENUM;
+            const AstConst* const lcp = VN_CAST(ops[0].countp, Const);
+            const AstConst* const rcp = VN_CAST(ops[1].countp, Const);
+            if (lScalar != rScalar) {
+                NineArg& sc = lScalar ? ops[0] : ops[1];
+                const NineArg& vec = lScalar ? ops[1] : ops[0];
+                FileLine* const rflp = new FileLine{flp};
+                rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+                AstNodeExpr* const spreadp
+                    = new AstReplicate{rflp, nineRead(sc, flp), vec.countp->cloneTree(false)};
+                AstNodeExpr* const scCountp = vec.countp->cloneTree(false);
+                nineDrop(sc);
+                sc.varp = nullptr;
+                sc.exprp = spreadp;
+                sc.countp = scCountp;
+                countp = vec.countp;
+            } else if (lcp && rcp && lcp->toSInt() != rcp->toSInt()) {
+                // Of two lengths: the body's own check stops the run
+                return fail();
+            }
+        }
+        const NineArg& a = ops[0];
+        std::string base = op;
+        bool invert = false;
+        if (op == "nand" || op == "nor" || op == "xnor") {
+            base = op.substr(1);
+            invert = true;
+        }
+        AstNodeExpr* onep = nullptr;
+        AstNodeExpr* zerop = nullptr;
+        AstNodeExpr* up = nullptr;
+        if (base == "not" && ops.size() == 1) {
+            onep = laneZero(a, flp);
+            zerop = laneOne(a, flp);
+            up = laneU(a, flp);
+        } else if (ops.size() == 1) {
+            // A reduction over the elements of a vector (9.2.2), as the
+            // tables combine them one after another: AND is '0' if any is
+            // '0' or 'L', '1' if all are '1' or 'H'; OR the other way round;
+            // XOR the parity of the values if all are '0', '1', 'L' or 'H'.
+            // Any 'U' that did not settle it makes 'U'.
+            AstNodeExpr* zp = nullptr;
+            AstNodeExpr* op1 = nullptr;
+            if (base == "and") {
+                zp = anyLane(laneZero(a, flp));
+                op1 = everyLane(laneOne(a, flp), a.countp, flp);
+            } else if (base == "or") {
+                op1 = anyLane(laneOne(a, flp));
+                zp = everyLane(laneZero(a, flp), a.countp, flp);
+            } else if (base == "xor") {
+                AstNodeExpr* const allp = everyLane(laneDefined(a, flp), a.countp, flp);
+                AstNodeExpr* const parityp = new AstRedXor{flp, laneValues(a, flp)};
+                zp = new AstLogAnd{flp, allp->cloneTree(false), new AstLogNot{flp, parityp}};
+                op1 = new AstLogAnd{flp, allp, parityp->cloneTree(false)};
+            } else {
+                return fail();
+            }
+            AstNodeExpr* const anyUp = anyLane(laneU(a, flp));
+            if (invert) std::swap(zp, op1);
+            AstNodeExpr* outp = elementOf(zp, op1, anyUp, flp);
+            for (NineArg& arg : ops) nineDrop(arg);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        } else if (ops.size() == 2 && (op == "?=" || op == "?/=")) {
+            // Matching equality (9.2.3): '-' on either side matches; else 'U'
+            // where either is 'U'; '1' or '0' where both are '0', '1', 'L'
+            // or 'H'; else 'X'. A vector is TRUE where every element is.
+            AstNodeExpr* outp = nineMatchElement(a, ops[1], countp, op == "?/=", flp);
+            for (NineArg& arg : ops) nineDrop(arg);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        } else if (ops.size() == 2) {
+            const NineArg& b = ops[1];
+            if (base == "and") {
+                zerop = new AstOr{flp, laneZero(a, flp), laneZero(b, flp)};
+                onep = new AstAnd{flp, laneOne(a, flp), laneOne(b, flp)};
+            } else if (base == "or") {
+                onep = new AstOr{flp, laneOne(a, flp), laneOne(b, flp)};
+                zerop = new AstAnd{flp, laneZero(a, flp), laneZero(b, flp)};
+            } else if (base == "xor") {
+                AstNodeExpr* const bothp
+                    = new AstAnd{flp, laneDefined(a, flp), laneDefined(b, flp)};
+                AstNodeExpr* const diffp = new AstXor{flp, nineRead(a, flp), nineRead(b, flp)};
+                onep = new AstAnd{flp, bothp->cloneTree(false), diffp->cloneTree(false)};
+                zerop = new AstAnd{flp, bothp, new AstNot{flp, diffp}};
+            } else {
+                return fail();
+            }
+            // 'U' where either is, unless the other settled it
+            up = new AstOr{flp, laneU(a, flp), laneU(b, flp)};
+            if (base != "xor") {
+                up = new AstAnd{flp, up,
+                                new AstNot{flp, new AstOr{flp, onep->cloneTree(false),
+                                                          zerop->cloneTree(false)}}};
+            }
+        } else {
+            return fail();
+        }
+        if (invert) std::swap(onep, zerop);
+        AstNodeExpr* outp = laneResult(onep, zerop, up, countp, flp);
+        for (NineArg& arg : ops) nineDrop(arg);
+        if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+        return outp;
+    }
+
+    // How numeric_std reads an operand: 'u' an UNSIGNED (or, in
+    // numeric_std_unsigned, any vector of the nine values), 's' a SIGNED,
+    // 'i' an integer; 0 for anything else
+    static char nineNumKind(const VhdlType* typep, bool vectorsUnsigned) {
+        if (!typep) return 0;
+        const VhdlTypeKind kind = typep->base()->kind();
+        if (kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::UNIVERSAL_INTEGER) return 'i';
+        if (!nineValued(typep) || kind != VhdlTypeKind::ARRAY) return 0;
+        const std::string& name = typep->base()->name();
+        if (name == "unresolved_unsigned" || name == "unsigned") return 'u';
+        if (name == "unresolved_signed" || name == "signed") return 's';
+        return vectorsUnsigned ? 'u' : 0;
+    }
+    static bool inPackageNamed(const VhdlSymbol* symp, const char* pkgp) {
+        for (const VhdlScope* scopep = symp ? symp->declScopep() : nullptr; scopep;
+             scopep = scopep->parentp()) {
+            if (scopep->name() == pkgp) return true;
+        }
+        return false;
+    }
+
+    // The value lanes of an operand -- bit 0 of each lane, the rest clear --
+    // which is all arithmetic reads once every lane is '0', '1', 'L' or 'H'
+    static AstNodeExpr* laneValues(const NineArg& a, FileLine* flp) {
+        return new AstAnd{flp, nineRead(a, flp), laneMask(1, a.countp, flp)};
+    }
+    // Whether every lane of an operand is '0', '1', 'L' or 'H'
+    static AstNodeExpr* laneAllDefined(const NineArg& a, FileLine* flp) {
+        return new AstEq{flp, laneDefined(a, flp), laneMask(1, a.countp, flp)};
+    }
+    // Value lanes back into '0' and '1'
+    static AstNodeExpr* laneFromValues(AstNodeExpr* valuesp, const AstNodeExpr* countp,
+                                       FileLine* flp) {
+        return new AstOr{flp, new AstAnd{flp, valuesp, laneMask(1, countp, flp)},
+                         laneMask(2, countp, flp)};
+    }
+    // numeric_std's warning where an operand holds a metavalue, printed as
+    // its body's assertion would print it (severity WARNING), at the call;
+    // made into the expression where statements can be written
+    AstNodeExpr* withNineWarning(AstNodeExpr* outp, const NineArg& a, const NineArg* bp,
+                                 const std::string& msg, FileLine* flp) {
+        if (!m_inStmts) return outp;
+        const std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
+                                   + std::to_string(flp->firstColumn())
+                                   + ":@%0t:(assertion warning): " + msg;
+        AstNodeExpr* badp = new AstLogNot{flp, laneAllDefined(a, flp)};
+        if (bp) badp = new AstLogOr{flp, badp, new AstLogNot{flp, laneAllDefined(*bp, flp)}};
+        AstNode* const warnp = new AstIf{
+            flp, badp,
+            new AstDisplay{flp, VDisplayType::DT_DISPLAY, format, nullptr,
+                           new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}}},
+            nullptr};
+        return new AstExprStmt{flp, warnp, outp};
+    }
+    static int64_t constCount(const AstNodeExpr* countp) {
+        const AstConst* const constp = VN_CAST(countp, Const);
+        return constp ? constp->toSInt() : -1;
+    }
+
+    // The 256 bits of 64 lanes, and the masks that gather bit 0 of each lane
+    // into a 64-bit number and spread one back out: at each step a group of
+    // bits moves next to the group beside it (metavalue_design.md)
+    static AstConst* boxMask(int groupBits, int strideBits, FileLine* flp) {
+        V3Number num{flp, 256, 0};
+        num.setAllBits0();
+        for (int at = 0; at < 256; at += strideBits) {
+            for (int b = 0; b < groupBits; ++b) num.setBit(at + b, '1');
+        }
+        return new AstConst{flp, num};
+    }
+    static AstNodeExpr* box256(AstNodeExpr* exprp, FileLine* flp) {
+        return new AstCastSize{flp, exprp, new AstConst{flp, AstConst::Unsized32{}, 256}};
+    }
+    // Bit 0 of each of the first 64 lanes, as a 64-bit number
+    static AstNodeExpr* laneGather(AstNodeExpr* valuesp, FileLine* flp) {
+        AstNodeExpr* xp = new AstAnd{flp, box256(valuesp, flp), boxMask(1, 4, flp)};
+        static const int steps[][3]
+            = {{3, 2, 8}, {6, 4, 16}, {12, 8, 32}, {24, 16, 64}, {48, 32, 128}, {96, 64, 256}};
+        for (const auto& step : steps) {
+            xp = new AstAnd{flp,
+                            new AstOr{flp, xp->cloneTree(false),
+                                      new AstShiftR{flp, xp,
+                                                    new AstConst{flp, AstConst::WidthedValue{}, 32,
+                                                                 static_cast<uint32_t>(step[0])}}},
+                            boxMask(step[1], step[2], flp)};
+        }
+        return new AstCastSize{flp, xp, new AstConst{flp, AstConst::Unsized32{}, 64}};
+    }
+    // A 64-bit number into bit 0 of each of 64 lanes
+    static AstNodeExpr* laneSpread(AstNodeExpr* valuep, FileLine* flp) {
+        AstNodeExpr* xp = box256(valuep, flp);
+        static const int steps[][3]
+            = {{96, 32, 128}, {48, 16, 64}, {24, 8, 32}, {12, 4, 16}, {6, 2, 8}, {3, 1, 4}};
+        for (const auto& step : steps) {
+            xp = new AstAnd{flp,
+                            new AstOr{flp, xp->cloneTree(false),
+                                      new AstShiftL{flp, xp,
+                                                    new AstConst{flp, AstConst::WidthedValue{}, 32,
+                                                                 static_cast<uint32_t>(step[0])}}},
+                            boxMask(step[1], step[2], flp)};
+        }
+        return xp;
+    }
+
+    // An integer as the value lanes of a vector of so many elements, its
+    // two's complement cut to that length. A constant is written out; another
+    // integer is spread, which needs the length to be a number.
+    AstNodeExpr* laneOfInt(AstNodeVhdlExpr* nodep, bool sgn, const AstNodeExpr* countp,
+                           FileLine* flp) {
+        const int64_t count = constCount(countp);
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        if (val.isInt()) {
+            const int64_t v = val.toInt();
+            // A constant is written lane by lane. Past 64 lanes, and where
+            // the length is not a number, only one that is the same in every
+            // place above its own bits can be, and where the length is not a
+            // number it must not make the operation any wider: 0 or 1.
+            const int lanes = count > 0 ? static_cast<int>(std::min<int64_t>(count, 64)) : 1;
+            if (count < 0 && (v < 0 || v > 1)) return nullptr;
+            if (count > 64 && v < 0) return nullptr;
+            V3Number num{flp, lanes * 4, 0};
+            num.setAllBits0();
+            for (int k = 0; k < lanes; ++k) {
+                if ((static_cast<uint64_t>(v) >> std::min(k, 63)) & 1) num.setBit(k * 4, '1');
+            }
+            return new AstConst{flp, num};
+        }
+        if (count < 1 || count > 64) return nullptr;
+        AstNodeExpr* const intp = lowerExpr(nodep);
+        if (!intp) return nullptr;
+        // Widened to 64 bits the way the integer's sign says
+        AstNodeExpr* const widep = sgn || isSignedType(nodep->vhdlTypep())
+                                       ? static_cast<AstNodeExpr*>(new AstExtendS{flp, intp, 64})
+                                       : static_cast<AstNodeExpr*>(new AstExtend{flp, intp, 64});
+        return new AstCastSize{
+            flp, laneSpread(widep, flp),
+            new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(count * 4)}};
+    }
+
+    // numeric_std's arithmetic and comparisons over the nine values (16.5):
+    // where an operand holds anything but '0', '1', 'L' and 'H' an operation
+    // gives a vector of 'X' and a comparison gives FALSE ("/=" TRUE);
+    // otherwise 'L' and 'H' count as '0' and '1' and the operation is done
+    // on the value lanes, the carry of each lane landing in the next one.
+    // Null for a shape not handled here, whose body is compiled instead.
+    AstNodeExpr* nineNumeric(const VhdlSymbol* symp, const std::string& op,
+                             const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
+        const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
+        if (!slvUnsigned && !inPackageNamed(symp, "numeric_std")) return nullptr;
+        flp = nineFl(flp);
+        const bool arith = op == "+" || op == "-";
+        const bool relational
+            = op == "=" || op == "/=" || op == "<" || op == "<=" || op == ">" || op == ">=";
+        if (args.size() == 1 && (op == "-" || op == "abs")) {
+            // Unary minus and ABS of a SIGNED: 0 - a, and a where it is not
+            // negative
+            if (nineNumKind(args[0]->vhdlTypep(), slvUnsigned) != 's') return nullptr;
+            AstNode* stmtsp = nullptr;
+            NineArg a;
+            if (!nineArg(args[0], a, stmtsp, flp)) {
+                nineDrop(a);
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                return nullptr;
+            }
+            AstNodeExpr* const negp
+                = laneFromValues(new AstAdd{flp,
+                                            new AstAdd{flp, laneMask(0xe, a.countp, flp),
+                                                       new AstXor{flp, laneValues(a, flp),
+                                                                  laneMask(1, a.countp, flp)}},
+                                            new AstConst{flp, AstConst::WidthedValue{}, 1, 1}},
+                                 a.countp, flp);
+            AstNodeExpr* valuep = negp;
+            if (op == "abs") {
+                AstNodeExpr* const signp = new AstSel{
+                    flp, laneValues(a, flp),
+                    new AstMul{flp, i32(4, flp),
+                               new AstSub{flp, a.countp->cloneTree(false), i32(1, flp)}},
+                    1};
+                valuep = new AstCond{flp, signp, negp,
+                                     laneFromValues(laneValues(a, flp), a.countp, flp)};
+            }
+            AstNodeExpr* outp
+                = new AstCond{flp, laneAllDefined(a, flp), valuep, laneMask(1, a.countp, flp)};
+            nineDrop(a);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        }
+        if (args.size() != 2 || (!arith && !relational)) return nullptr;
+        const char lk = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
+        const char rk = nineNumKind(args[1]->vhdlTypep(), slvUnsigned);
+        if (!lk || !rk || (lk == 'i' && rk == 'i')) return nullptr;
+        if (lk != 'i' && rk != 'i' && lk != rk) return nullptr;
+        const bool sgn = lk == 's' || rk == 's';
+        AstNode* stmtsp = nullptr;
+        NineArg a;
+        NineArg b;
+        const auto fail = [&]() -> AstNodeExpr* {
+            nineDrop(a);
+            nineDrop(b);
+            if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+            return nullptr;
+        };
+        // The vector operand first; an integer is made the same length
+        const bool swapped = lk == 'i';
+        AstNodeVhdlExpr* const vecp = swapped ? args[1] : args[0];
+        AstNodeVhdlExpr* const othp = swapped ? args[0] : args[1];
+        if (!nineArg(vecp, a, stmtsp, flp)) return fail();
+        AstNodeExpr* bValuesp = nullptr;  // Value lanes of the other operand
+        AstNodeExpr* validp = laneAllDefined(a, flp);
+        if (lk == 'i' || rk == 'i') {
+            // numeric_std makes the integer a vector of the vector's length
+            // (TO_UNSIGNED(R, L'LENGTH)) for "+" and "-"; a comparison asks
+            // about the integer as it is, so the two are compared in lanes
+            // enough for either
+            if (relational) {
+                const int64_t count = constCount(a.countp);
+                if (count < 1) {
+                    const VhdlValue val = V3VhdlEval::eval(othp);
+                    if (!val.isInt() || val.toInt() < 0 || (sgn && val.toInt() > 1)) {
+                        VL_DO_DANGLING(validp->deleteTree(), validp);
+                        return fail();
+                    }
+                    if (!sgn) {
+                        // As many lanes as its bits: the vector's own length
+                        // is only known with the instance, and the narrower
+                        // of the two is widened with zeros
+                        const uint64_t v = static_cast<uint64_t>(val.toInt());
+                        int lanes = 1;
+                        while (lanes < 63 && (v >> lanes)) ++lanes;
+                        V3Number num{flp, lanes * 4, 0};
+                        num.setAllBits0();
+                        for (int k = 0; k < lanes; ++k) {
+                            if ((v >> k) & 1) num.setBit(k * 4, '1');
+                        }
+                        bValuesp = new AstConst{flp, num};
+                    }
+                } else if (count < 33) {
+                    // Widen the vector: zeros, or copies of its sign lane
+                    AstNodeExpr* const vp = nineRead(a, flp);
+                    const int extra = static_cast<int>(33 - count);
+                    AstNodeExpr* const fillp
+                        = sgn ? static_cast<AstNodeExpr*>(new AstReplicate{
+                                    flp,
+                                    new AstSel{flp, vp->cloneTree(false),
+                                               static_cast<int>(4 * (count - 1)), 4},
+                                    new AstConst{flp, AstConst::Unsized32{},
+                                                 static_cast<uint32_t>(extra)}})
+                              : laneMask(2, new AstConst{flp, AstConst::Signed32{}, extra}, flp);
+                    AstNodeExpr* const widep = new AstConcat{flp, fillp, vp};
+                    if (a.varp) {
+                        a.exprp = widep;
+                        a.varp = nullptr;
+                    } else {
+                        VL_DO_DANGLING(a.exprp->deleteTree(), a.exprp);
+                        a.exprp = widep;
+                    }
+                    VL_DO_DANGLING(a.countp->deleteTree(), a.countp);
+                    a.countp = i32(33, flp);
+                }
+            }
+            if (!bValuesp) bValuesp = laneOfInt(othp, sgn, a.countp, flp);
+            if (!bValuesp) {
+                VL_DO_DANGLING(validp->deleteTree(), validp);
+                return fail();
+            }
+        } else {
+            if (!nineArg(othp, b, stmtsp, flp)) {
+                VL_DO_DANGLING(validp->deleteTree(), validp);
+                return fail();
+            }
+            // Of the same length, or the body resizes them
+            const int64_t ac = constCount(a.countp);
+            const int64_t bc = constCount(b.countp);
+            const bool same
+                = (ac > 0 && ac == bc) || (ac < 0 && bc < 0 && a.countp->sameTree(b.countp));
+            if (!same) {
+                VL_DO_DANGLING(validp->deleteTree(), validp);
+                return fail();
+            }
+            bValuesp = laneValues(b, flp);
+            validp = new AstLogAnd{flp, validp, laneAllDefined(b, flp)};
+        }
+        AstNodeExpr* outp = nullptr;
+        if (arith) {
+            // a + b, or a - b as a + not b + 1, in lanes whose spare bits
+            // carry into the next lane
+            const bool sub = (op == "-");
+            AstNodeExpr* lhsp = laneValues(a, flp);
+            AstNodeExpr* rhsp = bValuesp;
+            if (sub && swapped) std::swap(lhsp, rhsp);  // int - vector
+            AstNodeExpr* sump = new AstOr{flp, lhsp, laneMask(0xe, a.countp, flp)};
+            if (sub) {
+                sump = new AstAdd{
+                    flp, new AstAdd{flp, sump, new AstXor{flp, rhsp, laneMask(1, a.countp, flp)}},
+                    new AstConst{flp, AstConst::WidthedValue{}, 1, 1}};
+            } else {
+                sump = new AstAdd{flp, sump, rhsp};
+            }
+            outp = new AstCond{flp, validp, laneFromValues(sump, a.countp, flp),
+                               laneMask(1, a.countp, flp)};
+        } else {
+            // Bit k of a value is bit 4k of its value lanes, so they compare
+            // as the values do. A narrower one -- an integer's lanes -- is
+            // widened with zeros, which is what comparing an UNSIGNED with an
+            // integer too large for it asks for. A SIGNED compares the same
+            // once each sign bit is flipped.
+            AstNodeExpr* lp = laneValues(a, flp);
+            AstNodeExpr* rp = bValuesp;
+            if (sgn) {
+                const auto flipped = [&](AstNodeExpr* vp) -> AstNodeExpr* {
+                    AstNodeExpr* const signp = new AstShiftL{
+                        flp,
+                        new AstOr{flp, laneMask(0, a.countp, flp),
+                                  new AstConst{flp, AstConst::WidthedValue{}, 1, 1}},
+                        new AstMul{flp, i32(4, flp),
+                                   new AstSub{flp, a.countp->cloneTree(false), i32(1, flp)}}};
+                    return new AstXor{flp, new AstOr{flp, vp, laneMask(0, a.countp, flp)}, signp};
+                };
+                lp = flipped(lp);
+                rp = flipped(rp);
+            }
+            if (swapped) std::swap(lp, rp);
+            AstNodeExpr* cmpp = nullptr;
+            if (op == "=") {
+                cmpp = new AstEq{flp, lp, rp};
+            } else if (op == "/=") {
+                cmpp = new AstNeq{flp, lp, rp};
+            } else if (op == "<") {
+                cmpp = new AstLt{flp, lp, rp};
+            } else if (op == "<=") {
+                cmpp = new AstLte{flp, lp, rp};
+            } else if (op == ">") {
+                cmpp = new AstGt{flp, lp, rp};
+            } else {
+                cmpp = new AstGte{flp, lp, rp};
+            }
+            outp = new AstCond{flp, validp, cmpp,
+                               new AstConst{flp, AstConst::BitTrue{}, op == "/="}};
+            outp = withNineWarning(outp, a, b.countp ? &b : nullptr,
+                                   "NUMERIC_STD.\"" + op + "\": metavalue detected, returning "
+                                       + (op == "/=" ? "TRUE" : "FALSE"),
+                                   flp);
+        }
+        nineDrop(a);
+        nineDrop(b);
+        if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+        return outp;
+    }
+
+    // numeric_std's conversions over the nine values (16.5): TO_INTEGER is 0
+    // where a lane holds anything but '0', '1', 'L' and 'H'; TO_UNSIGNED and
+    // TO_SIGNED spread an integer into '0' and '1'; RESIZE and the shifts
+    // move lanes as they are, metavalues and all. Null for a shape not
+    // handled here.
+    AstNodeExpr* nineConversion(const VhdlSymbol* symp, const std::string& name,
+                                const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
+        const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
+        if (!slvUnsigned && !inPackageNamed(symp, "numeric_std")) return nullptr;
+        flp = nineFl(flp);
+        if (name == "to_integer" && args.size() == 1) {
+            const char k = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
+            if (k != 'u' && k != 's') return nullptr;
+            AstNode* stmtsp = nullptr;
+            NineArg a;
+            if (!nineArg(args[0], a, stmtsp, flp)) {
+                nineDrop(a);
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                return nullptr;
+            }
+            AstNodeExpr* valp = laneGather(laneValues(a, flp), flp);
+            if (k == 's') {
+                // Its sign is its top element's: shifted up to bit 63 and back
+                AstNodeExpr* const upp = new AstSub{flp, i32(64, flp), a.countp->cloneTree(false)};
+                valp = new AstShiftRS{
+                    flp, new AstSigned{flp, new AstShiftL{flp, valp, upp->cloneTree(false)}}, upp};
+            }
+            // An INTEGER, which is signed
+            AstNodeExpr* outp = new AstCond{
+                flp, laneAllDefined(a, flp),
+                new AstSigned{
+                    flp, new AstCastSize{flp, valp, new AstConst{flp, AstConst::Unsized32{}, 32}}},
+                new AstConst{flp, AstConst::Signed32{}, 0}};
+            outp = withNineWarning(outp, a, nullptr,
+                                   "NUMERIC_STD.TO_INTEGER: metavalue detected, returning 0", flp);
+            nineDrop(a);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        }
+        if ((name == "to_unsigned" || name == "to_signed") && args.size() == 2) {
+            const VhdlValue sizev = V3VhdlEval::eval(args[1]);
+            if (!sizev.isInt() || sizev.toInt() < 1 || sizev.toInt() > 64) return nullptr;
+            AstNodeExpr* const countp = i32(sizev.toInt(), flp);
+            AstNodeExpr* const valuesp = laneOfInt(args[0], name == "to_signed", countp, flp);
+            if (!valuesp) {
+                VL_DO_DANGLING(countp->deleteTree(), countp);
+                return nullptr;
+            }
+            AstNodeExpr* const outp
+                = new AstCastSize{flp, laneFromValues(valuesp, countp, flp),
+                                  new AstConst{flp, AstConst::Unsized32{},
+                                               static_cast<uint32_t>(sizev.toInt() * 4)}};
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            return outp;
+        }
+        if (name == "resize" && args.size() == 2) {
+            const char k = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
+            if (k != 'u' && k != 's') return nullptr;
+            const VhdlValue sizev = V3VhdlEval::eval(args[1]);
+            if (!sizev.isInt() || sizev.toInt() < 1) return nullptr;
+            const int to = static_cast<int>(sizev.toInt());
+            AstNode* stmtsp = nullptr;
+            NineArg a;
+            if (!nineArg(args[0], a, stmtsp, flp) || constCount(a.countp) < 1) {
+                nineDrop(a);
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                return nullptr;
+            }
+            const int from = static_cast<int>(constCount(a.countp));
+            AstNodeExpr* const signp = new AstSel{flp, nineRead(a, flp), 4 * (from - 1), 4};
+            AstNodeExpr* outp = nullptr;
+            if (to == from) {
+                outp = nineRead(a, flp);
+                VL_DO_DANGLING(signp->deleteTree(), signp);
+            } else if (to > from) {
+                AstNodeExpr* const fillp
+                    = k == 's'
+                          ? static_cast<AstNodeExpr*>(
+                                new AstReplicate{flp, signp,
+                                                 new AstConst{flp, AstConst::Unsized32{},
+                                                              static_cast<uint32_t>(to - from)}})
+                          : laneMask(2, new AstConst{flp, AstConst::Signed32{}, to - from}, flp);
+                if (k != 's') VL_DO_DANGLING(signp->deleteTree(), signp);
+                outp = new AstConcat{flp, fillp, nineRead(a, flp)};
+            } else if (k == 's' && to > 1) {
+                // A SIGNED keeps its sign as it is cut short
+                outp = new AstConcat{flp, signp,
+                                     new AstSel{flp, nineRead(a, flp), 0, 4 * (to - 1)}};
+            } else if (k == 's') {
+                outp = signp;
+            } else {
+                outp = new AstSel{flp, nineRead(a, flp), 0, 4 * to};
+                VL_DO_DANGLING(signp->deleteTree(), signp);
+            }
+            nineDrop(a);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        }
+        return nullptr;
+    }
+
+    // Whether a subprogram is one std_logic_1164 declares
+    static bool inStdLogic1164(const VhdlSymbol* symp) {
+        for (const VhdlScope* scopep = symp ? symp->declScopep() : nullptr; scopep;
+             scopep = scopep->parentp()) {
+            if (scopep->name() == "std_logic_1164") return true;
+        }
+        return false;
+    }
+
+    // Whether an operation over the nine values is one emitted natively
+    // (nineOperator, nineConversion), asked without emitting anything: what
+    // such an operation gives back has the length its operands say, not the
+    // one a copy of the IEEE body would carry, and the two answers must agree
+    bool nineOperandKnown(const AstNodeVhdlExpr* nodep) const {
+        const VhdlType* const typep = nodep ? nodep->vhdlTypep() : nullptr;
+        if (!nineValued(typep) || isDynValue(nodep)) return false;
+        if (typep->base()->kind() == VhdlTypeKind::ENUM) return true;
+        return typep->dimensions() == 1 && typep->lengthEmittable()
+               && !lengthOnlyRunningDecides(typep);
+    }
+    // The length of such an operand where it is a number, else -1
+    static int64_t nineStaticCount(const VhdlType* typep) {
+        if (typep->base()->kind() == VhdlTypeKind::ENUM) return 1;
+        const int width = vectorWidth(typep);
+        return width > 0 ? width : -1;
+    }
+    // Whether two operands whose lengths are not numbers have the same one
+    static bool nineSameBounds(const VhdlType* ap, const VhdlType* bp) {
+        if (ap == bp) return true;
+        if (ap->indexTypes().size() != 1 || bp->indexTypes().size() != 1) return false;
+        const VhdlType* const aip = ap->indexTypes()[0];
+        const VhdlType* const bip = bp->indexTypes()[0];
+        if (!aip || !bip) return false;
+        if (aip == bip) return true;
+        return aip->boundsp() && bip->boundsp() && aip->boundsp()->sameTree(bip->boundsp());
+    }
+    // Whether an integer operand can be made into lanes of a vector of so
+    // many elements (laneOfInt)
+    static bool nineIntFits(AstNodeVhdlExpr* nodep, int64_t count, bool sgn, bool relational) {
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        if (!val.isInt()) return count >= 1 && count <= 64;
+        const int64_t v = val.toInt();
+        if (count < 1) {
+            if (relational && !sgn) return v >= 0;
+            return v >= 0 && v <= 1;
+        }
+        return count <= 64 || v >= 0;
+    }
+    bool ninePlan(const VhdlSymbol* symp, const std::string& op,
+                  const std::vector<AstNodeVhdlExpr*>& args) const {
+        if (!v3Global.opt.vhdlMetavalues() || !symp) return false;
+        symp = symp->resolved();
+        if (symp->predefined() || args.empty()) return false;
+        for (const AstNodeVhdlExpr* const argp : args) {
+            if (!argp || !argp->vhdlTypep()) return false;
+        }
+        if (inStdLogic1164(symp)) {
+            const bool logical = op == "and" || op == "or" || op == "nand" || op == "nor"
+                                 || op == "xor" || op == "xnor";
+            const bool matching = (op == "?=" || op == "?/=") && args.size() == 2;
+            if (!logical && !matching && !(op == "not" && args.size() == 1)) return false;
+            if (args.size() > 2) return false;
+            for (const AstNodeVhdlExpr* const argp : args) {
+                if (!nineOperandKnown(argp)) return false;
+            }
+            // A reduction is of a vector
+            if (logical && args.size() == 1
+                && args[0]->vhdlTypep()->base()->kind() != VhdlTypeKind::ARRAY) {
+                return false;
+            }
+            if (args.size() == 2) {
+                const VhdlType* const ltp = args[0]->vhdlTypep();
+                const VhdlType* const rtp = args[1]->vhdlTypep();
+                const bool lScalar = ltp->base()->kind() == VhdlTypeKind::ENUM;
+                const bool rScalar = rtp->base()->kind() == VhdlTypeKind::ENUM;
+                if (lScalar == rScalar) {
+                    const int64_t lc = nineStaticCount(ltp);
+                    const int64_t rc = nineStaticCount(rtp);
+                    if (lc != rc) return false;
+                    if (lc < 0 && !nineSameBounds(ltp, rtp)) return false;
+                }
+            }
+            return true;
+        }
+        const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
+        if (!slvUnsigned && !inPackageNamed(symp, "numeric_std")) return false;
+        const auto kindOf = [&](const AstNodeVhdlExpr* argp) {
+            return nineNumKind(argp->vhdlTypep(), slvUnsigned);
+        };
+        if (op == "to_integer") {
+            return args.size() == 1 && (kindOf(args[0]) == 'u' || kindOf(args[0]) == 's')
+                   && nineOperandKnown(args[0]);
+        }
+        if (op == "to_unsigned" || op == "to_signed") {
+            if (args.size() != 2 || kindOf(args[0]) != 'i' || kindOf(args[1]) != 'i') return false;
+            const VhdlValue sizev = V3VhdlEval::eval(args[1]);
+            if (!sizev.isInt() || sizev.toInt() < 1 || sizev.toInt() > 64) return false;
+            return nineIntFits(args[0], sizev.toInt(), op == "to_signed", false);
+        }
+        if (op == "resize") {
+            if (args.size() != 2 || kindOf(args[1]) != 'i') return false;
+            const char k = kindOf(args[0]);
+            if ((k != 'u' && k != 's') || !nineOperandKnown(args[0])) return false;
+            if (nineStaticCount(args[0]->vhdlTypep()) < 1) return false;
+            const VhdlValue sizev = V3VhdlEval::eval(args[1]);
+            return sizev.isInt() && sizev.toInt() >= 1;
+        }
+        if (args.size() == 1 && (op == "-" || op == "abs")) {
+            return kindOf(args[0]) == 's' && nineOperandKnown(args[0]);
+        }
+        const bool arith = op == "+" || op == "-";
+        const bool relational
+            = op == "=" || op == "/=" || op == "<" || op == "<=" || op == ">" || op == ">=";
+        if (args.size() != 2 || (!arith && !relational)) return false;
+        const char lk = kindOf(args[0]);
+        const char rk = kindOf(args[1]);
+        if (!lk || !rk || (lk == 'i' && rk == 'i')) return false;
+        if (lk != 'i' && rk != 'i' && lk != rk) return false;
+        const bool sgn = lk == 's' || rk == 's';
+        AstNodeVhdlExpr* const vecp = lk == 'i' ? args[1] : args[0];
+        AstNodeVhdlExpr* const othp = lk == 'i' ? args[0] : args[1];
+        if (!nineOperandKnown(vecp)) return false;
+        const int64_t count = nineStaticCount(vecp->vhdlTypep());
+        if (lk == 'i' || rk == 'i') return nineIntFits(othp, count, sgn, relational);
+        if (!nineOperandKnown(othp)) return false;
+        const int64_t ocount = nineStaticCount(othp->vhdlTypep());
+        if (count != ocount) return false;
+        return count > 0 || nineSameBounds(vecp->vhdlTypep(), othp->vhdlTypep());
+    }
+    // The same of an expression: an operator or a call over the nine values
+    bool ninePlanned(const AstNodeVhdlExpr* nodep) const {
+        if (!v3Global.opt.vhdlMetavalues() || !nodep) return false;
+        if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
+            return ninePlan(bp->vhdlSymp(), vhdlBinaryOpName(bp->op()), {bp->lhsp(), bp->rhsp()});
+        }
+        if (const AstVhdlUnary* const up = VN_CAST(nodep, VhdlUnary)) {
+            return ninePlan(up->vhdlSymp(), vhdlUnaryOpName(up->op()), {up->lhsp()});
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            const VhdlSymbol* const symp = callp->vhdlSymp();
+            if (!symp || symp->resolved()->kind() != VhdlSymKind::FUNCTION) return false;
+            std::vector<AstNodeVhdlExpr*> args;
+            for (AstNode* p = callp->argsp(); p; p = p->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+                if (!asp || !asp->actualp() || asp->formalp()) return false;
+                args.push_back(asp->actualp());
+            }
+            return ninePlan(symp, declaredName(symp->resolved()->name()), args);
+        }
+        return false;
+    }
+
+    // An operator of the IEEE packages over the nine values, emitted natively
+    // where it is one of those above; null where its body is to be compiled
+    AstNodeExpr* nineOperator(const VhdlSymbol* symp, const std::string& op,
+                              const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
+        if (!ninePlan(symp, op, args)) return nullptr;
+        if (inStdLogic1164(symp->resolved())) return nineLogical(op, args, flp);
+        return nineNumeric(symp->resolved(), op, args, flp);
+    }
+
     AstNodeExpr* lowerBinary(AstVhdlBinary* nodep) {
         FileLine* const flp = nodep->fileline();
         const VhdlSymbol* const symp = nodep->vhdlSymp();
         VhdlType* const ltypep = nodep->lhsp()->vhdlTypep();
         VhdlType* const rtypep = nodep->rhsp()->vhdlTypep();
+        if (AstNodeExpr* const outp = nineOperator(symp, vhdlBinaryOpName(nodep->op()),
+                                                   {nodep->lhsp(), nodep->rhsp()}, flp)) {
+            return outp;
+        }
         if (symp && !symp->predefined() && !isIeeeOperator(symp, ltypep, rtypep)) {
             if (AstNodeExpr* const outp = lowerUserOperator(
                     const_cast<VhdlSymbol*>(symp), {nodep->lhsp(), nodep->rhsp()}, flp)) {
@@ -17003,6 +18103,15 @@ private:
         if (!typep->isConstrainedArray() || typep->indexTypes().empty()) return false;
         const VhdlType* const idxp = typep->indexTypes()[0];
         return idxp && idxp->bounded() && idxp->length() == 0;
+    }
+    // Whether a resolution function is STD_LOGIC_1164's RESOLVED
+    static bool ieeeResolved(const VhdlSymbol* resolvep) {
+        if (!resolvep || resolvep->name() != "resolved") return false;
+        for (const VhdlScope* scopep = resolvep->declScopep(); scopep;
+             scopep = scopep->parentp()) {
+            if (scopep->name() == "std_logic_1164") return true;
+        }
+        return false;
     }
     static bool inArithmeticPackage(const VhdlSymbol* symp) {
         static const std::set<std::string> pkgs{
@@ -18857,6 +19966,20 @@ private:
             return new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}};
         }
         if (args.empty()) return nullptr;
+        // Under --vhdl-metavalues a function the IEEE packages declare over
+        // the nine logic values is compiled from its body, which says what
+        // each of them gives; the native forms below hold a logic value as
+        // one bit. What the language itself declares has no body to compile,
+        // and an edge test asks about a signal's history, which the body
+        // cannot do through a parameter (see below)
+        if (!symp->predefined() && name != "rising_edge" && name != "falling_edge") {
+            bool nine = nineValued(resultp);
+            for (const AstNodeVhdlExpr* const argp : args) {
+                if (nineValued(argp->vhdlTypep())) nine = true;
+            }
+            // Some of them are emitted natively over the nine values
+            if (nine) return ninePlanned(nodep) ? nineConversion(symp, name, args, flp) : nullptr;
+        }
         // "to_string(v)" is the text of the value: for a scalar the same as
         // T'IMAGE, except that a CHARACTER or a STRING is its own characters
         // with no quotation marks around them (16.3)
@@ -19015,6 +20138,7 @@ private:
         if (name == "to_string" && args.size() == 1 && symp->predefined()) {
             const VhdlType* const vtypep = args[0]->vhdlTypep();
             if (AstNodeExpr* const textp = dynTextOf(args[0], flp)) return textp;
+            if (AstNodeExpr* const textp = nineTextOf(args[0], flp)) return textp;
             AstNodeExpr* const valuep = lowerExpr(args[0]);
             if (!valuep) return nullptr;
             if (vtypep && isStringType(vtypep)) return valuep;
@@ -19030,6 +20154,33 @@ private:
         // it may be written anywhere; compiling std_logic_1164's own body for
         // it would ask about the history of a signal-class parameter, which
         // names a different signal at every call (16.8.2)
+        if ((name == "rising_edge" || name == "falling_edge") && args.size() == 1
+            && nineValued(args[0]->vhdlTypep())) {
+            // An event that took the signal to '1' or 'H' from '0' or 'L'
+            // (or the other way): TO_X01 of the value and of the value one
+            // delta before. As positions, (v | 4) is 7 for '1' and 'H' and 6
+            // for '0' and 'L', and something else for the other five.
+            if (const VhdlShadow* const shp = shadowFor(args[0], flp)) {
+                AstNodeExpr* const evp = eventOf(args[0], shp, flp);
+                AstNodeExpr* const nowp = lowerExpr(args[0]);
+                if (evp && nowp) {
+                    const bool rising = name == "rising_edge";
+                    const auto x01Is = [&](AstNodeExpr* valp, bool one) {
+                        return new AstEq{
+                            flp,
+                            new AstOr{flp, valp,
+                                      new AstConst{flp, AstConst::WidthedValue{}, 4, 4}},
+                            new AstConst{flp, AstConst::WidthedValue{}, 4, one ? 7U : 6U}};
+                    };
+                    return new AstLogAnd{
+                        flp, evp,
+                        new AstLogAnd{flp, x01Is(nowp, rising),
+                                      x01Is(shadowPart(args[0], shp->prevp, flp), !rising)}};
+                }
+                if (evp) VL_DO_DANGLING(evp->deleteTree(), evp);
+                if (nowp) VL_DO_DANGLING(nowp->deleteTree(), nowp);
+            }
+        }
         if ((name == "rising_edge" || name == "falling_edge") && args.size() == 1) {
             if (const VhdlShadow* const shp = shadowFor(args[0], flp)) {
                 AstNodeExpr* const evp = eventOf(args[0], shp, flp);
@@ -22527,6 +23678,10 @@ private:
             }
             AstVhdlAssoc* const argp = VN_CAST(callp->argsp(), VhdlAssoc);
             if (!argp || argp->nextp()) return nullptr;
+            // A clock of nine values has edges a Verilog edge does not see
+            // ('0' to 'H') and changes that are no edge ('U' to '1'), so its
+            // process wakes on every change and asks the full question
+            if (nineValued(argp->actualp()->vhdlTypep())) return nullptr;
             return argp->actualp();
         }
         // clk'event and clk = '1'
@@ -22588,6 +23743,8 @@ private:
             if (!val.isInt() || !val.typep()) return nullptr;
             const VhdlType* const basep = val.typep()->base();
             if (basep->kind() != VhdlTypeKind::ENUM) return nullptr;
+            // Of nine values, '1' is not the one value that is not '0'
+            if (nineValued(basep)) return nullptr;
             const std::string& litName = basep->literals()[val.toInt()]->name();
             high = enumIsLogic(basep) ? logicValueOf(litName) == LogicVal::ONE
                                       : val.toInt() != 0;
@@ -28173,7 +29330,7 @@ private:
                          : nullptr;
             if (vtypep && VN_IS(m_ftaskp, Func) && vtypep->base()->kind() == VhdlTypeKind::ARRAY
                 && vtypep->isConstrainedArray() && vtypep->dimLength(0) == 0
-                && !isStringType(vtypep) && isLogicish(velemp)) {
+                && !isStringType(vtypep) && (isLogicish(velemp) || nineValued(velemp))) {
                 return new AstReturn{flp, new AstConst{flp, AstConst::All0{}}};
             }
             // A function's result is of its return subtype: "return -3" from
@@ -30877,7 +32034,8 @@ private:
         if (!basep || basep == V3VhdlStd::booleanType()) {
             return val.toInt() == 0 ? VhdlTri::FALSE : VhdlTri::TRUE;
         }
-        if (basep->kind() == VhdlTypeKind::ENUM && enumIsLogic(basep)) {
+        if (basep->kind() == VhdlTypeKind::ENUM
+            && (enumIsLogic(basep) || enumIsStdUlogic(basep))) {
             const std::vector<VhdlSymbol*>& lits = basep->literals();
             const int64_t pos = val.toInt();
             if (pos < 0 || pos >= static_cast<int64_t>(lits.size())) return VhdlTri::UNKNOWN;
@@ -31128,6 +32286,9 @@ private:
         // (10.9): "case get_bits(n, b) is when "111" =>"
         if (caseWantsChain(nodep) || isDynValue(nodep->exprp())) {
             return lowerCaseAsChain(nodep, exprp, flp);
+        }
+        if (nodep->matching() && nineValued(nodep->exprp()->vhdlTypep())) {
+            if (AstNode* const outp = lowerNineMatchingCase(nodep, exprp, flp)) return outp;
         }
         AstCaseItem* itemsp = nullptr;
         // A choice may name 'Z', or '-' in a matching case, and those reach
@@ -36399,6 +37560,12 @@ private:
         if (AstNodeExpr* const textp = dynTextOf(valuep, flOf(valuep))) {
             format += "%s";
             return textp;
+        }
+        if (!isImage) {
+            if (AstNodeExpr* const textp = nineTextOf(valuep, flOf(valuep))) {
+                format += "%s";
+                return textp;
+            }
         }
         AstNodeExpr* const exprp = lowerExpr(valuep);
         if (!exprp) {

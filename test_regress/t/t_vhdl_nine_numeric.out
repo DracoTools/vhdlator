@@ -1,0 +1,9 @@
+t/t_vhdl_nine_numeric.vhd:64:22:@0:(assertion warning): NUMERIC_STD.TO_INTEGER: metavalue detected, returning 0
+t/t_vhdl_nine_numeric.vhd:65:5:@0:(report note): u+1=XXXXXXXX
+t/t_vhdl_nine_numeric.vhd:66:19:@0:(assertion warning): NUMERIC_STD."=": metavalue detected, returning FALSE
+t/t_vhdl_nine_numeric.vhd:67:14:@0:(assertion warning): NUMERIC_STD."/=": metavalue detected, returning TRUE
+t/t_vhdl_nine_numeric.vhd:68:19:@0:(assertion warning): NUMERIC_STD."<": metavalue detected, returning FALSE
+t/t_vhdl_nine_numeric.vhd:69:5:@0:(report note): cnt=UUUUUU
+t/t_vhdl_nine_numeric.vhd:71:5:@1000000:(report note): cnt=XXXXXX
+t/t_vhdl_nine_numeric.vhd:76:5:@9000000:(report note): cnt=000011
+t/t_vhdl_nine_numeric.vhd:78:5:@9000000:(report note): *-* All Finished *-*

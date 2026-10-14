@@ -287,11 +287,40 @@ void V3VhdlStd::clear() {
 //######################################################################
 // Implicit operators (5.2.6, 9.2)
 
+// Whether a type is STD_ULOGIC's shape, or an array of it
+static bool stdUlogicShaped(const VhdlType* typep) {
+    if (!typep) return false;
+    const VhdlType* basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
+        basep = basep->elementp()->base();
+    }
+    if (basep->kind() != VhdlTypeKind::ENUM || basep->literals().size() != 9) return false;
+    static const char* const nine = "UX01ZWLH-";
+    for (size_t i = 0; i < 9; ++i) {
+        const std::string& name = basep->literals()[i]->name();
+        if (name.size() != 3 || name[1] != nine[i]) return false;
+    }
+    return true;
+}
+
 bool V3VhdlStd::isIntrinsic(const VhdlSymbol* symp) {
     if (!symp) return false;
     if (!intrinsicName(symp->name())) return false;
     // One the language itself declares has no body that could be compiled
     if (symp->predefined()) return true;
+    // Under --vhdl-metavalues a subprogram over the nine logic values is
+    // compiled from its body, which says what each of them gives: the native
+    // forms hold a logic value as one bit. An edge test is the exception: it
+    // asks about a signal's history, which a body cannot do through a
+    // parameter, and the lowering answers it over the nine values itself.
+    if (v3Global.opt.vhdlMetavalues() && symp->name() != "rising_edge"
+        && symp->name() != "falling_edge") {
+        bool nine = stdUlogicShaped(symp->returnTypep());
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (stdUlogicShaped(typep)) nine = true;
+        }
+        if (nine) return false;
+    }
     // The packages the frontend stands in for. A subprogram declared anywhere
     // else is the design's own however it is named: IEEE's float_generic_pkg
     // declares a RESIZE that converts between floating point formats, which

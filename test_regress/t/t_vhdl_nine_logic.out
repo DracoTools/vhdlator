@@ -1,0 +1,7 @@
+t/t_vhdl_nine_logic.vhd:34:5:@0:(report note): u='U' v=UUUU
+t/t_vhdl_nine_logic.vhd:51:5:@0:(report note): n+1=XXXX
+t/t_vhdl_nine_logic.vhd:53:5:@1000000:(report note): r='1'
+t/t_vhdl_nine_logic.vhd:56:5:@3000000:(report note): r='X'
+t/t_vhdl_nine_logic.vhd:61:22:@5000000:(report note): case exact
+t/t_vhdl_nine_logic.vhd:69:5:@10000000:(report note): edges=2
+t/t_vhdl_nine_logic.vhd:71:5:@10000000:(report note): *-* All Finished *-*

@@ -2157,6 +2157,26 @@ Summary:
    this saves the cost of the checks, about 10% in a loop that does little
    but index arrays. Defaults to enabled.
 
+.. option:: --vhdl-metavalues
+
+.. option:: --no-vhdl-metavalues
+
+   Enables/disables keeping the nine values of VHDL's ``std_ulogic`` (and
+   ``std_logic``, ``std_logic_vector``, ``unsigned``, ``signed``) apart:
+   ``'U'``, ``'X'``, ``'0'``, ``'1'``, ``'Z'``, ``'W'``, ``'L'``, ``'H'`` and
+   ``'-'``. Each element is then held in four bits. Objects start at
+   ``'U'``, the operators of ``std_logic_1164`` follow its tables, a signal
+   with several drivers is resolved by ``resolved``, ``numeric_std`` gives
+   ``'X'`` results and ``metavalue detected`` warnings, and
+   ``rising_edge`` is true only of a change from ``'0'`` or ``'L'`` to
+   ``'1'`` or ``'H'``, as other VHDL simulators run them.
+
+   With :vlopt:`--no-vhdl-metavalues` each element is one bit: ``'H'``
+   reads as ``'1'``, ``'L'`` as ``'0'``, and ``'U'``, ``'X'``, ``'W'`` and
+   ``'-'`` as ``'0'``, which is faster but loses what those values say.
+
+   This is work in progress, and defaults to disabled while it is.
+
 .. option:: --vhdl-std <std>
 
    Selects which revision of the VHDL standard (IEEE 1076) applies to VHDL

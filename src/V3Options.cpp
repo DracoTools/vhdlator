@@ -1924,6 +1924,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
         v3Global.vlExit(0);
     });
     DECL_OPTION("-vhdl-bound-check", OnOff, &m_vhdlBoundCheck);
+    DECL_OPTION("-vhdl-metavalues", OnOff, &m_vhdlMetavalues);
     DECL_OPTION("-vhdl-std", CbVal, [this, fl](const char* valp) {
         // Accept both the bare year ("2008", "08") and the IEEE form ("1076-2008")
         static const std::map<const std::string, V3LangCode> stds{
