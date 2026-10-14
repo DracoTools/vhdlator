@@ -41861,7 +41861,13 @@ void VhdlLowerVisitor::hoistTargetStatements() {
     });
     for (AstNodeAssign* const assignp : assignps) {
         AstNodeExpr* lhsp = assignp->lhsp()->unlinkFrBack();
-        AstNode* const stmtsp = hoistIndexChecks(lhsp);
+        // One inside another's value comes out once that one has
+        AstNode* stmtsp = nullptr;
+        for (int round = 0; round < 64; ++round) {
+            AstNode* const onep = hoistIndexChecks(lhsp);
+            if (!onep) break;
+            stmtsp = AstNode::addNextNull(stmtsp, onep);
+        }
         assignp->lhsp(lhsp);
         if (stmtsp) assignp->addHereThisAsNext(stmtsp);
     }
