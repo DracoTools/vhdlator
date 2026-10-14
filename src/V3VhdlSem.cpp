@@ -3338,13 +3338,29 @@ void VhdlSemVisitor::visitSubprogDecl(AstVhdlSubprogDecl* nodep) {
     }
     // Constants standing for generics whose values do not fold go first
     // among the copy's declarations
+    // -- once: a copy analyzed again, for a call site, has them already
     if (!m_pendingSubprogDecls.empty()) {
+        std::set<std::string> have;
+        for (AstNode* dp = nodep->declsp(); dp; dp = dp->nextp()) {
+            if (const AstVhdlObjectDecl* const odp = VN_CAST(dp, VhdlObjectDecl)) {
+                have.insert(odp->name());
+            } else if (const AstVhdlAliasDecl* const adp = VN_CAST(dp, VhdlAliasDecl)) {
+                have.insert(adp->name());
+            }
+        }
         AstNode* listp = nullptr;
         for (AstNodeVhdl* const declp : m_pendingSubprogDecls) {
+            const AstVhdlObjectDecl* const odp = VN_CAST(declp, VhdlObjectDecl);
+            const AstVhdlAliasDecl* const adp = VN_CAST(declp, VhdlAliasDecl);
+            if ((odp && have.count(odp->name())) || (adp && have.count(adp->name()))) {
+                VL_DO_DANGLING(declp->deleteTree(), declp);
+                continue;
+            }
             listp = AstNode::addNextNull(listp, static_cast<AstNode*>(declp));
         }
         m_pendingSubprogDecls.clear();
-        if (AstNode* const firstDeclp = nodep->declsp()) {
+        if (!listp) {
+        } else if (AstNode* const firstDeclp = nodep->declsp()) {
             firstDeclp->addHereThisAsNext(listp);
         } else {
             nodep->addDeclsp(VN_AS(listp, NodeVhdl));

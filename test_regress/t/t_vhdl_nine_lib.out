@@ -1,0 +1,6 @@
+t/t_vhdl_nine_lib.vhd:78:5:@0:(report note): kind '0''1'
+t/t_vhdl_nine_lib.vhd:81:20:@0:(assertion warning): NUMERIC_STD.TO_INTEGER: metavalue detected, returning 0
+t/t_vhdl_nine_lib.vhd:83:5:@0:(report note): regs 010H
+t/t_vhdl_nine_lib.vhd:85:5:@2000000:(report note): tuser 10 tvalid '1'
+t/t_vhdl_nine_lib.vhd:87:5:@12000000:(report note): res 1001
+t/t_vhdl_nine_lib.vhd:88:5:@12000000:(report note): *-* All Finished *-*

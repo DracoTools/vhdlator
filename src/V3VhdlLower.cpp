@@ -460,6 +460,7 @@ public:
     void reportReachedRefusals() VL_MT_DISABLED;
     void addLogicPosPins() VL_MT_DISABLED;
     void twoStateBoundaryPorts() VL_MT_DISABLED;
+    void hoistTargetStatements() VL_MT_DISABLED;
     // Bit k of a vector of the nine values as Verilog reads it -- 1 for '1'
     // and 'H', 0 for anything else -- and back, '0' or '1'; scalar where the
     // value is one element
@@ -8311,7 +8312,17 @@ private:
         // leaves it open, and what an output's driver starts at (6.5.6.3).
         // A tristate one may not carry it: there the initial value is a
         // driver, and this frontend's own value would join the resolution.
-        if (nodep->defaultp() && !triPort) {
+        // An INOUT record of records under --vhdl-metavalues, whose open
+        // elements a generic sizes, given its default by a function: no copy
+        // of the function can give back a value of that shape here
+        // (recordMayCarry), so the default is left out, as the two-state
+        // lowering leaves out the default of every record it resolves
+        const bool unlowerableDefault = nodep->defaultp() && v3Global.opt.vhdlMetavalues()
+                                        && nodep->mode() == VhdlMode::INOUT
+                                        && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
+                                        && recordHasNestedOpen(symp->typep())
+                                        && VN_IS(nodep->defaultp(), VhdlCall);
+        if (nodep->defaultp() && !triPort && !unlowerableDefault) {
             varp->valuep(lowerExpr(nodep->defaultp()));
         } else if (!nodep->defaultp()
                    && (nodep->mode() == VhdlMode::OUT || nodep->mode() == VhdlMode::BUFFER)
@@ -8340,13 +8351,20 @@ private:
         // as one source of the actual, and what the actual resolves to,
         // which is what the port reads inside (14.7.3.3)
         if (nineInoutPort(nodep, symp)) {
+            // Of the port's own type, bounds and all: one the instance
+            // constrains is not one lowerType can write alone
+            AstNodeDType* const drvDtp = varp->childDTypep()
+                                             ? varp->childDTypep()->cloneTree(false)
+                                             : lowerType(symp->typep(), flp);
             AstVar* const drvp = new AstVar{flp, VVarType::VAR, varp->name() + "__Vdrv",
-                                            VFlagChildDType{}, lowerType(symp->typep(), flp)};
+                                            VFlagChildDType{}, drvDtp};
             drvp->direction(VDirection::OUTPUT);
             drvp->declDirection(VDirection::OUTPUT);
             drvp->ansi(true);
-            drvp->valuep(nodep->defaultp() ? lowerExpr(nodep->defaultp())
-                                           : defaultValueFor(symp->typep(), flp));
+            drvp->valuep(varp->valuep()       ? varp->valuep()->cloneTree(false)
+                         : unlowerableDefault ? nullptr
+                         : nodep->defaultp()  ? lowerExpr(nodep->defaultp())
+                                              : defaultValueFor(symp->typep(), flp));
             addStmt(new AstPort{flp, ++pinNum, drvp->name()});
             addStmt(drvp);
             if (symp->driverCount() >= 1) makeNineResolved(symp, drvp, flp);
@@ -9857,8 +9875,13 @@ private:
         if (val.known() && !val.isComposite()) {
             // A name of an array constant keeps its storage, so that its
             // index range travels with it and an index reads the right end
+            // -- and how wide its elements are, which a number does not say
+            // either: an index of one reads a single bit of it. Not in what
+            // the unit holds, whose storage would be a module's; an index
+            // there finds the element's bits itself (multiBitElemIndex).
             const bool keepRange = (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected))
-                                   && foldsToBareNumber(nodep->vhdlTypep());
+                                   && (foldsToBareNumber(nodep->vhdlTypep())
+                                       || (!m_emitForUnit && multiBitElems(nodep->vhdlTypep())));
             if (!keepRange) return lowerValue(val, nodep->vhdlTypep(), flp);
         }
 
@@ -13060,19 +13083,20 @@ private:
     // something. A number has no index range, and Verilog counts its bits
     // from the right; an array VHDL wrote as "0 to 3" counts from the left,
     // so indexing the folded number would read the wrong end of it.
+    // Whether an array's elements are enumeration values of more than one bit
+    // each, as the nine values are
+    static bool multiBitElems(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        if (isStringType(typep)) return false;
+        const VhdlType* const elemp = typep->base()->elementp();
+        return elemp && elemp->base()->kind() == VhdlTypeKind::ENUM && !enumIsLogic(elemp->base())
+               && bitsFor(elemp->base()->literals().size()) > 1;
+    }
     static bool foldsToBareNumber(const VhdlType* typep) {
         if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
         if (isStringType(typep)) return false;
         const std::vector<VhdlType*>& indexes = typep->indexTypes();
         if (indexes.size() != 1 || !indexes[0]) return false;
-        // Nor does a number know how wide each element is: an index of one
-        // reads a single bit of it, where an element of the nine values is
-        // four
-        const VhdlType* const elemp = typep->base()->elementp();
-        if (elemp && elemp->base()->kind() == VhdlTypeKind::ENUM && !enumIsLogic(elemp->base())
-            && bitsFor(elemp->base()->literals().size()) > 1) {
-            return true;
-        }
         return indexes[0]->ascending() && indexes[0]->length() > 1;
     }
 
@@ -16252,6 +16276,12 @@ private:
         return sizep ? sizep->actualp() : nullptr;
     }
 
+    // Whether source is of the VHDL libraries bundled with Verilator
+    static bool inBundledLibrary(const FileLine* flp) {
+        static const std::string s_dir = v3Global.opt.getVhdlLibPath("");
+        return flp->filename().compare(0, s_dir.size(), s_dir) == 0;
+    }
+
     // A lane of four bits, as many times over as there are elements
     static AstNodeExpr* laneMask(uint32_t pattern, const AstNodeExpr* countp, FileLine* flp) {
         AstNodeExpr* const lanep = new AstConst{flp, AstConst::WidthedValue{}, 4, pattern};
@@ -19128,9 +19158,15 @@ private:
                         return new AstSelExtract{nflp, fromp, leftp, rightp};
                     }
                 }
+                // The bundled IEEE bodies write slices for every width a
+                // call may have, on branches other widths never reach: one
+                // that runs off its object there is checked if it runs
+                // (8.5), and is no finding about the design
+                FileLine* const sflp = new FileLine{flp};
+                if (inBundledLibrary(flp)) sflp->warnOff(V3ErrorCode::SELRANGE, true);
                 return selectThrough(fromp,
                                      [&](AstNodeExpr* chosenp) {
-                                         return new AstSelExtract{flp, chosenp,
+                                         return new AstSelExtract{sflp, chosenp,
                                                                   leftp->cloneTree(false),
                                                                   rightp->cloneTree(false)};
                                      },
@@ -19221,6 +19257,12 @@ private:
                                "not a name");
                     return nullptr;
                 }
+                // A constant folded to a number, of elements wider than a
+                // bit: the element is so many bits, counted from the right
+                if (dim == 0 && VN_IS(outp, Const)
+                    && multiBitElemIndex(outp, indexp, nodep->prefixp()->vhdlTypep(), flp)) {
+                    continue;
+                }
                 outp = selectThrough(outp,
                                      [&](AstNodeExpr* chosenp) {
                                          return new AstSelBit{flp, chosenp,
@@ -19232,6 +19274,34 @@ private:
         }
         // Otherwise a function call
         return lowerFuncCall(nodep, flp);
+    }
+
+    // The element an index names of a constant folded to a number, whose
+    // elements are wider than a bit (multiBitElems): outp is replaced by the
+    // element's bits. False, and nothing changed, where the type says too
+    // little.
+    static bool multiBitElemIndex(AstNodeExpr*& outp, AstNodeExpr*& indexp, const VhdlType* typep,
+                                  FileLine* flp) {
+        if (!multiBitElems(typep) || !typep->isConstrainedArray() || typep->dimensions() != 1)
+            return false;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        if (!idxp || !idxp->bounded() || idxp->length() < 1) return false;
+        const int ew = bitsFor(typep->base()->elementp()->base()->literals().size());
+        if (outp->width() != 0 && outp->width() != ew * idxp->length()) return false;
+        // The leftmost element is the most significant
+        const int64_t lo = std::min(idxp->left(), idxp->right());
+        const int64_t hi = std::max(idxp->left(), idxp->right());
+        AstNodeExpr* const placep
+            = idxp->ascending()
+                  ? static_cast<AstNodeExpr*>(new AstSub{
+                        flp, new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(hi)},
+                        indexp})
+                  : new AstSub{flp, indexp,
+                               new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(lo)}};
+        indexp = nullptr;
+        outp = new AstSel{
+            flp, outp, new AstMul{flp, new AstConst{flp, AstConst::Signed32{}, ew}, placep}, ew};
+        return true;
     }
 
     std::map<std::pair<const VhdlType*, const AstClass*>, AstNodeFTask*> m_dynOfAccessFuncs;
@@ -22559,6 +22629,10 @@ private:
         int64_t count = -1;
         if (valIdxp && valIdxp->bounded()) {
             count = valIdxp->length();
+        } else if (nineValued(elemTypep) && VN_IS(valuep, VhdlLiteral)) {
+            // Of the nine values, four bits an element: a literal says how
+            // many it has itself
+            if (const int64_t len = nineLiteralCount(valuep)) count = len;
         } else if (VN_IS(memberp, Const) && elemTypep->base()->elementp()
                    && (isScalarLogic(elemTypep->base()->elementp())
                        || elemTypep->base()->elementp()->base() == V3VhdlStd::bitType())) {
@@ -26591,6 +26665,8 @@ private:
                 drop.insert(symp);
                 return;
             }
+            // Of the nine values, 'Z' is one of them, which the queue holds
+            if (nineValued(symp->typep())) return;
             for (const AstVhdlWaveform* wp = ap->wavesp(); wp;
                  wp = VN_CAST(wp->nextp(), VhdlWaveform)) {
                 if (!wp->valuep() || !zStaticValue(wp->valuep())) drop.insert(symp);
@@ -27224,10 +27300,15 @@ private:
         // A resolved signal: the transactions are this process's driver's,
         // whose value the resolution reads through the elements that are 'Z'
         VhdlDriver* resolvedDrvp = nullptr;
+        // Of the nine values, the driver is its value alone: 'Z' is one
+        const bool nineDrv = nineValued(symp->typep());
         if (drivenThroughDriver(symp)) {
             resolvedDrvp = const_cast<VhdlDriver*>(driverFor(targetp));
-            if (!resolvedDrvp || !resolvedDrvp->enp || resolvedDrvp->xp || resolvedDrvp->connp
-                || (!resolvedDrvp->resolveValRefp && !resolvedDrvp->zp)) {
+            if (nineDrv) {
+                if (!resolvedDrvp || !resolvedDrvp->valp || resolvedDrvp->connp) return nullptr;
+            } else if (!resolvedDrvp || !resolvedDrvp->enp || resolvedDrvp->xp
+                       || resolvedDrvp->connp
+                       || (!resolvedDrvp->resolveValRefp && !resolvedDrvp->zp)) {
                 return nullptr;
             }
         }
@@ -27252,7 +27333,7 @@ private:
         AstVar* zVarp = nullptr;  // The driver's 'Z' plane, for a resolved signal
         if (resolvedDrvp) {
             sigVarp = resolvedDrvp->valp;
-            zVarp = driverZPlane(*resolvedDrvp, symp, flp);
+            if (!nineDrv) zVarp = driverZPlane(*resolvedDrvp, symp, flp);
         } else {
             AstNodeExpr* const lhsp = lowerDriveTarget(sigNamep);
             AstVarRef* const lhsRefp = VN_CAST(lhsp, VarRef);
@@ -30651,7 +30732,16 @@ private:
             unsup(flp, "signal assignment to a slice whose ends only running settles");
             return nullptr;
         }
-        AstNodeExpr* const objp = lowerDriveTarget(callp->prefixp());
+        // A signal written through a driver of its own is written there
+        AstNodeExpr* objp = nullptr;
+        if (drivenThroughDriver(rootSymOf(callp->prefixp()))) {
+            const VhdlSymbol* signalp = nullptr;
+            if (const VhdlDriver* const drvp = driverFor(callp->prefixp(), &signalp)) {
+                objp = driverTarget(callp->prefixp(), signalp, drvp->valp);
+            }
+        } else {
+            objp = lowerDriveTarget(callp->prefixp());
+        }
         AstNodeVhdlExpr* const uniformp = uniformAggregateValue(valuep);
         AstNodeExpr* const elemp = objp && uniformp ? lowerExpr(uniformp) : nullptr;
         // A value held two levels deep, into places whose words have a fixed
@@ -31255,6 +31345,16 @@ private:
                 outp = AstNode::addNextNull(outp, markp);
                 return AstNode::addNextNull(outp, resolvedWeakStmt(nodep, flp));
             }
+        }
+        // Of the nine values a driver is a value like any other, and a slice
+        // of it whose ends only running settles is written a place at a
+        // time, as one of a signal is below
+        if (sequential && v3Global.opt.vhdlMetavalues() && isRunningSlice(nodep->targetp())
+            && drivenThroughDriver(rootSymOf(nodep->targetp()))
+            && !pkgResolved(rootSymOf(nodep->targetp()))) {
+            AstNode* const outp = runningSliceDrive(nodep->targetp(), wfp->valuep(), delayp, flp);
+            if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+            return outp;
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             AstNodeExpr* const valuep
@@ -37787,6 +37887,9 @@ private:
     AstNode* lowerTextioRead(const std::string& name, std::vector<AstNodeVhdlExpr*>& args,
                              FileLine* origFlp) {
         if (args.size() < 2 || args.size() > 3) return nullptr;
+        // A value of the nine values is read by std_logic_1164's own bodies,
+        // which know all nine characters
+        if (nineValued(args[1]->vhdlTypep())) return nullptr;
         // The reader works a character at a time and counts in whole
         // integers, so the widths it mixes are deliberate
         FileLine* const flp = new FileLine{origFlp};
@@ -41131,8 +41234,28 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     addOpenPortPins();
     addPathPins();
     settleUpwardNames();
+    hoistTargetStatements();
     reportReachedRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
+}
+
+// An index in an assignment's target may need statements of its own -- the
+// nine values' TO_INTEGER says "metavalue detected" before it gives a number
+// -- and a target cannot hold them, so they run just before the assignment
+void VhdlLowerVisitor::hoistTargetStatements() {
+    std::vector<AstNodeAssign*> assignps;
+    m_netlistp->foreach([&](AstNodeAssign* assignp) {
+        if (VN_IS(assignp, AssignW) || !assignp->lhsp()) return;
+        if (!assignp->fileline()->language().vhdl()) return;
+        if (!assignp->lhsp()->exists([](const AstExprStmt*) { return true; })) return;
+        assignps.push_back(assignp);
+    });
+    for (AstNodeAssign* const assignp : assignps) {
+        AstNodeExpr* lhsp = assignp->lhsp()->unlinkFrBack();
+        AstNode* const stmtsp = hoistIndexChecks(lhsp);
+        assignp->lhsp(lhsp);
+        if (stmtsp) assignp->addHereThisAsNext(stmtsp);
+    }
 }
 
 // A module no VHDL unit instantiates is the top of the design, or one a
