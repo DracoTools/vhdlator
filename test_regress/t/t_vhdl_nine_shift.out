@@ -1,0 +1,9 @@
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 0: 1X0Z1L 1X0Z1L HX0Z10 HX0Z10 1X0Z1L HX0Z10
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 1: X0Z1L0 01X0Z1 X0Z100 HHX0Z1 X0Z1L1 0HX0Z1
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 2: 0Z1L00 001X0Z 0Z1000 HHHX0Z 0Z1L1X 10HX0Z
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 3: Z1L000 0001X0 Z10000 HHHHX0 Z1L1X0 Z10HX0
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 4: 1L0000 00001X 100000 HHHHHX 1L1X0Z 0Z10HX
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 5: L00000 000001 000000 HHHHHH L1X0Z1 X0Z10H
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 6: 000000 000000 000000 HHHHHH 1X0Z1L HX0Z10
+t/t_vhdl_nine_shift.vhd:25:7:@0:(report note): 7: 000000 000000 000000 HHHHHH X0Z1L1 0HX0Z1
+t/t_vhdl_nine_shift.vhd:29:5:@0:(report note): *-* All Finished *-*

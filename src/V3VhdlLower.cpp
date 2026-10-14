@@ -16329,6 +16329,26 @@ private:
         return new AstCast{flp, valuep, VFlagChildDType{}, dtp};
     }
 
+    // What a conversion between closely related array types of the nine
+    // values converts -- "unsigned(d xor k)" -- whose elements, and their
+    // number, it keeps (9.3.6). Null where this is not one.
+    static const AstNodeVhdlExpr* nineConverted(const AstNodeVhdlExpr* nodep) {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        const VhdlSymbol* const tsymp
+            = callp && callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+        if (!tsymp || tsymp->resolved()->kind() != VhdlSymKind::TYPE) return nullptr;
+        const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (!asp || asp->nextp() || asp->formalp() || !asp->actualp()) return nullptr;
+        const VhdlType* const fromp = asp->actualp()->vhdlTypep();
+        const VhdlType* const top = nodep->vhdlTypep();
+        if (!fromp || !top || !nineValued(fromp) || !nineValued(top)) return nullptr;
+        if (fromp->base()->kind() != VhdlTypeKind::ARRAY
+            || top->base()->kind() != VhdlTypeKind::ARRAY) {
+            return nullptr;
+        }
+        return asp->actualp();
+    }
+
     // How many elements an operand of those operations has, as an
     // expression: what its type says, a literal's own, a native result's
     // (nineResultCount), or a joining's operands' together. Null where
@@ -16341,6 +16361,9 @@ private:
             return sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(sizep);
         }
         if (AstNodeExpr* const countp = nineCount(nodep->vhdlTypep(), flp)) return countp;
+        if (const AstNodeVhdlExpr* const innerp = nineConverted(nodep)) {
+            return nineOperandCount(innerp, flp, depth + 1);
+        }
         if (const AstVhdlBinary* const catp = VN_CAST(nodep, VhdlBinary)) {
             if (catp->op() == VhdlBinaryOp::CONCAT) {
                 AstNodeExpr* const lp = nineOperandCount(catp->lhsp(), flp, depth + 1);
@@ -17364,6 +17387,86 @@ private:
             VL_DO_DANGLING(countp->deleteTree(), countp);
             return outp;
         }
+        // SHIFT_LEFT, SHIFT_RIGHT, ROTATE_LEFT and ROTATE_RIGHT move lanes
+        // as they are, metavalues and all; a shift brings in '0' lanes, or
+        // copies of the sign lane where it shifts a SIGNED right
+        if ((name == "shift_left" || name == "shift_right" || name == "rotate_left"
+             || name == "rotate_right")
+            && args.size() == 2) {
+            const char k = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
+            if (k != 'u' && k != 's') return nullptr;
+            AstNode* stmtsp = nullptr;
+            NineArg a;
+            AstNodeExpr* const countArgp
+                = nineArg(args[0], a, stmtsp, flp) ? lowerExpr(args[1]) : nullptr;
+            if (!countArgp) {
+                nineDrop(a);
+                if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                return nullptr;
+            }
+            // The count once, as a temporary where statements can hold one
+            NineArg n;
+            n.exprp = countArgp;
+            if (!VN_IS(countArgp, Const) && !VN_IS(countArgp, VarRef) && m_inStmts) {
+                n.exprp = nullptr;
+                n.varp = newTempVar("__Vninesh", newIntDType(flp), flp);
+                stmtsp
+                    = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(n.varp, flp), countArgp});
+            }
+            const auto bits
+                = [&](AstNodeExpr* elemsp) { return new AstMul{flp, i32(4, flp), elemsp}; };
+            const auto allOnes = [&]() { return laneMask(0xf, a.countp, flp); };
+            AstNodeExpr* outp = nullptr;
+            if (name == "shift_left" || name == "shift_right") {
+                const bool left = name == "shift_left";
+                AstNodeExpr* const movedp
+                    = left ? static_cast<AstNodeExpr*>(
+                                 new AstShiftL{flp, nineRead(a, flp), bits(nineRead(n, flp))})
+                           : new AstShiftR{flp, nineRead(a, flp), bits(nineRead(n, flp))};
+                // The places left empty: those the mask moved away from
+                AstNodeExpr* const keptp
+                    = left ? static_cast<AstNodeExpr*>(
+                                 new AstShiftL{flp, allOnes(), bits(nineRead(n, flp))})
+                           : new AstShiftR{flp, allOnes(), bits(nineRead(n, flp))};
+                AstNodeExpr* fillp = nullptr;
+                if (!left && k == 's') {
+                    FileLine* const rflp = new FileLine{flp};
+                    rflp->warnOff(V3ErrorCode::WIDTHCONCAT, true);
+                    fillp = new AstReplicate{
+                        rflp,
+                        new AstSel{
+                            flp, nineRead(a, flp),
+                            new AstMul{flp, i32(4, flp),
+                                       new AstSub{flp, a.countp->cloneTree(false), i32(1, flp)}},
+                            4},
+                        a.countp->cloneTree(false)};
+                } else {
+                    fillp = laneMask(2, a.countp, flp);
+                }
+                outp = new AstOr{flp, movedp, new AstAnd{flp, fillp, new AstNot{flp, keptp}}};
+            } else {
+                // By the count modulo the length, the lanes leaving one end
+                // coming back in at the other
+                const bool left = name == "rotate_left";
+                AstNodeExpr* const modp
+                    = new AstModDiv{flp, nineRead(n, flp), a.countp->cloneTree(false)};
+                AstNodeExpr* const restp
+                    = new AstSub{flp, a.countp->cloneTree(false), modp->cloneTree(false)};
+                AstNodeExpr* const firstp
+                    = left ? static_cast<AstNodeExpr*>(
+                                 new AstShiftL{flp, nineRead(a, flp), bits(modp)})
+                           : new AstShiftR{flp, nineRead(a, flp), bits(modp)};
+                AstNodeExpr* const secondp
+                    = left ? static_cast<AstNodeExpr*>(
+                                 new AstShiftR{flp, nineRead(a, flp), bits(restp)})
+                           : new AstShiftL{flp, nineRead(a, flp), bits(restp)};
+                outp = new AstOr{flp, firstp, secondp};
+            }
+            nineDrop(a);
+            nineDrop(n);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        }
         if (name == "resize" && args.size() == 2) {
             const char k = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
             if (k != 'u' && k != 's') return nullptr;
@@ -17435,6 +17538,10 @@ private:
                 return nineOperandKnown(catp->lhsp()) && nineOperandKnown(catp->rhsp());
             }
         }
+        // And a conversion of one between array types: the same elements
+        if (const AstNodeVhdlExpr* const innerp = nineConverted(nodep)) {
+            return nineOperandKnown(innerp);
+        }
         if (isDynValue(nodep)) return false;
         if (typep->base()->kind() == VhdlTypeKind::ENUM) return true;
         // A literal is as long as what it spells
@@ -17448,13 +17555,58 @@ private:
         return staticArrayLength(const_cast<AstNodeVhdlExpr*>(nodep), nodep->vhdlTypep());
     }
     // The length of such an operand where it is a number, else -1
-    int64_t nineStaticCount(const AstNodeVhdlExpr* nodep) const {
+    int64_t nineStaticCount(const AstNodeVhdlExpr* nodep, int depth = 0) const {
+        if (!nodep || depth > 16) return -1;
         if (const int64_t len = nineLiteralCount(nodep)) return len;
         if (AstNodeVhdlExpr* const sizep = nineSizedCall(nodep)) {
             const VhdlValue sizev = V3VhdlEval::eval(sizep);
             return sizev.isInt() && sizev.toInt() > 0 ? sizev.toInt() : -1;
         }
-        return nineStaticCount(nodep->vhdlTypep());
+        const int64_t typed = nineStaticCount(nodep->vhdlTypep());
+        if (typed > 0) return typed;
+        // Where the type says nothing, what nineOperandCount works out, as a
+        // number where it is one
+        if (const AstNodeVhdlExpr* const innerp = nineConverted(nodep)) {
+            return nineStaticCount(innerp, depth + 1);
+        }
+        const auto vectorish = [](const AstNodeVhdlExpr* argp) {
+            return argp && argp->vhdlTypep()
+                   && argp->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY;
+        };
+        const auto oneOf = [&](const AstNodeVhdlExpr* argp) -> int64_t {
+            return vectorish(argp) ? nineStaticCount(argp, depth + 1) : 1;
+        };
+        if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
+            if (bp->op() == VhdlBinaryOp::CONCAT) {
+                const int64_t l = oneOf(bp->lhsp());
+                const int64_t r = oneOf(bp->rhsp());
+                return l > 0 && r > 0 ? l + r : -1;
+            }
+            if (!ninePlanned(nodep)) return -1;
+            if (!vectorish(bp->lhsp())) return nineStaticCount(bp->rhsp(), depth + 1);
+            if (!vectorish(bp->rhsp())) return nineStaticCount(bp->lhsp(), depth + 1);
+            const int64_t l = nineStaticCount(bp->lhsp(), depth + 1);
+            const int64_t r = nineStaticCount(bp->rhsp(), depth + 1);
+            return l > 0 && r > 0 ? std::max(l, r) : -1;
+        }
+        if (const AstVhdlUnary* const up = VN_CAST(nodep, VhdlUnary)) {
+            return ninePlanned(nodep) ? nineStaticCount(up->lhsp(), depth + 1) : -1;
+        }
+        if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            if (!ninePlanned(nodep)) return -1;
+            const std::string name = declaredName(callp->vhdlSymp()->resolved()->name());
+            const AstVhdlAssoc* const firstp = VN_CAST(callp->argsp(), VhdlAssoc);
+            const AstVhdlAssoc* const secondp
+                = firstp ? VN_CAST(firstp->nextp(), VhdlAssoc) : nullptr;
+            if (name == "resize" && secondp) {
+                const VhdlValue sizev = V3VhdlEval::eval(secondp->actualp());
+                return sizev.isInt() && sizev.toInt() > 0 ? sizev.toInt() : -1;
+            }
+            if (firstp && vectorish(firstp->actualp())) {
+                return nineStaticCount(firstp->actualp(), depth + 1);
+            }
+        }
+        return -1;
     }
     static int64_t nineStaticCount(const VhdlType* typep) {
         if (typep->base()->kind() == VhdlTypeKind::ENUM) return 1;
@@ -17520,6 +17672,12 @@ private:
             }
             if (sizev.toInt() < 1 || sizev.toInt() > 64) return false;
             return nineIntFits(args[0], sizev.toInt(), op == "to_signed", false);
+        }
+        if (op == "shift_left" || op == "shift_right" || op == "rotate_left"
+            || op == "rotate_right") {
+            if (args.size() != 2 || kindOf(args[1]) != 'i') return false;
+            const char k = kindOf(args[0]);
+            return (k == 'u' || k == 's') && nineOperandKnown(args[0]);
         }
         if (op == "resize") {
             if (args.size() != 2 || kindOf(args[1]) != 'i') return false;
