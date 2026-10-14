@@ -17354,6 +17354,51 @@ private:
     // TO_SIGNED spread an integer into '0' and '1'; RESIZE and the shifts
     // move lanes as they are, metavalues and all. Null for a shape not
     // handled here.
+    // RESIZE where one of the lengths is not a number here but elaboration
+    // settles both -- "resize(si, so'length)" for ports an instance gives
+    // bounds to. The operand is cast to the length asked for, and the lanes
+    // from k up are filled -- with '0' for an UNSIGNED, with its sign lane
+    // for a SIGNED -- where k is the shorter length, one less for a SIGNED,
+    // whose sign stays leftmost (numeric_std RESIZE)
+    AstNodeExpr* nineResizeElab(const NineArg& a, bool sgn, AstNodeVhdlExpr* sizep,
+                                FileLine* flp) {
+        AstNodeExpr* const toCountp = lowerExpr(sizep);
+        if (!toCountp) return nullptr;
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        AstNodeExpr* const fromp = a.countp;
+        AstNodeExpr* keepp = new AstCond{
+            flp, new AstLtS{flp, fromp->cloneTree(false), toCountp->cloneTree(false)},
+            fromp->cloneTree(false), toCountp->cloneTree(false)};
+        if (sgn) keepp = new AstSub{flp, keepp, i32(1, flp)};
+        // The lanes from k up, as ones
+        AstNodeExpr* const upperp = new AstShiftL{cflp, laneMask(0xf, toCountp, flp),
+                                                  new AstMul{flp, i32(4, flp), keepp}};
+        AstNodeExpr* const fillp
+            = sgn ? static_cast<AstNodeExpr*>(new AstReplicate{
+                        cflp,
+                        new AstSel{
+                            flp, nineRead(a, flp),
+                            new AstMul{flp, i32(4, flp),
+                                       new AstSub{flp, fromp->cloneTree(false), i32(1, flp)}},
+                            4},
+                        toCountp->cloneTree(false)})
+                  : laneMask(2, toCountp, flp);
+        AstNodeDType* const dtypep = new AstPackArrayDType{
+            flp, VFlagChildDType{}, newLogicDType(flp, 1),
+            new AstRange{flp,
+                         new AstSub{flp, new AstMul{flp, i32(4, flp), toCountp->cloneTree(false)},
+                                    i32(1, flp)},
+                         i32(0, flp)}};
+        AstNodeExpr* const castp = new AstCast{cflp, nineRead(a, flp), VFlagChildDType{}, dtypep};
+        AstNodeExpr* const outp
+            = new AstOr{flp, new AstAnd{flp, castp, new AstNot{flp, upperp->cloneTree(false)}},
+                        new AstAnd{flp, fillp, upperp}};
+        VL_DO_DANGLING(toCountp->deleteTree(), toCountp);
+        return outp;
+    }
+
     AstNodeExpr* nineConversion(const VhdlSymbol* symp, const std::string& name,
                                 const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
         const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
@@ -17509,15 +17554,24 @@ private:
             const char k = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
             if (k != 'u' && k != 's') return nullptr;
             const VhdlValue sizev = V3VhdlEval::eval(args[1]);
-            if (!sizev.isInt() || sizev.toInt() < 1) return nullptr;
-            const int to = static_cast<int>(sizev.toInt());
             AstNode* stmtsp = nullptr;
             NineArg a;
-            if (!nineArg(args[0], a, stmtsp, flp) || constCount(a.countp) < 1) {
+            if (!nineArg(args[0], a, stmtsp, flp)) {
                 nineDrop(a);
                 if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
                 return nullptr;
             }
+            if (!sizev.isInt() || sizev.toInt() < 1 || constCount(a.countp) < 1) {
+                AstNodeExpr* outp = nineResizeElab(a, k == 's', args[1], flp);
+                nineDrop(a);
+                if (!outp) {
+                    if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                    return nullptr;
+                }
+                if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+                return outp;
+            }
+            const int to = static_cast<int>(sizev.toInt());
             const int from = static_cast<int>(constCount(a.countp));
             AstNodeExpr* const signp = new AstSel{flp, nineRead(a, flp), 4 * (from - 1), 4};
             AstNodeExpr* outp = nullptr;
@@ -17721,9 +17775,13 @@ private:
             if (args.size() != 2 || kindOf(args[1]) != 'i') return false;
             const char k = kindOf(args[0]);
             if ((k != 'u' && k != 's') || !nineOperandKnown(args[0])) return false;
-            if (nineStaticCount(args[0]) < 1) return false;
             const VhdlValue sizev = V3VhdlEval::eval(args[1]);
-            return sizev.isInt() && sizev.toInt() >= 1;
+            if (nineStaticCount(args[0]) >= 1 && sizev.isInt() && sizev.toInt() >= 1) {
+                return true;
+            }
+            // Lengths elaboration settles -- "resize(si, so'length)" for
+            // ports an instance gives bounds to
+            return !boundsOnlyRunningDecides(args[1]);
         }
         if (args.size() == 1 && (op == "-" || op == "abs")) {
             return kindOf(args[0]) == 's' && nineOperandKnown(args[0]);
