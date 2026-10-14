@@ -386,7 +386,11 @@ public:
     // so this answers for "std_logic_vector(7 downto 0)" as well.
     int logicVectorFlavour() const {
         if (base()->name() != "std_ulogic_vector") return 0;
-        return m_resolutionp ? 2 : 1;
+        // STD_LOGIC_VECTOR is "(resolved) STD_ULOGIC_VECTOR": the function is
+        // the vector's, or, where the nine values resolve as an enumeration
+        // like any other (--vhdl-metavalues), its element subtype's (6.3)
+        const bool elemResolved = m_elementp && m_elementp->m_resolutionp;
+        return m_resolutionp || elemResolved ? 2 : 1;
     }
     bool isResolved() const { return m_resolutionp != nullptr; }
 

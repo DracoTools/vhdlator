@@ -2470,6 +2470,8 @@ private:
                              bool generics = false) VL_MT_DISABLED;
     void analyzeDrivers(AstVhdlArchitecture* archp) VL_MT_DISABLED;
     static bool isLogicValued(const VhdlType* typep) VL_MT_DISABLED;
+    static bool logicShaped(const VhdlType* typep) VL_MT_DISABLED;
+    static bool nineRecordResolved(const VhdlSymbol* symp) VL_MT_DISABLED;
     static bool resolvedAsWhole(const VhdlSymbol* symp) VL_MT_DISABLED;
     static bool driversCombined(const VhdlType* typep, int depth = 0) VL_MT_DISABLED;
     static VhdlSymbol* elementResolver(const VhdlType* typep) VL_MT_DISABLED;
@@ -7963,7 +7965,24 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
 // are held as bits and resolved natively. Under --vhdl-metavalues the nine
 // values are an enumeration like any other, resolved by RESOLVED itself.
 bool VhdlSemVisitor::isLogicValued(const VhdlType* typep) {
-    if (!typep || v3Global.opt.vhdlMetavalues()) return false;
+    return !v3Global.opt.vhdlMetavalues() && logicShaped(typep);
+}
+
+// A record whose every element is RESOLVED over the nine values
+// (--vhdl-metavalues): a process that assigns any of its elements is a
+// driver of the record, which the lowering resolves element by element and
+// in which each driver drives only the elements it assigns (14.7.2)
+bool VhdlSemVisitor::nineRecordResolved(const VhdlSymbol* symp) {
+    if (!v3Global.opt.vhdlMetavalues() || !symp) return false;
+    const VhdlType* const typep = symp->typep();
+    if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+    return driversCombined(typep);
+}
+
+// Whether a type is the nine logic values, or an array of them, however they
+// are held
+bool VhdlSemVisitor::logicShaped(const VhdlType* typep) {
+    if (!typep) return false;
     const VhdlType* basep = typep->base();
     if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
         basep = basep->elementp()->base();
@@ -8033,7 +8052,13 @@ bool VhdlSemVisitor::driversCombined(const VhdlType* typep, int depth) {
     if (basep->kind() == VhdlTypeKind::RECORD) {
         if (basep->elements().empty()) return false;
         for (const VhdlSymbol* const elemp : basep->elements()) {
-            if (!driversCombined(elemp->typep(), depth + 1)) return false;
+            const VhdlType* const etp = elemp->typep();
+            // An element of the nine values resolved by RESOLVED, which
+            // --vhdl-metavalues resolves as an enumeration like any other
+            const bool nineResolved
+                = v3Global.opt.vhdlMetavalues() && logicShaped(etp) && etp
+                  && (etp->resolutionp() || (etp->elementp() && etp->elementp()->resolutionp()));
+            if (!nineResolved && !driversCombined(etp, depth + 1)) return false;
         }
         return true;
     }
@@ -8086,8 +8111,14 @@ void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbo
             if (!symp) continue;
             // Only where the drivers are combined at all: a signal whose
             // resolution is a function of the design's own is left as it
-            // was, since one driver per call site is not what it expects
-            if (!driversCombined(symp->typep())) continue;
+            // was, since one driver per call site is not what it expects.
+            // RESOLVED over the nine values (--vhdl-metavalues) is the
+            // logic values' own, which takes them in any order.
+            const VhdlType* const stp = symp->typep();
+            const bool nineResolved
+                = v3Global.opt.vhdlMetavalues() && logicShaped(stp) && stp
+                  && (stp->resolutionp() || (stp->elementp() && stp->elementp()->resolutionp()));
+            if (!driversCombined(stp) && !nineResolved) continue;
             if (VN_IS(asp->actualp(), VhdlName)) {
                 whole.insert(symp);
             } else {
@@ -8207,8 +8238,13 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                 // A source of a signal whose composite subtype names a
                 // resolution function is a value of the whole composite, so
                 // a process that drives only part of it is a driver of all
-                // of it, holding the rest as declared (14.7.2, 14.7.3.2)
-                if (symp && resolvedAsWhole(symp)) whole.insert(symp);
+                // of it, holding the rest as declared (14.7.2, 14.7.3.2).
+                // So, under --vhdl-metavalues, is a process that drives part
+                // of a record of elements each RESOLVED, which the lowering
+                // resolves with each driver driving only what it assigns.
+                if (symp && (resolvedAsWhole(symp) || nineRecordResolved(symp))) {
+                    whole.insert(symp);
+                }
             }
             const AstVhdlGenerate* const genp = VN_CAST(p, VhdlGenerate);
             const bool inGenerate = genp;
@@ -8229,7 +8265,19 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             for (const VhdlSymbol* const symp : whole) wholeSignals.insert(throughPorts(symp));
             whole.swap(wholeSignals);
             for (const VhdlSymbol* const symp : whole) {
-                counts[symp] += repeat;
+                // A signal the generate itself declares is one per iteration,
+                // each with the one driver its iteration gives it; only one
+                // declared outside is driven by every iteration (14.7.2)
+                bool ownSignal = false;
+                if (genp && repeat > 1 && symp->declp()) {
+                    for (const AstNode* up = symp->declp()->backp(); up; up = up->backp()) {
+                        if (up == genp) {
+                            ownSignal = true;
+                            break;
+                        }
+                    }
+                }
+                counts[symp] += ownSignal ? 1 : repeat;
                 if (!inGenerate) outsideGenerate.insert(symp);
                 if (!where.count(symp)) where[symp] = p->fileline();
             }
@@ -8239,7 +8287,7 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     for (const auto& pair : counts) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
         // Its elements are driven, not it
-        if (partial.count(symp) && !resolvedAsWhole(symp)) continue;
+        if (partial.count(symp) && !resolvedAsWhole(symp) && !nineRecordResolved(symp)) continue;
         symp->driverCount(pair.second);
         VhdlType* const typep = symp->typep();
         VhdlSymbol* const resolvep = typep ? typep->resolutionp() : nullptr;

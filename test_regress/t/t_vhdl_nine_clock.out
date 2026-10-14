@@ -1,0 +1,2 @@
+t/t_vhdl_nine_clock.vhd:72:5:@13000000:(report note): rise=3 fall=2 event=4 reset=0 conc=3 q=1010
+t/t_vhdl_nine_clock.vhd:75:5:@13000000:(report note): *-* All Finished *-*

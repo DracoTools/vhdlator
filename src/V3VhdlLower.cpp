@@ -9160,6 +9160,10 @@ private:
                         || (symp->driverCount() == 1 && m_zAssigned.count(symp->resolved()))) {
                         makeResolved(symp, varp, flp);
                     }
+                } else if (!symp->resolverp() && symp->driverCount() > 1
+                           && nineLanes(symp->typep()) > 0) {
+                    // A record of elements each RESOLVED over the nine values
+                    makeNineResolved(symp, varp, flp);
                 } else if (symp->resolverp() && symp->driverCount() <= 1 && !guardedSignal(symp)
                            && ieeeResolved(symp->resolverp())) {
                     // STD_LOGIC_1164's RESOLVED gives one driver's value back
@@ -16237,6 +16241,72 @@ private:
                                     laneShr(nineRead(a, flp), 3, flp)}}},
             laneMask(1, a.countp, flp)};
     }
+    // Where a lane holds one of the nine values, as bit 0 of each lane
+    static AstNodeExpr* laneIs(const NineArg& a, uint32_t pos, FileLine* flp) {
+        AstNodeExpr* const diffp = new AstXor{flp, nineRead(a, flp), laneMask(pos, a.countp, flp)};
+        return new AstAnd{
+            flp,
+            new AstNot{flp, new AstOr{flp,
+                                      new AstOr{flp, diffp->cloneTree(false),
+                                                laneShr(diffp->cloneTree(false), 1, flp)},
+                                      new AstOr{flp, laneShr(diffp->cloneTree(false), 2, flp),
+                                                laneShr(diffp, 3, flp)}}},
+            laneMask(1, a.countp, flp)};
+    }
+    // STD_LOGIC_1164's RESOLVED of two drivers, every element at once, as its
+    // table resolves them: 'U' wins; then 'X' or '-'; a forcing '0' and '1'
+    // together make 'X'; then the forcing value; then 'W', or 'L' and 'H'
+    // together, make 'W'; then the weak value; and 'Z' only of two 'Z's
+    static AstNodeExpr* nineResolve2(const NineArg& a, const NineArg& b, FileLine* flp) {
+        const auto either = [&](uint32_t pos) -> AstNodeExpr* {
+            return new AstOr{flp, laneIs(a, pos, flp), laneIs(b, pos, flp)};
+        };
+        const auto c = [](AstNodeExpr* p) { return p->cloneTree(false); };
+        // Not, kept within bit 0 of each lane, where the classes are held
+        const auto lnot = [&](AstNodeExpr* p) -> AstNodeExpr* {
+            return new AstAnd{flp, new AstNot{flp, p}, laneMask(1, a.countp, flp)};
+        };
+        const auto shl = [&](AstNodeExpr* p, uint32_t by) -> AstNodeExpr* {
+            return new AstShiftL{flp, p, new AstConst{flp, AstConst::WidthedValue{}, 32, by}};
+        };
+        AstNodeExpr* const up = either(0);
+        AstNodeExpr* const xp = new AstOr{flp, either(1), either(8)};
+        AstNodeExpr* const f0p = either(2);
+        AstNodeExpr* const f1p = either(3);
+        AstNodeExpr* const wWp = either(5);
+        AstNodeExpr* const w0p = either(6);
+        AstNodeExpr* const w1p = either(7);
+        // Settled by neither 'U' nor 'X'
+        AstNodeExpr* const cleanp = lnot(new AstOr{flp, c(up), c(xp)});
+        AstNodeExpr* const mXp
+            = new AstAnd{flp, lnot(c(up)), new AstOr{flp, c(xp), new AstAnd{flp, c(f0p), c(f1p)}}};
+        AstNodeExpr* const m0p = new AstAnd{flp, c(cleanp), new AstAnd{flp, c(f0p), lnot(c(f1p))}};
+        AstNodeExpr* const m1p = new AstAnd{flp, c(cleanp), new AstAnd{flp, c(f1p), lnot(c(f0p))}};
+        // Neither forcing value: the weak ones and 'Z' decide
+        AstNodeExpr* const restp = new AstAnd{flp, cleanp, lnot(new AstOr{flp, f0p, f1p})};
+        AstNodeExpr* const mWp
+            = new AstAnd{flp, c(restp), new AstOr{flp, c(wWp), new AstAnd{flp, c(w0p), c(w1p)}}};
+        AstNodeExpr* const mLp = new AstAnd{
+            flp, c(restp), new AstAnd{flp, c(w0p), lnot(new AstOr{flp, c(w1p), c(wWp)})}};
+        AstNodeExpr* const mHp = new AstAnd{
+            flp, c(restp), new AstAnd{flp, c(w1p), lnot(new AstOr{flp, c(w0p), c(wWp)})}};
+        AstNodeExpr* const mZp
+            = new AstAnd{flp, restp, lnot(new AstOr{flp, new AstOr{flp, w0p, w1p}, wWp})};
+        VL_DO_DANGLING(up->deleteTree(), up);
+        VL_DO_DANGLING(xp->deleteTree(), xp);
+        // Each class into its position: X 0001, '0' 0010, '1' 0011, Z 0100,
+        // W 0101, L 0110, H 0111 ('U' is 0000)
+        AstNodeExpr* outp = mXp;
+        outp = new AstOr{flp, outp, shl(m0p, 1)};
+        outp = new AstOr{flp, outp, new AstOr{flp, c(m1p), shl(m1p, 1)}};
+        outp = new AstOr{flp, outp, shl(mZp, 2)};
+        outp = new AstOr{flp, outp, new AstOr{flp, c(mWp), shl(mWp, 2)}};
+        outp = new AstOr{flp, outp, new AstOr{flp, shl(c(mLp), 1), shl(mLp, 2)}};
+        outp = new AstOr{flp, outp,
+                         new AstOr{flp, c(mHp), new AstOr{flp, shl(c(mHp), 1), shl(mHp, 2)}}};
+        return outp;
+    }
+
     // Where a lane is '-' (8, 1000)
     static AstNodeExpr* laneDash(const NineArg& a, FileLine* flp) {
         return new AstAnd{flp, laneShr(nineRead(a, flp), 3, flp), laneMask(1, a.countp, flp)};
@@ -17320,7 +17390,7 @@ private:
         // equal where exactly the literal's elements that are not 'Z' are
         // driven, and those hold what it says (9.2.3).
         if ((nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE)
-            && (!symp || symp->predefined())) {
+            && (!symp || symp->predefined()) && !v3Global.opt.vhdlMetavalues()) {
             // A name of a package's signal, or an element or a slice of it,
             // lowered, with the same select of its record of what is driven
             const auto pkgSide = [&](AstNodeVhdlExpr* exprp, AstNodeExpr*& valuep,
@@ -18301,9 +18371,247 @@ private:
         const VhdlType* const idxp = typep->indexTypes()[0];
         return idxp && idxp->bounded() && idxp->length() == 0;
     }
+    // Signals of the nine values resolved by RESOLVED whose resolution is built
+    // once the module's statements are lowered, and what each of their
+    // drivers drives: the whole signal, or only the parts its statements
+    // name (14.7.2: a driver for each scalar subelement assigned)
+    struct NinePending final {
+        VhdlSymbol* symp;
+        AstVar* netp;
+        FileLine* flp;
+    };
+    std::vector<NinePending> m_ninePending;
+    std::map<std::pair<const VhdlSymbol*, int>, std::vector<AstNodeVhdlExpr*>> m_nineParts;
+    std::set<std::pair<const VhdlSymbol*, int>> m_nineWhole;
+
+    // Which parts of a pending signal one concurrent statement drives, under
+    // the driver it is about to take
+    void noteNineParts(AstNodeVhdlStmt* nodep, const std::vector<const VhdlSymbol*>& resolved) {
+        if (m_ninePending.empty()) return;
+        // A generate counts its own drivers, one per iteration, and each of
+        // those is taken to drive the whole signal
+        if (nodep->exists([](const AstVhdlGenerate*) { return true; })) return;
+        for (const VhdlSymbol* const symp : resolved) {
+            bool pending = false;
+            for (const NinePending& np : m_ninePending) {
+                if (np.symp == symp) pending = true;
+            }
+            if (!pending) continue;
+            const auto key = std::make_pair(symp, m_driverUsed[symp]);
+            nodep->foreach([&](AstVhdlSigAssign* asgp) {
+                const VhdlSymbol* const tsymp = targetSymbol(asgp->targetp());
+                if (!tsymp || tsymp->resolved() != symp) return;
+                if (VN_IS(asgp->targetp(), VhdlName)) {
+                    m_nineWhole.insert(key);
+                } else {
+                    m_nineParts[key].push_back(asgp->targetp());
+                }
+            });
+            // A procedure handed the signal drives it as a whole
+            nodep->foreach([&](AstVhdlProcCall*) { m_nineWhole.insert(key); });
+        }
+    }
+
+    // The resolution of each pending signal: RESOLVED over its drivers, every
+    // element at once. A driver that drives only some elements holds 15 --
+    // no value of the nine -- in the others, which the resolution passes
+    // over; an element no driver drives keeps the value it was declared with.
+    void finishNineResolves() {
+        for (const NinePending& np : m_ninePending) {
+            VhdlSymbol* const symp = np.symp;
+            AstVar* const netp = np.netp;
+            FileLine* const nflp = nineFl(np.flp);
+            const auto drvIt = m_drivers.find(symp);
+            if (drvIt == m_drivers.end() || drvIt->second.empty()) continue;
+            const std::vector<VhdlDriver>& drivers = drvIt->second;
+            const int64_t lanes = nineLanes(symp->typep());
+            AstNodeExpr* const countp = i32(lanes, nflp);
+            const auto lv = [&](AstVar* varp) {
+                NineArg a;
+                a.exprp = new AstVarRef{nflp, varp, VAccess::READ};
+                a.countp = countp->cloneTree(false);
+                return a;
+            };
+            // Bit 0 of each lane spread over all four bits of it
+            const auto spread = [&](AstNodeExpr* bitsp) -> AstNodeExpr* {
+                AstNodeExpr* outp = bitsp;
+                for (uint32_t by = 1; by < 4; ++by) {
+                    outp = new AstOr{
+                        nflp, outp,
+                        new AstShiftL{nflp, bitsp->cloneTree(false),
+                                      new AstConst{nflp, AstConst::WidthedValue{}, 32, by}}};
+                }
+                return outp;
+            };
+            AstNode* bodyp = nullptr;
+            // What each driver contributes, as a variable of its own
+            std::vector<AstVar*> effs;
+            bool anyPartial = false;
+            for (size_t i = 0; i < drivers.size(); ++i) {
+                const auto key
+                    = std::make_pair(static_cast<const VhdlSymbol*>(symp), static_cast<int>(i));
+                const auto partsIt = m_nineParts.find(key);
+                if (partsIt == m_nineParts.end() || m_nineWhole.count(key)) {
+                    effs.push_back(drivers[i].valp);
+                    continue;
+                }
+                anyPartial = true;
+                // Which lanes it drives, written once at the start through
+                // the same names its statements write
+                AstVar* const maskp = new AstVar{
+                    nflp, VVarType::VAR,
+                    "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name() + "__lanes",
+                    VFlagChildDType{}, lowerType(symp->typep(), np.flp)};
+                maskp->trace(false);
+                maskp->valuep(laneMask(0, countp, nflp));
+                addStmt(maskp);
+                AstNode* setp = nullptr;
+                AstVar* const savedp = m_vars[symp];
+                m_vars[symp] = maskp;
+                for (AstNodeVhdlExpr* const partp : partsIt->second) {
+                    if (AstNodeExpr* const tgtp = lowerTarget(partp)) {
+                        setp = AstNode::addNextNull(
+                            setp,
+                            static_cast<AstNode*>(new AstAssign{
+                                nflp, tgtp, new AstConst{nflp, AstConst::StringToParse{}, "'1"}}));
+                    }
+                }
+                m_vars[symp] = savedp;
+                if (setp) addStmt(new AstInitial{nflp, setp});
+                AstVar* const effp = new AstVar{
+                    nflp, VVarType::VAR,
+                    "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name() + "__eff",
+                    VFlagChildDType{}, lowerType(symp->typep(), np.flp)};
+                effp->trace(false);
+                addStmt(effp);
+                bodyp = AstNode::addNextNull(
+                    bodyp,
+                    static_cast<AstNode*>(new AstAssign{
+                        nflp, new AstVarRef{nflp, effp, VAccess::WRITE},
+                        new AstOr{
+                            nflp,
+                            new AstAnd{nflp, new AstVarRef{nflp, drivers[i].valp, VAccess::READ},
+                                       new AstVarRef{nflp, maskp, VAccess::READ}},
+                            new AstAnd{
+                                nflp, laneMask(0xf, countp, nflp),
+                                new AstNot{nflp, new AstVarRef{nflp, maskp, VAccess::READ}}}}}));
+                effs.push_back(effp);
+            }
+            AstVar* const accp
+                = new AstVar{nflp, VVarType::VAR, "__Vresacc__" + m_prefix + symp->name(),
+                             VFlagChildDType{}, lowerType(symp->typep(), np.flp)};
+            accp->trace(false);
+            addStmt(accp);
+            bodyp
+                = AstNode::addNextNull(bodyp, static_cast<AstNode*>(new AstAssign{
+                                                  nflp, new AstVarRef{nflp, accp, VAccess::WRITE},
+                                                  new AstVarRef{nflp, effs[0], VAccess::READ}}));
+            for (size_t i = 1; i < effs.size(); ++i) {
+                NineArg a = lv(accp);
+                NineArg b = lv(effs[i]);
+                AstNodeExpr* stepp = nineResolve2(a, b, nflp);
+                if (anyPartial) {
+                    // Where one side drives nothing the other is the answer
+                    AstNodeExpr* const faP = laneIs(a, 15, nflp);
+                    AstNodeExpr* const fbP = laneIs(b, 15, nflp);
+                    AstNodeExpr* const bothp
+                        = new AstAnd{nflp,
+                                     new AstAnd{nflp, new AstNot{nflp, faP->cloneTree(false)},
+                                                new AstNot{nflp, fbP->cloneTree(false)}},
+                                     laneMask(1, countp, nflp)};
+                    AstNodeExpr* const onlyAp
+                        = new AstAnd{nflp, fbP,
+                                     new AstAnd{nflp, new AstNot{nflp, faP->cloneTree(false)},
+                                                laneMask(1, countp, nflp)}};
+                    stepp = new AstOr{
+                        nflp,
+                        new AstOr{nflp, new AstAnd{nflp, spread(faP), nineRead(b, nflp)},
+                                  new AstAnd{nflp, spread(onlyAp), nineRead(a, nflp)}},
+                        new AstAnd{nflp, spread(bothp), stepp}};
+                }
+                bodyp->addNext(
+                    new AstAssign{nflp, new AstVarRef{nflp, accp, VAccess::WRITE}, stepp});
+                nineDrop(a);
+                nineDrop(b);
+            }
+            AstNodeExpr* valuep = new AstVarRef{nflp, accp, VAccess::READ};
+            if (anyPartial) {
+                // An element no driver drives keeps its declared value
+                NineArg a = lv(accp);
+                AstNodeExpr* const nonep = laneIs(a, 15, nflp);
+                AstNodeExpr* const initp = netp->valuep()
+                                               ? VN_AS(netp->valuep(), NodeExpr)->cloneTree(false)
+                                               : defaultValueFor(symp->typep(), np.flp);
+                valuep = new AstOr{nflp, new AstAnd{nflp, spread(nonep->cloneTree(false)), initp},
+                                   new AstAnd{nflp, new AstNot{nflp, spread(nonep)}, valuep}};
+                nineDrop(a);
+            }
+            bodyp->addNext(new AstAssign{nflp, new AstVarRef{nflp, netp, VAccess::WRITE}, valuep});
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            netp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+            addStmt(new AstAlways{nflp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
+        }
+        m_ninePending.clear();
+        m_nineParts.clear();
+        m_nineWhole.clear();
+    }
+
+    // How many lanes a value of the nine values holds, where that is a number
+    // and they lie one after another: an element, a vector, or a record that
+    // packs whose every element is one of those; -1 for anything else
+    int64_t nineLanes(const VhdlType* typep, int depth = 0) const {
+        if (!typep || depth > 8 || !v3Global.opt.vhdlMetavalues()) return -1;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            if (!recordPacks(typep)) return -1;
+            int64_t total = 0;
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                const int64_t n = nineLanes(elemp->typep(), depth + 1);
+                if (n < 1) return -1;
+                total += n;
+            }
+            return total > 0 ? total : -1;
+        }
+        if (!nineValued(typep)) return -1;
+        if (basep->kind() == VhdlTypeKind::ENUM) return 1;
+        const int width = vectorWidth(typep);
+        return width > 0 ? width : -1;
+    }
+
+    // A signal several drivers drive whose subtype names no function, but
+    // whose every element is RESOLVED over the nine values -- a record of
+    // STD_LOGIC fields -- is resolved element by element, which a record's
+    // resolution is (6.3): all its lanes at once
+    void makeNineResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
+        const int count = symp->driverCount();
+        FileLine* const nflp = nineFl(flp);
+        AstNodeExpr* const countp = i32(nineLanes(symp->typep()), nflp);
+        AstNodeExpr* const initp = VN_CAST(netp->valuep(), NodeExpr);
+        netp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        std::vector<VhdlDriver> drivers;
+        for (int i = 0; i < count; ++i) {
+            VhdlDriver drv;
+            drv.valp = new AstVar{flp, VVarType::VAR,
+                                  "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name()
+                                      + "__val",
+                                  VFlagChildDType{}, lowerType(symp->typep(), flp)};
+            addStmt(drv.valp);
+            drv.valp->valuep(initp ? initp->cloneTree(false)
+                                   : defaultValueFor(symp->typep(), flp));
+            drivers.push_back(drv);
+        }
+        VL_DO_DANGLING(countp->deleteTree(), countp);
+        m_ninePending.push_back(NinePending{symp, netp, flp});
+        m_drivers.emplace(symp, drivers);
+    }
+
     // Whether a resolution function is STD_LOGIC_1164's RESOLVED
     static bool ieeeResolved(const VhdlSymbol* resolvep) {
-        if (!resolvep || resolvep->name() != "resolved") return false;
+        // A copy made for so many drivers -- "resolved__V2drv" -- is RESOLVED
+        // all the same
+        if (!resolvep) return false;
+        const std::string& name = resolvep->name();
+        if (name != "resolved" && name.rfind("resolved__V", 0) != 0) return false;
         for (const VhdlScope* scopep = resolvep->declScopep(); scopep;
              scopep = scopep->parentp()) {
             if (scopep->name() == "std_logic_1164") return true;
@@ -22260,6 +22568,7 @@ private:
         for (const VhdlSymbol* const symp : driven) {
             if (m_drivers.count(symp)) resolved.push_back(symp);
         }
+        noteNineParts(nodep, resolved);
         VL_RESTORER(m_countedDrivers);
         m_countedDrivers = false;
         lowerConcurrent(nodep);
@@ -23504,10 +23813,22 @@ private:
         AstNode* bodyp = nullptr;
         AstSenTree* sentreep = nullptr;
         if (ifp) {
-            sentreep = new AstSenTree{
-                flp, new AstSenItem{flp, rising ? VEdgeType::ET_POSEDGE : VEdgeType::ET_NEGEDGE,
-                                    lowerExpr(clockp)}};
-            bodyp = lowerClockedIf(ifp, sentreep);
+            AstNodeExpr* guardp = nullptr;
+            AstVhdlAlternative* clockAltp = nullptr;
+            for (AstNode* p = ifp->altsp(); p; p = p->nextp()) {
+                clockAltp = VN_AS(p, VhdlAlternative);
+            }
+            if (nineValued(clockp->vhdlTypep())) {
+                AstNodeExpr* const trigp
+                    = nineClockTrigger(clockAltp->condp(), clockp, rising, guardp, flp);
+                sentreep = new AstSenTree{flp, new AstSenItem{flp, VEdgeType::ET_POSEDGE, trigp}};
+            } else {
+                sentreep = new AstSenTree{
+                    flp,
+                    new AstSenItem{flp, rising ? VEdgeType::ET_POSEDGE : VEdgeType::ET_NEGEDGE,
+                                   lowerExpr(clockp)}};
+            }
+            bodyp = lowerClockedIf(ifp, sentreep, guardp);
             // Every VHDL process runs once when the simulation starts, before
             // any signal has changed (11.3). For a clocked process that is
             // what applies an asynchronous reset that is already asserted at
@@ -23898,7 +24219,8 @@ private:
         // its sensitivity list and its edge test kept.
         for (AstNode* p = ifp->altsp(); p && p != lastp; p = p->nextp()) {
             bool high = true;
-            if (!levelTest(VN_AS(p, VhdlAlternative)->condp(), high)) return nullptr;
+            int ninePos = -1;
+            if (!levelTest(VN_AS(p, VhdlAlternative)->condp(), high, &ninePos)) return nullptr;
         }
         // Nor where a reset branch reads a signal the process is sensitive
         // to beside its clock and its resets: "out1 <= state" under the
@@ -23914,8 +24236,9 @@ private:
         if (clockp->vhdlSymp()) controls.insert(clockp->vhdlSymp()->resolved());
         for (AstNode* p = ifp->altsp(); p && p != lastp; p = p->nextp()) {
             bool high = true;
+            int ninePos = -1;
             const AstNodeVhdlExpr* const resetp
-                = levelTest(VN_AS(p, VhdlAlternative)->condp(), high);
+                = levelTest(VN_AS(p, VhdlAlternative)->condp(), high, &ninePos);
             if (resetp && resetp->vhdlSymp()) controls.insert(resetp->vhdlSymp()->resolved());
         }
         // What the branches assign is not what they read: a target named
@@ -23968,10 +24291,8 @@ private:
             }
             AstVhdlAssoc* const argp = VN_CAST(callp->argsp(), VhdlAssoc);
             if (!argp || argp->nextp()) return nullptr;
-            // A clock of nine values has edges a Verilog edge does not see
-            // ('0' to 'H') and changes that are no edge ('U' to '1'), so its
-            // process wakes on every change and asks the full question
-            if (nineValued(argp->actualp()->vhdlTypep())) return nullptr;
+            // A clock of nine values is recognised too, and nineClockTrigger
+            // says what its edge is
             return argp->actualp();
         }
         // clk'event and clk = '1'
@@ -23992,31 +24313,71 @@ private:
         const VhdlValue val = V3VhdlEval::eval(eqp->rhsp());
         if (!val.isInt() || !val.typep()) return nullptr;
         const VhdlType* const basep = val.typep()->base();
+        if (nineValued(basep)) {
+            // Of the nine values only '1' and '0' are a level an edge test of
+            // this form names (it takes 'X' to '1' as an edge, 'L' to 'H' not)
+            if (val.toInt() != 3 && val.toInt() != 2) return nullptr;
+            rising = val.toInt() == 3;
+            return eventOn;
+        }
         if (!enumIsLogic(basep)) return nullptr;
         rising = logicValueOf(basep->literals()[val.toInt()]->name()) == LogicVal::ONE;
         return eventOn;
     }
 
+    // The edge a clocked process of a clock of the nine values runs on, as
+    // an expression whose rising edge it is, and the condition the clocked
+    // branch keeps: RISING_EDGE is a change to '1' or 'H' from '0' or 'L'
+    // (16.8.2), which a change from 'U' or 'X' is not, so the branch also
+    // asks what the clock was one delta before. "clk'event and clk = '1'"
+    // is a change to exactly '1', from anything, and keeps no condition.
+    AstNodeExpr* nineClockTrigger(AstNodeVhdlExpr* condp, AstNodeVhdlExpr* clockp, bool rising,
+                                  AstNodeExpr*& guardp, FileLine* flp) {
+        guardp = nullptr;
+        AstNodeExpr* const clkp = lowerExpr(clockp);
+        if (!clkp) return nullptr;
+        const auto lit
+            = [&](uint32_t v) { return new AstConst{flp, AstConst::WidthedValue{}, 4, v}; };
+        if (!VN_IS(condp, VhdlCall)) return new AstEq{flp, clkp, lit(rising ? 3 : 2)};
+        const VhdlShadow* const shp = shadowFor(clockp, flp);
+        if (!shp) {
+            VL_DO_DANGLING(clkp->deleteTree(), clkp);
+            return nullptr;
+        }
+        guardp = new AstEq{flp, new AstOr{flp, shadowPart(clockp, shp->prevp, flp), lit(4)},
+                           lit(rising ? 6 : 7)};
+        return new AstEq{flp, new AstOr{flp, clkp, lit(4)}, lit(rising ? 7 : 6)};
+    }
+
     // The body of a clocked process, with the edge test removed and any
     // asynchronous resets kept as ordinary conditions. The sentree gains an
     // edge item for each reset, so that the process runs when one asserts.
-    AstNode* lowerClockedIf(AstVhdlIf* ifp, AstSenTree* sentreep) {
+    AstNode* lowerClockedIf(AstVhdlIf* ifp, AstSenTree* sentreep, AstNodeExpr* guardp = nullptr) {
         std::vector<AstVhdlAlternative*> alts;
         for (AstNode* p = ifp->altsp(); p; p = p->nextp()) {
             alts.push_back(VN_AS(p, VhdlAlternative));
         }
         AstNode* elsep = lowerStmts(alts.back()->stmtsp());
+        if (guardp) elsep = new AstIf{guardp->fileline(), guardp, elsep, nullptr};
         for (size_t i = alts.size() - 1; i-- > 0;) {
             AstVhdlAlternative* const altp = alts[i];
             FileLine* const flp = altp->fileline();
             // An asynchronous reset makes the process run on its own edge too
             bool resetHigh = true;
+            int ninePos = -1;
             // clockedIf only takes a process whose every such branch is one
-            AstNodeVhdlExpr* const resetp = levelTest(altp->condp(), resetHigh);
+            AstNodeVhdlExpr* const resetp = levelTest(altp->condp(), resetHigh, &ninePos);
             UASSERT_OBJ(resetp, altp, "Asynchronous branch that is not a level test");
-            sentreep->addSensesp(
-                new AstSenItem{flp, resetHigh ? VEdgeType::ET_POSEDGE : VEdgeType::ET_NEGEDGE,
-                               lowerExpr(resetp)});
+            AstNodeExpr* trigp = lowerExpr(resetp);
+            if (ninePos >= 0 && trigp) {
+                // A reset of the nine values asserts where it becomes the
+                // value it is compared with
+                trigp = new AstEq{flp, trigp,
+                                  new AstConst{flp, AstConst::WidthedValue{}, 4,
+                                               static_cast<uint32_t>(ninePos)}};
+            }
+            sentreep->addSensesp(new AstSenItem{
+                flp, resetHigh ? VEdgeType::ET_POSEDGE : VEdgeType::ET_NEGEDGE, trigp});
             elsep = new AstIf{flp, lowerCondition(altp->condp()),
                               lowerStmts(altp->stmtsp()), elsep};
         }
@@ -24025,16 +24386,23 @@ private:
 
     // "rst = '1'", "rst = '0'" or plain "rst", giving the signal and the
     // level that asserts it
-    AstNodeVhdlExpr* levelTest(AstNodeVhdlExpr* condp, bool& high) {
+    AstNodeVhdlExpr* levelTest(AstNodeVhdlExpr* condp, bool& high, int* ninePosp = nullptr) {
         high = true;
+        if (ninePosp) *ninePosp = -1;
         if (AstVhdlBinary* const eqp = VN_CAST(condp, VhdlBinary)) {
             if (eqp->op() != VhdlBinaryOp::EQ) return nullptr;
             const VhdlValue val = V3VhdlEval::eval(eqp->rhsp());
             if (!val.isInt() || !val.typep()) return nullptr;
             const VhdlType* const basep = val.typep()->base();
             if (basep->kind() != VhdlTypeKind::ENUM) return nullptr;
-            // Of nine values, '1' is not the one value that is not '0'
-            if (nineValued(basep)) return nullptr;
+            // Of nine values, '1' is not the one value that is not '0': the
+            // reset asserts where the signal becomes exactly that value, and
+            // only a caller that can say so takes it
+            if (nineValued(basep)) {
+                if (!ninePosp) return nullptr;
+                *ninePosp = static_cast<int>(val.toInt());
+                return eqp->lhsp();
+            }
             const std::string& litName = basep->literals()[val.toInt()]->name();
             high = enumIsLogic(basep) ? logicValueOf(litName) == LogicVal::ONE
                                       : val.toInt() != 0;
@@ -24280,7 +24648,8 @@ private:
                 AstNodeVhdlExpr* const innerp = actualSignal(asp->actualp());
                 AstNodeVhdlExpr* const namedp = innerp ? innerp : asp->actualp();
                 if (const VhdlSymbol* const symp = pkgAliasBase(rootSymOf(namedp))) {
-                    if (VN_IS(namedp, VhdlName) || pkgResolved(symp) || resolvedAsWhole(symp)) {
+                    if (VN_IS(namedp, VhdlName) || pkgResolved(symp) || resolvedAsWhole(symp)
+                        || nineRecordResolved(symp)) {
                         out.insert(symp);
                     } else {
                         s_partialDriven.insert(symp);
@@ -24322,7 +24691,7 @@ private:
                         // wherever it is driven from (makePkgDriver), so a
                         // part of it is a driver like the whole
                         if (VN_IS(asp->actualp(), VhdlName) || pkgResolved(symp)
-                            || resolvedAsWhole(symp)) {
+                            || resolvedAsWhole(symp) || nineRecordResolved(symp)) {
                             out.insert(symp);
                         } else {
                             s_partialDriven.insert(symp);
@@ -24338,8 +24707,8 @@ private:
                 // here and another from there is not two drivers of the
                 // signal. Only a whole-signal assignment is counted, and a
                 // partial one takes the signal out of resolution altogether.
-                if (VN_IS(asgp->targetp(), VhdlName) || pkgResolved(symp)
-                    || resolvedAsWhole(symp)) {
+                if (VN_IS(asgp->targetp(), VhdlName) || pkgResolved(symp) || resolvedAsWhole(symp)
+                    || nineRecordResolved(symp)) {
                     out.insert(symp);
                 } else {
                     s_partialDriven.insert(symp);
@@ -24438,6 +24807,23 @@ private:
     // Whether a signal's subtype is a composite resolved by a function of the
     // design's own as a whole: a process that drives any part of it is a
     // driver of all of it, holding the rest as declared (14.7.2, 14.7.3.2)
+    // A record whose every element is RESOLVED over the nine values
+    // (--vhdl-metavalues): a process that assigns any of its elements is one
+    // of its drivers, driving only what it assigns (see finishNineResolves)
+    static bool nineRecordResolved(const VhdlSymbol* symp) {
+        if (!v3Global.opt.vhdlMetavalues() || !symp) return false;
+        const VhdlType* const typep = symp->typep();
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        if (typep->base()->elements().empty()) return false;
+        for (const VhdlSymbol* const elemp : typep->base()->elements()) {
+            const VhdlType* const etp = elemp->typep();
+            if (!nineValued(etp)) return false;
+            const bool resolved
+                = etp->resolutionp() || (etp->elementp() && etp->elementp()->resolutionp());
+            if (!resolved) return false;
+        }
+        return true;
+    }
     static bool resolvedAsWhole(const VhdlSymbol* symp) {
         if (!symp->resolverp() || symp->resolvePerElement()) return false;
         const VhdlType* const typep = symp->typep();
@@ -24584,7 +24970,7 @@ private:
         bool decided = false;
         if (!declaredInPackageAst(symp, decided) || !decided) return false;
         const VhdlType* const typep = symp->typep();
-        if (!typep || !isLogicish(typep)) return false;
+        if (!typep || (!isLogicish(typep) && !nineValued(typep))) return false;
         const VhdlType* const basep = typep->base();
         const auto resolvedByTable = [](const VhdlType* tp) {
             // std_logic_1164's own function; a function of the design's own
@@ -24649,6 +25035,11 @@ private:
     // weakly, 'x' a metavalue. A value that does not fold drives every
     // element, forcingly, with a known value.
     static AstNodeExpr* driveMaskOf(AstNodeVhdlExpr* valuep, char which, FileLine* flp) {
+        // A value of the nine values says itself whether it drives, weakly
+        // or not, so every element of it is given, and none is flagged
+        if (v3Global.opt.vhdlMetavalues() && valuep && nineValued(valuep->vhdlTypep())) {
+            return new AstConst{flp, AstConst::StringToParse{}, which == 'e' ? "'1" : "'0"};
+        }
         std::string chars;
         if (!logicCharsOf(valuep, chars)) {
             return new AstConst{flp, AstConst::StringToParse{}, which == 'e' ? "'1" : "'0"};
@@ -24839,26 +25230,57 @@ private:
             }
             loopp->addStmtsp(
                 new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), num(1)}});
-            funcp->addStmtsp(loopp);
-            // Where anything forces, the forcing drivers decide: a metavalue
-            // among them, or a 0 and a 1 together, is an 'X'. Where nothing
-            // does, the weak ones decide the same way, and with no driver at
-            // all the element is 'Z'. A value here has two states, so a
-            // metavalue reads as 1 -- never as the '0' a barrier waits for --
-            // and 'Z' as 0, which is what the rest of the design reads.
-            funcp->addStmtsp(new AstAssign{
-                flp, wr(acc["any"], flp),
-                new AstOr{flp, new AstOr{flp, rd(acc["s1"], flp), rd(acc["s0"], flp)},
-                          rd(acc["sx"], flp)}});
-            funcp->addStmtsp(new AstAssign{
-                flp, wr(retp, flp),
-                new AstOr{flp,
-                          new AstAnd{flp, rd(acc["any"], flp),
-                                     new AstOr{flp, rd(acc["sx"], flp), rd(acc["s1"], flp)}},
-                          new AstAnd{flp, new AstNot{flp, rd(acc["any"], flp)},
-                                     new AstOr{flp, rd(acc["wx"], flp), rd(acc["w1"], flp)}}}});
-            unitp->addStmtsp(funcp);
-            reg.putp = funcp;
+            // Over the nine values each driver's value is all there is to
+            // it: RESOLVED of them all, every element at once
+            if (v3Global.opt.vhdlMetavalues() && nineValued(symp->typep())
+                && nineLanes(symp->typep()) > 0) {
+                VL_DO_DANGLING(loopp->deleteTree(), loopp);
+                FileLine* const nflp = nineFl(flp);
+                AstNodeExpr* const countp = i32(nineLanes(symp->typep()), nflp);
+                funcp->addStmtsp(new AstAssign{nflp, wr(retp, nflp),
+                                               new AstSelBit{nflp, rd(reg.valsp, nflp), num(0)}});
+                funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), num(1)});
+                AstLoop* const nloopp = new AstLoop{flp};
+                nloopp->addStmtsp(new AstLoopTest{
+                    flp, nloopp, new AstLtS{flp, rd(ip, flp), rd(reg.countp, flp)}});
+                NineArg a;
+                a.exprp = new AstVarRef{nflp, retp, VAccess::READ};
+                a.countp = countp->cloneTree(false);
+                NineArg b;
+                b.exprp = new AstSelBit{nflp, rd(reg.valsp, nflp), rd(ip, nflp)};
+                b.countp = countp->cloneTree(false);
+                nloopp->addStmtsp(new AstAssign{nflp, wr(retp, nflp), nineResolve2(a, b, nflp)});
+                nineDrop(a);
+                nineDrop(b);
+                nloopp->addStmtsp(
+                    new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), num(1)}});
+                funcp->addStmtsp(nloopp);
+                VL_DO_DANGLING(countp->deleteTree(), countp);
+                unitp->addStmtsp(funcp);
+                reg.putp = funcp;
+            } else {
+                funcp->addStmtsp(loopp);
+                // Where anything forces, the forcing drivers decide: a metavalue
+                // among them, or a 0 and a 1 together, is an 'X'. Where nothing
+                // does, the weak ones decide the same way, and with no driver at
+                // all the element is 'Z'. A value here has two states, so a
+                // metavalue reads as 1 -- never as the '0' a barrier waits for --
+                // and 'Z' as 0, which is what the rest of the design reads.
+                funcp->addStmtsp(new AstAssign{
+                    flp, wr(acc["any"], flp),
+                    new AstOr{flp, new AstOr{flp, rd(acc["s1"], flp), rd(acc["s0"], flp)},
+                              rd(acc["sx"], flp)}});
+                funcp->addStmtsp(new AstAssign{
+                    flp, wr(retp, flp),
+                    new AstOr{
+                        flp,
+                        new AstAnd{flp, rd(acc["any"], flp),
+                                   new AstOr{flp, rd(acc["sx"], flp), rd(acc["s1"], flp)}},
+                        new AstAnd{flp, new AstNot{flp, rd(acc["any"], flp)},
+                                   new AstOr{flp, rd(acc["wx"], flp), rd(acc["w1"], flp)}}}});
+                unitp->addStmtsp(funcp);
+                reg.putp = funcp;
+            }
         }
         {
             // Which elements any driver drives, strongly or weakly: the rest
@@ -25191,6 +25613,18 @@ private:
             AstNodeExpr* const targetp = atPath(new AstVarRef{flp, netp, VAccess::WRITE});
             bodyp = AstNode::addNextNull(
                 bodyp, static_cast<AstNode*>(new AstAssign{flp, targetp, callp}));
+        }
+        // STD_LOGIC_1164's RESOLVED over the nine values resolves every
+        // element of every driver at once, as its table does one pair at a
+        // time: no array of drivers, and no call per element. Built once the
+        // module's statements are lowered, when which elements each driver
+        // drives is known (finishNineResolves).
+        if (ieeeResolved(resolvep) && !nullFtaskp && v3Global.opt.vhdlMetavalues()
+            && nineValued(symp->typep()) && bodyp && nineLanes(symp->typep()) > 0) {
+            VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
+            m_drivers.emplace(symp, drivers);
+            m_ninePending.push_back(NinePending{symp, netp, flp});
+            return;
         }
         // A guarded signal is resolved over the drivers that are still
         // connected, and any one of them may be turned off on its own
@@ -34657,9 +35091,14 @@ private:
                 const int idx = passedOn ? outerIt->second.idx : m_driverUsed[drivenp];
                 // Where that is not a driver this can bind, the formal names
                 // the signal, as it did before drivers were passed on
+                // A driver resolved by RESOLVED over the nine values has no
+                // enable: a process that hands its signal to a procedure has
+                // that driver from elaboration on (14.7.2), so it is the one
+                // the copy writes
+                const bool nineDrv = nineValued(drivenp->typep());
                 if (passedOn
                     && (idx >= static_cast<int>(drvIt->second.size())
-                        || !drvIt->second[idx].enp)) {
+                        || (!drvIt->second[idx].enp && !nineDrv))) {
                     drvIt = m_drivers.end();
                 }
                 // A package's signal whose drivers here are all spoken for
@@ -34673,7 +35112,8 @@ private:
                 // reads, whatever its mode, writes none: it names the signal,
                 // and the driver the call gave the process holds its value
                 if (drvIt != m_drivers.end() && idx < static_cast<int>(drvIt->second.size())
-                    && !drvIt->second[idx].enp && !drivesFormal(declp, formals[i]->vhdlSymp())) {
+                    && !drvIt->second[idx].enp && !nineDrv
+                    && !drivesFormal(declp, formals[i]->vhdlSymp())) {
                     drvIt = m_drivers.end();
                 }
             }
@@ -34690,7 +35130,7 @@ private:
                 // and nothing to say whether it drives at all, and a copy
                 // that wrote to it would drive from the moment it was
                 // elaborated rather than when the call was made.
-                if (!drvIt->second[idx].enp) {
+                if (!drvIt->second[idx].enp && !nineValued(signalp->typep())) {
                     m_sigCopyWhy = ", where the signal '" + formals[i]->name()
                                    + "' is given is resolved by a function of the design's own";
                     return nullptr;
@@ -39548,6 +39988,7 @@ private:
                 lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
             }
         }
+        finishNineResolves();
         settleExternalNames();
         m_modp->addStmtsp(m_stmtsp);
         m_stmtsp = nullptr;
