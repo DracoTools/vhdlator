@@ -30341,6 +30341,14 @@ private:
             // happened to start at.
             AstNodeExpr* valuep = nullptr;
             if (targetp) {
+                // Its subtype may be written in the component's generics,
+                // which the length of a value of nine-value elements needs
+                VL_RESTORER_COPY(m_bindExprs);
+                if (formalp->vhdlSymp() && formalp->vhdlSymp()->typep()) {
+                    for (const auto& pair : genericStandIns(nodep, formalp->vhdlSymp()->typep())) {
+                        m_bindExprs[pair.first] = pair.second;
+                    }
+                }
                 valuep = formalp->defaultp()   ? lowerExpr(formalp->defaultp())
                          : formalp->vhdlSymp() ? defaultValueFor(formalp->vhdlSymp()->typep(), flp)
                                                : nullptr;
