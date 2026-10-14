@@ -5262,6 +5262,23 @@ private:
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerDynValue(nodep, carrierTypep, flp);
         if (isDyn2Value(nodep)) return carrierOfDyn2(nodep, carrierTypep, flp);
+        // What an operation emitted natively over the nine values gives back
+        // is as long as its operands make it, which its open type does not
+        // say: "("0" & a) + b" is five long where a and b are four
+        if (carrierTypep && ninePlanned(nodep)) {
+            const int64_t count = nineStaticCount(nodep);
+            AstNodeFTask* const litFuncp
+                = count > 0 ? dynOfLiteralFunc(carrierTypep, count, flp) : nullptr;
+            if (litFuncp) {
+                if (AstNodeExpr* const valp = lowerExpr(nodep)) {
+                    AstFuncRef* const refp
+                        = new AstFuncRef{flp, litFuncp->name(), new AstArg{flp, "", valp}};
+                    refp->taskp(VN_AS(litFuncp, Func));
+                    return refp;
+                }
+                return nullptr;
+            }
+        }
         if (AstNodeExpr* const joinedp = aggregateOfArraysCarrier(nodep, carrierTypep, flp)) {
             return joinedp;
         }
@@ -8022,6 +8039,9 @@ private:
     bool m_inGenBody = false;  // Lowering the declarations of a generate's block
     // A block's port associated with a signal, and that signal (6.5.6.3)
     std::map<const VhdlSymbol*, const VhdlSymbol*> m_blockPortSignals;
+    // Signals a port of the block being lowered stands for, and that port's
+    // default, which the drivers its statements give the signal start at
+    std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_blockPortDefaults;
     // Signals some assignment gives a 'Z' written as a literal
     std::set<const VhdlSymbol*> m_zAssigned;
     // The names of the constants some external name reaches (8.7)
@@ -8367,7 +8387,14 @@ private:
                                               : defaultValueFor(symp->typep(), flp));
             addStmt(new AstPort{flp, ++pinNum, drvp->name()});
             addStmt(drvp);
-            if (symp->driverCount() >= 1) makeNineResolved(symp, drvp, flp);
+            // Its drivers: the statements that drive it, whole or -- an
+            // instance's output given one element of it -- in part
+            const auto partIt = m_partDriverCount.find(symp->resolved());
+            const int nDrv = symp->driverCount() >= 1            ? symp->driverCount()
+                             : partIt != m_partDriverCount.end() ? partIt->second
+                                                                 : 0;
+            if (nDrv >= 1) makeNineResolved(symp, drvp, flp, nDrv);
+            if (symp->driverCount() < 1 && nDrv >= 1) m_partDrivenPorts.insert(symp->resolved());
         }
         // The driving value of an output whose subtype names a resolution
         // function of the design's own is what the function makes of the
@@ -16282,6 +16309,116 @@ private:
         return flp->filename().compare(0, s_dir.size(), s_dir) == 0;
     }
 
+    // What an operation emitted natively gives back, given the shape of an
+    // array of its elements, so that an index or a slice of it counts in
+    // elements: "to_unsigned(n, 32)(31 downto 16)". Its range is the one the
+    // IEEE body gives its result -- "1 to n" from std_logic_1164's logical
+    // operators, "n - 1 downto 0" from numeric_std.
+    AstNodeExpr* nineShaped(AstNodeExpr* valuep, const AstNodeVhdlExpr* nodep, FileLine* flp) {
+        if (!v3Global.opt.vhdlMetavalues() || !ninePlanned(nodep)) return valuep;
+        const VhdlType* const typep = nodep->vhdlTypep();
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return valuep;
+        const int64_t count = nineStaticCount(nodep);
+        if (count < 1 || count > 65536) return valuep;
+        const bool logic
+            = inStdLogic1164(nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr);
+        AstRange* const rangep = logic ? new AstRange{flp, 1, static_cast<int>(count)}
+                                       : new AstRange{flp, static_cast<int>(count - 1), 0};
+        AstNodeDType* const dtp = new AstPackArrayDType{
+            flp, VFlagChildDType{}, new AstBasicDType{flp, VFlagLogicPacked{}, 4}, rangep};
+        return new AstCast{flp, valuep, VFlagChildDType{}, dtp};
+    }
+
+    // How many elements an operand of those operations has, as an
+    // expression: what its type says, a literal's own, a native result's
+    // (nineResultCount), or a joining's operands' together. Null where
+    // nothing here says.
+    AstNodeExpr* nineOperandCount(const AstNodeVhdlExpr* nodep, FileLine* flp, int depth = 0) {
+        if (!nodep || depth > 16) return nullptr;
+        if (const int64_t lit = nineLiteralCount(nodep)) return i32(lit, flp);
+        if (AstNodeVhdlExpr* const sizep = nineSizedCall(nodep)) {
+            const VhdlValue sizev = V3VhdlEval::eval(sizep);
+            return sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(sizep);
+        }
+        if (AstNodeExpr* const countp = nineCount(nodep->vhdlTypep(), flp)) return countp;
+        if (const AstVhdlBinary* const catp = VN_CAST(nodep, VhdlBinary)) {
+            if (catp->op() == VhdlBinaryOp::CONCAT) {
+                AstNodeExpr* const lp = nineOperandCount(catp->lhsp(), flp, depth + 1);
+                AstNodeExpr* const rp
+                    = lp ? nineOperandCount(catp->rhsp(), flp, depth + 1) : nullptr;
+                if (!rp) {
+                    if (lp) VL_DO_DANGLING(lp->deleteTree(), lp);
+                    return nullptr;
+                }
+                const AstConst* const lc = VN_CAST(lp, Const);
+                const AstConst* const rc = VN_CAST(rp, Const);
+                if (lc && rc) {
+                    const int32_t n = lc->toSInt() + rc->toSInt();
+                    VL_DO_DANGLING(lp->deleteTree(), lp);
+                    VL_DO_DANGLING(rp->deleteTree(), rp);
+                    return i32(n, flp);
+                }
+                return new AstAdd{flp, lp, rp};
+            }
+        }
+        return nineResultCount(nodep, flp, depth);
+    }
+
+    // How many elements an operation emitted natively gives back, as an
+    // expression: the size a conversion is given, the longer of two vectors
+    // (numeric_std makes the shorter as long first), the vector's beside a
+    // scalar or an integer. Null where this is not one or nothing says.
+    AstNodeExpr* nineResultCount(const AstNodeVhdlExpr* nodep, FileLine* flp, int depth = 0) {
+        if (depth > 16 || !ninePlanned(nodep)) return nullptr;
+        std::string op;
+        std::vector<AstNodeVhdlExpr*> args;
+        if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
+            op = vhdlBinaryOpName(bp->op());
+            args = {bp->lhsp(), bp->rhsp()};
+        } else if (const AstVhdlUnary* const up = VN_CAST(nodep, VhdlUnary)) {
+            op = vhdlUnaryOpName(up->op());
+            args = {up->lhsp()};
+        } else if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            op = declaredName(callp->vhdlSymp()->resolved()->name());
+            for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+                if (const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc)) {
+                    args.push_back(asp->actualp());
+                }
+            }
+        }
+        if (args.empty()) return nullptr;
+        const auto countOf
+            = [&](AstNodeVhdlExpr* argp) { return nineOperandCount(argp, flp, depth + 1); };
+        if (op == "to_unsigned" || op == "to_signed" || op == "resize") {
+            if (args.size() != 2 || !args[1]) return nullptr;
+            const VhdlValue sizev = V3VhdlEval::eval(args[1]);
+            return sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(args[1]);
+        }
+        if (args.size() == 1) return countOf(args[0]);
+        const auto vectorish = [](const AstNodeVhdlExpr* argp) {
+            return argp && argp->vhdlTypep()
+                   && argp->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY;
+        };
+        if (!vectorish(args[0])) return countOf(args[1]);
+        if (!vectorish(args[1])) return countOf(args[0]);
+        AstNodeExpr* const ap = countOf(args[0]);
+        AstNodeExpr* const bp = ap ? countOf(args[1]) : nullptr;
+        if (!bp) {
+            if (ap) VL_DO_DANGLING(ap->deleteTree(), ap);
+            return nullptr;
+        }
+        const AstConst* const ac = VN_CAST(ap, Const);
+        const AstConst* const bc = VN_CAST(bp, Const);
+        if (ac && bc) {
+            const int32_t n = std::max(ac->toSInt(), bc->toSInt());
+            VL_DO_DANGLING(ap->deleteTree(), ap);
+            VL_DO_DANGLING(bp->deleteTree(), bp);
+            return i32(n, flp);
+        }
+        return new AstCond{flp, new AstGtS{flp, ap->cloneTree(false), bp->cloneTree(false)}, ap,
+                           bp};
+    }
+
     // A lane of four bits, as many times over as there are elements
     static AstNodeExpr* laneMask(uint32_t pattern, const AstNodeExpr* countp, FileLine* flp) {
         AstNodeExpr* const lanep = new AstConst{flp, AstConst::WidthedValue{}, 4, pattern};
@@ -16318,7 +16455,7 @@ private:
             const VhdlValue sizev = V3VhdlEval::eval(sizep);
             arg.countp = sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(sizep);
         } else {
-            arg.countp = nineCount(nodep->vhdlTypep(), flp);
+            arg.countp = nineOperandCount(nodep, flp);
         }
         if (!arg.countp) return false;
         if (isDynValue(nodep)) return false;
@@ -16330,7 +16467,26 @@ private:
             arg.exprp = valp;
             return true;
         }
-        arg.varp = newTempVar("__Vnine", lowerType(nodep->vhdlTypep(), flp), flp);
+        // A value whose type gives no length -- a joining, a native result
+        // -- is held as so many lanes, where that is a number, and read
+        // again where it is not and reading it changes nothing
+        const VhdlType* const typep = nodep->vhdlTypep();
+        AstNodeDType* dtypep = nullptr;
+        if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY && !typep->isConstrainedArray()
+            && !typep->lengthEmittable()) {
+            if (const AstConst* const constp = VN_CAST(arg.countp, Const)) {
+                dtypep = new AstBasicDType{flp, VFlagLogicPacked{}, 4 * constp->toSInt()};
+            } else if (valp->isPure()) {
+                arg.exprp = valp;
+                return true;
+            } else {
+                VL_DO_DANGLING(valp->deleteTree(), valp);
+                return false;
+            }
+        } else {
+            dtypep = lowerType(nodep->vhdlTypep(), flp);
+        }
+        arg.varp = newTempVar("__Vnine", dtypep, flp);
         stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), valp});
         return true;
     }
@@ -16492,7 +16648,34 @@ private:
                     continue;
                 }
                 if (!chp->valuep()) {
-                    unsup(chp->fileline(), "range choice in a matching case of logic values");
+                    // A range of an element: each value in it is a choice
+                    // of its own (10.9), matched as any other
+                    const AstVhdlRange* const rp = VN_CAST(chp->exprp(), VhdlRange);
+                    const VhdlValue lv
+                        = rp && rp->leftp() ? V3VhdlEval::eval(rp->leftp()) : VhdlValue{};
+                    const VhdlValue rv
+                        = rp && rp->rightp() ? V3VhdlEval::eval(rp->rightp()) : VhdlValue{};
+                    if (selTypep->base()->kind() != VhdlTypeKind::ENUM || !lv.isInt()
+                        || !rv.isInt()) {
+                        unsup(chp->fileline(), "range choice in a matching case of logic values");
+                        continue;
+                    }
+                    const int64_t lo = std::min(lv.toInt(), rv.toInt());
+                    const int64_t hi = std::max(lv.toInt(), rv.toInt());
+                    // A null range chooses nothing
+                    const bool null = rp->dir() == VhdlDir::DOWNTO ? lv.toInt() < rv.toInt()
+                                                                   : lv.toInt() > rv.toInt();
+                    for (int64_t v = lo; !null && v <= hi && v < 9; ++v) {
+                        NineArg ch;
+                        ch.exprp = new AstConst{flp, AstConst::WidthedValue{}, 4,
+                                                static_cast<uint32_t>(v)};
+                        ch.countp = sel.countp->cloneTree(false);
+                        AstNodeExpr* const matchp
+                            = new AstEq{flp, nineMatchElement(sel, ch, sel.countp, false, flp),
+                                        new AstConst{flp, AstConst::WidthedValue{}, 4, 3}};
+                        nineDrop(ch);
+                        condp = condp ? new AstLogOr{flp, condp, matchp} : matchp;
+                    }
                     continue;
                 }
                 NineArg ch;
@@ -16708,6 +16891,9 @@ private:
         if (!typep) return 0;
         const VhdlTypeKind kind = typep->base()->kind();
         if (kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::UNIVERSAL_INTEGER) return 'i';
+        // A STD_ULOGIC beside an UNSIGNED: the VHDL-2008 "+" and "-" that
+        // take one add it as a vector of that one element
+        if (kind == VhdlTypeKind::ENUM && nineValued(typep)) return 'l';
         if (!nineValued(typep) || kind != VhdlTypeKind::ARRAY) return 0;
         const std::string& name = typep->base()->name();
         if (name == "unresolved_unsigned" || name == "unsigned") return 'u';
@@ -16892,7 +17078,9 @@ private:
         const char lk = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
         const char rk = nineNumKind(args[1]->vhdlTypep(), slvUnsigned);
         if (!lk || !rk || (lk == 'i' && rk == 'i')) return nullptr;
-        if (lk != 'i' && rk != 'i' && lk != rk) return nullptr;
+        const bool elemArith = arith && ((lk == 'u' && rk == 'l') || (lk == 'l' && rk == 'u'));
+        if (!elemArith && (lk == 'l' || rk == 'l')) return nullptr;
+        if (!elemArith && lk != 'i' && rk != 'i' && lk != rk) return nullptr;
         const bool sgn = lk == 's' || rk == 's';
         AstNode* stmtsp = nullptr;
         NineArg a;
@@ -17227,6 +17415,14 @@ private:
         const VhdlType* const typep = nodep ? nodep->vhdlTypep() : nullptr;
         if (!nineValued(typep)) return false;
         if (nineSizedCall(nodep)) return true;
+        // An operation emitted natively says its own length (nineResultCount)
+        if (ninePlanned(nodep)) return true;
+        // And a joining of two that are known, its operands' together
+        if (const AstVhdlBinary* const catp = VN_CAST(nodep, VhdlBinary)) {
+            if (catp->op() == VhdlBinaryOp::CONCAT) {
+                return nineOperandKnown(catp->lhsp()) && nineOperandKnown(catp->rhsp());
+            }
+        }
         if (isDynValue(nodep)) return false;
         if (typep->base()->kind() == VhdlTypeKind::ENUM) return true;
         // A literal is as long as what it spells
@@ -17331,7 +17527,11 @@ private:
         const char lk = kindOf(args[0]);
         const char rk = kindOf(args[1]);
         if (!lk || !rk || (lk == 'i' && rk == 'i')) return false;
-        if (lk != 'i' && rk != 'i' && lk != rk) return false;
+        // An element added to an UNSIGNED is one of its own length (zeros
+        // above it), which a SIGNED's sign would not be
+        const bool elemArith = arith && ((lk == 'u' && rk == 'l') || (lk == 'l' && rk == 'u'));
+        if (!elemArith && (lk == 'l' || rk == 'l')) return false;
+        if (!elemArith && lk != 'i' && rk != 'i' && lk != rk) return false;
         const bool sgn = lk == 's' || rk == 's';
         AstNodeVhdlExpr* const vecp = lk == 'i' ? args[1] : args[0];
         AstNodeVhdlExpr* const othp = lk == 'i' ? args[0] : args[1];
@@ -18793,8 +18993,8 @@ private:
     // whose every element is RESOLVED over the nine values -- a record of
     // STD_LOGIC fields -- is resolved element by element, which a record's
     // resolution is (6.3): all its lanes at once
-    void makeNineResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
-        const int count = symp->driverCount();
+    void makeNineResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp, int count = -1) {
+        if (count < 0) count = symp->driverCount();
         FileLine* const nflp = nineFl(flp);
         AstNodeExpr* const countp = nineLaneCount(symp->typep(), nflp);
         AstNodeExpr* const initp = VN_CAST(netp->valuep(), NodeExpr);
@@ -18805,7 +19005,9 @@ private:
             drv.valp = new AstVar{flp, VVarType::VAR,
                                   "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name()
                                       + "__val",
-                                  VFlagChildDType{}, lowerType(symp->typep(), flp)};
+                                  VFlagChildDType{},
+                                  netp->childDTypep() ? netp->childDTypep()->cloneTree(false)
+                                                      : lowerType(symp->typep(), flp)};
             addStmt(drv.valp);
             drv.valp->valuep(initp ? initp->cloneTree(false)
                                    : defaultValueFor(symp->typep(), flp));
@@ -18931,6 +19133,7 @@ private:
             AstNodeExpr* fromp = lowerExpr(prefixExprp);
             if (!fromp) return nullptr;
             fromp = derefIfAccess(fromp, prefixExprp, flp);
+            fromp = nineShaped(fromp, prefixExprp, flp);
             if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
                 AstNodeExpr* leftp = nullptr;
                 AstNodeExpr* rightp = nullptr;
@@ -22823,7 +23026,72 @@ private:
         for (const VhdlSymbol* const symp : driven) {
             if (m_drivers.count(symp)) resolved.push_back(symp);
         }
+        // Of the nine values, a statement driving part of a signal that has
+        // drivers of its own is one of them too (countPartDrivers)
+        if (v3Global.opt.vhdlMetavalues()) {
+            std::set<const VhdlSymbol*> parts;
+            partDrivenBy(nodep, parts);
+            for (const VhdlSymbol* const symp : parts) {
+                if (m_drivers.count(symp) && !driven.count(symp)
+                    && m_partDrivenPorts.count(symp)) {
+                    resolved.push_back(symp);
+                }
+            }
+        }
         noteNineParts(nodep, resolved);
+        // A driver an if or case generate gives exists only where that
+        // alternative is elaborated, which the back end settles: until its
+        // statement assigns it, it contributes nothing (code 15, which the
+        // resolution skips) rather than the signal's default
+        if (const AstVhdlGenerate* const genp = VN_CAST(nodep, VhdlGenerate)) {
+            FileLine* const flp = nodep->fileline();
+            if (v3Global.opt.vhdlMetavalues() && genp->kind() != VhdlLoopKind::FOR) {
+                for (const VhdlSymbol* const symp : resolved) {
+                    const auto drvIt = m_drivers.find(symp);
+                    if (drvIt == m_drivers.end() || !nineLaneable(symp->typep())) continue;
+                    const int idx = m_driverUsed[symp];
+                    if (idx >= static_cast<int>(drvIt->second.size())) continue;
+                    AstVar* const valp = drvIt->second[idx].valp;
+                    AstNodeExpr* const countp = valp ? nineLaneCount(symp->typep(), flp) : nullptr;
+                    if (!countp) continue;
+                    if (AstNode* const oldp = valp->valuep()) {
+                        VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+                    }
+                    valp->valuep(laneMask(0xf, countp, nineFl(flp)));
+                    VL_DO_DANGLING(countp->deleteTree(), countp);
+                }
+            }
+        }
+        // A signal whose one driver is given through a block's port starts
+        // where that driver does: at the port's default
+        for (const VhdlSymbol* const symp : driven) {
+            if (m_drivers.count(symp)) continue;
+            const auto defIt = m_blockPortDefaults.find(symp);
+            const auto varIt = m_vars.find(const_cast<VhdlSymbol*>(symp));
+            if (defIt == m_blockPortDefaults.end() || varIt == m_vars.end()) continue;
+            if (AstNodeExpr* const initp = lowerExpr(defIt->second)) {
+                if (AstNode* const oldp = varIt->second->valuep()) {
+                    VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+                }
+                varIt->second->valuep(initp);
+            }
+        }
+        // A driver given through a block's port starts at the port's default
+        for (const VhdlSymbol* const symp : resolved) {
+            const auto defIt = m_blockPortDefaults.find(symp);
+            const auto drvIt = m_drivers.find(symp);
+            if (defIt == m_blockPortDefaults.end() || drvIt == m_drivers.end()) continue;
+            const int idx = m_driverUsed[symp];
+            if (idx >= static_cast<int>(drvIt->second.size())) continue;
+            AstVar* const valp = drvIt->second[idx].valp;
+            if (!valp) continue;
+            if (AstNodeExpr* const initp = lowerExpr(defIt->second)) {
+                if (AstNode* const oldp = valp->valuep()) {
+                    VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+                }
+                valp->valuep(initp);
+            }
+        }
         VL_RESTORER(m_countedDrivers);
         m_countedDrivers = false;
         lowerConcurrent(nodep);
@@ -22859,6 +23127,7 @@ private:
             if (!blockp->label().empty()) m_blockPrefix += blockp->label() + "__";
             VL_RESTORER(m_regionDepth);
             ++m_regionDepth;
+            VL_RESTORER_COPY(m_blockPortDefaults);
             if (blockp->guardp()) lowerGuard(blockp, flp);
             if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
                 lowerBlockHeader(headerp);
@@ -23899,6 +24168,12 @@ private:
                         && (asymp->kind() == VhdlSymKind::SIGNAL
                             || asymp->kind() == VhdlSymKind::PORT)) {
                         m_blockPortSignals[symp->resolved()] = asymp;
+                        // What a driver the block's statements give the
+                        // signal starts at: the port's default (6.5.6.3)
+                        if (v3Global.opt.vhdlMetavalues() && ifp->defaultp()
+                            && ifp->mode() != VhdlMode::IN) {
+                            m_blockPortDefaults[asymp] = ifp->defaultp();
+                        }
                     }
                     m_vars.emplace(symp, refp->varp());
                     VL_DO_DANGLING(valuep->deleteTree(), valuep);
@@ -24978,6 +25253,48 @@ private:
         // drivers, and counting them here would make every one of them count
         // the ones after it as well
         if (follow) collectDriven(nodep->nextp(), out, true);
+    }
+
+    // How many concurrent statements drive part of a signal and none of it
+    // whole, which is how a port of the nine values may be driven by the
+    // instances inside: "port map (sync_o => sync(plug_num))"
+    std::map<const VhdlSymbol*, int> m_partDriverCount;
+    // Ports of the nine values whose drivers are those statements alone
+    std::set<const VhdlSymbol*> m_partDrivenPorts;
+    // The signals a statement drives a part of
+    void partDrivenBy(AstNode* nodep, std::set<const VhdlSymbol*>& out) {
+        nodep->foreach([&](AstVhdlAssoc* asp) {
+            if (!asp->drives() || !asp->actualp() || VN_IS(asp->actualp(), VhdlName)) return;
+            if (const VhdlSymbol* const symp = rootSymOf(asp->actualp())) {
+                out.insert(symp->resolved());
+            }
+        });
+        nodep->foreach([&](AstVhdlSigAssign* ap) {
+            if (!ap->targetp() || VN_IS(ap->targetp(), VhdlName)) return;
+            if (const VhdlSymbol* const symp = rootSymOf(ap->targetp())) {
+                out.insert(symp->resolved());
+            }
+        });
+    }
+    void countPartDrivers(AstNode* stmtsp) {
+        for (AstNode* p = stmtsp; p; p = p->nextp()) {
+            if (const AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+                countPartDrivers(blockp->stmtsp());
+                continue;
+            }
+            std::set<const VhdlSymbol*> here;
+            partDrivenBy(p, here);
+            // Every iteration of a for generate is a driver of its own (11.8)
+            int repeat = 1;
+            if (const AstVhdlGenerate* const genp = VN_CAST(p, VhdlGenerate)) {
+                const VhdlSymbol* const gsymp = genp->vhdlSymp();
+                const VhdlType* const rangep = gsymp ? gsymp->typep() : nullptr;
+                if (genp->kind() == VhdlLoopKind::FOR && rangep && rangep->bounded()) {
+                    repeat = static_cast<int>(std::max<int64_t>(rangep->length(), 0));
+                }
+            }
+            for (const VhdlSymbol* const symp : here) m_partDriverCount[symp] += repeat;
+        }
     }
 
     void countDrivers(AstNode* stmtsp) {
@@ -34713,6 +35030,79 @@ private:
         return true;
     }
 
+    // A formal whose subtype fixes its length, written by the call, given a
+    // slice whose ends only running settles of a variable that carries its
+    // own bounds -- "Char2QuadBits(c, sv(4*i to 4*i+3), ok, true)" in
+    // std_logic_1164's HREAD, where sv is as long as the caller's value. A
+    // temporary of the formal's subtype stands in for the slice during the
+    // call: filled from it before, and copied into it a place at a time
+    // after (4.2.2.1). False where the actual is not that.
+    bool fixedFormalCarriedSlice(AstVhdlAssoc* asp, VhdlType* formalTypep, AstNode*& prep,
+                                 AstNode*& postp, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(asp->actualp(), VhdlCall);
+        AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rangep || rangep->nextp() || !callp->prefixp() || !isDynObj(callp->prefixp())) {
+            return false;
+        }
+        if (!formalTypep || !formalTypep->isConstrainedArray()
+            || formalTypep->indexTypes().size() != 1) {
+            return false;
+        }
+        const VhdlType* const fidxp = formalTypep->indexTypes()[0];
+        if (!fidxp || !fidxp->bounded() || fidxp->length() < 1 || fidxp->length() > 4096) {
+            return false;
+        }
+        AstNodeExpr* const objp = lowerDriveTarget(callp->prefixp());
+        AstVarRef* const objRefp = VN_CAST(objp, VarRef);
+        AstVar* const cvarp = objRefp ? objRefp->varp() : nullptr;
+        if (objp) VL_DO_DANGLING(objp->deleteTree(), objp);
+        if (!cvarp) return false;
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, asc, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return false;
+        }
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        AstNodeExpr* const fillp = dynAsFixed(asp->actualp(), formalTypep, flp);
+        if (!fillp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            return false;
+        }
+        AstVar* const tp = newTempVar("__Vfixrt", lowerType(formalTypep, flp), flp);
+        AstVar* const lop = newTempVar("__Vfixlo", newIntDType(flp), flp);
+        AstVar* const kp = newTempVar("__Vfixk", newIntDType(flp), flp);
+        kp->usedLoopIdx(true);
+        const auto num = [&](int64_t v) {
+            return new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(v)};
+        };
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(lop, flp), intBound(leftp, flp)});
+        prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(tp, flp), fillp});
+        // Place k of the slice, from its left, is place k of the formal
+        AstNodeExpr* const placep
+            = asc ? static_cast<AstNodeExpr*>(new AstAdd{flp, rd(lop, flp), rd(kp, flp)})
+                  : new AstSub{flp, rd(lop, flp), rd(kp, flp)};
+        AstNodeExpr* const fplacep
+            = fidxp->ascending()
+                  ? static_cast<AstNodeExpr*>(new AstAdd{flp, num(fidxp->left()), rd(kp, flp)})
+                  : new AstSub{flp, num(fidxp->left()), rd(kp, flp)};
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(
+            new AstLoopTest{flp, loopp, new AstLtS{flp, rd(kp, flp), num(fidxp->length())}});
+        loopp->addStmtsp(new AstAssign{flp,
+                                       new AstSelBit{flp, dynPart(wr(cvarp, flp), "q", flp),
+                                                     dynOffset(rd(cvarp, flp), placep, flp)},
+                                       new AstSelBit{flp, rd(tp, flp), fplacep}});
+        loopp->addContsp(new AstAssign{flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), num(1)}});
+        postp = AstNode::addNextNull(postp, new AstAssign{flp, wr(kp, flp), num(0)});
+        postp = AstNode::addNextNull(postp, static_cast<AstNode*>(loopp));
+        m_argCarrier.emplace(asp, tp);
+        return true;
+    }
+
     bool dynOutRoundTrip(const VhdlSymbol* symp, AstVhdlCall* callp, AstNode*& prep,
                          AstNode*& postp, FileLine* flp) {
         if (!symp || !callp) return true;
@@ -34765,7 +35155,12 @@ private:
             // may leave the element open where the actual fixes it, and it
             // is the element that decides whether a value can be carried.
             VhdlType* const herep = boundTypeOf(asp->actualp());
-            if (!paramCarried(symp, at, herep)) continue;
+            if (!paramCarried(symp, at, herep)) {
+                if (paramModeOf(symp, at) != VhdlMode::IN) {
+                    fixedFormalCarriedSlice(asp, symp->paramTypes()[at], prep, postp, flp);
+                }
+                continue;
+            }
             if (paramModeOf(symp, at) == VhdlMode::IN) continue;
             if (isDynObj(asp->actualp())) continue;
             VhdlType* const atypep = asp->actualp()->vhdlTypep();
@@ -40239,6 +40634,9 @@ private:
         // Which signals have more than one driver has to be known before the
         // declarations are lowered, since it decides what they become
         if (archp) countDrivers(archp->stmtsp());
+        m_partDriverCount.clear();
+        m_partDrivenPorts.clear();
+        if (archp && v3Global.opt.vhdlMetavalues()) countPartDrivers(archp->stmtsp());
         // And which signals more than one concurrent statement assigns, in
         // whole or in part (readsResolved)
         m_assignedTwice.clear();

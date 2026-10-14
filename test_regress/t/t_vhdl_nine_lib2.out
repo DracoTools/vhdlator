@@ -1,0 +1,7 @@
+t/t_vhdl_nine_lib2.vhd:101:5:@1000000:(report note): q 99
+t/t_vhdl_nine_lib2.vhd:103:5:@1000000:(report note): v 0043
+t/t_vhdl_nine_lib2.vhd:104:5:@1000000:(report note): s '0'
+t/t_vhdl_nine_lib2.vhd:105:5:@1000000:(report note): bus ZH
+t/t_vhdl_nine_lib2.vhd:106:5:@1000000:(report note): y 1000 x '1'
+t/t_vhdl_nine_lib2.vhd:108:5:@3000000:(report note): s 'Z'
+t/t_vhdl_nine_lib2.vhd:109:5:@3000000:(report note): *-* All Finished *-*
