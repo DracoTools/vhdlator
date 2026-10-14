@@ -4713,6 +4713,16 @@ const VhdlSymbol* VhdlSemVisitor::nonStaticIndex(AstNodeVhdlExpr* nodep) {
             ap->foreach([&](const AstVhdlName* namep) {
                 const VhdlSymbol* const symp
                     = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                // What an object's subtype says of it -- "s(s'low)" -- is as
+                // static as the subtype, not as its value (9.4.3)
+                const AstVhdlAttrName* const attrp = VN_CAST(namep->backp(), VhdlAttrName);
+                if (attrp && attrp->prefixp() == namep) {
+                    const std::string& attr = attrp->name();
+                    if (attr == "low" || attr == "high" || attr == "left" || attr == "right"
+                        || attr == "length" || attr == "ascending") {
+                        return;
+                    }
+                }
                 if (!foundp && symp
                     && (symp->kind() == VhdlSymKind::VARIABLE
                         || symp->kind() == VhdlSymKind::SHARED_VARIABLE
