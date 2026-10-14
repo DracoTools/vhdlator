@@ -35041,9 +35041,7 @@ private:
                                  AstNode*& postp, FileLine* flp) {
         AstVhdlCall* const callp = VN_CAST(asp->actualp(), VhdlCall);
         AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
-        if (!rangep || rangep->nextp() || !callp->prefixp() || !isDynObj(callp->prefixp())) {
-            return false;
-        }
+        if (!rangep || rangep->nextp() || !callp->prefixp()) return false;
         if (!formalTypep || !formalTypep->isConstrainedArray()
             || formalTypep->indexTypes().size() != 1) {
             return false;
@@ -35056,7 +35054,9 @@ private:
         AstVarRef* const objRefp = VN_CAST(objp, VarRef);
         AstVar* const cvarp = objRefp ? objRefp->varp() : nullptr;
         if (objp) VL_DO_DANGLING(objp->deleteTree(), objp);
-        if (!cvarp) return false;
+        // The variable holds its own bounds, so the slice is a value that
+        // carries them, which the argument would otherwise be made a copy of
+        if (!cvarp || !isDynValue(asp->actualp())) return false;
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool asc = true;
@@ -35155,12 +35155,15 @@ private:
             // may leave the element open where the actual fixes it, and it
             // is the element that decides whether a value can be carried.
             VhdlType* const herep = boundTypeOf(asp->actualp());
-            if (!paramCarried(symp, at, herep)) {
-                if (paramModeOf(symp, at) != VhdlMode::IN) {
-                    fixedFormalCarriedSlice(asp, symp->paramTypes()[at], prep, postp, flp);
-                }
+            // A formal its declaration gives a fixed length, written, and
+            // given a slice of a value that carries its bounds
+            if (paramModeOf(symp, at) != VhdlMode::IN && symp->paramTypes()[at]
+                && symp->paramTypes()[at]->isConstrainedArray()
+                && !carriedDynamically(symp->paramTypes()[at])
+                && fixedFormalCarriedSlice(asp, symp->paramTypes()[at], prep, postp, flp)) {
                 continue;
             }
+            if (!paramCarried(symp, at, herep)) continue;
             if (paramModeOf(symp, at) == VhdlMode::IN) continue;
             if (isDynObj(asp->actualp())) continue;
             VhdlType* const atypep = asp->actualp()->vhdlTypep();
