@@ -16975,9 +16975,15 @@ private:
     static AstNodeExpr* laneValues(const NineArg& a, FileLine* flp) {
         return new AstAnd{flp, nineRead(a, flp), laneMask(1, a.countp, flp)};
     }
-    // Whether every lane of an operand is '0', '1', 'L' or 'H'
+    // Every lane '0', '1', 'L' or 'H': bit 1 set and bit 3 clear in each,
+    // asked of the whole value at once without moving any bit
     static AstNodeExpr* laneAllDefined(const NineArg& a, FileLine* flp) {
-        return new AstEq{flp, laneDefined(a, flp), laneMask(1, a.countp, flp)};
+        return new AstLogAnd{
+            flp,
+            new AstEq{flp, new AstAnd{flp, nineRead(a, flp), laneMask(2, a.countp, flp)},
+                      laneMask(2, a.countp, flp)},
+            new AstEq{flp, new AstAnd{flp, nineRead(a, flp), laneMask(8, a.countp, flp)},
+                      laneMask(0, a.countp, flp)}};
     }
     // Value lanes back into '0' and '1'
     static AstNodeExpr* laneFromValues(AstNodeExpr* valuesp, const AstNodeExpr* countp,
