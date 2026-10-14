@@ -159,7 +159,8 @@ enum VerilatedVarFlags : uint32_t {
     VLVF_BITVAR = (1 << 14),  // Four state bit (vs two state logic)
     VLVF_NET = (1 << 15),  // Net object
     VLVF_RECORD = (1 << 16),  // VHDL record, held packed: a structure with its fields as members
-    VLVF_INTEGER = (1 << 17)  // VHDL integer: an integer object, not a vector of bits
+    VLVF_INTEGER = (1 << 17),  // VHDL integer: an integer object, not a vector of bits
+    VLVF_NINE = (1 << 18)  // VHDL STD_ULOGIC: four bits per element, the position of its value
 };
 
 // One VPI-visible variable, consumed by VerilatedScope::varsInsertFromTable();

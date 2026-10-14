@@ -3209,6 +3209,10 @@ PLI_INT32 vpi_get(PLI_INT32 property, vpiHandle object) {
     case vpiSize: {
         const VerilatedVpioVarBase* const vop = VerilatedVpioVarBase::castp(object);
         if (VL_UNLIKELY(!vop)) return vpiUndefined;
+        // A VHDL STD_ULOGIC element is four bits, and one element to VPI
+        if (vop->varp()->isNine() && !vop->isIndexedDimUnpacked() && vop->size() >= 4) {
+            return vop->size() / 4;
+        }
         return vop->size();
     }
     case vpiSigned: {
@@ -3288,6 +3292,7 @@ bool vl_check_format(const VerilatedVpioVarBase* vop, const p_vpi_value valuep, 
         }
         break;
     case vpiDecStrVal:
+        if (varp->isNine() && varp->vltype() == VLVT_WDATA) return true;
         switch (varp->vltype()) {
         case VLVT_UINT8:
         case VLVT_UINT16:
@@ -3509,11 +3514,222 @@ void vl_vpi_put_word(const VerilatedVpioVar* vop, QData word, size_t bitCount, s
     }
 }
 
+// A VHDL STD_ULOGIC object holds each element as the position of its value in
+// four bits: 'U' 0, 'X' 1, '0' 2, '1' 3, 'Z' 4, 'W' 5, 'L' 6, 'H' 7, '-' 8. To
+// VPI an element is one bit: a binary string gives the nine characters, as nvc
+// and GHDL give them to cocotb, and the other formats give '1' and 'H' as 1,
+// '0' and 'L' as 0, 'Z' as z and the rest as x.
+static constexpr const char* VL_NINE_CHARS = "UX01ZWLH-";
+static bool vl_vpi_is_nine(const VerilatedVpioVarBase* vop) {
+    return vop->varp()->isNine() && !vop->isIndexedDimUnpacked() && vop->bitSize() >= 4
+           && vop->bitSize() % 4 == 0;
+}
+static bool vl_nine_one(uint8_t pos) { return pos == 3 || pos == 7; }
+static bool vl_nine_defined(uint8_t pos) { return pos == 2 || pos == 3 || pos == 6 || pos == 7; }
+
+// The value of a STD_ULOGIC object in a format; false where the format reads
+// its storage as it stands
+static bool vl_vpi_get_value_nine(const VerilatedVpioVarBase* vop, p_vpi_value valuep) {
+    static thread_local std::string t_outStr;
+    static thread_local std::vector<t_vpi_vecval> t_outVec;
+    const int n = static_cast<int>(vop->bitSize() / 4);
+    std::vector<uint8_t> pos(n);  // Element 0 is the rightmost
+    for (int i = 0; i < n; ++i) pos[i] = static_cast<uint8_t>(vl_vpi_get_word(vop, 4, 4 * i));
+    switch (valuep->format) {
+    case vpiBinStrVal: {
+        t_outStr.resize(n);
+        for (int i = 0; i < n; ++i)
+            t_outStr[n - 1 - i] = pos[i] <= 8 ? VL_NINE_CHARS[pos[i]] : 'X';
+        valuep->value.str = const_cast<PLI_BYTE8*>(t_outStr.c_str());
+        return true;
+    }
+    case vpiScalarVal: {
+        valuep->value.scalar = vl_nine_one(pos[0])       ? vpi1
+                               : vl_nine_defined(pos[0]) ? vpi0
+                               : pos[0] == 4             ? vpiZ
+                                                         : vpiX;
+        return true;
+    }
+    case vpiIntVal: {
+        uint32_t val = 0;
+        for (int i = 0; i < n && i < 32; ++i) {
+            if (vl_nine_one(pos[i])) val |= 1U << i;
+        }
+        valuep->value.integer = static_cast<PLI_INT32>(val);
+        return true;
+    }
+    case vpiVectorVal: {
+        t_outVec.assign((n + 31) / 32, t_vpi_vecval{0, 0});
+        for (int i = 0; i < n; ++i) {
+            const PLI_UINT32 bit = 1U << (i % 32);
+            t_vpi_vecval& word = t_outVec[i / 32];
+            if (vl_nine_one(pos[i])) {
+                word.aval |= bit;
+            } else if (pos[i] == 4) {
+                word.bval |= bit;
+            } else if (!vl_nine_defined(pos[i])) {
+                word.aval |= bit;
+                word.bval |= bit;
+            }
+        }
+        valuep->value.vector = t_outVec.data();
+        return true;
+    }
+    case vpiOctStrVal:
+    case vpiHexStrVal: {
+        const int per = valuep->format == vpiHexStrVal ? 4 : 3;
+        const int chars = (n + per - 1) / per;
+        t_outStr.resize(chars);
+        for (int c = 0; c < chars; ++c) {
+            int digit = 0;
+            int zs = 0;
+            int unknown = 0;
+            int bits = 0;
+            for (int b = 0; b < per && c * per + b < n; ++b, ++bits) {
+                const uint8_t p = pos[c * per + b];
+                if (vl_nine_one(p)) digit |= 1 << b;
+                if (p == 4) ++zs;
+                if (!vl_nine_defined(p)) ++unknown;
+            }
+            t_outStr[chars - 1 - c] = zs == bits ? 'z' : unknown ? 'x' : "0123456789abcdef"[digit];
+        }
+        valuep->value.str = const_cast<PLI_BYTE8*>(t_outStr.c_str());
+        return true;
+    }
+    case vpiDecStrVal: {
+        uint64_t val = 0;
+        bool unknown = false;
+        for (int i = 0; i < n; ++i) {
+            if (!vl_nine_defined(pos[i])) unknown = true;
+            if (i < 64 && vl_nine_one(pos[i])) val |= 1ULL << i;
+        }
+        if (unknown) {
+            t_outStr = "x";
+        } else {
+            vl_strprintf(t_outStr, "%llu",
+                         static_cast<unsigned long long>(val));  // lintok-format-ll
+        }
+        valuep->value.str = const_cast<PLI_BYTE8*>(t_outStr.c_str());
+        return true;
+    }
+    default: return false;
+    }
+}
+
+// The positions a value in a format gives a STD_ULOGIC object of n elements,
+// element 0 the rightmost; false where the format writes its storage as it
+// stands
+static bool vl_vpi_put_value_nine(const VerilatedVpioVarBase* vop, const p_vpi_value valuep,
+                                  std::vector<uint8_t>& pos) {
+    const int n = static_cast<int>(vop->bitSize() / 4);
+    pos.assign(n, 2);
+    const auto ofChar = [&](char ch) -> uint8_t {
+        switch (ch) {
+        case 'U':
+        case 'u': return 0;
+        case 'X':
+        case 'x': return 1;
+        case '0': return 2;
+        case '1': return 3;
+        case 'Z':
+        case 'z': return 4;
+        case 'W':
+        case 'w': return 5;
+        case 'L':
+        case 'l': return 6;
+        case 'H':
+        case 'h': return 7;
+        case '-': return 8;
+        default:
+            VL_VPI_WARNING_(__FILE__, __LINE__,
+                            "%s: Non STD_ULOGIC character '%c' in '%s' for '%s'", __func__, ch,
+                            valuep->value.str, vop->fullname());
+            return 1;
+        }
+    };
+    switch (valuep->format) {
+    case vpiBinStrVal: {
+        const int len = static_cast<int>(std::strlen(valuep->value.str));
+        for (int i = 0; i < n && i < len; ++i) pos[i] = ofChar(valuep->value.str[len - 1 - i]);
+        return true;
+    }
+    case vpiScalarVal: {
+        uint8_t p = 1;
+        switch (valuep->value.scalar) {
+        case vpi0: p = 2; break;
+        case vpi1: p = 3; break;
+        case vpiZ: p = 4; break;
+        case vpiH: p = 7; break;
+        case vpiL: p = 6; break;
+        case vpiDontCare: p = 8; break;
+        default: break;
+        }
+        pos.assign(n, p);
+        return true;
+    }
+    case vpiIntVal: {
+        const PLI_INT32 val = valuep->value.integer;
+        for (int i = 0; i < n; ++i) {
+            const bool one = i < 32 ? ((static_cast<uint32_t>(val) >> i) & 1) : val < 0;
+            pos[i] = one ? 3 : 2;
+        }
+        return true;
+    }
+    case vpiVectorVal: {
+        if (VL_UNLIKELY(!valuep->value.vector)) return false;
+        for (int i = 0; i < n; ++i) {
+            const t_vpi_vecval& word = valuep->value.vector[i / 32];
+            const bool a = (word.aval >> (i % 32)) & 1;
+            const bool b = (word.bval >> (i % 32)) & 1;
+            pos[i] = b ? (a ? 1 : 4) : (a ? 3 : 2);
+        }
+        return true;
+    }
+    case vpiOctStrVal:
+    case vpiHexStrVal: {
+        const int per = valuep->format == vpiHexStrVal ? 4 : 3;
+        const char* str = valuep->value.str;
+        if (per == 4 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) str += 2;
+        const int len = static_cast<int>(std::strlen(str));
+        for (int c = 0; c < len; ++c) {
+            const char ch = str[len - 1 - c];
+            int digit = 0;
+            uint8_t all = 0;  // An x or z digit makes every bit of it one
+            if (ch == 'x' || ch == 'X') {
+                all = 1;
+            } else if (ch == 'z' || ch == 'Z') {
+                all = 4;
+            } else if (ch >= '0' && ch <= '9') {
+                digit = ch - '0';
+            } else if (per == 4 && ch >= 'a' && ch <= 'f') {
+                digit = ch - 'a' + 10;
+            } else if (per == 4 && ch >= 'A' && ch <= 'F') {
+                digit = ch - 'A' + 10;
+            } else {
+                all = 1;
+            }
+            for (int b = 0; b < per && c * per + b < n; ++b) {
+                pos[c * per + b] = all ? all : (((digit >> b) & 1) ? 3 : 2);
+            }
+        }
+        return true;
+    }
+    case vpiDecStrVal: {
+        unsigned long long val = 0;  // lintok-format-ll
+        if (std::sscanf(valuep->value.str, "%30llu", &val) < 1) return false;  // lintok-format-ll
+        for (int i = 0; i < n; ++i) pos[i] = (i < 64 && ((val >> i) & 1)) ? 3 : 2;
+        return true;
+    }
+    default: return false;
+    }
+}
+
 void vl_vpi_get_value(const VerilatedVpioVarBase* vop, p_vpi_value valuep) {
     const VerilatedVar* const varp = vop->varp();
     void* const varDatap = vop->varDatap();
 
     if (!vl_check_format(vop, valuep, true)) return;
+    if (vl_vpi_is_nine(vop) && vl_vpi_get_value_nine(vop, valuep)) return;
     // string data type is dynamic and may vary in size during simulation
     static thread_local std::string t_outDynamicStr;
 
@@ -3891,6 +4107,11 @@ vpiHandle vpi_put_value(vpiHandle object, p_vpi_value valuep, p_vpi_time /*time_
             return object;
         }
 
+        std::vector<uint8_t> ninePos;
+        if (vl_vpi_is_nine(valueVop) && vl_vpi_put_value_nine(valueVop, valuep, ninePos)) {
+            for (size_t i = 0; i < ninePos.size(); ++i) put_word(valueVop, ninePos[i], 4, 4 * i);
+            return object;
+        }
         if (valuep->format == vpiVectorVal) {
             if (VL_UNLIKELY(!valuep->value.vector)) return nullptr;
             if (valueVop->varp()->vltype() == VLVT_WDATA) {

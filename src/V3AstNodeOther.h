@@ -2204,6 +2204,7 @@ class AstVar final : public AstNode {
     bool m_isStdRandomizeArg : 1;  // Argument variable created for std::randomize (__Varg*)
     bool m_processQueue : 1;  // Process queue variable
     bool m_mtaskCacheLineAlign : 1;  // Start MTask affinity group on a cache line
+    bool m_vhdlNine : 1;  // VHDL STD_ULOGIC values: four bits per element, its position
     void init() {
         m_ansi = false;
         m_declTyped = false;
@@ -2268,6 +2269,7 @@ class AstVar final : public AstNode {
         m_isStdRandomizeArg = false;
         m_processQueue = false;
         m_mtaskCacheLineAlign = false;
+        m_vhdlNine = false;
     }
 
 public:
@@ -2515,6 +2517,8 @@ public:
     bool isUsedLoopIdx() const { return m_usedLoopIdx; }
     bool mtaskCacheLineAlign() const { return m_mtaskCacheLineAlign; }
     void mtaskCacheLineAlign(bool flag) { m_mtaskCacheLineAlign = flag; }
+    bool vhdlNine() const { return m_vhdlNine; }
+    void vhdlNine(bool flag) { m_vhdlNine = flag; }
     bool isSc() const VL_MT_SAFE { return m_sc; }
     bool isScQuad() const;
     bool isScBv() const VL_MT_STABLE;

@@ -15240,11 +15240,32 @@ void VhdlSemVisitor::markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitSco
         const int here = position++;
         if (!asp->actualp()) continue;
         const VhdlSymbol* portp = nullptr;
+        bool elementOnly = false;  // The formal names a part of the port
         if (!asp->formalp()) {
             portp = portAt(unitScopep, here);
         } else if (const AstVhdlName* const namep = VN_CAST(asp->formalp(), VhdlName)) {
             const VhdlSymbol* const symp = namep->vhdlSymp();
             if (symp && symp->kind() == VhdlSymKind::PORT) portp = symp;
+        } else if (v3Global.opt.vhdlMetavalues()) {
+            // An element or a slice of the port -- "m.rdata => rdata" -- is
+            // a source of its actual as the whole port would be. A
+            // conversion's prefix names a function, not the port.
+            const AstNodeVhdlExpr* rootp = asp->formalp();
+            while (rootp) {
+                if (const AstVhdlSelected* const selp = VN_CAST(rootp, VhdlSelected)) {
+                    rootp = selp->prefixp();
+                } else if (const AstVhdlCall* const callp = VN_CAST(rootp, VhdlCall)) {
+                    rootp = callp->prefixp();
+                } else {
+                    break;
+                }
+            }
+            const AstVhdlName* const rnamep = VN_CAST(rootp, VhdlName);
+            const VhdlSymbol* const symp = rnamep ? rnamep->vhdlSymp() : nullptr;
+            if (symp && symp->kind() == VhdlSymKind::PORT) {
+                portp = symp;
+                elementOnly = true;
+            }
         }
         // A conversion written on the formal is a source of the actual in
         // its own right: the port's driving value goes out through it, and
@@ -15255,7 +15276,27 @@ void VhdlSemVisitor::markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitSco
             continue;
         }
         const AstVhdlIfaceDecl* const declp = VN_CAST(portp->declp(), VhdlIfaceDecl);
-        if (!declp || declp->mode() != VhdlMode::OUT) continue;
+        if (!declp) continue;
+        // An INOUT of the nine values resolved by RESOLVED is a source of its
+        // actual as much as an OUT is (14.7.3.2), where they are kept apart
+        // (--vhdl-metavalues) rather than left to a tristate net
+        bool nineInout = false;
+        if (declp->mode() == VhdlMode::INOUT && v3Global.opt.vhdlMetavalues()) {
+            const VhdlType* const ptp = portp->typep();
+            if (ptp && ptp->base()->kind() == VhdlTypeKind::RECORD) {
+                nineInout = driversCombined(ptp);
+            } else if (logicShaped(ptp)) {
+                for (const VhdlType* levelp = ptp; levelp && !nineInout;) {
+                    if (levelp->resolutionp()) nineInout = true;
+                    if (levelp->base()->kind() != VhdlTypeKind::ARRAY) break;
+                    levelp = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
+                }
+            }
+        }
+        if (declp->mode() != VhdlMode::OUT && !nineInout) continue;
+        // A part of an OUT is still written through the instance's own
+        // pin, as it is without --vhdl-metavalues
+        if (elementOnly && !nineInout) continue;
         asp->drives(true);
     }
 }

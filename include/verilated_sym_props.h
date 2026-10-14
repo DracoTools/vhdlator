@@ -291,6 +291,7 @@ public:
     uint32_t bitOffset() const { return m_bitOffset; }
     bool isRecord() const { return (vlflagsRaw() & VLVF_RECORD) != 0; }
     bool isInteger() const { return (vlflagsRaw() & VLVF_INTEGER) != 0; }
+    bool isNine() const { return (vlflagsRaw() & VLVF_NINE) != 0; }
     const VerilatedForceControlSignals* forceControlSignals() const {
         return m_forceControlSignals.get();
     }

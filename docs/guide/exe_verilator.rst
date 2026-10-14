@@ -2171,6 +2171,14 @@ Summary:
    ``rising_edge`` is true only of a change from ``'0'`` or ``'L'`` to
    ``'1'`` or ``'H'``, as other VHDL simulators run them.
 
+   Where only two values can pass, an element is ``1`` for ``'1'`` and
+   ``'H'`` and ``0`` otherwise: ports of the top-level entity, ports and
+   generics of a Verilog module instantiated from VHDL, and waveforms. A
+   Verilog output is ``'0'`` or ``'1'`` in VHDL. Over VPI an element is one
+   bit; ``vpiBinStrVal`` reads and writes the nine characters, as other VHDL
+   simulators give them to cocotb, and the other formats read ``'Z'`` as z
+   and ``'U'``, ``'X'``, ``'W'`` and ``'-'`` as x.
+
    With :vlopt:`--no-vhdl-metavalues` each element is one bit: ``'H'``
    reads as ``'1'``, ``'L'`` as ``'0'``, and ``'U'``, ``'X'``, ``'W'`` and
    ``'-'`` as ``'0'``, which is faster but loses what those values say.

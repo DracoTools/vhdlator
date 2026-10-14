@@ -793,6 +793,7 @@ string AstVar::vlEnumDir() const {
         if (basicp->keyword() == VBasicDTypeKwd::BIT) out += "|VLVF_BITVAR";
     }
     if (isNet()) out += "|VLVF_NET";
+    if (vhdlNine()) out += "|VLVF_NINE";
     return out;
 }
 

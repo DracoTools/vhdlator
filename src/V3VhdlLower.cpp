@@ -65,6 +65,11 @@ char enumLitChar(const VhdlSymbol* litp) {
 // where each of its values stays distinct. Only the two shapes the standard
 // itself declares are logic, and their positions are fixed, so a type written
 // ('1','0') is not BIT however much it looks like it.
+// While set, STD_ULOGIC lowers to one bit even under --vhdl-metavalues: the
+// type of a port a foreign testbench reads is worked out with it set (see
+// twoStateBoundaryPorts)
+static bool s_twoStateLogic = false;
+
 // Whether an enumeration has the shape of STD_ULOGIC, whatever it lowers to
 bool enumIsStdUlogic(const VhdlType* typep) {
     if (!typep || typep->base()->kind() != VhdlTypeKind::ENUM) return false;
@@ -85,13 +90,13 @@ bool enumIsLogic(const VhdlType* typep) {
     }
     // STD_ULOGIC, unless its nine values are kept apart: then it is an
     // enumeration like any other, held as its position
-    return !v3Global.opt.vhdlMetavalues() && enumIsStdUlogic(typep);
+    return (!v3Global.opt.vhdlMetavalues() || s_twoStateLogic) && enumIsStdUlogic(typep);
 }
 
 // Whether a type is STD_ULOGIC held as the position of each of its nine
 // values (--vhdl-metavalues), or an array of it
 bool nineValued(const VhdlType* typep) {
-    if (!typep || !v3Global.opt.vhdlMetavalues()) return false;
+    if (!typep || !v3Global.opt.vhdlMetavalues() || s_twoStateLogic) return false;
     const VhdlType* basep = typep->base();
     if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
         basep = basep->elementp()->base();
@@ -454,6 +459,53 @@ public:
     void addTraceRequest() VL_MT_DISABLED;
     void reportReachedRefusals() VL_MT_DISABLED;
     void addLogicPosPins() VL_MT_DISABLED;
+    void twoStateBoundaryPorts() VL_MT_DISABLED;
+    // Bit k of a vector of the nine values as Verilog reads it -- 1 for '1'
+    // and 'H', 0 for anything else -- and back, '0' or '1'; scalar where the
+    // value is one element
+    static AstNodeExpr* nineToBits(AstNodeExpr* lanesp, int count, bool scalar, FileLine* flp) {
+        AstNodeExpr* valuep = nullptr;
+        for (int k = count - 1; k >= 0; --k) {
+            AstNodeExpr* const lanep = scalar ? lanesp->cloneTree(false)
+                                              : static_cast<AstNodeExpr*>(new AstSel{
+                                                    flp, lanesp->cloneTree(false), 4 * k, 4});
+            AstNodeExpr* const onep = new AstEq{
+                flp, new AstOr{flp, lanep, new AstConst{flp, AstConst::WidthedValue{}, 4, 4}},
+                new AstConst{flp, AstConst::WidthedValue{}, 4, 7}};
+            valuep = valuep ? new AstConcat{flp, valuep, onep} : onep;
+        }
+        VL_DO_DANGLING(lanesp->deleteTree(), lanesp);
+        return valuep;
+    }
+    static AstNodeExpr* bitsToNine(AstNodeExpr* bitsp, int count, bool scalar, FileLine* flp) {
+        AstNodeExpr* valuep = nullptr;
+        for (int k = count - 1; k >= 0; --k) {
+            AstNodeExpr* const bitp
+                = scalar
+                      ? bitsp->cloneTree(false)
+                      : static_cast<AstNodeExpr*>(new AstSel{flp, bitsp->cloneTree(false), k, 1});
+            AstNodeExpr* const onep
+                = new AstConcat{flp, new AstConst{flp, AstConst::WidthedValue{}, 3, 1}, bitp};
+            valuep = valuep ? new AstConcat{flp, valuep, onep} : onep;
+        }
+        VL_DO_DANGLING(bitsp->deleteTree(), bitsp);
+        return valuep;
+    }
+    // The pins of an instance of a Verilog module, whose ports hold a bit
+    // where the actuals hold one of the nine values: an input is handed what
+    // Verilog reads of the actual, and an output fills a signal of bits of
+    // its own that the actual follows. A generic of the nine values is
+    // handed its bits likewise.
+    void verilogPinsOfNine(AstVhdlInstance* nodep, const std::string& modName, AstNode* pinsp,
+                           AstNode* paramsp, FileLine* flp);
+    // The ports of the nine values of each module, for twoStateBoundaryPorts
+    struct NineBoundaryPort final {
+        AstNodeModule* modp;
+        AstVar* varp;
+        VhdlType* typep;
+        FileLine* flp;
+    };
+    std::vector<NineBoundaryPort> m_nineBoundary;
     void addOpenPortPins() VL_MT_DISABLED;
     void addPathPins() VL_MT_DISABLED;
     void settleUpwardNames() VL_MT_DISABLED;
@@ -8228,7 +8280,11 @@ private:
         case VhdlMode::OUT: varp->direction(VDirection::OUTPUT); break;
         case VhdlMode::BUFFER: varp->direction(VDirection::OUTPUT); break;
         case VhdlMode::INOUT:
-            varp->direction(triPort ? VDirection::INOUT : VDirection::OUTPUT);
+            // Of the nine values, what the port reads comes in, and what the
+            // instance drives goes out through a second port (below)
+            varp->direction(triPort                      ? VDirection::INOUT
+                            : nineInoutPort(nodep, symp) ? VDirection::INPUT
+                                                         : VDirection::OUTPUT);
             break;
         case VhdlMode::LINKAGE:
             // A linkage port is there to be connected and nothing more: the
@@ -8271,6 +8327,30 @@ private:
         }
         addStmt(new AstPort{flp, ++pinNum, varp->name()});
         addStmt(varp);
+        // A port of the nine values a foreign testbench may read or write
+        if (v3Global.opt.vhdlMetavalues() && m_modp && nineValued(symp->typep())
+            && nodep->mode() != VhdlMode::INOUT && nodep->mode() != VhdlMode::LINKAGE
+            && (symp->typep()->base()->kind() == VhdlTypeKind::ENUM
+                || vectorWidth(symp->typep()) > 0)) {
+            m_nineBoundary.push_back(NineBoundaryPort{m_modp, varp, symp->typep(), flp});
+        }
+        // An INOUT of the nine values resolved by RESOLVED is two values:
+        // what the instance drives -- the resolution of its own drivers, or
+        // the port's default where it has none (14.7.3.2) -- which goes out
+        // as one source of the actual, and what the actual resolves to,
+        // which is what the port reads inside (14.7.3.3)
+        if (nineInoutPort(nodep, symp)) {
+            AstVar* const drvp = new AstVar{flp, VVarType::VAR, varp->name() + "__Vdrv",
+                                            VFlagChildDType{}, lowerType(symp->typep(), flp)};
+            drvp->direction(VDirection::OUTPUT);
+            drvp->declDirection(VDirection::OUTPUT);
+            drvp->ansi(true);
+            drvp->valuep(nodep->defaultp() ? lowerExpr(nodep->defaultp())
+                                           : defaultValueFor(symp->typep(), flp));
+            addStmt(new AstPort{flp, ++pinNum, drvp->name()});
+            addStmt(drvp);
+            if (symp->driverCount() >= 1) makeNineResolved(symp, drvp, flp);
+        }
         // The driving value of an output whose subtype names a resolution
         // function of the design's own is what the function makes of the
         // drivers the architecture gives it (14.7.3.2), and that is what the
@@ -9161,7 +9241,7 @@ private:
                         makeResolved(symp, varp, flp);
                     }
                 } else if (!symp->resolverp() && symp->driverCount() > 1
-                           && nineLanes(symp->typep()) > 0) {
+                           && nineLaneable(symp->typep())) {
                     // A record of elements each RESOLVED over the nine values
                     makeNineResolved(symp, varp, flp);
                 } else if (symp->resolverp() && symp->driverCount() <= 1 && !guardedSignal(symp)
@@ -12985,6 +13065,14 @@ private:
         if (isStringType(typep)) return false;
         const std::vector<VhdlType*>& indexes = typep->indexTypes();
         if (indexes.size() != 1 || !indexes[0]) return false;
+        // Nor does a number know how wide each element is: an index of one
+        // reads a single bit of it, where an element of the nine values is
+        // four
+        const VhdlType* const elemp = typep->base()->elementp();
+        if (elemp && elemp->base()->kind() == VhdlTypeKind::ENUM && !enumIsLogic(elemp->base())
+            && bitsFor(elemp->base()->literals().size()) > 1) {
+            return true;
+        }
         return indexes[0]->ascending() && indexes[0]->length() > 1;
     }
 
@@ -16877,13 +16965,15 @@ private:
                     AstNodeExpr* const vp = nineRead(x, flp);
                     AstNodeExpr* const extrap
                         = new AstSub{flp, maxp->cloneTree(false), x.countp->cloneTree(false)};
+                    // The top lane, as bits: a part select of a packed
+                    // array would count in its elements
                     AstNodeExpr* const lanep
-                        = sgn ? static_cast<AstNodeExpr*>(new AstSelPlus{
+                        = sgn ? static_cast<AstNodeExpr*>(new AstSel{
                                     flp, vp->cloneTree(false),
                                     new AstMul{
                                         flp, i32(4, flp),
                                         new AstSub{flp, x.countp->cloneTree(false), i32(1, flp)}},
-                                    i32(4, flp)})
+                                    4})
                               : new AstConst{flp, AstConst::WidthedValue{}, 4, 2};
                     FileLine* const rflp = new FileLine{flp};
                     rflp->warnOff(V3ErrorCode::ZEROREPL, true);
@@ -17185,7 +17275,10 @@ private:
             if (!sizev.isInt()) {
                 // A size the elaboration settles: the integer is spread into
                 // 64 lanes, and as many of them taken as the size says
-                return elabConstant(args[1]) && !V3VhdlEval::eval(args[0]).isInt();
+                // -- not one a subprogram works out from what its call
+                // supplies, which only running knows (4.3.1.1)
+                return elabConstant(args[1]) && !boundsOnlyRunningDecides(args[1])
+                       && !V3VhdlEval::eval(args[0]).isInt();
             }
             if (sizev.toInt() < 1 || sizev.toInt() > 64) return false;
             return nineIntFits(args[0], sizev.toInt(), op == "to_signed", false);
@@ -18407,6 +18500,18 @@ private:
                     m_nineParts[key].push_back(asgp->targetp());
                 }
             });
+            // An instance's port that drives part of the signal drives that
+            // part (6.5.6.3)
+            nodep->foreach([&](AstVhdlAssoc* asp) {
+                if (!asp->drives() || !asp->actualp()) return;
+                const VhdlSymbol* const asymp = rootSymOf(asp->actualp());
+                if (!asymp || asymp->resolved() != symp) return;
+                if (VN_IS(asp->actualp(), VhdlName)) {
+                    m_nineWhole.insert(key);
+                } else {
+                    m_nineParts[key].push_back(asp->actualp());
+                }
+            });
             // A procedure handed the signal drives it as a whole
             nodep->foreach([&](AstVhdlProcCall*) { m_nineWhole.insert(key); });
         }
@@ -18416,6 +18521,17 @@ private:
     // element at once. A driver that drives only some elements holds 15 --
     // no value of the nine -- in the others, which the resolution passes
     // over; an element no driver drives keeps the value it was declared with.
+    // The objects of the module that hold the nine values, as positions: VPI
+    // reads and writes them as the nine characters, as nvc and GHDL do
+    void markNineVars() {
+        if (!v3Global.opt.vhdlMetavalues()) return;
+        for (const auto& pair : m_vars) {
+            const VhdlSymbol* const symp = pair.first;
+            AstVar* const varp = pair.second;
+            if (!symp || !varp || !symp->isObject()) continue;
+            if (nineValued(symp->typep())) varp->vhdlNine(true);
+        }
+    }
     void finishNineResolves() {
         for (const NinePending& np : m_ninePending) {
             VhdlSymbol* const symp = np.symp;
@@ -18424,8 +18540,8 @@ private:
             const auto drvIt = m_drivers.find(symp);
             if (drvIt == m_drivers.end() || drvIt->second.empty()) continue;
             const std::vector<VhdlDriver>& drivers = drvIt->second;
-            const int64_t lanes = nineLanes(symp->typep());
-            AstNodeExpr* const countp = i32(lanes, nflp);
+            AstNodeExpr* const countp = nineLaneCount(symp->typep(), nflp);
+            if (!countp) continue;
             const auto lv = [&](AstVar* varp) {
                 NineArg a;
                 a.exprp = new AstVarRef{nflp, varp, VAccess::READ};
@@ -18559,6 +18675,62 @@ private:
     // How many lanes a value of the nine values holds, where that is a number
     // and they lie one after another: an element, a vector, or a record that
     // packs whose every element is one of those; -1 for anything else
+    // Whether a value of the nine values lies as lanes one after another: an
+    // element, a vector, or a record or array that packs such things, of
+    // lengths that are numbers or that a generic gives
+    bool nineLaneable(const VhdlType* typep, int depth = 0) const {
+        if (!typep || depth > 8 || !v3Global.opt.vhdlMetavalues()) return false;
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            if (!recordPacks(typep) || typep->elements().empty()) return false;
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                if (!nineLaneable(elemp->typep(), depth + 1)) return false;
+            }
+            return true;
+        }
+        if (basep->kind() == VhdlTypeKind::ARRAY && !nineValued(typep)) {
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : basep->elementp();
+            return elemp && elementPacks(elemp) && typep->dimensions() == 1
+                   && typep->lengthEmittable() && !lengthOnlyRunningDecides(typep)
+                   && nineLaneable(elemp, depth + 1);
+        }
+        if (!nineValued(typep)) return false;
+        if (basep->kind() == VhdlTypeKind::ENUM) return true;
+        return typep->dimensions() == 1 && typep->lengthEmittable()
+               && !lengthOnlyRunningDecides(typep);
+    }
+    // How many lanes such a value holds, as an expression
+    AstNodeExpr* nineLaneCount(const VhdlType* typep, FileLine* flp, int depth = 0) {
+        if (!nineLaneable(typep, depth)) return nullptr;
+        const int64_t lanes = nineLanes(typep, depth);
+        if (lanes > 0) return i32(lanes, flp);
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            AstNodeExpr* sump = nullptr;
+            for (const VhdlSymbol* const elemp : typep->elements()) {
+                AstNodeExpr* const onep = nineLaneCount(elemp->typep(), flp, depth + 1);
+                if (!onep) {
+                    if (sump) VL_DO_DANGLING(sump->deleteTree(), sump);
+                    return nullptr;
+                }
+                sump = sump ? new AstAdd{flp, sump, onep} : onep;
+            }
+            return sump;
+        }
+        if (basep->kind() == VhdlTypeKind::ARRAY && !nineValued(typep)) {
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : basep->elementp();
+            AstNodeExpr* const lenp = nineCount(typep, flp);
+            AstNodeExpr* const eachp = lenp ? nineLaneCount(elemp, flp, depth + 1) : nullptr;
+            if (!eachp) {
+                if (lenp) VL_DO_DANGLING(lenp->deleteTree(), lenp);
+                return nullptr;
+            }
+            return new AstMul{flp, lenp, eachp};
+        }
+        return nineCount(typep, flp);
+    }
     int64_t nineLanes(const VhdlType* typep, int depth = 0) const {
         if (!typep || depth > 8 || !v3Global.opt.vhdlMetavalues()) return -1;
         const VhdlType* const basep = typep->base();
@@ -18571,6 +18743,15 @@ private:
                 total += n;
             }
             return total > 0 ? total : -1;
+        }
+        // An array of such vectors packs them one after another
+        if (basep->kind() == VhdlTypeKind::ARRAY && !nineValued(typep)) {
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : basep->elementp();
+            const int length = vectorWidth(typep);
+            if (!elemp || length < 1 || !elementPacks(elemp)) return -1;
+            const int64_t each = nineLanes(elemp, depth + 1);
+            return each > 0 ? length * each : -1;
         }
         if (!nineValued(typep)) return -1;
         if (basep->kind() == VhdlTypeKind::ENUM) return 1;
@@ -18585,7 +18766,7 @@ private:
     void makeNineResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
         const int count = symp->driverCount();
         FileLine* const nflp = nineFl(flp);
-        AstNodeExpr* const countp = i32(nineLanes(symp->typep()), nflp);
+        AstNodeExpr* const countp = nineLaneCount(symp->typep(), nflp);
         AstNodeExpr* const initp = VN_CAST(netp->valuep(), NodeExpr);
         netp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
         std::vector<VhdlDriver> drivers;
@@ -24807,6 +24988,51 @@ private:
     // Whether a signal's subtype is a composite resolved by a function of the
     // design's own as a whole: a process that drives any part of it is a
     // driver of all of it, holding the rest as declared (14.7.2, 14.7.3.2)
+    // Whether a port is an INOUT of the nine values that RESOLVED resolves:
+    // an element or vector of STD_LOGIC, or a record of such elements
+    // The port declared at a place of the entity or component an instance
+    // names, for an association written by position
+    // (an entity instantiation names its entity by the module it builds)
+    const AstVhdlIfaceDecl* unitPortAt(const AstVhdlInstance* nodep, const std::string& modName,
+                                       size_t position) const {
+        const VhdlSymbol* const usymp = nodep->unitp() && nodep->unitp()->vhdlSymp()
+                                            ? nodep->unitp()->vhdlSymp()->resolved()
+                                            : nullptr;
+        const AstNode* portsp = nullptr;
+        if (const AstVhdlComponentDecl* const compp
+            = usymp ? VN_CAST(usymp->declp(), VhdlComponentDecl) : nullptr) {
+            portsp = compp->portsp();
+        } else {
+            const std::string lib
+                = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+            const auto it = m_entities.find(lib + "." + modName);
+            if (it == m_entities.end()) return nullptr;
+            if (const AstVhdlEntity* const entp = VN_CAST(it->second, VhdlEntity)) {
+                portsp = entp->portsp();
+            }
+        }
+        for (const AstNode* pp = portsp; pp; pp = pp->nextp()) {
+            if (position-- == 0) return VN_CAST(pp, VhdlIfaceDecl);
+        }
+        return nullptr;
+    }
+    bool nineInoutPort(const AstVhdlIfaceDecl* declp, const VhdlSymbol* symp) const {
+        if (!v3Global.opt.vhdlMetavalues() || !declp || !symp) return false;
+        if (declp->mode() != VhdlMode::INOUT) return false;
+        const VhdlType* const typep = symp->typep();
+        if (!typep) return false;
+        if (nineRecordResolved(symp)) return true;
+        // An element, a vector, or an array of vectors, resolved at some
+        // level by RESOLVED
+        if (!nineLaneable(typep)) return false;
+        for (const VhdlType* levelp = typep; levelp;) {
+            if (levelp->resolutionp()) return true;
+            if (levelp->base()->kind() != VhdlTypeKind::ARRAY) break;
+            levelp = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
+        }
+        return false;
+    }
+
     // A record whose every element is RESOLVED over the nine values
     // (--vhdl-metavalues): a process that assigns any of its elements is one
     // of its drivers, driving only what it assigns (see finishNineResolves)
@@ -25233,10 +25459,10 @@ private:
             // Over the nine values each driver's value is all there is to
             // it: RESOLVED of them all, every element at once
             if (v3Global.opt.vhdlMetavalues() && nineValued(symp->typep())
-                && nineLanes(symp->typep()) > 0) {
+                && nineLaneable(symp->typep())) {
                 VL_DO_DANGLING(loopp->deleteTree(), loopp);
                 FileLine* const nflp = nineFl(flp);
-                AstNodeExpr* const countp = i32(nineLanes(symp->typep()), nflp);
+                AstNodeExpr* const countp = nineLaneCount(symp->typep(), nflp);
                 funcp->addStmtsp(new AstAssign{nflp, wr(retp, nflp),
                                                new AstSelBit{nflp, rd(reg.valsp, nflp), num(0)}});
                 funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), num(1)});
@@ -25619,8 +25845,8 @@ private:
         // time: no array of drivers, and no call per element. Built once the
         // module's statements are lowered, when which elements each driver
         // drives is known (finishNineResolves).
-        if (ieeeResolved(resolvep) && !nullFtaskp && v3Global.opt.vhdlMetavalues()
-            && nineValued(symp->typep()) && bodyp && nineLanes(symp->typep()) > 0) {
+        if (ieeeResolved(resolvep) && !nullFtaskp && v3Global.opt.vhdlMetavalues() && bodyp
+            && nineLaneable(symp->typep())) {
             VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
             m_drivers.emplace(symp, drivers);
             m_ninePending.push_back(NinePending{symp, netp, flp});
@@ -28691,6 +28917,9 @@ private:
         // of the port's own type stands for the port, each part of it is
         // wired to its actual, and the port itself is associated once.
         std::map<const VhdlSymbol*, AstVar*> partial;
+        // An INOUT of the nine values the instance makes two ports of: what
+        // it drives, part by part, into a driver of each actual
+        std::map<const VhdlSymbol*, AstVar*> partialDrv;
         size_t portPosition = 0;  // Which port a positional association names
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
@@ -28730,12 +28959,22 @@ private:
             // a connection.
             const AstVhdlIfaceDecl* const pdeclp = VN_CAST(symp->declp(), VhdlIfaceDecl);
             const VhdlMode pmode = pdeclp ? pdeclp->mode() : VhdlMode::IN;
-            const VAccess pinAccess = pmode == VhdlMode::IN      ? VAccess::READ
-                                      : pmode == VhdlMode::INOUT ? VAccess::READWRITE
-                                                                 : VAccess::WRITE;
+            const bool nineInout = nineInoutPort(pdeclp, symp);
+            const VAccess pinAccess = pmode == VhdlMode::IN || nineInout ? VAccess::READ
+                                      : pmode == VhdlMode::INOUT         ? VAccess::READWRITE
+                                                                         : VAccess::WRITE;
             pinsp = AstNode::addNextNull(
                 pinsp, new AstPin{flp, ++pinNum, symp->name(),
                                   new AstVarRef{flp, tempp, pinAccess}});
+            if (nineInout) {
+                AstVar* const drvTempp
+                    = newTempVar("__Vpart__" + label + "__" + symp->name() + "__Vdrv",
+                                 tempp->childDTypep()->cloneTree(false), flp);
+                partialDrv.emplace(symp, drvTempp);
+                pinsp = AstNode::addNextNull(
+                    pinsp, new AstPin{flp, ++pinNum, symp->name() + "__Vdrv",
+                                      new AstVarRef{flp, drvTempp, VAccess::WRITE}});
+            }
         }
         for (AstNode* p = nodep->portMapp(); p; p = p->nextp()) {
             AstVhdlAssoc* const asp = VN_AS(p, VhdlAssoc);
@@ -28811,7 +29050,39 @@ private:
                             if (!selfp) m_bindExprs[pair.first] = pair.second;
                         }
                     }
-                    pinp = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
+                    // An INOUT of the nine values reads the actual through
+                    // its own pin, and drives one of the actual's drivers
+                    // through a second
+                    const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+                    const VhdlSymbol* fsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+                    std::string fname = fnamep ? fnamep->name() : "";
+                    if (!asp->formalp()) {
+                        // Written by position: the port at that place
+                        size_t position = 0;
+                        for (AstNode* qp = nodep->portMapp(); qp && qp != asp; qp = qp->nextp()) {
+                            ++position;
+                        }
+                        const AstVhdlIfaceDecl* const posDeclp
+                            = unitPortAt(nodep, modName, position);
+                        fsymp = posDeclp ? posDeclp->vhdlSymp() : nullptr;
+                        if (fsymp) fname = fsymp->name();
+                    }
+                    const AstVhdlIfaceDecl* const fdeclp
+                        = fsymp ? VN_CAST(fsymp->declp(), VhdlIfaceDecl) : nullptr;
+                    if (fdeclp && nineInoutPort(fdeclp, fsymp) && asp->actualp() && !asp->isOpen()
+                        && !VN_IS(asp->actualp(), VhdlOpen)) {
+                        pinp = lowerAssoc(asp, ++pinNum);
+                        AstVar* savedp = nullptr;
+                        VhdlSymbol* const keyp = bindPortDriver(asp, flp, savedp);
+                        AstNodeExpr* const drvActp = lowerExpr(asp->actualp());
+                        unbindPortDriver(keyp, savedp);
+                        if (drvActp) {
+                            pinsp = AstNode::addNext(
+                                pinsp, new AstPin{flp, ++pinNum, fname + "__Vdrv", drvActp});
+                        }
+                    } else {
+                        pinp = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
+                    }
                 }
                 // An association written by position names the port at that
                 // place of what is instantiated -- a component's, where it is
@@ -28859,11 +29130,41 @@ private:
                 if (actp) VL_DO_DANGLING(actp->deleteTree(), actp);
                 continue;
             }
+            const auto drvIt = partialDrv.find(symp);
+            if (drvIt != partialDrv.end()) {
+                // The part read is the actual's effective value; the part
+                // driven is one driver of the actual
+                FileLine* const cflp = new FileLine{flp};
+                cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                addStmt(new AstAlways{new AstAssignW{cflp, partp, actp}});
+                AstNodeExpr* drvPartp = nullptr;
+                {
+                    VL_RESTORER_COPY(m_vars);
+                    m_vars[symp] = drvIt->second;
+                    drvPartp = lowerExpr(asp->formalp());
+                }
+                AstVar* savedp = nullptr;
+                VhdlSymbol* const keyp = bindPortDriver(asp, flp, savedp);
+                AstNodeExpr* const drvActp = lowerExpr(asp->actualp());
+                unbindPortDriver(keyp, savedp);
+                if (drvPartp && drvActp) {
+                    addStmt(new AstAlways{new AstAssignW{cflp, drvActp, drvPartp}});
+                } else {
+                    if (drvPartp) VL_DO_DANGLING(drvPartp->deleteTree(), drvPartp);
+                    if (drvActp) VL_DO_DANGLING(drvActp->deleteTree(), drvActp);
+                }
+                continue;
+            }
             const AstVhdlIfaceDecl* const declp
                 = VN_CAST(symp->declp(), VhdlIfaceDecl);
-            const bool outward = declp
-                                 && (declp->mode() == VhdlMode::OUT
-                                     || declp->mode() == VhdlMode::BUFFER);
+            // An INOUT the instance emits as an output -- of the nine values,
+            // where no resolution of its own makes it two ports -- carries
+            // what the instance drives outward as well
+            const bool outward
+                = declp
+                  && (declp->mode() == VhdlMode::OUT || declp->mode() == VhdlMode::BUFFER
+                      || (declp->mode() == VhdlMode::INOUT && v3Global.opt.vhdlMetavalues()
+                          && !nineInoutPort(declp, symp)));
             // Both ways at once is one signal, not two wired together
             if (declp && declp->mode() == VhdlMode::INOUT && aliasableActual(asp, actp, partp)) {
                 AstVar* const actVarp = VN_AS(actp, VarRef)->varp();
@@ -29208,6 +29509,7 @@ private:
             }
         }
         pinsp = AstNode::addNextNull(pinsp, activityPins(modName, nodep, &pinNum, flp));
+        verilogPinsOfNine(nodep, modName, pinsp, paramsp, flp);
         m_instantiated.insert(modName);
         if (m_modp) m_cellParents[modName].insert(m_modp->name());
         m_cellDepths[modName].insert(m_regionDepth);
@@ -34985,7 +35287,11 @@ private:
                         partIdx = m_driverUsed[rootp];
                     }
                 }
-                if (partSigp && !pkgResolved(partSigp)) partSigp = nullptr;
+                // So is a part of a signal of the nine values resolved by
+                // RESOLVED: its drivers hold all of it, every element
+                if (partSigp && !pkgResolved(partSigp) && !nineLaneable(partSigp->typep())) {
+                    partSigp = nullptr;
+                }
                 if (partSigp) {
                     const auto dIt = m_drivers.find(partSigp);
                     if (dIt == m_drivers.end()
@@ -34993,7 +35299,10 @@ private:
                         partSigp = nullptr;
                     }
                 }
-                if (!partSigp && m_drivers.count(rootp) && !pkgResolved(rootp)) {
+                // A parameter of mode in only reads the part, which is what
+                // the drivers resolve to
+                if (!partSigp && m_drivers.count(rootp) && !pkgResolved(rootp)
+                    && formals[i]->mode() != VhdlMode::IN) {
                     m_sigCopyWhy = ", whose parameter '" + formals[i]->name()
                                    + "' is given part of a signal that has several drivers";
                     return nullptr;
@@ -35095,7 +35404,8 @@ private:
                 // enable: a process that hands its signal to a procedure has
                 // that driver from elaboration on (14.7.2), so it is the one
                 // the copy writes
-                const bool nineDrv = nineValued(drivenp->typep());
+                const bool nineDrv
+                    = nineValued(drivenp->typep()) || nineLaneable(drivenp->typep());
                 if (passedOn
                     && (idx >= static_cast<int>(drvIt->second.size())
                         || (!drvIt->second[idx].enp && !nineDrv))) {
@@ -35130,7 +35440,8 @@ private:
                 // and nothing to say whether it drives at all, and a copy
                 // that wrote to it would drive from the moment it was
                 // elaborated rather than when the call was made.
-                if (!drvIt->second[idx].enp && !nineValued(signalp->typep())) {
+                if (!drvIt->second[idx].enp && !nineValued(signalp->typep())
+                    && !nineLaneable(signalp->typep())) {
                     m_sigCopyWhy = ", where the signal '" + formals[i]->name()
                                    + "' is given is resolved by a function of the design's own";
                     return nullptr;
@@ -39989,6 +40300,7 @@ private:
             }
         }
         finishNineResolves();
+        markNineVars();
         settleExternalNames();
         m_modp->addStmtsp(m_stmtsp);
         m_stmtsp = nullptr;
@@ -40712,6 +41024,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         for (AstNode* gp = pair.second->genericsp(); gp; gp = gp->nextp()) {
             names.push_back(VN_AS(gp, VhdlIfaceDecl)->name());
         }
+        m_entities[pair.first] = pair.second;
         std::vector<std::string>& ports = m_entityPortNames[pair.first];
         for (AstNode* pp = pair.second->portsp(); pp; pp = pp->nextp()) {
             ports.push_back(VN_AS(pp, VhdlIfaceDecl)->name());
@@ -40813,12 +41126,155 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     }
     dropLogicPosPins();
     markPackageSignalRefs();
+    twoStateBoundaryPorts();
     addLogicPosPins();
     addOpenPortPins();
     addPathPins();
     settleUpwardNames();
     reportReachedRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
+}
+
+// A module no VHDL unit instantiates is the top of the design, or one a
+// Verilog module instantiates: either way what is on the other side of its
+// ports -- a C++ testbench, cocotb, Verilog -- holds a bit where VHDL holds
+// one of the nine values (--vhdl-metavalues). Such a port is a bit an
+// element, as it is without the option, and the nine values are a signal
+// of the module's own beside it: an input becomes '0' or '1', and an output
+// is 1 where it is '1' or 'H' and 0 for anything else.
+void VhdlLowerVisitor::twoStateBoundaryPorts() {
+    for (const NineBoundaryPort& bp : m_nineBoundary) {
+        if (m_instantiated.count(bp.modp->name())) continue;
+        AstVar* const ninep = bp.varp;
+        FileLine* const flp = new FileLine{bp.flp};
+        flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        const bool scalar = bp.typep->base()->kind() == VhdlTypeKind::ENUM;
+        const int count = scalar ? 1 : vectorWidth(bp.typep);
+        if (count < 1 || count > 65536) continue;
+        AstNodeDType* bitsDtp = nullptr;
+        {
+            VL_RESTORER(m_modp);
+            m_modp = bp.modp;
+            s_twoStateLogic = true;
+            bitsDtp = lowerType(bp.typep, flp);
+            s_twoStateLogic = false;
+        }
+        AstVar* const portp
+            = new AstVar{flp, VVarType::VAR, ninep->name(), VFlagChildDType{}, bitsDtp};
+        portp->direction(ninep->direction());
+        portp->declDirection(ninep->declDirection());
+        portp->ansi(ninep->isAnsi());
+        const bool input = ninep->direction() == VDirection::INPUT;
+        ninep->name(ninep->name() + "__Vnine");
+        ninep->direction(VDirection::NONE);
+        ninep->declDirection(VDirection::NONE);
+        ninep->ansi(false);
+        if (input) {
+            // An input left open holds its default; given a bit, it is that
+            ninep->valuep(nullptr);
+        }
+        ninep->addNextHere(portp);
+        // Element k of the vector is lane k of the nine values, bit k of
+        // the port
+        AstNodeExpr* const valuep
+            = input ? bitsToNine(new AstVarRef{flp, portp, VAccess::READ}, count, scalar, flp)
+                    : nineToBits(new AstVarRef{flp, ninep, VAccess::READ}, count, scalar, flp);
+        AstAssignW* const assignp
+            = input ? new AstAssignW{flp, new AstVarRef{flp, ninep, VAccess::WRITE}, valuep}
+                    : new AstAssignW{flp, new AstVarRef{flp, portp, VAccess::WRITE}, valuep};
+        bp.modp->addStmtsp(new AstAlways{assignp});
+    }
+    m_nineBoundary.clear();
+}
+
+void VhdlLowerVisitor::verilogPinsOfNine(AstVhdlInstance* nodep, const std::string& modName,
+                                         AstNode* pinsp, AstNode* paramsp, FileLine* origFlp) {
+    if (!v3Global.opt.vhdlMetavalues() || (!pinsp && !paramsp) || !m_modp) return;
+    const AstNodeModule* verilogp = nullptr;
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        if (modp->name() == modName && !modp->fileline()->language().vhdl()) verilogp = modp;
+    }
+    if (!verilogp) return;
+    // A component declaration says what each port is on the VHDL side; an
+    // entity instantiation of the module has none, and its actuals say it
+    const VhdlSymbol* const usymp = nodep->unitp() && nodep->unitp()->vhdlSymp()
+                                        ? nodep->unitp()->vhdlSymp()->resolved()
+                                        : nullptr;
+    const AstVhdlComponentDecl* const compp
+        = usymp ? VN_CAST(usymp->declp(), VhdlComponentDecl) : nullptr;
+    const auto same = [](const std::string& a, const std::string& b) {
+        return VString::downcase(a) == VString::downcase(b);
+    };
+    // The type of the VHDL side, and for a port whether it goes in or out
+    const auto sideOf
+        = [&](const AstPin* pinp, bool generic, const VhdlType*& typep, bool& input) {
+              typep = nullptr;
+              input = true;
+              if (compp) {
+                  for (AstNode* dp = generic ? compp->genericsp() : compp->portsp(); dp;
+                       dp = dp->nextp()) {
+                      const AstVhdlIfaceDecl* const ifp = VN_CAST(dp, VhdlIfaceDecl);
+                      if (!ifp || !same(ifp->name(), pinp->name())) continue;
+                      typep = ifp->vhdlSymp() ? ifp->vhdlSymp()->typep() : nullptr;
+                      if (ifp->mode() == VhdlMode::OUT || ifp->mode() == VhdlMode::BUFFER) {
+                          input = false;
+                      } else if (ifp->mode() != VhdlMode::IN) {
+                          typep = nullptr;
+                      }
+                  }
+                  return;
+              }
+              for (AstNode* ap = generic ? nodep->genericMapp() : nodep->portMapp(); ap;
+                   ap = ap->nextp()) {
+                  const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                  if (!asp || !asp->actualp() || !VN_IS(asp->formalp(), VhdlName)) continue;
+                  if (!same(VN_AS(asp->formalp(), VhdlName)->name(), pinp->name())) continue;
+                  typep = asp->actualp()->vhdlTypep();
+              }
+              if (generic) return;
+              for (const AstNode* sp = verilogp->stmtsp(); sp; sp = sp->nextp()) {
+                  const AstVar* const varp = VN_CAST(sp, Var);
+                  if (!varp || !varp->isIO() || !same(varp->name(), pinp->name())) continue;
+                  if (varp->direction() == VDirection::OUTPUT) {
+                      input = false;
+                  } else if (varp->direction() != VDirection::INPUT) {
+                      typep = nullptr;
+                  }
+              }
+          };
+    FileLine* const flp = new FileLine{origFlp};
+    flp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+    flp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+    for (int generic = 1; generic >= 0; --generic) {
+        for (AstNode* p = generic ? paramsp : pinsp; p; p = p->nextp()) {
+            AstPin* const pinp = VN_CAST(p, Pin);
+            if (!pinp || !pinp->exprp()) continue;
+            const VhdlType* typep = nullptr;
+            bool input = true;
+            sideOf(pinp, generic, typep, input);
+            if (!nineValued(typep)) continue;
+            const bool scalar = typep->base()->kind() == VhdlTypeKind::ENUM;
+            const int count = scalar ? 1 : vectorWidth(typep);
+            if (count < 1 || count > 65536) continue;
+            if (input) {
+                AstNodeExpr* const actp = VN_AS(pinp->exprp()->unlinkFrBack(), NodeExpr);
+                pinp->exprp(nineToBits(actp, count, scalar, flp));
+                continue;
+            }
+            AstNodeDType* bitsDtp = nullptr;
+            s_twoStateLogic = true;
+            bitsDtp = lowerType(const_cast<VhdlType*>(typep), flp);
+            s_twoStateLogic = false;
+            AstVar* const bitsp = newTempVar("__Vvlogpin__" + pinp->name(), bitsDtp, flp);
+            AstNodeExpr* const actp = VN_AS(pinp->exprp()->unlinkFrBack(), NodeExpr);
+            pinp->exprp(new AstVarRef{flp, bitsp, VAccess::WRITE});
+            addStmt(new AstAlways{new AstAssignW{
+                flp, actp,
+                bitsToNine(new AstVarRef{flp, bitsp, VAccess::READ}, count, scalar, flp)}});
+        }
+    }
 }
 
 // Each instance hands the generics of a logic type their positions too, where

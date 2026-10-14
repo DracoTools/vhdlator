@@ -1,0 +1,5 @@
+t/t_vhdl_nine_inout.vhd:58:5:@1000000:(report note): 1: sda='H' seen='H' bus=ZZZZ
+t/t_vhdl_nine_inout.vhd:65:5:@2000000:(report note): 2: sda='0' seen='0' bus=1010 read=1010
+t/t_vhdl_nine_inout.vhd:71:5:@3000000:(report note): 3: bus=XX10
+t/t_vhdl_nine_inout.vhd:76:5:@4000000:(report note): 4: sda='H' bus=0110
+t/t_vhdl_nine_inout.vhd:78:5:@4000000:(report note): *-* All Finished *-*

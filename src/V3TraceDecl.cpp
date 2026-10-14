@@ -356,6 +356,39 @@ class TraceDeclVisitor final : public VNVisitor {
         return newp;
     }
 
+    // How many elements a VHDL object of STD_ULOGIC values has, held four bits
+    // each as the position of its value ('U' 0 ... '-' 8); 0 if it is not one
+    static int vhdlNineElements(const AstVarScope* vscp) {
+        if (!vscp->varp()->vhdlNine()) return 0;
+        const AstNodeDType* dtypep = vscp->varp()->dtypep()->skipRefToEnump();
+        while (const AstPackArrayDType* const adtypep = VN_CAST(dtypep, PackArrayDType)) {
+            dtypep = adtypep->subDTypep()->skipRefToEnump();
+        }
+        if (!VN_IS(dtypep, BasicDType)) return 0;
+        const int width = vscp->varp()->width();
+        return width >= 4 && width % 4 == 0 ? width / 4 : 0;
+    }
+    // One bit per element: 1 for '1' and 'H' (0011 and 0111), 0 otherwise.
+    // VCD and FST as traced here have no other values.
+    static AstNodeExpr* vhdlNineBits(AstNodeExpr* lanesp, int elements) {
+        FileLine* const flp = lanesp->fileline();
+        AstNodeExpr* outp = nullptr;
+        for (int k = elements - 1; k >= 0; --k) {
+            AstNodeExpr* const bit0p = new AstSel{flp, lanesp->cloneTree(false), 4 * k, 1};
+            AstNodeExpr* const bit1p = new AstSel{flp, lanesp->cloneTree(false), 4 * k + 1, 1};
+            AstNodeExpr* const bit3p = new AstSel{flp, lanesp->cloneTree(false), 4 * k + 3, 1};
+            AstNodeExpr* const notp = new AstNot{flp, bit3p};
+            notp->dtypeFrom(bit3p);
+            AstNodeExpr* const andp = new AstAnd{flp, bit0p, bit1p};
+            andp->dtypeFrom(bit0p);
+            AstNodeExpr* const onep = new AstAnd{flp, andp, notp};
+            onep->dtypeFrom(bit0p);
+            outp = outp ? new AstConcat{flp, outp, onep} : onep;
+        }
+        VL_DO_DANGLING(lanesp->deleteTree(), lanesp);
+        return outp;
+    }
+
     void addIgnore(const string& why) {
         ++m_statIgnSigs;
         const std::string cmt = "Tracing: "s + m_traName + " // Ignored: " + why;
@@ -685,9 +718,26 @@ class TraceDeclVisitor final : public VNVisitor {
                         // traversal.
                         m_traValuep
                             = new AstVarRef{m_traVscp->fileline(), m_traVscp, VAccess::READ};
-                        // Recurse into data type of the signal. The visit methods will add
-                        // AstTraceDecls.
-                        iterate(m_traVscp->varp()->dtypep()->skipRefToEnump());
+                        if (const int elements = vhdlNineElements(m_traVscp)) {
+                            // A VHDL STD_ULOGIC object holds each element in four bits;
+                            // traced, an element is one bit
+                            m_traValuep = vhdlNineBits(m_traValuep, elements);
+                            const AstPackArrayDType* const adtypep = VN_CAST(
+                                m_traVscp->varp()->dtypep()->skipRefToEnump(), PackArrayDType);
+                            if (!adtypep) {
+                                m_traValuep->dtypeSetLogic();  // A scalar
+                            } else if (adtypep->elementsConst() == elements) {
+                                // The range the vector was declared with, either way
+                                m_traValuep->dtypep(m_traValuep->findLogicRangeDType(
+                                    VNumRange{adtypep->left(), adtypep->right()}, elements,
+                                    VSigning::UNSIGNED));
+                            }
+                            addTraceDecl(VNumRange{}, 0);
+                        } else {
+                            // Recurse into data type of the signal. The visit methods will
+                            // add AstTraceDecls.
+                            iterate(m_traVscp->varp()->dtypep()->skipRefToEnump());
+                        }
                         // Delete reference created above. Traversal cloned it as required.
                         if (m_traValuep) {
                             VL_DO_DANGLING(m_traValuep->deleteTree(), m_traValuep);
