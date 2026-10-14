@@ -2174,7 +2174,9 @@ Summary:
    Where only two values can pass, an element is ``1`` for ``'1'`` and
    ``'H'`` and ``0`` otherwise: ports of the top-level entity, ports and
    generics of a Verilog module instantiated from VHDL, and waveforms. A
-   Verilog output is ``'0'`` or ``'1'`` in VHDL. Over VPI an element is one
+   Verilog output is ``'0'`` or ``'1'`` in VHDL. An ``inout`` port of the
+   top-level entity reads what the design drives on it, and gives that out.
+   Over VPI an element is one
    bit; ``vpiBinStrVal`` reads and writes the nine characters, as other VHDL
    simulators give them to cocotb, and the other formats read ``'Z'`` as z
    and ``'U'``, ``'X'``, ``'W'`` and ``'-'`` as x.

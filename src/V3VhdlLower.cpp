@@ -505,6 +505,7 @@ public:
         AstVar* varp;
         VhdlType* typep;
         FileLine* flp;
+        AstVar* drvp = nullptr;  // An INOUT's driving value, beside varp its effective one
     };
     std::vector<NineBoundaryPort> m_nineBoundary;
     void addOpenPortPins() VL_MT_DISABLED;
@@ -8395,6 +8396,11 @@ private:
                                                                  : 0;
             if (nDrv >= 1) makeNineResolved(symp, drvp, flp, nDrv);
             if (symp->driverCount() < 1 && nDrv >= 1) m_partDrivenPorts.insert(symp->resolved());
+            if (m_modp
+                && (symp->typep()->base()->kind() == VhdlTypeKind::ENUM
+                    || vectorWidth(symp->typep()) > 0)) {
+                m_nineBoundary.push_back(NineBoundaryPort{m_modp, varp, symp->typep(), flp, drvp});
+            }
         }
         // The driving value of an output whose subtype names a resolution
         // function of the design's own is what the function makes of the
@@ -41966,6 +41972,38 @@ void VhdlLowerVisitor::twoStateBoundaryPorts() {
         }
         AstVar* const portp
             = new AstVar{flp, VVarType::VAR, ninep->name(), VFlagChildDType{}, bitsDtp};
+        if (bp.drvp) {
+            // An INOUT with nothing outside to resolve against: it reads
+            // what the design drives on it, the driving value being the
+            // effective one where no other source joins it (14.7.3.3), and
+            // that goes out as bits through the port of its name
+            AstVar* const drvp = bp.drvp;
+            portp->direction(VDirection::INOUT);
+            portp->declDirection(VDirection::INOUT);
+            portp->ansi(ninep->isAnsi());
+            for (AstNode* sp = bp.modp->stmtsp(); sp; sp = sp->nextp()) {
+                AstPort* const pp = VN_CAST(sp, Port);
+                if (pp && pp->name() == drvp->name()) {
+                    VL_DO_DANGLING(pp->unlinkFrBack()->deleteTree(), pp);
+                    break;
+                }
+            }
+            ninep->name(ninep->name() + "__Vnine");
+            for (AstVar* const vp : {ninep, drvp}) {
+                vp->direction(VDirection::NONE);
+                vp->declDirection(VDirection::NONE);
+                vp->ansi(false);
+            }
+            ninep->valuep(nullptr);
+            ninep->addNextHere(portp);
+            bp.modp->addStmtsp(
+                new AstAlways{new AstAssignW{flp, new AstVarRef{flp, ninep, VAccess::WRITE},
+                                             new AstVarRef{flp, drvp, VAccess::READ}}});
+            bp.modp->addStmtsp(new AstAlways{new AstAssignW{
+                flp, new AstVarRef{flp, portp, VAccess::WRITE},
+                nineToBits(new AstVarRef{flp, drvp, VAccess::READ}, count, scalar, flp)}});
+            continue;
+        }
         portp->direction(ninep->direction());
         portp->declDirection(ninep->declDirection());
         portp->ansi(ninep->isAnsi());
