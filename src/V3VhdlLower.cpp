@@ -16526,6 +16526,13 @@ private:
         return true;
     }
 
+    // Whether every lane of a value is a strong '0' or '1' (bits 3..1 are
+    // 001), which needs no shift, unlike the classes below
+    static AstNodeExpr* laneStrong(const NineArg& a, FileLine* flp) {
+        return new AstEq{flp, new AstAnd{flp, nineRead(a, flp), laneMask(0xe, a.countp, flp)},
+                         laneMask(2, a.countp, flp)};
+    }
+
     // The classes of each lane of a value, as bit 0 of the lane: '0', '1',
     // 'L' or 'H' (defined), and of those the ones that are one or zero; 'U'
     static AstNodeExpr* laneDefined(const NineArg& a, FileLine* flp) {
@@ -16914,6 +16921,26 @@ private:
         }
         if (invert) std::swap(onep, zerop);
         AstNodeExpr* outp = laneResult(onep, zerop, up, countp, flp);
+        // Where every lane of every operand is a strong '0' or '1' -- what
+        // a design holds nearly all the time -- each operation is one on
+        // whole words, and the classes above are worked out only otherwise
+        if (base == "not" || base == "and" || base == "or" || base == "xor") {
+            AstNodeExpr* fastp = nullptr;
+            if (base == "not") {
+                fastp = new AstXor{flp, nineRead(a, flp), laneMask(1, countp, flp)};
+            } else if (base == "and") {
+                fastp = new AstAnd{flp, nineRead(a, flp), nineRead(ops[1], flp)};
+            } else if (base == "or") {
+                fastp = new AstOr{flp, nineRead(a, flp), nineRead(ops[1], flp)};
+            } else {
+                fastp = new AstOr{flp, new AstXor{flp, nineRead(a, flp), nineRead(ops[1], flp)},
+                                  laneMask(2, countp, flp)};
+            }
+            if (invert) fastp = new AstXor{flp, fastp, laneMask(1, countp, flp)};
+            AstNodeExpr* strongp = laneStrong(a, flp);
+            if (ops.size() == 2) strongp = new AstLogAnd{flp, strongp, laneStrong(ops[1], flp)};
+            outp = new AstCond{flp, strongp, fastp, outp};
+        }
         for (NineArg& arg : ops) nineDrop(arg);
         if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
         return outp;
@@ -17260,8 +17287,13 @@ private:
             } else {
                 sump = new AstAdd{flp, sump, rhsp};
             }
+            // Every lane a strong '0' or '1': no class to check first
+            AstNodeExpr* strongp = laneStrong(a, flp);
+            if (b.countp) strongp = new AstLogAnd{flp, strongp, laneStrong(b, flp)};
+            AstNodeExpr* const fastp = laneFromValues(sump->cloneTree(false), a.countp, flp);
             outp = new AstCond{flp, validp, laneFromValues(sump, a.countp, flp),
                                laneMask(1, a.countp, flp)};
+            outp = new AstCond{flp, strongp, fastp, outp};
         } else {
             // Bit k of a value is bit 4k of its value lanes, so they compare
             // as the values do. A narrower one -- an integer's lanes -- is
