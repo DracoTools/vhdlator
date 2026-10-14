@@ -8043,6 +8043,9 @@ private:
     // Signals a port of the block being lowered stands for, and that port's
     // default, which the drivers its statements give the signal start at
     std::map<const VhdlSymbol*, AstNodeVhdlExpr*> m_blockPortDefaults;
+    // Of the block being lowered, each port that can drive the signal it is
+    // associated with, and that signal
+    std::vector<std::pair<const AstVhdlIfaceDecl*, const VhdlSymbol*>> m_blockOutPorts;
     // Signals some assignment gives a 'Z' written as a literal
     std::set<const VhdlSymbol*> m_zAssigned;
     // The names of the constants some external name reaches (8.7)
@@ -23400,10 +23403,13 @@ private:
             VL_RESTORER(m_regionDepth);
             ++m_regionDepth;
             VL_RESTORER_COPY(m_blockPortDefaults);
+            VL_RESTORER_COPY(m_blockOutPorts);
+            m_blockOutPorts.clear();
             if (blockp->guardp()) lowerGuard(blockp, flp);
             if (AstVhdlBlockHeader* const headerp = blockp->headerp()) {
                 lowerBlockHeader(headerp);
             }
+            if (v3Global.opt.vhdlMetavalues()) undrivenBlockPorts(blockp);
             for (AstNode* p = blockp->declsp(); p; p = p->nextp()) lowerDecl(p);
             for (AstNode* p = blockp->stmtsp(); p; p = p->nextp()) {
                 // A block is transparent to resolution: each statement of it
@@ -23775,6 +23781,33 @@ private:
     // of its own -- it is elaborated where it stands -- so each generic
     // becomes a constant with the value the map supplies, and each port a
     // signal wired to its actual.
+    // A port of a block that nothing in the block drives is still a source
+    // of the signal associated with it, and its driving value is its
+    // default (14.7.3.2): a signal with no other source starts at that
+    // value and keeps it, whatever the signal's own declaration says
+    void undrivenBlockPorts(AstVhdlBlock* blockp) {
+        if (m_blockOutPorts.empty()) return;
+        std::set<const VhdlSymbol*> driven;
+        for (AstNode* p = blockp->stmtsp(); p; p = p->nextp()) collectDriven(p, driven);
+        for (const auto& pair : m_blockOutPorts) {
+            const AstVhdlIfaceDecl* const ifp = pair.first;
+            const VhdlSymbol* const asymp = pair.second;
+            const VhdlSymbol* const psymp
+                = ifp->vhdlSymp() ? ifp->vhdlSymp()->resolved() : nullptr;
+            if (!psymp || driven.count(psymp) || driven.count(asymp)) continue;
+            if (asymp->driverCount() > 0 || m_drivers.count(asymp)) continue;
+            const auto varIt = m_vars.find(const_cast<VhdlSymbol*>(asymp));
+            if (varIt == m_vars.end()) continue;
+            FileLine* const flp = ifp->fileline();
+            AstNodeExpr* const initp = ifp->defaultp() ? lowerExpr(ifp->defaultp())
+                                                       : defaultValueFor(psymp->typep(), flp);
+            if (!initp) continue;
+            if (AstNode* const oldp = varIt->second->valuep()) {
+                VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+            }
+            varIt->second->valuep(initp);
+        }
+    }
     void lowerBlockHeader(AstVhdlBlockHeader* nodep) {
         lowerBlockInterface(nodep->genericsp(), nodep->genericMapp(), true);
         lowerBlockInterface(nodep->portsp(), nodep->portMapp(), false);
@@ -24440,6 +24473,9 @@ private:
                         && (asymp->kind() == VhdlSymKind::SIGNAL
                             || asymp->kind() == VhdlSymKind::PORT)) {
                         m_blockPortSignals[symp->resolved()] = asymp;
+                        if (ifp->mode() != VhdlMode::IN && ifp->mode() != VhdlMode::LINKAGE) {
+                            m_blockOutPorts.emplace_back(ifp, asymp);
+                        }
                         // What a driver the block's statements give the
                         // signal starts at: the port's default (6.5.6.3)
                         if (v3Global.opt.vhdlMetavalues() && ifp->defaultp()
