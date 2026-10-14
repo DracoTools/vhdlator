@@ -16461,9 +16461,16 @@ private:
         if (isDynValue(nodep)) return false;
         AstNodeExpr* const valp = lowerExpr(nodep);
         if (!valp) return false;
-        // Outside statements nothing can hold it, so it is read again where
-        // it is needed, which an operand of these operations may be
-        if (VN_IS(valp, VarRef) || VN_IS(valp, Const) || !m_inStmts) {
+        if (VN_IS(valp, VarRef) || VN_IS(valp, Const)) {
+            arg.exprp = valp;
+            return true;
+        }
+        // Outside statements and outside a module's concurrent part nothing
+        // can hold it, so it is read again where it is needed -- which an
+        // operand of these operations is several times over, and nested
+        // ones would multiply
+        const bool concurrent = !m_inStmts && m_modp && !m_ftaskp && !m_protClassp;
+        if (!m_inStmts && !concurrent) {
             arg.exprp = valp;
             return true;
         }
@@ -16487,7 +16494,12 @@ private:
             dtypep = lowerType(nodep->vhdlTypep(), flp);
         }
         arg.varp = newTempVar("__Vnine", dtypep, flp);
-        stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), valp});
+        if (concurrent) {
+            // In a module's concurrent part, a net that follows it
+            addStmt(new AstAlways{new AstAssignW{flp, wr(arg.varp, flp), valp}});
+        } else {
+            stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), valp});
+        }
         return true;
     }
 
