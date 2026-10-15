@@ -26011,6 +26011,24 @@ private:
         }
         return nullptr;
     }
+    // How many instances drive each signal through such an INOUT
+    std::map<const VhdlSymbol*, int> m_arrayInoutDrivers;
+    // An array whose elements are resolved at some level below its own --
+    // an array of STD_LOGIC_VECTOR -- whose own subtype names no function
+    static bool resolvedBelowTop(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY || typep->resolutionp()) {
+            return false;
+        }
+        int depth = 0;
+        for (const VhdlType* levelp
+             = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+             levelp && depth < 8; ++depth) {
+            if (levelp->resolutionp()) return true;
+            if (levelp->base()->kind() != VhdlTypeKind::ARRAY) break;
+            levelp = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
+        }
+        return false;
+    }
     bool nineInoutPort(const AstVhdlIfaceDecl* declp, const VhdlSymbol* symp) const {
         if (!v3Global.opt.vhdlMetavalues() || !declp || !symp) return false;
         if (declp->mode() != VhdlMode::INOUT) return false;
@@ -30089,6 +30107,26 @@ private:
                         }
                     } else {
                         pinp = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
+                        // An INOUT of an array of vectors each RESOLVED
+                        // element by element is not split in two under
+                        // --vhdl-metavalues: its words are a memory here, not
+                        // lanes one after another. Two instances driving one
+                        // signal through such ports would leave it to
+                        // whichever writes last, so the second is refused.
+                        if (v3Global.opt.vhdlMetavalues() && fdeclp
+                            && fdeclp->mode() == VhdlMode::INOUT && fsymp
+                            && resolvedBelowTop(fsymp->typep()) && !nineLaneable(fsymp->typep())
+                            && asp->actualp()) {
+                            if (const VhdlSymbol* const asymp = rootSymOf(asp->actualp())) {
+                                if (++m_arrayInoutDrivers[asymp->resolved()] == 2) {
+                                    unsup(flp, "signal '" + asymp->name()
+                                                   + "' of an array of resolved vectors driven"
+                                                     " through the inout ports of several"
+                                                     " instances under --vhdl-metavalues"
+                                                     " (--no-vhdl-metavalues resolves it)");
+                                }
+                            }
+                        }
                     }
                     // A signal whose one source is this output starts where
                     // the output's driver does, at the port's default: every

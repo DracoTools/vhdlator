@@ -11,11 +11,12 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# An inout array of vectors with one element released by turns
+# An inout array of vectors with one element released by turns. Two-state:
+# with the nine values such a signal is refused (t_vhdl_nine_inoutarray_bad)
 test.top_filename = "t/t_vhdl_inoutzelem.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
-             verilator_flags2=["--timing", "--top-module t_vhdl_inoutzelem"],
+             verilator_flags2=["--timing", "--no-vhdl-metavalues", "--top-module t_vhdl_inoutzelem"],
              make_top_shell=False,
              make_main=False)
 
