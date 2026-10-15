@@ -32332,12 +32332,64 @@ private:
         return itemsp ? new AstPattern{flp, itemsp} : nullptr;
     }
 
+    // A slice whose ends do not fold but whose distance does, as a subtype
+    // of that many elements: "res(i*8+7 downto i*8)" in a generate is eight
+    // elements in every copy. An assignment matches elements by position
+    // (10.6.2.1), so what a value is converted to needs only the length and
+    // the direction, not where the ends are. Only for a value that arrives
+    // carrying its bounds -- a call or a name: an aggregate whose range spans
+    // a constant length is lowered to the bits it fills. Null for anything
+    // else.
+    VhdlType* sliceOfConstantLength(AstNodeVhdlExpr* targetp, const AstNodeVhdlExpr* valuep,
+                                    FileLine* flp) {
+        if (!VN_IS(valuep, VhdlCall) && !VN_IS(valuep, VhdlName)) return nullptr;
+        const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rp = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
+        if (!rp || rp->nextp() || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) {
+            return nullptr;
+        }
+        VhdlType* const typep = targetp->vhdlTypep();
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
+            || typep->indexTypes().size() != 1 || !typep->indexTypes()[0]) {
+            return nullptr;
+        }
+        LinearForm span;
+        linearAdd(span, rp->leftp(), 1, 0, true);
+        linearAdd(span, rp->rightp(), -1, 0, true);
+        bool constant = span.ok;
+        for (const auto& term : span.terms) {
+            if (term.coeff != 0) constant = false;
+        }
+        const int64_t distance = span.konst;
+        span.clear();
+        if (!constant) return nullptr;
+        const bool ascending = rp->dir() == VhdlDir::TO;
+        const int64_t length = (ascending ? -distance : distance) + 1;
+        if (length < 1 || length > 65536) return nullptr;
+        const VhdlType* const ixp = typep->indexTypes()[0];
+        VhdlType* const idxp = VhdlSymTab::newType(ixp->base()->kind(), "", flp);
+        idxp->base(ixp->base());
+        idxp->setBounds(ascending ? 0 : length - 1, ascending ? length - 1 : 0, ascending);
+        VhdlType* const outp = VhdlSymTab::newType(VhdlTypeKind::ARRAY, "", flp);
+        outp->base(typep->base());
+        outp->addIndexType(idxp);
+        outp->elementp(typep->elementp() ? typep->elementp() : typep->base()->elementp());
+        outp->unconstrained(false);
+        return outp;
+    }
+
     AstNodeExpr* lowerDriveValue(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
                                  FileLine* flp) {
         if (valuep && targetp) {
             if (AstNodeExpr* const outp = zRecordDriveValue(targetp, valuep, flp)) return outp;
         }
         if (valuep && targetp && isDynValue(valuep) && !isDynObj(targetp)) {
+            // A slice as long as its range says, before what its subtype
+            // says: where the ends do not fold that subtype can be the whole
+            // of the object sliced
+            if (VhdlType* const fixedp = sliceOfConstantLength(targetp, valuep, flp)) {
+                if (AstNodeExpr* const outp = dynAsFixed(valuep, fixedp, flp)) return outp;
+            }
             VhdlType* ttypep = targetp->vhdlTypep();
             // A signal-class formal is written with its open subtype, but it
             // names the signal the call passed, and that is what has a length
@@ -33638,6 +33690,12 @@ private:
             if (ttypep && ttypep->lengthEmittable() && !lengthOnlyRunningDecides(ttypep)) {
                 AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
                 AstNodeExpr* const rhsp = lhsp ? dynAsFixed(valuep, ttypep, flp) : nullptr;
+                if (rhsp) return new AstAssign{flp, lhsp, rhsp};
+                if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            }
+            if (VhdlType* const fixedp = sliceOfConstantLength(nodep->targetp(), valuep, flp)) {
+                AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
+                AstNodeExpr* const rhsp = lhsp ? dynAsFixed(valuep, fixedp, flp) : nullptr;
                 if (rhsp) return new AstAssign{flp, lhsp, rhsp};
                 if (lhsp) VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
             }
