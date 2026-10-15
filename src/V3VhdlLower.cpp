@@ -20390,12 +20390,18 @@ private:
     };
 
     // Whether a generic is named anywhere in this expression, which is what
-    // says the elaboration settles it
+    // says the elaboration settles it. A generate parameter is settled as
+    // early, in each copy of the body (11.8): "lvl(i)(31 downto 32 - 2**i)"
+    // is a part select of 2**i places in neorv32's barrel shifter.
     static bool namesAGeneric(const AstNode* nodep) {
         bool found = false;
         const_cast<AstNode*>(nodep)->foreach([&](AstNodeVhdlExpr* exprp) {
             const VhdlSymbol* const symp = exprp->vhdlSymp();
-            if (symp && symp->resolved()->kind() == VhdlSymKind::GENERIC) found = true;
+            if (!symp) return;
+            const VhdlSymKind kind = symp->resolved()->kind();
+            if (kind == VhdlSymKind::GENERIC || kind == VhdlSymKind::GENERATE_PARAMETER) {
+                found = true;
+            }
         });
         return found;
     }
