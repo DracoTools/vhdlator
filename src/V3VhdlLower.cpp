@@ -374,7 +374,30 @@ public:
     // though, and the helper built for it names the generic that settled
     // them. That one stays in the module, where elaboration reaches it and
     // makes one per set of generics -- and so does a helper that calls it.
+    // Helpers kept in a generate body, and the body's statements
+    std::map<const AstNodeFTask*, const AstNode*> m_helperRegion;
     void addHelperFunc(AstNodeFTask* funcp) {
+        // One naming an object a generate body declares -- "signed(pp_width_c
+        // - 1 downto 0)", pp_width_c a constant of an if-generate's branch --
+        // stays in that body: beside the module it would outlive a branch
+        // that is not elaborated and name what is gone (neorv32's
+        // multiplier). It serves that body alone.
+        if (m_inGenerate && m_stmtsp && !m_ftaskp && !m_protClassp && m_modp) {
+            bool regional = false;
+            funcp->foreach([&](const AstVarRef* refp) {
+                const AstVar* const varp = refp->varp();
+                if (regional || !varp || varp->isFuncLocal()) return;
+                const AstNode* headp = varp;
+                for (const AstNode* up = varp; up; up = up->backp()) headp = up;
+                if (headp == m_stmtsp) regional = true;
+            });
+            if (regional) {
+                m_stmtsp = AstNode::addNextNull(m_stmtsp, static_cast<AstNode*>(funcp));
+                m_helperMod.emplace(funcp, m_modp);
+                m_helperRegion.emplace(funcp, m_stmtsp);
+                return;
+            }
+        }
         bool ofModule = namesGeneric(funcp);
         // A helper calling a function of the module, or naming one of its
         // objects, stays beside it too: a bound written as "PIPELINE_BITS-1"
@@ -448,6 +471,9 @@ public:
     // in a module is that module's, and another module asking for one of the
     // same shape gets its own.
     bool usableHelper(const AstNodeFTask* funcp) const {
+        // One a generate body holds is that body's alone
+        const auto rIt = m_helperRegion.find(funcp);
+        if (rIt != m_helperRegion.end() && rIt->second != m_stmtsp) return false;
         const auto it = m_helperMod.find(funcp);
         return it == m_helperMod.end() || it->second == m_modp;
     }
@@ -13585,7 +13611,16 @@ private:
             // in a module leave one deleted under the references to it
             // (GHDL gna issue2626)
             if (m_ftaskp) varp->name(varp->name() + "__Vk" + std::to_string(++m_tempNum));
-            m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+            // Asked for first inside a generate body, a constant that names
+            // nothing of the body is still the architecture's: kept in the
+            // body, another body reading it would name what the unrolling
+            // took away (neorv32's PMP, "mode_tor_c" in two generates)
+            if (m_inGenerate && !m_ftaskp && m_modp && valuep
+                && !valuep->exists([](const AstNodeVarRef*) { return true; })) {
+                m_modp->addStmtsp(varp);
+            } else {
+                m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
+            }
         }
         return varp;
     }
