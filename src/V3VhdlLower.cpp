@@ -393,9 +393,34 @@ public:
                 }
                 return m_stmtsp && lastp == m_stmtsp;
             };
+            // A call not yet bound to its subprogram is found by name among
+            // those a design unit declares, which is where a reference by
+            // name from inside the module resolves
+            // A subprogram a design unit declares may not have reached the
+            // module yet, and is then known by what it was lowered to
+            std::set<std::string> modSubNames;
+            std::set<const AstNodeFTask*> modSubs;
+            bool subsCollected = false;
             funcp->foreach([&](AstNodeFTaskRef* refp) {
-                if (!refp->taskp()) return;
-                if (m_helperMod.count(refp->taskp()) || inModule(refp->taskp())) {
+                if (!subsCollected) {
+                    subsCollected = true;
+                    for (const auto& pair : m_funcs) {
+                        for (const VhdlScope* scopep = pair.first->declScopep(); scopep;
+                             scopep = scopep->parentp()) {
+                            if (scopep->designRoot()) {
+                                modSubNames.insert(pair.second->name());
+                                modSubs.insert(pair.second);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!refp->taskp()) {
+                    if (modSubNames.count(refp->name())) ofModule = true;
+                    return;
+                }
+                if (m_helperMod.count(refp->taskp()) || inModule(refp->taskp())
+                    || modSubs.count(refp->taskp())) {
                     ofModule = true;
                 }
             });
