@@ -19182,8 +19182,32 @@ private:
         if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
             const int lw = exprVectorWidth(binp->lhsp());
             const int rw = exprVectorWidth(binp->rhsp());
-            if (binp->op() == VhdlBinaryOp::CONCAT) return lw + rw;
+            if (binp->op() == VhdlBinaryOp::CONCAT) {
+                // An element joined to an array is one more of them
+                // (9.2.5); a part of no known length leaves the whole unknown
+                const auto part = [](AstNodeVhdlExpr* exprp, int width) {
+                    const VhdlType* const typep = exprp->vhdlTypep();
+                    if (!width && typep && typep->base()->kind() != VhdlTypeKind::ARRAY) {
+                        return 1;
+                    }
+                    return width;
+                };
+                const int lp = part(binp->lhsp(), lw);
+                const int rp = part(binp->rhsp(), rw);
+                return lp && rp ? lp + rp : 0;
+            }
             return std::max(lw, rw);
+        }
+        // A conversion to an array type that leaves its bounds open is as
+        // long as its operand (9.3.6): "signed('0' & v)"
+        if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+            const VhdlSymbol* const markp
+                = callp->prefixp() ? callp->prefixp()->vhdlSymp() : nullptr;
+            const AstVhdlAssoc* const argp = VN_CAST(callp->argsp(), VhdlAssoc);
+            if (markp && markp->kind() == VhdlSymKind::TYPE && argp && !argp->nextp()
+                && !argp->formalp() && argp->actualp()) {
+                return exprVectorWidth(argp->actualp());
+            }
         }
         if (AstVhdlUnary* const unp = VN_CAST(nodep, VhdlUnary)) {
             return exprVectorWidth(unp->lhsp());
@@ -19254,6 +19278,67 @@ private:
         }
         const int lw = exprVectorWidth(nodep->lhsp());
         const int rw = exprVectorWidth(nodep->rhsp());
+        // A product is as long as its two operands together (numeric_std,
+        // numeric_bit, std_logic_arith), not as the longer: where nothing
+        // around it gives a width -- the operand of RESIZE, a comparison --
+        // the back end would multiply at the longer and lose the top.
+        // std_logic_arith's SIGNED times UNSIGNED gives the unsigned operand
+        // a place for its sign; numeric_std's vector times an integer makes
+        // the integer as long as the vector first.
+        const auto isArray = [](const VhdlType* typep) {
+            return typep && typep->base()->kind() == VhdlTypeKind::ARRAY;
+        };
+        if (nodep->op() == VhdlBinaryOp::MUL && (isArray(ltypep) || isArray(rtypep))) {
+            const bool ls = isSignedType(ltypep);
+            const bool rs = isSignedType(rtypep);
+            const auto ext = [&](AstNodeExpr* exprp, bool sgn, int width, bool asSigned) {
+                AstNodeExpr* const outp
+                    = sizedTo(sgn ? static_cast<AstNodeExpr*>(new AstSigned{flp, exprp})
+                                  : new AstUnsigned{flp, exprp},
+                              width, flp);
+                return asSigned ? static_cast<AstNodeExpr*>(new AstSigned{flp, outp}) : outp;
+            };
+            if (lw && rw) {
+                const bool anySigned = ls || rs;
+                const int total = lw + rw + (ls != rs ? 1 : 0);
+                lhsp = ext(lhsp, ls, total, anySigned);
+                rhsp = ext(rhsp, rs, total, anySigned);
+                return;
+            }
+            // A length elaboration settles -- "a(lo_c - 1 downto 0)" in a
+            // generate whose constants a generic gives -- is not a number
+            // here, so the width is written as the operands' own widths,
+            // which the back end folds once the instance is elaborated
+            if (isArray(ltypep) && isArray(rtypep) && ls == rs) {
+                const auto bitsOf = [&](AstNodeExpr* exprp) {
+                    return new AstAttrOf{flp, VAttrType::DIM_BITS, exprp->cloneTree(false)};
+                };
+                const auto castTo = [&](AstNodeExpr* exprp, AstNodeExpr* widthp) {
+                    AstNodeExpr* const fromp
+                        = ls ? static_cast<AstNodeExpr*>(new AstSigned{flp, exprp})
+                             : new AstUnsigned{flp, exprp};
+                    AstBasicDType* const dtp = new AstBasicDType{
+                        flp, VBasicDTypeKwd::LOGIC, ls ? VSigning::SIGNED : VSigning::UNSIGNED};
+                    dtp->rangep(
+                        new AstRange{flp, new AstSub{flp, widthp, i32(1, flp)}, i32(0, flp)});
+                    return new AstCast{flp, fromp, VFlagChildDType{}, dtp};
+                };
+                AstNodeExpr* const totalp = new AstAdd{flp, bitsOf(lhsp), bitsOf(rhsp)};
+                lhsp = castTo(lhsp, totalp->cloneTree(false));
+                rhsp = castTo(rhsp, totalp);
+                return;
+            }
+            if (lw && isIntegerType(rtypep) && isNumericVector(ltypep)) {
+                lhsp = ext(lhsp, ls, 2 * lw, ls);
+                rhsp = ext(sizedTo(rhsp, lw, flp), ls, 2 * lw, ls);
+                return;
+            }
+            if (rw && isIntegerType(ltypep) && isNumericVector(rtypep)) {
+                rhsp = ext(rhsp, rs, 2 * rw, rs);
+                lhsp = ext(sizedTo(lhsp, rw, flp), rs, 2 * rw, rs);
+                return;
+            }
+        }
         if (lw && rw && lw != rw) {
             // "+" and friends of numeric_std take operands of any two lengths
             // and give a result as long as the longer, each operand resized

@@ -9,19 +9,18 @@
 -- a branch's own width constants size a RESIZE of a product in a branch
 -- one instance elaborates and another does not; and a constant of the
 -- architecture compared in two for-generates (as neorv32's multiplier and
--- PMP are written). Under the nine values only: --no-vhdl-metavalues gets
--- the signed product of a concatenation wrong.
+-- PMP are written)
 
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-entity t_vhdl_nine_genscope_mul is
+entity t_vhdl_genscope_mul is
   generic (W : natural; SPLIT : boolean);
   port (a, b : in signed(W - 1 downto 0); p : out signed(2 * W - 1 downto 0));
 end entity;
 
-architecture a of t_vhdl_nine_genscope_mul is
+architecture a of t_vhdl_genscope_mul is
 begin
   whole : if not SPLIT generate
     p <= a * b;
@@ -41,10 +40,10 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-entity t_vhdl_nine_genscope is
+entity t_vhdl_genscope is
 end entity;
 
-architecture a of t_vhdl_nine_genscope is
+architecture a of t_vhdl_genscope is
   constant mode_c : std_ulogic_vector(1 downto 0) := "01";
   type cfg_t is array (0 to 3) of std_ulogic_vector(1 downto 0);
   signal cfg : cfg_t := ("01", "10", "01", "11");
@@ -52,8 +51,8 @@ architecture a of t_vhdl_nine_genscope is
   signal a, b : signed(7 downto 0) := to_signed(-37, 8);
   signal p1, p2 : signed(15 downto 0);
 begin
-  m1 : entity work.t_vhdl_nine_genscope_mul generic map (8, false) port map (a, b, p1);
-  m2 : entity work.t_vhdl_nine_genscope_mul generic map (8, true) port map (a, b, p2);
+  m1 : entity work.t_vhdl_genscope_mul generic map (8, false) port map (a, b, p1);
+  m2 : entity work.t_vhdl_genscope_mul generic map (8, true) port map (a, b, p2);
 
   ga : for i in 0 to 3 generate
     hit_a(i) <= '1' when cfg(i) = mode_c else '0';

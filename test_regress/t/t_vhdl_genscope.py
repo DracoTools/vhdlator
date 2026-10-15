@@ -12,11 +12,11 @@ import vltest_bootstrap
 test.scenarios('vlt')
 
 # Generate bodies keep what they declare; the architecture keeps the rest
-test.top_filename = "t/t_vhdl_nine_genscope.vhd"
+test.top_filename = "t/t_vhdl_genscope.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
              verilator_flags2=[
-                 "--timing", "--top-module t_vhdl_nine_genscope"
+                 "--timing", "--top-module t_vhdl_genscope"
              ],
              make_top_shell=False,
              make_main=False)
