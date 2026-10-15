@@ -26135,7 +26135,11 @@ private:
             if (!declp || !declp->targetp()) return symp;
             curp = rootSymOf(declp->targetp());
         }
-        return curp && curp != symp && pkgResolved(curp) ? curp : symp;
+        // Or any object with drivers of its own here: "alias npd :
+        // std_logic_vector(0 to pd'length - 1) is pd", pd an inout port of
+        // the nine values its instances drive element by element (VESTS
+        // ch_14_fg_14_05)
+        return curp && curp != symp && (pkgResolved(curp) || m_drivers.count(curp)) ? curp : symp;
     }
 
     // The logic values a value is made of, left to right, where it folds
@@ -27090,8 +27094,9 @@ private:
     // driver's own value rather than the signal. Returns null, and binds
     // nothing, where the signal is not resolved.
     VhdlSymbol* bindPortDriver(AstVhdlAssoc* asp, FileLine* flp, AstVar*& savedp) {
+        // Through an alias, the object it denotes (6.6.2)
         const VhdlSymbol* const symp
-            = asp->drives() && asp->actualp() ? rootSymOf(asp->actualp()) : nullptr;
+            = asp->drives() && asp->actualp() ? pkgAliasBase(rootSymOf(asp->actualp())) : nullptr;
         const auto it = symp ? m_drivers.find(symp) : m_drivers.end();
         if (it == m_drivers.end()
             || m_driverUsed[symp] >= static_cast<int>(it->second.size())) {
