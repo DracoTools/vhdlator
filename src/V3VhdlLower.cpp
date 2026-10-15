@@ -16634,8 +16634,16 @@ private:
                 arg.exprp = valp;
                 return true;
             } else {
-                VL_DO_DANGLING(valp->deleteTree(), valp);
-                return false;
+                // A count the elaboration settles -- the longer of two
+                // lengths generics give, "int_sum + signed(comb_sum)" (GHDL
+                // gna bug24065) -- is a width a declaration can carry
+                dtypep = new AstPackArrayDType{
+                    flp, VFlagChildDType{}, newLogicDType(flp, 1),
+                    new AstRange{
+                        flp,
+                        new AstSub{flp, new AstMul{flp, i32(4, flp), arg.countp->cloneTree(false)},
+                                   i32(1, flp)},
+                        i32(0, flp)}};
             }
         } else {
             dtypep = lowerType(nodep->vhdlTypep(), flp);
