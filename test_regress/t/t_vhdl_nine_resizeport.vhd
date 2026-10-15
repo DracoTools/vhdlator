@@ -9,13 +9,15 @@
 -- number until elaboration, and RESIZE is emitted natively at whatever
 -- length that settles. An UNSIGNED is filled with '0' or cut from the left;
 -- a SIGNED is filled with its sign element, or cut keeping its sign
--- leftmost -- metavalues and all (gna issue961)
+-- leftmost -- metavalues and all (gna issue961); and to a length of zero,
+-- a null array, as in a copy of numeric_std's DIVMOD (VUnit tb_string_ops)
 
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity t_vhdl_nine_resizeport_sub is
+  generic (nullw : natural := 0);
   port (ui : in unsigned; uo : out unsigned; si : in signed; so : out signed);
 end entity;
 
@@ -23,6 +25,13 @@ architecture a of t_vhdl_nine_resizeport_sub is
 begin
   uo <= resize(ui, uo'length);
   so <= resize(si, so'length);
+
+  process (ui)
+    variable vnull : unsigned(nullw - 1 downto 0);
+  begin
+    vnull := resize(ui, nullw);
+    assert vnull'length = 0 severity failure;
+  end process;
 end architecture;
 
 library ieee;

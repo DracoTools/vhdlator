@@ -17153,6 +17153,12 @@ private:
                            FileLine* flp) {
         const int64_t count = constCount(countp);
         const VhdlValue val = V3VhdlEval::eval(nodep);
+        // A length the elaboration settles: 64 lanes of it, cut to the
+        // length or widened, with copies of its sign above the 64 where it
+        // has one
+        if (count < 1 && countp && !(val.isInt() && val.toInt() >= 0 && val.toInt() <= 1)) {
+            return laneOfIntElab(nodep, sgn, countp, flp);
+        }
         if (val.isInt()) {
             const int64_t v = val.toInt();
             // A constant is written lane by lane. Past 64 lanes, and where
@@ -17179,6 +17185,73 @@ private:
         return new AstCastSize{
             flp, laneSpread(widep, flp),
             new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(count * 4)}};
+    }
+
+    // A count that may be zero, as one where it is: a null array is one place
+    static AstNodeExpr* atLeastOne(AstNodeExpr* countp, FileLine* flp) {
+        if (const AstConst* const constp = VN_CAST(countp, Const)) {
+            if (constp->toSInt() >= 1) return countp;
+        }
+        return new AstCond{flp, new AstLtS{flp, countp->cloneTree(false), i32(1, flp)},
+                           i32(1, flp), countp};
+    }
+    AstNodeExpr* laneOfIntElab(AstNodeVhdlExpr* nodep, bool sgn, const AstNodeExpr* lenp,
+                               FileLine* flp) {
+        AstNodeExpr* const countp
+            = atLeastOne(const_cast<AstNodeExpr*>(lenp)->cloneTree(false), flp);
+        const VhdlValue val = V3VhdlEval::eval(nodep);
+        AstNodeExpr* lanesp = nullptr;
+        bool negative = false;
+        if (val.isInt()) {
+            const int64_t v = val.toInt();
+            negative = v < 0;
+            V3Number num{flp, 256, 0};
+            num.setAllBits0();
+            for (int k = 0; k < 64; ++k) {
+                if ((static_cast<uint64_t>(v) >> k) & 1) num.setBit(k * 4, '1');
+            }
+            lanesp = new AstConst{flp, num};
+        } else {
+            AstNodeExpr* const intp = lowerExpr(nodep);
+            if (!intp) {
+                VL_DO_DANGLING(countp->deleteTree(), countp);
+                return nullptr;
+            }
+            negative = sgn || isSignedType(nodep->vhdlTypep());
+            AstNodeExpr* const widep
+                = negative ? static_cast<AstNodeExpr*>(new AstExtendS{flp, intp, 64})
+                           : static_cast<AstNodeExpr*>(new AstExtend{flp, intp, 64});
+            lanesp = laneSpread(widep, flp);
+        }
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+        const auto shaped = [&](AstNodeExpr* exprp) {
+            AstNodeDType* const dtypep = new AstPackArrayDType{
+                flp, VFlagChildDType{}, newLogicDType(flp, 1),
+                new AstRange{flp,
+                             new AstSub{flp,
+                                        new AstMul{flp, i32(4, flp), countp->cloneTree(false)},
+                                        i32(1, flp)},
+                             i32(0, flp)}};
+            return new AstCast{cflp, exprp, VFlagChildDType{}, dtypep};
+        };
+        AstNodeExpr* outp = shaped(lanesp->cloneTree(false));
+        if (negative) {
+            // Bit 0 of lane 63, in every value lane above the 64
+            AstNodeExpr* const signp = new AstSel{flp, lanesp->cloneTree(false), 252, 1};
+            AstNodeExpr* const abovep
+                = new AstShiftL{cflp, laneMask(1, countp, flp),
+                                new AstConst{flp, AstConst::WidthedValue{}, 32, 256}};
+            outp = new AstOr{flp, outp,
+                             new AstAnd{flp, abovep,
+                                        new AstReplicate{cflp, signp,
+                                                         new AstMul{flp, i32(4, flp),
+                                                                    countp->cloneTree(false)}}}};
+        }
+        VL_DO_DANGLING(lanesp->deleteTree(), lanesp);
+        VL_DO_DANGLING(countp->deleteTree(), countp);
+        return outp;
     }
 
     // numeric_std's arithmetic and comparisons over the nine values (16.5):
@@ -17449,8 +17522,13 @@ private:
     // whose sign stays leftmost (numeric_std RESIZE)
     AstNodeExpr* nineResizeElab(const NineArg& a, bool sgn, AstNodeVhdlExpr* sizep,
                                 FileLine* flp) {
-        AstNodeExpr* const toCountp = lowerExpr(sizep);
-        if (!toCountp) return nullptr;
+        AstNodeExpr* const sizeValp = lowerExpr(sizep);
+        if (!sizeValp) return nullptr;
+        // A length of zero is a null array, which one place stands for here
+        // as it does wherever one is declared (5.3.2.1): "XQUOT :=
+        // RESIZE(QUOT, XQUOT'length)" in a copy of DIVMOD made for a null
+        // quotient
+        AstNodeExpr* const toCountp = atLeastOne(sizeValp, flp);
         FileLine* const cflp = new FileLine{flp};
         cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
         cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
@@ -17792,19 +17870,12 @@ private:
         const int width = vectorWidth(typep);
         return width > 0 ? width : -1;
     }
-    // Whether two operands whose lengths are not numbers have the same one
-    static bool nineSameBounds(const VhdlType* ap, const VhdlType* bp) {
-        if (ap == bp) return true;
-        if (ap->indexTypes().size() != 1 || bp->indexTypes().size() != 1) return false;
-        const VhdlType* const aip = ap->indexTypes()[0];
-        const VhdlType* const bip = bp->indexTypes()[0];
-        if (!aip || !bip) return false;
-        if (aip == bip) return true;
-        return aip->boundsp() && bip->boundsp() && aip->boundsp()->sameTree(bip->boundsp());
-    }
     // Whether an integer operand can be made into lanes of a vector of so
     // many elements (laneOfInt)
     static bool nineIntFits(AstNodeVhdlExpr* nodep, int64_t count, bool sgn, bool relational) {
+        // An operand of "+" or "-" beside a vector whose length the
+        // elaboration settles is made that long whatever it is (laneOfIntElab)
+        if (count < 1 && !relational) return true;
         const VhdlValue val = V3VhdlEval::eval(nodep);
         if (!val.isInt()) return count >= 1 && count <= 64;
         const int64_t v = val.toInt();
@@ -17915,15 +17986,20 @@ private:
             return false;
         }
         if (args.size() == 2) {
-            const VhdlType* const ltp = args[0]->vhdlTypep();
             const VhdlType* const rtp = args[1]->vhdlTypep();
             const bool rScalar = rtp->base()->kind() == VhdlTypeKind::ENUM;
             if (lScalar != rScalar && !logical) return false;
             if (lScalar == rScalar) {
+                // Two lengths that are numbers and differ: the body's own
+                // check stops the run. Where either is a length the
+                // elaboration settles, the two are the same in any design
+                // that runs at all, however differently their bounds are
+                // written -- "(a(31 downto lsb) and m) = (b(29 downto lsb -
+                // 2) and m)" (neorv32's PMP) -- and the result is as long
+                // as the left one (std_logic_1164)
                 const int64_t lc = nineStaticCount(args[0]);
                 const int64_t rc = nineStaticCount(args[1]);
-                if (lc != rc) return false;
-                if (lc < 0 && !nineSameBounds(ltp, rtp)) return false;
+                if (lc > 0 && rc > 0 && lc != rc) return false;
             }
         }
         return true;

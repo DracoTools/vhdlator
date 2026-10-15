@@ -1,3 +1,3 @@
-t/t_vhdl_nine_resizeport.vhd:56:5:@1000000:(report note): 00001X0Z1LH- 1LH- 1X0Z1LH-
-t/t_vhdl_nine_resizeport.vhd:57:5:@1000000:(report note): WWWWW01X1H 11111001X0 11X0 1
-t/t_vhdl_nine_resizeport.vhd:66:5:@1000000:(report note): *-* All Finished *-*
+t/t_vhdl_nine_resizeport.vhd:65:5:@1000000:(report note): 00001X0Z1LH- 1LH- 1X0Z1LH-
+t/t_vhdl_nine_resizeport.vhd:66:5:@1000000:(report note): WWWWW01X1H 11111001X0 11X0 1
+t/t_vhdl_nine_resizeport.vhd:75:5:@1000000:(report note): *-* All Finished *-*
