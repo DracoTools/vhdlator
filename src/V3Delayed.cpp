@@ -157,6 +157,8 @@ class DelayedVisitor final : public VNVisitor {
         bool m_inSuspOrFork = false;  // Used on LHS of NBA in suspendable process or fork
         uint32_t m_nSites = 0;  // Number of NBAs in the source that assign it
         uint32_t m_nWholeSites = 0;  // How many of those assign all of it
+        const AstNodeProcedure* m_firstProcp = nullptr;  // Process of the first NBA to it
+        bool m_multiProc = false;  // NBAs in more than one process assign it
         Scheme m_scheme = Scheme::Undecided;  // Conversion scheme to use for this variable
         uint32_t m_nTmp = 0;  // Temporary number for unique names
 
@@ -450,6 +452,19 @@ class DelayedVisitor final : public VNVisitor {
             // Basic underlying type of elements, if any.
             const AstBasicDType* const basicp = uaDTypep->basicp();
             // If used in a loop, we must have a dynamic commit queue. (Also works in suspendables)
+            // So too where more than one process assigns its elements: flags
+            // are committed in the order the NBAs appear in the source, and
+            // IEEE 1800-2023 10.4.2 has NBAs performed in the order they were
+            // executed. Two processes writing one element in a time slot left
+            // the value of the one written first in the source, whichever ran
+            // last; the queue commits in the order the values were queued.
+            const bool queueable
+                = basicp
+                  && (basicp->isIntegralOrPacked() || basicp->isDouble() || basicp->isString());
+            if (vscpInfo.m_multiProc && !vscpInfo.m_inLoop && queueable) {
+                if (vscpInfo.m_partial) return Scheme::ValueQueuePartial;
+                return Scheme::ValueQueueWhole;
+            }
             if (vscpInfo.m_inLoop) {
                 // Arrays with compound element types have no commit queue
                 if (!basicp
@@ -1457,6 +1472,11 @@ class DelayedVisitor final : public VNVisitor {
         vscpInfo.m_inLoop |= m_inLoop;
         vscpInfo.m_inSuspOrFork |= m_inSuspendableOrFork;
         ++vscpInfo.m_nSites;
+        if (!vscpInfo.m_firstProcp) {
+            vscpInfo.m_firstProcp = m_procp;
+        } else if (vscpInfo.m_firstProcp != m_procp) {
+            vscpInfo.m_multiProc = true;
+        }
         // Sensitivity might be non-clocked, in a suspendable process, which are handled elsewhere
         if (m_activep->sentreep()->hasClocked()) {
             if (vscpInfo.m_fistActivep != m_activep) {
