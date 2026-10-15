@@ -848,6 +848,18 @@ private:
                     }
                     if (wantsCarrier && atypep) {
                         onep = asDynCarrier(asp->actualp(), atypep, asp->fileline());
+                        // Handed over as it is, it would be a value where a
+                        // carrier is wanted
+                        if (!onep) {
+                            AstNodeExpr* const rawp = lowerExpr(asp->actualp());
+                            if (rawp && !loweredIsCarrier(rawp)) {
+                                VL_DO_DANGLING(rawp->deleteTree(), rawp);
+                                unsup(asp->fileline(), "value of a length only running decides"
+                                                       " copied from this expression");
+                                return;
+                            }
+                            onep = rawp;
+                        }
                     }
                 }
                 if (!onep) onep = lowerExpr(asp->actualp());
@@ -7642,6 +7654,13 @@ private:
         // The conversions that build a value out of an integer are emitted
         // at the call rather than compiled, so what this call is worth is
         // what says whether it carries its bounds
+        // Under --vhdl-metavalues one over the nine values that is not
+        // emitted natively is compiled from its body, and gives back what
+        // the body was emitted to return, whatever subtype analysis gave the
+        // call: "xquot := resize(quot, xquot'length)" in numeric_std's DIVMOD
+        if (inArithmeticPackage(symp) && !V3VhdlStd::isIntrinsic(symp)) {
+            return carriedDynamically(emittedReturnType(symp));
+        }
         const std::string& name = symp->name();
         if ((name == "to_unsigned" || name == "to_signed" || name == "resize")
             && inArithmeticPackage(symp)) {
@@ -7751,7 +7770,10 @@ private:
     // selection or an index.
     bool isDynObj(const AstNodeVhdlExpr* nodep) const {
         if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
-            return namep->vhdlSymp() && m_dynSyms.count(namep->vhdlSymp()->resolved());
+            if (!namep->vhdlSymp()) return false;
+            if (m_dynSyms.count(namep->vhdlSymp()->resolved())) return true;
+            // An alias given a carrier of its own (aliasCarrier)
+            return m_ftaskp && m_aliasCarriers.count(std::make_pair(m_ftaskp, namep->vhdlSymp()));
         }
         // An element of a record whose length nothing settles is held in a
         // carrier of its own, and naming the element names that carrier
@@ -12968,7 +12990,14 @@ private:
         VhdlType* const atp = symp ? symp->typep() : nullptr;
         if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY || atp->dimensions() != 1) return;
         AstNodeVhdlExpr* const targetp = declp->targetp();
-        if (!VN_IS(targetp, VhdlName) || !isDynObj(targetp)) return;
+        // Or that renumbers one of a fixed length with bounds only running
+        // decides -- numeric_std's "alias XL : UNRESOLVED_UNSIGNED(L_LEFT
+        // downto 0) is L", L_LEFT a constant of the subprogram, in a copy for
+        // an operand a generic sizes: the alias is carried, and holds the
+        // object's elements
+        const bool fixedTarget
+            = VN_IS(targetp, VhdlName) && !isDynObj(targetp) && carriedDynamically(atp);
+        if (!VN_IS(targetp, VhdlName) || (!isDynObj(targetp) && !fixedTarget)) return;
         const VhdlSymbol* const tsymp
             = targetp->vhdlSymp() ? targetp->vhdlSymp()->resolved() : nullptr;
         if (!tsymp) return;
@@ -12988,8 +13017,10 @@ private:
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return;
         }
-        AstNodeExpr* const srcp = lowerExpr(targetp);
-        AstNodeDType* const carrDTypep = srcp ? dynCarrierRef(tsymp->typep(), flp) : nullptr;
+        AstNodeExpr* const srcp
+            = fixedTarget ? asDynCarrier(targetp, atp, flp) : lowerExpr(targetp);
+        AstNodeDType* const carrDTypep
+            = srcp ? dynCarrierRef(fixedTarget ? atp : tsymp->typep(), flp) : nullptr;
         if (!carrDTypep) {
             if (srcp) VL_DO_DANGLING(srcp->deleteTree(), srcp);
             VL_DO_DANGLING(leftp->deleteTree(), leftp);

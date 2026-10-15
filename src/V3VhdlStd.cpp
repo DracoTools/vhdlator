@@ -303,7 +303,7 @@ static bool stdUlogicShaped(const VhdlType* typep) {
     return true;
 }
 
-bool V3VhdlStd::isIntrinsic(const VhdlSymbol* symp) {
+bool V3VhdlStd::isIntrinsic(const VhdlSymbol* symp, bool evenNine) {
     if (!symp) return false;
     if (!intrinsicName(symp->name())) return false;
     // One the language itself declares has no body that could be compiled
@@ -313,7 +313,9 @@ bool V3VhdlStd::isIntrinsic(const VhdlSymbol* symp) {
     // forms hold a logic value as one bit. An edge test is the exception: it
     // asks about a signal's history, which a body cannot do through a
     // parameter, and the lowering answers it over the nine values itself.
-    if (v3Global.opt.vhdlMetavalues() && symp->name() != "rising_edge"
+    // With evenNine, one of those is asked about all the same: what it is
+    // rather than how it is carried out.
+    if (v3Global.opt.vhdlMetavalues() && !evenNine && symp->name() != "rising_edge"
         && symp->name() != "falling_edge") {
         bool nine = stdUlogicShaped(symp->returnTypep());
         for (const VhdlType* const typep : symp->paramTypes()) {

@@ -12336,10 +12336,12 @@ VhdlType* VhdlSemVisitor::intrinsicResultType(VhdlSymbol* symp,
                                               const std::vector<AstVhdlAssoc*>& assocs,
                                               VhdlType* resultp) {
     if (!symp || !resultp) return nullptr;
-    // Only where the frontend really is what carries the operation out. A
-    // package that declares a RESIZE of its own means its own thing by it,
-    // and its result is whatever its body returns (see V3VhdlStd)
-    if (!V3VhdlStd::isIntrinsic(symp)) return nullptr;
+    // Only those of the packages the frontend stands in for. A package that
+    // declares a RESIZE of its own means its own thing by it, and its result
+    // is whatever its body returns (see V3VhdlStd). Under --vhdl-metavalues
+    // one over the nine values is compiled from its body, which gives back
+    // the length the standard says, so that length is its subtype all the same
+    if (!V3VhdlStd::isIntrinsic(symp, true)) return nullptr;
     if (resultp->base()->kind() != VhdlTypeKind::ARRAY || resultp->isConstrainedArray()) {
         return nullptr;
     }

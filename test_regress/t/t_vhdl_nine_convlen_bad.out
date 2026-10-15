@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_nine_convlen_bad.vhd:25:65: Expected 16 element(s) for element 'im' of this aggregate, but the value has 17
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_nine_convlen_bad.vhd:26:44: Expected 8 element(s) for signal 'v', but the value has 9
+%Error: Exiting due to

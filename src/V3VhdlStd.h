@@ -72,7 +72,9 @@ public:
     // ordinary declarations in IEEE's fixed-point and floating-point
     // packages, and in any design that writes its own. Only a declaration
     // that came from one of the packages the frontend stands in for is one.
-    static bool isIntrinsic(const VhdlSymbol* symp) VL_MT_DISABLED;
+    // Under --vhdl-metavalues one over the nine values is compiled from its
+    // body instead, and is not one unless evenNine asks what it is anyway.
+    static bool isIntrinsic(const VhdlSymbol* symp, bool evenNine = false) VL_MT_DISABLED;
 
     // Declare the operators a type declaration implicitly brings with it
     // (5.2.6, 9.2). Called for every user-defined type as well.
