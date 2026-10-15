@@ -42748,13 +42748,36 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
     // reference to it, from the unit and from the modules, answered by the
     // one object the language says there is (4.3).
     {
-        const auto placeOf = [](const AstNode* tp) -> char {
+        // The way up from a node in a list goes back over every node before
+        // it, so each answer is kept for every node passed on the way: asked
+        // of every variable a large module names, the walk was quadratic
+        // (GHDL gna issue30, two minutes under the nine values)
+        std::unordered_map<const AstNode*, char> placeMemo;
+        const auto placeOf = [&](const AstNode* tp) -> char {
+            std::vector<const AstNode*> passed;
+            char place = '?';
             for (const AstNode* up = tp; up; up = up->backp()) {
-                if (VN_IS(up, Class)) return 'c';
-                if (VN_IS(up, Package)) return 'u';
-                if (VN_IS(up, NodeModule)) return 'm';
+                const auto it = placeMemo.find(up);
+                if (it != placeMemo.end()) {
+                    place = it->second;
+                    break;
+                }
+                if (VN_IS(up, Class)) {
+                    place = 'c';
+                    break;
+                }
+                if (VN_IS(up, Package)) {
+                    place = 'u';
+                    break;
+                }
+                if (VN_IS(up, NodeModule)) {
+                    place = 'm';
+                    break;
+                }
+                passed.push_back(up);
             }
-            return '?';
+            for (const AstNode* const np : passed) placeMemo[np] = place;
+            return place;
         };
         // Homing one thing may show up another that named it, so this is
         // run until nothing more moves
@@ -42779,6 +42802,7 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
                     // Left nowhere, so nothing else can claim it either
                     if (place == '?') {
                         unitp->addStmtsp(varp);
+                        placeMemo.erase(varp);
                         redirect.emplace(varp, varp);
                     }
                     return;
@@ -42796,6 +42820,7 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
                     for (AstNode* up = refp->backp(); up; up = up->backp()) {
                         if (AstNodeModule* const modp = VN_CAST(up, NodeModule)) {
                             modp->addStmtsp(varp);
+                            placeMemo.erase(varp);
                             return;
                         }
                     }
@@ -42822,6 +42847,7 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
                 varp->name(pkgObjectName(symp));
                 varp->lifetime(VLifetime::STATIC_EXPLICIT);
                 unitp->addStmtsp(varp);
+                placeMemo.erase(varp);
                 m_pkgObjs.emplace(symp, varp);
                 redirect.emplace(varp, varp);
             });
@@ -42843,17 +42869,28 @@ void VhdlLowerVisitor::markPackageSignalRefs() {
             // subprogram cannot leave without them. Where nothing else in the
             // design names one, it travels with the subprogram it belongs to.
             std::map<const AstVar*, const AstNode*> soleTaskOf;
+            // Which subprogram a node is inside, kept for every node passed
+            // on the way up, as placeOf keeps where one is
+            std::unordered_map<const AstNode*, const AstNode*> ownerMemo;
             m_netlistp->foreach([&](AstVarRef* refp) {
                 AstVar* const varp = refp->varp();
                 if (!varp) return;
                 const AstNode* ownerp = nullptr;
+                std::vector<const AstNode*> passed;
                 for (AstNode* up = refp->backp(); up; up = up->backp()) {
+                    const auto mIt = ownerMemo.find(up);
+                    if (mIt != ownerMemo.end()) {
+                        ownerp = mIt->second;
+                        break;
+                    }
                     if (VN_IS(up, NodeFTask)) {
                         ownerp = up;
                         break;
                     }
                     if (VN_IS(up, NodeModule)) break;
+                    passed.push_back(up);
                 }
+                for (const AstNode* const np : passed) ownerMemo[np] = ownerp;
                 const auto it = soleTaskOf.find(varp);
                 if (it == soleTaskOf.end()) {
                     soleTaskOf.emplace(varp, ownerp);
