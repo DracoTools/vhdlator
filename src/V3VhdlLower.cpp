@@ -16436,6 +16436,21 @@ private:
         return asp->actualp();
     }
 
+    // The operands of a joining and of the joinings down its left side, in
+    // order: "a & b & c" is "(a & b) & c"
+    static std::vector<const AstNodeVhdlExpr*> concatParts(const AstVhdlBinary* catp) {
+        std::vector<const AstNodeVhdlExpr*> rights;
+        const AstNodeVhdlExpr* leftp = catp;
+        while (const AstVhdlBinary* const bp = VN_CAST(leftp, VhdlBinary)) {
+            if (bp->op() != VhdlBinaryOp::CONCAT) break;
+            rights.push_back(bp->rhsp());
+            leftp = bp->lhsp();
+        }
+        std::vector<const AstNodeVhdlExpr*> parts{leftp};
+        parts.insert(parts.end(), rights.rbegin(), rights.rend());
+        return parts;
+    }
+
     // How many elements an operand of those operations has, as an
     // expression: what its type says, a literal's own, a native result's
     // (nineResultCount), or a joining's operands' together. Null where
@@ -16453,22 +16468,24 @@ private:
         }
         if (const AstVhdlBinary* const catp = VN_CAST(nodep, VhdlBinary)) {
             if (catp->op() == VhdlBinaryOp::CONCAT) {
-                AstNodeExpr* const lp = nineOperandCount(catp->lhsp(), flp, depth + 1);
-                AstNodeExpr* const rp
-                    = lp ? nineOperandCount(catp->rhsp(), flp, depth + 1) : nullptr;
-                if (!rp) {
-                    if (lp) VL_DO_DANGLING(lp->deleteTree(), lp);
-                    return nullptr;
+                // Along the joining's own left side, as nineStaticCount goes
+                int32_t sum = 0;
+                AstNodeExpr* restp = nullptr;
+                for (const AstNodeVhdlExpr* const partp : concatParts(catp)) {
+                    AstNodeExpr* const kp = nineOperandCount(partp, flp, depth + 1);
+                    if (!kp) {
+                        if (restp) VL_DO_DANGLING(restp->deleteTree(), restp);
+                        return nullptr;
+                    }
+                    if (const AstConst* const kc = VN_CAST(kp, Const)) {
+                        sum += kc->toSInt();
+                        VL_DO_DANGLING(kp->deleteTree(), kp);
+                    } else {
+                        restp = restp ? new AstAdd{flp, restp, kp} : kp;
+                    }
                 }
-                const AstConst* const lc = VN_CAST(lp, Const);
-                const AstConst* const rc = VN_CAST(rp, Const);
-                if (lc && rc) {
-                    const int32_t n = lc->toSInt() + rc->toSInt();
-                    VL_DO_DANGLING(lp->deleteTree(), lp);
-                    VL_DO_DANGLING(rp->deleteTree(), rp);
-                    return i32(n, flp);
-                }
-                return new AstAdd{flp, lp, rp};
+                if (!restp) return i32(sum, flp);
+                return sum ? new AstAdd{flp, restp, i32(sum, flp)} : restp;
             }
         }
         return nineResultCount(nodep, flp, depth);
@@ -17835,9 +17852,16 @@ private:
         };
         if (const AstVhdlBinary* const bp = VN_CAST(nodep, VhdlBinary)) {
             if (bp->op() == VhdlBinaryOp::CONCAT) {
-                const int64_t l = oneOf(bp->lhsp());
-                const int64_t r = oneOf(bp->rhsp());
-                return l > 0 && r > 0 ? l + r : -1;
+                // Along the joining's own left side without going deeper:
+                // "n & n & ... & n" of thirty-two elements is as deep as it
+                // is long
+                int64_t sum = 0;
+                for (const AstNodeVhdlExpr* const partp : concatParts(bp)) {
+                    const int64_t k = oneOf(partp);
+                    if (k < 1) return -1;
+                    sum += k;
+                }
+                return sum;
             }
             if (!ninePlanned(nodep)) return -1;
             if (!vectorish(bp->lhsp())) return nineStaticCount(bp->rhsp(), depth + 1);
