@@ -292,6 +292,25 @@ class PremitVisitor final : public VNVisitor {
 
 #undef START_STATEMENT_OR_RETURN
 
+    void visit(AstExprStmt* nodep) override {
+        iterateAndNextNull(nodep->stmtsp());
+        // The result is evaluated after the statements, so a temporary taken
+        // from it must be assigned after them too, not before the enclosing
+        // statement, where it would read what the statements then change
+        if (!m_stmtp || !nodep->stmtsp()) {
+            iterateAndNextNull(nodep->resultp());
+            return;
+        }
+        AstComment* const markp = new AstComment{nodep->fileline(), ""};
+        nodep->addStmtsp(markp);
+        {
+            VL_RESTORER(m_stmtp);
+            m_stmtp = markp;
+            iterateAndNextNull(nodep->resultp());
+        }
+        VL_DO_DANGLING(markp->unlinkFrBack()->deleteTree(), markp);
+    }
+
     // VISITORS - Expressions
     void visit(AstShiftL* nodep) override { visitShift(nodep); }
     void visit(AstShiftR* nodep) override { visitShift(nodep); }
