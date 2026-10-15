@@ -222,6 +222,7 @@ class VhdlLowerVisitor final {
     // Lowering a built-in procedure's actuals, any of which it may write
     bool m_checkAsCall = false;
     bool m_inStmts = false;  // Lowering the statements of a process or subprogram
+    bool m_nineWarningDropped = false;  // A native warning had no statement to go in
     const AstVhdlCall* m_dirReportedp = nullptr;  // Slice whose direction check is made
     bool m_emitForUnit = false;  // Building something the unit will hold
     // The names those classes have been given. A generic package instantiated
@@ -17351,7 +17352,10 @@ private:
     // made into the expression where statements can be written
     AstNodeExpr* withNineWarning(AstNodeExpr* outp, const NineArg& a, const NineArg* bp,
                                  const std::string& msg, FileLine* flp) {
-        if (!m_inStmts) return outp;
+        if (!m_inStmts) {
+            m_nineWarningDropped = true;
+            return outp;
+        }
         const std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
                                    + std::to_string(flp->firstColumn())
                                    + ":@%0t:(assertion warning): " + msg;
@@ -24246,12 +24250,13 @@ private:
                 reports = true;
             }
         });
-        // One that only reports runs once and then waits on what it reads,
-        // over and over -- the process it is equivalent to (11.5). An event
+        // One that reports runs once and then waits on what it reads, over
+        // and over -- the process it is equivalent to (11.5, 11.6). An event
         // control at the head of a block would also wake as the design
-        // starts, and report a second time what the first run did.
-        if (reports && !schedules && writtenp.empty() && allKnown
-            && v3Global.opt.timing().isTrue()) {
+        // starts, and report a second time what the first run did: twice
+        // at time zero the warning a native comparison gives over a
+        // metavalue in "less <= '1' when free < 3 else '0'".
+        if (reports && allKnown && v3Global.opt.timing().isTrue()) {
             if (AstSenTree* const senp = sensitivityOfBody(bodyp, flp)) {
                 AstNode* const loopp = AstNode::addNext(
                     bodyp, static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
@@ -29447,6 +29452,8 @@ private:
             emitWaveformProcess(outp, readsp, flp);
             return;
         }
+        VL_RESTORER(m_nineWarningDropped);
+        m_nineWarningDropped = false;
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         if (!lhsp) return;
         AstNodeExpr* rhsp = nullptr;
@@ -29458,6 +29465,25 @@ private:
             break;
         case VhdlAssignKind::CONDITIONAL: rhsp = conditionalValue(nodep); break;
         case VhdlAssignKind::SELECTED: rhsp = selectedValue(nodep); break;
+        }
+        // A native operation that warns when an operand holds a metavalue
+        // -- numeric_std's comparisons, TO_INTEGER -- has nowhere to say so
+        // in a continuous assignment. The statement is the process it is
+        // defined to be (11.6), which says it each time it runs, as the
+        // package's own assertion would.
+        if (m_nineWarningDropped && rhsp && oneUndelayed && !nodep->guarded()) {
+            VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
+            VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
+            if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
+            FileLine* const wflp = new FileLine{flp};
+            wflp->warnOff(V3ErrorCode::COMBDLY, true);
+            wflp->warnOff(V3ErrorCode::LATCH, true);
+            VL_RESTORER(m_inStmts);
+            m_inStmts = true;
+            if (AstNode* const stmtsp = lowerSeqAssign(nodep, true)) {
+                addStmt(concurrentProcess(stmtsp, nodep->postponed(), wflp));
+            }
+            return;
         }
         if (!rhsp) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
