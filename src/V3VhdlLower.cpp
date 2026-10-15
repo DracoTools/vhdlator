@@ -7651,8 +7651,21 @@ private:
         if (!symp) return false;
         symp = symp->resolved();
         if (symp->kind() != VhdlSymKind::FUNCTION) return false;
-        if (symp->predefined() || inArithmeticPackage(symp)) return false;
+        if (symp->predefined()) return false;
+        // The IEEE packages' operators are emitted natively, unless under
+        // --vhdl-metavalues one over the nine values is compiled from its body
+        if (inArithmeticPackage(symp) && !compiledOverNine(symp)) return false;
         return carriedDynamically(emittedReturnType(symp));
+    }
+    // Whether a subprogram of the IEEE packages is compiled from its body
+    // because it works over the nine values (--vhdl-metavalues)
+    static bool compiledOverNine(const VhdlSymbol* symp) {
+        if (!v3Global.opt.vhdlMetavalues() || !symp || symp->predefined()) return false;
+        if (nineValued(symp->returnTypep())) return true;
+        for (const VhdlType* const typep : symp->paramTypes()) {
+            if (nineValued(typep)) return true;
+        }
+        return false;
     }
 
     bool dynResultCall(const AstNodeVhdlExpr* nodep, int depth = 0) const {
@@ -7668,7 +7681,7 @@ private:
         // emitted natively is compiled from its body, and gives back what
         // the body was emitted to return, whatever subtype analysis gave the
         // call: "xquot := resize(quot, xquot'length)" in numeric_std's DIVMOD
-        if (inArithmeticPackage(symp) && !V3VhdlStd::isIntrinsic(symp)) {
+        if (inArithmeticPackage(symp) && compiledOverNine(symp)) {
             return carriedDynamically(emittedReturnType(symp));
         }
         const std::string& name = symp->name();
