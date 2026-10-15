@@ -17087,22 +17087,44 @@ private:
         } else {
             return nullptr;
         }
-        // Entry k is the four bits from 4k up
-        V3Number num{flp, static_cast<int>(4 * table.size()), 0};
-        num.setAllBits0();
+        // The tables tell only four classes of operand apart -- 'U'; 'X',
+        // 'Z', 'W' and '-'; '0' and 'L'; '1' and 'H' -- and give only 'U',
+        // 'X', '0' or '1', whose positions are the classes' numbers. So the
+        // lookup is two of two bits each, in constants of 32 bits, rather
+        // than one of four in a constant of 324, which the C++ writes out
+        // word by word at every use: inlined and unrolled through
+        // std_logic_arith that came to hundreds of megabytes (nvc
+        // synopsys2). Checked entry by entry; a table it does not hold for
+        // is left to the lanes.
+        static const uint32_t s_class[9] = {0, 1, 2, 3, 1, 1, 2, 3, 1};
+        const size_t n = ops.size();
+        uint32_t reduced = 0;
         for (size_t k = 0; k < table.size(); ++k) {
-            const size_t v = s_order.find(table[k]);
-            for (int b = 0; b < 4; ++b) {
-                if ((v >> b) & 1) num.setBit(static_cast<int>(4 * k + b), '1');
-            }
+            const uint32_t v = static_cast<uint32_t>(s_order.find(table[k]));
+            const uint32_t at = n == 1 ? s_class[k] : s_class[k / 9] * 4 + s_class[k % 9];
+            const uint32_t had = (reduced >> (2 * at)) & 3;
+            const bool seen
+                = n == 1 ? (k != at) : (k / 9 != s_class[k / 9] || k % 9 != s_class[k % 9]);
+            if (v > 3 || (seen && had != v)) return nullptr;
+            if (!seen) reduced |= v << (2 * at);
         }
-        const auto pos
-            = [&](const NineArg& x) { return new AstExtend{flp, nineRead(x, flp), 32}; };
+        uint32_t classes = 0;
+        for (uint32_t k = 0; k < 9; ++k) classes |= s_class[k] << (2 * k);
+        const auto lookup = [&](uint32_t bits, int width, AstNodeExpr* idxp) {
+            return new AstExtend{
+                flp,
+                new AstSel{flp, new AstConst{flp, AstConst::WidthedValue{}, width, bits},
+                           new AstMul{flp, idxp, i32(2, flp)}, 2},
+                32};
+        };
+        const auto classOf = [&](const NineArg& x) {
+            return lookup(classes, 18, new AstExtend{flp, nineRead(x, flp), 32});
+        };
         AstNodeExpr* const idxp
-            = ops.size() == 1
-                  ? static_cast<AstNodeExpr*>(pos(ops[0]))
-                  : new AstAdd{flp, new AstMul{flp, pos(ops[0]), i32(9, flp)}, pos(ops[1])};
-        return new AstSel{flp, new AstConst{flp, num}, new AstMul{flp, idxp, i32(4, flp)}, 4};
+            = n == 1 ? static_cast<AstNodeExpr*>(classOf(ops[0]))
+                     : new AstAdd{flp, new AstMul{flp, classOf(ops[0]), i32(4, flp)},
+                                  classOf(ops[1])};
+        return new AstSel{flp, lookup(reduced, n == 1 ? 8 : 32, idxp), 0, 4};
     }
 
     AstNodeExpr* nineLogical(const std::string& op, const std::vector<AstNodeVhdlExpr*>& args,
