@@ -12446,6 +12446,31 @@ private:
                            lenp->cloneTree(false), new AstConst{flp, AstConst::Signed32{}, 0}};
     }
 
+    // A slice of a vector of the nine values whose two ends elaboration
+    // settles, though they are not numbers here and analysis gave the slice
+    // no length: "addr(31 - tag_width_c downto 2 + offset_width_c)", the
+    // widths constants a generic gives through a function (neorv32's cache)
+    const AstVhdlRange* elabSliceRange(const AstNodeVhdlExpr* nodep) const {
+        const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->prefixp() || !nineValued(nodep->vhdlTypep())) return nullptr;
+        const AstVhdlRange* const rangep = VN_CAST(callp->argsp(), VhdlRange);
+        if (!rangep || rangep->nextp() || !rangep->leftp() || !rangep->rightp()) return nullptr;
+        if (rangep->dir() != VhdlDir::DOWNTO && rangep->dir() != VhdlDir::TO) return nullptr;
+        // Only ends that are not numbers here: two that are say the length
+        // themselves, which may be none -- "sv(0 to pad - 1)" in a copy of
+        // HREAD -- and a subprogram's are numbers in the copy made for a call
+        if (m_ftaskp
+            || (V3VhdlEval::eval(rangep->leftp()).isInt()
+                && V3VhdlEval::eval(rangep->rightp()).isInt())) {
+            return nullptr;
+        }
+        if (isDynValue(callp->prefixp()) || isRunningSlice(nodep)) return nullptr;
+        if (boundsOnlyRunningDecides(rangep->leftp())
+            || boundsOnlyRunningDecides(rangep->rightp())) {
+            return nullptr;
+        }
+        return rangep;
+    }
     // An alias of an external name whose subtype leaves a vector's bounds
     // open: the object it denotes has them, elaborated already (8.7)
     static bool openExternalAlias(const AstNodeVhdlExpr* nodep) {
@@ -16549,6 +16574,18 @@ private:
             return sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(sizep);
         }
         if (AstNodeExpr* const countp = nineCount(nodep->vhdlTypep(), flp)) return countp;
+        if (const AstVhdlRange* const rangep = elabSliceRange(nodep)) {
+            AstNodeExpr* const leftp = lowerExpr(rangep->leftp());
+            AstNodeExpr* const rightp = leftp ? lowerExpr(rangep->rightp()) : nullptr;
+            if (!rightp) {
+                if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                return nullptr;
+            }
+            AstNodeExpr* const spanp = rangep->dir() == VhdlDir::DOWNTO
+                                           ? new AstSub{flp, leftp, rightp}
+                                           : new AstSub{flp, rightp, leftp};
+            return atLeastOne(new AstAdd{flp, spanp, i32(1, flp)}, flp);
+        }
         if (openExternalAlias(nodep)) {
             AstNodeExpr* const objp = lowerExpr(const_cast<AstNodeVhdlExpr*>(nodep));
             return objp ? new AstAttrOf{flp, VAttrType::DIM_SIZE, objp,
@@ -17989,6 +18026,8 @@ private:
         // An alias of an external name is as long as what it denotes, which
         // the back end knows (nineOperandCount)
         if (openExternalAlias(nodep)) return true;
+        // And a slice whose ends elaboration settles, as long as they say
+        if (elabSliceRange(nodep)) return true;
         // A literal is as long as what it spells
         if (VN_IS(nodep, VhdlLiteral)) return nineLiteralCount(nodep) > 0;
         return typep->dimensions() == 1 && typep->lengthEmittable()
