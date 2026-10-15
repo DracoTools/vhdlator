@@ -24250,6 +24250,12 @@ private:
                 reports = true;
             }
         });
+        // Or calls a subprogram that does, which says so each time it is called
+        if (!reports) {
+            for (const AstNode* p = bodyp; p && !reports; p = p->nextp()) {
+                reports = callsReporting(p);
+            }
+        }
         // One that reports runs once and then waits on what it reads, over
         // and over -- the process it is equivalent to (11.5, 11.6). An event
         // control at the head of a block would also wake as the design
@@ -29280,6 +29286,32 @@ private:
         return reads;
     }
 
+    // Whether a value calls a subprogram that reports -- an assertion in
+    // its body, or in one it calls, numeric_std's warnings among them. As a
+    // continuous assignment it runs whenever the scheduler settles it, which
+    // at the start is more than once, where the process the statement is
+    // runs once (11.6)
+    static bool callsReporting(const AstNode* nodep) {
+        if (!nodep) return false;
+        std::set<const AstNodeFTask*> seen;
+        std::vector<const AstNodeFTask*> todo;
+        bool reports = false;
+        const auto collect = [&](const AstNode* fromp) {
+            fromp->foreach([&](const AstNodeFTaskRef* refp) {
+                const AstNodeFTask* const taskp = refp->taskp();
+                if (taskp && seen.insert(taskp).second) todo.push_back(taskp);
+            });
+        };
+        collect(nodep);
+        while (!todo.empty() && !reports) {
+            const AstNodeFTask* const taskp = todo.back();
+            todo.pop_back();
+            if (taskp->exists([](const AstDisplay*) { return true; })) reports = true;
+            collect(taskp);
+        }
+        return reports;
+    }
+
     void lowerConcurrentAssign(AstVhdlSigAssign* nodep) {
         FileLine* const flp = nodep->fileline();
         // The statement is a process of its own, with its own driver (11.6)
@@ -29471,7 +29503,8 @@ private:
         // in a continuous assignment. The statement is the process it is
         // defined to be (11.6), which says it each time it runs, as the
         // package's own assertion would.
-        if (m_nineWarningDropped && rhsp && oneUndelayed && !nodep->guarded()) {
+        if ((m_nineWarningDropped || callsReporting(rhsp)) && rhsp && oneUndelayed
+            && !nodep->guarded()) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
             VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
             if (delayp) VL_DO_DANGLING(delayp->deleteTree(), delayp);
