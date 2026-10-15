@@ -98,6 +98,39 @@ public:
 };
 
 //######################################################################
+// Size of a task's body once V3Unroll has had it: each loop as many times
+// over as --unroll-count allows, and no more than --unroll-stmts lets it
+// grow to. An upper bound -- a loop whose count never becomes a number is
+// written out once -- used for the copies a front end makes of one
+// subprogram per call site, whose bounds become numbers once each is inlined.
+
+class TaskUnrolledSizeVisitor final : public VNVisitorConst {
+    uint64_t m_size = 0;  // Nodes counted so far
+
+    void visit(AstLoop* nodep) override {
+        const uint64_t outer = m_size;
+        m_size = 1;
+        iterateChildrenConst(nodep);
+        const uint64_t body = m_size;
+        const uint64_t count = static_cast<uint64_t>(std::max(1, v3Global.opt.unrollCount()));
+        const uint64_t budget = static_cast<uint64_t>(std::max(1, v3Global.opt.unrollStmts()));
+        const uint64_t times = std::max<uint64_t>(1, std::min(count, budget / body));
+        constexpr uint64_t MAX_SIZE = 1ULL << 40;
+        m_size = std::min(MAX_SIZE, outer + std::min(MAX_SIZE / times, body) * times);
+    }
+    void visit(AstNode* nodep) override {
+        ++m_size;
+        iterateChildrenConst(nodep);
+    }
+
+public:
+    explicit TaskUnrolledSizeVisitor(const AstNode* nodep) {
+        iterateConst(const_cast<AstNode*>(nodep));
+    }
+    uint64_t size() const { return m_size; }
+};
+
+//######################################################################
 
 class TaskStateVisitor final : public VNVisitor {
     // NODE STATE
@@ -240,7 +273,12 @@ private:
             if (onStackp == vtxp) return 1;
         }
         stack.push_back(vtxp);
-        uint64_t size = vtxp->nodep()->nodeCount();
+        // A front end's copy per call site has its bounds as numbers once
+        // inlined, so its loops are unrolled in every copy: the multiplier
+        // that took a VHDL std_logic_arith "*" over 16 bits to 190 MB
+        const bool copy = !vtxp->nodep()->inlineFamily().empty();
+        uint64_t size
+            = copy ? TaskUnrolledSizeVisitor{vtxp->nodep()}.size() : vtxp->nodep()->nodeCount();
         for (V3GraphEdge& edge : vtxp->outEdges()) {
             TaskFTaskVertex* const calleep = edge.top()->cast<TaskFTaskVertex>();
             if (!calleep) continue;
