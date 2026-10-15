@@ -4372,6 +4372,10 @@ private:
     }
 
     AstNodeExpr* othersFillValue(AstNodeVhdlExpr* nodep) {
+        // Qualified, it is as long as the type it is qualified by, which a
+        // value written into an object must be anyway: "result :=
+        // rtype'(others => 'X')" in std_logic_arith, rtype the result's own
+        while (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) nodep = qp->valuep();
         AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
         if (!aggp) return nullptr;
         AstVhdlElemAssoc* const elemp = aggp->elemsp();
@@ -25921,6 +25925,21 @@ private:
         }
         return nullptr;
     }
+    // The port of this name of the entity an instance elaborates, which a
+    // component's declaration of it need not repeat the default of
+    const AstVhdlIfaceDecl* entityPortNamed(const std::string& modName,
+                                            const std::string& name) const {
+        const std::string lib = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
+        const auto it = m_entities.find(lib + "." + modName);
+        const AstVhdlEntity* const entp
+            = it == m_entities.end() ? nullptr : VN_CAST(it->second, VhdlEntity);
+        if (!entp) return nullptr;
+        for (const AstNode* pp = entp->portsp(); pp; pp = pp->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(pp, VhdlIfaceDecl);
+            if (ifp && VString::downcase(ifp->name()) == VString::downcase(name)) return ifp;
+        }
+        return nullptr;
+    }
     bool nineInoutPort(const AstVhdlIfaceDecl* declp, const VhdlSymbol* symp) const {
         if (!v3Global.opt.vhdlMetavalues() || !declp || !symp) return false;
         if (declp->mode() != VhdlMode::INOUT) return false;
@@ -29999,6 +30018,56 @@ private:
                         }
                     } else {
                         pinp = portExprSignal(lowerPortAssoc(asp, ++pinNum, flp), asp, label, flp);
+                    }
+                    // A signal whose one source is this output starts where
+                    // the output's driver does, at the port's default: every
+                    // signal's first value is worked out from its sources
+                    // before any process runs (14.7.5.2), and the value the
+                    // instance hands over arrives only once one has. Without
+                    // it "resetn : out std_logic := '0'" read 'U' at time zero
+                    // (GHDL gna issue30)
+                    // The default is the entity's, whose port the driver is:
+                    // the component's says nothing once the two are bound
+                    const AstVhdlIfaceDecl* const edeclp
+                        = !(bindingp && bindingp->portMapp()) && !fname.empty()
+                              ? entityPortNamed(modName, fname)
+                              : nullptr;
+                    // Only one an entity gives, whose port the driver is,
+                    // only a value that names no generic of it, and only of
+                    // a scalar: an array's "(others => '0')" is as long as the
+                    // port, which is written in the entity's terms
+                    const AstVhdlIfaceDecl* const odeclp
+                        = edeclp && edeclp->vhdlSymp() && edeclp->vhdlSymp()->typep()
+                                  && edeclp->vhdlSymp()->typep()->base()->kind()
+                                         != VhdlTypeKind::ARRAY
+                                  && edeclp->vhdlSymp()->typep()->base()->kind()
+                                         != VhdlTypeKind::RECORD
+                              ? edeclp
+                              : nullptr;
+                    bool namesGenerics = false;
+                    if (odeclp && odeclp->defaultp()) {
+                        odeclp->defaultp()->foreach([&](const AstNodeVhdlExpr* np) {
+                            const VhdlSymbol* const gsymp = np->vhdlSymp();
+                            if (gsymp && gsymp->resolved()->kind() == VhdlSymKind::GENERIC) {
+                                namesGenerics = true;
+                            }
+                        });
+                    }
+                    if (odeclp && odeclp->defaultp() && !namesGenerics
+                        && (odeclp->mode() == VhdlMode::OUT || odeclp->mode() == VhdlMode::BUFFER)
+                        && VN_IS(asp->actualp(), VhdlName) && asp->actualp()->vhdlSymp()
+                        && namesOnlyStatic(odeclp->defaultp())) {
+                        VhdlSymbol* const asymp = asp->actualp()->vhdlSymp()->resolved();
+                        const auto vIt = m_vars.find(asymp);
+                        if (asymp->kind() == VhdlSymKind::SIGNAL && asymp->driverCount() == 1
+                            && !m_drivers.count(asymp) && vIt != m_vars.end()) {
+                            if (AstNodeExpr* const initp = lowerExpr(odeclp->defaultp())) {
+                                if (AstNode* const oldp = vIt->second->valuep()) {
+                                    VL_DO_DANGLING(oldp->unlinkFrBack()->deleteTree(), oldp);
+                                }
+                                vIt->second->valuep(initp);
+                            }
+                        }
                     }
                 }
                 // An association written by position names the port at that
