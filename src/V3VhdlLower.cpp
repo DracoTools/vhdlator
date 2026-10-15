@@ -16985,6 +16985,54 @@ private:
     // The logical operators of std_logic_1164 over the nine values (9.2.2,
     // and the tables of std_logic_1164): one lane at a time, as the tables
     // say, a scalar beside a vector standing for every one of its elements
+    // std_logic_1164's tables (and_table, or_table, xor_table, not_table),
+    // left operand by row, in the order of the positions: U X 0 1 Z W L H -
+    AstNodeExpr* nineScalarTable(const std::string& op, const std::vector<AstNodeVhdlExpr*>& args,
+                                 const std::vector<NineArg>& ops, FileLine* flp) {
+        for (const AstNodeVhdlExpr* const argp : args) {
+            if (argp->vhdlTypep()->base()->kind() != VhdlTypeKind::ENUM) return nullptr;
+        }
+        static const std::string s_order = "UX01ZWLH-";
+        static const std::string s_not = "UX10XX10X";
+        static const std::map<std::string, std::string> s_tables{
+            {"and", "UU0UUU0UUUX0XXX0XX000000000UX01XX01XUX0XXX0XXUX0XXX0XX000000000UX01XX01X"
+                    "UX0XXX0XX"},
+            {"or", "UUU1UUU1UUXX1XXX1XUX01XX01X111111111UXX1XXX1XUXX1XXX1XUX01XX01X111111111"
+                   "UXX1XXX1X"},
+            {"xor", "UUUUUUUUUUXXXXXXXXUX01XX01XUX10XX10XUXXXXXXXXUXXXXXXXXUX01XX01XUX10XX10X"
+                    "UXXXXXXXX"}};
+        std::string table;
+        if (op == "not" && ops.size() == 1) {
+            table = s_not;
+        } else if (ops.size() == 2) {
+            const bool invert = op == "nand" || op == "nor" || op == "xnor";
+            const auto it = s_tables.find(invert ? op.substr(1) : op);
+            if (it == s_tables.end()) return nullptr;
+            table = it->second;
+            if (invert) {
+                for (char& c : table) c = s_not[s_order.find(c)];
+            }
+        } else {
+            return nullptr;
+        }
+        // Entry k is the four bits from 4k up
+        V3Number num{flp, static_cast<int>(4 * table.size()), 0};
+        num.setAllBits0();
+        for (size_t k = 0; k < table.size(); ++k) {
+            const size_t v = s_order.find(table[k]);
+            for (int b = 0; b < 4; ++b) {
+                if ((v >> b) & 1) num.setBit(static_cast<int>(4 * k + b), '1');
+            }
+        }
+        const auto pos
+            = [&](const NineArg& x) { return new AstExtend{flp, nineRead(x, flp), 32}; };
+        AstNodeExpr* const idxp
+            = ops.size() == 1
+                  ? static_cast<AstNodeExpr*>(pos(ops[0]))
+                  : new AstAdd{flp, new AstMul{flp, pos(ops[0]), i32(9, flp)}, pos(ops[1])};
+        return new AstSel{flp, new AstConst{flp, num}, new AstMul{flp, idxp, i32(4, flp)}, 4};
+    }
+
     AstNodeExpr* nineLogical(const std::string& op, const std::vector<AstNodeVhdlExpr*>& args,
                              FileLine* flp) {
         flp = nineFl(flp);
@@ -16997,6 +17045,15 @@ private:
         };
         for (size_t i = 0; i < args.size(); ++i) {
             if (!nineArg(args[i], ops[i], stmtsp, flp)) return fail();
+        }
+        // Of single elements, the standard's own table, read where the two
+        // positions say: a handful of nodes where the lanes take dozens,
+        // which in the long chains of "and" and "not" over STD_LOGIC that
+        // control logic is written in multiplied into minutes of V3Width
+        // (GHDL gna issue30)
+        if (AstNodeExpr* const tablep = nineScalarTable(op, args, ops, flp)) {
+            for (NineArg& arg : ops) nineDrop(arg);
+            return stmtsp ? new AstExprStmt{flp, stmtsp, tablep} : tablep;
         }
         const AstNodeExpr* countp = ops[0].countp;
         if (ops.size() == 2) {
