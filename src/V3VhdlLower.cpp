@@ -26022,6 +26022,14 @@ private:
         }
         return nullptr;
     }
+    // An array whose elements are vectors of the nine values -- not a vector
+    // of a logic type a design declares, which the option leaves alone
+    static bool arrayOfNineVectors(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        return elemp && elemp->base()->kind() == VhdlTypeKind::ARRAY && nineValued(elemp);
+    }
     // How many instances drive each signal through such an INOUT
     std::map<const VhdlSymbol*, int> m_arrayInoutDrivers;
     // An array whose elements are resolved at some level below its own --
@@ -30126,6 +30134,7 @@ private:
                         // whichever writes last, so the second is refused.
                         if (v3Global.opt.vhdlMetavalues() && fdeclp
                             && fdeclp->mode() == VhdlMode::INOUT && fsymp
+                            && arrayOfNineVectors(fsymp->typep())
                             && resolvedBelowTop(fsymp->typep()) && !nineLaneable(fsymp->typep())
                             && asp->actualp()) {
                             if (const VhdlSymbol* const asymp = rootSymOf(asp->actualp())) {
