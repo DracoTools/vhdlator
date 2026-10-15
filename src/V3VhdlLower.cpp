@@ -17296,14 +17296,29 @@ private:
         AstNodeExpr* const intp = lowerExpr(nodep);
         if (!intp) return nullptr;
         // Widened to 64 bits the way the integer's sign says
-        AstNodeExpr* const widep = sgn || isSignedType(nodep->vhdlTypep())
-                                       ? static_cast<AstNodeExpr*>(new AstExtendS{flp, intp, 64})
-                                       : static_cast<AstNodeExpr*>(new AstExtend{flp, intp, 64});
+        AstNodeExpr* const widep = intTo64(intp, sgn || isSignedType(nodep->vhdlTypep()), flp);
         return new AstCastSize{
             flp, laneSpread(widep, flp),
             new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(count * 4)}};
     }
 
+    // An integer operand at 64 bits, extended the way its sign says. A cast
+    // rather than an extension: what analysis typed an integer may still be
+    // worked out in reals -- "integer(0.25 * 2**SIZE + 0.5)", SIZE a generic,
+    // the conversion folded away (GHDL gna issue1820) -- and the back end
+    // converts such a value where it casts it, as it does without the nine
+    // values, but cannot extend it
+    static AstNodeExpr* intTo64(AstNodeExpr* intp, bool sgn, FileLine* flp) {
+        // The conversion is the one VHDL wrote, "integer(...)"
+        FileLine* const cflp = new FileLine{flp};
+        cflp->warnOff(V3ErrorCode::REALCVT, true);
+        const auto to64 = [&](AstNodeExpr* exprp) {
+            return new AstCastSize{cflp, exprp, new AstConst{cflp, AstConst::Unsized32{}, 64}};
+        };
+        // Cast first, which a real survives, and only then taken as signed
+        AstNodeExpr* const castp = to64(intp);
+        return sgn ? to64(new AstSigned{flp, castp}) : castp;
+    }
     // A count that may be zero, as one where it is: a null array is one place
     static AstNodeExpr* atLeastOne(AstNodeExpr* countp, FileLine* flp) {
         if (const AstConst* const constp = VN_CAST(countp, Const)) {
@@ -17335,9 +17350,7 @@ private:
                 return nullptr;
             }
             negative = sgn || isSignedType(nodep->vhdlTypep());
-            AstNodeExpr* const widep
-                = negative ? static_cast<AstNodeExpr*>(new AstExtendS{flp, intp, 64})
-                           : static_cast<AstNodeExpr*>(new AstExtend{flp, intp, 64});
+            AstNodeExpr* const widep = intTo64(intp, negative, flp);
             lanesp = laneSpread(widep, flp);
         }
         FileLine* const cflp = new FileLine{flp};
@@ -17726,9 +17739,7 @@ private:
                 return nullptr;
             }
             AstNodeExpr* const widep
-                = name == "to_signed" || isSignedType(args[0]->vhdlTypep())
-                      ? static_cast<AstNodeExpr*>(new AstExtendS{flp, intp, 64})
-                      : static_cast<AstNodeExpr*>(new AstExtend{flp, intp, 64});
+                = intTo64(intp, name == "to_signed" || isSignedType(args[0]->vhdlTypep()), flp);
             AstNodeExpr* const lanesp
                 = new AstSelPlus{flp, laneSpread(widep, flp), i32(0, flp),
                                  new AstMul{flp, i32(4, flp), sizep->cloneTree(false)}};
