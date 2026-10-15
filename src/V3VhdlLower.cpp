@@ -4429,8 +4429,18 @@ private:
             if (qp->vhdlTypep() && qp->vhdlTypep()->isConstrainedArray()) return nullptr;
             nodep = qp->valuep();
         }
+        if (depth > 8) return nullptr;
+        // A function called with no parentheses is a name, "q.get" for a
+        // method of a protected type (4.2.2.1)
+        if (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected)) {
+            const VhdlSymbol* const fsymp
+                = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+            if (!fsymp || fsymp->kind() != VhdlSymKind::FUNCTION) return nullptr;
+            VhdlType* const retp = emittedReturnType(fsymp);
+            return retp && retp->isConstrainedArray() ? retp : nullptr;
+        }
         const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
-        if (!callp || depth > 8) return nullptr;
+        if (!callp) return nullptr;
         const VhdlSymbol* const symp
             = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
         if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return nullptr;
