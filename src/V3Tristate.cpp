@@ -994,8 +994,35 @@ class TristateVisitor final : public TristateBaseVisitor {
         std::map<AstNode*, std::pair<AstVar*, AstVar*>> procDrivers;  // Process -> out, en
         // Only a value held as bits: an unpacked one is combined another way
         const bool packedVar = packedDType(varp->dtypep());
+        // A variable's initial value is where each process driving it starts,
+        // not a driver of its own: one driving for ever what the variable
+        // held at the start is still there, or-ed in, after a process has
+        // written "8'bzzzz0001" or "8'h34" (a VHDL signal's default is the
+        // initial value of each of its drivers, 14.7.2). Kept as a driver
+        // only where no process drives the variable at all.
+        std::vector<std::pair<AstNodeAssign*, AstNodeVarRef*>> initAsgps;
+        std::set<const AstNodeVarRef*> initRefs;
+        if (packedVar) {
+            bool otherProc = false;
+            for (auto it = beginStrength; it != endStrength; it++) {
+                AstNodeAssign* asgp = nullptr;
+                AstNode* const procp = procDriverOf(it->m_varrefp, asgp);
+                if (!procp || it->m_delayp) continue;
+                if (VN_IS(procp, InitialStatic)) {
+                    initAsgps.emplace_back(asgp, it->m_varrefp);
+                    initRefs.insert(it->m_varrefp);
+                } else {
+                    otherProc = true;
+                }
+            }
+            if (!otherProc) {
+                initAsgps.clear();
+                initRefs.clear();
+            }
+        }
         for (auto it = beginStrength; it != endStrength; it++) {
             AstNodeVarRef* const refp = it->m_varrefp;
+            if (initRefs.count(refp)) continue;
             AstNodeAssign* asgp = nullptr;
             AstNode* const procp = packedVar ? procDriverOf(refp, asgp) : nullptr;
             if (!procp || it->m_delayp) continue;
@@ -1049,9 +1076,51 @@ class TristateVisitor final : public TristateBaseVisitor {
                 if (!oldEnp->backp()) pushDeletep(oldEnp);
             }
         }
+        // The initial value, written where each process's driver starts:
+        // its value and what of it drives, as the initial assignment says
+        for (const auto& init : initAsgps) {
+            AstNodeAssign* const asgp = init.first;
+            const AstVar* const heldp = init.second->varp();
+            const auto eit = m_procEnables.find(asgp);
+            AstNodeExpr* const enValp = eit != m_procEnables.end() && eit->second
+                                            ? eit->second->cloneTree(false)
+                                            : newAllZerosOrOnes(asgp->lhsp(), true);
+            for (const auto& driver : procDrivers) {
+                AstVar* const outp = driver.second.first;
+                AstVar* const enVarp = driver.second.second;
+                AstNodeAssign* const valAsgp = asgp->cloneTree(false);
+                valAsgp->lhsp()->foreach([&](AstNodeVarRef* crefp) {
+                    if (crefp->varp() == heldp && crefp->access().isWriteOrRW()) {
+                        crefp->varp(outp);
+                    }
+                });
+                AstNodeExpr* const enLhsp = valAsgp->lhsp()->cloneTree(false);
+                enLhsp->foreach([&](AstNodeVarRef* crefp) {
+                    if (crefp->varp() == outp) crefp->varp(enVarp);
+                });
+                valAsgp->foreach([](AstNode* np) { np->user1p(nullptr); });
+                enLhsp->foreach([](AstNode* np) { np->user1p(nullptr); });
+                AstAssign* const enAsgp
+                    = new AstAssign{asgp->fileline(), enLhsp, enValp->cloneTree(false)};
+                valAsgp->user2Or(U2_NONGRAPH | U2_GRAPHING);
+                enAsgp->user2Or(U2_NONGRAPH | U2_GRAPHING);
+                asgp->addNextHere(enAsgp);
+                asgp->addNextHere(valAsgp);
+            }
+            VL_DO_DANGLING(pushDeletep(enValp), enValp);
+            // The assignment itself drives nothing now
+            asgp->lhsp()->foreach([this](AstNodeVarRef* crefp) {
+                if (AstNode* const oldEnp = crefp->user1p()) {
+                    crefp->user1p(nullptr);
+                    if (!oldEnp->backp()) pushDeletep(oldEnp);
+                }
+            });
+            pushDeletep(asgp->unlinkFrBack());
+        }
 
         for (auto it = beginStrength; it != endStrength; it++) {
             AstNodeVarRef* refp = it->m_varrefp;
+            if (initRefs.count(refp)) continue;
             {
                 AstNodeAssign* asgp = nullptr;
                 if (packedVar && !it->m_delayp && procDriverOf(refp, asgp)) continue;
