@@ -13487,6 +13487,13 @@ private:
             // (4.3), and every subprogram that reads it reads that one --
             // otherwise each gets a copy of its own and the copies collide
             // wherever two of those subprograms end up together
+            // A subprogram's own constant is given storage beside the
+            // module's, and each copy made of the subprogram gives it again
+            // -- with a value of its own, since the copy may fold it
+            // differently -- so each is a name of its own: two of one name
+            // in a module leave one deleted under the references to it
+            // (GHDL gna issue2626)
+            if (m_ftaskp) varp->name(varp->name() + "__Vk" + std::to_string(++m_tempNum));
             m_stmtsp = AstNode::addNextNull(m_stmtsp, varp);
         }
         return varp;
