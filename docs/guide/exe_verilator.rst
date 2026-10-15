@@ -2176,16 +2176,18 @@ Summary:
    generics of a Verilog module instantiated from VHDL, and waveforms. A
    Verilog output is ``'0'`` or ``'1'`` in VHDL. An ``inout`` port of the
    top-level entity reads what the design drives on it, and gives that out.
-   Over VPI an element is one
-   bit; ``vpiBinStrVal`` reads and writes the nine characters, as other VHDL
-   simulators give them to cocotb, and the other formats read ``'Z'`` as z
-   and ``'U'``, ``'X'``, ``'W'`` and ``'-'`` as x.
+   Over VPI an element is one bit; ``vpiBinStrVal`` reads and writes the
+   nine characters, as other VHDL simulators give them to cocotb, and the
+   other formats read ``'Z'`` as z and ``'U'``, ``'X'``, ``'W'`` and ``'-'``
+   as x.
 
    With :vlopt:`--no-vhdl-metavalues` each element is one bit: ``'H'``
    reads as ``'1'``, ``'L'`` as ``'0'``, and ``'U'``, ``'X'``, ``'W'`` and
    ``'-'`` as ``'0'``, which is faster but loses what those values say.
 
-   This is work in progress, and defaults to disabled while it is.
+   The nine values are kept by default. A signal of an array of resolved
+   vectors that several instances drive through ``inout`` ports is not
+   supported with them yet; :vlopt:`--no-vhdl-metavalues` resolves it.
 
 .. option:: --vhdl-std <std>
 
