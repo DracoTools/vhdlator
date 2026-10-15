@@ -5334,6 +5334,9 @@ private:
         if (AstNodeExpr* const joinedp = aggregateOfArraysCarrier(nodep, carrierTypep, flp)) {
             return joinedp;
         }
+        if (AstNodeExpr* const extp = externalAliasCarrier(nodep, carrierTypep, flp)) {
+            return extp;
+        }
         if (AstNodeExpr* const movingp = movingSliceCarrier(nodep, carrierTypep, flp)) {
             return movingp;
         }
@@ -12443,6 +12446,65 @@ private:
                            lenp->cloneTree(false), new AstConst{flp, AstConst::Signed32{}, 0}};
     }
 
+    // An alias of an external name whose subtype leaves a vector's bounds
+    // open: the object it denotes has them, elaborated already (8.7)
+    static bool openExternalAlias(const AstNodeVhdlExpr* nodep) {
+        if (!VN_IS(nodep, VhdlName)) return false;
+        const VhdlSymbol* const symp = nodep->vhdlSymp();
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return false;
+        const AstVhdlAliasDecl* const adp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!adp || !VN_IS(adp->targetp(), VhdlExternalName)) return false;
+        const VhdlType* const typep = symp->typep();
+        return typep && typep->base()->kind() == VhdlTypeKind::ARRAY && !typep->lengthEmittable()
+               && typep->dimensions() == 1;
+    }
+    // An alias of an external name whose subtype leaves the bounds open,
+    // made into a carrier: the object it denotes has them, asked of it as
+    // the back end knows its dimension, and its elements are copied one at
+    // a time -- "to_hstring(bid)", bid "<< signal i_th.bid :
+    // std_logic_vector >>", given to a body compiled with a carried
+    // parameter under --vhdl-metavalues (t_vhdl_extforce)
+    AstNodeExpr* externalAliasCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep,
+                                      FileLine* flp) {
+        if (!carrierTypep || !m_inStmts || !openExternalAlias(nodep)) return nullptr;
+        AstNodeExpr* const objp = lowerExpr(nodep);
+        if (!objp) return nullptr;
+        const auto attr = [&](VAttrType kind) {
+            return new AstAttrOf{flp, kind, objp->cloneTree(false),
+                                 new AstConst{flp, AstConst::Signed32{}, 1}};
+        };
+        AstVar* const tmpp = newTempVar("__Vextc", dynCarrierRef(carrierTypep, flp), flp);
+        AstVar* const np = newTempVar("__Vextn", newIntDType(flp), flp);
+        AstVar* const kp = newTempVar("__Vextk", newIntDType(flp), flp);
+        const auto part = [&](const char* name, VAccess access) {
+            return dynPart(new AstVarRef{flp, tmpp, access}, name, flp);
+        };
+        AstNode* stmtsp
+            = new AstAssign{flp, part("lft", VAccess::WRITE), attr(VAttrType::DIM_LEFT)};
+        stmtsp->addNext(
+            new AstAssign{flp, part("rgt", VAccess::WRITE), attr(VAttrType::DIM_RIGHT)});
+        stmtsp->addNext(new AstAssign{
+            flp, part("dsc", VAccess::WRITE),
+            new AstGtS{flp, part("lft", VAccess::READ), part("rgt", VAccess::READ)}});
+        stmtsp->addNext(new AstAssign{flp, wr(np, flp), attr(VAttrType::DIM_SIZE)});
+        stmtsp->addNext(new AstAssign{flp, part("q", VAccess::WRITE),
+                                      new AstNewDynamic{flp, rd(np, flp), nullptr}});
+        stmtsp->addNext(new AstAssign{flp, wr(kp, flp), i32(0, flp)});
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{flp, loopp, new AstLtS{flp, rd(kp, flp), rd(np, flp)}});
+        AstNodeExpr* const atp
+            = new AstCond{flp, part("dsc", VAccess::READ),
+                          new AstSub{flp, part("lft", VAccess::READ), rd(kp, flp)},
+                          new AstAdd{flp, part("lft", VAccess::READ), rd(kp, flp)}};
+        loopp->addStmtsp(new AstAssign{flp,
+                                       new AstSelBit{flp, part("q", VAccess::WRITE), rd(kp, flp)},
+                                       new AstSelBit{flp, objp, atp}});
+        loopp->addStmtsp(
+            new AstAssign{flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}});
+        stmtsp->addNext(loopp);
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
+    }
+
     // "x'length" and "x'element'length" of an alias of an external name
     // whose subtype indication leaves the bounds open: the object it denotes
     // has them, and is elaborated already (8.7), so they are asked of it --
@@ -16487,6 +16549,12 @@ private:
             return sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(sizep);
         }
         if (AstNodeExpr* const countp = nineCount(nodep->vhdlTypep(), flp)) return countp;
+        if (openExternalAlias(nodep)) {
+            AstNodeExpr* const objp = lowerExpr(const_cast<AstNodeVhdlExpr*>(nodep));
+            return objp ? new AstAttrOf{flp, VAttrType::DIM_SIZE, objp,
+                                        new AstConst{flp, AstConst::Signed32{}, 1}}
+                        : nullptr;
+        }
         if (const AstNodeVhdlExpr* const innerp = nineConverted(nodep)) {
             return nineOperandCount(innerp, flp, depth + 1);
         }
@@ -17850,6 +17918,9 @@ private:
         }
         if (isDynValue(nodep)) return false;
         if (typep->base()->kind() == VhdlTypeKind::ENUM) return true;
+        // An alias of an external name is as long as what it denotes, which
+        // the back end knows (nineOperandCount)
+        if (openExternalAlias(nodep)) return true;
         // A literal is as long as what it spells
         if (VN_IS(nodep, VhdlLiteral)) return nineLiteralCount(nodep) > 0;
         return typep->dimensions() == 1 && typep->lengthEmittable()
