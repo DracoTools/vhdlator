@@ -14197,7 +14197,18 @@ private:
             arp = aidx ? VN_CAST(aidx->boundsp(), VhdlRange) : nullptr;
         }
         const AstVhdlCall* const tcallp = VN_CAST(declp->targetp(), VhdlCall);
-        const AstVhdlRange* const trp = tcallp ? VN_CAST(tcallp->argsp(), VhdlRange) : nullptr;
+        const AstVhdlRange* trp = tcallp ? VN_CAST(tcallp->argsp(), VhdlRange) : nullptr;
+        // An object named whole has the range its subtype writes: std_logic_1164's
+        // "alias lv : STD_ULOGIC_VECTOR (1 to l'length) is l" in a copy made for
+        // "addr(31 downto lsb)", lsb a generic
+        if (!tcallp && VN_IS(declp->targetp(), VhdlName)) {
+            const VhdlType* const ttp = declp->targetp()->vhdlTypep();
+            const VhdlType* const tidx
+                = ttp && ttp->base()->kind() == VhdlTypeKind::ARRAY && ttp->dimensions() == 1
+                      ? ttp->indexTypes()[0]
+                      : nullptr;
+            trp = tidx ? VN_CAST(tidx->boundsp(), VhdlRange) : nullptr;
+        }
         if (!arp || arp->nextp() || !trp || trp->nextp()) return false;
         if (!arp->leftp() || !arp->rightp() || !trp->leftp() || !trp->rightp()) return false;
         shift.fromLeftVp = arp->leftp();
@@ -14274,7 +14285,8 @@ private:
                 shifted = aliasMapping(symp, declp, shift.fromLeft, shift.toLeft, shift.step);
                 // Bounds that are not numbers here leave the two numberings
                 // to be related by the ranges as written
-                if (!shifted && !numericallyBounded(symp->typep())) {
+                if (!shifted
+                    && (!numericallyBounded(symp->typep()) || !numericallyBounded(targetTypep))) {
                     shifted = aliasMappingExpr(symp, declp, shift);
                 }
             } else {
