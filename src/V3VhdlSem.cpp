@@ -15462,6 +15462,33 @@ void VhdlSemVisitor::checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* un
                                          + tsymp->name() + ", which has none, gives it none");
             }
         }
+        // Nor from a function's result, or an operator's, where the function
+        // is declared to return a type that leaves its index open: such an
+        // expression has no globally static subtype, which an unconstrained
+        // formal needs of its actual (6.5.6.3). nvc 1.22.1 and GHDL 7.0.0-dev
+        // refuse "reg_i => to_slv(int, 2)", "reg_i => inv(s)" and "reg_i => s
+        // and s"; Questa 2025.2 refuses the first (GHDL gna issue916)
+        if (!m_inSpecialized && asp->actualp() && writtenBare(formalp->subtypep())
+            && formalp->subtypep()->typeMarkp()
+            && markLeavesIndexOpen(formalp->subtypep()->typeMarkp()->vhdlSymp())
+            && (VN_IS(asp->actualp(), VhdlCall) || VN_IS(asp->actualp(), VhdlBinary)
+                || VN_IS(asp->actualp(), VhdlUnary))) {
+            const VhdlSymbol* const fsymp
+                = asp->actualp()->vhdlSymp() ? asp->actualp()->vhdlSymp()->resolved() : nullptr;
+            const AstVhdlSubprogDecl* const fdeclp
+                = fsymp && fsymp->kind() == VhdlSymKind::FUNCTION
+                      ? VN_CAST(fsymp->declp(), VhdlSubprogDecl)
+                      : nullptr;
+            const AstVhdlName* const retp
+                = fdeclp ? VN_CAST(fdeclp->returnTypep(), VhdlName) : nullptr;
+            if (retp && markLeavesIndexOpen(retp->vhdlSymp())) {
+                err(asp->actualp()->fileline(),
+                    "Port '" + portp->name()
+                        + "' takes its bounds from its actual, and the result of '" + fsymp->name()
+                        + "', of " + retp->name()
+                        + ", which has none, gives it none (IEEE 1076-2008 6.5.6.3)");
+            }
+        }
         const ObjInfo info = objectOfName(asp->actualp());
         if (info.cls != ObjClass::SIGNAL || !info.symp) continue;
         const VhdlMode fmode = formalp->mode();
