@@ -1311,30 +1311,44 @@ class DelayedVisitor final : public VNVisitor {
         // of all NBA targets in this process. Note this is a bit of a sledgehammer, we should only
         // need those that directly precede the NBA in control flow, but that is hard to compute,
         // so we will hammer away.
-
-        // First gather all senItems
         AstSenItem* senItemp = nullptr;
         if (addInitialTrigger) {
             senItemp = new AstSenItem{nodep->fileline(), AstSenItem::InitialNBA{}};
             ++m_nInitialNBA;
         }
-
+        addTimingDomains(firstNBAAddedIndex, senItemp);
+    }
+    // Add the timing domains gathered so far, and 'senItemp' (consumed), as sensitivities of the
+    // targets of the NBAs recorded from 'firstNBAIndex' on, and forget them
+    void addTimingDomains(size_t firstNBAIndex, AstSenItem* senItemp) {
         for (const AstSenTree* const domainp : m_timingDomains) {
             if (domainp->sensesp())
                 senItemp = AstNode::addNext(senItemp, domainp->sensesp()->cloneTree(true));
         }
         m_timingDomains.clear();
-        // Add them to all nba targets we gathered in this process
-        for (size_t i = firstNBAAddedIndex; i < m_nbas.size(); ++i) {
+        if (!senItemp) return;
+        for (size_t i = firstNBAIndex; i < m_nbas.size(); ++i) {
             m_vscpInfo(m_nbas[i].vscp).addSensitivity(senItemp);
         }
-        // Done with these
         VL_DO_DANGLING(senItemp->deleteTree(), senItemp);
     }
     void visit(AstFork* nodep) override {
         VL_RESTORER(m_inSuspendableOrFork);
         m_inSuspendableOrFork = true;
+        if (!nodep->joinType().joinNone()) {
+            iterateChildren(nodep);
+            return;
+        }
+        // The branches of a fork...join_none run as processes of their own: the parent goes on
+        // without them, so what they wait for does not resume the parent, and the NBAs of the
+        // parent do not commit on it. Were they to, an NBA target of the parent would be copied
+        // again, before the commit, whenever a branch resumed, losing the value assigned.
+        VInsertionSet<AstSenTree*> parentDomains;
+        std::swap(parentDomains, m_timingDomains);
+        const size_t firstNBAIndex = m_nbas.size();
         iterateChildren(nodep);
+        addTimingDomains(firstNBAIndex, nullptr);
+        std::swap(parentDomains, m_timingDomains);
     }
     // The timing domains a function may suspend on: those it awaits itself, and those of the
     // functions it calls. A function being worked out answers what is known of it so far,
