@@ -129,7 +129,9 @@ EvalLoop createEvalLoop(
     bool slow,  // Should create slow functions
     const TriggerKit& trigKit,  // The trigger kit
     AstVarScope* trigp,  // The trigger vector - may be nullptr if no triggers or using 'condp'
-    AstNodeExpr* condp,  // Explicit condition that must be true to run 'phaseWorkp'
+    // Explicit condition that must be true to run 'phaseWorkp'. If 'trigp' is also given, it is
+    // only dumped when the loop does not converge.
+    AstNodeExpr* condp,
     AstNodeStmt* innerp,  // The inner loop, if any
     AstNodeStmt* phasePrepp,  // Prep statements run before checking triggers
     AstNodeStmt* phaseWorkp,  // The work to do if anything triggered
@@ -138,8 +140,6 @@ EvalLoop createEvalLoop(
     // and must be unmodified otherwise.
     std::function<AstNodeStmt*(AstVarScope*)> phaseExtra = [](AstVarScope*) { return nullptr; }  //
 ) {
-    UASSERT(!trigp || !condp, "Cannot use both 'trigp' and 'condp' in 'createEvalLoop'");
-
     // All work is under a trigger or condition, so if there are none,
     // there is nothing to do besides executing the inner loop.
     if (!trigp && !condp) return {nullptr, innerp};
@@ -655,6 +655,80 @@ AstNode* createInputCombLoop(AstNetlist* netlistp, AstCFunc* const initFuncp,
 }
 
 //============================================================================
+// The condition under which the 'act' region has work to do: some trigger fired that the 'act'
+// logic or the timing schedulers act on. A trigger only the later regions act on is latched for
+// them, and does not need another pass of the 'act' loop: nothing ran, so computing the
+// triggers again would find none fired. 'timingSenTreeps' are the timing schedulers'
+// sensitivities: some schedulers are resumed whatever fired, so nothing reads their trigger.
+// Returns nullptr if the triggers are read other than as constant bit tests, in which case any
+// trigger has to count.
+
+AstNodeExpr* createActWorkCondition(AstNetlist* netlistp, const TriggerKit& trigKit,
+                                    const std::vector<const AstSenTree*>& timingSenTreeps) {
+    AstVarScope* const vscp = trigKit.vscp();
+    if (!vscp) return nullptr;  // No triggers, so no work either
+    const AstUnpackArrayDType* const dtypep = VN_AS(vscp->dtypep(), UnpackArrayDType);
+    std::vector<uint64_t> masks(dtypep->elementsConst(), 0);
+
+    // The trigger computation reads the vector as a whole, and is not a consumer
+    std::unordered_set<const AstCFunc*> computep;
+    std::vector<const AstCFunc*> pending;
+    if (trigKit.compBasep()) pending.push_back(trigKit.compBasep());
+    if (trigKit.compExtp()) pending.push_back(trigKit.compExtp());
+    while (!pending.empty()) {
+        const AstCFunc* const funcp = pending.back();
+        pending.pop_back();
+        if (!computep.insert(funcp).second) continue;
+        funcp->foreach([&](const AstNodeCCall* callp) {
+            if (callp->funcp()) pending.push_back(callp->funcp());
+        });
+    }
+
+    bool unknown = false;
+    const auto addBits = [&](const AstVarRef* refp) {
+        if (unknown || refp->varScopep() != vscp) return;
+        // Setting a trigger (as initialization does) is not acting on it
+        if (refp->access().isWriteOnly()) return;
+        const AstArraySel* const selp = VN_CAST(refp->backp(), ArraySel);
+        const AstConst* const idxp = selp ? VN_CAST(selp->bitp(), Const) : nullptr;
+        if (!refp->access().isReadOnly() || !idxp || selp->fromp() != refp) {
+            unknown = true;
+            return;
+        }
+        const uint32_t word = idxp->toUInt();
+        UASSERT_OBJ(word < masks.size(), refp, "Trigger word out of range");
+        uint64_t mask = ~uint64_t{0};
+        if (const AstAnd* const andp = VN_CAST(selp->backp(), And)) {
+            const AstConst* constp = VN_CAST(andp->lhsp(), Const);
+            if (!constp) constp = VN_CAST(andp->rhsp(), Const);
+            if (constp) mask = constp->num().toUQuad();
+        }
+        masks[word] |= mask;
+    };
+    netlistp->foreach([&](const AstCFunc* funcp) {
+        if (!unknown && !computep.count(funcp)) funcp->foreach(addBits);
+    });
+    for (const AstSenTree* const senTreep : timingSenTreeps) senTreep->foreach(addBits);
+    if (unknown) return nullptr;
+
+    FileLine* const flp = netlistp->topScopep()->fileline();
+    const int wordWidth = static_cast<int>(TriggerKit::WORD_SIZE);
+    AstNodeExpr* condp = nullptr;
+    for (size_t word = 0; word < masks.size(); ++word) {
+        if (!masks[word]) continue;
+        AstNodeExpr* const wordp = new AstArraySel{flp, new AstVarRef{flp, vscp, VAccess::READ},
+                                                   static_cast<int>(word)};
+        AstConst* const maskp = new AstConst{flp, AstConst::WidthedValue{}, wordWidth, 0};
+        maskp->num().setQuad(masks[word]);
+        AstNodeExpr* const firedp
+            = new AstNeq{flp, new AstAnd{flp, maskp, wordp},
+                         new AstConst{flp, AstConst::WidthedValue{}, wordWidth, 0}};
+        condp = condp ? new AstOr{flp, condp, firedp} : firedp;
+    }
+    return condp ? condp : new AstConst{flp, AstConst::BitFalse{}};
+}
+
+//============================================================================
 // EvalKit groups items that have to be passed to createEval() for a given eval region
 
 struct EvalKit final {
@@ -684,15 +758,20 @@ void createEval(AstNetlist* netlistp,  //
     // Grab the delay scheduler variable, if any
     AstVarScope* const delaySchedVscp = timingKit.getDelayScheduler(netlistp);
 
+    // The timing schedulers' sensitivities, before 'createResume' consumes them
+    std::vector<const AstSenTree*> timingSenTreeps;
+    for (const auto& pair : timingKit.m_lbs) timingSenTreeps.push_back(pair.second->sentreep());
+
     // 'createResume' consumes the contents that 'createReady' needs, so do the right order
     AstCCall* const timingReadyp = timingKit.createReady(netlistp);
     AstCCall* const timingResumep = timingKit.createResume(netlistp);
 
     // Create the active eval loop
+    AstNodeExpr* const actWorkCondp = createActWorkCondition(netlistp, trigKit, timingSenTreeps);
     EvalLoop topLoop = createEvalLoop(  //
         netlistp, "act", "Active", /* slow: */ false, trigKit,
-        // Use trigger
-        actKit.m_vscp, nullptr,
+        // Use trigger, but only run if a trigger the 'act' region uses fired
+        actKit.m_vscp, actWorkCondp,
         // Inner loop statements
         nullptr,
         // Prep statements
@@ -705,6 +784,12 @@ void createEval(AstNetlist* netlistp,  //
             if (timingReadyp) stmtsp = AstNode::addNext(stmtsp, timingReadyp->makeStmt());
             if (AstVarScope* const vscAccp = trigKit.vscAccp()) {
                 stmtsp = AstNode::addNext(stmtsp, trigKit.newOrIntoCall(actKit.m_vscp, vscAccp));
+                // Consumed, clear the accumulator
+                AstCMethodHard* const cCallp = new AstCMethodHard{
+                    flp, new AstVarRef{flp, vscAccp, VAccess::WRITE}, VCMethod::UNPACKED_FILL,
+                    new AstConst{flp, AstConst::Unsized64{}, 0}};
+                cCallp->dtypeSetVoid();
+                stmtsp = AstNode::addNext(stmtsp, cCallp->makeStmt());
             }
             stmtsp = AstNode::addNext(stmtsp, trigKit.newCompExtCall(nbaKit.m_vscp));
             stmtsp = AstNode::addNext(stmtsp, dumpp);
@@ -716,13 +801,6 @@ void createEval(AstNetlist* netlistp,  //
         // Work statements
         [&]() {
             AstNodeStmt* workp = nullptr;
-            if (AstVarScope* const actAccp = trigKit.vscAccp()) {
-                AstCMethodHard* const cCallp = new AstCMethodHard{
-                    flp, new AstVarRef{flp, actAccp, VAccess::WRITE}, VCMethod::UNPACKED_FILL,
-                    new AstConst{flp, AstConst::Unsized64{}, 0}};
-                cCallp->dtypeSetVoid();
-                workp = AstNode::addNext(workp, cCallp->makeStmt());
-            }
             // Resume triggered timing schedulers
             if (timingResumep) workp = AstNode::addNext(workp, timingResumep->makeStmt());
             // Invoke the 'act' function

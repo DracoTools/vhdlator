@@ -42,7 +42,6 @@
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}         No 'act' region triggers active
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_orInto__act_vec_vec
--V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}+    Vt_timing_eval_act___024root___eval_phase__inact
 -V{t#,#}+    Vt_timing_eval_act___024root___eval_phase__nba
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
@@ -59,7 +58,6 @@
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}         'act' region trigger index 3 is active: @([true] __VdlySched.awaitingCurrentTime())
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_orInto__act_vec_vec
--V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}+    Vt_timing_eval_act___024root___timing_resume
 -V{t#,#}         No process to resume waiting for @([event] t.a)
 -V{t#,#}         Not triggered processes waiting for @([event] t.a):
@@ -92,7 +90,6 @@
 -V{t#,#}         'act' region trigger index 0 is active: @([event] t.a)
 -V{t#,#}         'act' region trigger index 1 is active: @(posedge t.clk_inv)
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_orInto__act_vec_vec
--V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}+    Vt_timing_eval_act___024root___timing_resume
 -V{t#,#}         Moving to resume queue processes waiting for @([event] t.a):
 -V{t#,#}           - Process waiting at t/t_timing_eval_act.v:18
@@ -136,7 +133,6 @@
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}         'act' region trigger index 2 is active: @([event] t.e)
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_orInto__act_vec_vec
--V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}+    Vt_timing_eval_act___024root___timing_resume
 -V{t#,#}         Moving to resume queue processes waiting for @([event] t.e):
 -V{t#,#}           - Process waiting at t/t_timing_eval_act.v:34
@@ -162,7 +158,6 @@
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}         No 'act' region triggers active
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_orInto__act_vec_vec
--V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}+    Vt_timing_eval_act___024root___eval_phase__inact
 -V{t#,#}+    Vt_timing_eval_act___024root___eval_phase__nba
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
@@ -177,7 +172,6 @@
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}         No 'act' region triggers active
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_orInto__act_vec_vec
--V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
 -V{t#,#}+    Vt_timing_eval_act___024root___eval_phase__inact
 -V{t#,#}+    Vt_timing_eval_act___024root___eval_phase__nba
 -V{t#,#}+    Vt_timing_eval_act___024root___trigger_anySet__act
