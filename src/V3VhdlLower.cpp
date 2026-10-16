@@ -24760,8 +24760,10 @@ private:
         return outp ? outp : new AstConst{flp, AstConst::String{}, text};
     }
 
-    // A port with a conversion written on its formal: the port is a signal of
-    // its own, what it drives reaches the actual through the conversion, and
+    // A port with a conversion written on its formal -- or none, outConvp
+    // null, for a port that is a source of its actual all the same: the port
+    // is a signal of its own, what it drives reaches the actual through the
+    // conversion, and
     // -- where a conversion is written on the actual as well -- what the port
     // itself holds is what that conversion makes of the actual (6.5.7.1).
     void lowerConvertedPort(VhdlSymbol* symp, AstVhdlIfaceDecl* ifp, AstNodeVhdlExpr* outConvp,
@@ -24794,7 +24796,9 @@ private:
         // The conversion is applied to what the port drives, which where the
         // port holds something else is the driver's own value
         if (drvp) m_vars[symp] = drvp;
-        AstNodeExpr* const convValuep = lowerExpr(outConvp);
+        // With no conversion, what reaches the actual is the port itself
+        AstNodeExpr* const convValuep
+            = outConvp ? lowerExpr(outConvp) : new AstVarRef{flp, varp, VAccess::READ};
         if (drvp) m_vars[symp] = varp;
         if (!convValuep) {
             VL_DO_DANGLING(targetp->deleteTree(), targetp);
@@ -24887,6 +24891,7 @@ private:
             AstNodeVhdlExpr* actualp = nullptr;
             AstNodeVhdlExpr* outConvp = nullptr;  // "f(port) => actual" (6.5.7.1)
             bool inertial = false;
+            bool drives = false;  // A source of its actual (analyzeDrivers)
             for (size_t i = 0; i < assocs.size(); ++i) {
                 const AstVhdlName* const namep = VN_CAST(assocs[i]->formalp(), VhdlName);
                 AstVhdlCall* const convp = VN_CAST(assocs[i]->formalp(), VhdlCall);
@@ -24898,6 +24903,7 @@ private:
                 if (byName || byConv || (!assocs[i]->formalp() && i == position)) {
                     actualp = assocs[i]->actualp();
                     inertial = assocs[i]->inertial();
+                    drives = assocs[i]->drives();
                     if (byConv) outConvp = assocs[i]->formalp();
                     break;
                 }
@@ -24996,6 +25002,18 @@ private:
                     varp->varType(VVarType::LPARAM);
                 }
                 continue;
+            }
+            // A port of mode out the analysis made a source of its actual is
+            // a signal of its own, which the actual follows as it would
+            // through a conversion
+            if (!isGeneric && !inertial && drives && VN_IS(actualp, VhdlName)) {
+                if (AstNodeExpr* const targetp = lowerExpr(actualp)) {
+                    if (isAssignable(targetp)) {
+                        lowerConvertedPort(symp, ifp, nullptr, nullptr, actualp, targetp, flp);
+                        continue;
+                    }
+                    VL_DO_DANGLING(targetp->deleteTree(), targetp);
+                }
             }
             // The actual is looked at before the formal has a variable, so
             // that a formal of the same name cannot stand in for it

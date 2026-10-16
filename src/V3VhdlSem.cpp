@@ -8192,6 +8192,34 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     // (6.5.6.3), so a process inside the block driving the port is one of
     // the signal's drivers
     std::map<const VhdlSymbol*, const VhdlSymbol*> portSignals;
+    // -- but a port of mode out or buffer is a signal of its own, whose
+    // effective value is its driving value (14.7.3.3) and which is one
+    // source of its actual (14.7.3.2). Where the actual is resolved and has
+    // sources outside the block as well, that shows: the port reads what the
+    // block drives rather than what the sources add up to, and a port nothing
+    // inside drives still drives its default. Such a port is then one driver
+    // of the actual, as one with a conversion on its formal is, which the
+    // first walk finds and the second one counts. Under --vhdl-metavalues,
+    // and only for a port with at most one source inside, whose value is
+    // then that source's.
+    std::set<const VhdlSymbol*> ownPorts;
+    struct OwnCandidate final {
+        const VhdlSymbol* portp;
+        const VhdlSymbol* actualp;
+        int inside;  // The actual's sources inside the block
+    };
+    std::vector<OwnCandidate> candidates;
+    bool probing = v3Global.opt.vhdlMetavalues();
+    const auto ownPortCandidate = [&](const AstVhdlIfaceDecl* ifp, const VhdlSymbol* rp) {
+        if (ifp->mode() != VhdlMode::OUT && ifp->mode() != VhdlMode::BUFFER) return false;
+        if (ifp->signalKind() != VhdlSignalKind::NONE) return false;
+        if (guardedKindOf(rp) != VhdlSignalKind::NONE) return false;
+        const VhdlType* const stp = rp->typep();
+        if (!stp) return false;
+        if (nineRecordResolved(rp)) return true;
+        return logicShaped(stp)
+               && (stp->resolutionp() || (stp->elementp() && stp->elementp()->resolutionp()));
+    };
     const auto throughPorts = [&](const VhdlSymbol* symp) {
         for (int depth = 0; symp && depth < 32; ++depth) {
             const auto it = portSignals.find(symp);
@@ -8203,6 +8231,7 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::function<void(AstNode*)> walk = [&](AstNode* stmtsp) {
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
             if (AstVhdlBlock* const blockp = VN_CAST(p, VhdlBlock)) {
+                const size_t firstCand = candidates.size();
                 if (AstVhdlBlockHeader* const hdrp = blockp->headerp()) {
                     size_t pos = 0;
                     std::vector<const AstVhdlIfaceDecl*> ports;
@@ -8226,7 +8255,20 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                         if (rp->kind() != VhdlSymKind::SIGNAL && rp->kind() != VhdlSymKind::PORT) {
                             continue;
                         }
+                        if (ownPorts.count(ifp->vhdlSymp())) {
+                            // A source of the actual, as a port with a
+                            // conversion on its formal is
+                            AstVhdlAssoc* const wasp = const_cast<AstVhdlAssoc*>(asp);
+                            wasp->drives(true);
+                            ++counts[rp];
+                            outsideGenerate.insert(rp);
+                            if (!where.count(rp)) where[rp] = asp->fileline();
+                            continue;
+                        }
                         portSignals[ifp->vhdlSymp()] = rp;
+                        if (probing && ownPortCandidate(ifp, rp)) {
+                            candidates.push_back(OwnCandidate{ifp->vhdlSymp(), rp, 0});
+                        }
                     }
                 }
                 // A block is not a driver of its own, but a conversion
@@ -8253,7 +8295,14 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                     outsideGenerate.insert(symp);
                     if (!where.count(symp)) where[symp] = asp->fileline();
                 }
+                // How many of the actual's sources are inside the block
+                for (size_t i = firstCand; i < candidates.size(); ++i) {
+                    candidates[i].inside = -counts[candidates[i].actualp];
+                }
                 walk(blockp->stmtsp());
+                for (size_t i = firstCand; i < candidates.size(); ++i) {
+                    candidates[i].inside += counts[candidates[i].actualp];
+                }
                 continue;
             }
             std::set<const VhdlSymbol*> whole;
@@ -8310,6 +8359,22 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
         }
     };
     walk(archp->stmtsp());
+    if (probing) {
+        for (const OwnCandidate& cand : candidates) {
+            if (cand.inside <= 1 && counts[cand.actualp] > cand.inside) {
+                ownPorts.insert(cand.portp);
+            }
+        }
+        if (!ownPorts.empty()) {
+            probing = false;
+            counts.clear();
+            where.clear();
+            partial.clear();
+            outsideGenerate.clear();
+            portSignals.clear();
+            walk(archp->stmtsp());
+        }
+    }
     for (const auto& pair : counts) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
         // Its elements are driven, not it
