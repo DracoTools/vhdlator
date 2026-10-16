@@ -16721,6 +16721,24 @@ private:
             return sizev.isInt() ? i32(sizev.toInt(), flp) : lowerExpr(args[1]);
         }
         if (args.size() == 1) return countOf(args[0]);
+        // A product is as long as its operands together (numeric_std)
+        if (op == "*") {
+            AstNodeExpr* const lp = countOf(args[0]);
+            AstNodeExpr* const rp = lp ? countOf(args[1]) : nullptr;
+            if (!rp) {
+                if (lp) VL_DO_DANGLING(lp->deleteTree(), lp);
+                return nullptr;
+            }
+            const AstConst* const lc = VN_CAST(lp, Const);
+            const AstConst* const rc = VN_CAST(rp, Const);
+            if (lc && rc) {
+                const int32_t n = lc->toSInt() + rc->toSInt();
+                VL_DO_DANGLING(lp->deleteTree(), lp);
+                VL_DO_DANGLING(rp->deleteTree(), rp);
+                return i32(n, flp);
+            }
+            return new AstAdd{flp, lp, rp};
+        }
         const auto vectorish = [](const AstNodeVhdlExpr* argp) {
             return argp && argp->vhdlTypep()
                    && argp->vhdlTypep()->base()->kind() == VhdlTypeKind::ARRAY;
@@ -17639,6 +17657,79 @@ private:
     // otherwise 'L' and 'H' count as '0' and '1' and the operation is done
     // on the value lanes, the carry of each lane landing in the next one.
     // Null for a shape not handled here, whose body is compiled instead.
+    // numeric_std's "*" of two UNSIGNED or two SIGNED: as long as both
+    // together, all 'X' where either holds a metavalue (TO_01), and otherwise
+    // the product of their values. Each operand's value lanes are gathered
+    // into a number, the two multiplied at the product's width, and the
+    // product spread back into lanes, 64 at a time.
+    AstNodeExpr* nineProduct(const std::vector<AstNodeVhdlExpr*>& args, bool slvUnsigned,
+                             FileLine* flp) {
+        if (args.size() != 2) return nullptr;
+        const char lk = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
+        if ((lk != 'u' && lk != 's') || lk != nineNumKind(args[1]->vhdlTypep(), slvUnsigned)) {
+            return nullptr;
+        }
+        const bool sgn = lk == 's';
+        AstNode* stmtsp = nullptr;
+        NineArg a;
+        NineArg b;
+        const auto fail = [&]() -> AstNodeExpr* {
+            nineDrop(a);
+            nineDrop(b);
+            if (stmtsp) VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+            return nullptr;
+        };
+        if (!nineArg(args[0], a, stmtsp, flp) || !nineArg(args[1], b, stmtsp, flp)) return fail();
+        const int64_t ac = constCount(a.countp);
+        const int64_t bc = constCount(b.countp);
+        if (ac < 1 || bc < 1 || ac > 64 || bc > 64 || ac + bc > 128) return fail();
+        const int width = static_cast<int>(ac + bc);
+        // Gathering and spreading read what they are given once per step,
+        // so each value goes into a temporary first, or the expression would
+        // grow sixty-four times over at each of them
+        const bool concurrent = !m_inStmts && m_modp && !m_ftaskp && !m_protClassp;
+        if (!m_inStmts && !concurrent) return fail();
+        const auto hold = [&](AstNodeExpr* valp, int bits) -> AstVar* {
+            AstVar* const varp = newTempVar("__Vnine", newLogicDType(flp, bits), flp);
+            if (concurrent) {
+                addStmt(new AstAlways{new AstAssignW{flp, wr(varp, flp), valp}});
+            } else {
+                stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(varp, flp), valp});
+            }
+            return varp;
+        };
+        const auto operand = [&](const NineArg& x, int64_t xc) -> AstNodeExpr* {
+            AstVar* const gatheredp = hold(laneGather(laneValues(x, flp), flp), 64);
+            AstNodeExpr* valp = new AstSel{flp, rd(gatheredp, flp), 0, static_cast<int>(xc)};
+            if (sgn) valp = new AstSigned{flp, valp};
+            return new AstCastSize{
+                flp, valp, new AstConst{flp, AstConst::Unsized32{}, static_cast<uint32_t>(width)}};
+        };
+        AstNodeExpr* const opap = operand(a, ac);
+        AstNodeExpr* const opbp = operand(b, bc);
+        AstVar* const prodp = hold(sgn ? static_cast<AstNodeExpr*>(new AstMulS{flp, opap, opbp})
+                                       : static_cast<AstNodeExpr*>(new AstMul{flp, opap, opbp}),
+                                   width);
+        const auto spread = [&](int lsb, int nbits) -> AstNodeExpr* {
+            return new AstSel{flp, laneSpread(new AstSel{flp, rd(prodp, flp), lsb, nbits}, flp), 0,
+                              4 * nbits};
+        };
+        AstNodeExpr* lanesp = nullptr;
+        if (width <= 64) {
+            lanesp = spread(0, width);
+        } else {
+            lanesp = new AstConcat{flp, spread(64, width - 64), spread(0, 64)};
+        }
+        AstNodeExpr* const countp = i32(width, flp);
+        AstNodeExpr* outp
+            = new AstCond{flp, new AstLogAnd{flp, laneAllDefined(a, flp), laneAllDefined(b, flp)},
+                          laneFromValues(lanesp, countp, flp), laneMask(1, countp, flp)};
+        VL_DO_DANGLING(countp->deleteTree(), countp);
+        nineDrop(a);
+        nineDrop(b);
+        if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+        return outp;
+    }
     AstNodeExpr* nineNumeric(const VhdlSymbol* symp, const std::string& op,
                              const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
         const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
@@ -17681,6 +17772,7 @@ private:
             if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
             return outp;
         }
+        if (op == "*") return nineProduct(args, slvUnsigned, flp);
         if (args.size() != 2 || (!arith && !relational)) return nullptr;
         const char lk = nineNumKind(args[0]->vhdlTypep(), slvUnsigned);
         const char rk = nineNumKind(args[1]->vhdlTypep(), slvUnsigned);
@@ -18333,6 +18425,17 @@ private:
         }
         if (args.size() == 1 && (op == "-" || op == "abs")) {
             return kindOf(args[0]) == 's' && nineOperandKnown(args[0]);
+        }
+        // A product of two vectors of one kind, as long as both together,
+        // where it fits two 64-bit halves (nineNumeric)
+        if (op == "*") {
+            if (args.size() != 2) return false;
+            const char lk = kindOf(args[0]);
+            if ((lk != 'u' && lk != 's') || lk != kindOf(args[1])) return false;
+            if (!nineOperandKnown(args[0]) || !nineOperandKnown(args[1])) return false;
+            const int64_t lc = nineStaticCount(args[0]);
+            const int64_t rc = nineStaticCount(args[1]);
+            return lc >= 1 && rc >= 1 && lc <= 64 && rc <= 64 && lc + rc <= 128;
         }
         const bool arith = op == "+" || op == "-";
         const bool relational
