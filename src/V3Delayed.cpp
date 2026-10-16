@@ -442,7 +442,16 @@ class DelayedVisitor final : public VNVisitor {
             // captures the value it wrote last, which is all there is to
             // commit. A process that never ends is a loop, so without this
             // "forever begin #1; s <= tmp; end" lost every update.
+            // Nor where more than one process assigns it: unique flags are
+            // committed in a fixed order, and IEEE 1800-2023 10.4.2 has NBAs
+            // performed in the order they were executed. The shadow that
+            // takes the array's value at the first write of the time step
+            // holds every write after it, so the last one executed is the one
+            // committed.
             if (vscpInfo.m_whole) {
+                if (vscpInfo.m_inSuspOrFork && vscpInfo.m_multiProc) {
+                    return Scheme::ShadowVarCopied;
+                }
                 if (vscpInfo.m_inSuspOrFork
                     && (!vscpInfo.m_inLoop || vscpInfo.m_nWholeSites == vscpInfo.m_nSites)) {
                     return Scheme::FlagUnique;
@@ -522,8 +531,11 @@ class DelayedVisitor final : public VNVisitor {
             // the time step instead, and gathers every part written after
             // (a member or an element of one is not a Sel, so whether a
             // site writes only part of it is whether it writes less than all)
-            if (!isIntegralOrPacked && vscpInfo.m_inLoop
-                && vscpInfo.m_nWholeSites < vscpInfo.m_nSites
+            // So too for one that more than one process assigns, for the
+            // order the writes are committed in (as for an unpacked array)
+            if (!isIntegralOrPacked
+                && ((vscpInfo.m_inLoop && vscpInfo.m_nWholeSites < vscpInfo.m_nSites)
+                    || vscpInfo.m_multiProc)
                 && VN_IS(dtypep->skipRefp(), NodeUOrStructDType)) {
                 return Scheme::ShadowVarCopied;
             }
