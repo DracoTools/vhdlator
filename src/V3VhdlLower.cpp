@@ -10057,7 +10057,9 @@ private:
         if (AstVhdlQualified* const p = VN_CAST(nodep, VhdlQualified)) {
             return lowerExpr(p->valuep());
         }
-        if (AstVhdlAttrName* const p = VN_CAST(nodep, VhdlAttrName)) return lowerAttr(p);
+        if (AstVhdlAttrName* const p = VN_CAST(nodep, VhdlAttrName)) {
+            return enumIndexBound(p, lowerAttr(p));
+        }
         if (AstVhdlAllocator* const p = VN_CAST(nodep, VhdlAllocator)) return lowerAllocator(p);
         if (AstVhdlLiteral* const p = VN_CAST(nodep, VhdlLiteral)) {
             // A null access value is a null handle (9.3.2). A LINE is text
@@ -10084,6 +10086,22 @@ private:
     // The attributes that mean something at run time. Everything static has
     // already folded, so what is left either reads a value or asks about a
     // signal's history, and the latter needs the postponed region of M7.
+    // A bound of an array indexed by an enumeration, where the instance
+    // gives it, is carried as a position (V3VhdlSem openConstraintFor), and
+    // is a value of the enumeration again where it is asked for
+    AstNodeExpr* enumIndexBound(AstVhdlAttrName* nodep, AstNodeExpr* valuep) {
+        if (!valuep || VN_IS(valuep, Const) || !nodep->prefixp()) return valuep;
+        const std::string attr = VString::downcase(nodep->name());
+        if (attr != "left" && attr != "right" && attr != "high" && attr != "low") return valuep;
+        const VhdlType* const ptypep = nodep->prefixp()->vhdlTypep();
+        VhdlType* const typep = nodep->vhdlTypep();
+        if (!ptypep || ptypep->base()->kind() != VhdlTypeKind::ARRAY || !typep
+            || typep->base()->kind() != VhdlTypeKind::ENUM) {
+            return valuep;
+        }
+        FileLine* const flp = nodep->fileline();
+        return new AstCast{flp, valuep, VFlagChildDType{}, lowerType(typep, flp)};
+    }
     AstNodeExpr* lowerAttr(AstVhdlAttrName* nodep) {
         FileLine* const flp = nodep->fileline();
         const std::string& attr = nodep->name();

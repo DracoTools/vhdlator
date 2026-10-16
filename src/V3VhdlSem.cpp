@@ -2413,7 +2413,11 @@ public:
 private:
     void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
     bool defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim, int64_t& leftr,
-                       int64_t& rightr, bool* ascendingp = nullptr) VL_MT_DISABLED;
+                       int64_t& rightr, bool* ascendingp = nullptr,
+                       const std::vector<std::string>* pathp = nullptr) VL_MT_DISABLED;
+    static VhdlType* boundType(const VhdlSymbol* gsymp) VL_MT_DISABLED;
+    static AstNodeVhdlExpr* boundValue(FileLine* flp, const VhdlSymbol* gsymp,
+                                       int64_t value) VL_MT_DISABLED;
     void constrainBlockPorts(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
     void constrainBlockGenerics(AstVhdlBlockHeader* nodep) VL_MT_DISABLED;
 
@@ -16273,8 +16277,38 @@ VhdlScope* VhdlSemVisitor::specializeEntity(AstVhdlInstance* nodep, const std::s
 // has them, and otherwise its length starting at the index subtype's own left
 // bound (9.3.3.3)
 bool VhdlSemVisitor::defaultBounds(VhdlSymbol* symp, AstNodeVhdlExpr* valuep, int dim,
-                                   int64_t& leftr, int64_t& rightr, bool* ascendingp) {
-    VhdlType* const valueTypep = valuep->vhdlTypep();
+                                   int64_t& leftr, int64_t& rightr, bool* ascendingp,
+                                   const std::vector<std::string>* pathp) {
+    VhdlType* valueTypep = valuep->vhdlTypep();
+    // Bounds inside the type are those of the same place inside the value:
+    // its element's, or a record element's
+    if (pathp && !pathp->empty()) {
+        for (const std::string& step : *pathp) {
+            if (!valueTypep) return false;
+            if (step.empty()) {
+                if (valueTypep->base()->kind() != VhdlTypeKind::ARRAY) return false;
+                valueTypep = valueTypep->elementp() ? valueTypep->elementp()
+                                                    : valueTypep->base()->elementp();
+                continue;
+            }
+            if (valueTypep->base()->kind() != VhdlTypeKind::RECORD) return false;
+            VhdlType* elemTypep = nullptr;
+            for (VhdlSymbol* const elemp : valueTypep->elements()) {
+                if (elemp->name() == step) elemTypep = elemp->typep();
+            }
+            valueTypep = elemTypep;
+        }
+        if (!valueTypep || !valueTypep->isConstrainedArray()
+            || dim >= static_cast<int>(valueTypep->indexTypes().size())) {
+            return false;
+        }
+        const VhdlType* const idxp = valueTypep->indexTypes()[dim];
+        if (!idxp || !idxp->bounded()) return false;
+        leftr = idxp->left();
+        rightr = idxp->right();
+        if (ascendingp) *ascendingp = idxp->ascending();
+        return true;
+    }
     if (valueTypep && valueTypep->isConstrainedArray()
         && dim < static_cast<int>(valueTypep->indexTypes().size())) {
         const VhdlType* const idxp = valueTypep->indexTypes()[dim];
@@ -16314,7 +16348,8 @@ void VhdlSemVisitor::fillOpenGenericDefaults(VhdlScope* scopep) {
         int64_t left = 0;
         int64_t right = 0;
         bool ascending = false;
-        if (!defaultBounds(found[0], declp->defaultp(), bound.dim, left, right, &ascending)) {
+        if (!defaultBounds(found[0], declp->defaultp(), bound.dim, left, right, &ascending,
+                           &bound.path)) {
             continue;
         }
         // Which way the default's range runs, which is what the instance
@@ -16341,16 +16376,37 @@ void VhdlSemVisitor::fillOpenGenericDefaults(VhdlScope* scopep) {
             AstVhdlIfaceDecl* const genp = VN_CAST(gfound[0]->declp(), VhdlIfaceDecl);
             if (!genp || genp->defaultp()) continue;
             const int64_t value = side == 0 ? left : right;
-            AstVhdlLiteral* const litp = new AstVhdlLiteral{
-                genp->fileline(), VhdlLitKind::INTEGER, std::to_string(value)};
-            litp->intVal(value);
+            AstNodeVhdlExpr* const litp = boundValue(genp->fileline(), gfound[0], value);
             genp->defaultp(litp);
-            analyzeExpr(litp, V3VhdlStd::integerType());
+            analyzeExpr(litp, boundType(gfound[0]));
             // Deliberately not given to the symbol as a value: it is what an
             // instance that says nothing gets, and folding it here would fix
             // every instance to the default's bounds
         }
     }
+}
+
+// The type of a generic carrying a bound, and a bound written as a value of
+// it: a position of an enumeration is its literal (openConstraintFor)
+VhdlType* VhdlSemVisitor::boundType(const VhdlSymbol* gsymp) {
+    if (gsymp && gsymp->typep() && gsymp->typep()->base()->kind() == VhdlTypeKind::ENUM) {
+        return gsymp->typep();
+    }
+    return V3VhdlStd::integerType();
+}
+AstNodeVhdlExpr* VhdlSemVisitor::boundValue(FileLine* flp, const VhdlSymbol* gsymp,
+                                            int64_t value) {
+    const VhdlType* const typep = boundType(gsymp);
+    if (typep->base()->kind() == VhdlTypeKind::ENUM) {
+        const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
+        if (value >= 0 && value < static_cast<int64_t>(lits.size())) {
+            return new AstVhdlName{flp, lits[value]->name()};
+        }
+    }
+    AstVhdlLiteral* const litp
+        = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, std::to_string(value)};
+    litp->intVal(value);
+    return litp;
 }
 
 // Whether the instance's generic map already names that formal, so that a
@@ -16410,7 +16466,7 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
         int64_t right = 0;
         bool ascending = false;
         FileLine* const flp = nodep->fileline();
-        if (!defaultBounds(found[0], actualp, bound.dim, left, right, &ascending)) {
+        if (!defaultBounds(found[0], actualp, bound.dim, left, right, &ascending, &bound.path)) {
             // Bounds that are not numbers here -- "(0 to ix => '1')", or a
             // constant declared "(0 to ix)", in a for generate -- are the
             // instance's to settle as it is elaborated: they go over as
@@ -16490,16 +16546,15 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
         }
         for (int side = 0; side < 2; ++side) {
             const int64_t value = side == 0 ? left : right;
-            AstVhdlLiteral* const litp
-                = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, std::to_string(value)};
-            litp->intVal(value);
-            AstVhdlAssoc* const asp = new AstVhdlAssoc{
-                flp, new AstVhdlName{flp, side == 0 ? bound.leftName : bound.rightName}, litp};
-            nodep->addGenericMapp(asp);
+            const std::string& gname = side == 0 ? bound.leftName : bound.rightName;
             std::vector<VhdlSymbol*> gfound;
-            unitScopep->lookupLocal(asp->formalp()->name(), gfound);
-            if (!gfound.empty()) asp->formalp()->vhdlSymp(gfound[0]);
-            analyzeExpr(litp, V3VhdlStd::integerType());
+            unitScopep->lookupLocal(gname, gfound);
+            const VhdlSymbol* const gsymp = gfound.empty() ? nullptr : gfound[0];
+            AstNodeVhdlExpr* const litp = boundValue(flp, gsymp, value);
+            AstVhdlAssoc* const asp = new AstVhdlAssoc{flp, new AstVhdlName{flp, gname}, litp};
+            nodep->addGenericMapp(asp);
+            if (gsymp) asp->formalp()->vhdlSymp(const_cast<VhdlSymbol*>(gsymp));
+            analyzeExpr(litp, boundType(gsymp));
         }
     }
 }
@@ -16871,12 +16926,20 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
             const std::string leftName = "__vl" + mangled(d);
             const std::string rightName = "__vr" + mangled(d);
             const std::string ascName = "__va" + mangled(d);
+            // The bounds are integers, the positions of an index of an
+            // enumeration -- "array (t_direction range <>) of ..." (UVVM's
+            // Ethernet VVC) -- whose own 'LEFT is a value of it, so a default
+            // is then given as a position where the default folds
+            // (fillOpenGenericDefaults)
+            const VhdlType* const ixp
+                = d < basep->indexTypes().size() ? basep->indexTypes()[d] : nullptr;
+            const bool enumIndex = ixp && ixp->base()->kind() == VhdlTypeKind::ENUM;
             // A generic nothing is associated with is its default, bounds
             // and all (6.5.6.2): "t : integer_vector := ramp(dim)" left out
             // of an instance's map is as long as ramp makes it
             const auto boundOfDefault = [&](const char* attr) -> AstNodeVhdlExpr* {
                 if (!path.empty() || dims != 1 || ifp->kind() != VhdlIfaceKind::CONSTANT
-                    || !ifp->defaultp() || !leftDflt.empty()) {
+                    || !ifp->defaultp() || !leftDflt.empty() || (enumIndex && attr[0] != 'a')) {
                     return nullptr;
                 }
                 return new AstVhdlAttrName{flp, ifp->defaultp()->cloneTree(false), attr};
