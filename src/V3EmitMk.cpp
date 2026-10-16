@@ -21,6 +21,7 @@
 #include "V3EmitCBase.h"
 #include "V3HierBlock.h"
 #include "V3Os.h"
+#include "V3Vhdl.h"
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -730,6 +731,18 @@ public:
         }
         of.puts("# Include global rules\n");
         of.puts("include $(VERILATOR_ROOT)/include/verilated.mk\n");
+        if (V3Vhdl::anyRead()) {
+            // A VHDL design is triggered logic throughout, and a value of the
+            // nine logic values is four bits an element: at -Os the
+            // comparisons the scheduler makes of every trigger on every delta
+            // stay calls, and the run is a third slower. Still overridden by
+            // OPT_FAST/OPT_GLOBAL given to make.
+            of.puts("\n# VHDL design: optimize the model and the runtime for speed\n");
+            of.puts("ifneq ($(CFG_WITH_DEV_GCOV),yes)\n");
+            of.puts("OPT_FAST = -O2\n");
+            of.puts("OPT_GLOBAL = -O2\n");
+            of.puts("endif\n");
+        }
 
         if (v3Global.opt.exe()) {
             of.puts("\n### Executable rules... (from --exe)\n");

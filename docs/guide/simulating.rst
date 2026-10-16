@@ -133,7 +133,10 @@ simulation speed with reasonable C++ compilation times. To this end,
 OPT_FAST is set to "-Os" by default. Higher optimization such as "-O2" or
 "-O3" may help (though often they provide only a minimal performance
 benefit), but compile times may be excessively large even with medium-sized
-designs. Compilation times can be improved at the expense of simulation
+designs. A design with VHDL sources is the exception: its model sets
+OPT_FAST and OPT_GLOBAL to "-O2", as its processes are scheduled as
+triggered logic throughout and "-Os" makes the run about a third slower.
+Given to make, OPT_FAST and OPT_GLOBAL still override that. Compilation times can be improved at the expense of simulation
 speed by reducing optimization, for example, with OPT_FAST="-O0". Often
 good simulation speed can be achieved with OPT_FAST="-O1 -fstrict-aliasing"
 but with improved compilation times. Files controlled by OPT_SLOW have
