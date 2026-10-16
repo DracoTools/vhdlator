@@ -17697,16 +17697,8 @@ private:
         // A length a generic gives -- neorv32's multiplier, "opa * opb" over
         // signed(DWIDTH downto 0) -- is a number once the design is
         // elaborated, and a function of the module can be that wide
-        const auto byGenerics = [](const AstNodeExpr* countp) {
-            return const_cast<AstNodeExpr*>(countp)->isPure()
-                   && !countp->exists([](const AstNodeFTaskRef*) { return true; })
-                   && !countp->exists([](const AstVarRef* refp) {
-                          return !refp->varp()
-                                 || !(refp->varp()->isParam() || refp->varp()->isGenVar());
-                      });
-        };
-        if ((ac < 0 || bc < 0) && ac != 0 && bc != 0 && byGenerics(a.countp)
-            && byGenerics(b.countp)) {
+        if ((ac < 0 || bc < 0) && ac != 0 && bc != 0 && countByGenerics(a.countp)
+            && countByGenerics(b.countp)) {
             AstNodeExpr* outp = nineProductByGenerics(a, b, sgn, flp);
             if (!outp) return fail();
             nineDrop(a);
@@ -17762,6 +17754,26 @@ private:
         nineDrop(b);
         if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
         return outp;
+    }
+    // A length written with generics alone (and genvars), which the widths of
+    // a function of the module can be: no call, as "PIPELINE_BITS - 1" with
+    // PIPELINE_BITS a function of them has (GHDL gna issue2065)
+    static bool countByGenerics(const AstNodeExpr* countp) {
+        return const_cast<AstNodeExpr*>(countp)->isPure()
+               && !countp->exists([](const AstNodeFTaskRef*) { return true; })
+               && !countp->exists([](const AstVarRef* refp) {
+                      return !refp->varp()
+                             || !(refp->varp()->isParam() || refp->varp()->isGenVar());
+                  });
+    }
+    // Whether the length of an operand is one such, as nineProduct will find
+    bool nineCountByGenerics(const AstNodeVhdlExpr* nodep) const {
+        AstNodeExpr* const countp
+            = const_cast<VhdlLowerVisitor*>(this)->nineOperandCount(nodep, nodep->fileline());
+        if (!countp) return false;
+        const bool generic = countByGenerics(countp);
+        VL_DO_DANGLING(countp->deleteTree(), countp);
+        return generic;
     }
     // The same where a length is a generic's: a function of the module,
     // whose widths are those lengths, gathers each operand's value lanes
@@ -18554,7 +18566,10 @@ private:
             const int64_t rc = nineStaticCount(args[1]);
             // A length elaboration settles -- a generic's -- is planned too
             // (nineProductByGenerics)
-            if (lc < 0 || rc < 0) return lc != 0 && rc != 0 && !m_ftaskp;
+            if (lc < 0 || rc < 0) {
+                return lc != 0 && rc != 0 && !m_ftaskp && (lc > 0 || nineCountByGenerics(args[0]))
+                       && (rc > 0 || nineCountByGenerics(args[1]));
+            }
             return lc >= 1 && rc >= 1 && lc <= 64 && rc <= 64 && lc + rc <= 128;
         }
         const bool arith = op == "+" || op == "-";
