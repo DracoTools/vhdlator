@@ -11,14 +11,14 @@ import vltest_bootstrap
 
 test.scenarios('vlt')
 
-# TO_UNSIGNED of an integer worked out in reals, at a generic's size. The
-# real product is typed as an integer by analysis, which leaves the back end
-# to convert it and say so (bugs.md 388mk)
+# TO_UNSIGNED of an integer worked out in reals, at a generic's size: the
+# conversion of a universal real rounds, and the build has nothing to say
+# about it (bugs.md 388mk)
 test.top_filename = "t/t_vhdl_genrealsize.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
              verilator_flags2=[
-                 "--timing", "-Wno-REALCVT", "--top-module t_vhdl_genrealsize"
+                 "--timing", "--top-module t_vhdl_genrealsize"
              ],
              make_top_shell=False,
              make_main=False)

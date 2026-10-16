@@ -21368,7 +21368,12 @@ private:
         if (dyn && top->base()->kind() == VhdlTypeKind::ARRAY) return valuep;
         VhdlType* const fromp = argp->vhdlTypep();
         const VhdlTypeKind toKind = top->base()->kind();
-        const VhdlTypeKind fromKind = fromp ? fromp->base()->kind() : toKind;
+        // A universal real is a real as far as converting it goes:
+        // "integer(0.25 * 2**SIZE + 0.5)" rounds (9.3.6)
+        const VhdlTypeKind fromKind = !fromp ? toKind
+                                      : fromp->base()->kind() == VhdlTypeKind::UNIVERSAL_REAL
+                                          ? VhdlTypeKind::FLOATING
+                                          : fromp->base()->kind();
         if (AstNode* const failp = conversionBoundsFailure(top, fromp, flp)) {
             return new AstExprStmt{flp, failp, valuep};
         }
