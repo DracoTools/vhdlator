@@ -37784,8 +37784,8 @@ private:
             if (writtenp.count(refp)) return;
             AstVar* const varp = refp->varp();
             if (!varp || !knownp.count(varp)) return;
-            if (!partsFollowable(varp)) return;
-            AstNodeExpr* const partp = staticPartRead(refp);
+            if (!partsFollowable(varp, false)) return;
+            AstNodeExpr* const partp = staticPartRead(refp, false);
             const auto it = partOf.find(varp);
             if (it == partOf.end()) {
                 partOf.emplace(varp, partp);
@@ -38165,6 +38165,11 @@ private:
         // signal names the same part of it, and by a fixed index, that part
         // is what the statement waits on.
         std::map<const AstVar*, AstNodeExpr*> partOf;  // Null once two parts differ
+        bool observes = false;
+        for (AstNode* stmtp = bodyp; stmtp && !observes; stmtp = stmtp->nextp()) {
+            observes
+                = stmtp->exists([](const AstDisplay*) { return true; }) || callsReporting(stmtp);
+        }
         bodyp->foreachAndNext([&](AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
             // What an assignment writes it does not thereby read: a process
@@ -38181,8 +38186,9 @@ private:
             // What an attribute keeps about a signal is a variable of the
             // module too, and the statement waits on it as it waits on the
             // signal itself.
-            AstNodeExpr* const partp
-                = signals.count(varp) && partsFollowable(varp) ? staticPartRead(refp) : nullptr;
+            AstNodeExpr* const partp = signals.count(varp) && partsFollowable(varp, observes)
+                                           ? staticPartRead(refp, observes)
+                                           : nullptr;
             const auto it = partOf.find(varp);
             if (it == partOf.end()) {
                 partOf.emplace(varp, partp);
@@ -38243,11 +38249,17 @@ private:
     // Whether the parts of a signal can be waited on one at a time: one held
     // as bits, a record, or an array of either. A value that carries its own
     // bounds is a structure whose members are not parts of the signal.
-    static bool partsFollowable(const AstVar* varp) {
+    // Each part followed is a trigger of its own, which the scheduler asks
+    // about on every delta, so an element of an array of values or of a
+    // record is followed only where a statement can tell an extra run from
+    // none: where it reports (extended)
+    static bool partsFollowable(const AstVar* varp, bool extended) {
         const AstNodeDType* const dtp = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
         if (!dtp || isCarrierDType(dtp)) return false;
-        return VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType) || VN_IS(dtp, UnpackArrayDType)
-               || VN_IS(dtp, NodeUOrStructDType) || VN_IS(dtp, RefDType);
+        if (VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType)) return true;
+        return extended
+               && (VN_IS(dtp, UnpackArrayDType) || VN_IS(dtp, NodeUOrStructDType)
+                   || VN_IS(dtp, RefDType));
     }
     // An index the elaboration settles: constants, generics and generate
     // parameters, which is what makes a name static (8.1)
@@ -38271,18 +38283,25 @@ private:
     // prefix is what a statement reading it waits on (11.6). Null where the
     // whole signal is read, or where which part is read is not decided until
     // it runs.
-    static AstNodeExpr* staticPartRead(AstVarRef* refp) {
+    // Without extended, only a bit or a slice of the signal itself, by
+    // constant indices.
+    static AstNodeExpr* staticPartRead(AstVarRef* refp, bool extended) {
         AstNode* upp = refp->backp();
         AstNodeExpr* outp = nullptr;
+        const auto indexOk = [&](const AstNodeExpr* idxp) {
+            return extended ? staticIndex(idxp) : VN_IS(idxp, Const);
+        };
         while (upp) {
             const AstNodeExpr* const fromp = outp ? outp : static_cast<AstNodeExpr*>(refp);
             if (const AstSelBit* const bitp = VN_CAST(upp, SelBit)) {
-                if (bitp->fromp() != fromp || !staticIndex(bitp->bitp())) break;
+                if (bitp->fromp() != fromp || !indexOk(bitp->bitp())) break;
             } else if (const AstSelExtract* const extp = VN_CAST(upp, SelExtract)) {
-                if (extp->fromp() != fromp || !staticIndex(extp->leftp())
-                    || !staticIndex(extp->rightp())) {
+                if (extp->fromp() != fromp || !indexOk(extp->leftp())
+                    || !indexOk(extp->rightp())) {
                     break;
                 }
+            } else if (!extended) {
+                break;
             } else if (const AstArraySel* const asp = VN_CAST(upp, ArraySel)) {
                 if (asp->fromp() != fromp || !staticIndex(asp->bitp())) break;
             } else if (const AstMemberSel* const msp = VN_CAST(upp, MemberSel)) {
