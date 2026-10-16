@@ -223,6 +223,9 @@ class VhdlLowerVisitor final {
     bool m_checkAsCall = false;
     bool m_inStmts = false;  // Lowering the statements of a process or subprogram
     bool m_nineWarningDropped = false;  // A native warning had no statement to go in
+    // The nets that hold an operand of a native operation in the concurrent part, and the
+    // value each follows
+    std::map<const AstVar*, const AstNodeExpr*> m_concHolds;
     const AstVhdlCall* m_dirReportedp = nullptr;  // Slice whose direction check is made
     bool m_emitForUnit = false;  // Building something the unit will hold
     // The names those classes have been given. A generic package instantiated
@@ -16818,6 +16821,14 @@ private:
             arg.exprp = valp;
             return true;
         }
+        // In the concurrent part a name -- an element of a signal, "m(r)(i - 1)" in
+        // a for-generate -- is read as it stands too: a net holding it would be
+        // what the statement waits on, one trigger for each statement, where the
+        // signal it names is one for all of them
+        if (concurrent && repeatable(valp)) {
+            arg.exprp = valp;
+            return true;
+        }
         // A value whose type gives no length -- a joining, a native result
         // -- is held as so many lanes, where that is a number, and read
         // again where it is not and reading it changes nothing
@@ -16848,6 +16859,7 @@ private:
         arg.varp = newTempVar("__Vnine", dtypep, flp);
         if (concurrent) {
             // In a module's concurrent part, a net that follows it
+            m_concHolds.emplace(arg.varp, valp);
             addStmt(new AstAlways{new AstAssignW{flp, wr(arg.varp, flp), valp}});
         } else {
             stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), valp});
@@ -17692,6 +17704,7 @@ private:
         const auto hold = [&](AstNodeExpr* valp, int bits) -> AstVar* {
             AstVar* const varp = newTempVar("__Vnine", newLogicDType(flp, bits), flp);
             if (concurrent) {
+                m_concHolds.emplace(varp, valp);
                 addStmt(new AstAlways{new AstAssignW{flp, wr(varp, flp), valp}});
             } else {
                 stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(varp, flp), valp});
@@ -38337,8 +38350,21 @@ private:
             observes
                 = stmtp->exists([](const AstDisplay*) { return true; }) || callsReporting(stmtp);
         }
-        bodyp->foreachAndNext([&](AstVarRef* refp) {
+        // A net holding an operand of a native operation is waited on as what
+        // its value reads: the signals are a trigger each, shared by every
+        // statement reading them, where the nets are one per statement. The
+        // net has settled before any trigger is worked out.
+        std::set<const AstVar*> heldSeen;
+        std::function<void(AstNode*, bool)> visitReads;
+        const auto visitRef = [&](AstVarRef* refp) {
             if (!refp->access().isReadOrRW()) return;
+            const auto holdIt = m_concHolds.find(refp->varp());
+            if (holdIt != m_concHolds.end()) {
+                if (heldSeen.insert(holdIt->first).second) {
+                    visitReads(const_cast<AstNodeExpr*>(holdIt->second), false);
+                }
+                return;
+            }
             // What an assignment writes it does not thereby read: a process
             // woken by its own assignment runs again for every one it makes
             // -- nor a part of it, "ge(i) <= ...", whose prefix is not
@@ -38367,7 +38393,15 @@ private:
             if (std::find(reads.begin(), reads.end(), varp) == reads.end()) {
                 reads.push_back(varp);
             }
-        });
+        };
+        visitReads = [&](AstNode* nodep, bool withNext) {
+            if (withNext) {
+                nodep->foreachAndNext(visitRef);
+            } else {
+                nodep->foreach(visitRef);
+            }
+        };
+        visitReads(bodyp, true);
         AstSenItem* itemsp = nullptr;
         for (AstVar* const varp : reads) {
             AstNodeExpr* const partp = partOf[varp];
@@ -42091,6 +42125,7 @@ private:
         // belongs to the module the call is in: reused from another module
         // it would name a subprogram that is not in scope there
         m_signalCopies.clear();
+        m_concHolds.clear();
         // As does a driver's task: a unit lowered again -- for another
         // binding of it -- emits its own, and the one before is gone
         m_waveTasks.clear();
