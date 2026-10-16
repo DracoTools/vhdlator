@@ -31306,7 +31306,18 @@ private:
         if (nodep->isOpen() || VN_IS(nodep->actualp(), VhdlOpen)) {
             return new AstPin{flp, pinNum, formal, nullptr};
         }
-        return new AstPin{flp, pinNum, formal, lowerExpr(nodep->actualp())};
+        // A null actual holds no elements, which this frontend declares with
+        // one place where its range folds, and with the places between its
+        // ends where the instance's bounds give them (declaredPlaces): an
+        // open port given "unsigned(-1 downto 0)" is two. Either way there is
+        // nothing to carry, so the widths the pin joins do not matter.
+        FileLine* pflp = flp;
+        if (arrayLength(nodep->actualp()->vhdlTypep()) == 0) {
+            pflp = new FileLine{flp};
+            pflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+            pflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+        }
+        return new AstPin{pflp, pinNum, formal, lowerExpr(nodep->actualp())};
     }
 
     // A generate statement elaborates its body once per value of its
