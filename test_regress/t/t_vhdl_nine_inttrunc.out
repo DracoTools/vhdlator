@@ -1,0 +1,8 @@
+t/t_vhdl_nine_inttrunc.vhd:28:11:@0:(assertion warning): NUMERIC_STD.TO_UNSIGNED: vector truncated
+t/t_vhdl_nine_inttrunc.vhd:35:13:@1000000:(assertion warning): NUMERIC_STD.TO_UNSIGNED: vector truncated
+t/t_vhdl_nine_inttrunc.vhd:36:13:@1000000:(assertion warning): NUMERIC_STD.TO_UNSIGNED: vector truncated
+t/t_vhdl_nine_inttrunc.vhd:37:13:@1000000:(assertion warning): NUMERIC_STD.TO_UNSIGNED: vector truncated
+t/t_vhdl_nine_inttrunc.vhd:38:13:@1000000:(assertion warning): NUMERIC_STD.TO_UNSIGNED: vector truncated
+t/t_vhdl_nine_inttrunc.vhd:40:13:@1000000:(assertion warning): NUMERIC_STD.TO_SIGNED: vector truncated
+t/t_vhdl_nine_inttrunc.vhd:42:5:@2000000:(report note): 0000 0001 0101 1101 0001 1000 1000 0000
+t/t_vhdl_nine_inttrunc.vhd:45:5:@2000000:(report note): *-* All Finished *-*

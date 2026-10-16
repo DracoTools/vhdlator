@@ -17372,6 +17372,60 @@ private:
         const AstConst* const constp = VN_CAST(countp, Const);
         return constp ? constp->toSInt() : -1;
     }
+    // numeric_std's warning where "+" or "-" makes its integer operand a
+    // vector of the other's length, TO_UNSIGNED(R, L'LENGTH) or TO_SIGNED,
+    // and it does not fit (severity WARNING). Not for an operand with a call
+    // in it, which this would run a second time.
+    AstNodeExpr* withTruncWarning(AstNodeExpr* outp, AstNodeVhdlExpr* intExprp, bool sgn,
+                                  const AstNodeExpr* countp, FileLine* flp) {
+        if (!countp) return outp;
+        if (!m_inStmts) {
+            m_nineWarningDropped = true;
+            return outp;
+        }
+        const int64_t count = constCount(countp);
+        const VhdlValue val = V3VhdlEval::eval(intExprp);
+        AstNodeExpr* badp = nullptr;
+        if (val.isInt() && count >= 1) {
+            const int64_t v = val.toInt();
+            const int64_t bits = sgn ? count - 1 : count;
+            if (bits >= 63) return outp;
+            const int64_t limit = int64_t{1} << bits;
+            if (sgn ? (v >= -limit && v < limit) : (v >= 0 && v < limit)) return outp;
+            badp = new AstConst{flp, AstConst::BitTrue{}};
+        } else {
+            if (intExprp->exists([](const AstVhdlCall*) { return true; })) return outp;
+            AstNodeExpr* const intp = lowerExpr(intExprp);
+            if (!intp) return outp;
+            AstNodeExpr* const vp = intTo64(intp, true, flp);
+            AstNodeExpr* bitsp = const_cast<AstNodeExpr*>(countp)->cloneTree(false);
+            if (sgn) bitsp = new AstSub{flp, bitsp, i32(1, flp)};
+            const auto limitp = [&]() {
+                return new AstShiftL{flp, new AstConst{flp, AstConst::WidthedValue{}, 64, 1},
+                                     bitsp->cloneTree(false)};
+            };
+            badp = new AstGteS{flp, vp->cloneTree(false), limitp()};
+            if (sgn) {
+                badp = new AstLogOr{
+                    flp, badp,
+                    new AstLtS{flp, vp->cloneTree(false), new AstNegate{flp, limitp()}}};
+            }
+            // Past 63 bits every integer fits
+            badp = new AstLogAnd{flp, new AstLtS{flp, bitsp, i32(63, flp)}, badp};
+            VL_DO_DANGLING(vp->deleteTree(), vp);
+        }
+        const std::string msg = std::string{"NUMERIC_STD."} + (sgn ? "TO_SIGNED" : "TO_UNSIGNED")
+                                + ": vector truncated";
+        const std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
+                                   + std::to_string(flp->firstColumn())
+                                   + ":@%0t:(assertion warning): " + msg;
+        AstNode* const warnp = new AstIf{
+            flp, badp,
+            new AstDisplay{flp, VDisplayType::DT_DISPLAY, format, nullptr,
+                           new AstTime{flp, m_modp ? m_modp->timeunit() : VTimescale{}}},
+            nullptr};
+        return new AstExprStmt{flp, warnp, outp};
+    }
 
     // The 256 bits of 64 lanes, and the masks that gather bit 0 of each lane
     // into a 64-bit number and spread one back out: at each step a group of
@@ -17745,6 +17799,7 @@ private:
             outp = new AstCond{flp, validp, laneFromValues(sump, a.countp, flp),
                                laneMask(1, a.countp, flp)};
             outp = new AstCond{flp, strongp, fastp, outp};
+            if (lk == 'i' || rk == 'i') outp = withTruncWarning(outp, othp, sgn, a.countp, flp);
         } else {
             // Bit k of a value is bit 4k of its value lanes, so they compare
             // as the values do. A narrower one -- an integer's lanes -- is
