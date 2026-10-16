@@ -1,0 +1,11 @@
+%Error-UNSUPPORTED: t/t_class_new_argdefault_unsup.v:20:9: Unsupported: Default value that names something in missing argument 'p' in call to constructor
+                                                         : ... note: In instance 't'
+   20 |     b = new(5);
+      |         ^~~
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error: t/t_class_new_argdefault_unsup.v:20:9: Function Argument expects 'int$[1:2]', got 'bit[31:0]'
+                                             : ... note: In instance 't'
+   20 |     b = new(5);
+      |         ^~~
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

@@ -2210,7 +2210,22 @@ V3TaskConnects V3Task::taskConnects(AstNodeFTaskRef* nodep, AstNode* taskStmtsp,
                 // expression that hasn't been folded yet. Try folding it
                 // now; we don't have much to lose if it fails.
                 newvaluep = V3Const::constifyEdit(VN_AS(portp->valuep(), NodeExpr));
-                if (!VN_IS(newvaluep, Const)) {
+                // A constructor has no result to hand back through a
+                // wrapper, so its default is worked out where it is called,
+                // as a constant one is -- which is the same thing where the
+                // default names nothing: "int p [1:2] = '{1, 2}"
+                const bool namesNothing = !newvaluep->exists([](const AstNode* np) {
+                    return VN_IS(np, NodeVarRef) || VN_IS(np, NodeFTaskRef);
+                });
+                if (!VN_IS(newvaluep, Const) && nodep->taskp()->isConstructor()) {
+                    if (!namesNothing) {
+                        nodep->v3warn(E_UNSUPPORTED,
+                                      "Unsupported: Default value that names something in"
+                                      " missing argument "
+                                          << portp->prettyNameQ() << " in call to constructor");
+                        newvaluep = new AstConst{nodep->fileline(), AstConst::Unsized32{}, 0};
+                    }
+                } else if (!VN_IS(newvaluep, Const)) {
                     if (statep) {
                         portp->pinNum(i + 1);  // Make sure correct, will use to build name
                         UINFO(9, "taskConnects arg wrapper needed " << portp->valuep());
