@@ -17379,22 +17379,28 @@ private:
     AstNodeExpr* withTruncWarning(AstNodeExpr* outp, AstNodeVhdlExpr* intExprp, bool sgn,
                                   const AstNodeExpr* countp, FileLine* flp) {
         if (!countp) return outp;
-        if (!m_inStmts) {
-            m_nineWarningDropped = true;
-            return outp;
-        }
         const int64_t count = constCount(countp);
         const VhdlValue val = V3VhdlEval::eval(intExprp);
-        AstNodeExpr* badp = nullptr;
-        if (val.isInt() && count >= 1) {
+        const bool folds = val.isInt() && count >= 1;
+        if (folds) {
             const int64_t v = val.toInt();
             const int64_t bits = sgn ? count - 1 : count;
             if (bits >= 63) return outp;
             const int64_t limit = int64_t{1} << bits;
             if (sgn ? (v >= -limit && v < limit) : (v >= 0 && v < limit)) return outp;
+        } else if (intExprp->exists([](const AstVhdlCall*) { return true; })) {
+            return outp;
+        }
+        // Where statements cannot be written, the statement is emitted as
+        // the process it is, and asked again there
+        if (!m_inStmts) {
+            m_nineWarningDropped = true;
+            return outp;
+        }
+        AstNodeExpr* badp = nullptr;
+        if (folds) {
             badp = new AstConst{flp, AstConst::BitTrue{}};
         } else {
-            if (intExprp->exists([](const AstVhdlCall*) { return true; })) return outp;
             AstNodeExpr* const intp = lowerExpr(intExprp);
             if (!intp) return outp;
             AstNodeExpr* const vp = intTo64(intp, true, flp);
