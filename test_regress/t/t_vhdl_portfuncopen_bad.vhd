@@ -6,9 +6,11 @@
 --
 -- A port that takes its bounds from its actual cannot take them from a
 -- function's result, or an operator's, whose declared type leaves its index
--- open: such an expression has no globally static subtype (6.5.6.3).
--- nvc 1.22.1 and GHDL 7.0.0-dev refuse all three (GHDL gna issue916);
--- a constrained formal, and a signal, stay accepted.
+-- open and which reads a signal: such an expression has no globally static
+-- subtype (6.5.6.3). nvc 1.22.1 and GHDL 7.0.0-dev refuse all three (GHDL
+-- gna issue916); a constrained formal, a signal, and a call of static
+-- operands -- a globally static expression, whose value says its subtype
+-- (NVC issue613) -- stay accepted.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -41,4 +43,5 @@ begin
   u2 : entity work.t_vhdl_portfuncopen_bad_sub port map (reg_i => inv(s));
   u3 : entity work.t_vhdl_portfuncopen_bad_sub port map (reg_i => s and s);
   ok : entity work.t_vhdl_portfuncopen_bad_sub port map (reg_i => s, fix_i => to_slv(int, 2));
+  ok2 : entity work.t_vhdl_portfuncopen_bad_sub port map (reg_i => to_slv(3, 2));
 end architecture;

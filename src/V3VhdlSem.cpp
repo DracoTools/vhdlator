@@ -15485,7 +15485,22 @@ void VhdlSemVisitor::checkPortAssociations(AstVhdlInstance* nodep, VhdlScope* un
                       : nullptr;
             const AstVhdlName* const retp
                 = fdeclp ? VN_CAST(fdeclp->returnTypep(), VhdlName) : nullptr;
-            if (retp && markLeavesIndexOpen(retp->vhdlSymp())) {
+            // A call of static operands is a globally static expression
+            // (9.4.3), whose value says the subtype: "sig => to_unsigned(4,
+            // 4)" is taken by all three (NVC issue613). One that reads a
+            // signal or a variable is not.
+            bool readsObject = false;
+            asp->actualp()->foreach([&](const AstVhdlName* np) {
+                const VhdlSymbol* const symp
+                    = np->vhdlSymp() ? np->vhdlSymp()->resolved() : nullptr;
+                if (!symp) return;
+                const VhdlSymKind k = symp->kind();
+                if (k == VhdlSymKind::SIGNAL || k == VhdlSymKind::PORT
+                    || k == VhdlSymKind::VARIABLE || k == VhdlSymKind::SHARED_VARIABLE) {
+                    readsObject = true;
+                }
+            });
+            if (retp && readsObject && markLeavesIndexOpen(retp->vhdlSymp())) {
                 err(asp->actualp()->fileline(),
                     "Port '" + portp->name()
                         + "' takes its bounds from its actual, and the result of '" + fsymp->name()
