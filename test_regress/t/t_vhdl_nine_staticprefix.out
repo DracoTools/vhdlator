@@ -1,0 +1,4 @@
+t/t_vhdl_nine_staticprefix.vhd:33:32:@0:(assertion warning): NUMERIC_STD.">=": metavalue detected, returning FALSE
+t/t_vhdl_nine_staticprefix.vhd:31:25:@0:(assertion warning): NUMERIC_STD."=": metavalue detected, returning FALSE
+t/t_vhdl_nine_staticprefix.vhd:30:23:@0:(assertion warning): NUMERIC_STD."<": metavalue detected, returning FALSE
+t/t_vhdl_nine_staticprefix.vhd:44:5:@1000000:(report note): *-* All Finished *-*

@@ -37766,9 +37766,7 @@ private:
             if (writtenp.count(refp)) return;
             AstVar* const varp = refp->varp();
             if (!varp || !knownp.count(varp)) return;
-            const AstNodeDType* const dtp
-                = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
-            if (!VN_IS(dtp, BasicDType) && !VN_IS(dtp, PackArrayDType)) return;
+            if (!partsFollowable(varp)) return;
             AstNodeExpr* const partp = staticPartRead(refp);
             const auto it = partOf.find(varp);
             if (it == partOf.end()) {
@@ -38153,27 +38151,20 @@ private:
             if (!refp->access().isReadOrRW()) return;
             // What an assignment writes it does not thereby read: a process
             // woken by its own assignment runs again for every one it makes
-            if (const AstNodeAssign* const asgp = VN_CAST(refp->backp(), NodeAssign)) {
-                if (asgp->lhsp() == refp) return;
-            }
+            // -- nor a part of it, "ge(i) <= ...", whose prefix is not
+            // marked written until later
+            if (assignedThrough(refp)) return;
             if (isToggleFlipRead(refp)) return;
             AstVar* const varp = refp->varp();
             if (!nameableRead(varp)) return;
             // In a subprogram's body, its own variables and formals are not
             // what the process waits on
             if (signalsOnly && !signals.count(varp)) return;
-            // Only a signal held as one value can be shadowed a part at a
-            // time: a record, or an array of them, is read through a
-            // selection that has no shadow of its own. What an attribute
-            // keeps about a signal is a variable of the module too, and the
-            // statement waits on it as it waits on the signal itself.
-            const AstNodeDType* const dtp
-                = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+            // What an attribute keeps about a signal is a variable of the
+            // module too, and the statement waits on it as it waits on the
+            // signal itself.
             AstNodeExpr* const partp
-                = (signals.count(varp)
-                   && (VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType)))
-                      ? staticPartRead(refp)
-                      : nullptr;
+                = signals.count(varp) && partsFollowable(varp) ? staticPartRead(refp) : nullptr;
             const auto it = partOf.find(varp);
             if (it == partOf.end()) {
                 partOf.emplace(varp, partp);
@@ -38200,26 +38191,90 @@ private:
         return itemsp ? new AstSenTree{flp, itemsp} : nullptr;
     }
 
-    // The part of a signal a reference names, where a fixed index says which
-    // -- "v(1)" or "v(3 downto 1)". Null where the whole signal is read, or
-    // where which part is read is not decided until it runs.
+    // Whether a reference is what an assignment writes, whole or through a
+    // selection of a part of it
+    static bool assignedThrough(const AstVarRef* refp) {
+        const AstNode* curp = refp;
+        for (const AstNode* upp = refp->backp(); upp; upp = upp->backp()) {
+            if (const AstNodeAssign* const asgp = VN_CAST(upp, NodeAssign)) {
+                return asgp->lhsp() == curp;
+            }
+            const AstNodeExpr* fromp = nullptr;
+            if (const AstSelBit* const p = VN_CAST(upp, SelBit)) {
+                fromp = p->fromp();
+            } else if (const AstSelExtract* const p = VN_CAST(upp, SelExtract)) {
+                fromp = p->fromp();
+            } else if (const AstSelPlus* const p = VN_CAST(upp, SelPlus)) {
+                fromp = p->fromp();
+            } else if (const AstSelMinus* const p = VN_CAST(upp, SelMinus)) {
+                fromp = p->fromp();
+            } else if (const AstArraySel* const p = VN_CAST(upp, ArraySel)) {
+                fromp = p->fromp();
+            } else if (const AstMemberSel* const p = VN_CAST(upp, MemberSel)) {
+                fromp = p->fromp();
+            } else if (const AstStructSel* const p = VN_CAST(upp, StructSel)) {
+                fromp = p->fromp();
+            } else if (const AstSel* const p = VN_CAST(upp, Sel)) {
+                fromp = p->fromp();
+            }
+            if (!fromp || fromp != curp) return false;
+            curp = upp;
+        }
+        return false;
+    }
+    // Whether the parts of a signal can be waited on one at a time: one held
+    // as bits, a record, or an array of either. A value that carries its own
+    // bounds is a structure whose members are not parts of the signal.
+    static bool partsFollowable(const AstVar* varp) {
+        const AstNodeDType* const dtp = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
+        if (!dtp || isCarrierDType(dtp)) return false;
+        return VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType) || VN_IS(dtp, UnpackArrayDType)
+               || VN_IS(dtp, NodeUOrStructDType) || VN_IS(dtp, RefDType);
+    }
+    // An index the elaboration settles: constants, generics and generate
+    // parameters, which is what makes a name static (8.1)
+    static bool staticIndex(const AstNodeExpr* exprp) {
+        if (VN_IS(exprp, Const)) return true;
+        bool ok = true;
+        exprp->foreach([&](const AstNode* np) {
+            if (const AstVarRef* const vrefp = VN_CAST(np, VarRef)) {
+                if (!vrefp->varp() || (!vrefp->varp()->isParam() && !vrefp->varp()->isGenVar())) {
+                    ok = false;
+                }
+            } else if (VN_IS(np, NodeFTaskRef)) {
+                ok = false;
+            }
+        });
+        return ok;
+    }
+    // The part of a signal a reference names, where a static index says
+    // which -- "v(1)", "v(3 downto 1)", "a(r - 1)" in a generate over r, a
+    // record's element, or a part of one of those. That longest static
+    // prefix is what a statement reading it waits on (11.6). Null where the
+    // whole signal is read, or where which part is read is not decided until
+    // it runs.
     static AstNodeExpr* staticPartRead(AstVarRef* refp) {
         AstNode* upp = refp->backp();
         AstNodeExpr* outp = nullptr;
         while (upp) {
+            const AstNodeExpr* const fromp = outp ? outp : static_cast<AstNodeExpr*>(refp);
             if (const AstSelBit* const bitp = VN_CAST(upp, SelBit)) {
-                if (bitp->fromp() != (outp ? outp : static_cast<AstNodeExpr*>(refp))) break;
-                if (!VN_IS(bitp->bitp(), Const)) return nullptr;
-                outp = VN_AS(upp, NodeExpr);
+                if (bitp->fromp() != fromp || !staticIndex(bitp->bitp())) break;
             } else if (const AstSelExtract* const extp = VN_CAST(upp, SelExtract)) {
-                if (extp->fromp() != (outp ? outp : static_cast<AstNodeExpr*>(refp))) break;
-                if (!VN_IS(extp->leftp(), Const) || !VN_IS(extp->rightp(), Const)) {
-                    return nullptr;
+                if (extp->fromp() != fromp || !staticIndex(extp->leftp())
+                    || !staticIndex(extp->rightp())) {
+                    break;
                 }
-                outp = VN_AS(upp, NodeExpr);
+            } else if (const AstArraySel* const asp = VN_CAST(upp, ArraySel)) {
+                if (asp->fromp() != fromp || !staticIndex(asp->bitp())) break;
+            } else if (const AstMemberSel* const msp = VN_CAST(upp, MemberSel)) {
+                if (msp->fromp() != fromp) break;
+            } else if (const AstStructSel* const ssp = VN_CAST(upp, StructSel)) {
+                if (ssp->fromp() != fromp) break;
             } else {
                 break;
             }
+            outp = VN_AS(upp, NodeExpr);
             upp = upp->backp();
         }
         return outp;
@@ -38239,23 +38294,38 @@ private:
         // would otherwise be followed by its lowest bit alone, and a change
         // that leaves that bit alone would never be seen.
         const AstNodeDType* const dtp = varp->childDTypep() ? varp->childDTypep() : varp->dtypep();
-        const AstPackArrayDType* const packp = VN_CAST(dtp, PackArrayDType);
-        AstNodeDType* const elemp
-            = packp && packp->childDTypep() ? packp->childDTypep()->cloneTree(false) : nullptr;
-        int bits = 1;
-        if (const AstSelExtract* const extp = VN_CAST(partp, SelExtract)) {
-            const int left = VN_AS(extp->leftp(), Const)->toSInt();
-            const int right = VN_AS(extp->rightp(), Const)->toSInt();
-            bits = (left > right ? left - right : right - left) + 1;
-        }
+        const AstSelBit* const selBitp = VN_CAST(partp, SelBit);
+        const AstSelExtract* const selExtp = VN_CAST(partp, SelExtract);
+        const bool fixedBits
+            = (VN_IS(dtp, BasicDType) || VN_IS(dtp, PackArrayDType))
+              && ((selBitp && VN_IS(selBitp->fromp(), VarRef) && VN_IS(selBitp->bitp(), Const))
+                  || (selExtp && VN_IS(selExtp->fromp(), VarRef) && VN_IS(selExtp->leftp(), Const)
+                      && VN_IS(selExtp->rightp(), Const)));
         AstNodeDType* sensDTypep = nullptr;
-        if (!elemp) {
-            sensDTypep = newLogicDType(flp, bits);
-        } else if (bits == 1) {
-            sensDTypep = elemp;
+        if (!fixedBits) {
+            // Any other part -- an element of an array of values, an element
+            // of a record, a part settled by the elaboration -- is followed
+            // as the type of what it reads
+            sensDTypep
+                = new AstRefDType{flp, AstRefDType::FlagTypeOfExpr{}, partp->cloneTree(false)};
         } else {
-            sensDTypep = new AstPackArrayDType{flp, VFlagChildDType{}, elemp,
-                                               new AstRange{flp, bits - 1, 0}};
+            const AstPackArrayDType* const packp = VN_CAST(dtp, PackArrayDType);
+            AstNodeDType* const elemp
+                = packp && packp->childDTypep() ? packp->childDTypep()->cloneTree(false) : nullptr;
+            int bits = 1;
+            if (selExtp) {
+                const int left = VN_AS(selExtp->leftp(), Const)->toSInt();
+                const int right = VN_AS(selExtp->rightp(), Const)->toSInt();
+                bits = (left > right ? left - right : right - left) + 1;
+            }
+            if (!elemp) {
+                sensDTypep = newLogicDType(flp, bits);
+            } else if (bits == 1) {
+                sensDTypep = elemp;
+            } else {
+                sensDTypep = new AstPackArrayDType{flp, VFlagChildDType{}, elemp,
+                                                   new AstRange{flp, bits - 1, 0}};
+            }
         }
         AstVar* const tempp
             = new AstVar{flp, VVarType::VAR, "__Vsens" + std::to_string(++m_tempNum),
