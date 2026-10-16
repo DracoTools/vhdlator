@@ -5200,9 +5200,25 @@ private:
             return nullptr;
         }
         VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
+        // So is a slice of an object whose length is a number, where the
+        // slice's own length is not one and its ends do not move together
+        // -- "v(29 downto n - 2)" in a copy made for a call whose n is a
+        // generic -- which taken from the object's subtype was as long as
+        // the whole object
+        const bool fixedObj = objTypep && objTypep->isConstrainedArray();
+        if (fixedObj) {
+            const VhdlType* const sliceTypep = nodep->vhdlTypep();
+            const bool sliceBounded = sliceTypep && sliceTypep->isConstrainedArray()
+                                      && sliceTypep->indexTypes().size() == 1
+                                      && sliceTypep->indexTypes()[0]
+                                      && sliceTypep->indexTypes()[0]->bounded();
+            if (sliceBounded || constSliceSpan(rp) > 0 || arrayLength(objTypep) < 0) {
+                return nullptr;
+            }
+        }
         if (!objTypep || objTypep->base()->kind() != VhdlTypeKind::ARRAY
-            || objTypep->isConstrainedArray() || !objTypep->lengthEmittable()
-            || objTypep->indexTypes().size() != 1 || carriedDynamically(objTypep)) {
+            || (!fixedObj && !objTypep->lengthEmittable()) || objTypep->indexTypes().size() != 1
+            || carriedDynamically(objTypep)) {
             return nullptr;
         }
         AstNodeExpr* leftp = nullptr;
