@@ -24459,17 +24459,24 @@ private:
                 reports = callsReporting(p);
             }
         }
-        // One that reports runs once and then waits on what it reads, over
-        // and over -- the process it is equivalent to (11.5, 11.6). An event
-        // control at the head of a block would also wake as the design
-        // starts, and report a second time what the first run did: twice
-        // at time zero the warning a native comparison gives over a
-        // metavalue in "less <= '1' when free < 3 else '0'".
+        // One that reports runs once at the start and again on each change of
+        // what it reads -- the process it is equivalent to (11.5, 11.6) --
+        // and so reports exactly as often. An "always" on what it reads does
+        // that and no more: its change triggers fire once at initialization
+        // (V3SenExprBuilder), so it is not also emitted to run at the start,
+        // which reported twice at time zero the warning a native comparison
+        // gives over a metavalue in "less <= '1' when free < 3 else '0'".
         if (reports && allKnown && v3Global.opt.timing().isTrue()) {
             if (AstSenTree* const senp = sensitivityOfBody(bodyp, flp)) {
-                AstNode* const loopp = AstNode::addNext(
-                    bodyp, static_cast<AstNode*>(new AstEventControl{flp, senp, nullptr}));
-                return new AstAlways{flp, VAlwaysKwd::ALWAYS, nullptr, loopp};
+                // Each concurrent statement is a driver of its own (11.6),
+                // clocked by what it reads, which is no conflict in VHDL
+                for (const AstNode* const np : writtenp) {
+                    const AstVarRef* const refp = VN_CAST(np, VarRef);
+                    if (refp && refp->varp()) {
+                        refp->varp()->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    }
+                }
+                return new AstAlways{flp, VAlwaysKwd::ALWAYS, asChanges(senp), bodyp};
             }
         }
         schedules = schedules || reports;
@@ -24492,7 +24499,8 @@ private:
                             refp->varp()->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
                         }
                     }
-                    AstAlways* const partp = new AstAlways{flp, VAlwaysKwd::ALWAYS, senp, bodyp};
+                    AstAlways* const partp
+                        = new AstAlways{flp, VAlwaysKwd::ALWAYS, asChanges(senp), bodyp};
                     m_concSenp.insert(partp);
                     return partp;
                 }
@@ -25581,13 +25589,22 @@ private:
                         pflp, new AstIf{pflp, new AstVarRef{pflp, pendp, VAccess::READ}, runp}});
                     return;
                 }
-                if (v3Global.opt.timing().isTrue()) {
-                    // A process with a sensitivity list is the same as one
-                    // with "wait on <list>" as its last statement (11.3): it
-                    // runs once when the simulation starts and then waits.
-                    // Written out that way it runs exactly once at time zero,
-                    // where an "always" with the same sensitivity may or may
-                    // not fire there depending on what the signals start at.
+                // A process with a sensitivity list is the same as one with
+                // "wait on <list>" as its last statement (11.3): it runs once
+                // when the simulation starts and then waits. An "always" on
+                // the same list does exactly that: a change trigger fires at
+                // initialization whatever the signals start at
+                // (V3SenExprBuilder), so the body runs once in the first
+                // pass, after what is assigned continuously has settled, and
+                // again on each change. It is scheduled as triggered logic,
+                // where a process that suspends is a coroutine resumed through
+                // the scheduler on every wake, which cost neorv32's testbench
+                // a seventh of its run time.
+                // A postponed process keeps the form below, waiting for the
+                // postponed region after its signals change.
+                if (v3Global.opt.timing().isTrue() && m_postponed) {
+                    // Written out as its own wait it runs exactly once at
+                    // time zero, and then waits on the list
                     bodyp = AstNode::addNextNull(
                         bodyp, static_cast<AstNode*>(
                                    new AstEventControl{flp, sentreep, nullptr}));
@@ -25605,7 +25622,11 @@ private:
                 }
                 // Without --timing there is nothing to suspend on, so the
                 // body is emitted a second time to start it
-                addStmt(new AstInitial{flp, lowerStmts(nodep->stmtsp())});
+                if (!v3Global.opt.timing().isTrue()) {
+                    addStmt(new AstInitial{flp, lowerStmts(nodep->stmtsp())});
+                } else {
+                    asChanges(sentreep);
+                }
             }
         }
         if (!sentreep && nodep->hasSensList()) return;  // Already reported
@@ -25696,12 +25717,29 @@ private:
                 allowInitialDriver(altp->stmtsp(), false);
                 continue;
             }
+            // Every signal the statement may write: a target, the names an
+            // aggregate target joins, a procedure's actuals
+            const auto allowNames = [&](AstNode* fromp) {
+                if (!fromp) return;
+                fromp->foreachAndNext([&](AstVhdlName* namep) {
+                    VhdlSymbol* const symp = namep->vhdlSymp();
+                    const auto it = symp ? m_vars.find(symp->resolved()) : m_vars.end();
+                    if (it != m_vars.end() && it->second) {
+                        it->second->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                    }
+                });
+            };
             if (AstVhdlSigAssign* const asgp = VN_CAST(p, VhdlSigAssign)) {
                 VhdlSymbol* const symp = targetSymbol(asgp->targetp());
                 const auto it = symp ? m_vars.find(symp) : m_vars.end();
                 if (it != m_vars.end()) {
                     it->second->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
                 }
+                allowNames(asgp->targetp());
+                continue;
+            }
+            if (AstVhdlProcCall* const pcallp = VN_CAST(p, VhdlProcCall)) {
+                allowNames(pcallp->callp());
                 continue;
             }
             if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
@@ -36554,6 +36592,17 @@ private:
     // exact even for a bit taken out of a vector; for anything wider it has
     // to be a change, since an edge item would only ever look at the least
     // significant bit.
+    // The same items as changes, which is what makes an "always" on them run
+    // once at the start: a change item fires at initialization, an edge item
+    // does not (V3SenExprBuilder)
+    static AstSenTree* asChanges(AstSenTree* senp) {
+        for (AstSenItem* itemp = senp->sensesp(); itemp; itemp = VN_AS(itemp->nextp(), SenItem)) {
+            if (itemp->edgeType() == VEdgeType::ET_BOTHEDGE) {
+                itemp->edgeType(VEdgeType::ET_CHANGED);
+            }
+        }
+        return senp;
+    }
     static AstSenItem* senItemFor(AstNodeExpr* exprp, bool oneBit, FileLine* flp) {
         return new AstSenItem{flp, oneBit ? VEdgeType::ET_BOTHEDGE : VEdgeType::ET_CHANGED,
                               exprp};
@@ -38255,11 +38304,18 @@ private:
                                   bool signalsOnly = false) {
         if (!bodyp) return nullptr;
         std::set<const AstVar*> signals;
+        // A variable is never what a statement waits on: "process (all)" is
+        // sensitive to the signals it reads (11.3), and one that waited on
+        // its own variable would wake itself with every write to it
+        std::set<const AstVar*> variables;
         for (const auto& pair : m_vars) {
             if (!pair.first) continue;
             if (pair.first->kind() == VhdlSymKind::SIGNAL
                 || pair.first->kind() == VhdlSymKind::PORT) {
                 signals.insert(pair.second);
+            } else if (pair.first->kind() == VhdlSymKind::VARIABLE
+                       || pair.first->kind() == VhdlSymKind::SHARED_VARIABLE) {
+                variables.insert(pair.second);
             }
         }
         std::vector<AstVar*> reads;
@@ -38268,6 +38324,14 @@ private:
         // signal names the same part of it, and by a fixed index, that part
         // is what the statement waits on.
         std::map<const AstVar*, AstNodeExpr*> partOf;  // Null once two parts differ
+        // Nor what the body itself writes as it runs -- a temporary, a
+        // range check's value -- which it would otherwise wake itself with
+        std::set<const AstVar*> scratch;
+        bodyp->foreachAndNext([&](const AstAssign* asgp) {
+            if (const AstVarRef* const lrefp = VN_CAST(asgp->lhsp(), VarRef)) {
+                if (!signals.count(lrefp->varp())) scratch.insert(lrefp->varp());
+            }
+        });
         bool observes = false;
         for (AstNode* stmtp = bodyp; stmtp && !observes; stmtp = stmtp->nextp()) {
             observes
@@ -38283,6 +38347,8 @@ private:
             if (isToggleFlipRead(refp)) return;
             AstVar* const varp = refp->varp();
             if (!nameableRead(varp)) return;
+            if (variables.count(varp) && !signals.count(varp)) return;
+            if (scratch.count(varp)) return;
             // In a subprogram's body, its own variables and formals are not
             // what the process waits on
             if (signalsOnly && !signals.count(varp)) return;
