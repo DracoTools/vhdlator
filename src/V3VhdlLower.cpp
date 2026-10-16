@@ -17694,6 +17694,26 @@ private:
         if (!nineArg(args[0], a, stmtsp, flp) || !nineArg(args[1], b, stmtsp, flp)) return fail();
         const int64_t ac = constCount(a.countp);
         const int64_t bc = constCount(b.countp);
+        // A length a generic gives -- neorv32's multiplier, "opa * opb" over
+        // signed(DWIDTH downto 0) -- is a number once the design is
+        // elaborated, and a function of the module can be that wide
+        const auto byGenerics = [](const AstNodeExpr* countp) {
+            return const_cast<AstNodeExpr*>(countp)->isPure()
+                   && !countp->exists([](const AstNodeFTaskRef*) { return true; })
+                   && !countp->exists([](const AstVarRef* refp) {
+                          return !refp->varp()
+                                 || !(refp->varp()->isParam() || refp->varp()->isGenVar());
+                      });
+        };
+        if ((ac < 0 || bc < 0) && ac != 0 && bc != 0 && byGenerics(a.countp)
+            && byGenerics(b.countp)) {
+            AstNodeExpr* outp = nineProductByGenerics(a, b, sgn, flp);
+            if (!outp) return fail();
+            nineDrop(a);
+            nineDrop(b);
+            if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+            return outp;
+        }
         if (ac < 1 || bc < 1 || ac > 64 || bc > 64 || ac + bc > 128) return fail();
         const int width = static_cast<int>(ac + bc);
         // Gathering and spreading read what they are given once per step,
@@ -17742,6 +17762,90 @@ private:
         nineDrop(b);
         if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
         return outp;
+    }
+    // The same where a length is a generic's: a function of the module,
+    // whose widths are those lengths, gathers each operand's value lanes
+    // into a number, multiplies the two at the product's width and spreads
+    // the product back into lanes -- all 'X' where either operand holds a
+    // metavalue (TO_01)
+    AstNodeExpr* nineProductByGenerics(const NineArg& a, const NineArg& b, bool sgn,
+                                       FileLine* origFlp) {
+        if (!m_modp || m_ftaskp || m_protClassp) return nullptr;
+        FileLine* const flp = dynFl(origFlp);
+        const auto bitsType = [&](AstNodeExpr* bitsp) -> AstNodeDType* {
+            return new AstPackArrayDType{
+                flp, VFlagChildDType{}, newLogicDType(flp, 1),
+                new AstRange{flp, new AstSub{flp, bitsp, i32(1, flp)}, i32(0, flp)}};
+        };
+        const auto lanesOf = [&](const AstNodeExpr* countp) {
+            return new AstMul{flp, i32(4, flp),
+                              const_cast<AstNodeExpr*>(countp)->cloneTree(false)};
+        };
+        const auto sum = [&]() {
+            return new AstAdd{flp, a.countp->cloneTree(false), b.countp->cloneTree(false)};
+        };
+        const std::string name = "__Vninemul" + std::to_string(++m_nameNum);
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, bitsType(lanesOf(sum())), flp));
+        AstVar* const ap = dynArg(funcp, "a", bitsType(lanesOf(a.countp)), flp);
+        AstVar* const bp = dynArg(funcp, "b", bitsType(lanesOf(b.countp)), flp);
+        AstVar* const avp = newFuncLocal("av", bitsType(a.countp->cloneTree(false)), flp);
+        AstVar* const bvp = newFuncLocal("bv", bitsType(b.countp->cloneTree(false)), flp);
+        AstVar* const pp = newFuncLocal("p", bitsType(sum()), flp);
+        AstVar* const ip = newFuncLocal("i", newIntDType(flp), flp);
+        AstVar* const okp = newFuncLocal("ok", bitDType(flp), flp);
+        for (AstVar* const vp : {avp, bvp, pp, ip, okp}) funcp->addStmtsp(vp);
+        const auto out = [&]() { return wr(VN_AS(funcp->fvarp(), Var), flp); };
+        const auto laneBit = [&](AstVar* lanesp, int bit) {
+            return new AstSel{
+                flp, rd(lanesp, flp),
+                new AstAdd{flp, new AstMul{flp, i32(4, flp), rd(ip, flp)}, i32(bit, flp)}, 1};
+        };
+        const auto incr = [&]() {
+            return new AstAssign{flp, wr(ip, flp), new AstAdd{flp, rd(ip, flp), i32(1, flp)}};
+        };
+        funcp->addStmtsp(new AstAssign{flp, wr(okp, flp), new AstConst{flp, AstConst::BitTrue{}}});
+        // Every lane '0', '1', 'L' or 'H' (bit 1 set, bit 3 clear), and its value bit
+        const auto gather = [&](AstVar* lanesp, AstVar* valsp, const AstNodeExpr* countp) {
+            funcp->addStmtsp(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+            AstNode* bodyp = new AstIf{
+                flp, new AstLogOr{flp, new AstLogNot{flp, laneBit(lanesp, 1)}, laneBit(lanesp, 3)},
+                new AstAssign{flp, wr(okp, flp), new AstConst{flp, AstConst::BitFalse{}}},
+                nullptr};
+            bodyp->addNext(new AstAssign{flp, new AstSel{flp, wr(valsp, flp), rd(ip, flp), 1},
+                                         laneBit(lanesp, 0)});
+            bodyp->addNext(incr());
+            funcp->addStmtsp(whileLoop(
+                flp,
+                new AstLtS{flp, rd(ip, flp), const_cast<AstNodeExpr*>(countp)->cloneTree(false)},
+                bodyp));
+        };
+        gather(ap, avp, a.countp);
+        gather(bp, bvp, b.countp);
+        AstNodeExpr* const prodp
+            = sgn ? static_cast<AstNodeExpr*>(new AstMulS{flp, new AstSigned{flp, rd(avp, flp)},
+                                                          new AstSigned{flp, rd(bvp, flp)}})
+                  : static_cast<AstNodeExpr*>(new AstMul{flp, rd(avp, flp), rd(bvp, flp)});
+        AstNode* thenp = new AstAssign{flp, wr(pp, flp), prodp};
+        thenp->addNext(new AstAssign{flp, wr(ip, flp), i32(0, flp)});
+        // '0' is lane 2 and '1' lane 3
+        AstNode* spreadp = new AstAssign{
+            flp, new AstSel{flp, out(), new AstMul{flp, i32(4, flp), rd(ip, flp)}, 4},
+            new AstConcat{flp, new AstConst{flp, AstConst::WidthedValue{}, 3, 1},
+                          new AstSel{flp, rd(pp, flp), rd(ip, flp), 1}}};
+        spreadp->addNext(incr());
+        thenp->addNext(whileLoop(flp, new AstLtS{flp, rd(ip, flp), sum()}, spreadp));
+        AstNodeExpr* const countp = sum();
+        funcp->addStmtsp(new AstIf{flp, rd(okp, flp), thenp,
+                                   new AstAssign{flp, out(), laneMask(1, countp, flp)}});
+        VL_DO_DANGLING(countp->deleteTree(), countp);
+        addHelperFunc(funcp);
+        AstArg* const argsp = new AstArg{flp, "", nineRead(a, origFlp)};
+        argsp->addNext(new AstArg{flp, "", nineRead(b, origFlp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, name, argsp};
+        refp->taskp(funcp);
+        return refp;
     }
     AstNodeExpr* nineNumeric(const VhdlSymbol* symp, const std::string& op,
                              const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
@@ -18448,6 +18552,9 @@ private:
             if (!nineOperandKnown(args[0]) || !nineOperandKnown(args[1])) return false;
             const int64_t lc = nineStaticCount(args[0]);
             const int64_t rc = nineStaticCount(args[1]);
+            // A length elaboration settles -- a generic's -- is planned too
+            // (nineProductByGenerics)
+            if (lc < 0 || rc < 0) return lc != 0 && rc != 0 && !m_ftaskp;
             return lc >= 1 && rc >= 1 && lc <= 64 && rc <= 64 && lc + rc <= 128;
         }
         const bool arith = op == "+" || op == "-";
