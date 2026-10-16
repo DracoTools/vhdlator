@@ -3861,9 +3861,11 @@ void AstCgOptionAssign::dumpJson(std::ostream& str) const {
 void AstDelay::dump(std::ostream& str) const {
     this->AstNodeStmt::dump(str);
     if (isCycleDelay()) str << " [CYCLE]";
+    if (unordered()) str << " [UNORDERED]";
 }
 void AstDelay::dumpJson(std::ostream& str) const {
     dumpJsonBoolFuncIf(str, isCycleDelay);
+    dumpJsonBoolFuncIf(str, unordered);
     dumpJsonGen(str);
 }
 

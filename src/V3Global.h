@@ -191,6 +191,8 @@ class V3Global final {
     bool m_usesTiming = false;  // Design uses timing constructs
     bool m_usesForce = false;  // Design uses force/release statements
     bool m_usesZeroDelay = false;  // Design uses #0 delay (or non-constant delay)
+    // A #0 delay of the design must resume before the logic of the NBA region runs
+    bool m_zeroDelayOrdered = false;
     bool m_hasForceableSignals = false;  // Need to apply V3Force pass
     bool m_hasAssignDeassign = false;  // Need to apply V3Force pass for assign/deassign statements
     bool m_hasSystemCSections = false;  // Has AstSystemCSection that need to be emitted
@@ -270,7 +272,11 @@ public:
     bool usesTiming() const { return m_usesTiming; }
     void setUsesTiming() { m_usesTiming = true; }
     bool usesZeroDelay() const { return m_usesZeroDelay; }
-    void setUsesZeroDelay() { m_usesZeroDelay = true; }
+    bool zeroDelayOrdered() const { return m_zeroDelayOrdered; }
+    void setUsesZeroDelay(bool ordered) {
+        m_usesZeroDelay = true;
+        if (ordered) m_zeroDelayOrdered = true;
+    }
     bool hasForceableSignals() const { return m_hasForceableSignals; }
     void setHasForceableSignals() { m_hasForceableSignals = true; }
     bool hasAssignDeassign() const { return m_hasAssignDeassign; }

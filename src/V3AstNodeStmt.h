@@ -583,6 +583,10 @@ class AstDelay final : public AstNodeStmt {
     // @astgen op4 := throughoutp : Optional[AstNodeExpr] // Throughout condition (IEEE 16.9.9)
     VTimescale m_timeunit;  // Delay's time unit
     const bool m_isCycle;  // True if it is a cycle delay
+    // True if a #0 here need not resume before the logic of the NBA region runs: the delay comes
+    // from a language with no inactive region (VHDL), whose processes all run in delta cycles
+    bool m_unordered = false;
+
 public:
     AstDelay(FileLine* fl, AstNodeExpr* lhsp, bool isCycle)
         : ASTGEN_SUPER_Delay(fl)
@@ -597,6 +601,8 @@ public:
     void timeunit(const VTimescale& flag) { m_timeunit = flag; }
     VTimescale timeunit() const { return m_timeunit; }
     bool isCycleDelay() const { return m_isCycle; }
+    bool unordered() const { return m_unordered; }
+    void unordered(bool flag) { m_unordered = flag; }
     bool isRangeDelay() const { return m_isCycle && rhsp() != nullptr; }
     bool isUnbounded() const { return isRangeDelay() && VN_IS(rhsp(), Unbounded); }
     void fallDelay(AstNodeExpr* const fallDelayp) { rhsp(fallDelayp); }

@@ -375,7 +375,21 @@ void V3Vhdl::analyzeAndLower(AstNetlist* rootp, VInFilter* filterp) {
         for (AstNodeVhdlUnit* const unitp : V3VhdlSem::specializedUnits()) {
             withCopies.push_back(unitp);
         }
+        std::unordered_set<const AstNodeModule*> verilogModules;
+        for (const AstNodeModule* modp = rootp->modulesp(); modp;
+             modp = VN_AS(modp->nextp(), NodeModule)) {
+            verilogModules.insert(modp);
+        }
         V3VhdlLower::lower(withCopies, rootp);
+        // VHDL has no inactive region: a process that waits for no time
+        // resumes in a delta cycle, after the signal updates, and the
+        // lowering waits for those itself where it has to. So a #0 it
+        // leaves never needs everything else kept in the active region.
+        for (AstNodeModule* modp = rootp->modulesp(); modp;
+             modp = VN_AS(modp->nextp(), NodeModule)) {
+            if (verilogModules.count(modp)) continue;
+            modp->foreach([](AstDelay* delayp) { delayp->unordered(true); });
+        }
     }
 
     // The VHDL tree has served its purpose; nothing downstream may see one

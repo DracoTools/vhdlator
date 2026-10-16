@@ -297,6 +297,29 @@ public:
     }
 };
 
+// Whether the logic may start a fork, itself or in a function it calls
+class ForkFinder final {
+    std::unordered_map<const AstCFunc*, bool> m_funcs;  // Functions worked out so far
+
+public:
+    bool mayFork(const AstNode* nodep) {
+        bool found = false;
+        nodep->foreach([&](const AstNode* np) {
+            if (found) return;
+            if (VN_IS(np, Fork)) {
+                found = true;
+            } else if (const AstNodeCCall* const callp = VN_CAST(np, NodeCCall)) {
+                const AstCFunc* const funcp = callp->funcp();
+                if (!funcp) return;
+                const auto pair = m_funcs.emplace(funcp, false);  // Recursion answers no
+                if (pair.second) pair.first->second = mayFork(funcp);
+                found = pair.first->second;
+            }
+        });
+        return found;
+    }
+};
+
 void colorActiveRegion(V3Graph& graph) {
     // Work queue for depth first traversal
     std::vector<V3GraphVertex*> queue{};
@@ -305,6 +328,19 @@ void colorActiveRegion(V3Graph& graph) {
     for (V3GraphVertex& vtx : graph.vertices()) {
         if (const auto activeEventVtxp = vtx.cast<SchedSenVertex>()) {
             queue.push_back(activeEventVtxp);
+        }
+    }
+
+    // If the only #0 delays are those that need not resume before the 'nba' logic (see
+    // AstDelay::unordered), only the logic that may start a fork has to go to 'act': a forked
+    // process starts once its parent suspends, as a delay of no time, and it has to start in the
+    // same delta as its parent, before the 'nba' region commits.
+    if (v3Global.usesZeroDelay() && !v3Global.zeroDelayOrdered()) {
+        ForkFinder forkFinder;
+        for (V3GraphVertex& vtx : graph.vertices()) {
+            if (const auto lvtxp = vtx.cast<SchedLogicVertex>()) {
+                if (forkFinder.mayFork(lvtxp->logicp())) queue.push_back(lvtxp);
+            }
         }
     }
 
@@ -365,7 +401,9 @@ LogicRegions partition(LogicByScope& clockedLogic, LogicByScope& combinationalLo
             // in which case **EVERYTHING** that is not a Post block needs to go to 'act'.
             // This severely limits downstream optimizations (e.g. V3LifePost), and severely
             // reduces available parallelism in 'nba' for multi-threaded execution.
-            if (v3Global.usesZeroDelay() && !VN_IS(lvtxp->logicp(), AlwaysPost)) toAct = true;
+            // A #0 that need not resume before the 'nba' logic (see AstDelay::unordered)
+            // does not need this.
+            if (v3Global.zeroDelayOrdered() && !VN_IS(lvtxp->logicp(), AlwaysPost)) toAct = true;
             LogicByScope& lbs = toAct ? result.m_act : result.m_nba;
             AstNode* const logicp = lvtxp->logicp();
             logicp->unlinkFrBack();
