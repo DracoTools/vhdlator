@@ -32730,6 +32730,79 @@ private:
         V3VhdlEval::s_keepReports = true;
         AstNode* const outp = lowerStmtInner(nodep);
         V3VhdlEval::s_keepReports = savedKeep;
+        return outp ? splitPatternTargets(nodep, outp) : nullptr;
+    }
+    // A slice of elements that do not pack, whose ends move but whose length is a number --
+    // "v_packet(22 + n to 22 + n + 3) := ..." in UVVM's Ethernet VVC -- is a target written
+    // out one element at a time (unpackedSlice), which Verilog cannot assign to. The value
+    // goes into a temporary as long as the slice first, and each element from there, so that
+    // a value reading the same object reads it as it was.
+    AstNode* splitPatternTargets(AstNodeVhdlStmt* nodep, AstNode* outp) {
+        AstNodeVhdlExpr* targetp = nullptr;
+        if (const AstVhdlVarAssign* const ap = VN_CAST(nodep, VhdlVarAssign)) {
+            targetp = ap->targetp();
+        } else if (const AstVhdlSigAssign* const ap = VN_CAST(nodep, VhdlSigAssign)) {
+            targetp = ap->targetp();
+        }
+        const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        if (!callp || !VN_IS(callp->argsp(), VhdlRange)) return outp;
+        std::vector<AstNodeAssign*> asgnps;
+        for (AstNode* p = outp; p; p = p->nextp()) {
+            p->foreach([&](AstNodeAssign* asgnp) {
+                if (VN_IS(asgnp->lhsp(), Pattern)) asgnps.push_back(asgnp);
+            });
+        }
+        if (asgnps.empty()) return outp;
+        VhdlType* objTypep = callp->prefixp()->vhdlTypep();
+        if (objTypep && !objTypep->elementp()) {
+            if (VhdlType* const boundp = boundTypeOf(callp->prefixp())) objTypep = boundp;
+        }
+        VhdlType* const elemp = !objTypep              ? nullptr
+                                : objTypep->elementp() ? objTypep->elementp()
+                                                       : objTypep->base()->elementp();
+        if (!elemp || (elemp->base()->kind() == VhdlTypeKind::ARRAY && !elemp->lengthEmittable())
+            || lengthOnlyRunningDecides(elemp)) {
+            return outp;
+        }
+        for (AstNodeAssign* const asgnp : asgnps) {
+            FileLine* const flp = asgnp->fileline();
+            AstPattern* const patp = VN_AS(asgnp->lhsp(), Pattern);
+            std::vector<AstNodeExpr*> placeps;
+            for (AstPatMember* memp = VN_CAST(patp->itemsp(), PatMember); memp;
+                 memp = VN_CAST(memp->nextp(), PatMember)) {
+                if (memp->keyp() || memp->repp() || memp->isDefault() || !memp->lhssp()
+                    || memp->lhssp()->nextp()) {
+                    placeps.clear();
+                    break;
+                }
+                placeps.push_back(memp->lhssp());
+            }
+            if (placeps.empty()) continue;
+            AstVar* const tmpp
+                = newTempVar("__Vslice",
+                             new AstUnpackArrayDType{
+                                 flp, VFlagChildDType{}, lowerType(elemp, flp),
+                                 new AstRange{flp, 0, static_cast<int>(placeps.size()) - 1}},
+                             flp);
+            AstNode* stmtsp = new AstAssign{flp, wr(tmpp, flp), asgnp->rhsp()->unlinkFrBack()};
+            for (size_t k = 0; k < placeps.size(); ++k) {
+                AstNodeExpr* const placep = placeps[k]->unlinkFrBack();
+                AstNodeExpr* const fromp
+                    = new AstSelBit{flp, rd(tmpp, flp), i32(static_cast<int64_t>(k), flp)};
+                stmtsp = AstNode::addNext(stmtsp,
+                                          static_cast<AstNode*>(asgnp->cloneType(placep, fromp)));
+            }
+            if (asgnp == outp) {
+                // The head of what the statement lowered to, which has no parent to replace in
+                if (AstNode* const restp = asgnp->nextp()) {
+                    stmtsp = AstNode::addNext(stmtsp, restp->unlinkFrBackWithNext());
+                }
+                outp = stmtsp;
+            } else {
+                asgnp->replaceWith(stmtsp);
+            }
+            VL_DO_DANGLING(asgnp->deleteTree(), asgnp);
+        }
         return outp;
     }
     AstNode* lowerStmtInner(AstNodeVhdlStmt* nodep) {
