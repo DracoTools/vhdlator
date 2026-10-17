@@ -23815,8 +23815,9 @@ private:
             AstNodeExpr* elemp = lowerExpr(valuep);
             if (!elemp) return nullptr;
             // An element of a scalar subtype is a value of it or an error, as an assignment to
-            // it would be: REAL'LEFT * REAL'LEFT is no REAL (NVC real7)
-            if (!asString && !packed) {
+            // it would be: REAL'LEFT * REAL'LEFT is no REAL (NVC real7). Of one dimension only:
+            // a value of an array of two is a row, "((0, 0), (0, 0))" (NVC default1)
+            if (!asString && !packed && typep->base()->dimensions() <= 1) {
                 const VhdlType* const elemTypep
                     = typep->elementp() ? typep->elementp() : typep->base()->elementp();
                 elemp = rangeChecked(elemp, elemTypep, valuep, flp);
