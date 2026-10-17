@@ -1,0 +1,4 @@
+t/t_vhdl_static_int_bad.vhd:15:5:@0:(report note): fits
+%Error: t/t_vhdl_static_int_bad.vhd:17: Value 4294967296 is outside of the range -2147483648 to 2147483647 of INTEGER
+%Error: t/t_vhdl_static_int_bad.vhd:17: Verilog $stop
+Aborting...

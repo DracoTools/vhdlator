@@ -6038,6 +6038,55 @@ private:
         refp->taskp(VN_AS(funcpr, Func));
         return refp;
     }
+    // TO_INTEGER of a vector whose value INTEGER cannot hold: numeric_std's body works it out in
+    // INTEGER arithmetic, which overflows, where nvc and GHDL stop the run (NVC ieee20). The
+    // value, held in 64 bits with the vector's signedness, is handed back, or the run stops.
+    AstNodeExpr* intRangeChecked(AstNodeExpr* v64p, bool sgn, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return v64p;
+        AstNodeDType* const dtypep
+            = new AstBasicDType{flp, VBasicDTypeKwd::LOGIC,
+                                sgn ? VSigning::SIGNED : VSigning::UNSIGNED, VNumRange{63, 0}, -1};
+        const auto c64 = [&](int64_t v) -> AstNodeExpr* {
+            return new AstSigned{
+                flp, new AstConst{flp, AstConst::Unsized64{}, static_cast<uint64_t>(v)}};
+        };
+        return stopWhere(
+            v64p, dtypep, sgn ? "toint|s" : "toint|u",
+            [&](AstNodeExpr* vp) -> AstNodeExpr* {
+                if (!sgn) {
+                    return new AstGt{flp, vp,
+                                     new AstConst{flp, AstConst::Unsized64{}, 0x7fffffffULL}};
+                }
+                return new AstLogOr{flp, new AstLtS{flp, vp, c64(-2147483648LL)},
+                                    new AstGtS{flp, vp->cloneTree(false), c64(2147483647LL)}};
+            },
+            "NUMERIC_STD.TO_INTEGER: the value %0d does not fit INTEGER", flp);
+    }
+    // A static value of INTEGER or of a universal integer that INTEGER cannot hold, standing where
+    // an INTEGER is read: "i < -2 ** 32" (NVC arith6), where nvc and GHDL stop the run. Held in
+    // 32 bits it would be another number. The value is handed back after the run stops.
+    AstNodeExpr* staticIntChecked(AstNodeExpr* constp, const VhdlValue& val, const VhdlType* typep,
+                                  FileLine* flp) {
+        if (!constp || !typep || !val.isInt() || !v3Global.opt.vhdlBoundCheck() || !m_inStmts) {
+            return constp;
+        }
+        const VhdlTypeKind kind = typep->base()->kind();
+        if (kind != VhdlTypeKind::INTEGER && kind != VhdlTypeKind::UNIVERSAL_INTEGER) {
+            return constp;
+        }
+        if (kind == VhdlTypeKind::INTEGER && needsWideInt(typep->base())) return constp;
+        if (val.toInt() >= INT32_MIN && val.toInt() <= INT32_MAX) return constp;
+        AstNode* const msgp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                             "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                                 + ": Value " + std::to_string(val.toInt())
+                                 + " is outside of the range -2147483648 to 2147483647 of INTEGER",
+                             nullptr, nullptr};
+        msgp->addNext(new AstStop{flp, true});
+        // After the stop the number stands for nothing: an INTEGER, so no width is warned of
+        VL_DO_DANGLING(constp->deleteTree(), constp);
+        return new AstExprStmt{flp, msgp, new AstConst{flp, AstConst::Signed32{}, 0}};
+    }
     // An INTEGER raised to a negative power is an error (9.2.8), where nvc,
     // GHDL and Questa stop the run (NVC bounds30). Under --vhdl-bound-check,
     // and not for an exponent that is a number of zero or more.
@@ -6083,6 +6132,36 @@ private:
             },
             "Position %0d is outside of the positions " + std::to_string(lo) + " to "
                 + std::to_string(hi) + " of " + typep->prettyName(),
+            flp);
+    }
+    // A REAL converted to an integer type in a port's association, where the value rounded is
+    // not one of the type (9.3.6): the conversion is evaluated as the design is elaborated,
+    // where nvc and Questa stop (NVC bounds43). While running, GHDL and Questa carry on past
+    // the same conversion, so a statement's is not checked (conv10).
+    bool m_portConversion = false;  // Lowering a port association's conversion
+    AstNodeExpr* realToIntChecked(AstNodeExpr* valuep, const VhdlType* typep, FileLine* flp) {
+        if (!valuep || !typep || !m_portConversion || !v3Global.opt.vhdlBoundCheck()
+            || VN_IS(valuep, Const)) {
+            return valuep;
+        }
+        if (!typep->bounded() || typep->isNull()
+            || typep->base()->kind() != VhdlTypeKind::INTEGER) {
+            return valuep;
+        }
+        // Rounded half away from zero, so a value half below the low end rounds outside, as
+        // one half above the high end does
+        const double lo = static_cast<double>(typep->low()) - 0.5;
+        const double hi = static_cast<double>(typep->high()) + 0.5;
+        return stopWhere(
+            valuep, new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE}, "rtoi|" + typep->prettyName(),
+            [&](AstNodeExpr* vp) {
+                return new AstLogOr{
+                    flp, new AstLteD{flp, vp, new AstConst{flp, AstConst::RealDouble{}, lo}},
+                    new AstGteD{flp, vp->cloneTree(false),
+                                new AstConst{flp, AstConst::RealDouble{}, hi}}};
+            },
+            "Value %g is outside of the range " + std::to_string(typep->low()) + " to "
+                + std::to_string(typep->high()) + " of " + typep->prettyName(),
             flp);
     }
     // A negative delay in an "after" or a "wait for" is an error when it is
@@ -10311,7 +10390,10 @@ private:
             const bool keepRange = (VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected))
                                    && (foldsToBareNumber(nodep->vhdlTypep())
                                        || (!m_emitForUnit && multiBitElems(nodep->vhdlTypep())));
-            if (!keepRange) return lowerValue(val, nodep->vhdlTypep(), flp);
+            if (!keepRange) {
+                AstNodeExpr* const constp = lowerValue(val, nodep->vhdlTypep(), flp);
+                return staticIntChecked(constp, val, nodep->vhdlTypep(), flp);
+            }
         }
 
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) {
@@ -18514,6 +18596,11 @@ private:
                 valp = new AstShiftRS{
                     flp, new AstSigned{flp, new AstShiftL{flp, valp, upp->cloneTree(false)}}, upp};
             }
+            // More elements than INTEGER holds bits of may give a value it cannot hold
+            const AstConst* const countConstp = VN_CAST(a.countp, Const);
+            if (!countConstp || countConstp->toSInt() > (k == 's' ? 32 : 31)) {
+                valp = intRangeChecked(valp, k == 's', flp);
+            }
             // An INTEGER, which is signed
             AstNodeExpr* outp = new AstCond{
                 flp, laneAllDefined(a, flp),
@@ -22053,7 +22140,7 @@ private:
             return new AstCast{flp, valuep, VFlagChildDType{}, lowerType(top, flp)};
         }
         if (toKind != VhdlTypeKind::FLOATING && fromKind == VhdlTypeKind::FLOATING) {
-            return new AstRToIRoundS{flp, valuep};
+            return new AstRToIRoundS{flp, realToIntChecked(valuep, top, flp)};
         }
         if (toKind == VhdlTypeKind::ARRAY) {
             // An array whose elements do not pack is the same elements in
@@ -22736,10 +22823,18 @@ private:
                 return nullptr;
             }
             // The operand's bits, read with its own signedness ...
-            AstNodeExpr* const valuep
-                = isSignedType(args[0]->vhdlTypep())
-                      ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
-                      : static_cast<AstNodeExpr*>(new AstUnsigned{flp, firstp});
+            const bool sgn = isSignedType(args[0]->vhdlTypep());
+            AstNodeExpr* valuep = sgn ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp})
+                                      : static_cast<AstNodeExpr*>(new AstUnsigned{flp, firstp});
+            // ... checked to fit, where it has more bits than INTEGER holds
+            const int width = vectorWidth(args[0]->vhdlTypep());
+            if (width > (sgn ? 32 : 31) && width <= 64) {
+                valuep
+                    = new AstCastSize{flp, valuep, new AstConst{flp, AstConst::Unsized32{}, 64}};
+                valuep = intRangeChecked(
+                    sgn ? static_cast<AstNodeExpr*>(new AstSigned{flp, valuep}) : valuep, sgn,
+                    flp);
+            }
             // ... widened to INTEGER, which is what the function returns.
             // Leaving it at the operand's width instead would make an
             // ordinary "acc + to_integer(v)" add two different widths.
@@ -25515,8 +25610,12 @@ private:
         // port holds something else is the driver's own value
         if (drvp) m_vars[symp] = drvp;
         // With no conversion, what reaches the actual is the port itself
-        AstNodeExpr* const convValuep
-            = outConvp ? lowerExpr(outConvp) : new AstVarRef{flp, varp, VAccess::READ};
+        AstNodeExpr* convValuep = nullptr;
+        {
+            VL_RESTORER(m_portConversion);
+            m_portConversion = true;
+            convValuep = outConvp ? lowerExpr(outConvp) : new AstVarRef{flp, varp, VAccess::READ};
+        }
         if (drvp) m_vars[symp] = varp;
         if (!convValuep) {
             VL_DO_DANGLING(targetp->deleteTree(), targetp);
@@ -25568,7 +25667,13 @@ private:
             addStmt(new AstAlways{new AstAssignW{cflp, targetp, convValuep}});
         }
         if (inConvp) {
-            if (AstNodeExpr* const inValuep = lowerExpr(inConvp)) {
+            AstNodeExpr* inValuep = nullptr;
+            {
+                VL_RESTORER(m_portConversion);
+                m_portConversion = true;
+                inValuep = lowerExpr(inConvp);
+            }
+            if (inValuep) {
                 addStmt(new AstAlways{new AstAssignW{
                     cflp, new AstVarRef{cflp, varp, VAccess::WRITE}, inValuep}});
             }

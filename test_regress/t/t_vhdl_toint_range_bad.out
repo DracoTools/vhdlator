@@ -1,0 +1,4 @@
+t/t_vhdl_toint_range_bad.vhd:21:5:@1000000:(report note): minus five fits
+%Error: t/t_vhdl_toint_range_bad.vhd:24: NUMERIC_STD.TO_INTEGER: the value -4294967296 does not fit INTEGER
+%Error: t/t_vhdl_toint_range_bad.vhd:24: Verilog $stop
+Aborting...
