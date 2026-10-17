@@ -1,0 +1,4 @@
+t/t_vhdl_nullformal_idx_bad.vhd:22:5:@0:(report note): one fits
+%Error: t/t_vhdl_nullformal_idx_bad.vhd:13: Index 1 is outside of the range 1 to 0 of the array
+%Error: t/t_vhdl_nullformal_idx_bad.vhd:13: Verilog $stop
+Aborting...

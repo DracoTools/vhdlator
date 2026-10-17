@@ -5703,13 +5703,29 @@ private:
     }
     AstNodeExpr* checkedIndex(const AstNodeVhdlExpr* actualp, AstNodeExpr* indexp,
                               const VhdlType* arrayTypep, int dim, FileLine* flp) {
-        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts || VN_IS(indexp, Const)) return indexp;
-        if (elabOnly(indexp)) return indexp;
+        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return indexp;
+        const AstConst* const constp = VN_CAST(indexp, Const);
+        if (!constp && elabOnly(indexp)) return indexp;
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool ascending = true;
         const VhdlType* idxp = nullptr;
         if (!checkRange(arrayTypep, dim, flp, leftp, rightp, ascending, idxp)) return indexp;
+        // A number is left to the static checks, but for one outside a range a copy of a
+        // subprogram was given by its call: "x(1) := '1'" with x's actual null (NVC bounds27),
+        // an error only once it runs
+        if (constp) {
+            const bool outside
+                = idxp->bounded() && !constp->num().isFourState()
+                  && (idxp->length() <= 0
+                      || constp->num().toSQuad() < std::min(idxp->left(), idxp->right())
+                      || constp->num().toSQuad() > std::max(idxp->left(), idxp->right()));
+            if (!outside) {
+                VL_DO_DANGLING(leftp->deleteTree(), leftp);
+                VL_DO_DANGLING(rightp->deleteTree(), rightp);
+                return indexp;
+            }
+        }
         // An index whose own subtype lies inside the range needs no check
         const VhdlType* const ownp = actualp ? actualp->vhdlTypep() : nullptr;
         if (idxp->bounded() && ownp && ownp->bounded()
