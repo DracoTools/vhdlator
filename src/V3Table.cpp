@@ -166,7 +166,7 @@ class TableVisitor final : public VNVisitor {
     unsigned m_outWidthBytes = 0;  // Output table width - in bytes
     std::vector<AstVarScope*> m_inVarps;  // Input variable list
     std::vector<TableOutputVar> m_outVarps;  // Output variable list
-    bool m_nonNumber = false;  // An input or output is not a number (an unpacked struct, ...)
+    bool m_nonNumber = false;  // An input or output is a compound value (an unpacked struct, ...)
 
     // METHODS
 
@@ -175,8 +175,13 @@ public:
         // Called by TableSimulateVisitor on each unique varref encountered
         UINFO(9, "   SimVARREF " << nodep);
         AstVarScope* const vscp = nodep->varScopep();
-        // Each row sets the inputs to numbers, and reads the outputs as numbers
-        if (!nodep->varp()->dtypeSkipRefp()->isIntegralOrPacked()) m_nonNumber = true;
+        // Each row sets the inputs to numbers, and reads the outputs as numbers: a value made of
+        // members or elements (an unpacked struct or array) is not one
+        const AstNodeDType* const dtypep = nodep->varp()->dtypeSkipRefp();
+        if (VN_IS(dtypep, UnpackArrayDType)
+            || (VN_IS(dtypep, NodeUOrStructDType) && dtypep->isCompound())) {
+            m_nonNumber = true;
+        }
         if (nodep->access().isWriteOrRW()) {
             // We'll make the table with a separate natural alignment for each output var, so
             // always have 8, 16 or 32 bit widths, so use widthTotalBytes
@@ -215,7 +220,7 @@ private:
             = std::max<double>(chkvis.instrCount() * TABLE_BYTES_PER_INST + chkvis.dataCount(), 1);
         if (chkvis.isImpure()) chkvis.clearOptimizable(nodep, "Table creates side effects");
         if (m_nonNumber)
-            chkvis.clearOptimizable(nodep, "Table has a variable that is not a number");
+            chkvis.clearOptimizable(nodep, "Table has a variable that is a compound value");
         if (chkvis.isCoverage()) {
             chkvis.clearOptimizable(nodep, "Table removes coverage points");
         }
