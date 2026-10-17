@@ -391,6 +391,7 @@ class EmitCSyms final : EmitCBaseVisitorConst {
             std::string flags = memberVlEnumDir(svd.m_varp, itemDTypep);
             if (subp && subp->packed()) flags += "|VLVF_RECORD";
             flags += vhdlIntegerFlag(svd.m_varp, itemDTypep);
+            if (itemp->vhdlNine()) flags += "|VLVF_NINE";
             // The parent's storage, read from this member's own bit
             std::string stmt
                 = scopeVar + "->varInsertPart(\"" + V3OutFormatter::quoteNameControls(prettyName)
@@ -460,12 +461,11 @@ class EmitCSyms final : EmitCBaseVisitorConst {
         return TableEntryKind::TABLE_ROW;
     }
 
-    static std::string insertDTypeVarStatement(const ScopeVarData& svd,
-                                               const AstScope* const scopep,
-                                               const std::string& prettyName,
-                                               const std::string& cName,
-                                               const AstNodeDType* const dtypep, const int udim,
-                                               const int pdim, const std::string& bounds) {
+    static std::string
+    insertDTypeVarStatement(const ScopeVarData& svd, const AstScope* const scopep,
+                            const std::string& prettyName, const std::string& cName,
+                            const AstNodeDType* const dtypep, const int udim, const int pdim,
+                            const std::string& bounds, const std::string& extraFlags = "") {
         const std::string vlEnumType = dtypep->vlEnumType();
         const bool needsEntSize = needsEmittedEntSize(vlEnumType);
         std::string stmt;
@@ -483,8 +483,8 @@ class EmitCSyms final : EmitCBaseVisitorConst {
             = needsEntSize
                   ? "sizeof(" + varName + ") / " + std::to_string(getUnpackedElements(dtypep))
                   : "";
-        appendVarProperties(stmt, vlEnumType, memberVlEnumDir(svd.m_varp, dtypep), udim, pdim,
-                            bounds, entSize);
+        appendVarProperties(stmt, vlEnumType, memberVlEnumDir(svd.m_varp, dtypep) + extraFlags,
+                            udim, pdim, bounds, entSize);
         return stmt;
     }
 
@@ -500,7 +500,8 @@ class EmitCSyms final : EmitCBaseVisitorConst {
             const std::string cName = cPrefix + "." + itemp->nameProtect();
             const VarDims dims = getVarDims(itemDTypep);
             stmts.emplace_back(insertDTypeVarStatement(svd, scopep, prettyName, cName, itemDTypep,
-                                                       dims.udim, dims.pdim, boundsString(dims))
+                                                       dims.udim, dims.pdim, boundsString(dims),
+                                                       itemp->vhdlNine() ? "|VLVF_NINE" : "")
                                + ";");
             if (const AstNodeUOrStructDType* const subp
                 = VN_CAST(itemDTypep->skipRefp(), NodeUOrStructDType)) {

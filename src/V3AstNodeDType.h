@@ -973,6 +973,7 @@ class AstMemberDType final : public AstNodeDType {
     string m_tag;  // Holds the string of the verilator tag -- used in JSON output.
     int m_lsb = -1;  // Within this level's packed struct, the LSB of the first bit of the member
     bool m_constrainedRand = false;
+    bool m_vhdlNine = false;  // VHDL STD_ULOGIC values: four bits per element, its position
     VRandAttr m_rand;  // Randomizability of this member (rand, randc, etc)
 public:
     AstMemberDType(FileLine* fl, const string& name, VFlagChildDType, AstNodeDType* dtp,
@@ -1032,6 +1033,8 @@ public:
     void markConstrainedRand(bool flag) { m_constrainedRand = flag; }
     VRandAttr rand() const { return m_rand; }
     void rand(const VRandAttr flag) { m_rand = flag; }
+    bool vhdlNine() const { return m_vhdlNine; }
+    void vhdlNine(bool flag) { m_vhdlNine = flag; }
 };
 class AstNBACommitQueueDType final : public AstNodeDType {
     // @astgen ptr := m_subDTypep : AstNodeDType  // Type of the corresponding variable

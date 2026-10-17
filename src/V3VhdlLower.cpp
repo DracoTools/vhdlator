@@ -2253,8 +2253,12 @@ private:
         AstStructDType* const structp = new AstStructDType{flp, VSigning::UNSIGNED};
         structp->name(typep->name());
         for (VhdlSymbol* const elemp : typep->elements()) {
-            structp->addMembersp(new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
-                                                    memberDType(elemp->typep(), flp), nullptr});
+            AstMemberDType* const memberp = new AstMemberDType{
+                flp, elemp->name(), VFlagChildDType{}, memberDType(elemp->typep(), flp), nullptr};
+            // Read and written over VPI as the nine characters, as a signal of its type is
+            memberp->vhdlNine(nineValued(elemp->typep()) && !elementCarried(elemp->typep())
+                              && !elementCarriedTwo(elemp->typep()));
+            structp->addMembersp(memberp);
         }
         return structp;
     }
@@ -2592,9 +2596,14 @@ private:
         if (unitp) structp->classOrPackagep(unitp);
         const bool noCarry = !recordMayCarry(keyp);
         for (VhdlSymbol* const elemp : keyp->elements()) {
-            structp->addMembersp(
-                new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
-                                   memberDType(elemp->typep(), flp, noCarry), nullptr});
+            AstMemberDType* const memberp
+                = new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
+                                     memberDType(elemp->typep(), flp, noCarry), nullptr};
+            memberp->vhdlNine(
+                nineValued(elemp->typep())
+                && (noCarry
+                    || (!elementCarried(elemp->typep()) && !elementCarriedTwo(elemp->typep()))));
+            structp->addMembersp(memberp);
         }
         AstTypedef* const tdp = new AstTypedef{flp, name, nullptr, VFlagChildDType{}, structp};
         if (local) {
