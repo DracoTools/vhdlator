@@ -1,0 +1,4 @@
+t/t_vhdl_conctgt_idx_bad.vhd:20:5:@1000000:(report note): in range
+%Error: t/t_vhdl_conctgt_idx_bad.vhd:14: Index 8 is outside of the range 5 to 7 of the array
+%Error: t/t_vhdl_conctgt_idx_bad.vhd:14: Verilog $stop
+Aborting...

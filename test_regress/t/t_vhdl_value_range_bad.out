@@ -1,0 +1,4 @@
+t/t_vhdl_value_range_bad.vhd:16:5:@0:(report note): three fits
+%Error: t/t_vhdl_value_range_bad.vhd:17: Value 4 is outside of the range 1 to 3 of subtype myint
+%Error: t/t_vhdl_value_range_bad.vhd:17: Verilog $stop
+Aborting...

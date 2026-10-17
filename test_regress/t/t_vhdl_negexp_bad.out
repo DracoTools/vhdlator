@@ -1,0 +1,4 @@
+t/t_vhdl_negexp_bad.vhd:15:5:@0:(report note): eight
+%Error: t/t_vhdl_negexp_bad.vhd:18: Negative exponent -1 of an integer
+%Error: t/t_vhdl_negexp_bad.vhd:18: Verilog $stop
+Aborting...

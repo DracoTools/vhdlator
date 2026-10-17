@@ -1,0 +1,4 @@
+t/t_vhdl_valpos_bad.vhd:23:5:@0:(report note): in range
+%Error: t/t_vhdl_valpos_bad.vhd:24: Position 2 is outside of the positions 0 to 1 of warm
+%Error: t/t_vhdl_valpos_bad.vhd:24: Verilog $stop
+Aborting...

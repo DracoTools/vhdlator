@@ -5937,6 +5937,86 @@ private:
         refp->taskp(VN_AS(funcpr, Func));
         return refp;
     }
+    // A value handed back by a helper of its own, one per place and check,
+    // which stops the run with the message given where the test holds of it
+    // (the message prints the value with its one "%0d"). For the checks that
+    // read their operand once and are no more than a test of it.
+    AstNodeExpr* stopWhere(AstNodeExpr* valp, AstNodeDType* dtypep, const std::string& key,
+                           const std::function<AstNodeExpr*(AstNodeExpr*)>& failsp,
+                           const std::string& message, FileLine* flp) {
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        AstNodeFTask*& funcpr = m_rangeChkFuncs[where + "|" + key];
+        if (!funcpr || !usableHelper(funcpr)) {
+            FileLine* const hflp = dynFl(flp);
+            const std::string name = "__Vvalchk" + std::to_string(++m_nameNum);
+            AstFunc* const funcp = new AstFunc{hflp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            funcp->fvarp(newReturnVar(name, dtypep->cloneTree(false), hflp));
+            AstVar* const vp = dynArg(funcp, "v", dtypep, hflp);
+            AstNode* const stmtsp
+                = new AstDisplay{hflp, VDisplayType::DT_DISPLAY,
+                                 "%%Error: " + where + ": " + message, nullptr, rd(vp, hflp)};
+            stmtsp->addNext(new AstStop{hflp, true});
+            funcp->addStmtsp(new AstIf{hflp, failsp(rd(vp, hflp)), stmtsp});
+            funcp->addStmtsp(new AstAssign{
+                hflp, new AstVarRef{hflp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                rd(vp, hflp)});
+            addHelperFunc(funcp);
+            funcpr = funcp;
+        } else {
+            VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
+        }
+        AstFuncRef* const refp = new AstFuncRef{flp, funcpr->name(), new AstArg{flp, "", valp}};
+        refp->taskp(VN_AS(funcpr, Func));
+        return refp;
+    }
+    // An INTEGER raised to a negative power is an error (9.2.8), where nvc,
+    // GHDL and Questa stop the run (NVC bounds30). Under --vhdl-bound-check,
+    // and not for an exponent that is a number of zero or more.
+    AstNodeExpr* exponentChecked(AstNodeExpr* rhsp, FileLine* flp) {
+        if (!rhsp || !v3Global.opt.vhdlBoundCheck() || !m_inStmts || elabOnly(rhsp)) return rhsp;
+        if (const AstConst* const constp = VN_CAST(rhsp, Const)) {
+            if (!constp->num().isNegative()) return rhsp;
+        }
+        return stopWhere(
+            rhsp, newIntDType(flp), "exp",
+            [&](AstNodeExpr* vp) {
+                return new AstLtS{flp, vp, new AstConst{flp, AstConst::Signed32{}, 0}};
+            },
+            "Negative exponent %0d of an integer", flp);
+    }
+    // "T'VAL(n)" of an enumeration type is an error where no value of T is at
+    // position n (16.2.3), where nvc, GHDL and Questa stop the run (NVC
+    // bounds6). A number type's 'VAL is its value, checked as one.
+    AstNodeExpr* valPositionChecked(AstNodeExpr* argp, const VhdlType* typep, FileLine* flp) {
+        if (!argp || !typep || !v3Global.opt.vhdlBoundCheck() || !m_inStmts || elabOnly(argp)) {
+            return argp;
+        }
+        const VhdlType* const basep = typep->base();
+        if (basep->kind() != VhdlTypeKind::ENUM) return rangeChecked(argp, typep, nullptr, flp);
+        if (enumIsLogic(basep) || !typep->bounded() || typep->isNull()) return argp;
+        const int64_t lo = typep->low();
+        const int64_t hi = typep->high();
+        if (const AstConst* const constp = VN_CAST(argp, Const)) {
+            if (!constp->num().isFourState() && constp->num().toSQuad() >= lo
+                && constp->num().toSQuad() <= hi) {
+                return argp;
+            }
+        }
+        return stopWhere(
+            argp, newIntDType(flp), "val|" + typep->prettyName(),
+            [&](AstNodeExpr* vp) {
+                return new AstLogOr{
+                    flp,
+                    new AstLtS{flp, vp,
+                               new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(lo)}},
+                    new AstGtS{flp, vp->cloneTree(false),
+                               new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(hi)}}};
+            },
+            "Position %0d is outside of the positions " + std::to_string(lo) + " to "
+                + std::to_string(hi) + " of " + typep->prettyName(),
+            flp);
+    }
     // A negative delay in an "after" or a "wait for" is an error when it is
     // evaluated (10.2, 10.5.2.1), where nvc, GHDL and Questa stop the run:
     // "illegal negative delay -1 ns". The delay is handed back, or the run
@@ -9388,7 +9468,14 @@ private:
             AstNode* setLaterp = nullptr;
             if (m_ftaskp && varp->varType() == VVarType::VAR && varp->valuep()
                 && !valueFolds(varp->valuep())) {
-                AstNodeExpr* const valp = VN_AS(varp->valuep(), NodeExpr)->unlinkFrBack();
+                AstNodeExpr* valp = VN_AS(varp->valuep(), NodeExpr)->unlinkFrBack();
+                // Given as a statement, it is checked as an assignment is: "variable r :
+                // natural := x" with x -1 stops the run (NVC bounds16)
+                if (objp->defaultp()) {
+                    VL_RESTORER(m_inStmts);
+                    m_inStmts = true;
+                    valp = rangeChecked(valp, symp->typep(), objp->defaultp(), flp);
+                }
                 setLaterp = new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, valp};
             }
             addStmt(varp);
@@ -10187,7 +10274,8 @@ private:
             if (argp) {
                 VhdlType* const totypep = nodep->vhdlTypep();
                 if (!totypep) return argp;
-                return new AstCast{flp, argp, VFlagChildDType{}, lowerType(totypep, flp)};
+                AstNodeExpr* const posp = valPositionChecked(argp, totypep, flp);
+                return new AstCast{flp, posp, VFlagChildDType{}, lowerType(totypep, flp)};
             }
         } else if (attr == "succ" || attr == "pred") {
             // The next or previous value of the type, which is as wide as the
@@ -10585,7 +10673,9 @@ private:
                 AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), nullptr};
                 refp->taskp(VN_AS(funcp, Func));
                 refp->addArgsp(new AstArg{flp, "", textp});
-                return refp;
+                // The value read is one of the subtype or an error (16.2.3):
+                // "myint'value(\"4\")" with myint 1 to 3 (NVC bounds13)
+                return rangeChecked(refp, wantp, nullptr, flp);
             }
         }
         // A user-defined attribute stands for the static expression an
@@ -10809,6 +10899,12 @@ private:
             bodyp = AstNode::addNext(
                 bodyp, static_cast<AstNode*>(new AstAssign{
                            flp, new AstVarRef{flp, retp, VAccess::WRITE}, i32(0, flp)}));
+            // Whether a literal matched: none is an error (16.2.3)
+            AstVar* const foundp = newFuncLocal("found", newLogicDType(flp, 1), flp);
+            funcp->addStmtsp(foundp);
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstAssign{
+                           flp, wr(foundp, flp), new AstConst{flp, AstConst::BitFalse{}}}));
             for (const VhdlSymbol* const litp : basep->literals()) {
                 const std::string& litName = litp->name();
                 const bool isChar = litName.size() >= 2 && litName.front() == '\'';
@@ -10821,8 +10917,17 @@ private:
                         new AstEqN{flp, gotp,
                                    new AstConst{flp, AstConst::String{},
                                                 isChar ? litName : VString::downcase(litName)}},
-                        new AstAssign{flp, new AstVarRef{flp, retp, VAccess::WRITE},
-                                      i32(litp->position(), flp)}}));
+                        AstNode::addNext(
+                            static_cast<AstNode*>(
+                                new AstAssign{flp, new AstVarRef{flp, retp, VAccess::WRITE},
+                                              i32(litp->position(), flp)}),
+                            static_cast<AstNode*>(new AstAssign{
+                                flp, wr(foundp, flp), new AstConst{flp, AstConst::BitTrue{}}}))}));
+            }
+            if (v3Global.opt.vhdlBoundCheck()) {
+                bodyp = AstNode::addNext(bodyp, static_cast<AstNode*>(new AstIf{
+                                                    flp, new AstLogNot{flp, rd(foundp, flp)},
+                                                    valueTextFailure(basep, rd(sp, flp), flp)}));
             }
             funcp->addStmtsp(bodyp);
             addHelperFunc(funcp);
@@ -11014,6 +11119,19 @@ private:
             valuep = new AstCond{flp, rd(negp, flp), new AstNegate{flp, magp},
                                  magp->cloneTree(false)};
         }
+        // Text that is no literal of the type -- no digit, or something other
+        // than blanks after the number -- is an error (16.2.3), where nvc,
+        // GHDL and Questa stop the run: "integer'value(\"hello\")" (NVC
+        // bounds12)
+        if (!isPhys && v3Global.opt.vhdlBoundCheck()) {
+            AstNode* const failp = valueTextFailure(basep, rd(sp, flp), flp);
+            bodyp = AstNode::addNext(
+                bodyp, static_cast<AstNode*>(new AstIf{
+                           flp,
+                           new AstLogOr{flp, new AstEq{flp, rd(ip, flp), rd(startp, flp)},
+                                        new AstLte{flp, rd(ip, flp), rd(hip, flp)}},
+                           failp}));
+        }
         bodyp = AstNode::addNext(
             bodyp, static_cast<AstNode*>(new AstAssign{
                        flp, new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}, valuep}));
@@ -11021,6 +11139,14 @@ private:
         addHelperFunc(funcp);
         m_valueFuncs.insert_or_assign(basep, funcp);
         return funcp;
+    }
+    static AstNode* valueTextFailure(const VhdlType* basep, AstNodeExpr* textp, FileLine* flp) {
+        AstNode* const stmtsp = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                                               "%%Error: " + basep->prettyName()
+                                                   + "'VALUE: \"%s\" is no literal of the type",
+                                               nullptr, textp};
+        stmtsp->addNext(new AstStop{flp, true});
+        return stmtsp;
     }
 
     // The parameter that holds an attribute's array value, typed as an array
@@ -19252,6 +19378,7 @@ private:
             // "**" on INTEGER gives an INTEGER (9.2.8). Saying so here rather
             // than leaving the width to be worked out is what lets one stand
             // in a range, where the width pass reaches it already settled.
+            if (isIntegerType(ltypep)) rhsp = exponentChecked(rhsp, flp);
             AstNodeExpr* const powp
                 = signd ? static_cast<AstNodeExpr*>(new AstPowSS{flp, lhsp, rhsp})
                         : static_cast<AstNodeExpr*>(new AstPow{flp, lhsp, rhsp});
@@ -29497,6 +29624,27 @@ private:
             VL_DO_DANGLING(valuep->deleteTree(), valuep);
             return nullptr;
         }
+        // A pulse rejection limit is neither negative nor greater than the
+        // delay of the first element (10.5.2.1), where nvc and GHDL stop the
+        // run: "reject v inertial '1' after 2 ns" with v 5 ns (NVC delay3)
+        if (first && wfp->rejectp() && kind != VhdlDelayKind::TRANSPORT
+            && v3Global.opt.vhdlBoundCheck() && rp->isPure() && dp->isPure()
+            && !(VN_IS(rp, Const) && VN_IS(dp, Const) && !VN_AS(rp, Const)->num().isNegative()
+                 && VN_AS(rp, Const)->num().toSQuad() <= VN_AS(dp, Const)->num().toSQuad())) {
+            FileLine* const rflp = wfp->rejectp()->fileline();
+            AstNode* const failp = new AstDisplay{
+                rflp, VDisplayType::DT_DISPLAY,
+                "%%Error: " + rflp->filename() + ":" + std::to_string(rflp->lineno())
+                    + ": The pulse rejection limit is greater than the delay of the first"
+                      " waveform element",
+                nullptr, nullptr};
+            failp->addNext(new AstStop{rflp, true});
+            // Times are held unsigned, so a negative limit is greater too
+            FileLine* const cflp = dynFl(rflp);
+            AstNodeExpr* const condp = new AstGt{cflp, rp->cloneTree(false), dp->cloneTree(false)};
+            prep
+                = AstNode::addNextNull(prep, static_cast<AstNode*>(new AstIf{rflp, condp, failp}));
+        }
         AstArg* const argsp = new AstArg{flp, "", valuep};
         argsp->addNext(new AstArg{flp, "", dp});
         argsp->addNext(new AstArg{flp, "", rp});
@@ -29691,6 +29839,32 @@ private:
         return reads;
     }
 
+    // Whether a target names an element by an index only running settles:
+    // "s(k) <= 61" with k a signal
+    static bool runningIndexTarget(const AstNodeVhdlExpr* targetp) {
+        bool reads = false;
+        targetp->foreach([&](const AstVhdlCall* callp) {
+            for (const AstNode* argp = callp->argsp(); argp; argp = argp->nextp()) {
+                if (VN_IS(argp, VhdlRange)) continue;
+                argp->foreach([&](const AstVhdlName* namep) {
+                    const VhdlSymbol* const symp
+                        = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                    if (!symp) return;
+                    if (symp->kind() != VhdlSymKind::SIGNAL && symp->kind() != VhdlSymKind::PORT
+                        && symp->kind() != VhdlSymKind::VARIABLE
+                        && symp->kind() != VhdlSymKind::SHARED_VARIABLE) {
+                        return;
+                    }
+                    // An attribute of its subtype is fixed by elaboration
+                    const AstVhdlAttrName* const ap = VN_CAST(namep->backp(), VhdlAttrName);
+                    if (ap && ap->prefixp() == namep) return;
+                    reads = true;
+                });
+            }
+        });
+        return reads;
+    }
+
     // Whether a value calls a subprogram that reports -- an assertion in
     // its body, or in one it calls, numeric_std's warnings among them. As a
     // continuous assignment it runs whenever the scheduler settles it, which
@@ -29758,6 +29932,22 @@ private:
                                               : nullptr;
             return elemp && !elementPacks(elemp);
         };
+        // "s(k) <= 61" with k a signal: an index of the target only running
+        // settles is checked against the target's range, which a check does in
+        // a statement (NVC bounds3). The statement is the process it is defined
+        // to be (11.6).
+        if (oneUndelayed && !nodep->guarded() && v3Global.opt.vhdlBoundCheck()
+            && runningIndexTarget(nodep->targetp())) {
+            FileLine* const sflp = new FileLine{flp};
+            sflp->warnOff(V3ErrorCode::COMBDLY, true);
+            sflp->warnOff(V3ErrorCode::LATCH, true);
+            VL_RESTORER(m_inStmts);
+            m_inStmts = true;
+            if (AstNode* const stmtsp = lowerSeqAssign(nodep, true)) {
+                addStmt(concurrentProcess(stmtsp, nodep->postponed(), sflp));
+            }
+            return;
+        }
         if (oneUndelayed && (runningSliceTarget(nodep->targetp()) || unpackedAggTarget())) {
             FileLine* const sflp = new FileLine{flp};
             sflp->warnOff(V3ErrorCode::COMBDLY, true);
@@ -32550,6 +32740,22 @@ private:
         AstNode* outp = new AstAssign{flp, wr(lop, flp), intBound(leftp, flp)};
         outp = AstNode::addNext(
             outp, static_cast<AstNode*>(new AstAssign{flp, wr(hip, flp), intBound(rightp, flp)}));
+        // A slice that is not null lies inside the target's range, or the run
+        // stops (8.5): "s(k downto 1) <= ..." with k 9 and s 8 downto 0 (NVC
+        // bounds5). Its ends are statements here, so they can be checked.
+        if (v3Global.opt.vhdlBoundCheck() && m_inStmts) {
+            AstNodeExpr* arrLeftp = nullptr;
+            AstNodeExpr* arrRightp = nullptr;
+            bool arrAscending = true;
+            const VhdlType* arrIdxp = nullptr;
+            if (checkRange(objTypep, 0, flp, arrLeftp, arrRightp, arrAscending, arrIdxp)) {
+                outp = AstNode::addNext(
+                    outp, static_cast<AstNode*>(
+                              new AstAssign{flp, wr(lop, flp),
+                                            checkCall(true, rd(lop, flp), rd(hip, flp), arrLeftp,
+                                                      arrRightp, arrAscending, flp)}));
+            }
+        }
         // How many places, none for a null range
         AstNodeExpr* const spanp = asc ? new AstSub{flp, rd(hip, flp), rd(lop, flp)}
                                        : new AstSub{flp, rd(lop, flp), rd(hip, flp)};

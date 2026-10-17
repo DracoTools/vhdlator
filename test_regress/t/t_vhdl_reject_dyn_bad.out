@@ -1,0 +1,4 @@
+t/t_vhdl_reject_dyn_bad.vhd:18:5:@3000000:(report note): limit fits
+%Error: t/t_vhdl_reject_dyn_bad.vhd:20: The pulse rejection limit is greater than the delay of the first waveform element
+%Error: t/t_vhdl_reject_dyn_bad.vhd:20: Verilog $stop
+Aborting...

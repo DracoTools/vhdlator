@@ -1,0 +1,4 @@
+t/t_vhdl_value_text_bad.vhd:17:5:@0:(report note): literals read
+%Error: integer'VALUE: "hello" is no literal of the type
+%Error: t/t_vhdl_value_text_bad.vhd:18: Verilog $stop
+Aborting...

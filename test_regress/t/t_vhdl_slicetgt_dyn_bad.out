@@ -1,0 +1,4 @@
+t/t_vhdl_slicetgt_dyn_bad.vhd:23:5:@2000000:(report note): in range
+%Error: t/t_vhdl_slicetgt_dyn_bad.vhd:25: Slice 9 downto 1 is outside of the range 8 downto 0 of the array
+%Error: t/t_vhdl_slicetgt_dyn_bad.vhd:25: Verilog $stop
+Aborting...
