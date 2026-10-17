@@ -18536,9 +18536,11 @@ private:
                 // A size the elaboration settles: the integer is spread into
                 // 64 lanes, and as many of them taken as the size says
                 // -- not one a subprogram works out from what its call
-                // supplies, which only running knows (4.3.1.1)
-                return elabConstant(args[1]) && !boundsOnlyRunningDecides(args[1])
-                       && !V3VhdlEval::eval(args[0]).isInt();
+                // supplies, which only running knows (4.3.1.1). A constant
+                // integer too: compiled, its copy gives back a value carrying
+                // its bounds, which the place it goes to did not expect --
+                // "(to_signed(-3, W), ...)" for a record (388mw)
+                return elabConstant(args[1]) && !boundsOnlyRunningDecides(args[1]);
             }
             if (sizev.toInt() < 1 || sizev.toInt() > 64) return false;
             return nineIntFits(args[0], sizev.toInt(), op == "to_signed", false);
