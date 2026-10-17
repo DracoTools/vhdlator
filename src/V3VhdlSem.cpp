@@ -10019,6 +10019,15 @@ VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
                                        + objects[0]->kindName() + ", which has no value");
             return V3VhdlStd::errorType();
         }
+        // An attribute's declaration gives no object: the attribute has a value only as an
+        // attribute of a named entity, "x's" (6.7, 16.2; GHDL gna issue621, "s.v")
+        if (kind == VhdlSymKind::ATTRIBUTE && !m_inSpecialized) {
+            err(nodep->fileline(), "'" + nodep->name()
+                                       + "' names an attribute, which has a value only as the"
+                                         " attribute of a named entity: X'"
+                                       + nodep->name());
+            return V3VhdlStd::errorType();
+        }
         return objects[0]->typep() ? objects[0]->typep() : V3VhdlStd::errorType();
     }
     if (callables.empty()) {
