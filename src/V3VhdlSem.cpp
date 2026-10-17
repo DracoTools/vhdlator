@@ -14879,9 +14879,12 @@ void VhdlSemVisitor::checkOthersTarget(const AstNodeVhdlExpr* targetp,
                                        const AstNodeVhdlExpr* valuep) {
     const AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate);
     if (!aggp || m_inSpecialized || m_inPackageInstance) return;
-    // GHDL 7.0.0-dev's default VHDL-93 mode is relaxed enough to take it, and
-    // its own testsuite (gna/issue2422) needs it taken there
-    if (aggp->fileline()->language() < V3LangCode::L1076_2008) return;
+    // GHDL 7.0.0-dev's default VHDL-93 mode, "93c", is relaxed enough to take it before
+    // VHDL-2008, and its own testsuite (gna/issue2422) needs it taken there; its strict
+    // "--std=93" refuses it, as nvc's 1993 does (gna bug044)
+    if (aggp->fileline()->language() < V3LangCode::L1076_2008 && v3Global.opt.vhdlRelaxed93()) {
+        return;
+    }
     bool others = false;
     for (const AstNode* ep = aggp->elemsp(); ep; ep = ep->nextp()) {
         for (const AstNode* cp = VN_AS(ep, VhdlElemAssoc)->choicesp(); cp; cp = cp->nextp()) {

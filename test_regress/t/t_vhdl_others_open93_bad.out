@@ -1,0 +1,4 @@
+%Error: t/t_vhdl_others_open93_bad.vhd:18:10: An aggregate with 'others' takes its index range from its target, and this target's subtype is an unconstrained array type
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_others_open93_bad.vhd:19:10: An aggregate with 'others' takes its index range from its target, and this target's subtype is an unconstrained array type
+%Error: Exiting due to

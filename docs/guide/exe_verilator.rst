@@ -2203,7 +2203,9 @@ Summary:
    Accepted values are ``1993``, ``2000``, ``2002``, ``2008`` and ``2019``,
    each of which may also be written in the abbreviated form (``93``, ``00``,
    ``02``, ``08``, ``19``) or the full IEEE form (``1076-2008``). The default
-   is ``2008``.
+   is ``2008``. ``93c`` is VHDL-93 with the relaxations GHDL's default mode
+   of that name allows, such as an aggregate with ``others`` whose target is
+   a parameter of an unconstrained array type.
 
    To apply a VHDL revision to files with some other extension, use
    :vlopt:`--language` with the full IEEE form, for example ``--language

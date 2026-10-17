@@ -134,7 +134,7 @@ def nvc_expectations(nvc_root, phase):
 GHDL_VERB_RE = re.compile(r'^\s*(analyze_failure|analyze)\b(.*)$', re.M)
 _GHDL_EXPECT = {}
 # The script also says which revision each source is analyzed under: GHDL's
-# own default, VHDL-93, unless GHDL_STD_FLAGS or an analyze line says
+# own default, VHDL-93 as relaxed as its "93c", unless GHDL_STD_FLAGS or an analyze line says
 # otherwise. A VHDL-93 source is not a VHDL-2008 one -- a shared variable of
 # an ordinary type is legal in one and not the other -- so the file is
 # measured under the revision its suite gives it.
@@ -142,7 +142,7 @@ GHDL_STD_RE = re.compile(r'--std=(\w+)')
 GHDL_STDS = {
     '87': '93',
     '93': '93',
-    '93c': '93',
+    '93c': '93c',
     '00': '2000',
     '02': '2002',
     '08': '2008',
@@ -170,7 +170,7 @@ def ghdl_expectations(directory):
         return table
     stds = _GHDL_STD.setdefault(directory, {})
     segments = _GHDL_SEGMENT.setdefault(directory, {})
-    current = '93'
+    current = '93c'
     segment = 0
     for line in text.splitlines():
         if GHDL_CLEAN_RE.match(line):

@@ -1929,14 +1929,14 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
     DECL_OPTION("-vhdl-std", CbVal, [this, fl](const char* valp) {
         // Accept both the bare year ("2008", "08") and the IEEE form ("1076-2008")
         static const std::map<const std::string, V3LangCode> stds{
-            {"93", V3LangCode::L1076_1993},        {"1993", V3LangCode::L1076_1993},
-            {"1076-1993", V3LangCode::L1076_1993}, {"00", V3LangCode::L1076_2000},
-            {"2000", V3LangCode::L1076_2000},      {"1076-2000", V3LangCode::L1076_2000},
-            {"02", V3LangCode::L1076_2002},        {"2002", V3LangCode::L1076_2002},
-            {"1076-2002", V3LangCode::L1076_2002}, {"08", V3LangCode::L1076_2008},
-            {"2008", V3LangCode::L1076_2008},      {"1076-2008", V3LangCode::L1076_2008},
-            {"19", V3LangCode::L1076_2019},        {"2019", V3LangCode::L1076_2019},
-            {"1076-2019", V3LangCode::L1076_2019}};
+            {"93", V3LangCode::L1076_1993},        {"93c", V3LangCode::L1076_1993},
+            {"1993", V3LangCode::L1076_1993},      {"1076-1993", V3LangCode::L1076_1993},
+            {"00", V3LangCode::L1076_2000},        {"2000", V3LangCode::L1076_2000},
+            {"1076-2000", V3LangCode::L1076_2000}, {"02", V3LangCode::L1076_2002},
+            {"2002", V3LangCode::L1076_2002},      {"1076-2002", V3LangCode::L1076_2002},
+            {"08", V3LangCode::L1076_2008},        {"2008", V3LangCode::L1076_2008},
+            {"1076-2008", V3LangCode::L1076_2008}, {"19", V3LangCode::L1076_2019},
+            {"2019", V3LangCode::L1076_2019},      {"1076-2019", V3LangCode::L1076_2019}};
         const auto it = stds.find(valp);
         if (it == stds.end()) {
             VSpellCheck spell;
@@ -1946,6 +1946,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
             return;
         }
         m_vhdlStd = it->second;
+        m_vhdlRelaxed93 = std::string{valp} == "93c";
         // Re-map the VHDL extensions to the newly selected revision
         addLangExt(".vhd", m_vhdlStd);
         addLangExt(".vhdl", m_vhdlStd);

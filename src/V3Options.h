@@ -393,6 +393,7 @@ private:
     // have a concept of the default language at a global level.
     V3LangCode  m_defaultLanguage;      // main switch: --language
     V3LangCode  m_vhdlStd;              // main switch: --vhdl-std
+    bool        m_vhdlRelaxed93 = false;  // main switch: --vhdl-std 93c
 
     // MEMBERS (optimizations)
     bool m_fAcycSimp;    // main switch: -fno-acyc-simp: acyclic pre-optimizations
@@ -868,6 +869,8 @@ public:
     string filePathLookedMsg(FileLine* fl, const string& modname);
     V3LangCode fileLanguage(const string& filename);
     V3LangCode vhdlStd() const VL_MT_SAFE { return m_vhdlStd; }
+    // VHDL-93 as GHDL's default "93c" takes it, relaxing a rule a later revision relaxed
+    bool vhdlRelaxed93() const VL_MT_SAFE { return m_vhdlRelaxed93; }
     static bool fileStatNormal(const string& filename);
 
     // METHODS (other OS)
