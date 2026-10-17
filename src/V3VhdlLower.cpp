@@ -5854,10 +5854,11 @@ private:
             if (val.known() && V3VhdlEval::inRange(val, typep)) return valp;
         }
         const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
-        const std::string lo
-            = real ? std::to_string(typep->lowReal()) : std::to_string(typep->low());
-        const std::string hi
-            = real ? std::to_string(typep->highReal()) : std::to_string(typep->high());
+        // A REAL bound as its image, which reads back as the same number
+        const std::string lo = real ? V3VhdlEval::image(VhdlValue::mkReal(typep->lowReal()))
+                                    : std::to_string(typep->low());
+        const std::string hi = real ? V3VhdlEval::image(VhdlValue::mkReal(typep->highReal()))
+                                    : std::to_string(typep->high());
         // In line, the value held once: "{ t = v; if (t < lo || t > hi) stop; t }"
         AstVar* const tmpp
             = newTempVar("__Vrng", lowerType(const_cast<VhdlType*>(basep), flp), flp);
@@ -23456,6 +23457,13 @@ private:
             }
             AstNodeExpr* elemp = lowerExpr(valuep);
             if (!elemp) return nullptr;
+            // An element of a scalar subtype is a value of it or an error, as an assignment to
+            // it would be: REAL'LEFT * REAL'LEFT is no REAL (NVC real7)
+            if (!asString && !packed) {
+                const VhdlType* const elemTypep
+                    = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+                elemp = rangeChecked(elemp, elemTypep, valuep, flp);
+            }
             if (asString) {
                 elemp = stringElem(valuep, elemp, flp);
                 outp = outp ? new AstConcatN{flp, outp, elemp} : elemp;
