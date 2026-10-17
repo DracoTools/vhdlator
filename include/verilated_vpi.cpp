@@ -3606,8 +3606,8 @@ static bool vl_vpi_get_value_nine(const VerilatedVpioVarBase* vop, p_vpi_value v
         if (unknown) {
             t_outStr = "x";
         } else {
-            vl_strprintf(t_outStr, "%llu",
-                         static_cast<unsigned long long>(val));  // lintok-format-ll
+            vl_strprintf(t_outStr, "%llu",  // lintok-format-ll
+                         static_cast<unsigned long long>(val));
         }
         valuep->value.str = const_cast<PLI_BYTE8*>(t_outStr.c_str());
         return true;
@@ -3642,7 +3642,7 @@ static bool vl_vpi_put_value_nine(const VerilatedVpioVarBase* vop, const p_vpi_v
         case '-': return 8;
         default:
             VL_VPI_WARNING_(__FILE__, __LINE__,
-                            "%s: Non STD_ULOGIC character '%c' in '%s' for '%s'", __func__, ch,
+                            "vpi_put_value: Non STD_ULOGIC character '%c' in '%s' for '%s'", ch,
                             valuep->value.str, vop->fullname());
             return 1;
         }

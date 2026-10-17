@@ -1,0 +1,3 @@
+vpi_put_value: Non STD_ULOGIC character 'Q' in '01Q1' for 'TOP.t_vhdl_nine_vpi.inp'
+inp = 01X1
+*-* All Finished *-*
