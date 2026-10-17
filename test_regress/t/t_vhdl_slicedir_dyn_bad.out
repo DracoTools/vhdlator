@@ -1,0 +1,4 @@
+t/t_vhdl_slicedir_dyn_bad.vhd:20:5:@0:(report note): downto prefix fits
+[0] %Error: t_vhdl_slicedir_dyn_bad.vhd:12: Assertion failed in t_vhdl_slicedir_dyn_bad.low_part__V2: Slice runs 'downto' but bit_vector is indexed 'to'
+%Error: t/t_vhdl_slicedir_dyn_bad.vhd:12: Verilog $stop
+Aborting...

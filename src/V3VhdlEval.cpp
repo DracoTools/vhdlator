@@ -824,6 +824,11 @@ private:
                     if (!v.known()) return VhdlValue{};
                     const int64_t from = std::min(lo.toInt(), hi.toInt());
                     const int64_t to = std::max(lo.toInt(), hi.toInt());
+                    // A value of the aggregate's own type gives the range its elements, one
+                    // each, and has to be as long (9.3.3.3): not a value to fold otherwise
+                    if ((v.isArray() || v.isStr()) && valLength(v) != to - from + 1) {
+                        return VhdlValue{};
+                    }
                     for (int64_t i = from; i <= to; ++i) {
                         out.setElement(i, v);
                         given.insert(i);

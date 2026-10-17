@@ -1,0 +1,4 @@
+t/t_vhdl_copy_reclen_bad.vhd:24:5:@0:(report note): four fits
+[0] %Error: t_vhdl_copy_reclen_bad.vhd:15: Assertion failed in t_vhdl_copy_reclen_bad.assign__V2: Array lengths do not match
+%Error: t/t_vhdl_copy_reclen_bad.vhd:15: Verilog $stop
+Aborting...

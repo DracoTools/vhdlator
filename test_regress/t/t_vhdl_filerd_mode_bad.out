@@ -1,0 +1,4 @@
+t/t_vhdl_filerd_mode_bad.vhd:18:5:@0:(report note): written
+%Error: t/t_vhdl_filerd_mode_bad.vhd:19: Read from a file opened for writing or appending
+%Error: t/t_vhdl_filerd_mode_bad.vhd:19: Verilog $stop
+Aborting...

@@ -13,8 +13,9 @@ test.scenarios('vlt')
 
 # A slice against the direction of a parameter in a call that reaches it is an
 # error when it runs (8.5), and the same call behind a branch never taken is
-# legal, so the design compiles and the error is reported once. The slice
-# that matches is not reported.
+# legal, so the design compiles and the error is reported once, where the run
+# stops, as nvc, GHDL and Questa stop it. The slice that matches is not
+# reported.
 test.top_filename = "t/t_vhdl_slicedirrun_bad.vhd"
 
 test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--main"],
@@ -22,9 +23,10 @@ test.compile(verilator_flags=["-Mdir " + test.obj_dir, "--exe", "--build", "--ma
              make_top_shell=False,
              make_main=False)
 
-test.execute()
+test.execute(fails=True)
 
 test.file_grep(test.run_log_filename, r'slices that match passed')
 test.file_grep_count(test.run_log_filename, r"Slice runs 'downto' but std_ulogic_vector is indexed 'to'", 1)
+test.file_grep_not(test.run_log_filename, r'All Finished')
 
 test.passes()

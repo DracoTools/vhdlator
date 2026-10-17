@@ -1,0 +1,4 @@
+t/t_vhdl_aggslice_len_bad.vhd:16:7:@0:(report note): 00001111
+[0] %Error: t_vhdl_aggslice_len_bad.vhd:16: Assertion failed in t_vhdl_aggslice_len_bad.test__V2: Array lengths do not match
+%Error: t/t_vhdl_aggslice_len_bad.vhd:16: Verilog $stop
+Aborting...

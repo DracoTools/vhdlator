@@ -818,7 +818,18 @@ private:
                               ? symp->paramTypes()[at]
                               : nullptr;
                     if (staticLengthsDiffer(formalp, asp->actualp()->vhdlTypep())) {
-                        if (AstNodeExpr* const valp = lowerExpr(asp->actualp())) {
+                        // The run stops before the value is used, so the formal is given one
+                        // as long as it is, which is no width to warn of
+                        AstNodeExpr* valp
+                            = defaultValueFor(const_cast<VhdlType*>(formalp), asp->fileline());
+                        if (!valp) {
+                            if (AstNodeExpr* const actp = lowerExpr(asp->actualp())) {
+                                valp = new AstCast{
+                                    asp->fileline(), actp, VFlagChildDType{},
+                                    lowerType(const_cast<VhdlType*>(formalp), asp->fileline())};
+                            }
+                        }
+                        if (valp) {
                             onep = new AstExprStmt{asp->fileline(),
                                                    lengthMismatch(asp->fileline()), valp};
                         }
@@ -4424,6 +4435,13 @@ private:
         // "(v'range => 'X')" covers the whole of it, which is what "others"
         // says another way (9.3.3.3)
         if (!choicep->isOthers() && !wholeRangeChoice(choicep)) return nullptr;
+        // Unless what it gives is of the aggregate's own type, which is the whole slice and not
+        // a value for each element: "(x'range => v)" with v as long as x (NVC bounds42)
+        const VhdlType* const aggTypep = aggp->vhdlTypep();
+        const VhdlType* const valTypep = elemp->valuep()->vhdlTypep();
+        if (!choicep->isOthers() && aggTypep && valTypep && valTypep->base() == aggTypep->base()) {
+            return nullptr;
+        }
         return lowerExpr(elemp->valuep());
     }
 
@@ -5578,19 +5596,25 @@ private:
         return refp;
     }
 
-    // Whether two one-dimensional array subtypes both have a length that is
-    // a number here, and the numbers differ
+    // Whether two array subtypes of as many dimensions both have a length that is a number here
+    // in some dimension, and the numbers differ: "bv2d(1 to 5, 1 to 2)" handed to a formal
+    // "bv2d(1 to 5, 1 to 3)" (NVC bounds19)
     static bool staticLengthsDiffer(const VhdlType* ap, const VhdlType* bp) {
-        const auto lengthOf = [](const VhdlType* tp) -> int64_t {
+        const auto lengthOf = [](const VhdlType* tp, size_t dim) -> int64_t {
             if (!tp || tp->base()->kind() != VhdlTypeKind::ARRAY || !tp->isConstrainedArray()
-                || tp->indexTypes().size() != 1) {
+                || dim >= tp->indexTypes().size() || !tp->indexTypes()[dim]
+                || !tp->indexTypes()[dim]->bounded()) {
                 return -1;
             }
-            return std::max<int64_t>(tp->indexTypes()[0]->length(), 0);
+            return std::max<int64_t>(tp->indexTypes()[dim]->length(), 0);
         };
-        const int64_t a = lengthOf(ap);
-        const int64_t b = lengthOf(bp);
-        return a >= 0 && b >= 0 && a != b;
+        if (!ap || !bp || ap->indexTypes().size() != bp->indexTypes().size()) return false;
+        for (size_t dim = 0; dim < ap->indexTypes().size(); ++dim) {
+            const int64_t a = lengthOf(ap, dim);
+            const int64_t b = lengthOf(bp, dim);
+            if (a >= 0 && b >= 0 && a != b) return true;
+        }
+        return false;
     }
     // Lengths that do not match, where only running can tell, are an error
     // that ends the run (5.3.2.2, 10.6.2.1), as nvc 1.22.1 and GHDL 7.0.0-dev
@@ -5954,6 +5978,33 @@ private:
         refp->taskp(VN_AS(funcpr, Func));
         return refp;
     }
+    // A value of an aggregate whose lengths do not match, which stops the run where it is
+    // evaluated: a call, which runs wherever a value can stand -- an argument of a display too,
+    // where the statements of an expression are not run
+    AstNodeExpr* lengthMismatchValue(const VhdlType* typep, FileLine* flp) {
+        AstNodeExpr* const zerop = defaultValueFor(const_cast<VhdlType*>(typep), flp);
+        if (!zerop) return nullptr;
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        AstNodeFTask*& funcpr = m_rangeChkFuncs[where + "|lenmis|" + typep->prettyName()];
+        if (!funcpr || !usableHelper(funcpr)) {
+            FileLine* const hflp = dynFl(flp);
+            const std::string name = "__Vlenchk" + std::to_string(++m_nameNum);
+            AstFunc* const funcp = new AstFunc{hflp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            funcp->fvarp(newReturnVar(name, lowerType(const_cast<VhdlType*>(typep), hflp), hflp));
+            AstVar* const vp
+                = dynArg(funcp, "v", lowerType(const_cast<VhdlType*>(typep), hflp), hflp);
+            funcp->addStmtsp(lengthMismatch(hflp));
+            funcp->addStmtsp(new AstAssign{
+                hflp, new AstVarRef{hflp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                rd(vp, hflp)});
+            addHelperFunc(funcp);
+            funcpr = funcp;
+        }
+        AstFuncRef* const refp = new AstFuncRef{flp, funcpr->name(), new AstArg{flp, "", zerop}};
+        refp->taskp(VN_AS(funcpr, Func));
+        return refp;
+    }
     // A value handed back by a helper of its own, one per place and check,
     // which stops the run with the message given where the test holds of it
     // (the message prints the value with its one "%0d"). For the checks that
@@ -6136,6 +6187,59 @@ private:
         if (!checkRange(arrayTypep, 0, flp, leftp, rightp, ascending, idxp)) return sliceLeftp;
         return checkCall(true, sliceLeftp, sliceRightp->cloneTree(false), leftp, rightp, ascending,
                          flp);
+    }
+    // A slice that runs the other way from its prefix is an error where it is not null (8.5),
+    // where nvc, GHDL and Questa stop the run: "v(n - 1 downto 0)" of a parameter a call gave
+    // the bounds 0 to 7 (NVC issue1231). For ends only running gives; sliceAgainstPrefix
+    // reports those the analysis settles. The left end is handed back, or the run stops.
+    AstNodeExpr* sliceDirChecked(AstNodeExpr* sliceLeftp, AstNodeExpr* sliceRightp, bool sliceAsc,
+                                 bool sliceDirKnown, const VhdlType* arrayTypep, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts || !sliceDirKnown) return sliceLeftp;
+        if (VN_IS(sliceLeftp, Const) && VN_IS(sliceRightp, Const)) return sliceLeftp;
+        if (!sliceRightp->isPure() || (elabOnly(sliceLeftp) && elabOnly(sliceRightp))) {
+            return sliceLeftp;
+        }
+        if (!arrayTypep || arrayTypep->base()->kind() != VhdlTypeKind::ARRAY
+            || !arrayTypep->isConstrainedArray() || stringBehind(arrayTypep)) {
+            return sliceLeftp;
+        }
+        const VhdlType* const idxp = indexSubtype(arrayTypep, 0);
+        if (!idxp || !idxp->bounded() || idxp->ascending() == sliceAsc) return sliceLeftp;
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        const std::string key = where + "|sdir";
+        AstNodeFTask*& funcpr = m_idxChkFuncs[key];
+        if (!funcpr || !usableHelper(funcpr)) {
+            FileLine* const hflp = dynFl(flp);
+            const std::string name = "__Vsldchk" + std::to_string(++m_nameNum);
+            AstFunc* const funcp = new AstFunc{hflp, name, nullptr, nullptr};
+            funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+            funcp->fvarp(newReturnVar(name, newIntDType(hflp), hflp));
+            AstVar* const lp = dynArg(funcp, "l", newIntDType(hflp), hflp);
+            AstVar* const rp = dynArg(funcp, "r", newIntDType(hflp), hflp);
+            AstNodeExpr* const notNullp
+                = sliceAsc
+                      ? static_cast<AstNodeExpr*>(new AstLteS{hflp, rd(lp, hflp), rd(rp, hflp)})
+                      : static_cast<AstNodeExpr*>(new AstGteS{hflp, rd(lp, hflp), rd(rp, hflp)});
+            AstNode* const stmtsp = new AstDisplay{
+                hflp, VDisplayType::DT_DISPLAY,
+                "%%Error: " + where + ": Slice %0d" + (sliceAsc ? " to " : " downto ")
+                    + "%0d runs the other way from its prefix, indexed "
+                    + (idxp->ascending() ? "'to'" : "'downto'"),
+                nullptr, rd(lp, hflp)};
+            VN_AS(stmtsp, Display)->fmtp()->exprsp()->addNext(rd(rp, hflp));
+            stmtsp->addNext(new AstStop{hflp, true});
+            funcp->addStmtsp(new AstIf{hflp, notNullp, stmtsp});
+            funcp->addStmtsp(new AstAssign{
+                hflp, new AstVarRef{hflp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE},
+                rd(lp, hflp)});
+            addHelperFunc(funcp);
+            funcpr = funcp;
+        }
+        AstArg* const argsp = new AstArg{flp, "", intBound(sliceLeftp, flp)};
+        argsp->addNext(new AstArg{flp, "", intBound(sliceRightp->cloneTree(false), flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, funcpr->name(), argsp};
+        refp->taskp(VN_AS(funcpr, Func));
+        return refp;
     }
     // "__VidxchkN(i, left, right)" or "__VslchkN(l, r, left, right)": i or l,
     // once checked. One per place and direction, so the report's text is a
@@ -9270,6 +9374,10 @@ private:
                     // open is an error rather than an empty one (5.5.2)
                     AstNodeExpr* const fdp = new AstVarRef{flp, varp, VAccess::READ};
                     openp = AstNode::addNext(openp, fileOpenCheck(fdp, namep, mode, flp));
+                    // Its mode, for the checks of READ and WRITE (fileModeCheck)
+                    if (AstNode* const keepp = fileModeKept(fdp, mode, flp)) {
+                        openp = AstNode::addNext(openp, keepp);
+                    }
                     VL_DO_DANGLING(fdp->deleteTree(), fdp);
                     // A file of a subprogram is opened again on every call.
                     // Anywhere else -- an architecture, a block, a process --
@@ -20396,8 +20504,11 @@ private:
                 FileLine* const quietp = new FileLine{flp};
                 quietp->warnOff(V3ErrorCode::SELRANGE, true);
                 valp->foreach([&](AstNode* np) { np->fileline(quietp); });
-                return new AstExprStmt{
-                    flp, new AstDisplay{flp, VDisplayType::DT_ERROR, msg, nullptr, nullptr}, valp};
+                // and the run stops there, as nvc, GHDL and Questa stop it (NVC issue1231)
+                AstNode* const stopsp
+                    = new AstDisplay{flp, VDisplayType::DT_ERROR, msg, nullptr, nullptr};
+                stopsp->addNext(new AstStop{flp, true});
+                return new AstExprStmt{flp, stopsp, valp};
             }
         }
         // An indexed name of a formal whose elements the call named one at a
@@ -20461,6 +20572,8 @@ private:
                     return nullptr;
                 }
                 leftp = checkedSliceLeft(leftp, rightp, nodep->prefixp()->vhdlTypep(), flp);
+                leftp = sliceDirChecked(leftp, rightp, sliceAsc, sliceDirKnown,
+                                        nodep->prefixp()->vhdlTypep(), flp);
                 leftp = applyShifts(shifts, leftp, flp);
                 rightp = applyShifts(shifts, rightp, flp);
                 // A name numbered the other way round from the object it
@@ -23435,6 +23548,15 @@ private:
                     const VhdlType* const ridxp = indexSubtype(runTypep, 0);
                     if (ridxp && ridxp->bounded()) have = ridxp->length();
                 }
+                // A value of another length than the choice it is given: an error once it is
+                // evaluated (9.3.3.3), where nvc and Questa stop the run (NVC bounds42)
+                if (runp && have >= 0 && span >= 0 && have != span && v3Global.opt.vhdlBoundCheck()
+                    && m_inStmts) {
+                    VL_DO_DANGLING(runp->deleteTree(), runp);
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
+                    return lengthMismatchValue(typep, flp);
+                }
                 if (!runp || have != span || !canExpand(runTypep, runp)) {
                     if (runp) VL_DO_DANGLING(runp->deleteTree(), runp);
                     unsup(flp, "aggregate with a run of elements given at once");
@@ -23454,6 +23576,21 @@ private:
                 }
                 itemsp = AstNode::addNextNull(itemsp, membersp);
                 continue;
+            }
+            // A value of the aggregate's own type, of another length than the indices it is
+            // given: an error once it is evaluated (9.3.3.3), where nvc and Questa stop the run
+            // (NVC bounds42)
+            if ((spanAt[static_cast<size_t>(i)] > 1 || runAt[static_cast<size_t>(i)])
+                && v3Global.opt.vhdlBoundCheck() && m_inStmts) {
+                const int64_t have = staticValueLength(valuep);
+                if (have >= 0 && have != spanAt[static_cast<size_t>(i)]) {
+                    if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
+                    if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
+                    if (AstNodeExpr* const valp = lengthMismatchValue(typep, flp)) return valp;
+                    // Of no length a default can be given: the value as it is, after the stop
+                    AstNodeExpr* const runp = lowerExpr(valuep);
+                    return runp ? new AstExprStmt{flp, lengthMismatch(flp), runp} : nullptr;
+                }
             }
             AstNodeExpr* elemp = lowerExpr(valuep);
             if (!elemp) return nullptr;
@@ -24005,6 +24142,12 @@ private:
         // which the choices of a legal aggregate must cover exactly -- so a
         // single range choice is the whole of it (9.3.3.3)
         if (!chp->isOthers() && !chp->rangep()) return nullptr;
+        // A value of the aggregate's own type gives the range its elements rather than one
+        // for each of them (NVC bounds42)
+        if (!chp->isOthers() && eap->valuep() && eap->valuep()->vhdlTypep()
+            && eap->valuep()->vhdlTypep()->base() == typep->base()) {
+            return nullptr;
+        }
         const bool packed
             = typep->base()->elementp() && elementPacks(typep->base()->elementp());
         if (isStringType(typep)) {
@@ -25433,6 +25576,24 @@ private:
                     if (byConv) outConvp = assocs[i]->formalp();
                     break;
                 }
+            }
+            // An actual whose length is a number here, other than the formal's: an error once
+            // the block is elaborated (6.5.6.3), where nvc and Questa stop the run -- "p =>
+            // inertial get_bits('1', 5)" for "p : in bit_vector(1 to 2)" (NVC bounds44), and
+            // not a width warning that would stop the build instead
+            if (actualp && !isGeneric && !outConvp && v3Global.opt.vhdlBoundCheck()
+                && !VN_IS(actualp, VhdlOpen) && symp->typep()
+                && staticLengthsDiffer(symp->typep(), shapeTypeOf(actualp))) {
+                FileLine* const aflp = actualp->fileline();
+                AstNode* const msgp = new AstDisplay{
+                    aflp, VDisplayType::DT_DISPLAY,
+                    "%%Error: " + aflp->filename() + ":" + std::to_string(aflp->lineno())
+                        + ": The actual's length does not match port '" + symp->name() + "''s",
+                    nullptr, nullptr};
+                msgp->addNext(new AstStop{aflp, true});
+                addStmt(new AstInitial{aflp, msgp});
+                // The run stops before the port is read: it is left open
+                actualp = nullptr;
             }
             // A conversion written on the formal converts what the port
             // drives on its way out to the actual (6.5.7.1): the port is a
@@ -34544,6 +34705,13 @@ private:
                 return dynCarrierAssign(tgtp, valuep, flp, nodep->targetp()->vhdlTypep());
             }
         }
+        // In the copy of a subprogram made for one call, a value whose length differs from
+        // the one the call gave its target: an error once it runs (10.6.2.1), where nvc and
+        // Questa stop the run (NVC bounds25, bounds33). Outside such a copy the analysis says.
+        if (valuep && m_ftaskp && v3Global.opt.vhdlBoundCheck()
+            && valueLengthsDiffer(nodep->targetp()->vhdlTypep(), valuep)) {
+            return lengthMismatch(flp);
+        }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
         AstNodeExpr* const rhsp
             = valuep ? rangeChecked(lowerExpr(valuep), nodep->targetp()->vhdlTypep(), valuep, flp)
@@ -34553,6 +34721,102 @@ private:
             return lengthCheckedTextAssign(VN_AS(lhsp, VarRef), rhsp, flp);
         }
         return new AstAssign{flp, lhsp, rhsp};
+    }
+
+    // How many elements a value has, where that is a number here: a literal or a value the
+    // elaboration folds, an aggregate written positionally, a value of a constrained subtype;
+    // -1 where it is not
+    int64_t staticValueLength(AstNodeVhdlExpr* valuep) {
+        if (!valuep) return -1;
+        const VhdlType* const typep = valuep->vhdlTypep();
+        if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY || typep->dimensions() != 1) {
+            return -1;
+        }
+        if (AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate)) {
+            // Its own subtype is the target's, which the analysis gave it: counted instead,
+            // positionally, or from the least to the greatest of choices that are numbers
+            int64_t count = 0;
+            int64_t lowest = INT64_MAX;
+            int64_t highest = INT64_MIN;
+            bool named = false;
+            for (AstVhdlElemAssoc* ap = aggp->elemsp(); ap;
+                 ap = VN_AS(ap->nextp(), VhdlElemAssoc)) {
+                if (!ap->choicesp()) {
+                    const int64_t span = elementSpan(ap->valuep(), typep);
+                    if (span < 0) return -1;
+                    count += span;
+                    continue;
+                }
+                named = true;
+                for (AstVhdlChoice* chp = ap->choicesp(); chp;
+                     chp = VN_AS(chp->nextp(), VhdlChoice)) {
+                    if (chp->isOthers()) return -1;
+                    int64_t lo = 0;
+                    int64_t hi = 0;
+                    if (AstVhdlRange* const rp = chp->rangep()) {
+                        if (!rp->leftp() || !rp->rightp()) return -1;
+                        const VhdlValue a = V3VhdlEval::eval(rp->leftp());
+                        const VhdlValue b = V3VhdlEval::eval(rp->rightp());
+                        if (!a.isInt() || !b.isInt()) return -1;
+                        lo = std::min(a.toInt(), b.toInt());
+                        hi = std::max(a.toInt(), b.toInt());
+                    } else {
+                        const VhdlValue v = V3VhdlEval::eval(chp->valuep());
+                        if (!v.isInt()) return -1;
+                        lo = hi = v.toInt();
+                    }
+                    lowest = std::min(lowest, lo);
+                    highest = std::max(highest, hi);
+                }
+            }
+            if (named) return count || lowest > highest ? -1 : highest - lowest + 1;
+            return count;
+        }
+        if (VN_IS(valuep, VhdlLiteral)) {
+            const VhdlValue val = V3VhdlEval::eval(valuep);
+            if (val.isStr()) return static_cast<int64_t>(val.toStr().size());
+            if (val.isArray()) return static_cast<int64_t>(val.elements());
+            return -1;
+        }
+        const VhdlType* const shapep = shapeTypeOf(valuep);
+        if (!shapep || !shapep->isConstrainedArray() || shapep->indexTypes().size() != 1
+            || !shapep->indexTypes()[0] || !shapep->indexTypes()[0]->bounded()) {
+            return -1;
+        }
+        return std::max<int64_t>(shapep->indexTypes()[0]->length(), 0);
+    }
+    // Whether a value given to an object of this subtype has, here, a length other than the
+    // object's: as an array, or in an element of a record aggregate
+    bool valueLengthsDiffer(const VhdlType* targetTypep, AstNodeVhdlExpr* valuep) {
+        if (!targetTypep || !valuep) return false;
+        const VhdlType* const basep = targetTypep->base();
+        if (basep->kind() == VhdlTypeKind::ARRAY) {
+            if (!targetTypep->isConstrainedArray() || targetTypep->indexTypes().size() != 1
+                || !targetTypep->indexTypes()[0] || !targetTypep->indexTypes()[0]->bounded()) {
+                return false;
+            }
+            const int64_t want = std::max<int64_t>(targetTypep->indexTypes()[0]->length(), 0);
+            const int64_t have = staticValueLength(valuep);
+            return have >= 0 && have != want;
+        }
+        AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate);
+        if (basep->kind() != VhdlTypeKind::RECORD || !aggp) return false;
+        const std::vector<VhdlSymbol*>& elems = targetTypep->elements();
+        size_t pos = 0;
+        for (AstVhdlElemAssoc* ap = aggp->elemsp(); ap; ap = VN_AS(ap->nextp(), VhdlElemAssoc)) {
+            const VhdlSymbol* elemp = nullptr;
+            if (!ap->choicesp()) {
+                if (pos < elems.size()) elemp = elems[pos];
+                ++pos;
+            } else if (!ap->choicesp()->nextp()) {
+                const AstVhdlName* const namep = VN_CAST(ap->choicesp()->exprp(), VhdlName);
+                for (const VhdlSymbol* const ep : elems) {
+                    if (namep && ep && ep->name() == namep->name()) elemp = ep;
+                }
+            }
+            if (elemp && valueLengthsDiffer(elemp->typep(), ap->valuep())) return true;
+        }
+        return false;
     }
 
     // Whether a variable of a STRING type is written with a value that may
@@ -39342,7 +39606,8 @@ private:
             if (!filep) return nullptr;
             // Closed, the file is not open: its descriptor goes back to 0, which
             // the operations on it check
-            AstNode* outp = new AstFClose{flp, filep};
+            AstNode* outp = fileModeForgotten(filep, flp);
+            outp = AstNode::addNextNull(outp, static_cast<AstNode*>(new AstFClose{flp, filep}));
             if (const AstVarRef* const refp = VN_CAST(filep, VarRef)) {
                 outp->addNext(new AstAssign{flp, new AstVarRef{flp, refp->varp(), VAccess::WRITE},
                                             new AstConst{flp, AstConst::WidthedValue{}, 32, 0}});
@@ -39361,6 +39626,7 @@ private:
             AstNodeExpr* const linep = lowerExpr(args[1]);
             if (!filep || !linep) return nullptr;
             AstNode* outp = fileNotOpenCheck(filep, true, flp);
+            AstNode::addNextNull(outp, fileModeCheck(filep, true, flp));
             outp->addNext(new AstStmtExpr{flp, new AstFGetS{flp, linep->cloneTree(false), filep}});
             // A LINE holds the line without its end of line (16.4), which
             // $fgets keeps
@@ -39388,6 +39654,7 @@ private:
             if (!filep || !linep) return nullptr;
             // Write the buffer, then empty it, as writeline does (16.4)
             AstNode* const outp = fileNotOpenCheck(filep, false, flp);
+            AstNode::addNextNull(outp, fileModeCheck(filep, false, flp));
             outp->addNext(new AstDisplay{flp, VDisplayType::DT_WRITE, "%s\n", filep,
                                          linep->cloneTree(false)});
             return AstNode::addNext(
@@ -39823,12 +40090,74 @@ private:
                                    new AstConst{flp, AstConst::WidthedValue{}, 32, 0}},
                          msgp};
     }
+    // Reading a file opened for writing or appending, or writing one opened for reading, is an
+    // error too (5.5.2), where nvc, GHDL and Questa stop the run (NVC file13, file14). The mode
+    // FILE_OPEN gave each descriptor is kept, plus one, in a table of the design's own; a file
+    // its declaration opened is not in it, and is not checked.
+    AstVar* m_fileModesp = nullptr;
+    AstVar* fileModes(FileLine* flp) {
+        if (m_fileModesp && m_fileModesp->backp()) return m_fileModesp;
+        AstPackage* const unitp = m_netlistp->dollarUnitPkgAddp();
+        for (AstNode* np = unitp->stmtsp(); np; np = np->nextp()) {
+            AstVar* const varp = VN_CAST(np, Var);
+            if (varp && varp->name() == "__Vvhdl_file_modes") return m_fileModesp = varp;
+        }
+        m_fileModesp = new AstVar{
+            flp, VVarType::VAR, "__Vvhdl_file_modes", VFlagChildDType{},
+            new AstAssocArrayDType{flp, VFlagChildDType{}, newIntDType(flp), newIntDType(flp)}};
+        unitp->addStmtsp(m_fileModesp);
+        return m_fileModesp;
+    }
+    AstNodeExpr* fileModeOf(AstNodeExpr* filep, VAccess access, FileLine* flp) {
+        return new AstSelBit{flp, new AstVarRef{flp, fileModes(flp), access},
+                             sizedTo(filep, 32, flp)};
+    }
+    // The mode FILE_OPEN or a declaration gave a descriptor, kept; and forgotten as the file
+    // is closed, since the descriptor may be given to another file next
+    AstNode* fileModeKept(AstNodeExpr* filep, const std::string& mode, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck()) return nullptr;
+        return new AstIf{flp,
+                         new AstNeq{flp, filep->cloneTree(false),
+                                    new AstConst{flp, AstConst::WidthedValue{}, 32, 0}},
+                         new AstAssign{flp,
+                                       fileModeOf(filep->cloneTree(false), VAccess::WRITE, flp),
+                                       new AstConst{flp, AstConst::Signed32{},
+                                                    mode == "w" ? 2 : (mode == "a" ? 3 : 1)}}};
+    }
+    AstNode* fileModeForgotten(AstNodeExpr* filep, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck()) return nullptr;
+        return new AstAssign{flp, fileModeOf(filep->cloneTree(false), VAccess::WRITE, flp),
+                             new AstConst{flp, AstConst::Signed32{}, 0}};
+    }
+    AstNode* fileModeCheck(AstNodeExpr* filep, bool reading, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck()) return nullptr;
+        AstNodeExpr* const modep = fileModeOf(filep->cloneTree(false), VAccess::READ, flp);
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        AstNodeExpr* const wrongp = reading
+                                        ? static_cast<AstNodeExpr*>(new AstGtS{flp, modep, num(1)})
+                                        : static_cast<AstNodeExpr*>(new AstEq{flp, modep, num(1)});
+        AstNode* const msgp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                             "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                                 + (reading ? ": Read from a file opened for writing or appending"
+                                            : ": Write to a file opened for reading"),
+                             nullptr, nullptr};
+        msgp->addNext(new AstStop{flp, true});
+        return new AstIf{
+            flp,
+            new AstLogAnd{flp,
+                          new AstNeq{flp, filep->cloneTree(false),
+                                     new AstConst{flp, AstConst::WidthedValue{}, 32, 0}},
+                          wrongp},
+            msgp};
+    }
     AstNode* lowerFileReadWrite(bool reading, std::vector<AstNodeVhdlExpr*>& args,
                                 FileLine* flp) {
         if (args.size() < 2 || args.size() > 3) return nullptr;
         AstNodeExpr* const fileChkp = lowerExpr(args[0]);
         if (!fileChkp) return nullptr;
         AstNode* const checkp = fileNotOpenCheck(fileChkp, reading, flp);
+        AstNode::addNextNull(checkp, fileModeCheck(fileChkp, reading, flp));
         VL_DO_DANGLING(fileChkp->deleteTree(), fileChkp);
         AstNode* const bodyp = lowerFileReadWriteBody(reading, args, flp);
         if (!bodyp) {
@@ -40885,8 +41214,30 @@ private:
                 mode = "?";
             }
         }
+        // The mode kept for the checks of READ and WRITE, plus one: 1 to read, 2 to write,
+        // 3 to append
+        AstNodeExpr* keptModep = nullptr;
+        if (v3Global.opt.vhdlBoundCheck()) {
+            if (mode == "?") {
+                if (AstNodeExpr* const kindp = lowerExpr(args[first + 2])) {
+                    keptModep = new AstAdd{flp, sizedTo(kindp, 32, flp),
+                                           new AstConst{flp, AstConst::Signed32{}, 1}};
+                }
+            } else {
+                keptModep = new AstConst{flp, AstConst::Signed32{},
+                                         mode == "w" ? 2 : (mode == "a" ? 3 : 1)};
+            }
+        }
         if (!modep) modep = new AstConst{flp, AstConst::String{}, mode};
         AstNode* outp = new AstAssign{flp, filep, new AstFOpen{flp, namep, modep}};
+        if (keptModep) {
+            outp->addNext(new AstIf{
+                flp,
+                new AstNeq{flp, filep->cloneTree(false),
+                           new AstConst{flp, AstConst::WidthedValue{}, 32, 0}},
+                new AstAssign{flp, fileModeOf(filep->cloneTree(false), VAccess::WRITE, flp),
+                              keptModep}});
+        }
         if (statusp) {
             // FILE_OPEN_STATUS is (OPEN_OK, STATUS_ERROR, NAME_ERROR,
             // MODE_ERROR), so a file that would not open is 2 (16.3)
@@ -41778,9 +42129,10 @@ private:
             const auto closes = [&]() -> AstNode* {
                 AstNode* outp = nullptr;
                 for (size_t i = m_ftaskFiles.size(); i-- > 0;) {
-                    outp = AstNode::addNextNull(
-                        outp, static_cast<AstNode*>(new AstFClose{
-                                  flp, new AstVarRef{flp, m_ftaskFiles[i], VAccess::READ}}));
+                    AstNodeExpr* const fdp = new AstVarRef{flp, m_ftaskFiles[i], VAccess::READ};
+                    outp = AstNode::addNextNull(outp, fileModeForgotten(fdp, flp));
+                    outp = AstNode::addNextNull(outp,
+                                                static_cast<AstNode*>(new AstFClose{flp, fdp}));
                 }
                 return outp;
             };

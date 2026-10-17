@@ -1,0 +1,4 @@
+t/t_vhdl_filewr_mode_bad.vhd:22:5:@0:(report note): read back
+%Error: t/t_vhdl_filewr_mode_bad.vhd:23: Write to a file opened for reading
+%Error: t/t_vhdl_filewr_mode_bad.vhd:23: Verilog $stop
+Aborting...
