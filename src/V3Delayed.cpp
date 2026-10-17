@@ -159,6 +159,11 @@ class DelayedVisitor final : public VNVisitor {
         uint32_t m_nWholeSites = 0;  // How many of those assign all of it
         const AstNodeProcedure* m_firstProcp = nullptr;  // Process of the first NBA to it
         bool m_multiProc = false;  // NBAs in more than one process assign it
+        // Unpacked arrays: the process of the first NBA to each element its outermost index
+        // names as a constant, and whether two processes may assign one element
+        std::unordered_map<int64_t, const AstNodeProcedure*> m_elemProcps;
+        bool m_varIndex = false;  // An NBA to it has an outermost index that is not a constant
+        bool m_elemShared = false;  // Two processes assign an element with the same constant
         Scheme m_scheme = Scheme::Undecided;  // Conversion scheme to use for this variable
         uint32_t m_nTmp = 0;  // Temporary number for unique names
 
@@ -470,7 +475,11 @@ class DelayedVisitor final : public VNVisitor {
             const bool queueable
                 = basicp
                   && (basicp->isIntegralOrPacked() || basicp->isDouble() || basicp->isString());
-            if (vscpInfo.m_multiProc && !vscpInfo.m_inLoop && queueable) {
+            // Processes that each assign elements of their own, at constant indices (one per
+            // generated block), cannot reorder each other's writes.
+            const bool procsShare
+                = vscpInfo.m_multiProc && (vscpInfo.m_varIndex || vscpInfo.m_elemShared);
+            if (procsShare && !vscpInfo.m_inLoop && queueable) {
                 if (vscpInfo.m_partial) return Scheme::ValueQueuePartial;
                 return Scheme::ValueQueueWhole;
             }
@@ -1502,6 +1511,34 @@ class DelayedVisitor final : public VNVisitor {
             vscpInfo.m_firstProcp = m_procp;
         } else if (vscpInfo.m_firstProcp != m_procp) {
             vscpInfo.m_multiProc = true;
+        }
+        {
+            // The element of an unpacked array the outermost index selects
+            const AstArraySel* outerp = nullptr;
+            for (const AstNode* np = nodep->lhsp(); np;) {
+                if (const AstArraySel* const aselp = VN_CAST(np, ArraySel)) {
+                    if (VN_IS(aselp->fromp(), VarRef)) {
+                        outerp = aselp;
+                        break;
+                    }
+                    np = aselp->fromp();
+                } else if (const AstSel* const selp = VN_CAST(np, Sel)) {
+                    np = selp->fromp();
+                } else if (const AstStructSel* const sselp = VN_CAST(np, StructSel)) {
+                    np = sselp->fromp();
+                } else {
+                    break;
+                }
+            }
+            const AstConst* const idxp = outerp ? VN_CAST(outerp->bitp(), Const) : nullptr;
+            if (!idxp || idxp->num().isFourState() || idxp->width() > 64) {
+                vscpInfo.m_varIndex = true;
+            } else {
+                const auto pair = vscpInfo.m_elemProcps.emplace(idxp->num().toSQuad(), m_procp);
+                if (pair.second == false && pair.first->second != m_procp) {
+                    vscpInfo.m_elemShared = true;
+                }
+            }
         }
         // Sensitivity might be non-clocked, in a suspendable process, which are handled elsewhere
         if (m_activep->sentreep()->hasClocked()) {
