@@ -371,8 +371,13 @@ public:
     // The same, with names given values from outside: what an instantiation
     // hands an entity's generics, so that a bound written in terms of one
     // folds to the number that instance gives it
+    // The generics an instantiation hands values, as evalWith was given them: read inside the
+    // body of a call as much as in the expression itself
+    const std::map<const VhdlSymbol*, VhdlValue>* m_bindingsp = nullptr;
     VhdlValue evalWith(AstNodeVhdlExpr* nodep,
                        const std::map<const VhdlSymbol*, VhdlValue>& bindings) {
+        VL_RESTORER(m_bindingsp);
+        m_bindingsp = &bindings;
         m_frames.emplace_back();
         for (const auto& pair : bindings) m_frames.back()[pair.first] = pair.second;
         const VhdlValue out = eval(nodep);
@@ -647,6 +652,22 @@ private:
             const Frame& frame = m_frames.back();
             const auto it = frame.find(symp);
             if (it != frame.end()) return it->second;
+            // A generic an instantiation gave a value, read inside a call's body
+            if (m_bindingsp && symp->kind() == VhdlSymKind::GENERIC) {
+                const auto bit = m_bindingsp->find(symp->resolved());
+                if (bit != m_bindingsp->end()) return bit->second;
+            }
+            // A bound of a subtype the copy of a subprogram made for one call took from the
+            // subprogram it copies names that one's parameter: the copy's of the same name is
+            // what it means while the copy runs
+            if (m_allowImpure && symp->kind() == VhdlSymKind::PARAMETER) {
+                for (const auto& pair : frame) {
+                    if (pair.first->kind() == VhdlSymKind::PARAMETER
+                        && pair.first->name() == symp->name()) {
+                        return pair.second;
+                    }
+                }
+            }
         }
         // A variable of the object a method runs on
         if (m_thisObj) {
@@ -1743,7 +1764,20 @@ private:
                 // No alternative holds: the variable is left as it was
                 if (!valuep) return Flow::NORMAL;
             }
-            const VhdlValue val = eval(valuep);
+            VhdlValue val = eval(valuep);
+            // "(others => v)" is as long as what it is given to, which is known where the
+            // target already holds a value: "v.wa.id := (others => '0')"
+            if (m_allowImpure) {
+                if (AstNodeVhdlExpr* const restp = othersOnly(valuep)) {
+                    const VhdlValue cur = eval(p->targetp());
+                    const VhdlValue elem = eval(restp);
+                    if (cur.isArray() && elem.known() && valLength(val) != valLength(cur)) {
+                        std::vector<VhdlValue> elems(static_cast<size_t>(valLength(cur)), elem);
+                        val = VhdlValue::mkArray(std::move(elems), cur.arrayLeft(),
+                                                 cur.arrayAscending(), cur.typep());
+                    }
+                }
+            }
             // Elaboration carries an unknown on rather than giving up on the
             // whole activation: what a handle's actor is decides nothing
             // about the widths beside it
@@ -1863,7 +1897,16 @@ private:
             return it == frame.end() ? nullptr : &it->second;
         }
         if (AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
-            if (!selp->isAll()) return nullptr;
+            if (!selp->isAll()) {
+                // An element of a record the frame holds, at elaboration: "v.wa.id := ..."
+                if (!m_allowImpure) return nullptr;
+                const AstVhdlName* const sfxp = VN_CAST(selp->suffixp(), VhdlName);
+                VhdlValue* const recp = sfxp ? targetObject(selp->prefixp()) : nullptr;
+                if (!recp || !recp->isRecord()) return nullptr;
+                recp->ownFields();
+                const VhdlSymbol* const elemp = sfxp->vhdlSymp();
+                return recp->fieldPtr(elemp ? elemp->name() : VString::downcase(sfxp->name()));
+            }
             VhdlValue* const accp = targetObject(selp->prefixp());
             return accp ? heapObject(*accp) : nullptr;
         }
@@ -2188,7 +2231,8 @@ private:
             VhdlValue init = op->defaultp() ? eval(op->defaultp()) : VhdlValue{};
             if (m_allowImpure) {
                 if (!op->defaultp() && !scalarValued(symp->typep())) {
-                    init = defaultOf(symp->typep());
+                    init = recordOfArraysHeld(symp->typep()) ? defaultInFrame(symp->typep())
+                                                             : defaultOf(symp->typep());
                 }
                 init = conformTo(init, symp->typep());
             }
@@ -2233,6 +2277,7 @@ private:
     bool held(const VhdlType* typep) const {
         if (valueHeld(typep)) return true;
         if (!m_allowImpure || !typep) return false;
+        if (recordOfArraysHeld(typep)) return true;
         if (isAccessType(typep)) return true;
         if (isTextType(typep)) return true;
         if (typep->base()->kind() != VhdlTypeKind::ARRAY
@@ -2255,6 +2300,74 @@ private:
             if (!ep || !valueHeld(ep->typep())) return false;
         }
         return true;
+    }
+
+    // Elaboration also holds a record whose elements are scalars, vectors of scalars, or records
+    // of those: what a function giving an interface record its default builds, element by
+    // element (UVVM's init_axi_if_signals, bugs.md 388mb)
+    static bool recordOfArraysHeld(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        for (const VhdlSymbol* const ep : typep->elements()) {
+            const VhdlType* const etp = ep ? ep->typep() : nullptr;
+            if (!etp) return false;
+            if (scalarValued(etp)) continue;
+            if (etp->base()->kind() == VhdlTypeKind::RECORD) {
+                if (!recordOfArraysHeld(etp, depth + 1)) return false;
+                continue;
+            }
+            if (etp->base()->kind() != VhdlTypeKind::ARRAY
+                || etp->base()->indexTypes().size() != 1)
+                return false;
+            const VhdlType* const elemp
+                = etp->elementp() ? etp->elementp() : etp->base()->elementp();
+            if (!scalarValued(elemp)) return false;
+        }
+        return true;
+    }
+    // The value an object of such a subtype starts with, its element bounds worked out in the
+    // current frame where the analysis left them as expressions of a parameter: "variable v :
+    // if_t(wa(id(w - 1 downto 0)), ...)" with w the function's (6.4.2.3)
+    VhdlValue defaultInFrame(VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8) return VhdlValue{};
+        if (typep->base()->kind() == VhdlTypeKind::RECORD) {
+            std::vector<std::pair<std::string, VhdlValue>> fields;
+            for (VhdlSymbol* const ep : typep->elements()) {
+                if (!ep) return VhdlValue{};
+                VhdlValue val = defaultInFrame(ep->typep(), depth + 1);
+                if (!val.known()) return VhdlValue{};
+                fields.emplace_back(ep->name(), val);
+            }
+            return VhdlValue::mkRecord(std::move(fields), typep);
+        }
+        if (typep->base()->kind() == VhdlTypeKind::ARRAY && typep->indexTypes().size() == 1) {
+            const VhdlType* const idxp = typep->indexTypes()[0];
+            if (idxp && idxp->bounded()) return defaultOf(typep);
+            const AstVhdlRange* const rp = idxp ? VN_CAST(idxp->boundsp(), VhdlRange) : nullptr;
+            if (!rp || !rp->leftp() || !rp->rightp()) return VhdlValue{};
+            const VhdlValue l = eval(rp->leftp());
+            const VhdlValue r = eval(rp->rightp());
+            if (!l.isInt() || !r.isInt()) return VhdlValue{};
+            const bool ascending = rp->dir() == VhdlDir::TO;
+            const int64_t len = ascending ? r.toInt() - l.toInt() + 1 : l.toInt() - r.toInt() + 1;
+            if (len > (1 << 20)) return VhdlValue{};
+            VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+            const VhdlValue elem = defaultOf(elemp);
+            if (!elem.known()) return VhdlValue{};
+            std::vector<VhdlValue> elems(static_cast<size_t>(std::max<int64_t>(len, 0)), elem);
+            return VhdlValue::mkArray(std::move(elems), l.toInt(), ascending, typep);
+        }
+        return defaultOf(typep);
+    }
+    // Whether a value is "(others => v)" and nothing else, which takes its length from where
+    // it is written
+    static AstNodeVhdlExpr* othersOnly(AstNodeVhdlExpr* valuep) {
+        const AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate);
+        if (!aggp || !aggp->elemsp() || aggp->elemsp()->nextp()) return nullptr;
+        const AstVhdlElemAssoc* const ap = aggp->elemsp();
+        const AstVhdlChoice* const chp = ap->choicesp();
+        if (!chp || chp->nextp() || !chp->isOthers()) return nullptr;
+        return ap->valuep();
     }
 
     // Whether a value of this type is one this evaluator holds faithfully:

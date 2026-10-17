@@ -8253,8 +8253,31 @@ private:
     // A record value elaboration settled in full, as the pattern (or, for
     // one that packs, the concatenation) an object of its type is given;
     // null if any element of it is not something lowerValue writes
-    AstNodeExpr* lowerWholeValue(const VhdlValue& val, VhdlType* typep, FileLine* flp) {
+    // With byShape, an element the type leaves open is written as long as the value says: the
+    // object it goes to holds it at the width its instance gives (VhdlPortDefault)
+    AstNodeExpr* lowerWholeValue(const VhdlValue& val, VhdlType* typep, FileLine* flp,
+                                 bool byShape = false) {
         if (!val.isComposite()) return lowerValue(val, typep, flp);
+        if (byShape && val.isArray()) {
+            // An array of character literals -- STD_ULOGIC's -- written as the text of them,
+            // which is how a bit string is lowered
+            const VhdlType* const elemp
+                = typep ? (typep->elementp() ? typep->elementp() : typep->base()->elementp())
+                        : nullptr;
+            if (!elemp || elemp->base()->kind() != VhdlTypeKind::ENUM) return nullptr;
+            const std::vector<VhdlSymbol*>& lits = elemp->base()->literals();
+            std::string text;
+            for (size_t i = 0; i < val.elements(); ++i) {
+                const VhdlValue& ev = val.elementAt(i);
+                if (!ev.isInt() || ev.toInt() < 0
+                    || ev.toInt() >= static_cast<int64_t>(lits.size()))
+                    return nullptr;
+                const std::string& name = lits[static_cast<size_t>(ev.toInt())]->name();
+                if (name.size() != 3 || name.front() != '\'') return nullptr;
+                text += name[1];
+            }
+            return lowerBitString(text, typep, flp);
+        }
         VhdlType* const basep = typep ? typep->base() : nullptr;
         if (!val.isRecord() || !basep || basep->kind() != VhdlTypeKind::RECORD
             || basep->elements().size() != val.elements()) {
@@ -8265,9 +8288,10 @@ private:
         AstNode* itemsp = nullptr;
         for (size_t i = 0; i < val.elements(); ++i) {
             VhdlSymbol* const elemp = basep->elements()[i];
-            AstNodeExpr* const onep = elementCarried(elemp->typep())
-                                          ? nullptr
-                                          : lowerWholeValue(val.elementAt(i), elemp->typep(), flp);
+            AstNodeExpr* const onep
+                = elementCarried(elemp->typep()) && !byShape
+                      ? nullptr
+                      : lowerWholeValue(val.elementAt(i), elemp->typep(), flp, byShape);
             if (!onep) {
                 if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
                 if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
@@ -8508,6 +8532,12 @@ private:
     // One generic map on the way down to the instance a relayed bound
     // belongs to: each formal, and what the entity above hands it
     using VhdlHoistLevel = std::vector<std::pair<const VhdlSymbol*, AstNodeVhdlExpr*>>;
+    // Whether a port's default is one each instance works out (VhdlPortDefault)
+    static bool defaultByInstance(const AstVhdlIfaceDecl* ifp, const VhdlSymbol* symp) {
+        return ifp->defaultp() && v3Global.opt.vhdlMetavalues() && ifp->mode() == VhdlMode::INOUT
+               && symp->typep() && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
+               && recordHasNestedOpen(symp->typep()) && VN_IS(ifp->defaultp(), VhdlCall);
+    }
     struct VhdlHoistedBound final {
         std::string name;  // The parameter the module gains
         AstNodeVhdlExpr* exprp;  // The bound, as the entity wrote it
@@ -8520,6 +8550,16 @@ private:
     std::map<std::pair<const AstVhdlInstance*, std::string>, std::string> m_hoistRelay;
     std::map<const AstNodeVhdlExpr*, std::string> m_hoistName;
     std::map<std::string, std::vector<VhdlHoistedBound>> m_hoists;  // By module name
+    // An INOUT record-of-records port given its default by a function of the generics, under
+    // the nine values (bugs.md 388mb): no copy of the function gives back a value of that shape
+    // here, so each instance works the default out over what it hands the generics, and the
+    // module takes it as a parameter its port's driver starts at
+    struct VhdlPortDefault final {
+        std::string name;  // The parameter the module gains
+        AstNodeVhdlExpr* exprp;  // The default, as the entity wrote it
+        VhdlType* typep;  // The port's subtype
+    };
+    std::map<std::string, std::vector<VhdlPortDefault>> m_portDefaults;  // By module name
     std::map<std::string, AstVar*> m_hoistVars;  // Those declared in this module
     int m_hoistNum = 0;
 
@@ -8780,13 +8820,20 @@ private:
         // of the function can give back a value of that shape here
         // (recordMayCarry), so the default is left out, as the two-state
         // lowering leaves out the default of every record it resolves
-        const bool unlowerableDefault = nodep->defaultp() && v3Global.opt.vhdlMetavalues()
-                                        && nodep->mode() == VhdlMode::INOUT
-                                        && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
-                                        && recordHasNestedOpen(symp->typep())
-                                        && VN_IS(nodep->defaultp(), VhdlCall);
+        const bool unlowerableDefault = defaultByInstance(nodep, symp);
         if (nodep->defaultp() && !triPort && !unlowerableDefault) {
             varp->valuep(lowerExpr(nodep->defaultp()));
+        } else if (unlowerableDefault && !triPort && m_modp && !nineInoutPort(nodep, symp)) {
+            // A default each instance works out (VhdlPortDefault), handed over as a parameter
+            // of the port's own type, which the port starts at
+            AstNodeDType* const dtp = varp->childDTypep() ? varp->childDTypep()->cloneTree(false)
+                                                          : lowerType(symp->typep(), flp);
+            AstVar* const dfltp = new AstVar{flp, VVarType::GPARAM, symp->name() + "__Vdflt",
+                                             VFlagChildDType{}, dtp};
+            AstNodeExpr* const startp = defaultValueFor(symp->typep(), flp);
+            dfltp->valuep(startp ? startp : new AstConst{flp, AstConst::All0{}});
+            addStmt(dfltp);
+            varp->valuep(new AstVarRef{flp, dfltp, VAccess::READ});
         } else if (!nodep->defaultp()
                    && (nodep->mode() == VhdlMode::OUT || nodep->mode() == VhdlMode::BUFFER)
                    && startsAtItsLeft(symp->typep())) {
@@ -8828,6 +8875,16 @@ private:
                          : unlowerableDefault ? nullptr
                          : nodep->defaultp()  ? lowerExpr(nodep->defaultp())
                                               : defaultValueFor(symp->typep(), flp));
+            // A default each instance works out, handed over as a parameter of the port's
+            // own type; one nothing works out leaves the driver where it started
+            if (unlowerableDefault && m_modp) {
+                AstVar* const dfltp = new AstVar{flp, VVarType::GPARAM, symp->name() + "__Vdflt",
+                                                 VFlagChildDType{}, drvDtp->cloneTree(false)};
+                AstNodeExpr* const startp = defaultValueFor(symp->typep(), flp);
+                dfltp->valuep(startp ? startp : new AstConst{flp, AstConst::All0{}});
+                addStmt(dfltp);
+                drvp->valuep(new AstVarRef{flp, dfltp, VAccess::READ});
+            }
             addStmt(new AstPort{flp, ++pinNum, drvp->name()});
             addStmt(drvp);
             // Its drivers: the statements that drive it, whole or -- an
@@ -31859,6 +31916,7 @@ private:
         // can carry: elaboration works each out over what this instance
         // hands that generic, and the number goes over as a parameter
         paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
+        paramsp = AstNode::addNextNull(paramsp, portDefaultPins(modName, nodep, &pinNum));
         // A copy made for a generic type sized by a generic of this unit
         // takes that generic's value here
         {
@@ -31999,6 +32057,42 @@ private:
         return outp;
     }
 
+    // What this instance hands the generics, as values elaboration can work out
+    static std::map<const VhdlSymbol*, VhdlValue> instanceBindings(AstVhdlInstance* nodep) {
+        std::map<const VhdlSymbol*, VhdlValue> bindings;
+        size_t position = 0;
+        for (AstNode* p = nodep->genericMapp(); p; p = p->nextp()) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            const size_t at = asp && !asp->formalp() ? position++ : SIZE_MAX;
+            if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+            const VhdlSymbol* gsymp = fnamep ? fnamep->vhdlSymp() : nullptr;
+            if (!gsymp && at < nodep->formalGenericSyms().size()) {
+                gsymp = nodep->formalGenericSyms()[at];
+            }
+            if (!gsymp) continue;
+            const VhdlValue val = V3VhdlEval::evalElab(asp->actualp());
+            if (val.known()) bindings.emplace(gsymp->resolved(), val);
+        }
+        return bindings;
+    }
+    // The defaults of the entity's ports that each instance works out (VhdlPortDefault),
+    // over what this one hands the generics
+    AstPin* portDefaultPins(const std::string& modName, AstVhdlInstance* nodep, int* pinNump) {
+        const auto it = m_portDefaults.find(modName);
+        if (it == m_portDefaults.end()) return nullptr;
+        const std::map<const VhdlSymbol*, VhdlValue> bindings = instanceBindings(nodep);
+        AstPin* outp = nullptr;
+        for (const VhdlPortDefault& dflt : it->second) {
+            const VhdlValue val = V3VhdlEval::evalElabWith(dflt.exprp, bindings);
+            if (!val.isRecord()) continue;
+            FileLine* const flp = dflt.exprp->fileline();
+            AstNodeExpr* const valuep = lowerWholeValue(val, dflt.typep, flp, true);
+            if (!valuep) continue;
+            outp = AstNode::addNextNull(outp, new AstPin{flp, ++*pinNump, dflt.name, valuep});
+        }
+        return outp;
+    }
     // What this instance hands the entity's generics, as values elaboration
     // can work out, and the bounds written in terms of them folded over
     // those values (6.5.6.2, 9.4.3)
@@ -43662,6 +43756,14 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             }
         }
         if (!hoists.empty()) m_hoists.emplace(entp->name(), std::move(hoists));
+        for (AstNode* p = entp->portsp(); p; p = p->nextp()) {
+            AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            VhdlSymbol* const symp = ifp ? ifp->vhdlSymp() : nullptr;
+            if (symp && defaultByInstance(ifp, symp)) {
+                m_portDefaults[entp->name()].push_back(
+                    VhdlPortDefault{symp->name() + "__Vdflt", ifp->defaultp(), symp->typep()});
+            }
+        }
     }
     // A component that hands one of its own data generics, or part of one,
     // to an instance whose bounds are hoisted cannot work those bounds out:

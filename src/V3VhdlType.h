@@ -558,6 +558,15 @@ public:
         if (off < 0 || static_cast<size_t>(off) >= m_fieldsp->size()) return nullptr;
         return &(*m_fieldsp)[static_cast<size_t>(off)].second;
     }
+    // One element of a record by name, to be written in place; null where there is none. The
+    // caller has made the elements its own first.
+    VhdlValue* fieldPtr(const std::string& name) {
+        if (!m_fieldsp || m_kind != VhdlValKind::RECORD) return nullptr;
+        for (auto& pair : *m_fieldsp) {
+            if (pair.first == name) return &pair.second;
+        }
+        return nullptr;
+    }
     // Text replaced, its bounds kept; bounds replaced, its text kept
     void setStr(const std::string& text) { m_str = text; }
     void setBounds(int64_t left, bool ascending) {
