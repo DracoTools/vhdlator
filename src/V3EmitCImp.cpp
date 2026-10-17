@@ -80,7 +80,7 @@ class EmitCImp final : public EmitCFunc {
                     putns(varp, varp->dtypep()->cType(scopedName, false, false));
                     if (!canBeConstexpr) {
                         puts(" = ");
-                        emitConstInit(varp->valuep());
+                        emitConstInit(varp->valuep(), varp->dtypep());
                     }
                     puts(";\n");
                 }

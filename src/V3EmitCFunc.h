@@ -263,6 +263,10 @@ public:
     void emitVarResetScopeHash();
     void emitChangeDet();
     void emitConstInit(AstNode* initp) { iterateConst(initp); }
+    // An initializer of an object of the given type, which a struct constant takes
+    void emitConstInit(AstNode* initp, const AstNodeDType* dtypep) {
+        iterateConstAs(initp, dtypep);
+    }
     void putCommaIterateNext(AstNode* nodep, bool comma = false) {
         for (AstNode* subnodep = nodep; subnodep; subnodep = subnodep->nextp()) {
             if (comma) puts(", ");
@@ -1946,10 +1950,37 @@ public:
         }
     }
     void visit(AstConsPackUOrStruct* nodep) override {
-        putnbs(nodep, nodep->dtypep()->cType("", false, false));
+        // Written as the structure it initializes, member for member, where that is another
+        // one of the same shape (constStructAs)
+        const AstNodeUOrStructDType* const asp = constStructAs(nodep);
+        const bool retyped = asp && asp != nodep->dtypep()->skipRefp();
+        putnbs(nodep,
+               retyped ? asp->cType("", false, false) : nodep->dtypep()->cType("", false, false));
         puts("{");
-        for (AstNode* memberp = nodep->membersp(); memberp; memberp = memberp->nextp()) {
-            iterateConst(memberp);
+        const AstNodeUOrStructDType* const ownp
+            = VN_CAST(nodep->dtypep()->skipRefp(), NodeUOrStructDType);
+        for (AstConsPackMember* memberp = nodep->membersp(); memberp;
+             memberp = VN_AS(memberp->nextp(), ConsPackMember)) {
+            // The member in the same place of the other structure
+            const AstMemberDType* wantp = nullptr;
+            if (retyped && ownp) {
+                const AstMemberDType* bp = asp->membersp();
+                for (const AstMemberDType* ap = ownp->membersp(); ap && bp;
+                     ap = VN_AS(ap->nextp(), MemberDType), bp = VN_AS(bp->nextp(), MemberDType)) {
+                    if (ap == memberp->dtypep()) {
+                        wantp = bp;
+                        break;
+                    }
+                }
+            }
+            if (wantp) {
+                putnbs(memberp, ".");
+                puts(wantp->name());
+                puts(" = ");
+                iterateConstAs(memberp->rhsp(), wantp->subDTypep());
+            } else {
+                iterateConst(memberp);
+            }
             if (memberp->nextp()) puts(", ");
         }
         puts("}");

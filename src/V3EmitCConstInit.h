@@ -45,6 +45,37 @@ protected:
     // constant expression, and so can be a call
     bool m_fillUniform = false;
 
+    // The constant being emitted as an element or a value of a type that may be another
+    // structure of the same members than its own -- one module's copy of a record and the
+    // package's (VHDL generics) -- and that type, which it is written as
+    const AstNode* m_constItemp = nullptr;
+    const AstNodeDType* m_constItemDTypep = nullptr;
+    // Emit an item of an initializer as the type it initializes
+    void iterateConstAs(const AstNode* itemp, const AstNodeDType* dtypep) {
+        VL_RESTORER(m_constItemp);
+        VL_RESTORER(m_constItemDTypep);
+        m_constItemp = itemp;
+        m_constItemDTypep = dtypep;
+        iterateConst(const_cast<AstNode*>(itemp));
+    }
+    // The structure a struct constant is written as: the one it initializes where that is
+    // another of the same number of members, of the same widths
+    const AstNodeUOrStructDType* constStructAs(const AstConsPackUOrStruct* nodep) const {
+        const AstNodeUOrStructDType* const ownp
+            = VN_CAST(nodep->dtypep()->skipRefp(), NodeUOrStructDType);
+        if (m_constItemp != nodep || !m_constItemDTypep || !ownp) return ownp;
+        const AstNodeUOrStructDType* const wantp
+            = VN_CAST(m_constItemDTypep->skipRefp(), NodeUOrStructDType);
+        if (!wantp || wantp == ownp || wantp->packed() || ownp->packed()) return ownp;
+        const AstMemberDType* ap = wantp->membersp();
+        const AstMemberDType* bp = ownp->membersp();
+        for (; ap && bp;
+             ap = VN_AS(ap->nextp(), MemberDType), bp = VN_AS(bp->nextp(), MemberDType)) {
+            if (ap->width() != bp->width()) return ownp;
+        }
+        return ap || bp ? ownp : wantp;
+    }
+
     // An array initializer whose default is every element is written as that
     // default passed to VlUnpacked::filled once the array is long enough that
     // an element list costs the C++ compiler: VESTS tc988 allocates records of
@@ -90,7 +121,7 @@ protected:
             if (emitsFilled(nodep)) {
                 puts(dtypep->cType("", false, false, false));
                 puts("::filled(");
-                iterateConst(nodep->defaultp());
+                iterateConstAs(nodep->defaultp(), dtypep->subDTypep());
                 puts(")");
                 return;
             }
@@ -107,7 +138,7 @@ protected:
                 if (n) puts((n % tabMod) ? ", " : ",\n");
                 AstNode* const itemp = nodep->getIndexDefaultedValuep(n);
                 UASSERT_OBJ(itemp, nodep, "Missing array init element");
-                iterateConst(itemp);
+                iterateConstAs(itemp, dtypep->subDTypep());
             }
             puts("\n");
             puts("}");
