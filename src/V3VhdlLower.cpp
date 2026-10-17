@@ -513,6 +513,7 @@ public:
     void lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) VL_MT_DISABLED;
     void addTraceRequest() VL_MT_DISABLED;
     void reportReachedRefusals() VL_MT_DISABLED;
+    void reportSubprogramRefusals() VL_MT_DISABLED;
     void addLogicPosPins() VL_MT_DISABLED;
     void twoStateBoundaryPorts() VL_MT_DISABLED;
     void hoistTargetStatements() VL_MT_DISABLED;
@@ -579,10 +580,21 @@ private:
     // A construct the frontend understands but cannot yet emit. Kept distinct
     // from an error in the source, which is what the analyzer reports.
     void unsup(FileLine* flp, const std::string& what) {
+        // Inside a subprogram's body, only once it is known that the design can call it:
+        // a library's procedure nothing calls -- UVVM's HVVC bridge analyzed on its own, a
+        // signal parameter's open element no caller sized (bugs.md 388mr) -- is never run,
+        // and is left out instead (reportSubprogramRefusals)
+        if (m_ftaskp && !m_reportingDeferred) {
+            m_ftaskRefusals.emplace_back(m_ftaskp, flp, what);
+            return;
+        }
         const std::string msg = "Unsupported: VHDL " + what + " cannot be lowered yet";
         flp->v3error(msg);
         m_errored = true;
     }
+    // Refusals inside subprogram bodies, waiting on whether anything calls the subprogram
+    std::vector<std::tuple<AstNodeFTask*, FileLine*, std::string>> m_ftaskRefusals;
+    bool m_reportingDeferred = false;  // Reporting them now
 
     // METHODS - types
 
@@ -10157,7 +10169,14 @@ private:
             // "mustHave", since a vector of logic is otherwise left to start
             // the way Verilator starts one, and a generic with no value at
             // all is what stops the lint
-            return defaultValueFor(typep, flp, true);
+            if (AstNodeExpr* const valuep = defaultValueFor(typep, flp, true)) return valuep;
+            // An array its instance gives the bounds of, of records -- UVVM's
+            // "gc_dut_if_field_config : t_dut_if_field_config_direction_array", indexed by
+            // an enumeration (bugs.md 388mr): zero everywhere, whatever the shape is
+            AstPatMember* const memberp
+                = new AstPatMember{flp, new AstConst{flp, AstConst::All0{}}, nullptr, nullptr};
+            memberp->isDefault(true);
+            return new AstPattern{flp, memberp};
         }
         // Only for the kinds a width is written in terms of. An enumeration
         // is never one, and its values are as wide as the type rather than
@@ -32724,6 +32743,7 @@ private:
         AstNode* outp = nullptr;
         for (AstNode* p = stmtsp; p; p = p->nextp()) {
             const int before = V3Error::errorCount();
+            const size_t refusedBefore = m_ftaskRefusals.size();
             AstNode* onep = lowerStmt(VN_AS(p, NodeVhdlStmt));
             if (onep) onep = AstNode::addNextNull(onep, stopCheckAfter(p));
             // A statement that lowers to nothing has to have said why: "null"
@@ -32731,7 +32751,7 @@ private:
             // nothing back has reported it. Saying nothing and emitting
             // nothing would leave the design quietly missing what it wrote.
             if (!onep && !VN_IS(p, VhdlNull) && !assignsNothing(p)
-                && V3Error::errorCount() == before) {
+                && V3Error::errorCount() == before && m_ftaskRefusals.size() == refusedBefore) {
                 unsup(p->fileline(), std::string{"statement "} + p->typeName());
             }
             outp = AstNode::addNextNull(outp, onep);
@@ -33259,9 +33279,23 @@ private:
                 elem2Funcp = dynToFixedExprFunc(elemCarrp, fixedElemp, flp);
             }
         }
+        // The carrier is the base type's, unless only the object's subtype gives its words a
+        // length: "hvvc_to_bridge.data_words(0 to n - 1) <= data_words" in UVVM's HVVC bridge,
+        // the record's element an open array of open std_logic_vector and the signal's
+        // subtype giving both (bugs.md 388mr)
+        VhdlType* carrTypep = objTypep->base();
+        {
+            const VhdlType* const baseElemp = carrTypep->elementp();
+            const VhdlType* const ownElemp = objTypep->elementp();
+            if (baseElemp && baseElemp->base()->kind() == VhdlTypeKind::ARRAY
+                && !baseElemp->lengthEmittable() && ownElemp && ownElemp->lengthEmittable()
+                && !lengthOnlyRunningDecides(ownElemp)) {
+                carrTypep = objTypep;
+            }
+        }
         AstNodeExpr* const carrp = elem2Funcp ? asDyn2Carrier(valuep, v2typep, flp)
                                    : objp && !uniformp && !v2typep
-                                       ? asDynCarrier(valuep, objTypep->base(), flp)
+                                       ? asDynCarrier(valuep, carrTypep, flp)
                                        : nullptr;
         if (!objp || !repeatable(objp) || (!elemp && !carrp)) {
             for (AstNodeExpr* const p : {leftp, rightp, objp, elemp, carrp}) {
@@ -33306,10 +33340,9 @@ private:
                                   placesp}}));
         AstVar* cvarp = nullptr;
         if (carrp) {
-            cvarp = newTempVar("__Vsdcarr",
-                               elem2Funcp ? dyn2CarrierRef(v2typep, flp)
-                                          : dynCarrierRef(objTypep->base(), flp),
-                               flp);
+            cvarp = newTempVar(
+                "__Vsdcarr",
+                elem2Funcp ? dyn2CarrierRef(v2typep, flp) : dynCarrierRef(carrTypep, flp), flp);
             outp = AstNode::addNext(
                 outp, static_cast<AstNode*>(new AstAssign{flp, wr(cvarp, flp), carrp}));
             outp = AstNode::addNext(
@@ -44237,6 +44270,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     settleUpwardNames();
     hoistTargetStatements();
     reportReachedRefusals();
+    reportSubprogramRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
 }
 
@@ -44609,6 +44643,81 @@ void VhdlLowerVisitor::reportReachedRefusals() {
         }
     }
     m_reachedRefusals.clear();
+}
+
+// The refusals inside subprograms, reported for those the design may call: from a statement
+// outside every subprogram, or from a subprogram that is called in turn. A subprogram nothing
+// calls never runs, so one whose body could not be lowered is left out, with those that call
+// only it, rather than refused.
+void VhdlLowerVisitor::reportSubprogramRefusals() {
+    if (m_ftaskRefusals.empty()) return;
+    std::map<const AstNodeFTask*, std::set<const AstNodeFTask*>> callees;
+    std::set<const AstNodeFTask*> live;
+    std::vector<const AstNodeFTask*> todo;
+    m_netlistp->foreach([&](const AstNodeFTaskRef* refp) {
+        const AstNodeFTask* const calleep = refp->taskp();
+        if (!calleep) return;
+        // The subprogram the call is in, if any; a class's methods are reached by other
+        // means, so a call in one counts as from outside
+        const AstNodeFTask* callerp = nullptr;
+        for (const AstNode* up = refp->aboveLoopp(); up; up = up->aboveLoopp()) {
+            if (VN_IS(up, Class)) break;
+            if (const AstNodeFTask* const ftp = VN_CAST(up, NodeFTask)) {
+                callerp = ftp;
+                break;
+            }
+        }
+        if (callerp) {
+            callees[callerp].insert(calleep);
+        } else if (live.insert(calleep).second) {
+            todo.push_back(calleep);
+        }
+    });
+    // A method of a class, and what it calls, may be reached through the class
+    m_netlistp->foreach([&](const AstClass* classp) {
+        classp->foreach([&](const AstNodeFTask* ftp) {
+            if (live.insert(ftp).second) todo.push_back(ftp);
+        });
+    });
+    while (!todo.empty()) {
+        const AstNodeFTask* const ftp = todo.back();
+        todo.pop_back();
+        for (const AstNodeFTask* const calleep : callees[ftp]) {
+            if (live.insert(calleep).second) todo.push_back(calleep);
+        }
+    }
+    // One the lowering itself has since taken out is reported, being past asking about
+    std::set<const AstNodeFTask*> existing;
+    m_netlistp->foreach([&](const AstNodeFTask* ftp) { existing.insert(ftp); });
+    VL_RESTORER(m_reportingDeferred);
+    m_reportingDeferred = true;
+    std::set<AstNodeFTask*> dropped;
+    for (const auto& refusal : m_ftaskRefusals) {
+        AstNodeFTask* const ftp = std::get<0>(refusal);
+        if (!existing.count(ftp) || live.count(ftp)) {
+            unsup(std::get<1>(refusal), std::get<2>(refusal));
+        } else {
+            dropped.insert(ftp);
+        }
+    }
+    m_ftaskRefusals.clear();
+    if (dropped.empty()) return;
+    // With every subprogram that calls one left out, none of them is still named
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (const auto& pair : callees) {
+            if (dropped.count(const_cast<AstNodeFTask*>(pair.first))) continue;
+            for (const AstNodeFTask* const calleep : pair.second) {
+                if (!dropped.count(const_cast<AstNodeFTask*>(calleep))) continue;
+                dropped.insert(const_cast<AstNodeFTask*>(pair.first));
+                grew = true;
+                break;
+            }
+        }
+    }
+    for (AstNodeFTask* const ftp : dropped) {
+        if (ftp->backp()) VL_DO_DANGLING(ftp->unlinkFrBack()->deleteTree(), ftp);
+    }
 }
 
 // A reference to a signal a package declares has to say which package it is
