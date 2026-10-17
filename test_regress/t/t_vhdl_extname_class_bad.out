@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_extname_class_bad.vhd:24: The class of object 'x' is not variable
+%Error: t/t_vhdl_extname_class_bad.vhd:24: Verilog $stop
+Aborting...

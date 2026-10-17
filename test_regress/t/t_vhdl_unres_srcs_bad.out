@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_unres_srcs_bad.vhd:10: Unresolved signal 'x' has more than one source
+%Error: t/t_vhdl_unres_srcs_bad.vhd:10: Verilog $stop
+Aborting...

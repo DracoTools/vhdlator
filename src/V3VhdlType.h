@@ -100,6 +100,9 @@ class VhdlType final {
     std::vector<VhdlType*> m_indexTypes;
     VhdlType* m_elementp = nullptr;
     bool m_unconstrained = false;  // Array with an unconstrained index
+    // The subtype a range constraint narrows, where the analysis could not check that the range
+    // lies within it (5.2.1); elaboration does
+    const VhdlType* m_narrowsp = nullptr;
     // One row of a multidimensional aggregate. VHDL gives such a row no type
     // of its own -- the parentheses group indices, they do not make a value
     // (9.3.3.3) -- so the array made to check and lower a row must not be
@@ -305,6 +308,8 @@ public:
     void elementp(VhdlType* typep) { m_elementp = typep; }
     bool unconstrained() const { return m_unconstrained; }
     void unconstrained(bool flag) { m_unconstrained = flag; }
+    const VhdlType* narrows() const { return m_narrowsp; }
+    void narrows(const VhdlType* typep) { m_narrowsp = typep; }
     bool aggRow() const { return m_aggRow; }
     void aggRow(bool flag) { m_aggRow = flag; }
     bool portShaped() const { return m_portShaped; }

@@ -6162,6 +6162,33 @@ private:
         stmtsp->addNext(new AstStop{flp, true});
         return stmtsp;
     }
+    // The run stopped where a subtype's range, settled only by elaboration, does not lie within
+    // the subtype it narrows (5.2.1); null where it does or cannot be told
+    static AstNode* subrangeFailure(const VhdlType* typep, FileLine* flp) {
+        const VhdlType* const narrowsp = typep ? typep->narrows() : nullptr;
+        if (!narrowsp || !typep->bounded() || !narrowsp->bounded() || typep->isNull()) {
+            return nullptr;
+        }
+        const bool real = typep->base()->kind() == VhdlTypeKind::FLOATING;
+        if (real ? (typep->lowReal() >= narrowsp->lowReal()
+                    && typep->highReal() <= narrowsp->highReal())
+                 : (typep->low() >= narrowsp->low() && typep->high() <= narrowsp->high())) {
+            return nullptr;
+        }
+        const auto text = [&](const VhdlType* tp) {
+            return real ? V3VhdlEval::image(VhdlValue::mkReal(tp->lowReal())) + " to "
+                              + V3VhdlEval::image(VhdlValue::mkReal(tp->highReal()))
+                        : std::to_string(tp->low()) + " to " + std::to_string(tp->high());
+        };
+        AstNode* const stmtsp
+            = new AstDisplay{flp, VDisplayType::DT_DISPLAY,
+                             "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                                 + ": Range " + text(typep) + " is outside the range of "
+                                 + narrowsp->prettyName() + ", which is " + text(narrowsp),
+                             nullptr, nullptr};
+        stmtsp->addNext(new AstStop{flp, true});
+        return stmtsp;
+    }
     // A slice whose ends are not both numbers: the left end, once the slice
     // is checked; the right end is read again, so it has to be pure
     AstNodeExpr* checkedSliceLeft(AstNodeExpr* sliceLeftp, AstNodeExpr* sliceRightp,
@@ -9478,6 +9505,28 @@ private:
                 addStmt(varp);
                 addStmt(lengthMismatch(flp));
                 return;
+            }
+            // An unresolved signal with several sources is an error of elaboration (14.7.2),
+            // where nvc, GHDL and Questa stop (NVC driver9); the analysis warned of it
+            if (v3Global.opt.vhdlBoundCheck() && objp->kind() == VhdlObjKind::SIGNAL
+                && symp->unresolvedSources()) {
+                AstNode* const msgp = new AstDisplay{
+                    flp, VDisplayType::DT_DISPLAY,
+                    "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                        + ": Unresolved signal '" + objp->name() + "' has more than one source",
+                    nullptr, nullptr};
+                msgp->addNext(new AstStop{flp, true});
+                addStmt(new AstInitial{flp, msgp});
+            }
+            // A range constraint whose bounds only elaboration settles lies within the subtype
+            // it narrows, or the declaration is an error once elaborated (5.2.1), where nvc and
+            // Questa stop the run: "variable v : positive range 0 to n - 1" (NVC issue1394)
+            if (v3Global.opt.vhdlBoundCheck()) {
+                if (AstNode* const failp = subrangeFailure(symp->typep(), flp)) {
+                    addStmt(varp);
+                    addStmt(m_ftaskp ? failp : new AstInitial{flp, failp});
+                    return;
+                }
             }
             // Anywhere, an initial value elaboration folds that does not fit
             // its object -- another length, or a number outside its subtype
@@ -42853,6 +42902,21 @@ private:
         m_pendingExt.clear();
         m_pendingBlockExt.clear();
         if (archp) collectBlockPaths(archp->stmtsp(), "");
+        // An external name the analysis found denoting the wrong object: elaboration fails
+        // there, where nvc, GHDL and Questa stop, so the model stops when it starts (8.7)
+        if (archp && v3Global.opt.vhdlBoundCheck()) {
+            archp->foreach([&](const AstVhdlExternalName* extp) {
+                if (extp->elabError().empty()) return;
+                FileLine* const eflp = extp->fileline();
+                AstNode* const msgp = new AstDisplay{eflp, VDisplayType::DT_DISPLAY,
+                                                     "%%Error: " + eflp->filename() + ":"
+                                                         + std::to_string(eflp->lineno()) + ": "
+                                                         + extp->elabError(),
+                                                     nullptr, nullptr};
+                msgp->addNext(new AstStop{eflp, true});
+                m_modp->addStmtsp(new AstInitial{eflp, msgp});
+            });
+        }
         m_funcs.clear();
         // A copy made for one call, bound to the signal that call passed,
         // belongs to the module the call is in: reused from another module

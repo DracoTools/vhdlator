@@ -137,6 +137,9 @@ class VhdlSymbol final {
     // A composite whose element subtype names the resolution function: the
     // drivers are resolved one element at a time rather than whole (14.7.3.2)
     bool m_resolvePerElement = false;
+    // An unresolved signal with sources outside any generate, more than one: an error of
+    // elaboration (14.7.2), which the analysis only warns of
+    bool m_unresolvedSources = false;
     AstVhdlSubprogDecl* m_bodyp = nullptr;  // A subprogram's body, for copying
     // Values given by attribute specifications (7.2), by attribute name. The
     // expression stays owned by the specification.
@@ -190,6 +193,8 @@ public:
     void resolverForCount(int count, VhdlSymbol* symp) { m_resolverByCount[count] = symp; }
     bool resolvePerElement() const { return m_resolvePerElement; }
     void resolvePerElement(bool flag) { m_resolvePerElement = flag; }
+    bool unresolvedSources() const { return m_unresolvedSources; }
+    void unresolvedSources(bool flag) { m_unresolvedSources = flag; }
 
     const std::string& foreignName() const { return m_foreignName; }
     void foreignName(const std::string& name) { m_foreignName = name; }

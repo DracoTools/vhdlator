@@ -1002,6 +1002,8 @@ class AstVhdlExternalName final : public AstNodeVhdlExpr {
     int m_upLevels = 0;  // Count of leading "^." in a relative pathname
     bool m_absolute = false;  // Pathname began with "."
     bool m_package = false;  // Pathname began with "@"
+    // What elaboration finds wrong with the object it denotes, or empty (8.7)
+    std::string m_elabError;
 
 public:
     AstVhdlExternalName(FileLine* fl, const std::string& objClass, AstVhdlSubtypeInd* subtypep)
@@ -1022,6 +1024,8 @@ public:
     void absolute(bool flag) { m_absolute = flag; }
     bool package() const { return m_package; }
     void package(bool flag) { m_package = flag; }
+    const std::string& elabError() const { return m_elabError; }
+    void elabError(const std::string& text) { m_elabError = text; }
 };
 
 class AstVhdlLiteral final : public AstNodeVhdlExpr {

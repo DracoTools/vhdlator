@@ -1663,7 +1663,11 @@ class VhdlSemVisitor final : public VNVisitor {
         // In a copy made for one call site the bounds are that call's, not
         // something the design wrote (4.2.2.1)
         if (m_inSpecialized) return;
-        if (rangep && notLocallyStatic(rangep)) return;
+        if (rangep && notLocallyStatic(rangep)) {
+            // Left to elaboration, which checks it once the bounds are numbers (NVC issue1394)
+            if (typep && basep && typep != basep) const_cast<VhdlType*>(typep)->narrows(basep);
+            return;
+        }
         if (!typep || !basep || !typep->bounded() || !basep->bounded()) return;
         if (typep->isNull()) return;  // A null range names no value at all
         if (basep->base()->kind() == VhdlTypeKind::FLOATING) {
@@ -1675,6 +1679,214 @@ class VhdlSemVisitor final : public VNVisitor {
         }
         err(flp, "Range " + rangeText(typep) + " is outside the range of " + basep->prettyName()
                      + ", which is " + rangeText(basep));
+    }
+
+    // The object a pathname denotes, followed through labelled blocks and entity instances:
+    // from the root entity's architecture for an absolute pathname, and otherwise from the
+    // innermost architecture or block the name is written in; null where it cannot be followed
+    // here, which leaves it to the back end (8.7). Asked once every unit is analyzed.
+    struct ExtRegion final {
+        const AstNode* nodep;  // An architecture or a block
+        std::string entKey;  // "lib.entity" whose ports and generics an architecture sees
+    };
+    ExtRegion archRegion(const std::string& entKey, const std::string& archName) {
+        // Keyed as the units were written, and an identifier is not case sensitive
+        const auto find = [](const std::map<std::string, AstVhdlArchitecture*>& map,
+                             const std::string& key) -> AstVhdlArchitecture* {
+            const auto it = map.find(key);
+            if (it != map.end()) return it->second;
+            for (const auto& pair : map) {
+                if (lower(pair.first) == key) return pair.second;
+            }
+            return nullptr;
+        };
+        AstVhdlArchitecture* const archp
+            = archName.empty() ? find(m_archUnits, entKey)
+                               : find(m_archByKey, entKey + "(" + lower(archName) + ")");
+        std::string scopeKey = entKey;
+        for (const auto& pair : m_unitScopes) {
+            if (lower(pair.first) == entKey) scopeKey = pair.first;
+        }
+        return ExtRegion{archp, scopeKey};
+    }
+    const VhdlSymbol* externalTarget(const AstVhdlExternalName* p) {
+        std::vector<std::string> names;
+        for (const AstNode* pp = p->pathp(); pp; pp = pp->nextp()) {
+            const AstVhdlName* const np = VN_CAST(pp, VhdlName);
+            if (!np) return nullptr;
+            names.push_back(lower(np->name()));
+        }
+        if (names.empty()) return nullptr;
+        std::string libname = "work";
+        for (const AstNode* up = p->backp(); up; up = up->backp()) {
+            if (const AstNodeVhdlUnit* const unitp = VN_CAST(up, NodeVhdlUnit)) {
+                if (!unitp->libname().empty()) libname = lower(unitp->libname());
+                break;
+            }
+        }
+        if (p->absolute()) {
+            // ".top.inst.obj": the first name is the root of the design (8.7)
+            const ExtRegion rootp = archRegion(libname + "." + names[0], "");
+            if (!rootp.nodep || names.size() < 2) return nullptr;
+            return externalTargetFrom(rootp, names, 1, libname);
+        }
+        // The regions the name is written in, innermost first: the path is followed from the
+        // first of them it starts in, since a process may sit in a block of its own here
+        std::vector<ExtRegion> regionps;
+        std::string entKey;
+        for (const AstNode* up = p->backp(); up; up = up->backp()) {
+            if (const AstVhdlArchitecture* const archp = VN_CAST(up, VhdlArchitecture)) {
+                std::vector<std::string> parts;
+                if (archp->entityNamep() && flatten(archp->entityNamep(), parts)
+                    && !parts.empty()) {
+                    entKey = libname + "." + lower(parts.back());
+                }
+            }
+            if (VN_IS(up, VhdlBlock) || VN_IS(up, VhdlArchitecture)) {
+                regionps.push_back(ExtRegion{up, ""});
+            }
+            if (VN_IS(up, VhdlGenerate)) return nullptr;
+            if (VN_IS(up, NodeVhdlUnit)) break;
+        }
+        if (!regionps.empty()) regionps.back().entKey = entKey;
+        for (const ExtRegion& startp : regionps) {
+            if (const VhdlSymbol* const symp = externalTargetFrom(startp, names, 0, libname)) {
+                return symp;
+            }
+        }
+        return nullptr;
+    }
+    const VhdlSymbol* externalTargetFrom(ExtRegion region, const std::vector<std::string>& names,
+                                         size_t first, const std::string& libname) {
+        const auto declsOf = [](const AstNode* rp) -> const AstNode* {
+            if (const AstVhdlBlock* const bp = VN_CAST(rp, VhdlBlock)) return bp->declsp();
+            return VN_AS(rp, VhdlArchitecture)->declsp();
+        };
+        const auto stmtsOf = [](const AstNode* rp) -> const AstNode* {
+            if (const AstVhdlBlock* const bp = VN_CAST(rp, VhdlBlock)) return bp->stmtsp();
+            return VN_AS(rp, VhdlArchitecture)->stmtsp();
+        };
+        for (size_t i = first; region.nodep && i < names.size(); ++i) {
+            if (i + 1 == names.size()) {
+                for (const AstNode* dp = declsOf(region.nodep); dp; dp = dp->nextp()) {
+                    const AstVhdlObjectDecl* const odp = VN_CAST(dp, VhdlObjectDecl);
+                    if (odp && lower(odp->name()) == names[i] && odp->vhdlSymp()) {
+                        return odp->vhdlSymp();
+                    }
+                }
+                // A port or a generic of the entity the architecture belongs to
+                if (!region.entKey.empty() && VN_IS(region.nodep, VhdlArchitecture)) {
+                    const auto it = m_unitScopes.find(region.entKey);
+                    if (it != m_unitScopes.end()) {
+                        std::vector<VhdlSymbol*> found;
+                        it->second->lookupLocal(names[i], found);
+                        for (VhdlSymbol* const symp : found) {
+                            if (symp->resolved()->isObject()) return symp->resolved();
+                        }
+                    }
+                }
+                return nullptr;
+            }
+            ExtRegion next{nullptr, ""};
+            for (const AstNode* sp = stmtsOf(region.nodep); sp; sp = sp->nextp()) {
+                const AstNodeVhdlStmt* const stp = VN_CAST(sp, NodeVhdlStmt);
+                if (!stp || lower(stp->label()) != names[i]) continue;
+                if (VN_IS(sp, VhdlBlock)) {
+                    next = ExtRegion{sp, ""};
+                    break;
+                }
+                const AstVhdlInstance* const instp = VN_CAST(sp, VhdlInstance);
+                if (!instp || instp->kind() != "entity") return nullptr;
+                // "entity work.c(sim)" is held as a call of the entity's name
+                const AstNodeVhdlExpr* unitNamep = instp->unitp();
+                std::string archName = instp->archName();
+                if (const AstVhdlCall* const callp = VN_CAST(unitNamep, VhdlCall)) {
+                    unitNamep = callp->prefixp();
+                    const AstNode* argp = callp->argsp();
+                    if (const AstVhdlAssoc* const asp = VN_CAST(argp, VhdlAssoc)) {
+                        argp = asp->actualp();
+                    }
+                    const AstVhdlName* const archNamep = VN_CAST(argp, VhdlName);
+                    if (archName.empty() && archNamep) archName = archNamep->name();
+                }
+                std::vector<std::string> parts;
+                if (!flatten(unitNamep, parts) || parts.empty()) return nullptr;
+                const std::string lib
+                    = parts.size() > 1 && lower(parts[0]) != "work" ? lower(parts[0]) : libname;
+                next = archRegion(lib + "." + lower(parts.back()), archName);
+                break;
+            }
+            region = next;
+        }
+        return nullptr;
+    }
+
+public:
+    // Every external name of these units checked against the object it denotes
+    void checkExternalNames(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            unitp->foreach([&](AstVhdlExternalName* extp) {
+                if (extp->package()) return;
+                if (const VhdlSymbol* const tgtp = externalTarget(extp)) {
+                    // An alias of it may leave the name itself untyped; its subtype says
+                    const VhdlType* typep = extp->vhdlTypep();
+                    if (!typep && extp->subtypep()) typep = extp->subtypep()->vhdlTypep();
+                    extp->elabError(externalMismatch(extp, typep, tgtp));
+                }
+            });
+        }
+    }
+
+private:
+    // Whether two types are of other kinds, or enumerations of other literals
+    static bool typesDifferInShape(const VhdlType* ap, const VhdlType* bp) {
+        if (ap->kind() != bp->kind()) return true;
+        if (ap->kind() == VhdlTypeKind::ENUM) {
+            if (ap->literals().size() != bp->literals().size()) return true;
+            for (size_t i = 0; i < ap->literals().size(); ++i) {
+                if (ap->literals()[i]->name() != bp->literals()[i]->name()) return true;
+            }
+        }
+        return false;
+    }
+    // What elaboration says of an external name and the object it denotes, or empty
+    static std::string externalMismatch(const AstVhdlExternalName* p, const VhdlType* typep,
+                                        const VhdlSymbol* tgtp) {
+        const std::string cls = p->objClass();
+        const VhdlSymKind kind = tgtp->kind();
+        const bool classOk
+            = cls == "signal" ? kind == VhdlSymKind::SIGNAL || kind == VhdlSymKind::PORT
+              : cls == "variable"
+                  ? kind == VhdlSymKind::VARIABLE || kind == VhdlSymKind::SHARED_VARIABLE
+                  : kind == VhdlSymKind::CONSTANT || kind == VhdlSymKind::GENERIC;
+        if (!classOk) return "The class of object '" + tgtp->name() + "' is not " + cls;
+        const VhdlType* const ttypep = tgtp->typep();
+        if (!typep || !ttypep || typep->isError() || ttypep->isError()) return "";
+        // Two types declared apart are two types, but nvc alone refuses one where the other is
+        // of the same shape -- two enumerations of the same literals (NVC issue907) -- and GHDL
+        // and Questa run on; a type of another kind is refused by nvc and Questa (NVC ename9)
+        if (typep->base() != ttypep->base() && typesDifferInShape(typep->base(), ttypep->base())) {
+            return "The type of " + cls + " '" + tgtp->name() + "' is not " + typep->prettyName();
+        }
+        if (typep->base() != ttypep->base()) return "";
+        if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->isConstrainedArray()
+            || typep->indexTypes().size() != 1 || !typep->indexTypes()[0]
+            || !typep->indexTypes()[0]->bounded()) {
+            return "";
+        }
+        const int64_t want = std::max<int64_t>(typep->indexTypes()[0]->length(), 0);
+        int64_t have = -1;
+        if (ttypep->isConstrainedArray() && ttypep->indexTypes().size() == 1
+            && ttypep->indexTypes()[0] && ttypep->indexTypes()[0]->bounded()) {
+            have = std::max<int64_t>(ttypep->indexTypes()[0]->length(), 0);
+        } else if (tgtp->value().isStr()) {
+            have = static_cast<int64_t>(tgtp->value().toStr().size());
+        } else if (tgtp->value().isArray()) {
+            have = static_cast<int64_t>(tgtp->value().elements());
+        }
+        if (have < 0 || have == want) return "";
+        return "Object '" + tgtp->name() + "' has length " + std::to_string(have)
+               + ", where the external name's subtype has length " + std::to_string(want);
     }
 
     // Build the type a type definition describes (clause 5)
@@ -8424,6 +8636,8 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             where[symp]->v3warn(MULTIDRIVEN,
                                 "Signal '" + symp->name() + "' has " + std::to_string(pair.second)
                                     + " drivers, but its subtype names no resolution function");
+            // The model stops when it starts, as elaboration would (NVC driver9)
+            symp->unresolvedSources(true);
             continue;
         }
         symp->resolverp(resolvep);
@@ -8582,6 +8796,11 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     V3VhdlStd::build();
     VhdlSemVisitor visitor;
     visitor.analyzeUnits(unitsp);
+    // The object an external name denotes has the class it says, its base type, and as long a
+    // value as a constrained subtype says, or elaboration fails (8.7), where nvc, GHDL and
+    // Questa stop (NVC ename5, ename9, ename10, issue907). Found once every unit the name may
+    // reach is analyzed; the model stops when it starts.
+    visitor.checkExternalNames(unitsp);
     VhdlScope::hide2008(false);
     visitor.checkBodiesGiven(unitsp);
     // Give every call to an unconstrained subprogram a copy with the lengths
@@ -14118,6 +14337,7 @@ VhdlType* VhdlSemVisitor::analyzeExpr(AstNodeVhdlExpr* nodep, VhdlType* wantp) {
         resultp = wantp ? wantp : V3VhdlStd::errorType();
     } else if (AstVhdlExternalName* const p = VN_CAST(nodep, VhdlExternalName)) {
         resultp = resolveSubtype(p->subtypep());
+
         // "<< signal @work.my_pkg.sig : natural >>" names an object a
         // package declares (8.7): the library, the package, and the object
         // in it, found here where the packages are known
