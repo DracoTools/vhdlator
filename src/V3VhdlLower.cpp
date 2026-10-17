@@ -12687,8 +12687,14 @@ private:
         return rangep;
     }
     // An alias of an external name whose subtype leaves a vector's bounds
-    // open: the object it denotes has them, elaborated already (8.7)
+    // open, or such an external name itself: the object it denotes has them,
+    // elaborated already (8.7)
     static bool openExternalAlias(const AstNodeVhdlExpr* nodep) {
+        if (VN_IS(nodep, VhdlExternalName)) {
+            const VhdlType* const typep = nodep->vhdlTypep();
+            return typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                   && !typep->lengthEmittable() && typep->dimensions() == 1;
+        }
         if (!VN_IS(nodep, VhdlName)) return false;
         const VhdlSymbol* const symp = nodep->vhdlSymp();
         if (!symp || symp->kind() != VhdlSymKind::ALIAS) return false;
@@ -12758,6 +12764,18 @@ private:
             prefixp = elemp->prefixp();
         }
         if (nodep->argp()) return nullptr;  // "x'length(n)" counts the other way
+        // "<< signal s : std_logic_vector >>'length" itself
+        if (VN_IS(prefixp, VhdlExternalName)) {
+            const VhdlType* const typep = prefixp->vhdlTypep();
+            if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY
+                || typep->lengthEmittable()) {
+                return nullptr;
+            }
+            AstNodeExpr* const objp = lowerExpr(prefixp);
+            if (!objp) return nullptr;
+            return new AstAttrOf{flp, VAttrType::DIM_SIZE, objp,
+                                 new AstConst{flp, AstConst::Signed32{}, dim}};
+        }
         const AstVhdlName* const namep = VN_CAST(prefixp, VhdlName);
         const VhdlSymbol* const symp = namep ? namep->vhdlSymp() : nullptr;
         if (!symp || symp->kind() != VhdlSymKind::ALIAS) return nullptr;

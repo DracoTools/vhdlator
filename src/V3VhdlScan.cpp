@@ -391,6 +391,7 @@ bool V3VhdlScan::tickIsAttribute() const {
     case VhdlTokType::CHARACTER_LIT:
     case VhdlTokType::STRING_LIT:
     case VhdlTokType::KWD_ALL: return true;  // e.g. accessValue.all'length
+    case VhdlTokType::GTGT: return true;  // The end of an external name: << signal s : t >>'length
     case VhdlTokType::KWD_RANGE:
     case VhdlTokType::KWD_SUBTYPE:
         // These are attribute names only when they followed a tick, as in
