@@ -39390,6 +39390,9 @@ private:
             if (!nameableRead(varp)) return;
             if (variables.count(varp) && !signals.count(varp)) return;
             if (scratch.count(varp)) return;
+            // Nor the table of the modes files were opened with, which is the run's own
+            // bookkeeping and no signal ("process (all)" writing a line; GHDL gna issue2561)
+            if (varp == m_fileModesp) return;
             // In a subprogram's body, its own variables and formals are not
             // what the process waits on
             if (signalsOnly && !signals.count(varp)) return;
