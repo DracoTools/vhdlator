@@ -30092,6 +30092,17 @@ private:
     // The statements one waveform becomes: each element assigned at its own
     // time, in the order written (10.5.2.2). Adds what it reads to readsp,
     // which is what the process is sensitive to.
+    // An element of a waveform a concurrent statement schedules, checked against its target's
+    // subtype as the process the statement is runs: "i <= i + 1 after 10 ns" with i of a type
+    // "range 0 to 100" stops at 101 (10.5.2.1; NVC bounds11). What the process waits on is
+    // the value as written, read before the check.
+    AstNodeExpr* waveRangeChecked(AstNodeExpr* valuep, AstNodeVhdlExpr* targetp,
+                                  AstVhdlWaveform* wfp, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck() || m_inStmts) return valuep;
+        VL_RESTORER(m_inStmts);
+        m_inStmts = true;
+        return rangeChecked(valuep, targetp->vhdlTypep(), wfp->valuep(), flp);
+    }
     AstNode* waveformStmts(AstNodeVhdlExpr* targetp, AstVhdlWaveform* wavesp, AstNodeExpr*& readsp,
                            FileLine* flp, VhdlDelayKind kind = VhdlDelayKind::NONE) {
         AstNode* stmtsp = nullptr;
@@ -30123,10 +30134,11 @@ private:
             }
             AstTask* const wtaskp = drvp ? nullptr : waveTaskFor(targetp, flp);
             if (wtaskp) {
-                AstNodeExpr* const valuep = lowerExpr(p->valuep());
+                AstNodeExpr* valuep = lowerExpr(p->valuep());
                 if (!valuep) return nullptr;
                 readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
                                 : valuep->cloneTree(false);
+                valuep = waveRangeChecked(valuep, targetp, p, flp);
                 AstNode* const callp
                     = waveCall(wtaskp, kind, p, p == wavesp, valuep, flp, targetp);
                 if (!callp) return nullptr;
@@ -30136,10 +30148,11 @@ private:
             if (!wtaskp) {
                 AstNodeExpr* const onep = drvp ? driverTarget(targetp, signalp, drvp->valp)
                                                : lowerDriveTarget(targetp);
-                AstNodeExpr* const valuep = lowerExpr(p->valuep());
+                AstNodeExpr* valuep = lowerExpr(p->valuep());
                 if (!onep || !valuep) return nullptr;
                 readsp = readsp ? new AstConcat{flp, readsp, valuep->cloneTree(false)}
                                 : valuep->cloneTree(false);
+                valuep = waveRangeChecked(valuep, targetp, p, flp);
                 AstNode* const delayp
                     = afterp ? new AstDelay{flp, afterp->cloneTree(false), false} : nullptr;
                 stmtsp = AstNode::addNextNull(
@@ -30557,6 +30570,18 @@ private:
                 }
             }
             return;
+        }
+        // The value is checked against the target's subtype when the process the statement
+        // is runs, as an assignment in a process is (10.5.2.1): "i <= i + 1 after 10 ns" with
+        // i of a type "range 0 to 100" stops at 101 (NVC bounds11)
+        if (v3Global.opt.vhdlBoundCheck()) {
+            VL_RESTORER(m_inStmts);
+            m_inStmts = true;
+            rhsp = rangeChecked(rhsp, nodep->targetp()->vhdlTypep(),
+                                nodep->kind() == VhdlAssignKind::SIMPLE && nodep->wavesp()
+                                    ? nodep->wavesp()->valuep()
+                                    : nullptr,
+                                flp);
         }
         if (drivenThroughDriver(rootSymOf(nodep->targetp()))) {
             VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
