@@ -16806,10 +16806,26 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
                            && osymp->typep()->indexTypes()[0]->boundsp()) {
                     // Its range is written but does not fold here; one with
                     // no range at all takes its bounds from a value settled
-                    // later, and is asked again then
-                    leftEndp = new AstVhdlAttrName{flp, onamep->cloneTree(false), "left"};
-                    rightEndp = new AstVhdlAttrName{flp, onamep->cloneTree(false), "right"};
-                    ascp = new AstVhdlAttrName{flp, onamep->cloneTree(false), "ascending"};
+                    // later, and is asked again then. A bound of an element
+                    // or of a record element is that one's: "g(g'left)" or
+                    // "g(g'left).addr" -- a generic of UVVM's Ethernet VVC
+                    // handed on to its transmitting VVC, an array of records
+                    // with a field of open length -- not the outer array's
+                    AstNodeVhdlExpr* navp = onamep->cloneTree(false);
+                    for (const std::string& step : bound.path) {
+                        if (step.empty()) {
+                            AstVhdlCall* const callp = new AstVhdlCall{flp, navp};
+                            callp->addArgsp(new AstVhdlAssoc{
+                                flp, nullptr,
+                                new AstVhdlAttrName{flp, navp->cloneTree(false), "left"}});
+                            navp = callp;
+                        } else {
+                            navp = new AstVhdlSelected{flp, navp, new AstVhdlName{flp, step}};
+                        }
+                    }
+                    leftEndp = new AstVhdlAttrName{flp, navp->cloneTree(false), "left"};
+                    rightEndp = new AstVhdlAttrName{flp, navp->cloneTree(false), "right"};
+                    ascp = new AstVhdlAttrName{flp, navp, "ascending"};
                 }
             }
             if (leftEndp) {

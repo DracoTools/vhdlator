@@ -31683,6 +31683,21 @@ private:
                 pinp = lowerAssoc(asp, ++pinNum);
             }
             if (!pinp) continue;
+            // A bound of an enumeration index handed to a generic carrying one, "G'LEFT" of the
+            // parent's generic: the generic is an integer, a position, so the position goes over
+            // and not the enumeration value it is cast back to (enumIndexBound)
+            if (const AstVhdlAttrName* const attrp = VN_CAST(asp->actualp(), VhdlAttrName)) {
+                const std::string& fname = pinp->name();
+                AstCast* const castp = VN_CAST(pinp->exprp(), Cast);
+                if (castp && attrp->vhdlTypep()
+                    && attrp->vhdlTypep()->base()->kind() == VhdlTypeKind::ENUM
+                    && (fname.compare(0, 6, "__vl__") == 0
+                        || fname.compare(0, 6, "__vr__") == 0)) {
+                    AstNodeExpr* const posp = castp->fromp()->unlinkFrBack();
+                    castp->replaceWith(posp);
+                    VL_DO_DANGLING(castp->deleteTree(), castp);
+                }
+            }
             // A generic carrying another's bounds stands ahead of it in the
             // clause but has no place in it, so a positional association is
             // given the name of the generic it actually reaches (6.5.7.1)
