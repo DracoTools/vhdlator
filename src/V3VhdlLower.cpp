@@ -32844,7 +32844,19 @@ private:
     AstNode* lowerStmtInner(AstNodeVhdlStmt* nodep) {
         FileLine* const flp = nodep->fileline();
         if (AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
-            return lowerSeqAssign(asgp, true);
+            AstNode* const outp = lowerSeqAssign(asgp, true);
+            // A postponed process that schedules a transaction for the next delta cycle is an
+            // error (14.7.5.3), where nvc and GHDL stop the run and Questa reports one
+            if (outp && m_postponed && v3Global.opt.vhdlBoundCheck() && zeroDelayWave(asgp)) {
+                AstNode* const errp = new AstDisplay{
+                    flp, VDisplayType::DT_ERROR,
+                    "A postponed process cannot cause a delta cycle: a signal assignment with no"
+                    " delay",
+                    nullptr, nullptr};
+                errp->addNext(new AstStop{flp, true});
+                return AstNode::addNext(errp, outp);
+            }
+            return outp;
         }
         if (AstVhdlVarAssign* const asgp = VN_CAST(nodep, VhdlVarAssign)) {
             return lowerVarAssign(asgp);
@@ -32983,6 +32995,17 @@ private:
         }
         unsup(flp, std::string{"statement "} + nodep->typeName());
         return nullptr;
+    }
+
+    // Whether a simple signal assignment gives a value for the next delta cycle: its first
+    // element has no "after", or one of no time
+    static bool zeroDelayWave(const AstVhdlSigAssign* nodep) {
+        if (nodep->kind() != VhdlAssignKind::SIMPLE) return false;
+        const AstVhdlWaveform* const wfp = nodep->wavesp();
+        if (!wfp || !wfp->valuep()) return false;  // "unaffected" schedules nothing
+        if (!wfp->afterp()) return true;
+        const VhdlValue val = V3VhdlEval::eval(wfp->afterp());
+        return val.isInt() && val.toInt() == 0;
     }
 
     // A signal assignment takes effect at the end of the delta cycle, which
