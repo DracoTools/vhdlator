@@ -387,6 +387,14 @@ class ParamProcessor final {
                 key += ",";
             }
             key += "}";
+        } else if (const AstConsPackUOrStruct* const structp = VN_CAST(nodep, ConsPackUOrStruct)) {
+            key += "{";
+            for (const AstConsPackMember* memberp = structp->membersp(); memberp;
+                 memberp = VN_AS(memberp->nextp(), ConsPackMember)) {
+                key += paramValueString(memberp->rhsp());
+                key += ",";
+            }
+            key += "}";
         } else if (const AstClassRefDType* const classRefp = VN_CAST(nodep, ClassRefDType)) {
             // For parameterized class types, use the original class name (without specialization
             // suffix) plus the actual type parameter values. This ensures equivalent class types
