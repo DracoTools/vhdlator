@@ -1822,6 +1822,75 @@ class VhdlSemVisitor final : public VNVisitor {
     }
 
 public:
+    // An access to an array of more than one open dimension designates what its allocators
+    // make. Nothing here carries the bounds of such an array, but where every allocator of the
+    // type makes one of a single shape that the analysis settles -- "new t_usa2_1(st_ind2,
+    // st_ind1)" and "new t_usa2_1'(c)" with c of that subtype, VESTS tc521 -- the type
+    // designates that shape, and its objects are held as values of it (bugs.md 388aw)
+    void settleAccessShapes(const std::vector<AstNodeVhdlUnit*>& unitsp) {
+        const auto opaque = [](const VhdlType* accp) {
+            if (!accp || accp->base()->kind() != VhdlTypeKind::ACCESS) return false;
+            const VhdlType* const desp = accp->base()->designatedp();
+            return desp && desp->base()->kind() == VhdlTypeKind::ARRAY
+                   && !desp->isConstrainedArray() && desp->base()->indexTypes().size() > 1;
+        };
+        const auto settled = [](const VhdlType* tp) {
+            if (!tp || !tp->isConstrainedArray()) return false;
+            for (const VhdlType* const idxp : tp->indexTypes()) {
+                if (!idxp || !idxp->bounded()) return false;
+            }
+            return true;
+        };
+        const auto sameShape = [](const VhdlType* ap, const VhdlType* bp) {
+            if (ap->indexTypes().size() != bp->indexTypes().size()) return false;
+            for (size_t i = 0; i < ap->indexTypes().size(); ++i) {
+                const VhdlType* const ai = ap->indexTypes()[i];
+                const VhdlType* const bi = bp->indexTypes()[i];
+                if (ai->left() != bi->left() || ai->right() != bi->right()
+                    || ai->ascending() != bi->ascending()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        std::map<VhdlType*, VhdlType*> shapes;  // Access base type -> the one shape, or null
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            unitp->foreach([&](AstVhdlAllocator* allocp) {
+                VhdlType* const accp = allocp->vhdlTypep();
+                if (!opaque(accp)) return;
+                VhdlType* shapep = nullptr;
+                if (allocp->subtypep()) {
+                    shapep = allocp->subtypep()->vhdlTypep();
+                } else if (AstNodeVhdlExpr* valuep = allocp->valuep()) {
+                    while (AstVhdlQualified* const qp = VN_CAST(valuep, VhdlQualified)) {
+                        valuep = qp->valuep();
+                    }
+                    shapep = valuep ? valuep->vhdlTypep() : nullptr;
+                }
+                VhdlType* const keyp = accp->base();
+                const auto it = shapes.find(keyp);
+                if (!settled(shapep) || shapep->base() != keyp->designatedp()->base()
+                    || (it != shapes.end() && (!it->second || !sameShape(it->second, shapep)))) {
+                    shapes[keyp] = nullptr;
+                    return;
+                }
+                if (it == shapes.end()) shapes[keyp] = shapep;
+            });
+        }
+        for (const auto& pair : shapes) {
+            if (pair.second) pair.first->designatedp(pair.second);
+        }
+        // What a dereference of one denotes is a value of that shape
+        for (AstNodeVhdlUnit* const unitp : unitsp) {
+            unitp->foreach([&](AstVhdlSelected* selp) {
+                if (!selp->isAll() || !selp->prefixp()) return;
+                const VhdlType* const accp = selp->prefixp()->vhdlTypep();
+                if (!accp || accp->base()->kind() != VhdlTypeKind::ACCESS) return;
+                const auto it = shapes.find(accp->base());
+                if (it != shapes.end() && it->second) selp->vhdlTypep(it->second);
+            });
+        }
+    }
     // Every external name of these units checked against the object it denotes
     void checkExternalNames(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         for (AstNodeVhdlUnit* const unitp : unitsp) {
@@ -8801,6 +8870,7 @@ bool V3VhdlSem::analyze(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // Questa stop (NVC ename5, ename9, ename10, issue907). Found once every unit the name may
     // reach is analyzed; the model stops when it starts.
     visitor.checkExternalNames(unitsp);
+    visitor.settleAccessShapes(unitsp);
     VhdlScope::hide2008(false);
     visitor.checkBodiesGiven(unitsp);
     // Give every call to an unconstrained subprogram a copy with the lengths

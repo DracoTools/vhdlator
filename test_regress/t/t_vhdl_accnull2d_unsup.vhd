@@ -6,7 +6,9 @@
 --
 
 -- The object such an access points at has nowhere here to keep its bounds,
--- so an allocator and a dereference are refused where they are written
+-- so where its allocators make objects of more than one shape, an allocator
+-- and a dereference are refused where they are written (one shape is held
+-- as that shape: t_vhdl_acc2dshape)
 entity t_vhdl_accnull2d_unsup is
 end entity;
 
@@ -19,6 +21,7 @@ begin
     begin
         a := new grid(0 to 1, 0 to 2);
         a(0, 1) := '1';
+        a := new grid(0 to 3, 0 to 3);
         wait;
     end process;
 end architecture;
