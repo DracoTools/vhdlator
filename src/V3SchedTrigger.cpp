@@ -557,6 +557,44 @@ TriggerKit::TriggerKit(const std::string& name, bool slow, uint32_t nSenseWords,
     }
 }
 
+TriggerDirtyInputs& triggerDirtyInputs() {
+    static TriggerDirtyInputs s_inputs;
+    return s_inputs;
+}
+
+// Whether a sensitivity's inputs can change without a write the netlist shows -- a method of a
+// scheduler or an event, a call, a member of a class or of an interface a virtual interface may
+// reach, a top level input, a signal written through VPI or DPI or user C++ -- so that its
+// trigger has to be computed every time
+static bool opaqueSensitivity(const AstSenItem* itemp,
+                              const std::unordered_set<const AstVar*>& cReferenced) {
+    bool opaque = false;
+    bool anyInput = false;
+    for (const AstNode* const nodep : {static_cast<const AstNode*>(itemp->sensp()),
+                                       static_cast<const AstNode*>(itemp->condp())}) {
+        if (!nodep) continue;
+        nodep->foreach([&](const AstNode* np) {
+            if (VN_IS(np, CMethodHard) || VN_IS(np, NodeCCall) || VN_IS(np, NodeFTaskRef)
+                || VN_IS(np, CExpr) || VN_IS(np, CExprUser) || VN_IS(np, MemberSel)) {
+                opaque = true;
+            } else if (const AstVarRef* const refp = VN_CAST(np, VarRef)) {
+                anyInput = true;
+                const AstVarScope* const vscp = refp->varScopep();
+                const AstVar* const varp = refp->varp();
+                if (!vscp || varp->isPrimaryInish() || varp->isSigUserRWPublic()
+                    || varp->isWrittenByDpi() || varp->isForceable() || cReferenced.count(varp)
+                    || (v3Global.hasVirtIfaces() && VN_IS(vscp->scopep()->modp(), Iface))) {
+                    opaque = true;
+                }
+            } else if (VN_IS(np, NodeVarRef)) {
+                opaque = true;
+            }
+        });
+    }
+    // A sensitivity reading nothing is a constant, which only fires if it fires every time
+    return opaque || !anyInput;
+}
+
 AstAssign* TriggerKit::createSenTrigVecAssignment(AstVarScope* const target,
                                                   std::vector<AstNodeExpr*>& trigps) {
     FileLine* const flp = target->fileline();
@@ -742,7 +780,156 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
     }
     UASSERT(trigps.size() == nSenseTriggers, "Inconsistent number of trigger expressions");
 
+    // Only the triggers whose inputs may have been written since the triggers were last computed
+    // are computed again, a word at a time; the writers flag the words (markTriggerInputWrites).
+    // An opaque trigger (opaqueSensitivity) is computed every time.
+    bool tracked = name == "act" && !slow && v3Global.opt.fTriggerDirty();
+    std::vector<bool> opaqueItem(senItemps.size(), false);
+    // Words of which every trigger is opaque, or that hold none: computed every time
+    std::vector<bool> alwaysWord(nSenseWords, true);
+    // Words holding an opaque trigger among others
+    std::vector<bool> mixedWord(nSenseWords, false);
+    // The triggers that read each variable of the computation: inputs, and the previous and
+    // current values SenExprBuilder keeps
+    std::unordered_map<const AstVarScope*, std::set<size_t>> itemsReading;
+    std::unordered_map<const AstVarScope*, std::set<uint32_t>> inputWords;
+    // The opaque triggers alone, for a word whose other triggers are not computed
+    std::vector<AstNodeExpr*> opaqueps;
+    if (tracked) {
+        std::unordered_set<const AstVar*> cReferenced;
+        netlistp->foreach([&](const AstNode* np) {
+            if (VN_IS(np, CStmt) || VN_IS(np, CStmtUser) || VN_IS(np, CExpr)
+                || VN_IS(np, CExprUser)) {
+                np->foreach([&](const AstVarRef* refp) { cReferenced.insert(refp->varp()); });
+            }
+        });
+        std::vector<bool> anyPlain(nSenseWords, false);
+        std::vector<bool> anyOpaque(nSenseWords, false);
+        for (size_t i = 0; i < senItemps.size(); ++i) {
+            const uint32_t word = static_cast<uint32_t>(i / WORD_SIZE);
+            const AstSenItem* const itemp = senItemps[i];
+            if (!itemp) continue;
+            opaqueItem[i] = opaqueSensitivity(itemp, cReferenced);
+            (opaqueItem[i] ? anyOpaque : anyPlain)[word] = true;
+            if (!opaqueItem[i]) {
+                for (const AstNode* const nodep : {static_cast<const AstNode*>(itemp->sensp()),
+                                                   static_cast<const AstNode*>(itemp->condp())}) {
+                    if (!nodep) continue;
+                    nodep->foreach([&](const AstVarRef* refp) {
+                        inputWords[refp->varScopep()].insert(word);
+                    });
+                }
+            }
+            trigps[i]->foreach(
+                [&](const AstVarRef* refp) { itemsReading[refp->varScopep()].insert(i); });
+        }
+        for (uint32_t w = 0; w < nSenseWords; ++w) {
+            alwaysWord[w] = !anyPlain[w];
+            mixedWord[w] = anyPlain[w] && anyOpaque[w];
+        }
+        // Nothing to track where every word is computed every time
+        if (std::all_of(alwaysWord.begin(), alwaysWord.end(), [](bool b) { return b; })) {
+            tracked = false;
+        }
+        for (size_t i = 0; tracked && i < trigps.size(); ++i) {
+            opaqueps.push_back(i < opaqueItem.size() && opaqueItem[i]
+                                   ? trigps[i]->cloneTree(false)
+                                   : new AstConst{flp, AstConst::BitFalse{}});
+        }
+    }
+
     AstAssign* const trigStmtsp = createSenTrigVecAssignment(kit.m_vscp, trigps);
+    AstNode* trigWordsp = trigStmtsp;
+
+    // The flag of a word, and whether any word of a set is flagged
+    const auto dirtyOf = [&](uint32_t word) -> AstNodeExpr* {
+        return new AstArraySel{flp, rd(kit.m_dirtyVscp), static_cast<int>(word)};
+    };
+    // An update of a previous or current value, run only if a trigger reading it is computed
+    const auto guardUpdate = [&](AstNodeStmt* stmtp) -> AstNodeStmt* {
+        if (!kit.m_dirtyVscp) return stmtp;
+        std::set<uint32_t> words;
+        bool always = false;
+        stmtp->foreach([&](const AstVarRef* refp) {
+            if (!refp->access().isWriteOrRW()) return;
+            const auto it = itemsReading.find(refp->varScopep());
+            if (it == itemsReading.end()) {
+                always = true;
+                return;
+            }
+            for (const size_t i : it->second) {
+                if (opaqueItem[i]) always = true;
+                words.insert(static_cast<uint32_t>(i / WORD_SIZE));
+            }
+        });
+        if (always || words.empty()) return stmtp;
+        AstNodeExpr* condp = nullptr;
+        for (const uint32_t word : words) {
+            condp = condp ? new AstOr{flp, condp, dirtyOf(word)} : dirtyOf(word);
+        }
+        return new AstIf{flp, condp, stmtp};
+    };
+    if (tracked) {
+        AstNodeDType* const flagDTypep = new AstBasicDType{flp, VFlagBitPacked{}, 1};
+        netlistp->typeTablep()->addTypesp(flagDTypep);
+        AstUnpackArrayDType* const dirtyDTypep = new AstUnpackArrayDType{
+            flp, flagDTypep, new AstRange{flp, static_cast<int>(nSenseWords) - 1, 0}};
+        netlistp->typeTablep()->addTypesp(dirtyDTypep);
+        AstScope* const topScopep = netlistp->topScopep()->scopep();
+        kit.m_dirtyVscp = topScopep->createTemp("__V" + name + "Dirty", dirtyDTypep);
+        kit.m_dirtyVscp->varp()->isInternal(true);
+        kit.m_dirtyVscp->varp()->noReset(true);
+        // Every word is computed the first time
+        AstCMethodHard* const setp
+            = new AstCMethodHard{flp, wr(kit.m_dirtyVscp), VCMethod::UNPACKED_FILL,
+                                 new AstConst{flp, AstConst::WidthedValue{}, 1, 1}};
+        setp->dtypeSetVoid();
+        initFuncp->addStmtsp(setp->makeStmt());
+        // The words of the opaque triggers alone
+        AstAssign* const opaqueStmtsp = createSenTrigVecAssignment(kit.m_vscp, opaqueps);
+        const auto split = [&](AstAssign* headp) {
+            std::vector<AstAssign*> asgnps;
+            for (AstAssign* asgnp = headp; asgnp; asgnp = VN_AS(asgnp->nextp(), Assign)) {
+                asgnps.push_back(asgnp);
+            }
+            for (size_t i = asgnps.size(); i-- > 1;) asgnps[i]->unlinkFrBack();
+            UASSERT(asgnps.size() == nSenseWords, "One assignment per sense word expected");
+            return asgnps;
+        };
+        const std::vector<AstAssign*> allps = split(trigStmtsp);
+        const std::vector<AstAssign*> onlyOpaqueps = split(opaqueStmtsp);
+        // A word not flagged has no trigger but the opaque ones that could have fired
+        trigWordsp = nullptr;
+        for (uint32_t word = 0; word < nSenseWords; ++word) {
+            AstNode* stmtp = allps[word];
+            if (alwaysWord[word]) {
+                VL_DO_DANGLING(onlyOpaqueps[word]->deleteTree(), onlyOpaqueps[word]);
+            } else if (mixedWord[word]) {
+                stmtp = new AstIf{flp, dirtyOf(word), allps[word], onlyOpaqueps[word]};
+            } else {
+                VL_DO_DANGLING(onlyOpaqueps[word]->deleteTree(), onlyOpaqueps[word]);
+                AstAssign* const zerop = new AstAssign{
+                    flp, new AstArraySel{flp, wr(kit.m_vscp), static_cast<int>(word)},
+                    new AstConst{flp, AstConst::WidthedValue{}, static_cast<int>(WORD_SIZE), 0}};
+                stmtp = new AstIf{flp, dirtyOf(word), allps[word], zerop};
+            }
+            trigWordsp = AstNode::addNext(trigWordsp, stmtp);
+        }
+        // What each input flags
+        TriggerDirtyInputs& inputs = triggerDirtyInputs();
+        inputs.m_dirtyVscp = kit.m_dirtyVscp;
+        inputs.m_words.clear();
+        for (const auto& pair : inputWords) {
+            std::vector<uint32_t>& words = inputs.m_words[pair.first];
+            for (const uint32_t w : pair.second) {
+                if (!alwaysWord[w]) words.push_back(w);
+            }
+        }
+        size_t nTracked = 0;
+        for (size_t w = 0; w < nSenseWords; ++w) nTracked += !alwaysWord[w];
+        V3Stats::addStat("Scheduling, '" + name + "' trigger words computed when written",
+                         nTracked);
+    }
 
     // Add a print for each of the extra triggers
     for (unsigned i = 0; i < extraTriggers.size(); ++i) {
@@ -789,9 +976,21 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
             fp->addStmtsp(AstCStmt::profExecSectionPush(flp, "trigBase " + name));
         }
         // Trigger computation
-        for (AstNodeStmt* const nodep : senResults.m_preUpdates) fp->addStmtsp(nodep);
-        fp->addStmtsp(trigStmtsp);
-        for (AstNodeStmt* const nodep : senResults.m_postUpdates) fp->addStmtsp(nodep);
+        for (AstNodeStmt* const nodep : senResults.m_preUpdates) {
+            fp->addStmtsp(guardUpdate(nodep));
+        }
+        fp->addStmtsp(trigWordsp);
+        for (AstNodeStmt* const nodep : senResults.m_postUpdates) {
+            fp->addStmtsp(guardUpdate(nodep));
+        }
+        // Computed: the flags stay clear until an input is written again
+        if (kit.m_dirtyVscp) {
+            AstCMethodHard* const clearp
+                = new AstCMethodHard{flp, wr(kit.m_dirtyVscp), VCMethod::UNPACKED_FILL,
+                                     new AstConst{flp, AstConst::WidthedValue{}, 1, 0}};
+            clearp->dtypeSetVoid();
+            fp->addStmtsp(clearp->makeStmt());
+        }
         // Add the initialization time triggers
         if (initialTrigsp) {
             AstVarScope* const initVscp = scopep->createTemp("__V" + name + "DidInit", 1);

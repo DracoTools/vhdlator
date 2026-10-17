@@ -504,6 +504,10 @@ static void process() {
             V3Const::constifyAll(v3Global.rootp());
             V3Dead::deadifyAllScoped(v3Global.rootp());
 
+            // Flag the trigger words of what each function writes (writes stay in their CFuncs
+            // from here on, as for tracing below)
+            V3Sched::markTriggerInputWrites(v3Global.rootp());
+
             // Create tracing logic, since we ripped out some signals the user might want to trace
             // Note past this point, we presume traced variables won't move between CFuncs
             // (It's OK if untraced temporaries move around, or vars

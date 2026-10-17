@@ -1540,6 +1540,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
     DECL_OPTION("-finline-funcs-eager", FOnOff, &m_fInlineFuncsEager);
     DECL_OPTION("-flife", FOnOff, &m_fLife);
     DECL_OPTION("-flife-post", FOnOff, &m_fLifePost);
+    DECL_OPTION("-ftrigger-dirty", FOnOff, &m_fTriggerDirty);
     DECL_OPTION("-flift-expr", FOnOff, &m_fLiftExpr);
     DECL_OPTION("-flocalize", FOnOff, &m_fLocalize);
     DECL_OPTION("-fmerge-cond", FOnOff, &m_fMergeCond);
@@ -2457,6 +2458,7 @@ void V3Options::optimize(int level) {
     m_fSubst = flag;
     m_fSubstConst = flag;
     m_fTable = flag;
+    m_fTriggerDirty = flag;
     m_fVarSplit = flag;
     // And set specific optimization levels
     if (level >= 3) {

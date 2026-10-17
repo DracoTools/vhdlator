@@ -1291,4 +1291,55 @@ void schedule(AstNetlist* netlistp) {
     V3Global::dumpCheckGlobalTree("sched", 0, dumpTreeEitherLevel() >= 3);
 }
 
+//============================================================================
+// Flag the 'act' trigger words of the inputs each function writes
+
+void markTriggerInputWrites(AstNetlist* netlistp) {
+    TriggerDirtyInputs& inputs = triggerDirtyInputs();
+    AstVarScope* const dirtyVscp = inputs.m_dirtyVscp;
+    if (!dirtyVscp) return;
+    // The flags are clear only once the triggers are computed, so a function may flag its words
+    // when it starts, whichever of its writes it then makes. A coroutine flags them again each
+    // time it is resumed.
+    std::vector<AstCFunc*> funcps;
+    netlistp->foreach([&](AstCFunc* funcp) { funcps.push_back(funcp); });
+    FileLine* const flp = netlistp->fileline();
+    for (AstCFunc* const funcp : funcps) {
+        std::set<uint32_t> words;
+        funcp->foreach([&](const AstVarRef* refp) {
+            if (!refp->access().isWriteOrRW()) return;
+            const auto it = inputs.m_words.find(refp->varScopep());
+            if (it != inputs.m_words.end()) words.insert(it->second.begin(), it->second.end());
+        });
+        if (words.empty()) continue;
+        const auto settersp = [&]() {
+            AstNode* stmtsp = nullptr;
+            for (const uint32_t word : words) {
+                AstNodeExpr* const lhsp = new AstArraySel{
+                    flp, new AstVarRef{flp, dirtyVscp, VAccess::WRITE}, static_cast<int>(word)};
+                stmtsp = AstNode::addNext(
+                    stmtsp, new AstAssign{flp, lhsp, new AstConst{flp, AstConst::BitTrue{}}});
+            }
+            return stmtsp;
+        };
+        if (funcp->isCoroutine() && funcp->stmtsp()) {
+            std::vector<AstCAwait*> awaitps;
+            funcp->stmtsp()->foreachAndNext([&](AstCAwait* awaitp) { awaitps.push_back(awaitp); });
+            for (AstCAwait* const awaitp : awaitps) {
+                // After the statement the await is part of, which the process resumes into
+                AstNode* stmtp = awaitp;
+                while (stmtp->backp() && !VN_IS(stmtp, NodeStmt)) stmtp = stmtp->backp();
+                stmtp->addNextHere(settersp());
+            }
+        }
+        if (AstNode* const firstp = funcp->stmtsp()) {
+            firstp->addHereThisAsNext(settersp());
+        } else {
+            funcp->addStmtsp(settersp());
+        }
+    }
+    inputs.m_dirtyVscp = nullptr;
+    inputs.m_words.clear();
+}
+
 }  // namespace V3Sched

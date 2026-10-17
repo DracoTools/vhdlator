@@ -829,6 +829,12 @@ Summary:
 
 .. option:: -fno-table
 
+.. option:: -fno-trigger-dirty
+
+   Rarely needed. Compute every 'act' region trigger on each pass of the
+   scheduling loop, rather than only those whose inputs were written since
+   the triggers were last computed.
+
    Rarely needed. Disables one of the internal optimization steps. These
    are typically used only when recommended by a maintainer to help debug
    or work around an issue.

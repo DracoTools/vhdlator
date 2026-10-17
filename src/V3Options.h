@@ -438,6 +438,7 @@ private:
     bool m_fSubst;       // main switch: -fno-subst: substitute expression temp values
     bool m_fSubstConst;  // main switch: -fno-subst-const: final constant substitution
     bool m_fTable;       // main switch: -fno-table: lookup table creation
+    bool m_fTriggerDirty;  // main switch: -fno-trigger-dirty: compute the triggers written to
     bool m_fTaskifyAll = false;  // main switch: --ftaskify-all-forked
     bool m_fVarSplit;    // main switch: -fno-var-split: automatic variable splitting
     // clang-format on
@@ -799,6 +800,7 @@ public:
     bool fSubst() const { return m_fSubst; }
     bool fSubstConst() const { return m_fSubstConst; }
     bool fTable() const { return m_fTable; }
+    bool fTriggerDirty() const { return m_fTriggerDirty; }
     bool fTaskifyAll() const { return m_fTaskifyAll; }
     bool fVarSplit() const { return m_fVarSplit; }
 

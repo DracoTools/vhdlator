@@ -13,7 +13,9 @@ test.scenarios('vlt_all')
 
 test.compile(verilator_flags2=["--binary", "--stats", test.top_filename.replace(".v", ".cpp")])
 
-test.file_grep(test.stats, r'Optimizations, MergeCond merges\s+(\d+)', 4)
+# One of them the 'act' trigger word computed when its inputs were written, with the
+# update of the previous value it compares with
+test.file_grep(test.stats, r'Optimizations, MergeCond merges\s+(\d+)', 5)
 
 test.execute(expect_filename=test.golden_filename)
 

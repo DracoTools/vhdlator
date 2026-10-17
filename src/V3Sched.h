@@ -256,6 +256,8 @@ private:
     // It is used to accumulate triggers that were found fired and cleared in beforeTrigger's
     // in current 'act' region iteration
     AstVarScope* m_vscAccp = nullptr;
+    // The flags of the sense words whose inputs were written since the last computation
+    AstVarScope* m_dirtyVscp = nullptr;
     // The AstCFunc that computes the current active base triggers
     AstCFunc* m_compVecp = nullptr;
     // The AstCFunc that computes the current active extended triggers
@@ -338,6 +340,8 @@ public:
         return m_senItem2TrigIdx;
     }
     AstCFunc* compBasep() const { return m_compVecp; }
+    // The flags of the sense words to compute again, if tracked (see markTriggerInputWrites)
+    AstVarScope* dirtyVscp() const { return m_dirtyVscp; }
     AstCFunc* compExtp() const { return m_compExtp; }
     const std::string& name() const { return m_name; }
     const std::unordered_map<const AstSenTree*, AstSenTree*>& mapPre() const { return m_mapPre; }
@@ -440,6 +444,19 @@ void transformForks(AstNetlist* const netlistp) VL_MT_DISABLED;
 
 // Top level entry point to scheduling
 void schedule(AstNetlist*) VL_MT_DISABLED;
+
+// The 'act' trigger words computed only when an input of theirs was written: the flags, and for
+// each input the words to flag when it is written. Recorded by TriggerKit::create, used by
+// markTriggerInputWrites.
+struct TriggerDirtyInputs final {
+    AstVarScope* m_dirtyVscp = nullptr;
+    std::unordered_map<const AstVarScope*, std::vector<uint32_t>> m_words;
+};
+TriggerDirtyInputs& triggerDirtyInputs() VL_MT_DISABLED;
+
+// Flag the trigger words of the inputs each function writes, once it is known which function
+// writes what (after V3LifePost), as V3Trace does for its activity flags
+void markTriggerInputWrites(AstNetlist* netlistp) VL_MT_DISABLED;
 
 // Sub-steps
 LogicByScope breakCycles(AstNetlist* netlistp,
