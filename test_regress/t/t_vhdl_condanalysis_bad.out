@@ -1,10 +1,18 @@
-%Error: t/t_vhdl_condanalysis_bad.vhd:15:1: Conditional analysis expression: 'NOT_DEFINED' is no conditional analysis identifier
+%Error: t/t_vhdl_condanalysis_bad.vhd:16:1: Conditional analysis expression: 'NOT_DEFINED' is no conditional analysis identifier
         ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
-%Error: t/t_vhdl_condanalysis_bad.vhd:17:1: Conditional analysis directive '`else' has no '`if'
-%Error: t/t_vhdl_condanalysis_bad.vhd:19:1: Conditional analysis: reached
-%Warning-USERWARN: t/t_vhdl_condanalysis_bad.vhd:23:1: Conditional analysis: a warning
+%Error: t/t_vhdl_condanalysis_bad.vhd:18:1: Conditional analysis directive '`else' has no '`if'
+%Error: t/t_vhdl_condanalysis_bad.vhd:19:1: Conditional analysis directive '`elsif' has no '`if'
+%Error: t/t_vhdl_condanalysis_bad.vhd:20:1: Conditional analysis directive '`end' has no '`if'
+%Error: t/t_vhdl_condanalysis_bad.vhd:22:1: Conditional analysis: reached
+%Warning-USERWARN: t/t_vhdl_condanalysis_bad.vhd:26:1: Conditional analysis: a warning
                    ... For warning description see https://verilator.org/warn/USERWARN?v=latest
                    ... Use "/* verilator lint_off USERWARN */" and lint_on around source to disable this message.
-%Error: t/t_vhdl_condanalysis_bad.vhd:24:1: Conditional analysis expression: expected 'then'
-%Error: t/t_vhdl_condanalysis_bad.vhd:28:1: Conditional analysis directive '`if' has no '`end'
+%Error: t/t_vhdl_condanalysis_bad.vhd:27:1: Conditional analysis expression: expected 'then'
+%Error: t/t_vhdl_condanalysis_bad.vhd:29:1: Conditional analysis expression: expected ')'
+%Error: t/t_vhdl_condanalysis_bad.vhd:31:1: Conditional analysis expression: expected an identifier
+%Error: t/t_vhdl_condanalysis_bad.vhd:33:1: Conditional analysis expression: expected a relational operator after 'TOOL_TYPE'
+%Error: t/t_vhdl_condanalysis_bad.vhd:35:1: Conditional analysis expression: expected a string literal after 'TOOL_TYPE ='
+%Error: t/t_vhdl_condanalysis_bad.vhd:37:1: Conditional analysis expression: unterminated string literal
+%Error: t/t_vhdl_condanalysis_bad.vhd:39:1: Conditional analysis expression: unexpected text after 'then'
+%Error: t/t_vhdl_condanalysis_bad.vhd:43:1: Conditional analysis directive '`if' has no '`end'
 %Error: Exiting due to

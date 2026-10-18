@@ -182,8 +182,9 @@ void V3PreShell::undef(const string& name) {
     cmdLineDefines().erase(name);
 }
 bool V3PreShell::cmdLineDefine(const string& name, string& value) {
-    const auto it = cmdLineDefines().find(name);
-    if (it == cmdLineDefines().end()) return false;
+    const std::map<string, string>& defines = cmdLineDefines();
+    const auto it = defines.find(name);
+    if (it == defines.end()) return false;
     value = it->second;
     return true;
 }
