@@ -25547,6 +25547,31 @@ private:
             return new AstConst{flp, AstConst::String{},
                                 symp && !symp->name().empty() ? symp->name() : written};
         }
+        // A design unit's own name: a package's path starts at its library, and the entity or
+        // architecture this is written in is the instance being elaborated, whose path the
+        // instances above it say (16.2.7; NVC attr12, elab9)
+        if (symp
+            && (symp->kind() == VhdlSymKind::PACKAGE || VN_IS(symp->declp(), VhdlPackage)
+                || VN_IS(symp->declp(), VhdlPackageBody))) {
+            const AstNodeVhdlUnit* const unitp = VN_CAST(symp->declp(), NodeVhdlUnit);
+            const std::string plib
+                = unitp && !unitp->libname().empty() ? unitp->libname() : std::string{"work"};
+            return pathString(":" + plib + ":" + symp->name() + ":", flp);
+        }
+        if (symp && m_modp
+            && (symp->kind() == VhdlSymKind::ENTITY
+                || symp->kind() == VhdlSymKind::ARCHITECTURE)) {
+            const auto unitIt = m_pathUnitOf.find(m_modp->name());
+            if (unitIt != m_pathUnitOf.end()
+                && VString::downcase(symp->kind() == VhdlSymKind::ENTITY ? unitIt->second.first
+                                                                         : unitIt->second.second)
+                       == VString::downcase(symp->name())) {
+                const std::pair<AstVar*, AstVar*> params = pathParams(m_modp);
+                AstVar* const rootp = attr == "instance_name" ? params.first : params.second;
+                return new AstConcatN{flp, new AstVarRef{flp, rootp, VAccess::READ},
+                                      pathString(":", flp)};
+            }
+        }
         std::vector<std::string> parts;
         std::string lib;
         std::string unit;
@@ -25570,6 +25595,21 @@ private:
                 }
                 known = vhdlPathWalk(upp, parts, lib, unit, inPkg);
                 region = true;
+                break;
+            }
+        }
+        // A package's own name, written inside it, names no symbol: the package is the unit
+        // this is in (NVC attr12, "pack'instance_name" in package pack)
+        if (!known) {
+            for (const AstNode* upp = nodep; upp; upp = parentOf(upp)) {
+                const AstNodeVhdlUnit* const unitp = VN_CAST(upp, NodeVhdlUnit);
+                if (!unitp) continue;
+                if ((VN_IS(unitp, VhdlPackage) || VN_IS(unitp, VhdlPackageBody))
+                    && VString::downcase(unitp->name()) == VString::downcase(written)) {
+                    const std::string plib
+                        = unitp->libname().empty() ? std::string{"work"} : unitp->libname();
+                    return pathString(":" + plib + ":" + VString::downcase(written) + ":", flp);
+                }
                 break;
             }
         }

@@ -1419,6 +1419,20 @@ private:
             // object does not.
             VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
             if (!symp) return VhdlValue{};
+            // An entity or an architecture is the instance being elaborated, whose path the
+            // instances above it say, which is not one value here (NVC elab9); a package's
+            // path starts at its library (NVC attr12)
+            if (symp->kind() == VhdlSymKind::ENTITY || symp->kind() == VhdlSymKind::ARCHITECTURE) {
+                return VhdlValue{};
+            }
+            if (symp->kind() == VhdlSymKind::PACKAGE || VN_IS(symp->declp(), VhdlPackage)
+                || VN_IS(symp->declp(), VhdlPackageBody)) {
+                const AstNodeVhdlUnit* const unitp = VN_CAST(symp->declp(), NodeVhdlUnit);
+                const std::string lib
+                    = unitp && !unitp->libname().empty() ? unitp->libname() : std::string{"work"};
+                return VhdlValue::mkStr(":" + lib + ":" + sourceName(symp->name()) + ":",
+                                        V3VhdlStd::stringType());
+            }
             // Under a design entity the path runs through the instances above
             // it, which differ from one instance to the next: the design
             // carries it, and it is not one value here
