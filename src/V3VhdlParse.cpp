@@ -31,7 +31,13 @@
 #include "V3VhdlParse.h"
 
 #include "V3Global.h"
+#include "V3PreShell.h"
 
+#include "config_package.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <functional>
 #include <set>
 #include <sstream>
@@ -72,9 +78,21 @@ const VhdlToken& V3VhdlParse::peek(size_t ahead) {
         if (m_atEnd) break;
         VhdlToken tok = m_scanner.next();
         // A tool directive is not part of the grammar (15.11), so it never
-        // reaches the parser
-        if (tok.type == VhdlTokType::TOOL_DIRECTIVE) continue;
-        if (tok.type == VhdlTokType::END_OF_FILE) m_atEnd = true;
+        // reaches the parser; one of conditional analysis says which text that
+        // follows does (24.2)
+        if (tok.type == VhdlTokType::TOOL_DIRECTIVE) {
+            toolDirective(tok);
+            continue;
+        }
+        if (tok.type == VhdlTokType::END_OF_FILE) {
+            m_atEnd = true;
+            if (!m_conds.empty()) {
+                m_conds.back().flp->v3error("Conditional analysis directive '`if' has no '`end'");
+                m_conds.clear();
+            }
+        } else if (!condActive()) {
+            continue;
+        }
         m_ahead.push_back(tok);
     }
     if (m_ahead.size() <= ahead) return m_ahead.back();  // The END_OF_FILE token
@@ -82,6 +100,247 @@ const VhdlToken& V3VhdlParse::peek(size_t ahead) {
 }
 
 VhdlTokType V3VhdlParse::peekType(size_t ahead) { return peek(ahead).type; }
+
+//######################################################################
+// Conditional analysis (VHDL-2019 24.2)
+
+namespace {
+// A conditional analysis expression over the text of a directive: relations of an identifier
+// and a string literal, combined with the logical operators (24.2.2)
+class VhdlCondExpr final {
+    const std::string& m_text;
+    size_t m_pos = 0;
+    FileLine* const m_flp;
+    const std::function<bool(const std::string&, std::string&)>& m_valueOf;
+    bool m_failed = false;
+
+    void skipSpace() {
+        while (m_pos < m_text.size() && std::isspace(static_cast<unsigned char>(m_text[m_pos]))) {
+            ++m_pos;
+        }
+    }
+    // The next word, lowercased, without consuming it
+    std::string peekWord() {
+        skipSpace();
+        size_t end = m_pos;
+        while (end < m_text.size()
+               && (std::isalnum(static_cast<unsigned char>(m_text[end])) || m_text[end] == '_')) {
+            ++end;
+        }
+        std::string word = m_text.substr(m_pos, end - m_pos);
+        std::transform(word.begin(), word.end(), word.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        return word;
+    }
+    void fail(const std::string& why) {
+        if (!m_failed) m_flp->v3error("Conditional analysis expression: " + why);
+        m_failed = true;
+    }
+    bool term() {
+        const std::string word = peekWord();
+        if (word == "not") {
+            m_pos += 3;
+            return !term();
+        }
+        skipSpace();
+        if (m_pos < m_text.size() && m_text[m_pos] == '(') {
+            ++m_pos;
+            const bool v = expr();
+            skipSpace();
+            if (m_pos >= m_text.size() || m_text[m_pos] != ')') {
+                fail("expected ')'");
+            } else {
+                ++m_pos;
+            }
+            return v;
+        }
+        if (word.empty()) {
+            fail("expected an identifier");
+            return false;
+        }
+        const std::string name = m_text.substr(m_pos, word.size());
+        m_pos += word.size();
+        skipSpace();
+        std::string op;
+        while (m_pos < m_text.size() && std::strchr("=/<>", m_text[m_pos])) op += m_text[m_pos++];
+        if (op != "=" && op != "/=" && op != "<" && op != "<=" && op != ">" && op != ">=") {
+            fail("expected a relational operator after '" + name + "'");
+            return false;
+        }
+        skipSpace();
+        if (m_pos >= m_text.size() || m_text[m_pos] != '"') {
+            fail("expected a string literal after '" + name + " " + op + "'");
+            return false;
+        }
+        ++m_pos;
+        std::string lit;
+        while (m_pos < m_text.size()) {
+            if (m_text[m_pos] == '"') {
+                if (m_pos + 1 < m_text.size() && m_text[m_pos + 1] == '"') {
+                    lit += '"';
+                    m_pos += 2;
+                    continue;
+                }
+                break;
+            }
+            lit += m_text[m_pos++];
+        }
+        if (m_pos >= m_text.size()) {
+            fail("unterminated string literal");
+            return false;
+        }
+        ++m_pos;
+        std::string value;
+        if (!m_valueOf(name, value)) {
+            fail("'" + name + "' is no conditional analysis identifier");
+            return false;
+        }
+        const int cmp = value.compare(lit);
+        if (op == "=") return cmp == 0;
+        if (op == "/=") return cmp != 0;
+        if (op == "<") return cmp < 0;
+        if (op == "<=") return cmp <= 0;
+        if (op == ">") return cmp > 0;
+        return cmp >= 0;
+    }
+
+public:
+    VhdlCondExpr(const std::string& text, FileLine* flp,
+                 const std::function<bool(const std::string&, std::string&)>& valueOf)
+        : m_text{text}
+        , m_flp{flp}
+        , m_valueOf{valueOf} {}
+    bool expr() {
+        bool v = term();
+        while (!m_failed) {
+            const std::string word = peekWord();
+            if (word != "and" && word != "or" && word != "xor" && word != "xnor" && word != "nand"
+                && word != "nor") {
+                break;
+            }
+            m_pos += word.size();
+            const bool r = term();
+            if (word == "and")
+                v = v && r;
+            else if (word == "or")
+                v = v || r;
+            else if (word == "xor")
+                v = v != r;
+            else if (word == "xnor")
+                v = v == r;
+            else if (word == "nand")
+                v = !(v && r);
+            else
+                v = !(v || r);
+        }
+        return v;
+    }
+    // The whole of an "`if" or "`elsif": the expression and then "then"
+    bool condition() {
+        const bool v = expr();
+        if (m_failed) return false;
+        if (peekWord() != "then") {
+            fail("expected 'then'");
+            return false;
+        }
+        m_pos += 4;
+        skipSpace();
+        if (m_pos < m_text.size() && m_text.compare(m_pos, 2, "--") != 0) {
+            fail("unexpected text after 'then'");
+        }
+        return v && !m_failed;
+    }
+};
+}  // namespace
+
+void V3VhdlParse::toolDirective(const VhdlToken& tok) {
+    if (m_lang < V3LangCode::L1076_2008) return;  // Refused by the scanner
+    std::string word;
+    size_t pos = 0;
+    while (pos < tok.text.size()
+           && (std::isalnum(static_cast<unsigned char>(tok.text[pos])) || tok.text[pos] == '_')) {
+        word += static_cast<char>(std::tolower(static_cast<unsigned char>(tok.text[pos])));
+        ++pos;
+    }
+    const std::string rest = tok.text.substr(pos);
+    // The standard identifiers (24.2.3) and those the command line defines (-D)
+    const std::function<bool(const std::string&, std::string&)> valueOf
+        = [this](const std::string& name, std::string& value) {
+              std::string lower = name;
+              std::transform(lower.begin(), lower.end(), lower.begin(),
+                             [](unsigned char c) { return std::tolower(c); });
+              if (lower == "vhdl_version") {
+                  value = m_lang >= V3LangCode::L1076_2019   ? "2019"
+                          : m_lang >= V3LangCode::L1076_2008 ? "2008"
+                          : m_lang >= V3LangCode::L1076_2002 ? "2002"
+                          : m_lang >= V3LangCode::L1076_2000 ? "2000"
+                                                             : "1993";
+                  return true;
+              }
+              if (lower == "tool_type") {
+                  value = "SIMULATION";
+                  return true;
+              }
+              if (lower == "tool_vendor" || lower == "tool_name") {
+                  value = "Verilator";
+                  return true;
+              }
+              if (lower == "tool_edition") {
+                  value = "";
+                  return true;
+              }
+              if (lower == "tool_version") {
+                  value = PACKAGE_VERSION_NUMBER_STRING;
+                  return true;
+              }
+              return V3PreShell::cmdLineDefine(name, value)
+                     || V3PreShell::cmdLineDefine(lower, value);
+          };
+    if (word == "if") {
+        const bool parentActive = condActive();
+        bool v = false;
+        if (parentActive) v = VhdlCondExpr{rest, tok.flp, valueOf}.condition();
+        m_conds.push_back(CondFrame{parentActive, v, parentActive && v, tok.flp});
+    } else if (word == "elsif") {
+        if (m_conds.empty()) {
+            tok.flp->v3error("Conditional analysis directive '`elsif' has no '`if'");
+            return;
+        }
+        CondFrame& frame = m_conds.back();
+        if (!frame.parentActive || frame.taken) {
+            frame.active = false;
+        } else {
+            frame.active = VhdlCondExpr{rest, tok.flp, valueOf}.condition();
+            frame.taken = frame.active;
+        }
+    } else if (word == "else") {
+        if (m_conds.empty()) {
+            tok.flp->v3error("Conditional analysis directive '`else' has no '`if'");
+            return;
+        }
+        CondFrame& frame = m_conds.back();
+        frame.active = frame.parentActive && !frame.taken;
+        frame.taken = true;
+    } else if (word == "end") {
+        if (m_conds.empty()) {
+            tok.flp->v3error("Conditional analysis directive '`end' has no '`if'");
+            return;
+        }
+        m_conds.pop_back();
+    } else if ((word == "warning" || word == "error") && condActive()) {
+        // "`warning "text"" and "`error "text"" (24.2.4)
+        const size_t open = rest.find('"');
+        const size_t close = open == std::string::npos ? open : rest.rfind('"');
+        const std::string msg = open != std::string::npos && close > open
+                                    ? rest.substr(open + 1, close - open - 1)
+                                    : rest;
+        if (word == "error") {
+            tok.flp->v3error("Conditional analysis: " << msg);
+        } else {
+            tok.flp->v3warn(USERWARN, "Conditional analysis: " << msg);
+        }
+    }
+}
 
 // A lexical element, spelled so that two of them are the same string exactly
 // when 4.10 counts them the same: case does not matter in a basic identifier,

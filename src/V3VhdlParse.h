@@ -52,6 +52,15 @@ class V3VhdlParse final {
     int m_printed = 0;  // Of those, how many were reported
     bool m_panic = false;  // Suppressing a cascade from an earlier error
     bool m_atEnd = false;  // Scanner is exhausted
+    // Conditional analysis (VHDL-2019 24.2, which nvc 1.22.1 takes in VHDL-2008 too): what
+    // each open "`if" has decided
+    struct CondFrame final {
+        bool parentActive;  // The text around the "`if" is analyzed
+        bool taken;  // A branch of it was chosen already
+        bool active;  // The text of the branch being read is analyzed
+        FileLine* flp;  // The "`if", for a missing "`end"
+    };
+    std::vector<CondFrame> m_conds;
     // While a subprogram specification is being parsed, what it is spelled
     // as, one lexical element at a time, to test the conformance of a body
     // to its declaration by (4.10)
@@ -77,6 +86,9 @@ public:
 private:
     // Token access
     const VhdlToken& peek(size_t ahead = 0) VL_MT_DISABLED;
+    // A tool directive: conditional analysis, its warnings and errors, and nothing for others
+    void toolDirective(const VhdlToken& tok) VL_MT_DISABLED;
+    bool condActive() const { return m_conds.empty() || m_conds.back().active; }
     VhdlTokType peekType(size_t ahead = 0) VL_MT_DISABLED;
     VhdlToken consume() VL_MT_DISABLED;
     bool check(VhdlTokType type) VL_MT_DISABLED;  // Consume if it matches

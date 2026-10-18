@@ -355,6 +355,11 @@ Summary:
    relatively standard across Verilog tools, while ``-D`` is similar to
    :command:`gcc -D`.
 
+   In VHDL sources the symbol is also an identifier of conditional
+   analysis, as ```if USER_ID = "yes" then`` reads it (IEEE 1076-2019
+   24.2), beside the standard ones such as ``VHDL_VERSION`` and
+   ``TOOL_TYPE``.
+
 .. option:: --debug
 
    Run under debug.

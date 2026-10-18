@@ -39,6 +39,8 @@ public:
     static void preprocInclude(FileLine* fl, const string& modname) VL_MT_DISABLED;
     static void defineCmdLine(const string& name, const string& value) VL_MT_DISABLED;
     static void undef(const string& name) VL_MT_DISABLED;
+    // The value the command line gave a define (-D, +define+), for VHDL's conditional analysis
+    static bool cmdLineDefine(const string& name, string& value) VL_MT_DISABLED;
     static void dumpDefines(std::ostream& os) VL_MT_DISABLED;
     static void candidateDefines(VSpellCheck* spellerp) VL_MT_DISABLED;
     static void selfTest() VL_MT_DISABLED;

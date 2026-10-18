@@ -1,0 +1,10 @@
+%Error: t/t_vhdl_condanalysis_bad.vhd:15:1: Conditional analysis expression: 'NOT_DEFINED' is no conditional analysis identifier
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: t/t_vhdl_condanalysis_bad.vhd:17:1: Conditional analysis directive '`else' has no '`if'
+%Error: t/t_vhdl_condanalysis_bad.vhd:19:1: Conditional analysis: reached
+%Warning-USERWARN: t/t_vhdl_condanalysis_bad.vhd:23:1: Conditional analysis: a warning
+                   ... For warning description see https://verilator.org/warn/USERWARN?v=latest
+                   ... Use "/* verilator lint_off USERWARN */" and lint_on around source to disable this message.
+%Error: t/t_vhdl_condanalysis_bad.vhd:24:1: Conditional analysis expression: expected 'then'
+%Error: t/t_vhdl_condanalysis_bad.vhd:28:1: Conditional analysis directive '`if' has no '`end'
+%Error: Exiting due to

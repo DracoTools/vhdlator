@@ -167,11 +167,26 @@ bool V3PreShell::preproc(FileLine* fl, const string& modname, VInFilter* filterp
 void V3PreShell::preprocInclude(FileLine* fl, const string& modname) {
     V3PreShellImp::s_preImp.preprocInclude(fl, modname);
 }
+// What the command line defined, for VHDL's conditional analysis, which has no preprocessor
+static std::map<string, string>& cmdLineDefines() {
+    static std::map<string, string> s_defines;
+    return s_defines;
+}
 void V3PreShell::defineCmdLine(const string& name, const string& value) {
     FileLine* const prefl = new FileLine{FileLine::commandLineFilename()};
     V3PreShellImp::s_preprocp->defineCmdLine(prefl, name, value);
+    cmdLineDefines()[name] = value;
 }
-void V3PreShell::undef(const string& name) { V3PreShellImp::s_preprocp->undef(name); }
+void V3PreShell::undef(const string& name) {
+    V3PreShellImp::s_preprocp->undef(name);
+    cmdLineDefines().erase(name);
+}
+bool V3PreShell::cmdLineDefine(const string& name, string& value) {
+    const auto it = cmdLineDefines().find(name);
+    if (it == cmdLineDefines().end()) return false;
+    value = it->second;
+    return true;
+}
 void V3PreShell::dumpDefines(std::ostream& os) { V3PreShellImp::s_preprocp->dumpDefines(os); }
 void V3PreShell::candidateDefines(VSpellCheck* spellerp) {
     V3PreShellImp::s_preprocp->candidateDefines(spellerp);
