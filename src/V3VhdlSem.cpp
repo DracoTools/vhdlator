@@ -2418,7 +2418,10 @@ public:
                                      const std::vector<VhdlValue>& actualValues,
                                      const std::string& name) VL_MT_DISABLED;
     void findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep, bool skipZero,
-                          bool& sawOpen, bool& sawUnfolded) VL_MT_DISABLED;
+                          bool& sawOpen, bool& sawUnfolded, bool top = true) VL_MT_DISABLED;
+    // Set where a branch whose condition folds TRUE returns: what it returns is the result,
+    // and nothing after it runs (findReturnedType)
+    bool m_returnSettled = false;
     static bool returnsACall(AstNode* stmtsp) VL_MT_DISABLED;
     bool writtenWithGenericType(AstNode* subtypep) const VL_MT_DISABLED;
     static bool sameButForUniversal(const std::vector<VhdlSymbol*>& cands) VL_MT_DISABLED;
@@ -7082,8 +7085,9 @@ static bool sameUnfoldedSpan(const VhdlType* ap, const VhdlType* bp) {
 
 // The type of the first return statement that has a length of its own
 void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep,
-                                      bool skipZero, bool& sawOpen, bool& sawUnfolded) {
-    for (AstNode* p = stmtsp; p && !disagreep; p = p->nextp()) {
+                                      bool skipZero, bool& sawOpen, bool& sawUnfolded, bool top) {
+    if (top) m_returnSettled = false;
+    for (AstNode* p = stmtsp; p && !disagreep && !m_returnSettled; p = p->nextp()) {
         if (AstVhdlReturn* const retp = VN_CAST(p, VhdlReturn)) {
             if (retp->valuep() && retp->valuep()->vhdlTypep()) {
                 // A conversion keeps the length of what it converts (9.3.6),
@@ -7188,21 +7192,64 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
             continue;
         }
         if (AstVhdlIf* const ifp = VN_CAST(p, VhdlIf)) {
-            for (AstNode* ap = ifp->altsp(); ap && !disagreep; ap = ap->nextp()) {
-                findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
-                                 sawOpen, sawUnfolded);
+            for (AstNode* ap = ifp->altsp(); ap && !disagreep && !m_returnSettled;
+                 ap = ap->nextp()) {
+                AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
+                // A condition the call's lengths fold: a branch that cannot run says
+                // nothing, and one that does run and returns is the result -- the guard
+                // "if L'LENGTH < 1 or R'LENGTH < 1 then return NAU" of numeric_std's "+"
+                // given a null operand (NVC ieee13), which is otherwise skipped as a guard
+                // the lengths rule out
+                const VhdlType* const ctp = altp->condp() ? altp->condp()->vhdlTypep() : nullptr;
+                // Only a condition on what the call fixes for every use of the copy: the
+                // lengths and bounds of its parameters, not their values, which one copy may
+                // be called with many of ("if n > 0", t_vhdl_retmix)
+                bool byShape = ctp != nullptr;
+                if (byShape) {
+                    altp->condp()->foreach([&](const AstVhdlName* namep) {
+                        const VhdlSymbol* const symp
+                            = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                        if (!symp || !VN_IS(symp->declp(), VhdlIfaceDecl)) return;
+                        const AstVhdlAttrName* const attrp = VN_CAST(namep->backp(), VhdlAttrName);
+                        if (!attrp || attrp->prefixp() != namep) byShape = false;
+                    });
+                }
+                if (byShape && ctp->base() == V3VhdlStd::booleanType()) {
+                    const VhdlValue cond = V3VhdlEval::eval(altp->condp());
+                    if (cond.isInt() && cond.toInt() == 0) continue;
+                    if (cond.isInt()) {
+                        AstNode* lastp = altp->stmtsp();
+                        while (lastp && lastp->nextp()) lastp = lastp->nextp();
+                        if (VN_IS(lastp, VhdlReturn)) {
+                            VhdlType* takenp = nullptr;
+                            bool dis = false;
+                            bool open = false;
+                            bool unfolded = false;
+                            findReturnedType(altp->stmtsp(), takenp, dis, false, open, unfolded,
+                                             false);
+                            if (takenp && !dis && !open) {
+                                foundp = takenp;
+                                m_returnSettled = true;
+                                return;
+                            }
+                        }
+                    }
+                }
+                findReturnedType(altp->stmtsp(), foundp, disagreep, skipZero, sawOpen, sawUnfolded,
+                                 false);
             }
             continue;
         }
         if (AstVhdlCase* const casep = VN_CAST(p, VhdlCase)) {
             for (AstNode* ap = casep->altsp(); ap && !disagreep; ap = ap->nextp()) {
                 findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
-                                 sawOpen, sawUnfolded);
+                                 sawOpen, sawUnfolded, false);
             }
             continue;
         }
         if (AstVhdlLoop* const loopp = VN_CAST(p, VhdlLoop)) {
-            findReturnedType(loopp->stmtsp(), foundp, disagreep, skipZero, sawOpen, sawUnfolded);
+            findReturnedType(loopp->stmtsp(), foundp, disagreep, skipZero, sawOpen, sawUnfolded,
+                             false);
         }
     }
 }
