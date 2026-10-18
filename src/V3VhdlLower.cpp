@@ -82,6 +82,16 @@ bool enumIsStdUlogic(const VhdlType* typep) {
     return true;
 }
 
+// Whether a type is BIT or an array of it: two values, which no net needs to resolve
+static bool enumIsBitLike(const VhdlType* typep) {
+    if (!typep) return false;
+    const VhdlType* basep = typep->base();
+    if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
+        basep = basep->elementp()->base();
+    }
+    return basep->kind() == VhdlTypeKind::ENUM && basep->literals().size() == 2;
+}
+
 bool enumIsLogic(const VhdlType* typep) {
     if (!typep || typep->base()->kind() != VhdlTypeKind::ENUM) return false;
     const std::vector<VhdlSymbol*>& lits = typep->base()->literals();
@@ -9826,7 +9836,8 @@ private:
                 // driver15)
                 if (isLogicish(symp->typep()) && !symp->resolvePerElement()
                     && !(guardedSignal(symp) && symp->resolverNullp())
-                    && (!symp->resolverp() || ieeeResolved(symp->resolverp()))) {
+                    && (!symp->resolverp() || ieeeResolved(symp->resolverp())
+                        || !enumIsBitLike(symp->typep()))) {
                     // One driver of a logic signal resolves to itself, so the
                     // wiring is only worth building for several. An array
                     // whose element subtype names a function of the design's
