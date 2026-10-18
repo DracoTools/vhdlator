@@ -9821,8 +9821,12 @@ private:
                 addStmt(m_ftaskp ? setp : new AstInitial{flp, setp});
             }
             if (objp->kind() == VhdlObjKind::SIGNAL) {
+                // Only where the logic tables are the resolution: a function of the design's
+                // own over BIT is called as the language calls it, reports and all (NVC
+                // driver15)
                 if (isLogicish(symp->typep()) && !symp->resolvePerElement()
-                    && !(guardedSignal(symp) && symp->resolverNullp())) {
+                    && !(guardedSignal(symp) && symp->resolverNullp())
+                    && (!symp->resolverp() || ieeeResolved(symp->resolverp()))) {
                     // One driver of a logic signal resolves to itself, so the
                     // wiring is only worth building for several. An array
                     // whose element subtype names a function of the design's
