@@ -326,6 +326,9 @@ def expected_outcome(path):
 # run as VHDL-93, NVC's own default for the list
 NVC_REGRESS_RE = re.compile(r'(.*/nvc)/test/regress/([^/]+)\.vhdl?$')
 _NVC_STD = {}
+# The identifiers of conditional analysis NVC's harness defines for a test ("define=X=Y"),
+# by test name
+_NVC_DEFINES = {}
 
 
 def nvc_regress_std(nvc_root, name):
@@ -356,6 +359,8 @@ def nvc_regress_std(nvc_root, name):
                     for flag in flags:
                         if flag in ('2000', '2002', '2008', '2019'):
                             std = flag
+                        if flag.startswith('define='):
+                            _NVC_DEFINES.setdefault(words[0], []).append('-D' + flag[7:])
                     table[words[0]] = std
         except OSError:
             pass
@@ -377,8 +382,10 @@ def extra_flags(path):
     match = NVC_REGRESS_RE.match(os.path.normpath(os.path.abspath(path)))
     if match:
         std = nvc_regress_std(match.group(1), match.group(2))
+        defines = _NVC_DEFINES.get(match.group(2), [])
         if std:
-            return ['--vhdl-std', std]
+            return ['--vhdl-std', std] + defines
+        return defines
     return []
 
 
