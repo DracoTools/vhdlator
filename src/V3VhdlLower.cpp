@@ -10404,6 +10404,23 @@ private:
     // One of numeric_std's own vectors, whose operators are declared over
     // any two lengths and compare by value -- as against an array type,
     // whose "=" is the predefined one and false between lengths that differ
+    // How an operator's package reads a STD_LOGIC_VECTOR: as a number, unsigned (1) or signed
+    // (2), for std_logic_unsigned, numeric_std_unsigned and std_logic_signed, whose "=" and
+    // orderings compare values across lengths as numeric_std's do (GHDL gna issue377 through
+    // NVC: "v(23 downto 0) = CONV_STD_LOGIC_VECTOR(0, 23)" holds); 0 for any other
+    static int vectorAsNumber(const VhdlSymbol* symp) {
+        if (!symp) return 0;
+        for (const VhdlScope* scopep = symp->resolved()->declScopep(); scopep;
+             scopep = scopep->parentp()) {
+            const std::string& n = scopep->name();
+            if (n == "std_logic_unsigned" || n == "numeric_std_unsigned"
+                || n == "numeric_bit_unsigned") {
+                return 1;
+            }
+            if (n == "std_logic_signed") return 2;
+        }
+        return 0;
+    }
     static bool isNumericVector(const VhdlType* typep) {
         if (!typep) return false;
         const VhdlType* const basep = typep->base();
@@ -19601,8 +19618,9 @@ private:
             {
                 const int lw = staticArrayLength(nodep->lhsp(), ltypep);
                 const int rw = staticArrayLength(nodep->rhsp(), rtypep);
-                if (lw && rw && lw != rw
-                    && !(isNumericVector(ltypep) && isNumericVector(rtypep))) {
+                const bool byValue = (isNumericVector(ltypep) && isNumericVector(rtypep))
+                                     || vectorAsNumber(nodep->vhdlSymp());
+                if (lw && rw && lw != rw && !byValue) {
                     VL_DO_DANGLING(lhsp->deleteTree(), lhsp);
                     VL_DO_DANGLING(rhsp->deleteTree(), rhsp);
                     return new AstConst{flp, AstConst::BitTrue{}, !equal};
@@ -19612,7 +19630,7 @@ private:
                 // downto 0)" is false in an instance given 4, or 0
                 // -- and two null arrays are equal, whatever the places an
                 // object declared with null ends has here hold
-                if ((!lw || !rw) && !(isNumericVector(ltypep) && isNumericVector(rtypep))) {
+                if ((!lw || !rw) && !byValue) {
                     const auto lengthOf
                         = [&](int known, AstNodeVhdlExpr* opp, const VhdlType* typep) {
                               if (known) return i32(known, flp);
@@ -20008,6 +20026,12 @@ private:
     // the expression rather than read off one type.
     static int exprVectorWidth(AstNodeVhdlExpr* nodep) {
         if (!nodep) return 0;
+        // A string or bit string literal is as long as its characters, whatever subtype the
+        // context gave it: "1" against a six-element vector in std_logic_unsigned's ">=" as
+        // VHDL-93 reads it
+        if (VN_IS(nodep, VhdlLiteral)) {
+            if (const int width = staticArrayLength(nodep, nodep->vhdlTypep())) return width;
+        }
         if (const int width = vectorWidth(nodep->vhdlTypep())) return width;
         if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
             const int lw = exprVectorWidth(binp->lhsp());
@@ -20198,8 +20222,11 @@ private:
                                  && nodep->op() != VhdlBinaryOp::DIV
                                  && nodep->op() != VhdlBinaryOp::MOD
                                  && nodep->op() != VhdlBinaryOp::REM;
-                if (cmp && !(isNumericVector(ltypep) && isNumericVector(rtypep))) break;
-                const bool signd = isSignedType(ltypep) || isSignedType(rtypep);
+                const int asNumber = vectorAsNumber(nodep->vhdlSymp());
+                if (cmp && !(isNumericVector(ltypep) && isNumericVector(rtypep)) && !asNumber) {
+                    break;
+                }
+                const bool signd = isSignedType(ltypep) || isSignedType(rtypep) || asNumber == 2;
                 if (lw < rw) {
                     lhsp = sizedTo(signd ? new AstSigned{flp, lhsp} : lhsp, rw, flp);
                 } else {

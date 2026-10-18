@@ -9741,6 +9741,25 @@ int VhdlSemVisitor::flavourOf(AstNodeVhdlExpr* nodep) {
     return found;
 }
 
+// Whether two subprograms have one profile by base types, a STD_LOGIC_VECTOR and a
+// STD_ULOGIC_VECTOR counting as one
+static bool sameBaseProfile(const VhdlSymbol* ap, const VhdlSymbol* bp) {
+    ap = ap->resolved();
+    bp = bp->resolved();
+    if (ap->name() != bp->name() || ap->paramTypes().size() != bp->paramTypes().size()) {
+        return false;
+    }
+    for (size_t i = 0; i < ap->paramTypes().size(); ++i) {
+        const VhdlType* const at = ap->paramTypes()[i];
+        const VhdlType* const bt = bp->paramTypes()[i];
+        if (!at || !bt || at->base() != bt->base()) return false;
+    }
+    const VhdlType* const ar = ap->returnTypep();
+    const VhdlType* const br = bp->returnTypep();
+    if (!ar != !br) return false;
+    return !ar || ar->base() == br->base();
+}
+
 VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>& cands,
                                VhdlType* wantp, const std::string& what) {
     // An alias and what it aliases are one declaration, not two: aliasing a
@@ -9866,6 +9885,11 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
                 bool matched = false;
                 for (VhdlSymbol* const exp : explicits) {
                     if (exp->homographOf(symp)) matched = true;
+                    // Before VHDL-2008 STD_LOGIC_VECTOR's own predefined operation, which the
+                    // explicit one is a homograph of, stands here as STD_ULOGIC_VECTOR's: the
+                    // same profile but for that (std_logic_unsigned's ">=", as Questa and the
+                    // relaxed modes of nvc and GHDL take VHDL-93)
+                    if (!matched && sameBaseProfile(exp, symp)) matched = true;
                 }
                 if (!matched) sameProfile = false;
             }
@@ -9907,6 +9931,28 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
                     // asked what types it could have, the way an operand is
                     const int wanted
                         = actualp ? actualp->logicVectorFlavour() : flavourOf(asp->actualp());
+                    if (!wanted) continue;
+                    if (wanted != offered) spelledSame = false;
+                }
+                if (spelledSame) exact.push_back(symp);
+            }
+            if (exact.size() == 1) cands.swap(exact);
+        } else if (AstVhdlBinary* const binp = VN_CAST(nodep, VhdlBinary)) {
+            // The same for an operator's two operands: STD_LOGIC_VECTOR's "=" from
+            // std_logic_unsigned over two of them, beside STD_ULOGIC_VECTOR's predefined one
+            // (GHDL gna issue377 through NVC, run as VHDL-93)
+            std::vector<VhdlSymbol*> exact;
+            for (VhdlSymbol* const symp : cands) {
+                bool spelledSame = true;
+                size_t pos = 0;
+                for (AstNodeVhdlExpr* const opp : {binp->lhsp(), binp->rhsp()}) {
+                    const size_t at = pos++;
+                    if (!opp || at >= symp->paramTypes().size()) continue;
+                    const VhdlType* const formalp = symp->paramTypes()[at];
+                    const int offered = formalp ? formalp->logicVectorFlavour() : 0;
+                    if (!offered) continue;
+                    const VhdlType* const actualp = opp->vhdlTypep();
+                    const int wanted = actualp ? actualp->logicVectorFlavour() : flavourOf(opp);
                     if (!wanted) continue;
                     if (wanted != offered) spelledSame = false;
                 }
