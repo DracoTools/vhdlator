@@ -17972,9 +17972,11 @@ private:
             AstNodeExpr* const vp = intTo64(intp, true, flp);
             AstNodeExpr* bitsp = const_cast<AstNodeExpr*>(countp)->cloneTree(false);
             if (sgn) bitsp = new AstSub{flp, bitsp, i32(1, flp)};
+            // Signed, so that its negation is the least value and not a large unsigned one
             const auto limitp = [&]() {
-                return new AstShiftL{flp, new AstConst{flp, AstConst::WidthedValue{}, 64, 1},
-                                     bitsp->cloneTree(false)};
+                return new AstSigned{
+                    flp, new AstShiftL{flp, new AstConst{flp, AstConst::WidthedValue{}, 64, 1},
+                                       bitsp->cloneTree(false)}};
             };
             badp = new AstGteS{flp, vp->cloneTree(false), limitp()};
             if (sgn) {
@@ -18721,7 +18723,9 @@ private:
             AstNodeExpr* const lanesp
                 = new AstSelPlus{flp, laneSpread(widep, flp), i32(0, flp),
                                  new AstMul{flp, i32(4, flp), sizep->cloneTree(false)}};
-            AstNodeExpr* const outp = new AstOr{flp, lanesp, laneMask(2, sizep, flp)};
+            AstNodeExpr* outp = new AstOr{flp, lanesp, laneMask(2, sizep, flp)};
+            // "vector truncated" where the value does not fit (NVC ieee11)
+            outp = withTruncWarning(outp, args[0], name == "to_signed", sizep, flp);
             VL_DO_DANGLING(sizep->deleteTree(), sizep);
             return outp;
         }
@@ -18734,10 +18738,12 @@ private:
                 VL_DO_DANGLING(countp->deleteTree(), countp);
                 return nullptr;
             }
-            AstNodeExpr* const outp
+            AstNodeExpr* outp
                 = new AstCastSize{flp, laneFromValues(valuesp, countp, flp),
                                   new AstConst{flp, AstConst::Unsized32{},
                                                static_cast<uint32_t>(sizev.toInt() * 4)}};
+            // "vector truncated" where the value does not fit (NVC ieee11)
+            outp = withTruncWarning(outp, args[0], name == "to_signed", countp, flp);
             VL_DO_DANGLING(countp->deleteTree(), countp);
             return outp;
         }
@@ -23036,6 +23042,13 @@ private:
                         signd ? static_cast<AstNodeExpr*>(new AstSigned{flp, firstp}) : firstp,
                         new AstConst{flp, AstConst::Unsized32{},
                                      static_cast<uint32_t>(want < 1 ? 1 : want)}};
+                }
+                // "vector truncated" where the value does not fit (NVC ieee11)
+                if (name != "resize" && want >= 1 && args[0]->vhdlTypep()
+                    && args[0]->vhdlTypep()->base()->kind() != VhdlTypeKind::ARRAY) {
+                    AstNodeExpr* const countp = i32(want, flp);
+                    sized = withTruncWarning(sized, args[0], name == "to_signed", countp, flp);
+                    VL_DO_DANGLING(countp->deleteTree(), countp);
                 }
             } else if (name == "resize" && resultp && !carriedDynamically(resultp)
                        && resultp->lengthEmittable()
