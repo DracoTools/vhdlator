@@ -1788,6 +1788,9 @@ class VhdlSemVisitor final : public VNVisitor {
                 return nullptr;
             }
             ExtRegion next{nullptr, ""};
+            // Into a statement of the region whose declarations the name is written in:
+            // that is elaborated after them (14.4.2), so the object does not exist yet
+            if (region.nodep == m_extDeclRegionp) m_extTooEarly = true;
             for (const AstNode* sp = stmtsOf(region.nodep); sp; sp = sp->nextp()) {
                 const AstNodeVhdlStmt* const stp = VN_CAST(sp, NodeVhdlStmt);
                 if (!stp || lower(stp->label()) != names[i]) continue;
@@ -1891,12 +1894,49 @@ public:
             });
         }
     }
+    // The architecture or block in whose declarative part an external name is
+    // written, outside any subprogram or process, if it is
+    static const AstNode* externalDeclRegion(const AstNode* nodep) {
+        const AstNode* childp = nodep;
+        for (const AstNode* up = nodep->backp(); up; up = up->backp()) {
+            if (VN_IS(up, VhdlSubprogDecl) || VN_IS(up, VhdlProcess)) return nullptr;
+            const AstNode* declsp = nullptr;
+            if (const AstVhdlArchitecture* const archp = VN_CAST(up, VhdlArchitecture)) {
+                declsp = archp->declsp();
+            } else if (const AstVhdlBlock* const bp = VN_CAST(up, VhdlBlock)) {
+                declsp = bp->declsp();
+            } else {
+                if (up->nextp() != childp) childp = up;  // A parent, not a sibling before it
+                continue;
+            }
+            for (const AstNode* dp = declsp; dp; dp = dp->nextp()) {
+                if (dp == childp) return up;
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+    const AstNode* m_extDeclRegionp = nullptr;  // See externalDeclRegion
+    bool m_extTooEarly = false;  // The walk went into a statement of that region
+
     // Every external name of these units checked against the object it denotes
     void checkExternalNames(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         for (AstNodeVhdlUnit* const unitp : unitsp) {
             unitp->foreach([&](AstVhdlExternalName* extp) {
                 if (extp->package()) return;
-                if (const VhdlSymbol* const tgtp = externalTarget(extp)) {
+                VL_RESTORER(m_extDeclRegionp);
+                VL_RESTORER(m_extTooEarly);
+                m_extDeclRegionp = externalDeclRegion(extp);
+                m_extTooEarly = false;
+                const VhdlSymbol* const tgtp = externalTarget(extp);
+                // Evaluated as the declarations are elaborated, before the statement the object
+                // is in (8.7, 14.4.2), where nvc and GHDL stop (GHDL gna issue2528)
+                if (tgtp && m_extTooEarly) {
+                    extp->elabError("External name names an object not yet elaborated where it"
+                                    " is evaluated");
+                    return;
+                }
+                if (tgtp) {
                     // An alias of it may leave the name itself untyped; its subtype says
                     const VhdlType* typep = extp->vhdlTypep();
                     if (!typep && extp->subtypep()) typep = extp->subtypep()->vhdlTypep();
@@ -1938,6 +1978,20 @@ private:
             return "The type of " + cls + " '" + tgtp->name() + "' is not " + typep->prettyName();
         }
         if (typep->base() != ttypep->base()) return "";
+        // A scalar subtype of another range: GHDL and Questa stop, nvc runs on (GHDL gna
+        // issue3302)
+        {
+            const VhdlTypeKind k = typep->base()->kind();
+            if ((k == VhdlTypeKind::INTEGER || k == VhdlTypeKind::PHYSICAL
+                 || k == VhdlTypeKind::ENUM)
+                && typep != typep->base() && typep->bounded() && ttypep->bounded()
+                && (typep->low() != ttypep->low() || typep->high() != ttypep->high())) {
+                return "Object '" + tgtp->name() + "' is of range " + std::to_string(ttypep->low())
+                       + " to " + std::to_string(ttypep->high())
+                       + ", where the external name's subtype is " + std::to_string(typep->low())
+                       + " to " + std::to_string(typep->high());
+            }
+        }
         if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->isConstrainedArray()
             || typep->indexTypes().size() != 1 || !typep->indexTypes()[0]
             || !typep->indexTypes()[0]->bounded()) {
@@ -2651,6 +2705,7 @@ private:
     void visit(AstVhdlWait* nodep) override;
     void visit(AstVhdlReturn* nodep) override;
     void visit(AstVhdlProcCall* nodep) override;
+    bool inGenericTemplate(const AstNode* nodep) const VL_MT_DISABLED;
     void visit(AstVhdlNext* nodep) override;
     void visit(AstVhdlInstance* nodep) override;
     void visit(AstVhdlConfigSpec* nodep) override;
@@ -3093,6 +3148,35 @@ void VhdlSemVisitor::visit(AstVhdlSubtypeDecl* nodep) {
     declare(symp, nodep->fileline());
 }
 
+// Whether a declaration is inside a subprogram or a process, which run, rather than
+// in a declarative part elaboration alone goes through
+static bool insideRunningCode(const AstNode* nodep) {
+    for (const AstNode* up = parentOf(nodep); up; up = parentOf(up)) {
+        if (VN_IS(up, VhdlSubprogDecl) || VN_IS(up, VhdlProcess)) return true;
+        if (VN_IS(up, NodeVhdlUnit)) return false;
+    }
+    return false;
+}
+
+// Whether a declaration is in a package with generics, or its body, as written rather than
+// as a copy for an instance of it: the template is never elaborated (4.9)
+bool VhdlSemVisitor::inGenericTemplate(const AstNode* nodep) const {
+    if (m_inPkgInst) return false;
+    for (const AstNode* up = parentOf(nodep); up; up = parentOf(up)) {
+        if (const AstVhdlPackage* const pkgp = VN_CAST(up, VhdlPackage)) {
+            return pkgp->genericsp() && !pkgp->genericMapp();
+        }
+        if (const AstVhdlPackageBody* const bodyp = VN_CAST(up, VhdlPackageBody)) {
+            const auto it = m_primaryUnits.find(m_libname + "." + lower(bodyp->name()));
+            const AstVhdlPackage* const pkgp
+                = it != m_primaryUnits.end() ? VN_CAST(it->second, VhdlPackage) : nullptr;
+            return pkgp && pkgp->genericsp();
+        }
+        if (VN_IS(up, NodeVhdlUnit)) return false;
+    }
+    return false;
+}
+
 void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
     VL_RESTORER_COPY(m_declaring);
     m_declaring.insert(nodep->name());
@@ -3283,7 +3367,20 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
         // needs no object of its own, and one element of a record being
         // unknown is no reason to emit the rest as a number.
         if (kind == VhdlSymKind::CONSTANT) {
+            const bool savedElabNow = V3VhdlEval::s_elabNow;
+            std::vector<V3VhdlEval::ElabReport>* const savedSinkp = V3VhdlEval::s_elabReportsp;
+            std::vector<V3VhdlEval::ElabReport> reports;
+            V3VhdlEval::s_elabNow = !insideRunningCode(nodep);
+            // What the function elaboration runs for it reports, it reports once (14.4.2;
+            // GHDL gna issue2353)
+            V3VhdlEval::s_elabReportsp
+                = V3VhdlEval::s_elabNow && !inGenericTemplate(nodep) ? &reports : nullptr;
             VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            V3VhdlEval::s_elabNow = savedElabNow;
+            V3VhdlEval::s_elabReportsp = savedSinkp;
+            if (val.known() && !reports.empty()) {
+                V3VhdlEval::s_constReports.emplace_back(symp, std::move(reports));
+            }
             // An architecture's constant given what an impure function of it
             // returns, where that function touches only shared variables the
             // architecture itself declared: every instance elaborates the
@@ -4029,6 +4126,24 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
                                    found[0]->paramHasDefault(i));
                 }
                 if (found[0]->returnTypep()) symp->returnTypep(found[0]->returnTypep());
+            }
+        }
+    }
+    // "alias element_t is ram'element": a nonobject alias of the subtype the attribute denotes
+    // (6.6.3), usable as a type mark; nvc and GHDL take it, Questa refuses (GHDL gna issue3270)
+    if (const AstVhdlAttrName* const attrp = VN_CAST(nodep->targetp(), VhdlAttrName)) {
+        const std::string attr = lower(attrp->name());
+        if ((attr == "element" || attr == "subtype" || attr == "base") && !nodep->subtypep()
+            && !nodep->signaturep()) {
+            if (VhdlType* const tp = resolveTypeMark(nodep->targetp())) {
+                VhdlSymbol* const typeSymp
+                    = VhdlSymTab::newSymbol(VhdlSymKind::TYPE, nodep->name(), nodep);
+                typeSymp->typep(tp);
+                symp->aliasp(typeSymp);
+                symp->typep(tp);
+                symp->objectAlias(false);
+                declare(symp, nodep->fileline());
+                return;
             }
         }
     }
@@ -6926,6 +7041,9 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     // supplies, the result has one too -- so the copy is an ordinary
     // subprogram, and nothing tries to specialize it again
     VhdlSymbol* const newSymp = copyp->vhdlSymp();
+    if (newSymp && originalp->vhdlSymp()) {
+        newSymp->declaredParamTypes(originalp->vhdlSymp()->declaredParamTypes());
+    }
     if (newSymp && newSymp->returnTypep()
         && newSymp->returnTypep()->base()->kind() == VhdlTypeKind::ARRAY
         && !newSymp->returnTypep()->lengthEmittable()) {
@@ -11633,8 +11751,10 @@ VhdlType* VhdlSemVisitor::constrainArrayFromIndices(VhdlType* typep,
     }
     const VhdlType* const declIdxp
         = typep->indexTypes().empty() ? typep->base()->indexTypes()[0] : typep->indexTypes()[0];
-    // Which way round the formal's own range runs, where its subtype says
-    const bool ascending = declIdxp && declIdxp->boundsp() ? declIdxp->ascending() : false;
+    // Which way round the formal's own range runs: its subtype's, or else its
+    // index subtype's, NATURAL's for a BIT_VECTOR (6.5.7.1; GHDL gna issue2346, as GHDL
+    // and Questa run it)
+    const bool ascending = declIdxp ? declIdxp->ascending() : true;
     VhdlType* const outp = cloneSubtype(typep, flp);
     VhdlType* const newIndexp
         = cloneSubtype(const_cast<VhdlType*>(typep->base()->indexTypes()[0]), flp);
@@ -13337,6 +13457,9 @@ int64_t VhdlSemVisitor::staticLength(AstNodeVhdlExpr* nodep) {
             const int64_t rLen = rArr ? staticLength(binp->rhsp()) : 0;
             if ((lArr && lLen < 0) || (rArr && rLen < 0)) return -1;
             if (lArr && rArr && lLen != rLen) {
+                // With a null operand numeric_std's are null, and
+                // std_logic_arith's the longer one: what the body says
+                if (lLen == 0 || rLen == 0) return -1;
                 if (binp->op() == VhdlBinaryOp::ADD || binp->op() == VhdlBinaryOp::SUB) {
                     return std::max(lLen, rLen);
                 }
@@ -13777,6 +13900,24 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
         if (unp->op() == VhdlUnaryOp::NOT && opp && opp->predefined() && unp->lhsp()
             && (!valuep->vhdlTypep() || !valuep->vhdlTypep()->lengthEmittable())) {
             return constrainFromValue(typep, unp->lhsp(), flp);
+        }
+    }
+    // An operator a package declares is recorded with its left operand's
+    // subtype until its copy says what it returns. Where an operand is null
+    // that is not the answer -- numeric_std's "+" of one is null (NVC ieee13)
+    // -- so the copy is made now, and says.
+    {
+        const AstVhdlBinary* const binp = VN_CAST(valuep, VhdlBinary);
+        if (m_specp && binp && binp->op() != VhdlBinaryOp::CONCAT && binp->vhdlSymp()
+            && !binp->vhdlSymp()->predefined()) {
+            for (AstNodeVhdlExpr* const sidep : {binp->lhsp(), binp->rhsp()}) {
+                const VhdlType* const tp = sidep ? sidep->vhdlTypep() : nullptr;
+                if (tp && tp->base()->kind() == VhdlTypeKind::ARRAY
+                    && staticLength(sidep) == 0) {
+                    specializeWithin(valuep);
+                    break;
+                }
+            }
         }
     }
     // A value that is itself constrained hands over its index ranges

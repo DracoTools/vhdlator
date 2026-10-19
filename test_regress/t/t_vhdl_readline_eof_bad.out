@@ -1,0 +1,4 @@
+t/t_vhdl_readline_eof_bad.vhd:30:5:@0:(report note): read 2 lines
+%Error: t/t_vhdl_readline_eof_bad.vhd:31: READLINE past the end of the file
+%Error: t/t_vhdl_readline_eof_bad.vhd:31: Verilog $stop
+Aborting...

@@ -1,0 +1,4 @@
+t/t_vhdl_driving_nodrv_bad.vhd:30:5:@1000000:(report note): p1 done
+%Error: t/t_vhdl_driving_nodrv_bad.vhd:38: 'DRIVING of 'x' in a process that does not contain a driver for it
+%Error: t/t_vhdl_driving_nodrv_bad.vhd:38: Verilog $stop
+Aborting...

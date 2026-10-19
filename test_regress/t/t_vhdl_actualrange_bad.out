@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_actualrange_bad.vhd:20: Value -1 is outside of the range 0 to 2147483647 of subtype natural
+%Error: t/t_vhdl_actualrange_bad.vhd:20: Verilog $stop
+Aborting...

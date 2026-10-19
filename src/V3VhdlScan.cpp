@@ -32,6 +32,7 @@
 #include "V3PchAstNoMT.h"  // VL_MT_DISABLED_CODE_UNIT
 
 #include "V3VhdlScan.h"
+#include "V3VhdlSym.h"
 
 #include "V3Global.h"
 
@@ -553,7 +554,9 @@ VhdlToken V3VhdlScan::scanExtendedIdentifier(FileLine* flp) {
     } else if (tok.text.empty()) {
         flp->v3error("Extended identifier may not be empty");
     }
-    // 15.4.3: extended identifiers are case sensitive, so no lowercasing here
+    // 15.4.3: extended identifiers are case sensitive and distinct from
+    // basic ones, so the text is the key that keeps them so (vhdlExtendedKey)
+    tok.text = vhdlExtendedKey(tok.text);
     return tok;
 }
 

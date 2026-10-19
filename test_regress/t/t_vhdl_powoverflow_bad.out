@@ -1,0 +1,3 @@
+t/t_vhdl_powoverflow_bad.vhd:22:5:@0:(report failure): 2 ** 31 should have stopped the run
+%Error: t/t_vhdl_powoverflow_bad.vhd:22: Verilog $stop
+Aborting...

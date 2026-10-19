@@ -45,6 +45,7 @@
 #include "V3VhdlSem.h"
 #include "V3VhdlParse.h"
 #include "V3VhdlScan.h"
+#include "V3VhdlSym.h"
 
 #include "V3Os.h"
 
@@ -71,7 +72,11 @@ void dumpToken(const VhdlToken& token) {
               << token.flp->firstColumn() << ": " << vhdlTokName(token.type);
     switch (token.type) {
     case VhdlTokType::IDENTIFIER:
-        std::cout << " " << (token.extendedId ? "\\" + token.text + "\\" : token.text);
+        // An extended identifier as the source writes it (vhdlExtendedKey)
+        std::cout << " "
+                  << (vhdlIsExtendedName(token.text)
+                          ? "\\" + vhdlExtendedText(token.text) + "\\"
+                          : token.text);
         break;
     case VhdlTokType::CHARACTER_LIT: std::cout << " '" << token.text << "'"; break;
     case VhdlTokType::STRING_LIT:

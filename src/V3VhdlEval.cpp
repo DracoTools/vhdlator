@@ -391,6 +391,17 @@ public:
         VL_RESTORER(m_depth);
         ++m_depth;
         if (AstVhdlLiteral* const p = VN_CAST(nodep, VhdlLiteral)) return evalLiteral(p);
+        // NOW while a declaration elaborates is 0 ns: the simulation has not begun
+        // (14.4.2; GHDL gna issue648, "constant L : positive := 9 + now / 1 ns")
+        if (V3VhdlEval::s_elabNow && (VN_IS(nodep, VhdlName) || (VN_IS(nodep, VhdlCall)
+                                                     && !VN_AS(nodep, VhdlCall)->argsp()))) {
+            const VhdlSymbol* const nowp = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved()
+                                                              : nullptr;
+            if (nowp && nowp->kind() == VhdlSymKind::FUNCTION && nowp->predefined()
+                && nowp->name() == "now" && nowp->paramTypes().empty()) {
+                return VhdlValue::mkInt(0, V3VhdlStd::timeType());
+            }
+        }
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) return evalSymbol(p->vhdlSymp());
         if (AstVhdlSelected* const p = VN_CAST(nodep, VhdlSelected)) {
             // "p.all" is what an access value designates (8.3)
@@ -415,6 +426,16 @@ public:
         if (AstVhdlBinary* const p = VN_CAST(nodep, VhdlBinary)) return evalBinary(p);
         if (AstVhdlQualified* const p = VN_CAST(nodep, VhdlQualified)) {
             VhdlValue val = eval(p->valuep());
+            // An operand outside the subtype is an error, not a value (9.3.5): it is left to
+            // the run, which stops there, as GHDL does (gna issue1240)
+            const VhdlType* const qtypep = p->vhdlTypep();
+            const VhdlTypeKind qkind = qtypep ? qtypep->base()->kind() : VhdlTypeKind::ERROR;
+            if (val.known() && !val.isComposite() && qtypep && qtypep->bounded()
+                && (qkind == VhdlTypeKind::INTEGER || qkind == VhdlTypeKind::PHYSICAL
+                    || qkind == VhdlTypeKind::ENUM || qkind == VhdlTypeKind::FLOATING)
+                && !V3VhdlEval::inRange(val, qtypep)) {
+                return VhdlValue{};
+            }
             if (val.known() && p->vhdlTypep()) val.typep(p->vhdlTypep());
             return val;
         }
@@ -1570,7 +1591,7 @@ private:
         if (attr == "simple_name") {
             VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
             if (!symp) return VhdlValue{};
-            return VhdlValue::mkStr(symp->name(), V3VhdlStd::stringType());
+            return VhdlValue::mkStr(vhdlDisplayName(symp->name()), V3VhdlStd::stringType());
         }
         return VhdlValue{};
     }
@@ -1720,7 +1741,36 @@ private:
             // a report statement, or an assertion whose condition is false --
             // is output the run has to produce, so the call is left to run
             // (GHDL gna issue321). See s_keepReports.
-            if (!V3VhdlEval::s_keepReports) return Flow::NORMAL;
+            if (!V3VhdlEval::s_keepReports) {
+                // Elaboration says what it says once, and a caller collecting it prints it
+                if (std::vector<V3VhdlEval::ElabReport>* const sinkp
+                    = V3VhdlEval::s_elabReportsp) {
+                    bool fires = ap->isReport();
+                    if (!fires) {
+                        const VhdlValue condv = eval(ap->condp());
+                        if (!condv.isInt()) return bail();
+                        fires = condv.toInt() == 0;
+                    }
+                    if (fires) {
+                        int severity = ap->isReport() ? 0 : 2;
+                        if (ap->severityp()) {
+                            const VhdlValue sevv = eval(ap->severityp());
+                            if (!sevv.isInt()) return bail();
+                            severity = static_cast<int>(sevv.toInt());
+                        }
+                        std::string text;
+                        if (ap->reportp()) {
+                            const VhdlValue textv = eval(ap->reportp());
+                            if (!textv.isStr()) return bail();
+                            text = textv.toStr();
+                        }
+                        sinkp->push_back(V3VhdlEval::ElabReport{
+                            ap->fileline(), ap->isReport(), severity, ap->reportp() != nullptr,
+                            text});
+                    }
+                }
+                return Flow::NORMAL;
+            }
             if (ap->isReport()) return bail();
             const VhdlValue condv = eval(ap->condp());
             if (condv.isInt() && condv.toInt() == 0) return bail();
@@ -2582,6 +2632,10 @@ private:
 
 bool V3VhdlEval::s_sharedInitValues = false;
 bool V3VhdlEval::s_keepReports = false;
+bool V3VhdlEval::s_elabNow = false;
+std::vector<V3VhdlEval::ElabReport>* V3VhdlEval::s_elabReportsp = nullptr;
+std::vector<std::pair<const VhdlSymbol*, std::vector<V3VhdlEval::ElabReport>>>
+    V3VhdlEval::s_constReports;
 std::set<const VhdlSymbol*> V3VhdlEval::s_archShared;
 std::set<const VhdlSymbol*> V3VhdlEval::s_elabWritten;
 std::set<const VhdlSymbol*> V3VhdlEval::s_elabObjects;
@@ -2672,17 +2726,7 @@ std::string V3VhdlEval::image(const VhdlValue& val) {
 }
 
 std::string V3VhdlEval::literalImage(const std::string& name) {
-    const bool charLit = name.size() >= 3 && name.front() == '\'' && name.back() == '\'';
-    const bool extended = !charLit && std::any_of(name.begin(), name.end(), [](char c) {
-        return !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_');
-    });
-    if (!extended) return name;
-    std::string out = "\\";
-    for (const char c : name) {
-        out += c;
-        if (c == '\\') out += c;
-    }
-    return out + "\\";
+    return vhdlDisplayName(name);
 }
 
 VhdlValue V3VhdlEval::fromImage(const std::string& text, VhdlType* typep) {
@@ -2696,21 +2740,38 @@ VhdlValue V3VhdlEval::fromImage(const std::string& text, VhdlType* typep) {
     switch (basep->kind()) {
     case VhdlTypeKind::INTEGER:
     case VhdlTypeKind::UNIVERSAL_INTEGER: {
+        // An underline may separate digits (15.5.2)
+        std::string digits;
+        for (const char c : body) {
+            if (c != '_') digits += c;
+        }
         char* endp = nullptr;
-        const long long v = std::strtoll(body.c_str(), &endp, 10);
+        const long long v = std::strtoll(digits.c_str(), &endp, 10);
         if (!endp || *endp) return VhdlValue{};
         return VhdlValue::mkInt(static_cast<int64_t>(v), typep);
     }
     case VhdlTypeKind::FLOATING: {
+        std::string digits;
+        for (const char c : body) {
+            if (c != '_') digits += c;
+        }
         char* endp = nullptr;
-        const double v = std::strtod(body.c_str(), &endp);
+        const double v = std::strtod(digits.c_str(), &endp);
         if (!endp || *endp) return VhdlValue{};
         return VhdlValue::mkReal(v, typep);
     }
     case VhdlTypeKind::ENUM: {
         // Case insensitive for an identifier, exact for a character literal
         std::string want = body;
-        if (want.size() != 3 || want.front() != '\'' || want.back() != '\'') {
+        if (vhdlIsExtendedName(want) && want.size() > 2) {
+            // An extended identifier as written, its own backslashes doubled
+            std::string text;
+            for (size_t i = 1; i + 1 < want.size(); ++i) {
+                text += want[i];
+                if (want[i] == '\\' && want[i + 1] == '\\' && i + 2 < want.size()) ++i;
+            }
+            want = vhdlExtendedKey(text);
+        } else if (want.size() != 3 || want.front() != '\'' || want.back() != '\'') {
             for (char& c : want) {
                 if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
             }

@@ -69,6 +69,21 @@ public:
     // design is elaborated -- the call still folds, its value being needed
     // there and its report being one elaboration would make.
     static bool s_keepReports;
+    // While a constant a design unit or a block declares is elaborated, outside any
+    // subprogram or process: NOW is then 0 ns (14.4.2)
+    static bool s_elabNow;
+    // What the code elaboration runs to fold a value reports: a report statement, or an
+    // assertion whose condition is false (10.3). Collected while s_elabReportsp is set,
+    // and kept per constant folded so, whose elaboration is what says it (14.4.2).
+    struct ElabReport final {
+        FileLine* flp;  // The statement that reports
+        bool isReport;  // A report, not an assertion
+        int severity;  // NOTE 0 .. FAILURE 3
+        bool hasText;  // Else the default "Assertion violation."
+        std::string text;
+    };
+    static std::vector<ElabReport>* s_elabReportsp;
+    static std::vector<std::pair<const VhdlSymbol*, std::vector<ElabReport>>> s_constReports;
     // While an architecture's own declarations elaborate, the shared
     // variables it declared, which an impure function called there reads
     // and writes in the order the declarations elaborate (14.4.2): each

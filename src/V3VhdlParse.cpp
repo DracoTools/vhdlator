@@ -347,7 +347,7 @@ void V3VhdlParse::toolDirective(const VhdlToken& tok) {
 // and a numeric literal may be written differently if its value is the same
 static std::string conformanceSpelling(const VhdlToken& tok) {
     switch (tok.type) {
-    case VhdlTokType::IDENTIFIER: return tok.extendedId ? "\\" + tok.text + "\\" : tok.text;
+    case VhdlTokType::IDENTIFIER: return tok.text;  // An extended one is keyed apart already
     case VhdlTokType::INTEGER_LIT: return "#" + std::to_string(tok.intVal);
     case VhdlTokType::REAL_LIT: {
         std::ostringstream os;

@@ -53,6 +53,89 @@ class FileLine;
 inline std::string vhdlCharLitName(const std::string& text) { return "'" + text + "'"; }
 
 //============================================================================
+// An extended identifier is case sensitive and distinct from every basic one
+// (15.4.3), but names are compared lowercased throughout. So the scanner keys
+// one by a form lowercasing leaves alone: between backslashes, an uppercase
+// letter as a backslash before its lowercase, and a backslash doubled.
+// "\Foo\" is keyed "\\foo\", "\foo\" is "\foo\", and neither is "foo".
+inline bool vhdlIsExtendedName(const std::string& name) {
+    return name.size() >= 2 && name.front() == '\\' && name.back() == '\\';
+}
+inline std::string vhdlExtendedKey(const std::string& text) {
+    std::string out = "\\";
+    for (const char c : text) {
+        if (c >= 'A' && c <= 'Z') {
+            out += '\\';
+            out += static_cast<char>(c - 'A' + 'a');
+        } else if (c == '\\') {
+            out += "\\\\";
+        } else {
+            out += c;
+        }
+    }
+    return out + "\\";
+}
+// The identifier a key stands for, without its backslashes: what TO_STRING
+// gives (5.7). A basic one is itself.
+inline std::string vhdlExtendedText(const std::string& name) {
+    if (!vhdlIsExtendedName(name)) return name;
+    std::string out;
+    for (size_t i = 1; i + 1 < name.size(); ++i) {
+        if (name[i] == '\\' && i + 2 < name.size()) {
+            const char c = name[++i];
+            out += c == '\\' ? c : static_cast<char>(c - 'a' + 'A');
+        } else {
+            out += name[i];
+        }
+    }
+    return out;
+}
+// A text names are written into -- a path, ":top(a):\\foo\:" -- with each key
+// in it written as the source writes the identifier. Inside a key a backslash
+// is always followed by another or by a lowercase letter, so where one is
+// not, the key ends.
+inline std::string vhdlDisplayText(const std::string& text) {
+    if (text.find('\\') == std::string::npos) return text;
+    std::string out;
+    bool inKey = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c != '\\') {
+            out += c;
+            continue;
+        }
+        if (!inKey) {
+            inKey = true;
+            out += c;
+            continue;
+        }
+        const char n = i + 1 < text.size() ? text[i + 1] : '\0';
+        if (n == '\\') {
+            out += "\\\\";
+            ++i;
+        } else if (n >= 'a' && n <= 'z') {
+            out += static_cast<char>(n - 'a' + 'A');
+            ++i;
+        } else {
+            inKey = false;
+            out += c;
+        }
+    }
+    return out;
+}
+// The identifier as the source writes it, backslashes and all: what 'IMAGE,
+// 'SIMPLE_NAME and 'PATH_NAME give (16.2), and what a message shows
+inline std::string vhdlDisplayName(const std::string& name) {
+    if (!vhdlIsExtendedName(name)) return name;
+    std::string out = "\\";
+    for (const char c : vhdlExtendedText(name)) {
+        out += c;
+        if (c == '\\') out += c;
+    }
+    return out + "\\";
+}
+
+//============================================================================
 // What a name denotes
 
 enum class VhdlSymKind : uint8_t {
@@ -102,6 +185,9 @@ class VhdlSymbol final {
     std::vector<std::string> m_paramNames;
     std::vector<bool> m_paramDefaults;
     std::vector<bool> m_paramGenerics;  // Written with a generic type's name
+    // A copy made for one call declares each parameter with the subtype the call supplies;
+    // these are the subtypes the subprogram declares, which an actual must belong to
+    std::vector<VhdlType*> m_declaredParamTypes;
     VhdlType* m_returnTypep = nullptr;
     int m_position = 0;  // Enumeration literal position, or record element index
     bool m_predefined = false;  // Comes from std.standard rather than source
@@ -247,6 +333,12 @@ public:
     void elabValue(const VhdlValue& val) { m_elabValue = val; }
 
     const std::vector<VhdlType*>& paramTypes() const { return m_paramTypes; }
+    const std::vector<VhdlType*>& declaredParamTypes() const {
+        return m_declaredParamTypes.empty() ? m_paramTypes : m_declaredParamTypes;
+    }
+    void declaredParamTypes(const std::vector<VhdlType*>& typeps) {
+        m_declaredParamTypes = typeps;
+    }
     void addParamType(VhdlType* typep) {
         m_paramTypes.push_back(typep);
         m_paramNames.emplace_back();

@@ -1,0 +1,5 @@
+t/t_vhdl_elabreport.vhd:39:5:@0:(assertion warning): n is 42
+t/t_vhdl_elabreport.vhd:20:5:@0:(report note): get1 called
+t/t_vhdl_elabreport.vhd:26:5:@0:(report note): get called, return: 123
+t/t_vhdl_elabreport.vhd:26:5:@0:(report note): get called, return: 123
+t/t_vhdl_elabreport.vhd:59:5:@1000000:(report note): *-* All Finished *-*

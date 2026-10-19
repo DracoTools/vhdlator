@@ -210,6 +210,9 @@ class VhdlLowerVisitor final {
     // How many of a signal's drivers have been lowered, which is the index of
     // the one being lowered now
     std::map<const VhdlSymbol*, int> m_driverUsed;
+    // The signals the process being lowered drives, which 'DRIVING asks
+    // about (16.2.4); null outside a process
+    const std::set<const VhdlSymbol*>* m_procDrivenp = nullptr;
     // A protected type becomes a class, and a shared variable of it an
     // instance of that class (5.6). The class is built once, on first use.
     std::map<const VhdlType*, AstClass*> m_protClasses;
@@ -233,6 +236,14 @@ class VhdlLowerVisitor final {
     bool m_checkAsCall = false;
     bool m_inStmts = false;  // Lowering the statements of a process or subprogram
     bool m_nineWarningDropped = false;  // A native warning had no statement to go in
+    // Lowering a concurrent assignment's value, which a check may be written into in line, as
+    // the value is computed each time the statement runs (11.6)
+    bool m_checksInValue = false;
+    // Whether a run-time check can be written where lowering is now
+    bool checksHere() const { return m_inStmts || m_checksInValue; }
+    // Actuals a function call associates with a scalar formal of a narrower
+    // subtype, which each must belong to (4.2.2.1, 14.6), and that subtype
+    std::map<const AstNodeVhdlExpr*, const VhdlType*> m_actualChecks;
     // The nets that hold an operand of a native operation in the concurrent part, and the
     // value each follows
     std::map<const AstVar*, const AstNodeExpr*> m_concHolds;
@@ -527,6 +538,8 @@ public:
     void addLogicPosPins() VL_MT_DISABLED;
     void twoStateBoundaryPorts() VL_MT_DISABLED;
     void hoistTargetStatements() VL_MT_DISABLED;
+    void encodeExtendedNames() VL_MT_DISABLED;
+    void emitElabReports() VL_MT_DISABLED;
     // Bit k of a vector of the nine values as Verilog reads it -- 1 for '1'
     // and 'H', 0 for anything else -- and back, '0' or '1'; scalar where the
     // value is one element
@@ -5659,7 +5672,7 @@ private:
     // way it runs. False where there is no such range to check against.
     bool checkRange(const VhdlType* arrayTypep, int dim, FileLine* flp, AstNodeExpr*& leftp,
                     AstNodeExpr*& rightp, bool& ascending, const VhdlType*& idxpr) {
-        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return false;
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return false;
         if (!arrayTypep || arrayTypep->base()->kind() != VhdlTypeKind::ARRAY
             || stringBehind(arrayTypep) || arrayTypep->dimOpen(dim)) {
             return false;
@@ -5749,7 +5762,7 @@ private:
     }
     AstNodeExpr* checkedIndex(const AstNodeVhdlExpr* actualp, AstNodeExpr* indexp,
                               const VhdlType* arrayTypep, int dim, FileLine* flp) {
-        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return indexp;
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return indexp;
         const AstConst* const constp = VN_CAST(indexp, Const);
         if (!constp && elabOnly(indexp)) return indexp;
         AstNodeExpr* leftp = nullptr;
@@ -5854,9 +5867,37 @@ private:
     // itself needs none, being exactly what it is held as; REAL is checked,
     // for the infinities arithmetic can give.
     std::map<std::string, AstNodeFTask*> m_rangeChkFuncs;
+    // A value elaboration folds outside the subtype it is given -- "constant
+    // c : natural := -1", a generic mapped to one -- is an error of
+    // elaboration, where nvc, GHDL and Questa stop (14.4.2.5): the model
+    // stops when it starts. Not in a subprogram, which elaboration does not
+    // run, and once per place.
+    std::set<std::pair<std::string, int>> m_elabFailed;  // Each place stops once
+    void elabStop(FileLine* flp, const std::string& msg) {
+        if (!m_modp || m_ftaskp || m_protClassp) return;
+        if (!m_elabFailed.emplace(flp->filename(), flp->lineno()).second) return;
+        AstNode* const stmtsp = new AstDisplay{
+            flp, VDisplayType::DT_DISPLAY,
+            "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno()) + ": " + msg,
+            nullptr, nullptr};
+        stmtsp->addNext(new AstStop{flp, true});
+        m_modp->addStmtsp(new AstInitial{flp, stmtsp});
+    }
+    void elabRangeFailure(const VhdlType* typep, const AstNodeVhdlExpr* valuep, FileLine* flp) {
+        if (!valuep) return;
+        const VhdlValue val = V3VhdlEval::eval(const_cast<AstNodeVhdlExpr*>(valuep));
+        if (!val.known() || val.isComposite() || V3VhdlEval::inRange(val, typep)) return;
+        const bool real = typep->base()->kind() == VhdlTypeKind::FLOATING;
+        const std::string lo = real ? V3VhdlEval::image(VhdlValue::mkReal(typep->lowReal()))
+                                    : std::to_string(typep->low());
+        const std::string hi = real ? V3VhdlEval::image(VhdlValue::mkReal(typep->highReal()))
+                                    : std::to_string(typep->high());
+        elabStop(flp, "Value " + V3VhdlEval::image(val) + " is outside of the range " + lo
+                          + " to " + hi + " of subtype " + typep->prettyName());
+    }
     AstNodeExpr* rangeChecked(AstNodeExpr* valp, const VhdlType* typep,
                               const AstNodeVhdlExpr* valuep, FileLine* flp) {
-        if (!valp || !typep || !v3Global.opt.vhdlBoundCheck() || !m_inStmts) return valp;
+        if (!valp || !typep || !v3Global.opt.vhdlBoundCheck()) return valp;
         const VhdlType* const basep = typep->base();
         const VhdlTypeKind kind = basep->kind();
         const bool real = kind == VhdlTypeKind::FLOATING;
@@ -5898,6 +5939,13 @@ private:
             const VhdlValue val
                 = valuep ? V3VhdlEval::eval(const_cast<AstNodeVhdlExpr*>(valuep)) : VhdlValue{};
             if (val.known() && V3VhdlEval::inRange(val, typep)) return valp;
+        }
+        // A check is made when the statement it is in runs, or in line in a
+        // concurrent assignment's value. Outside those there is nowhere to make
+        // it, and only what elaboration folds is checked, when the model starts
+        if (!checksHere()) {
+            elabRangeFailure(typep, valuep, flp);
+            return valp;
         }
         const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
         // A REAL bound as its image, which reads back as the same number
@@ -5967,7 +6015,7 @@ private:
     // divisor is handed back, or the run stops. Under --vhdl-bound-check,
     // and not for a divisor that is a number other than zero.
     AstNodeExpr* divisorChecked(AstNodeExpr* rhsp, VhdlType* rtypep, FileLine* flp) {
-        if (!rhsp || !rtypep || !v3Global.opt.vhdlBoundCheck() || !m_inStmts) return rhsp;
+        if (!rhsp || !rtypep || !v3Global.opt.vhdlBoundCheck() || !checksHere()) return rhsp;
         const VhdlTypeKind kind = rtypep->base()->kind();
         if (kind != VhdlTypeKind::INTEGER && kind != VhdlTypeKind::PHYSICAL) return rhsp;
         if (const AstConst* const constp = VN_CAST(rhsp, Const)) {
@@ -6064,7 +6112,7 @@ private:
     // INTEGER arithmetic, which overflows, where nvc and GHDL stop the run (NVC ieee20). The
     // value, held in 64 bits with the vector's signedness, is handed back, or the run stops.
     AstNodeExpr* intRangeChecked(AstNodeExpr* v64p, bool sgn, FileLine* flp) {
-        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return v64p;
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return v64p;
         AstNodeDType* const dtypep
             = new AstBasicDType{flp, VBasicDTypeKwd::LOGIC,
                                 sgn ? VSigning::SIGNED : VSigning::UNSIGNED, VNumRange{63, 0}, -1};
@@ -6089,7 +6137,7 @@ private:
     // 32 bits it would be another number. The value is handed back after the run stops.
     AstNodeExpr* staticIntChecked(AstNodeExpr* constp, const VhdlValue& val, const VhdlType* typep,
                                   FileLine* flp) {
-        if (!constp || !typep || !val.isInt() || !v3Global.opt.vhdlBoundCheck() || !m_inStmts) {
+        if (!constp || !typep || !val.isInt() || !v3Global.opt.vhdlBoundCheck() || !checksHere()) {
             return constp;
         }
         const VhdlTypeKind kind = typep->base()->kind();
@@ -6113,7 +6161,7 @@ private:
     // GHDL and Questa stop the run (NVC bounds30). Under --vhdl-bound-check,
     // and not for an exponent that is a number of zero or more.
     AstNodeExpr* exponentChecked(AstNodeExpr* rhsp, FileLine* flp) {
-        if (!rhsp || !v3Global.opt.vhdlBoundCheck() || !m_inStmts || elabOnly(rhsp)) return rhsp;
+        if (!rhsp || !v3Global.opt.vhdlBoundCheck() || !checksHere() || elabOnly(rhsp)) return rhsp;
         if (const AstConst* const constp = VN_CAST(rhsp, Const)) {
             if (!constp->num().isNegative()) return rhsp;
         }
@@ -6124,11 +6172,38 @@ private:
             },
             "Negative exponent %0d of an integer", flp);
     }
+    // An INTEGER "**" whose result INTEGER cannot hold is an error (9.2.8),
+    // where nvc and GHDL stop the run: "2 ** 31" (GHDL gna issue2646, issue683;
+    // Questa computes it wider). Worked out as a REAL, which is exact that far,
+    // beside the INTEGER result. Where both operands can be read twice.
+    AstNode* powOverflowCheck(AstNodeExpr* lhsp, AstNodeExpr* rhsp, FileLine* flp) {
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere() || !repeatable(lhsp)
+            || !repeatable(rhsp) || elabOnly(lhsp) || elabOnly(rhsp)) {
+            return nullptr;
+        }
+        if (VN_IS(lhsp, Const) && VN_IS(rhsp, Const)) return nullptr;  // Folded, and checked so
+        AstNodeExpr* const realp
+            = new AstPowD{flp, new AstIToRD{flp, lhsp->cloneTree(false)},
+                          new AstIToRD{flp, rhsp->cloneTree(false)}};
+        AstNodeExpr* const checkedp = stopWhere(
+            realp, new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE}, "pow",
+            [&](AstNodeExpr* vp) {
+                return new AstLogOr{
+                    flp,
+                    new AstGtD{flp, vp, new AstConst{flp, AstConst::RealDouble{}, 2147483647.0}},
+                    new AstLtD{flp, vp->cloneTree(false),
+                               new AstConst{flp, AstConst::RealDouble{}, -2147483648.0}}};
+            },
+            "The result %g of ** cannot be represented as INTEGER", flp);
+        AstVar* const tmpp
+            = newTempVar("__Vpow", new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE}, flp);
+        return new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, checkedp};
+    }
     // "T'VAL(n)" of an enumeration type is an error where no value of T is at
     // position n (16.2.3), where nvc, GHDL and Questa stop the run (NVC
     // bounds6). A number type's 'VAL is its value, checked as one.
     AstNodeExpr* valPositionChecked(AstNodeExpr* argp, const VhdlType* typep, FileLine* flp) {
-        if (!argp || !typep || !v3Global.opt.vhdlBoundCheck() || !m_inStmts || elabOnly(argp)) {
+        if (!argp || !typep || !v3Global.opt.vhdlBoundCheck() || !checksHere() || elabOnly(argp)) {
             return argp;
         }
         const VhdlType* const basep = typep->base();
@@ -6294,7 +6369,7 @@ private:
     // is checked; the right end is read again, so it has to be pure
     AstNodeExpr* checkedSliceLeft(AstNodeExpr* sliceLeftp, AstNodeExpr* sliceRightp,
                                   const VhdlType* arrayTypep, FileLine* flp) {
-        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts) return sliceLeftp;
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return sliceLeftp;
         if (VN_IS(sliceLeftp, Const) && VN_IS(sliceRightp, Const)) return sliceLeftp;
         if (!sliceRightp->isPure()) return sliceLeftp;
         // Ends that read only generics are settled when the instance is, and
@@ -6322,7 +6397,7 @@ private:
     // reports those the analysis settles. The left end is handed back, or the run stops.
     AstNodeExpr* sliceDirChecked(AstNodeExpr* sliceLeftp, AstNodeExpr* sliceRightp, bool sliceAsc,
                                  bool sliceDirKnown, const VhdlType* arrayTypep, FileLine* flp) {
-        if (!v3Global.opt.vhdlBoundCheck() || !m_inStmts || !sliceDirKnown) return sliceLeftp;
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere() || !sliceDirKnown) return sliceLeftp;
         if (VN_IS(sliceLeftp, Const) && VN_IS(sliceRightp, Const)) return sliceLeftp;
         if (!sliceRightp->isPure() || (elabOnly(sliceLeftp) && elabOnly(sliceRightp))) {
             return sliceLeftp;
@@ -9686,6 +9761,22 @@ private:
                     return;
                 }
             }
+            // An aggregate whose elements are of different lengths, for an array whose
+            // element subtype is left open (GHDL gna issue2131, issue1723, issue3055)
+            if (objp->defaultp() && v3Global.opt.vhdlBoundCheck()) {
+                const std::string msg = aggElementsDiffer(objp->defaultp(), symp->typep());
+                if (!msg.empty()) {
+                    AstNode* const failp = new AstDisplay{
+                        flp, VDisplayType::DT_DISPLAY,
+                        "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno()) + ": "
+                            + msg,
+                        nullptr, nullptr};
+                    failp->addNext(new AstStop{flp, true});
+                    addStmt(varp);
+                    addStmt(m_ftaskp ? failp : new AstInitial{flp, failp});
+                    return;
+                }
+            }
             // Anywhere, an initial value elaboration folds that does not fit
             // its object -- another length, or a number outside its subtype
             // -- is an error once the declaration is elaborated (5.3.2.2,
@@ -10473,7 +10564,98 @@ private:
         }
     }
 
+    // The checks a value makes of itself, which have to be made before it is
+    // folded: "natural'(-1)" is a constant, and an error (9.3.5)
+    // - A qualified expression's operand belongs to the subtype it names
+    //   (9.3.5), where elaboration folds it, and a type conversion's result
+    //   to its type mark's (9.3.6).
+    // - An actual a function call associates with a scalar formal belongs to
+    //   the formal's subtype (4.2.2.1, 14.6): TO_UNSIGNED(-1, 8) is an error.
     AstNodeExpr* lowerExpr(AstNodeVhdlExpr* nodep) {
+        if (!nodep || !v3Global.opt.vhdlBoundCheck()) return lowerExprUnchecked(nodep);
+        const VhdlType* checkp = nullptr;
+        AstNodeVhdlExpr* ofp = nullptr;  // What the value is written as, if it says
+        if (!m_actualChecks.empty()) {
+            const auto it = m_actualChecks.find(nodep);
+            if (it != m_actualChecks.end()) {
+                checkp = it->second;
+                ofp = nodep;
+            }
+        }
+        if (!checkp) {
+            // Only an operand that folds: one that does not is not checked by
+            // nvc or GHDL, only by Questa
+            AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified);
+            if (qp && qp->valuep() && V3VhdlEval::eval(qp->valuep()).known()) {
+                checkp = nodep->vhdlTypep();
+                ofp = qp->valuep();
+            } else if (conversionOperand(nodep)) {
+                // Its operand is of another type and says nothing of the
+                // range; the conversion itself may fold, and say
+                checkp = nodep->vhdlTypep();
+                ofp = nodep;
+            }
+        }
+        if (!checkp || !scalarRanged(checkp)) return lowerExprUnchecked(nodep);
+        // Lowered once, as itself: what it is made of is checked in its turn
+        VL_RESTORER_COPY(m_actualChecks);
+        m_actualChecks.erase(nodep);
+        AstNodeExpr* const valp = lowerExprUnchecked(nodep);
+        // Of generics, constants and calls of them only, it may be a width the call's result
+        // is sized by -- TO_SIGNED(5, PIPELINE_BITS) -- which has to stay a constant:
+        // elaboration checks it
+        if (valp && !VN_IS(valp, Const) && (elabOnly(valp) || readsNoObject(nodep))) {
+            elabRangeFailure(checkp, ofp, nodep->fileline());
+            return valp;
+        }
+        return rangeChecked(valp, checkp, ofp, nodep->fileline());
+    }
+    // Whether an expression reads no signal, port, variable or parameter, and no
+    // external name: what elaboration alone decides (9.4.3)
+    static bool readsNoObject(AstNodeVhdlExpr* nodep) {
+        if (nodep->exists([](const AstVhdlExternalName*) { return true; })) return false;
+        return !nodep->exists([](const AstVhdlName* namep) {
+            const VhdlSymbol* const symp
+                = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+            if (!symp) return false;
+            switch (symp->kind()) {
+            case VhdlSymKind::SIGNAL:
+            case VhdlSymKind::PORT:
+            case VhdlSymKind::VARIABLE:
+            case VhdlSymKind::SHARED_VARIABLE:
+            case VhdlSymKind::PARAMETER:
+            case VhdlSymKind::ALIAS: return true;
+            default: return false;
+            }
+        });
+    }
+    // A scalar subtype narrower than what its type can hold, which a value
+    // may lie outside of
+    static bool scalarRanged(const VhdlType* typep) {
+        if (!typep || !typep->bounded() || typep->isNull()) return false;
+        const VhdlTypeKind kind = typep->base()->kind();
+        if (kind == VhdlTypeKind::FLOATING) return typep != typep->base();
+        if (kind != VhdlTypeKind::INTEGER && kind != VhdlTypeKind::PHYSICAL
+            && kind != VhdlTypeKind::ENUM) {
+            return false;
+        }
+        if (kind == VhdlTypeKind::ENUM && enumIsLogic(typep->base())) return false;
+        return typep != typep->base() || kind == VhdlTypeKind::INTEGER;
+    }
+    // The operand of a type conversion, "t(x)": a call whose prefix names a
+    // type, with one association and no formal (9.3.6)
+    static AstNodeVhdlExpr* conversionOperand(AstNodeVhdlExpr* nodep) {
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        if (!callp || !callp->prefixp() || !callp->argsp() || callp->argsp()->nextp()) {
+            return nullptr;
+        }
+        const VhdlSymbol* const prefixp = callp->prefixp()->vhdlSymp();
+        if (!prefixp || prefixp->resolved()->kind() != VhdlSymKind::TYPE) return nullptr;
+        AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+        if (asp && asp->formalp()) return nullptr;
+        return asp ? asp->actualp() : VN_CAST(callp->argsp(), NodeVhdlExpr);
+    }
+    AstNodeExpr* lowerExprUnchecked(AstNodeVhdlExpr* nodep) {
         if (!nodep) return nullptr;
         FileLine* const flp = nodep->fileline();
         // A bound hoisted into a parameter of the module is that parameter,
@@ -11030,6 +11212,17 @@ private:
             if (!wantp && nodep->prefixp()) wantp = nodep->prefixp()->vhdlTypep();
             if (!wantp && nodep->prefixp() && nodep->prefixp()->vhdlSymp()) {
                 wantp = nodep->prefixp()->vhdlSymp()->typep();
+            }
+            // Text elaboration folds that holds nothing, which is no value of any type,
+            // outside a subprogram, which elaboration does not run: the model stops when it
+            // starts (16.2.3; GHDL gna bug0143). Other text is left to the run's own reader.
+            if (!m_ftaskp && wantp && v3Global.opt.vhdlBoundCheck()) {
+                const VhdlValue textv = V3VhdlEval::eval(nodep->argp());
+                if (textv.isStr()
+                    && textv.toStr().find_first_not_of(" \t") == std::string::npos) {
+                    elabStop(flp, "'VALUE of \"" + textv.toStr() + "\" is not a value of "
+                                      + wantp->prettyName());
+                }
             }
             if (AstNodeFTask* const funcp = valueFuncFor(wantp, flp)) {
                 AstNodeExpr* const textp = lowerExpr(nodep->argp());
@@ -13144,6 +13337,29 @@ private:
         const VhdlSymbol* const symp = rootSymOf(nodep->prefixp());
         if (!symp) return nullptr;
         VhdlSymbol* const rsymp = const_cast<VhdlSymbol*>(pkgAliasBase(symp->resolved()));
+        // Asked in a process that has no driver for the signal, the two are
+        // an error (16.2.4), where nvc and GHDL stop the run when it is
+        // evaluated (NVC driver7). Not in a subprogram, whose signal may be
+        // driven through the process that calls it.
+        if (m_procDrivenp && !m_ftaskp && rsymp->kind() == VhdlSymKind::SIGNAL
+            && !m_procDrivenp->count(rsymp) && !m_procDrivenp->count(symp)) {
+            AstNode* const stmtsp = new AstDisplay{
+                flp, VDisplayType::DT_DISPLAY,
+                "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno()) + ": '"
+                    + VString::upcase(attr) + " of '" + symp->name()
+                    + "' in a process that does not contain a driver for it",
+                nullptr, nullptr};
+            stmtsp->addNext(new AstStop{flp, true});
+            if (attr == "driving") {
+                return new AstExprStmt{flp, stmtsp, new AstConst{flp, AstConst::BitFalse{}}};
+            }
+            AstNodeExpr* const valp = lowerExpr(nodep->prefixp());
+            if (!valp) {
+                VL_DO_DANGLING(stmtsp->deleteTree(), stmtsp);
+                return nullptr;
+            }
+            return new AstExprStmt{flp, stmtsp, valp};
+        }
         // A driver that only ever writes part of the signal is not driving
         // the whole of it, and which process wrote which part is not known
         // here, so it is refused rather than answered for the whole
@@ -17806,29 +18022,47 @@ private:
             if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
             return outp;
         } else if (ops.size() == 2 && (op == "?<" || op == "?<=" || op == "?>" || op == "?>=")) {
-            // The matching orderings of two elements (9.2.3): "l ?< r" is
-            // "not l and r", "?<=" "not l or r", "?>" "l and not r", "?>="
-            // "l or not r", over the tables; a '-' on either side is 'X'
+            // The matching orderings of two elements (9.2.3): ?< by its table -- 'X' where
+            // either is '-', else 'U' where either is, else 'X' unless both are '0', '1', 'L'
+            // or 'H', which give '1' only for '0' or 'L' before '1' or 'H' -- and the others
+            // made of it and ?= with STD_LOGIC_1164's "or" and "not": ?<= is ?< or ?=, ?> not
+            // ?<=, and ?>= not ?< (GHDL gna issue1872)
             const NineArg& b = ops[1];
-            const bool lt = op == "?<" || op == "?<=";
-            const bool strict = op == "?<" || op == "?>";
-            // The operand that is negated, and the other
-            const NineArg& negp = lt ? a : b;
-            const NineArg& keepp = lt ? b : a;
-            if (strict) {  // and
-                onep = new AstAnd{flp, laneZero(negp, flp), laneOne(keepp, flp)};
-                zerop = new AstOr{flp, laneOne(negp, flp), laneZero(keepp, flp)};
-            } else {  // or
-                onep = new AstOr{flp, laneZero(negp, flp), laneOne(keepp, flp)};
-                zerop = new AstAnd{flp, laneOne(negp, flp), laneZero(keepp, flp)};
+            AstNodeExpr* const dashp = new AstOr{flp, laneDash(a, flp), laneDash(b, flp)};
+            AstNodeExpr* const uAnyp = new AstAnd{
+                flp, new AstOr{flp, laneU(a, flp), laneU(b, flp)}, new AstNot{flp, dashp}};
+            AstNodeExpr* const bothp = new AstAnd{flp, laneDefined(a, flp), laneDefined(b, flp)};
+            AstNodeExpr* const ltp = new AstAnd{flp, laneZero(a, flp), laneOne(b, flp)};
+            AstNodeExpr* const samep
+                = new AstOr{flp, new AstAnd{flp, laneOne(a, flp), laneOne(b, flp)},
+                            new AstAnd{flp, laneZero(a, flp), laneZero(b, flp)}};
+            struct Lanes final {
+                AstNodeExpr* onep;
+                AstNodeExpr* zerop;
+                AstNodeExpr* up;
+            };
+            const auto c = [](AstNodeExpr* np) { return np->cloneTree(false); };
+            const Lanes lt{new AstAnd{flp, c(bothp), c(ltp)},
+                           new AstAnd{flp, c(bothp), new AstNot{flp, c(ltp)}}, c(uAnyp)};
+            Lanes res = lt;
+            if (op == "?<=" || op == "?>") {
+                const Lanes eq{new AstOr{flp, c(dashp), new AstAnd{flp, c(bothp), c(samep)}},
+                               new AstAnd{flp, c(bothp), new AstNot{flp, c(samep)}}, c(uAnyp)};
+                // STD_LOGIC_1164's "or": '1' where either is, '0' where both are, else 'U'
+                // where either is
+                AstNodeExpr* const orOnep = new AstOr{flp, lt.onep, eq.onep};
+                res = Lanes{orOnep, new AstAnd{flp, lt.zerop, eq.zerop},
+                            new AstAnd{flp, new AstOr{flp, lt.up, eq.up},
+                                       new AstNot{flp, c(orOnep)}}};
             }
-            AstNodeExpr* const notDashp
-                = new AstNot{flp, new AstOr{flp, laneDash(a, flp), laneDash(b, flp)}};
-            onep = new AstAnd{flp, onep, notDashp->cloneTree(false)};
-            zerop = new AstAnd{flp, zerop, notDashp->cloneTree(false)};
-            up = new AstAnd{
-                flp, new AstAnd{flp, new AstOr{flp, laneU(a, flp), laneU(b, flp)}, notDashp},
-                new AstNot{flp, new AstOr{flp, onep->cloneTree(false), zerop->cloneTree(false)}}};
+            if (op == "?>" || op == "?>=") std::swap(res.onep, res.zerop);  // "not"
+            onep = res.onep;
+            zerop = res.zerop;
+            up = res.up;
+            VL_DO_DANGLING(bothp->deleteTree(), bothp);
+            VL_DO_DANGLING(ltp->deleteTree(), ltp);
+            VL_DO_DANGLING(samep->deleteTree(), samep);
+            VL_DO_DANGLING(uAnyp->deleteTree(), uAnyp);
         } else if (ops.size() == 2) {
             const NineArg& b = ops[1];
             if (base == "and") {
@@ -19223,6 +19457,17 @@ private:
                 }
             }
         }
+        // numeric_std's and numeric_bit's "+" and "-" of a null operand give a null array
+        // (NAU), emitted natively under two states; a null array is held as one element
+        // of a bit (GHDL and nvc; NVC ieee13)
+        if (symp && isIeeeOperator(symp, ltypep, rtypep)
+            && (nodep->op() == VhdlBinaryOp::ADD || nodep->op() == VhdlBinaryOp::SUB)
+            && !v3Global.opt.vhdlMetavalues() && ltypep && rtypep
+            && ltypep->base()->kind() == VhdlTypeKind::ARRAY
+            && rtypep->base()->kind() == VhdlTypeKind::ARRAY
+            && (nullArrayType(ltypep) || nullArrayType(rtypep))) {
+            return new AstConst{flp, AstConst::WidthedValue{}, 1, 0};
+        }
         if (symp && !symp->predefined() && !isIeeeOperator(symp, ltypep, rtypep)) {
             if (AstNodeExpr* const outp = lowerUserOperator(
                     const_cast<VhdlSymbol*>(symp), {nodep->lhsp(), nodep->rhsp()}, flp)) {
@@ -19772,12 +20017,16 @@ private:
             // "**" on INTEGER gives an INTEGER (9.2.8). Saying so here rather
             // than leaving the width to be worked out is what lets one stand
             // in a range, where the width pass reaches it already settled.
+            AstNode* const overflowp
+                = isIntegerType(ltypep) && !needsWideInt(ltypep->base())
+                      ? powOverflowCheck(lhsp, rhsp, flp)
+                      : nullptr;
             if (isIntegerType(ltypep)) rhsp = exponentChecked(rhsp, flp);
             AstNodeExpr* const powp
                 = signd ? static_cast<AstNodeExpr*>(new AstPowSS{flp, lhsp, rhsp})
                         : static_cast<AstNodeExpr*>(new AstPow{flp, lhsp, rhsp});
             powp->dtypeSetInteger();
-            return powp;
+            return overflowp ? new AstExprStmt{flp, overflowp, powp} : powp;
         }
         case VhdlBinaryOp::CONCAT: {
             // What an access value points at carries its own bounds, and a
@@ -22584,6 +22833,26 @@ private:
         return true;
     }
 
+    // Each actual of a function call that a scalar formal of a narrower
+    // subtype takes, by position or by the formal's name (6.5.7.1)
+    void noteActualChecks(AstVhdlCall* nodep, const VhdlSymbol* symp) {
+        if (!v3Global.opt.vhdlBoundCheck() || symp->kind() != VhdlSymKind::FUNCTION) return;
+        // As the subprogram declares them: a copy's are what the call supplied
+        const std::vector<VhdlType*>& formals = symp->declaredParamTypes();
+        int pos = 0;
+        for (AstNode* p = nodep->argsp(); p; p = p->nextp(), ++pos) {
+            AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
+            if (!asp || !asp->actualp() || VN_IS(asp->actualp(), VhdlOpen)) continue;
+            int idx = pos;
+            if (asp->formalp()) {
+                const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+                if (!fnamep) continue;  // A conversion or a part of the formal
+                idx = symp->paramIndex(fnamep->name());
+            }
+            if (idx < 0 || idx >= static_cast<int>(formals.size())) continue;
+            if (scalarRanged(formals[idx])) m_actualChecks[asp->actualp()] = formals[idx];
+        }
+    }
     AstNodeExpr* lowerFuncCall(AstVhdlCall* nodep, FileLine* flp) {
         // An alias, or a generic subprogram bound to one, denotes what it was
         // declared for, and that is what is emitted (6.6.1)
@@ -22598,6 +22867,8 @@ private:
             AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
             if (asp && asp->actualp()) args.push_back(asp->actualp());
         }
+        VL_RESTORER_COPY(m_actualChecks);
+        noteActualChecks(nodep, symp);
         if (AstNodeExpr* const outp = lowerIntrinsic(symp, args, nodep, flp)) return outp;
         // A function of a protected type runs on the object it is called on
         AstVhdlSelected* funcSelp = VN_CAST(nodep->prefixp(), VhdlSelected);
@@ -23855,10 +24126,17 @@ private:
             // A value of the aggregate's own type, of another length than the indices it is
             // given: an error once it is evaluated (9.3.3.3), where nvc and Questa stop the run
             // (NVC bounds42)
+            // Outside a statement both lengths are static, so it is an error of
+            // elaboration, where GHDL stops (gna issue2066)
             if ((spanAt[static_cast<size_t>(i)] > 1 || runAt[static_cast<size_t>(i)])
-                && v3Global.opt.vhdlBoundCheck() && m_inStmts) {
+                && v3Global.opt.vhdlBoundCheck()) {
                 const int64_t have = staticValueLength(valuep);
-                if (have >= 0 && have != spanAt[static_cast<size_t>(i)]) {
+                if (have >= 0 && have != spanAt[static_cast<size_t>(i)] && !m_inStmts) {
+                    elabStop(flp, "Expected " + std::to_string(spanAt[static_cast<size_t>(i)])
+                                      + " element(s) for this choice of the aggregate, but"
+                                        " the value has "
+                                      + std::to_string(have));
+                } else if (have >= 0 && have != spanAt[static_cast<size_t>(i)]) {
                     if (outp) VL_DO_DANGLING(outp->deleteTree(), outp);
                     if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
                     if (AstNodeExpr* const valp = lengthMismatchValue(typep, flp)) return valp;
@@ -24846,6 +25124,8 @@ private:
         }
         VL_RESTORER(m_countedDrivers);
         m_countedDrivers = false;
+        VL_RESTORER(m_procDrivenp);
+        if (VN_IS(nodep, VhdlProcess)) m_procDrivenp = &driven;
         lowerConcurrent(nodep);
         // A generate written out once per iteration counted its own, since
         // how many there were is what made it write them out
@@ -24853,6 +25133,17 @@ private:
         for (const VhdlSymbol* const symp : resolved) ++m_driverUsed[symp];
     }
 
+    // A concurrent statement runs once as the design starts (11.6), so a
+    // qualified expression in it whose operand folds outside the subtype it
+    // names stops the model then (9.3.5; GHDL gna issue1240). The value it is
+    // part of may be worked out natively, past the qualification.
+    void staticQualifiedFailures(AstNode* nodep) {
+        if (!v3Global.opt.vhdlBoundCheck()) return;
+        nodep->foreach([&](AstVhdlQualified* qp) {
+            if (!qp->valuep() || !scalarRanged(qp->vhdlTypep())) return;
+            elabRangeFailure(qp->vhdlTypep(), qp->valuep(), qp->fileline());
+        });
+    }
     void lowerConcurrent(AstNodeVhdlStmt* nodep) {
         FileLine* const flp = nodep->fileline();
         if (AstVhdlProcess* const procp = VN_CAST(nodep, VhdlProcess)) {
@@ -24860,6 +25151,7 @@ private:
             return;
         }
         if (AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
+            staticQualifiedFailures(asgp);
             lowerConcurrentAssign(asgp);
             return;
         }
@@ -24901,8 +25193,13 @@ private:
         }
         if (AstVhdlAssert* const assertp = VN_CAST(nodep, VhdlAssert)) {
             // A concurrent assertion is a process that runs when its
-            // expression changes (11.5)
-            addStmt(concurrentProcess(lowerAssert(assertp), assertp->postponed(), flp));
+            // expression changes (11.5), and a call in it that reports is
+            // left to run, as in a statement of a process (GHDL gna issue2353)
+            const bool savedKeep = V3VhdlEval::s_keepReports;
+            V3VhdlEval::s_keepReports = true;
+            AstNode* const bodyp = lowerAssert(assertp);
+            V3VhdlEval::s_keepReports = savedKeep;
+            addStmt(concurrentProcess(bodyp, assertp->postponed(), flp));
             return;
         }
         if (AstVhdlProcCall* const callp = VN_CAST(nodep, VhdlProcCall)) {
@@ -25555,8 +25852,9 @@ private:
             written = flat.empty() ? std::string{"?"} : flat.back();
         }
         if (attr == "simple_name") {
-            return new AstConst{flp, AstConst::String{},
-                                symp && !symp->name().empty() ? symp->name() : written};
+            return new AstConst{
+                flp, AstConst::String{},
+                vhdlDisplayName(symp && !symp->name().empty() ? symp->name() : written)};
         }
         // A design unit's own name: a package's path starts at its library, and the entity or
         // architecture this is written in is the instance being elaborated, whose path the
@@ -25729,7 +26027,8 @@ private:
             const std::string chunk
                 = text.substr(at, mark == std::string::npos ? std::string::npos : mark - at);
             if (!chunk.empty()) {
-                AstNodeExpr* const litp = new AstConst{flp, AstConst::String{}, chunk};
+                AstNodeExpr* const litp
+                    = new AstConst{flp, AstConst::String{}, vhdlDisplayText(chunk)};
                 outp = outp ? new AstConcatN{flp, outp, litp} : litp;
             }
             if (mark == std::string::npos) break;
@@ -25902,6 +26201,12 @@ private:
                     if (byConv) outConvp = assocs[i]->formalp();
                     break;
                 }
+            }
+            // A generic given a value elaboration folds outside its subtype stops the model
+            // when it starts (6.5.6.2, 14.3.4; GHDL gna issue3177)
+            if (actualp && isGeneric && v3Global.opt.vhdlBoundCheck() && symp->typep()
+                && scalarRanged(symp->typep())) {
+                elabRangeFailure(symp->typep(), actualp, actualp->fileline());
             }
             // An actual whose length is a number here, other than the formal's: an error once
             // the block is elaborated (6.5.6.3), where nvc and Questa stop the run -- "p =>
@@ -26237,6 +26542,7 @@ private:
             if (nineValued(clockp->vhdlTypep())) {
                 AstNodeExpr* const trigp
                     = nineClockTrigger(clockAltp->condp(), clockp, rising, guardp, flp);
+                UASSERT_OBJ(trigp, nodep, "Clocked process with no trigger for its clock");
                 sentreep = new AstSenTree{flp, new AstSenItem{flp, VEdgeType::ET_POSEDGE, trigp}};
             } else {
                 sentreep = new AstSenTree{
@@ -26785,12 +27091,15 @@ private:
         const auto lit
             = [&](uint32_t v) { return new AstConst{flp, AstConst::WidthedValue{}, 4, v}; };
         if (!VN_IS(condp, VhdlCall)) return new AstEq{flp, clkp, lit(rising ? 3 : 2)};
-        const VhdlShadow* const shp = shadowFor(clockp, flp);
+        // An alias of the clock has the history of what it denotes: "alias clk is aclk"
+        // (6.6.2; GHDL gna issue301)
+        AstNodeVhdlExpr* const namedp = boundNameOf(clockp);
+        const VhdlShadow* const shp = shadowFor(namedp, flp);
         if (!shp) {
             VL_DO_DANGLING(clkp->deleteTree(), clkp);
             return nullptr;
         }
-        guardp = new AstEq{flp, new AstOr{flp, shadowPart(clockp, shp->prevp, flp), lit(4)},
+        guardp = new AstEq{flp, new AstOr{flp, shadowPart(namedp, shp->prevp, flp), lit(4)},
                            lit(rising ? 6 : 7)};
         return new AstEq{flp, new AstOr{flp, clkp, lit(4)}, lit(rising ? 7 : 6)};
     }
@@ -30627,13 +30936,17 @@ private:
         if (!lhsp) return;
         AstNodeExpr* rhsp = nullptr;
         AstNode* delayp = nullptr;
-        switch (nodep->kind()) {
-        case VhdlAssignKind::SIMPLE:
-            rhsp = waveformValue(nodep->wavesp(), nodep->targetp());
-            delayp = waveformDelay(nodep->wavesp());
-            break;
-        case VhdlAssignKind::CONDITIONAL: rhsp = conditionalValue(nodep); break;
-        case VhdlAssignKind::SELECTED: rhsp = selectedValue(nodep); break;
+        {
+            VL_RESTORER(m_checksInValue);
+            m_checksInValue = true;
+            switch (nodep->kind()) {
+            case VhdlAssignKind::SIMPLE:
+                rhsp = waveformValue(nodep->wavesp(), nodep->targetp());
+                delayp = waveformDelay(nodep->wavesp());
+                break;
+            case VhdlAssignKind::CONDITIONAL: rhsp = conditionalValue(nodep); break;
+            case VhdlAssignKind::SELECTED: rhsp = selectedValue(nodep); break;
+            }
         }
         // A native operation that warns when an operand holds a metavalue
         // -- numeric_std's comparisons, TO_INTEGER -- has nowhere to say so
@@ -31823,6 +32136,12 @@ private:
                 pinp = lowerAssoc(asp, ++pinNum);
             }
             if (!pinp) continue;
+            // A generic given a value elaboration folds outside its subtype stops the model
+            // when it starts (6.5.6.2, 14.3.4)
+            if (formalSymp && formalSymp->typep() && asp->actualp()
+                && v3Global.opt.vhdlBoundCheck() && scalarRanged(formalSymp->typep())) {
+                elabRangeFailure(formalSymp->typep(), asp->actualp(), asp->actualp()->fileline());
+            }
             // A bound of an enumeration index handed to a generic carrying one, "G'LEFT" of the
             // parent's generic: the generic is an integer, a position, so the position goes over
             // and not the enumeration value it is cast back to (enumIndexBound)
@@ -32876,8 +33195,33 @@ private:
                 unsup(p->fileline(), std::string{"statement "} + p->typeName());
             }
             outp = AstNode::addNextNull(outp, onep);
+            // What follows a return the copy made for one call always makes is
+            // never reached, and is not emitted for the back end to width-check:
+            // numeric_std's "+" of a null operand returns NAU before it sizes
+            // anything (NVC ieee13)
+            if (m_ftaskp && definiteReturn(p)) break;
         }
         return outp;
+    }
+    // Whether a statement always returns, as far as conditions that fold say
+    static bool definiteReturn(AstNode* stmtp) {
+        if (VN_IS(stmtp, VhdlReturn)) return true;
+        AstVhdlIf* const ifp = VN_CAST(stmtp, VhdlIf);
+        if (!ifp) return false;
+        for (AstNode* p = ifp->altsp(); p; p = p->nextp()) {
+            AstVhdlAlternative* const altp = VN_AS(p, VhdlAlternative);
+            if (altp->condp()) {
+                const VhdlTri taken
+                    = staticTruth(V3VhdlEval::eval(altp->condp()), altp->condp());
+                if (taken == VhdlTri::FALSE) continue;
+                if (taken == VhdlTri::UNKNOWN) return false;
+            }
+            for (AstNode* sp = altp->stmtsp(); sp; sp = sp->nextp()) {
+                if (definiteReturn(sp)) return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     AstNode* lowerStmt(AstNodeVhdlStmt* nodep) {
@@ -35239,6 +35583,70 @@ private:
     // How many elements a value has, where that is a number here: a literal or a value the
     // elaboration folds, an aggregate written positionally, a value of a constrained subtype;
     // -1 where it is not
+    // The elements of an array whose element subtype the type leaves open are all of
+    // one subtype, which the value says (5.3.2.2, 9.3.3.3): an aggregate whose elements
+    // are of different static lengths is an error once elaborated, where GHDL and nvc
+    // stop. For an element that is a record, each element of it left open. What is
+    // wrong, or nothing.
+    std::string aggElementsDiffer(AstNodeVhdlExpr* valuep, const VhdlType* typep) {
+        while (AstVhdlQualified* const qp = VN_CAST(valuep, VhdlQualified)) {
+            valuep = qp->valuep();
+        }
+        AstVhdlAggregate* const aggp = VN_CAST(valuep, VhdlAggregate);
+        if (!aggp || !typep || typep->base()->kind() != VhdlTypeKind::ARRAY
+            || typep->base()->dimensions() != 1) {
+            return "";
+        }
+        const VhdlType* const elemp = typep->base()->elementp();
+        if (!elemp) return "";
+        // The value given for each element, past any choices
+        std::vector<AstNodeVhdlExpr*> values;
+        for (AstVhdlElemAssoc* p = aggp->elemsp(); p; p = VN_AS(p->nextp(), VhdlElemAssoc)) {
+            if (p->valuep()) values.push_back(p->valuep());
+        }
+        const auto differ = [&](const std::function<int64_t(AstNodeVhdlExpr*)>& lengthOf,
+                                const std::string& what) -> std::string {
+            int64_t first = -1;
+            for (AstNodeVhdlExpr* const vp : values) {
+                const int64_t len = lengthOf(vp);
+                if (len < 0) continue;
+                if (first < 0) {
+                    first = len;
+                } else if (len != first) {
+                    return "Elements of this aggregate" + what + " are of different lengths, "
+                           + std::to_string(first) + " and " + std::to_string(len);
+                }
+            }
+            return "";
+        };
+        if (elemp->base()->kind() == VhdlTypeKind::ARRAY && !elemp->lengthEmittable()) {
+            return differ([&](AstNodeVhdlExpr* vp) { return staticValueLength(vp); }, "");
+        }
+        if (elemp->base()->kind() != VhdlTypeKind::RECORD) return "";
+        // A record value written as a positional aggregate: its element at each open place
+        const std::vector<VhdlSymbol*>& fields = elemp->base()->elements();
+        for (size_t f = 0; f < fields.size(); ++f) {
+            const VhdlType* const ftp = fields[f]->typep();
+            if (!ftp || ftp->base()->kind() != VhdlTypeKind::ARRAY || ftp->lengthEmittable()) {
+                continue;
+            }
+            const std::string msg = differ(
+                [&](AstNodeVhdlExpr* vp) -> int64_t {
+                    AstVhdlAggregate* const rp = VN_CAST(vp, VhdlAggregate);
+                    if (!rp) return -1;
+                    size_t at = 0;
+                    for (AstVhdlElemAssoc* p = rp->elemsp(); p;
+                         p = VN_AS(p->nextp(), VhdlElemAssoc), ++at) {
+                        if (p->choicesp()) return -1;  // Positional only
+                        if (at == f) return staticValueLength(p->valuep());
+                    }
+                    return -1;
+                },
+                ", element '" + fields[f]->name() + "',");
+            if (!msg.empty()) return msg;
+        }
+        return "";
+    }
     int64_t staticValueLength(AstNodeVhdlExpr* valuep) {
         if (!valuep) return -1;
         const VhdlType* const typep = valuep->vhdlTypep();
@@ -36056,6 +36464,7 @@ private:
 
     AstNode* lowerIf(AstVhdlIf* nodep) {
         std::vector<AstVhdlAlternative*> alts;
+        bool lastTaken = false;  // The last of alts is always taken, so needs no test
         // A condition the copy made for one call site settles is a branch the
         // design either always takes or never reaches. "value'length =
         // target'length" inside a copy where the two differ is the second,
@@ -36073,6 +36482,7 @@ private:
             if (taken != VhdlTri::UNKNOWN) {
                 if (taken == VhdlTri::FALSE) continue;  // Never taken
                 alts.push_back(altp);
+                lastTaken = true;
                 break;  // Always taken, so nothing after it is reached
             }
             alts.push_back(altp);
@@ -36080,7 +36490,7 @@ private:
         AstNode* outp = nullptr;
         for (size_t i = alts.size(); i-- > 0;) {
             AstVhdlAlternative* const altp = alts[i];
-            if (!altp->condp()) {
+            if (!altp->condp() || (lastTaken && i + 1 == alts.size())) {
                 outp = lowerStmts(altp->stmtsp());
                 continue;
             }
@@ -39810,29 +40220,14 @@ private:
     // others, and the process resumes after they have -- which is what a
     // delta cycle is, and what "wait for 0 ns" waits for.
     // A postponed process runs at the end of the last delta of a time step
-    // (10.3, 14.7.5.3). Verilator has a postponed region of its own -- what
-    // $strobe is written in -- so a bit toggled there says when that moment
-    // has come, and a process that has just resumed waits for it.
+    // (10.3, 14.7.5.3), after Verilator's postponed region: a process that has
+    // just resumed waits for that, and is resumed there in the same step
     AstNode* postponedWait(FileLine* flp) {
-        if (!m_postVarp) {
-            m_postVarp = new AstVar{flp, VVarType::VAR, "__Vpostponed", VFlagChildDType{},
-                                    newLogicDType(flp, 1)};
-            m_postVarp->valuep(new AstConst{flp, AstConst::BitFalse{}});
-            m_stmtsp = AstNode::addNextNull(m_stmtsp, m_postVarp);
-            FileLine* const pflp = new FileLine{flp};
-            pflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
-            m_shadowsp = AstNode::addNextNull(
-                m_shadowsp,
-                static_cast<AstNode*>(new AstAlwaysPostponed{
-                    pflp, new AstAssign{pflp, new AstVarRef{pflp, m_postVarp, VAccess::WRITE},
-                                        new AstNot{pflp, new AstVarRef{pflp, m_postVarp,
-                                                                       VAccess::READ}}}}));
-        }
-        AstSenTree* const senp = new AstSenTree{
-            flp, senItemFor(new AstVarRef{flp, m_postVarp, VAccess::READ}, true, flp)};
-        return new AstEventControl{flp, senp, nullptr};
+        AstDelay* const dlyp
+            = new AstDelay{flp, new AstConst{flp, AstConst::Unsized64{}, 0}, false};
+        dlyp->postponed(true);
+        return dlyp;
     }
-    AstVar* m_postVarp = nullptr;  // The module's postponed-region bit, if used
     bool m_postponed = false;  // Lowering the body of a postponed process
 
     AstNode* deltaWait(FileLine* flp) {
@@ -40143,7 +40538,26 @@ private:
             if (!filep || !linep) return nullptr;
             AstNode* outp = fileNotOpenCheck(filep, true, flp);
             AstNode::addNextNull(outp, fileModeCheck(filep, true, flp));
-            outp->addNext(new AstStmtExpr{flp, new AstFGetS{flp, linep->cloneTree(false), filep}});
+            if (v3Global.opt.vhdlBoundCheck()) {
+                // Reading a file at its end is an error (5.5.2, 16.4), where GHDL and
+                // Questa stop (GHDL gna bug096): $fgets reads nothing there
+                AstVar* const gotp = newTempVar("__Vrdl", newIntDType(flp), flp);
+                outp->addNext(new AstAssign{flp, new AstVarRef{flp, gotp, VAccess::WRITE},
+                                            new AstFGetS{flp, linep->cloneTree(false), filep}});
+                AstNode* const stopp = new AstDisplay{
+                    flp, VDisplayType::DT_DISPLAY,
+                    "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno())
+                        + ": READLINE past the end of the file",
+                    nullptr, nullptr};
+                stopp->addNext(new AstStop{flp, true});
+                outp->addNext(new AstIf{flp,
+                                        new AstEq{flp, new AstVarRef{flp, gotp, VAccess::READ},
+                                                  new AstConst{flp, AstConst::Signed32{}, 0}},
+                                        stopp});
+            } else {
+                outp->addNext(
+                    new AstStmtExpr{flp, new AstFGetS{flp, linep->cloneTree(false), filep}});
+            }
             // A LINE holds the line without its end of line (16.4), which
             // $fgets keeps
             AstNodeExpr* const lastp
@@ -41907,7 +42321,7 @@ private:
         if (name.size() >= 3 && name.front() == '\'' && name.back() == '\'') {
             return name.substr(1, name.size() - 2);
         }
-        return name;
+        return vhdlExtendedText(name);
     }
 
     // "t'image(t'val(n))" of a logic type: the name of the literal at that
@@ -44416,9 +44830,99 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     addPathPins();
     settleUpwardNames();
     hoistTargetStatements();
+    emitElabReports();
+    encodeExtendedNames();
     reportReachedRefusals();
     reportSubprogramRefusals();
     if (v3Global.opt.trace()) addTraceRequest();
+}
+
+// What the functions elaboration ran to fold constants reported (V3VhdlEval::s_constReports)
+// is said once, as the model starts, in the order the constants were elaborated (14.4.2;
+// GHDL gna issue2353), by the top module: the one --top-module names, or else the first
+// that nothing instantiates. A FAILURE stops the run there, as it stops elaboration.
+void VhdlLowerVisitor::emitElabReports() {
+    if (V3VhdlEval::s_constReports.empty()) return;
+    const std::string wanted = VString::downcase(v3Global.opt.topModule());
+    AstNodeModule* topp = nullptr;
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp && !topp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        if (!VN_IS(modp, Module)) continue;
+        if (wanted.empty() ? !m_instantiated.count(modp->name())
+                           : VString::downcase(modp->name()) == wanted) {
+            topp = modp;
+        }
+    }
+    if (!topp) return;
+    static const char* const LEVELS[] = {"note", "warning", "error", "failure"};
+    AstNode* stmtsp = nullptr;
+    for (const auto& entry : V3VhdlEval::s_constReports) {
+        for (const V3VhdlEval::ElabReport& rep : entry.second) {
+            FileLine* const flp = rep.flp;
+            const int sev = rep.severity < 0 || rep.severity > 3 ? 2 : rep.severity;
+            std::string format = flp->filename() + ":" + std::to_string(flp->lineno()) + ":"
+                                 + std::to_string(flp->firstColumn()) + ":@%0t:("
+                                 + (rep.isReport ? "report " : "assertion ") + LEVELS[sev]
+                                 + "): ";
+            appendLiteral(format, rep.hasText ? rep.text : std::string{"Assertion violation."});
+            stmtsp = AstNode::addNextNull(
+                stmtsp, static_cast<AstNode*>(new AstDisplay{
+                            flp, VDisplayType::DT_DISPLAY, format, nullptr,
+                            new AstTime{flp, topp->timeunit()}}));
+            if (sev >= 3) {
+                stmtsp = AstNode::addNext(stmtsp, static_cast<AstNode*>(new AstStop{flp, true}));
+            }
+        }
+    }
+    V3VhdlEval::s_constReports.clear();
+    // Before any process runs, as elaboration is: in static initialization
+    if (stmtsp) topp->addStmtsp(new AstInitialStatic{topp->fileline(), stmtsp});
+}
+
+// An extended identifier is keyed with backslashes (vhdlExtendedKey), which
+// no name Verilog makes contains: its parser encodes an escaped identifier.
+// So every name holding one is encoded the same way here, once the design is
+// whole, and declarations and references stay alike. A string constant's
+// text is not a name and keeps its backslashes ('IMAGE of a literal).
+void VhdlLowerVisitor::encodeExtendedNames() {
+    const auto enc = [](const std::string& name) {
+        return name.find('\\') == std::string::npos ? name : AstNode::encodeName(name);
+    };
+    // A dotted path is encoded a part at a time, so its dots stay dots
+    const auto encDotted = [&](const std::string& dotted) {
+        if (dotted.find('\\') == std::string::npos) return dotted;
+        std::string out;
+        size_t at = 0;
+        for (;;) {
+            const size_t dot = dotted.find('.', at);
+            out += enc(dotted.substr(at, dot == std::string::npos ? std::string::npos : dot - at));
+            if (dot == std::string::npos) break;
+            out += '.';
+            at = dot + 1;
+        }
+        return out;
+    };
+    const auto rename = [&](AstNode* nodep) {
+        const std::string& name = nodep->name();
+        if (name.find('\\') != std::string::npos) nodep->name(enc(name));
+    };
+    m_netlistp->foreach([&](AstNode* nodep) {
+        if (VN_IS(nodep, Var) || VN_IS(nodep, NodeModule) || VN_IS(nodep, Pin)
+            || VN_IS(nodep, NodeFTask) || VN_IS(nodep, ParseRef) || VN_IS(nodep, NodeBlock)
+            || VN_IS(nodep, GenBlock) || VN_IS(nodep, MemberDType) || VN_IS(nodep, MemberSel)
+            || VN_IS(nodep, StructSel) || VN_IS(nodep, Typedef)) {
+            rename(nodep);
+        } else if (AstCell* const cellp = VN_CAST(nodep, Cell)) {
+            rename(cellp);
+            cellp->modName(enc(cellp->modName()));
+        } else if (AstVarXRef* const xrefp = VN_CAST(nodep, VarXRef)) {
+            rename(xrefp);
+            xrefp->dotted(encDotted(xrefp->dotted()));
+        } else if (AstNodeFTaskRef* const frefp = VN_CAST(nodep, NodeFTaskRef)) {
+            rename(frefp);
+            frefp->dotted(encDotted(frefp->dotted()));
+        }
+    });
 }
 
 // An index in an assignment's target may need statements of its own -- the
