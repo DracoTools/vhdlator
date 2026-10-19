@@ -1,0 +1,7 @@
+t/t_vhdl_typeattrname.vhd:23:5:@0:(report note): bv
+t/t_vhdl_typeattrname.vhd:24:5:@0:(report note): bit_vector
+t/t_vhdl_typeattrname.vhd:25:5:@0:(report note): at_t
+t/t_vhdl_typeattrname.vhd:26:5:@0:(report note): at_t
+t/t_vhdl_typeattrname.vhd:27:5:@0:(report note): ft_t
+t/t_vhdl_typeattrname.vhd:28:5:@0:(report note): ft_t
+t/t_vhdl_typeattrname.vhd:29:5:@0:(report note): *-* All Finished *-*

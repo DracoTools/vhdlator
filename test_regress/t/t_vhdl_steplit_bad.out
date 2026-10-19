@@ -1,0 +1,5 @@
+t/t_vhdl_steplit_bad.vhd:20:5:@0:(report note): rightof value1 is value2
+t/t_vhdl_steplit_bad.vhd:22:5:@0:(report note): leftof value2 is value1
+%Error: t/t_vhdl_steplit_bad.vhd:23: No value of enum_t lies past the end of its range
+%Error: t/t_vhdl_steplit_bad.vhd:23: Verilog $stop
+Aborting...

@@ -1541,6 +1541,12 @@ private:
     }
     // "[bit, bit return integer]", the parameter and result type profile
     static std::string signatureOf(const VhdlSymbol* symp) {
+        // A subprogram's place in a path is written with its signature from VHDL-2002 on
+        // (16.2.7); before that its name stands alone, ":lib:p:proc:x" in the LRM's own
+        // example (NVC attr13 under VHDL-93; attr17 and attr21 under VHDL-2002)
+        if (symp->declp() && symp->declp()->fileline()->language() < V3LangCode::L1076_2002) {
+            return "";
+        }
         std::string out = "[";
         bool first = true;
         size_t index = 0;
@@ -1798,6 +1804,39 @@ private:
             return V3VhdlEval::fromImage(arg.toStr(), typep);
         }
         if (attr == "simple_name") {
+            // A prefix that is itself 'SUBTYPE or 'BASE denotes a type, whose simple name is the
+            // type's: "bv'subtype'base'simple_name" is "bit_vector", "v'subtype'simple_name"
+            // the type mark v was declared with (GHDL gna issue261; GHDL and Questa agree)
+            if (AstVhdlAttrName* const ap = VN_CAST(nodep->prefixp(), VhdlAttrName)) {
+                const std::function<const VhdlType*(AstNodeVhdlExpr*, int)> denoted
+                    = [&](AstNodeVhdlExpr* ep, int depth) -> const VhdlType* {
+                    if (!ep || depth > 8) return nullptr;
+                    if (AstVhdlAttrName* const inp = VN_CAST(ep, VhdlAttrName)) {
+                        if (inp->name() == "base") {
+                            const VhdlType* const tp = denoted(inp->prefixp(), depth + 1);
+                            return tp ? tp->base() : nullptr;
+                        }
+                        if (inp->name() != "subtype") return nullptr;
+                        const VhdlSymbol* const osymp
+                            = inp->prefixp() && inp->prefixp()->vhdlSymp()
+                                  ? inp->prefixp()->vhdlSymp()->resolved()
+                                  : nullptr;
+                        if (osymp && osymp->isObject()) return osymp->typep();
+                        return denoted(inp->prefixp(), depth + 1);
+                    }
+                    const VhdlSymbol* const tsymp
+                        = ep->vhdlSymp() ? ep->vhdlSymp()->resolved() : nullptr;
+                    return tsymp && tsymp->kind() == VhdlSymKind::TYPE ? tsymp->typep() : nullptr;
+                };
+                const VhdlType* tp = denoted(ap, 0);
+                if (!tp && (ap->name() == "subtype" || ap->name() == "base")) tp = ap->vhdlTypep();
+                if (tp) {
+                    const std::string tname = tp->name().empty() ? tp->base()->name() : tp->name();
+                    if (!tname.empty()) {
+                        return VhdlValue::mkStr(vhdlDisplayName(tname), V3VhdlStd::stringType());
+                    }
+                }
+            }
             VhdlSymbol* const symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
             if (!symp) return VhdlValue{};
             return VhdlValue::mkStr(vhdlDisplayName(symp->name()), V3VhdlStd::stringType());

@@ -6395,6 +6395,30 @@ private:
             = newTempVar("__Vpow", new AstBasicDType{flp, VBasicDTypeKwd::DOUBLE}, flp);
         return new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, checkedp};
     }
+    // 'SUCC, 'PRED, 'LEFTOF or 'RIGHTOF of a value that is a number here, written in a
+    // statement, stepping past an end of the type: an error when the statement runs (16.2.2;
+    // GHDL gna ticket65's "enum_t'rightof(value2)"). The step is made of numbers, so the
+    // general check, which leaves what elaboration settles to fold, would pass it over.
+    bool staticStepPast(const AstVhdlAttrName* nodep, int delta, const VhdlType* typep,
+                        FileLine*) const {
+        if (!v3Global.opt.vhdlBoundCheck() || !checksHere() || !typep || !nodep->argp()) {
+            return false;
+        }
+        if (!inSequentialStmt(nodep) || !typep->bounded()) return false;
+        const VhdlValue v = V3VhdlEval::eval(nodep->argp());
+        if (!v.isInt()) return false;
+        const int64_t pos = v.toInt() + delta;
+        return pos < typep->low() || pos > typep->high();
+    }
+    AstNode* stepPastError(const VhdlType* typep, FileLine* flp) {
+        AstNode* const errp = new AstDisplay{
+            flp, VDisplayType::DT_DISPLAY,
+            "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno()) + ": No value of "
+                + typep->prettyName() + " lies past the end of its range",
+            nullptr, nullptr};
+        errp->addNext(new AstStop{flp, true});
+        return errp;
+    }
     // "T'VAL(n)" of an enumeration type is an error where no value of T is at
     // position n (16.2.3), where nvc, GHDL and Questa stop the run (NVC
     // bounds6). A number type's 'VAL is its value, checked as one.
@@ -11187,7 +11211,11 @@ private:
                 VhdlType* const totypep = nodep->vhdlTypep();
                 if (!totypep) return stepp;
                 // A step past the type's last value is an error (16.2.2)
-                AstNodeExpr* const checkedp = valPositionChecked(stepp, totypep, sflp);
+                AstNodeExpr* const checkedp
+                    = staticStepPast(nodep, attr == "succ" ? 1 : -1, totypep, flp)
+                          ? static_cast<AstNodeExpr*>(
+                                new AstExprStmt{sflp, stepPastError(totypep, flp), stepp})
+                          : valPositionChecked(stepp, totypep, sflp);
                 return new AstCast{sflp, checkedp, VFlagChildDType{}, lowerType(totypep, sflp)};
             }
         } else if (attr == "leftof" || attr == "rightof") {
@@ -11213,7 +11241,11 @@ private:
                 FileLine* const sflp = new FileLine{flp};
                 sflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
                 sflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
-                AstNodeExpr* const checkedp = valPositionChecked(stepp, totypep, sflp);
+                const int delta = (attr == "rightof") == ascending ? 1 : -1;
+                AstNodeExpr* const checkedp = staticStepPast(nodep, delta, totypep, flp)
+                                                  ? static_cast<AstNodeExpr*>(new AstExprStmt{
+                                                        sflp, stepPastError(totypep, flp), stepp})
+                                                  : valPositionChecked(stepp, totypep, sflp);
                 return new AstCast{sflp, checkedp, VFlagChildDType{}, lowerType(totypep, sflp)};
             }
         }
@@ -15358,7 +15390,34 @@ private:
             valuep = qualp->valuep();
         }
         VhdlType* const typep = valuep->vhdlTypep();
-        if (!dynBoundedArray(typep)) {
+        // Bounds that are numbers, or expressions the instance settles: "array (low to high)"
+        // with low and high an entity's generics (GHDL gna bug21497)
+        AstNodeExpr* countp = nullptr;
+        AstNodeExpr* leftEndp = nullptr;
+        bool ascending = true;
+        if (dynBoundedArray(typep)) {
+            const VhdlType* const idxTypep = typep->indexTypes()[0];
+            countp = new AstConst{flp, AstConst::Signed32{},
+                                  static_cast<int32_t>(idxTypep->length())};
+            leftEndp
+                = new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(idxTypep->left())};
+            ascending = idxTypep->ascending();
+        } else if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+                   && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
+                   && typep->lengthEmittable()) {
+            const AstVhdlRange* const rp = VN_CAST(typep->indexTypes()[0]->boundsp(), VhdlRange);
+            if (rp && rp->leftp() && rp->rightp() && !rp->dirUnknown()) {
+                AstNodeExpr* const lenp = boundsLength(typep, flp);
+                leftEndp = lenp ? lowerBound(rp->leftp()) : nullptr;
+                if (lenp && leftEndp) {
+                    countp = atLeastZero(lenp, flp);
+                    ascending = rp->dir() != VhdlDir::DOWNTO;
+                } else if (lenp) {
+                    VL_DO_DANGLING(lenp->deleteTree(), lenp);
+                }
+            }
+        }
+        if (!countp) {
             // "new t'(l to r => v)": the aggregate says its own range, and
             // the bounds may only be known while running
             if (AstNodeExpr* const outp = dynAllocFromRun(valuep, dynp, flp)) return outp;
@@ -15367,10 +15426,12 @@ private:
             unsup(flp, "allocator for a value whose bounds are not known");
             return nullptr;
         }
-        const VhdlType* const idxTypep = typep->indexTypes()[0];
-        const int64_t count = idxTypep->length();
         AstNodeExpr* const srcp = lowerExpr(valuep);
-        if (!srcp) return nullptr;
+        if (!srcp) {
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            VL_DO_DANGLING(leftEndp->deleteTree(), leftEndp);
+            return nullptr;
+        }
         // The value is written into a temporary of its own type first, since
         // an aggregate or a call result cannot be read one element at a time
         AstVar* const srcVarp
@@ -15382,32 +15443,23 @@ private:
         AstNode* stmtsp
             = new AstAssign{flp, new AstVarRef{flp, srcVarp, VAccess::WRITE}, srcp};
         stmtsp = AstNode::addNext(
-            stmtsp,
-            static_cast<AstNode*>(new AstAssign{
-                flp, new AstVarRef{flp, objVarp, VAccess::WRITE},
-                dynNew(new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(count)},
-                       new AstConst{flp, AstConst::Signed32{},
-                                    static_cast<int32_t>(idxTypep->left())},
-                       idxTypep->ascending() ? 1 : -1, flp)}));
+            stmtsp, static_cast<AstNode*>(
+                        new AstAssign{flp, new AstVarRef{flp, objVarp, VAccess::WRITE},
+                                      dynNew(countp->cloneTree(false), leftEndp->cloneTree(false),
+                                             ascending ? 1 : -1, flp)}));
         stmtsp = AstNode::addNext(
             stmtsp, static_cast<AstNode*>(
                         new AstAssign{flp, new AstVarRef{flp, idxVarp, VAccess::WRITE},
                                       new AstConst{flp, AstConst::Signed32{}, 0}}));
-        AstNodeExpr* const srcIdxp
-            = new AstConst{flp, AstConst::Signed32{},
-                           static_cast<int32_t>(idxTypep->left())};
+        AstNodeExpr* const srcIdxp = leftEndp;
         AstNodeExpr* const elemIdxp
-            = idxTypep->ascending()
-                  ? static_cast<AstNodeExpr*>(
-                        new AstAdd{flp, srcIdxp, new AstVarRef{flp, idxVarp, VAccess::READ}})
-                  : static_cast<AstNodeExpr*>(
-                        new AstSub{flp, srcIdxp, new AstVarRef{flp, idxVarp, VAccess::READ}});
+            = ascending ? static_cast<AstNodeExpr*>(
+                              new AstAdd{flp, srcIdxp, new AstVarRef{flp, idxVarp, VAccess::READ}})
+                        : static_cast<AstNodeExpr*>(new AstSub{
+                              flp, srcIdxp, new AstVarRef{flp, idxVarp, VAccess::READ}});
         AstLoop* const loopp = new AstLoop{flp};
         loopp->addStmtsp(new AstLoopTest{
-            flp, loopp,
-            new AstLtS{flp, new AstVarRef{flp, idxVarp, VAccess::READ},
-                       new AstConst{flp, AstConst::Signed32{},
-                                    static_cast<int32_t>(count)}}});
+            flp, loopp, new AstLtS{flp, new AstVarRef{flp, idxVarp, VAccess::READ}, countp}});
         // Where the object's elements carry their own bounds, each element
         // of the value is made a carrier on the way in
         AstNodeExpr* srcElemp
@@ -26421,6 +26473,12 @@ private:
     // "[bit,bit return integer]", the parameter and result profile a name is
     // written with where the name alone need not pick out one declaration
     static std::string signatureOf(const VhdlSymbol* symp) {
+        // A subprogram's place in a path is written with its signature from VHDL-2002 on
+        // (16.2.7); before that its name stands alone, ":lib:p:proc:x" in the LRM's own
+        // example (NVC attr13 under VHDL-93; attr17 and attr21 under VHDL-2002)
+        if (symp->declp() && symp->declp()->fileline()->language() < V3LangCode::L1076_2002) {
+            return "";
+        }
         std::string out = "[";
         bool first = true;
         size_t index = 0;
@@ -26528,6 +26586,28 @@ private:
         return out;
     }
 
+    // The type a name denotes where it is written with 'SUBTYPE or 'BASE: an object's
+    // declared subtype, and the base of what the prefix denotes. Null for anything else.
+    static const VhdlType* typeDenotedBy(const AstNodeVhdlExpr* exprp, int depth = 0) {
+        if (!exprp || depth > 8) return nullptr;
+        if (const AstVhdlAttrName* const ap = VN_CAST(exprp, VhdlAttrName)) {
+            if (ap->name() == "base") {
+                const VhdlType* const innerp = typeDenotedBy(ap->prefixp(), depth + 1);
+                return innerp ? innerp->base() : nullptr;
+            }
+            if (ap->name() == "subtype") {
+                const VhdlSymbol* const osymp = ap->prefixp() && ap->prefixp()->vhdlSymp()
+                                                    ? ap->prefixp()->vhdlSymp()->resolved()
+                                                    : nullptr;
+                if (osymp && osymp->isObject()) return osymp->typep();
+                return typeDenotedBy(ap->prefixp(), depth + 1);
+            }
+            return nullptr;
+        }
+        const VhdlSymbol* const symp = exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+        if (symp && symp->kind() == VhdlSymKind::TYPE) return symp->typep();
+        return nullptr;
+    }
     // "x'SIMPLE_NAME", "x'PATH_NAME" and "x'INSTANCE_NAME" (16.2.7)
     AstNodeExpr* lowerNameAttr(AstVhdlAttrName* nodep, const std::string& attr, FileLine* flp) {
         const VhdlSymbol* symp = nodep->prefixp() ? nodep->prefixp()->vhdlSymp() : nullptr;
@@ -26537,6 +26617,18 @@ private:
             std::vector<std::string> flat;
             flattenName(nodep->prefixp(), flat);
             written = flat.empty() ? std::string{"?"} : flat.back();
+        }
+        // A prefix that is itself 'SUBTYPE or 'BASE denotes a type, whose simple name is the
+        // type's: "bv'subtype'base'simple_name" is "bit_vector", "v'subtype'simple_name" the
+        // type mark v was declared with (GHDL gna issue261; GHDL and Questa agree)
+        if (attr == "simple_name" && (!symp || symp->name().empty())) {
+            if (const VhdlType* const typep = typeDenotedBy(nodep->prefixp())) {
+                const std::string tname
+                    = typep->name().empty() ? typep->base()->name() : typep->name();
+                if (!tname.empty()) {
+                    return new AstConst{flp, AstConst::String{}, vhdlDisplayName(tname)};
+                }
+            }
         }
         if (attr == "simple_name") {
             return new AstConst{
@@ -26602,6 +26694,18 @@ private:
                 if (!unitp) continue;
                 if ((VN_IS(unitp, VhdlPackage) || VN_IS(unitp, VhdlPackageBody))
                     && VString::downcase(unitp->name()) == VString::downcase(written)) {
+                    const std::string plib
+                        = unitp->libname().empty() ? std::string{"work"} : unitp->libname();
+                    return pathString(":" + plib + ":" + VString::downcase(written) + ":", flp);
+                }
+                // Or, in an instance of a generic package, the generic package's own name,
+                // which the instance's copy does not declare: "fixed_generic_pkg'instance_name"
+                // in ieee.fixed_pkg is ":ieee:fixed_generic_pkg:" to nvc, GHDL and Questa
+                // (GHDL gna issue2946, issue339)
+                if ((VN_IS(unitp, VhdlPackage) || VN_IS(unitp, VhdlPackageBody)
+                     || VN_IS(unitp, VhdlPackageInst))
+                    && attr == "instance_name" && !nodep->prefixp()->vhdlSymp()
+                    && VN_IS(nodep->prefixp(), VhdlName)) {
                     const std::string plib
                         = unitp->libname().empty() ? std::string{"work"} : unitp->libname();
                     return pathString(":" + plib + ":" + VString::downcase(written) + ":", flp);
@@ -37451,7 +37555,13 @@ private:
         // about how long: the literal is as long as its characters (9.3.2),
         // and each of them names a literal of the element type
         std::string text;
-        if (!otypep->isConstrainedArray()) {
+        if (!otypep->isConstrainedArray() && otypep->lengthEmittable()
+            && (VN_IS(otherp, VhdlName) || VN_IS(otherp, VhdlSelected))) {
+            // A length the instance settles -- "array (low to high)" with low and high
+            // generics (GHDL gna bug21497) -- is compared in a loop, in a statement
+            if (!m_inStmts) return nullptr;
+            return dynAccessEqualLoop(nodep, objNodep, dynp, otherp, otypep, flp);
+        } else if (!otypep->isConstrainedArray()) {
             const VhdlValue val = V3VhdlEval::eval(otherp);
             if (!val.isStr()) return nullptr;
             text = val.toStr();
@@ -37494,6 +37604,53 @@ private:
             outp = new AstLogAnd{flp, outp, new AstEq{flp, elemp, rhsElemp}};
         }
         VL_DO_DANGLING(objp->deleteTree(), objp);
+        if (nodep->op() == VhdlBinaryOp::NE) return new AstLogNot{flp, outp};
+        return outp;
+    }
+
+    // The same, where the length is an expression: the lengths, then each element in turn
+    AstNodeExpr* dynAccessEqualLoop(AstVhdlBinary* nodep, AstNodeVhdlExpr* objNodep,
+                                    const DynAccess* dynp, AstNodeVhdlExpr* otherp,
+                                    const VhdlType* otypep, FileLine* flp) {
+        AstNodeExpr* const countp = boundsLength(otypep, flp);
+        if (!countp) return nullptr;
+        AstNodeExpr* const objp = lowerExpr(objNodep);
+        if (!objp || !repeatable(objp)) {
+            if (objp) VL_DO_DANGLING(objp->deleteTree(), objp);
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            return nullptr;
+        }
+        AstVar* const eqp
+            = newTempVar("__Vdyneq", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
+        AstVar* const kp = newTempVar("__Vdyneqk", newIntDType(flp), flp);
+        AstNodeExpr* const rhsElemp
+            = dynSourceElem(otherp, new AstVarRef{flp, kp, VAccess::READ}, flp);
+        if (!rhsElemp) {
+            VL_DO_DANGLING(objp->deleteTree(), objp);
+            VL_DO_DANGLING(countp->deleteTree(), countp);
+            return nullptr;
+        }
+        AstNode* stmtsp
+            = new AstAssign{flp, new AstVarRef{flp, eqp, VAccess::WRITE},
+                            new AstEq{flp, dynLength(dynp, objp->cloneTree(false), flp),
+                                      countp->cloneTree(false)}};
+        stmtsp->addNext(new AstAssign{flp, new AstVarRef{flp, kp, VAccess::WRITE}, i32(0, flp)});
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{
+            flp, loopp,
+            new AstLogAnd{flp, new AstVarRef{flp, eqp, VAccess::READ},
+                          new AstLtS{flp, new AstVarRef{flp, kp, VAccess::READ}, countp}}});
+        AstNodeExpr* const elemp = new AstSelBit{flp, memberOf(objp, dynp->datap->name(), flp),
+                                                 new AstVarRef{flp, kp, VAccess::READ}};
+        loopp->addStmtsp(new AstIf{flp, new AstNeq{flp, elemp, rhsElemp},
+                                   new AstAssign{flp, new AstVarRef{flp, eqp, VAccess::WRITE},
+                                                 new AstConst{flp, AstConst::BitFalse{}}}});
+        loopp->addContsp(
+            new AstAssign{flp, new AstVarRef{flp, kp, VAccess::WRITE},
+                          new AstAdd{flp, new AstVarRef{flp, kp, VAccess::READ}, i32(1, flp)}});
+        stmtsp->addNext(loopp);
+        AstNodeExpr* const resultp = new AstVarRef{flp, eqp, VAccess::READ};
+        AstNodeExpr* const outp = new AstExprStmt{flp, stmtsp, resultp};
         if (nodep->op() == VhdlBinaryOp::NE) return new AstLogNot{flp, outp};
         return outp;
     }
@@ -37618,6 +37775,23 @@ private:
                 return new AstSelBit{flp, srcp, idxp};
             }
             VL_DO_DANGLING(srcp->deleteTree(), srcp);
+        }
+        // Bounds the instance settles: from the left end, as the expression it is
+        if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY && typep->dimensions() == 1
+            && typep->indexTypes()[0] && typep->lengthEmittable()) {
+            const AstVhdlRange* const rp = VN_CAST(typep->indexTypes()[0]->boundsp(), VhdlRange);
+            AstNodeExpr* const leftp
+                = rp && rp->leftp() && !rp->dirUnknown() ? lowerBound(rp->leftp()) : nullptr;
+            AstNodeExpr* const srcp = leftp ? lowerExpr(wholep) : nullptr;
+            if (leftp && srcp && repeatable(srcp)) {
+                AstNodeExpr* const idxp
+                    = rp->dir() != VhdlDir::DOWNTO
+                          ? static_cast<AstNodeExpr*>(new AstAdd{flp, leftp, offsetp})
+                          : static_cast<AstNodeExpr*>(new AstSub{flp, leftp, offsetp});
+                return new AstSelBit{flp, srcp, idxp};
+            }
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (srcp) VL_DO_DANGLING(srcp->deleteTree(), srcp);
         }
         VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
         unsup(flp, "value copied into an unconstrained array through an access value");

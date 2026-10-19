@@ -11316,7 +11316,43 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         && (attrName == "instance_name" || attrName == "path_name"
             || attrName == "simple_name")) {
         std::vector<VhdlSymbol*> found;
-        if (!parts.empty()) lookup(parts.back(), found);
+        // An expanded name denotes what is declared in the region its prefix names, not
+        // whatever the last name is visible as here: "lib.p'path_name" is the package p of
+        // library lib, and "b1.s" the s block b1 declares, however many inner blocks declare
+        // an s of their own (16.2.7; NVC attr13, the LRM's own example)
+        if (parts.size() >= 2) {
+            VhdlScope* scopep = m_scopep;
+            size_t from = 0;
+            // A library's name starts at the library: "lib.p" of library lib
+            std::vector<VhdlSymbol*> heads;
+            lookup(parts[0], heads);
+            std::string lib;
+            if (!heads.empty() && heads[0]->resolved()->kind() == VhdlSymKind::LIBRARY) {
+                lib = lower(parts[0]);
+                if (lib == "work") lib = m_libname;
+                scopep = libScope(lib);
+                from = 1;
+            }
+            for (size_t i = from; i + 1 < parts.size() && scopep; ++i) {
+                scopep = scopep->findNamed(parts[i]);
+            }
+            if (scopep) scopep->lookupLocal(parts.back(), found);
+            // A package that is a design unit of the library is a region of it, with no
+            // symbol there: one is made for it, as a use clause naming it makes one
+            if (found.empty() && !lib.empty() && parts.size() == 2) {
+                const std::string key = lib + "." + lower(parts[1]);
+                const auto uIt = m_primaryUnits.find(key);
+                const auto sIt = m_unitScopes.find(key);
+                if (uIt != m_primaryUnits.end() && sIt != m_unitScopes.end()
+                    && (VN_IS(uIt->second, VhdlPackage) || VN_IS(uIt->second, VhdlPackageInst))) {
+                    VhdlSymbol* const psymp
+                        = VhdlSymTab::newSymbol(VhdlSymKind::PACKAGE, parts[1], uIt->second);
+                    psymp->innerp(sIt->second);
+                    found.push_back(psymp);
+                }
+            }
+        }
+        if (!parts.empty() && found.empty()) lookup(parts.back(), found);
         // "foo [bit return string]'instance_name": where the name is
         // overloaded the signature says which declaration it is (8.6)
         if (found.size() > 1 && nodep->signaturep()) {
@@ -11347,6 +11383,23 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
             }
         }
         if (!found.empty()) nodep->prefixp()->vhdlSymp(found[0]);
+        // A prefix that is 'SUBTYPE or 'BASE denotes a type, whose simple name the attribute
+        // gives: kept on the prefix (GHDL gna issue261, "bv'subtype'base'simple_name")
+        if (AstVhdlAttrName* const markp = VN_CAST(nodep->prefixp(), VhdlAttrName)) {
+            if (markp->name() == "subtype" || markp->name() == "base") {
+                AstVhdlAttrName* const innerp
+                    = markp->name() == "base" ? VN_CAST(markp->prefixp(), VhdlAttrName) : markp;
+                VhdlType* typep = nullptr;
+                if (innerp && innerp->name() == "subtype") {
+                    typep = resolveTypeMark(innerp);
+                } else if (markp->name() == "base") {
+                    typep = resolveTypeMark(markp->prefixp());
+                }
+                if (typep && !typep->isError()) {
+                    markp->vhdlTypep(markp->name() == "base" ? typep->base() : typep);
+                }
+            }
+        }
         // The prefix names a named entity (16.2.7), and "v'subtype" of an
         // object declared with a constraint is a subtype no declaration names
         // (nvc 1.22.1 and GHDL 7.0.0-dev; Questa 2025.2 takes it)
