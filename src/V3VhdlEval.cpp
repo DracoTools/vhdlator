@@ -2722,14 +2722,21 @@ private:
         if (!arg.known()) return VhdlValue{};
         VhdlType* const top = symp->typep();
         const VhdlTypeKind kind = top->base()->kind();
-        if (kind == VhdlTypeKind::FLOATING) return VhdlValue::mkReal(arg.toReal(), top);
+        // A conversion whose result is outside the subtype converted to is an error (9.3.6),
+        // which the conversion itself reports when it is evaluated: no value to fold, so that
+        // the check is made ("t(3)" with t 0 to 1, GHDL gna issue618)
+        const auto checked = [&](const VhdlValue& v) {
+            return top->bounded() && !V3VhdlEval::inRange(v, top) ? VhdlValue{} : v;
+        };
+        if (kind == VhdlTypeKind::FLOATING) return checked(VhdlValue::mkReal(arg.toReal(), top));
         if (kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::UNIVERSAL_INTEGER) {
             if (arg.isStr()) return VhdlValue{};
-            if (!arg.isReal()) return VhdlValue::mkInt(arg.toInt(), top);
+            if (!arg.isReal()) return checked(VhdlValue::mkInt(arg.toInt(), top));
             // Rounding is away from zero at a half (9.3.6)
             const double r = arg.toReal();
             if (!(r >= -9.2e18 && r <= 9.2e18)) return VhdlValue{};
-            return VhdlValue::mkInt(static_cast<int64_t>(r < 0 ? r - 0.5 : r + 0.5), top);
+            return checked(
+                VhdlValue::mkInt(static_cast<int64_t>(r < 0 ? r - 0.5 : r + 0.5), top));
         }
         // A conversion between closely related array types keeps the value
         if (kind == VhdlTypeKind::ARRAY && arg.isStr()) {
