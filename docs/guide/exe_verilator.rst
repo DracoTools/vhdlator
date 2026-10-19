@@ -2150,16 +2150,35 @@ Summary:
    1076 makes a value an error when it is evaluated or assigned; where one
    fails, the model stops with an error, as other VHDL simulators stop it:
 
-   - each index into an array, and the first index of each slice, lies
-     inside the array's range, including a range that a generic gives;
-   - a value assigned to a variable or a signal, or returned by a function,
-     lies inside its scalar subtype's range (``natural``, ``my_int range 1
-     to 10``, ``delay_length``);
+   - an index into an array lies inside the array's range, and a slice that
+     is not null lies inside it, including ranges that a generic gives;
+   - a value assigned to a variable or a signal, returned by a function,
+     given to a scalar parameter of a function, or made by a type conversion
+     lies inside its subtype's range (``natural``, ``my_int range 1 to
+     10``, ``delay_length``), and so does each element of an aggregate;
    - an array value has the length of what it is assigned to, of the
-     constrained formal it is passed to, or of an alias of it;
-   - an INTEGER or physical division, ``mod`` or ``rem`` is not by zero;
-   - a delay in ``after`` or ``wait for`` is not negative;
-   - a function does not end without a ``return``.
+     constrained formal it is passed to, of an alias of it, and of the
+     choice of an aggregate it is given for;
+   - an INTEGER or physical division, ``mod`` or ``rem`` is not by zero, an
+     INTEGER exponent is not negative, and an INTEGER ``**`` fits INTEGER;
+   - ``TO_INTEGER`` of a vector gives a value INTEGER can hold;
+   - ``'VAL`` names a position of its type, ``'VALUE`` reads a value of it,
+     and ``'DRIVING`` and ``'DRIVING_VALUE`` are asked in a process that
+     drives the signal;
+   - a delay in ``after`` or ``wait for`` is not negative, and a ``reject``
+     limit is not greater than the delay it applies to;
+   - a function does not end without a ``return``;
+   - a file is open, in a mode that allows the operation, and ``READLINE``
+     is not at its end;
+   - a postponed process does not cause a delta cycle.
+
+   The checks are made in processes and subprograms, and in the values of
+   concurrent assignments. What elaboration would find stops the model when
+   it starts: an unresolved signal with more than one source, a generic or
+   a range constraint given a value outside its subtype, a qualified
+   expression whose operand is outside its subtype, and an external name of
+   the wrong class, type, length or range, or evaluated before the object
+   it names is elaborated.
 
    Values that cannot fail a check, such as the variable of a loop over the
    array's ``'RANGE`` used as its index, are not checked. With

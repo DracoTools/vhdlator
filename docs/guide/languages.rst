@@ -65,35 +65,68 @@ Verilator implements a full IEEE 1800-2023 compliant preprocessor,
 including triple-quoted strings, and \`ifdef expressions.
 
 
-VHDL 2008 (IEEE 1076-2008) Support
-----------------------------------
+VHDL (IEEE 1076) Support
+------------------------
 
 Verilator reads VHDL as well as Verilog. Files with a :file:`.vhd` or
-:file:`.vhdl` extension are taken as VHDL, and :vlopt:`--vhdl-std` selects
-the revision that applies to them; the default is VHDL-2008.
+:file:`.vhdl` extension are taken as VHDL.
 
 .. code-block:: bash
 
      verilator --binary --timing counter.vhd --top counter
 
+VHDL-2008 is the default, and the revision this support is built for.
+:vlopt:`--vhdl-std` selects another one: ``1993``, ``2000``, ``2002`` or
+``2019``. An earlier revision is not a separate implementation: it reserves
+that revision's words, refuses what that revision forbids and VHDL-2008
+allows, and hides from a unit compiled under it what VHDL-2008 added to
+``STANDARD``, ``TEXTIO`` and the IEEE packages. ``93c`` is VHDL-93 with the
+relaxations GHDL's default mode of that name allows. VHDL-2019 is supported
+in part: its reserved words and conditional analysis, but not yet most of
+what it adds to the language (see :ref:`VHDL Limitations`).
+
+Conditional analysis (VHDL-2019 24.2, which VHDL-2008 tools commonly accept
+too) is applied in every revision: ```if``, ```elsif``, ```else``, ```end``,
+```warning`` and ```error``, over the standard identifiers
+``VHDL_VERSION``, ``TOOL_TYPE``, ``TOOL_VENDOR``, ``TOOL_NAME``,
+``TOOL_EDITION`` and ``TOOL_VERSION``, and over identifiers defined with
+:vlopt:`-D <-D<var>>`.
+
 Nothing else is needed to use the standard libraries. ``library std`` is
 always available, and a context or use clause naming a package of ``library
 ieee``, such as ``ieee.numeric_std``, causes Verilator to read the IEEE
 package it ships and whatever that package depends on. Pass
-:vlopt:`--no-std-vhdl` to supply your own copies instead.
+:vlopt:`--no-std-vhdl` to supply your own copies instead. Verilator ships
+``std.standard``, ``std.textio`` and ``std.env``; IEEE's ``std_logic_1164``,
+``numeric_std``, ``numeric_bit``, ``numeric_std_unsigned``,
+``numeric_bit_unsigned``, ``fixed_pkg``, ``float_pkg``, ``math_real`` and
+``math_complex``, with the two context declarations ``ieee_std_context`` and
+``ieee_bit_context``; and Synopsys' ``std_logic_arith``,
+``std_logic_unsigned``, ``std_logic_signed``, ``std_logic_misc`` and
+``std_logic_textio``.
 
 Supported are entities and architectures, packages and package bodies,
 context declarations, configurations, all the standard type classes
 (enumeration, integer, floating point, physical, array, record, access,
 file and protected), shared variables, subprograms with all four parameter
-classes, resolution functions and multiple drivers, all the concurrent and
-sequential statements, blocks, ``for``/``if``/``case`` generate statements,
-component and direct entity instantiation, aliases, attributes, and the
-predefined libraries ``std.standard``, ``std.textio``, ``std.env``, and IEEE
-``std_logic_1164``, ``numeric_std``, ``numeric_bit``,
-``numeric_std_unsigned``, ``math_real`` and ``math_complex``, along with the
-two context declarations IEEE defines, ``ieee.ieee_std_context`` and
-``ieee.ieee_bit_context``.
+classes, generic types, subprograms and packages, resolution functions and
+multiple drivers, all the concurrent and sequential statements, blocks,
+guarded signals, ``for``/``if``/``case`` generate statements, component and
+direct entity instantiation, external names, aliases and attributes.
+Verification libraries built on these run: UVVM, VUnit and OSVVM.
+
+``std_ulogic`` keeps its nine values by default, each element held in four
+bits, and the IEEE packages, resolution and edge tests behave as in other
+VHDL simulators. :vlopt:`--no-vhdl-metavalues` holds one bit per element
+instead, which roughly halves the run time and loses what ``'U'``,
+``'X'``, ``'W'`` and ``'-'`` say (see :ref:`VHDL Limitations`).
+
+VHDL makes many values an error when they are evaluated: an index outside
+its array, a value outside its subtype, a length that does not match, a
+division by zero. The model checks them as it runs and stops where other
+VHDL simulators stop; an error that elaboration would find stops it when it
+starts. :vlopt:`--vhdl-bound-check` lists the checks, and
+:vlopt:`--no-vhdl-bound-check` drops them for speed.
 
 A VHDL design that suspends -- a process with no sensitivity list, ``wait``
 in any of its forms, or an ``after`` delay -- needs :vlopt:`--timing`, the
@@ -130,10 +163,13 @@ beside its other output. A design that wants the file elsewhere, or wants to
 start and stop tracing, can do that from its own C++ main with
 :vlopt:`--exe` as any Verilator model can.
 
+A VHDL design is reached over VPI as other VHDL simulators present one, which
+is what cocotb drives, and a subprogram declared with GHDL's ``VHPIDIRECT``
+form of the ``FOREIGN`` attribute calls C as a DPI import does.
+
 See :ref:`VHDL Limitations` for where the compiled model diverges from
 the LRM, and :doc:`mixed-language` for instantiating VHDL from Verilog and
 Verilog from VHDL.
-
 
 Verilog AMS Support
 -------------------
@@ -442,113 +478,90 @@ See :ref:`Covergroup Coverage`.
 VHDL Limitations
 ----------------
 
-Verilator compiles VHDL to a statically scheduled two-state model, the same
-one it compiles Verilog to. That is where the speed comes from, and it has
-consequences the LRM does not allow for. They are listed here so that a
-design that depends on one of them can be recognized as such.
+Verilator compiles VHDL to the same statically scheduled model it compiles
+Verilog to. That is where the speed comes from. Where the compiled model
+differs from what the LRM says, it is listed here, so that a design that
+depends on one of these can be recognized as such.
 
-**Metavalues do not exist at run time.** The nine values of ``std_ulogic``
-are mapped when the model is built: ``'1'`` and ``'H'`` become 1, ``'0'``
-and ``'L'`` become 0, ``'Z'`` becomes Z, and ``'U'``, ``'W'`` and ``'-'``
-become X, which Verilator then eliminates exactly as it eliminates Verilog's
-X. So a comparison such as ``if s = 'U'`` is never true at run time, and an
-uninitialized signal reads as 0 rather than reporting ``'U'``. Use
-:vlopt:`--x-initial` ``unique`` for randomized initial state, which is the
-closest analogue of VHDL's ``'U'`` default. Metavalues in *static*
-expressions are exact, so a constant or generic comparison against ``'U'``
-folds correctly at compile time.
+**What is not supported.** Most of what VHDL-2019 adds: interface mode
+views, the reflection API (``value_mirror``, ``subtype_mirror``), the
+additions to ``std.env``, the assertion and report control API, the new
+generic type classes, protected types as parameters and their ``private``
+part, conditional expressions, sequential blocks, named return values, and
+the predefined ``TO_STRING`` and ``'VALUE`` of composite types. Nor PSL,
+VHPI, or the VITAL timing libraries. Each is reported as unsupported where
+it is written.
 
-**Inertial delay is not modelled.** An ``after`` clause lowers to a
-Verilog-style non-blocking delay, which is transport-like. VHDL's default
-inertial pulse rejection, and an explicit ``reject`` clause, do not remove
-short pulses.
+**Metavalues under --no-vhdl-metavalues.** With
+:vlopt:`--no-vhdl-metavalues` an element of ``std_ulogic`` is one bit:
+``'1'`` and ``'H'`` are 1, ``'0'`` and ``'L'`` are 0, ``'Z'`` is high
+impedance, and ``'U'``, ``'X'``, ``'W'`` and ``'-'`` are 0. So a comparison
+with ``'U'`` is never true, ``numeric_std`` gives no ``'X'`` results and no
+``metavalue detected`` warnings, and an uninitialized signal reads as
+``'0'``. A record signal holding ``'Z'`` in one of its elements is refused
+in that mode. The default, nine values, has none of these limits; it does
+not yet support an array of resolved vectors that several instances drive
+through ``inout`` ports, which two states resolve.
 
-**A waveform does not replace what is already scheduled.** ``s <= a after 10
-ns, b after 20 ns`` schedules both, which is right; but VHDL says a later
-assignment to the same signal deletes any transaction already projected for a
-later time, and that deletion is not modelled. A design that overwrites its
-own pending transactions sees both.
+**A delta cycle is observable; the delta count is not.** A signal assignment
+schedules an update, and each delta cycle is a pass of the scheduler, so a
+process sees exactly the values VHDL says it sees, ``wait for 0 ns`` resumes
+after one delta, and a postponed process runs after the last one. Logic that
+no process can observe between deltas is evaluated combinationally, which no
+process can tell apart. The number of deltas a time step took is not
+counted, and a message reports the time without it.
 
-**A delta cycle boundary is observable; the delta count is not.** A signal
-assignment schedules an update rather than making one, so a process that
-reads a signal it is not sensitive to sees the value the delta started with,
-which is what VHDL requires and what Verilog's ``#0`` does not give. What
-differs is how far ``wait for 0 ns`` goes: VHDL resumes the process in the
-next simulation cycle, after one signal update, while Verilator resumes it
-once the time step has settled. A testbench that steps through delta cycles
-one at a time -- ``s <= v; wait for 0 ns;`` and then reading a signal driven
-*from* ``s`` -- sees the settled value one cycle early. Ordinary designs,
-including every clocked one, cannot tell the difference.
+**The projected waveform of some signals keeps every transaction.**
+Inertial delay, ``reject`` and the preemption of transactions already
+scheduled follow the LRM (10.5.2.2) for scalars, vectors, records of up to
+64 scalar elements and resolved signals, element by element. An array of
+arrays, a record of more than 64 scalar elements, a resolved signal reached
+through a procedure's signal parameter, and a concurrent assignment to a
+resolved signal deliver every transaction they are given.
 
-**Unconstrained values are sometimes slower.** Where the length of an
-unconstrained array is fixed at the call site -- which is every call into
-``ieee.numeric_std`` in real code -- the subprogram is specialized to that
-length and runs at the speed of hand-written Verilog. Where the length is
-not known until the value is computed, as for ``integer'image``, the value
-is carried dynamically instead. An access value pointing at an unconstrained
-array -- ``type p is access t`` where ``t`` is ``array (natural range <>) of
-...`` -- is the same case: the object carries the bounds the allocation gave
-it, and indexing, slicing and the array attributes read them from it. Both
-are correct; only the second allocates.
+**Some run-time errors are not detected.** :vlopt:`--vhdl-bound-check`
+lists what is checked. Where nvc, GHDL and Questa do not agree that a run
+stops, the majority decides, and so these run on: an INTEGER ``+``, ``-``
+or ``*`` that overflows (GHDL and Questa wrap), a REAL converted to an
+INTEGER it does not fit (GHDL and Questa carry on), and a qualified
+expression whose operand only running decides (only Questa checks it).
+Also unchecked: a length mismatch through a port map expression or an
+external name, and an index into an array whose range names an attribute.
 
-**An external name reaches instances, not blocks.** ``<< signal
-uut.inner : integer >>`` reads and writes the object it names, by a
-pathname relative to where it is written or absolute from the root. A
-pathname that starts at ``^``, one that names a *block* label -- a block is
-elaborated where it stands, so it is not a level of hierarchy here -- and
-the ``@`` form that names an object in a package are not supported. After a
-``release`` the signal keeps the value it was forced to until something
-drives it again.
+**A string's bounds are its length, where only running decides them.** A
+``STRING`` is held as text, which is what makes ``LINE``, ``textio`` and
+``'IMAGE`` cheap, and text has a length but no bounds. Bounds that analysis
+or elaboration settles are kept; a string declared over a range computed
+while the design runs answers ``'LEFT`` with 1. Likewise, what a ``LINE``
+holds after a ``READ`` is indexed from 1, where the LRM keeps the indexes
+the characters had before.
 
-**A path name stops at the design unit.** ``'INSTANCE_NAME`` and
-``'PATH_NAME`` give every region from the design unit down --
-``:work:pkg:f[ return integer]:`` for a package subprogram,
-``:top(tb):lbl:b`` for a signal in a block -- but not the part of the path
-that comes from outside the unit. A signal in an instantiated entity reads
-``:sub(rtl):s`` where the LRM asks for ``:top(tb):u1@sub(rtl):s``, since one
-compiled entity serves every instance of it.
+**An external name climbs one level.** ``<< signal ^.x : t >>`` names an
+object of the unit that instantiates this one, where one unit does. A
+pathname that climbs further, or out of a unit instantiated from more than
+one place, is not supported.
 
-**A range of length one loses its direction across an unconstrained port.**
-A port or generic written without a constraint takes the subtype of the
-actual, and the two bounds are carried to the instance separately, so which
-way the range runs is read back from them. Where the two bounds are equal
-the range is reported as ascending. Only ``'ascending`` can tell the
-difference; every other attribute, and indexing, are the same either way.
-
-**Arithmetic on a width not known until run time.** Verilator emits
-fixed-width operations, so arithmetic whose operand width is only known
-during execution is not available. This is reachable only by doing
-arithmetic on a value whose length came from a run-time computation.
-
-**A guarded signal is not disconnected.** A guarded assignment drives while
-its block's ``GUARD`` is true and holds its last value while it is false,
-which is what a signal with one driver does. For a signal declared with the
-``bus`` or ``register`` kind and driven from more than one place, VHDL turns
-the driver off entirely and lets the resolution function see one fewer
-value; that removal is not modelled, so such a signal keeps contributing its
-last value. ``disconnect`` specifications are accepted and ignored for the
-same reason.
-
-**An attribute specification must name what it applies to.** ``attribute a
-of x : signal is ...`` gives ``x'a`` its value, but the ``all`` and
-``others`` forms, which give every entity of a class in the declarative part
-the same value, are not applied.
+**A guarded signal's disconnection takes effect at once.** A guarded
+assignment's driver is disconnected as its block's ``GUARD`` becomes false,
+and a ``bus`` or ``register`` signal is resolved without it. A
+``disconnect ... after`` specification is accepted, and its delay ignored.
 
 **A transaction is recorded per signal, not per element.** ``S'ACTIVE``,
 ``S'TRANSACTION``, ``S'QUIET`` and ``S'LAST_ACTIVE`` ask whether a driver
-assigned, not whether the value changed, which a compiled model has no other
-way to know; so a signal any of them names is given a companion bit that
-every assignment to it flips. Assigning one element of a composite signal
-flips the whole signal's bit, so ``S(i)'TRANSACTION`` reports a transaction
-on ``S``. Where the signal is driven from outside the entity that asks --
-an input port, say -- there is no assignment to mark, and the four are
-answered from the signal's events instead, which is the same answer whenever
-every transaction changes the value.
+assigned, not whether the value changed, and each signal they name is given
+a bit that every assignment to it flips. Assigning one element of a
+composite signal flips the whole signal's bit, so ``S(i)'TRANSACTION``
+reports a transaction on ``S``.
+
+**Arithmetic on a width only running decides.** Verilator emits
+fixed-width operations, so arithmetic whose operand width is only known
+while the design runs is refused. This is reachable only by doing
+arithmetic on a value whose length came from a run-time computation.
 
 **``'DELAYED`` needs a static delay.** ``S'DELAYED(T)`` becomes a signal of
 its own driven from ``S`` through ``T``, which requires ``T`` to be known
 when the model is built. The LRM requires ``T`` to be a static expression,
-so this rejects only what was already illegal.
+so this refuses only what was already illegal.
 
 **The image of a real is a VHDL literal, but not always the same one.**
 ``real'image`` gives text that reads back as a VHDL literal -- ``4.0``,
@@ -556,7 +569,6 @@ so this rejects only what was already illegal.
 reference simulators do not agree either: GHDL 7.0.0-dev writes ``5.0e-1``
 where NVC 1.22.1 writes ``0.5``. The number of digits a value is written to
 may differ from both.
-
 
 Encrypted Verilog
 -----------------

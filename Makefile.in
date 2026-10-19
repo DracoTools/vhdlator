@@ -113,6 +113,7 @@ SUBDIRS = docs src test_regress \
   examples/cmake_protect_lib \
   examples/make_hello_binary \
   examples/make_hello_vhdl \
+  examples/make_tracing_vhdl \
   examples/make_vhdl_foreign \
   examples/make_vhdl_vpi \
   examples/make_mixed_lang \
@@ -329,6 +330,7 @@ installdata:
 	done
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_hello_binary
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_hello_vhdl
+	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_tracing_vhdl
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_foreign
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_vpi
 	$(MKINSTALLDIRS) $(DESTDIR)$(pkgdatadir)/examples/make_mixed_lang
@@ -375,6 +377,7 @@ uninstall:
 	-rmdir $(DESTDIR)$(pkgdatadir)/include
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_binary
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_hello_vhdl
+	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_tracing_vhdl
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_foreign
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_vhdl_vpi
 	-rmdir $(DESTDIR)$(pkgdatadir)/examples/make_mixed_lang

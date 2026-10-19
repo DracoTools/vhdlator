@@ -17,6 +17,9 @@ examples/make_hello_binary
 examples/make_hello_vhdl
    Example GNU-make simple VHDL->binary conversion
 
+examples/make_tracing_vhdl
+   Example GNU-make VHDL->binary with a VCD waveform
+
 examples/make_vhdl_foreign
    Example VHDL calling C with the FOREIGN attribute, and C calling VHDL
 
