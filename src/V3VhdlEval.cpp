@@ -1351,10 +1351,10 @@ private:
             if (!powOvf(lhs.toInt(), rhs.toInt(), out)) return VhdlValue{};
             // A result its type cannot hold is an error the running model reports, not a value
             // to fold: "2 ** v_exponent - 1" of a variable no statement writes, which is 31
-            // (9.2.8; GHDL gna issue2646). A universal result is held exactly, "2 ** n" with n
-            // a constant 40 in a type's range, unless an operand is not static -- a variable,
-            // a signal, a parameter or a loop's -- which makes it INTEGER's "**", as nvc and
-            // GHDL take it (Questa keeps it universal)
+            // (9.2.8; GHDL gna issue2646). Of an INTEGER result -- the analysis gives one where
+            // the context wants an INTEGER -- and an operand that is not static: a variable, a
+            // signal, a parameter or a loop's. "2 ** n" with n a constant 40 in a type's range
+            // is folded, and so is a universal result, "to_string(2 ** e - 1)" (ex1)
             const auto notStatic = [](const AstNodeVhdlExpr* opp) {
                 bool any = false;
                 opp->foreach([&](const AstNodeVhdlExpr* ep) {
@@ -1374,10 +1374,7 @@ private:
                 return any;
             };
             const bool running = notStatic(nodep->lhsp()) || notStatic(nodep->rhsp());
-            const VhdlType* rbasep = resp ? resp->base() : nullptr;
-            if (rbasep && rbasep->kind() == VhdlTypeKind::UNIVERSAL_INTEGER && running) {
-                rbasep = V3VhdlStd::integerType() ? V3VhdlStd::integerType()->base() : nullptr;
-            }
+            const VhdlType* const rbasep = resp ? resp->base() : nullptr;
             if (running && rbasep && rbasep->kind() == VhdlTypeKind::INTEGER && rbasep->bounded()
                 && (out < rbasep->low() || out > rbasep->high())) {
                 return VhdlValue{};
@@ -2886,9 +2883,19 @@ private:
         const auto checked = [&](const VhdlValue& v) {
             if (!top->bounded() || V3VhdlEval::inRange(v, top)) return v;
             // Said, so that what requires the value to be in range -- an object's initial
-            // value -- reports it (NVC bounds/issue99, "natural(-1.5)")
-            fail("Value " + v.prettyName() + " is outside the range of the conversion to "
-                 + top->prettyName());
+            // value -- reports it (NVC bounds/issue99, "natural(-1.5)"). Not of an operand
+            // that calls a function of the design, which is globally static at most: the
+            // error is elaboration's, where the model stops as it starts ("natural(get_m15)",
+            // GHDL gna ticket31, which analysis accepts)
+            const bool calls = asp->actualp()->exists([](const AstNodeVhdlExpr* ep) {
+                const VhdlSymbol* const csymp
+                    = ep->vhdlSymp() ? ep->vhdlSymp()->resolved() : nullptr;
+                return csymp && csymp->kind() == VhdlSymKind::FUNCTION && !csymp->predefined();
+            });
+            if (!calls) {
+                fail("Value " + v.prettyName() + " is outside the range of the conversion to "
+                     + top->prettyName());
+            }
             return VhdlValue{};
         };
         if (kind == VhdlTypeKind::FLOATING) return checked(VhdlValue::mkReal(arg.toReal(), top));

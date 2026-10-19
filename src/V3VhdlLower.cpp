@@ -5863,14 +5863,26 @@ private:
             return !refp->varp() || !(refp->varp()->isParam() || refp->varp()->isGenVar());
         }) && !np->exists([](const AstNodeFTaskRef*) { return true; });
     }
+    // Whether an expression is written in a sequential statement -- a process's or a
+    // subprogram's -- and not in a declaration, whose subtype may be lowered where a
+    // statement is
+    static bool inSequentialStmt(const AstNode* nodep) {
+        for (const AstNode* up = nodep; up; up = parentOf(up)) {
+            if (VN_IS(up, NodeVhdlDecl) && !VN_IS(up, VhdlSubprogDecl)) return false;
+            if (VN_IS(up, VhdlProcess) || VN_IS(up, VhdlSubprogDecl)) return true;
+        }
+        return false;
+    }
     AstNodeExpr* checkedIndex(const AstNodeVhdlExpr* actualp, AstNodeExpr* indexp,
                               const VhdlType* arrayTypep, int dim, FileLine* flp) {
         if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return indexp;
         const AstConst* const constp = VN_CAST(indexp, Const);
         // An index only generics give is settled with the instance: checked as the model
         // starts, as a slice of such ends is (elabSliceCheck; GHDL gna ticket9,
-        // "a(a'length + 3)" of an open port)
-        if (!constp && elabOnly(indexp)) {
+        // "a(a'length + 3)" of an open port). Not in a statement, which checks it where it
+        // runs: "C(I - 1)" in the arm of "if I = 0" that the iteration with I = 0 never
+        // takes is no error (NVC issue112)
+        if (!constp && elabOnly(indexp) && !inSequentialStmt(actualp)) {
             elabIndexCheck(indexp, arrayTypep, dim, flp);
             return indexp;
         }
@@ -20544,35 +20556,13 @@ private:
             // "**" on INTEGER gives an INTEGER (9.2.8). Saying so here rather
             // than leaving the width to be worked out is what lets one stand
             // in a range, where the width pass reaches it already settled.
-            // Of the result's type: a literal on the left is universal, and "2 ** v" is an
-            // INTEGER where an INTEGER is wanted (9.3.6; GHDL gna issue2646)
-            // A universal result is INTEGER's "**" where an operand is not static -- a
-            // variable, a signal, a parameter or a loop's -- as nvc and GHDL take it
-            const VhdlType* powTypep = nodep->vhdlTypep() ? nodep->vhdlTypep() : ltypep;
-            const auto notStatic = [](const AstNodeVhdlExpr* opp) {
-                bool any = false;
-                opp->foreach([&](const AstNodeVhdlExpr* ep) {
-                    const VhdlSymbol* const osymp
-                        = ep->vhdlSymp() ? ep->vhdlSymp()->resolved() : nullptr;
-                    if (!osymp) return;
-                    switch (osymp->kind()) {
-                    case VhdlSymKind::VARIABLE:
-                    case VhdlSymKind::SHARED_VARIABLE:
-                    case VhdlSymKind::SIGNAL:
-                    case VhdlSymKind::PORT:
-                    case VhdlSymKind::PARAMETER:
-                    case VhdlSymKind::LOOP_PARAMETER: any = true; break;
-                    default: break;
-                    }
-                });
-                return any;
-            };
-            if (powTypep && powTypep->base()->kind() == VhdlTypeKind::UNIVERSAL_INTEGER
-                && V3VhdlStd::integerType()
-                && (notStatic(nodep->lhsp()) || notStatic(nodep->rhsp()))) {
-                powTypep = V3VhdlStd::integerType();
-            }
-            AstNode* const overflowp = isIntegerType(powTypep) && !needsWideInt(powTypep->base())
+            // Of the result's type, which the analysis gives by the context: INTEGER where an
+            // INTEGER is wanted ("v := 2 ** e - 1"), universal where it is not ("to_string(2
+            // ** e - 1)", which nvc, GHDL and Questa compute exactly; GHDL gna issue2646:ex1)
+            const VhdlType* const powTypep = nodep->vhdlTypep() ? nodep->vhdlTypep() : ltypep;
+            AstNode* const overflowp = powTypep
+                                               && powTypep->base()->kind() == VhdlTypeKind::INTEGER
+                                               && !needsWideInt(powTypep->base())
                                            ? powOverflowCheck(lhsp, rhsp, flp)
                                            : nullptr;
             if (isIntegerType(ltypep)) rhsp = exponentChecked(rhsp, flp);
