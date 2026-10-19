@@ -11283,6 +11283,7 @@ private:
                 return outp;
             }
         }
+        if (!argp) elementOfAllocated(nodep);
         if (attr == "left" || attr == "right" || attr == "high" || attr == "low"
             || attr == "length" || attr == "ascending") {
             const VhdlType* typep = nodep->prefixp()->vhdlTypep();
@@ -13777,6 +13778,32 @@ private:
             new AstAssign{flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}});
         stmtsp->addNext(loopp);
         return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
+    }
+
+    // "p'element'length" with p an access to an array whose element subtype
+    // is open: the allocator gave every element the same bounds (9.3.7), so
+    // they are asked of the first element instead, "p(p'left)'length",
+    // which is read where the run decides it (GHDL gna issue2166:repro4)
+    void elementOfAllocated(AstVhdlAttrName* nodep) {
+        AstVhdlAttrName* const elemp = VN_CAST(nodep->prefixp(), VhdlAttrName);
+        if (!elemp || VString::downcase(elemp->name()) != "element" || elemp->argp()) return;
+        const DynAccess* dynp = nullptr;
+        AstNodeVhdlExpr* const objp = dynAccessObj(elemp->prefixp(), dynp);
+        if (!objp) return;
+        const VhdlType* const accp = objp->vhdlTypep() ? objp->vhdlTypep()->base() : nullptr;
+        VhdlType* const arrp = accp ? accp->designatedp() : nullptr;
+        if (!arrp || arrp->base()->kind() != VhdlTypeKind::ARRAY || arrp->indexTypes().empty()
+            || !arrp->base()->elementp() || arrp->base()->elementp()->lengthEmittable()) {
+            return;
+        }
+        FileLine* const flp = elemp->fileline();
+        AstVhdlAttrName* const leftp = new AstVhdlAttrName{flp, objp->cloneTree(false), "left"};
+        leftp->vhdlTypep(arrp->indexTypes()[0]);
+        AstVhdlCall* const indexp = new AstVhdlCall{flp, objp->cloneTree(false)};
+        indexp->addArgsp(new AstVhdlAssoc{flp, nullptr, leftp});
+        indexp->vhdlTypep(arrp->base()->elementp());
+        elemp->replaceWith(indexp);
+        VL_DO_DANGLING(elemp->deleteTree(), elemp);
     }
 
     // "x'length" and "x'element'length" of an alias of an external name
@@ -26168,6 +26195,11 @@ private:
             const AstVar* const varp = refp->varp();
             if (varp && (varp->isParam() || varp->varType() == VVarType::GENVAR)) return;
             reads = true;
+        });
+        // So does a call of a copy made for the signals it was given
+        bodyp->foreachAndNext([&](const AstNodeFTaskRef* callp) {
+            const auto it = m_sigCopyReads.find(callp->taskp());
+            if (it != m_sigCopyReads.end() && !it->second.empty()) reads = true;
         });
         if (!reads) return new AstInitial{flp, bodyp};
         // A statement waits on what it names, and on nothing else (11.6) --
@@ -39952,6 +39984,13 @@ private:
             formals.push_back(VN_AS(p, VhdlIfaceDecl));
         }
         std::map<const VhdlSymbol*, AstVar*> bind;
+        std::vector<AstVar*> readBind;  // The signals the call reads through its formals
+        const auto readsThrough = [&](const AstVhdlIfaceDecl* ifp, AstVar* varp) {
+            if (!varp || ifp->mode() == VhdlMode::OUT || ifp->mode() == VhdlMode::BUFFER) return;
+            if (std::find(readBind.begin(), readBind.end(), varp) == readBind.end()) {
+                readBind.push_back(varp);
+            }
+        };
         std::map<const VhdlSymbol*, AstNodeVhdlExpr*> exprBind;
         std::map<const VhdlSymbol*, VhdlActive> activeBind;
         std::map<const VhdlSymbol*, VhdlSymbol*> symBind;
@@ -40360,6 +40399,7 @@ private:
                 }
                 exprBind.emplace(formals[i]->vhdlSymp(), actualp);
                 for (const auto& pair : carried) exprBind.emplace(pair.first, pair.second);
+                readsThrough(formals[i], m_vars[rootp]);
                 // Which variable the name at the end stands for: a formal of
                 // this copy bound to a whole signal names that signal's
                 key += "|" + path + carryKey + "="
@@ -40439,6 +40479,7 @@ private:
                        + std::to_string(idx);
             }
             bind.emplace(formals[i]->vhdlSymp(), varIt->second);
+            readsThrough(formals[i], varIt->second);
             // Which signal the formal names, so that inside the copy its
             // history attributes -- 'EVENT, 'LAST_VALUE and the rest -- are
             // answered from the actual's record rather than from nothing
@@ -40578,6 +40619,7 @@ private:
                 taskp->addStmtsp(new AstPragma{taskp->fileline(), VPragmaType::NO_INLINE_TASK});
             }
             copyIt = m_signalCopies.emplace(key, taskp).first;
+            m_sigCopyReads[taskp] = readBind;
         }
         return copyIt->second;
     }
@@ -41514,11 +41556,28 @@ private:
                 reads.push_back(varp);
             }
         };
+        // A call of a copy made for the signals it was given reads them where
+        // it is written, the whole of each (10.2): "q <= d when
+        // registered(clk, true)" waits on clk (GHDL gna issue317, PoC)
+        const auto visitCall = [&](const AstNodeFTaskRef* callp) {
+            const auto it = m_sigCopyReads.find(callp->taskp());
+            if (it == m_sigCopyReads.end()) return;
+            for (AstVar* const varp : it->second) {
+                if (!nameableRead(varp) || scratch.count(varp)) continue;
+                if (signalsOnly && !signals.count(varp)) continue;
+                partOf[varp] = nullptr;
+                if (std::find(reads.begin(), reads.end(), varp) == reads.end()) {
+                    reads.push_back(varp);
+                }
+            }
+        };
         visitReads = [&](AstNode* nodep, bool withNext) {
             if (withNext) {
                 nodep->foreachAndNext(visitRef);
+                nodep->foreachAndNext(visitCall);
             } else {
                 nodep->foreach(visitRef);
+                nodep->foreach(visitCall);
             }
         };
         visitReads(bodyp, true);
@@ -44239,6 +44298,10 @@ private:
     };
     std::map<const VhdlSymbol*, DrvBind> m_bindDrivers;
     std::map<std::string, AstNodeFTask*> m_signalCopies;
+    // The signals a copy reads through its signal formals of mode in and inout,
+    // which a statement calling it waits on (10.2, 11.6): inside the copy they
+    // are named directly, so the call itself names none of them
+    std::map<const AstNodeFTask*, std::vector<AstVar*>> m_sigCopyReads;
 
     // Whether every element of a record has a length the back end can fold
     // Whether a value of this type can be carried with its own bounds
@@ -45373,6 +45436,7 @@ private:
         // belongs to the module the call is in: reused from another module
         // it would name a subprogram that is not in scope there
         m_signalCopies.clear();
+        m_sigCopyReads.clear();
         m_concHolds.clear();
         // As does a driver's task: a unit lowered again -- for another
         // binding of it -- emits its own, and the one before is gone
@@ -46391,8 +46455,27 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     for (const std::string& key : order) {
         // An entity whose generic type nothing settled is not a design: it is
         // the template the copies were made from, and each instance of it is
-        // an instance of one of those copies instead (6.5.5)
-        if (hasUnboundGeneric(entities[key])) continue;
+        // an instance of one of those copies instead (6.5.5). As the top,
+        // nothing can give it one: nvc and Questa refuse it too (GHDL gna
+        // issue3167)
+        if (hasUnboundGeneric(entities[key])) {
+            const AstVhdlEntity* const entp = entities[key];
+            if (VString::downcase(v3Global.opt.topModule()) == VString::downcase(entp->name())) {
+                for (AstNode* p = entp->genericsp(); p; p = p->nextp()) {
+                    const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+                    if (ifp->kind() == VhdlIfaceKind::CONSTANT || ifp->isBound()) continue;
+                    const char* const what = ifp->kind() == VhdlIfaceKind::TYPE ? "type"
+                                             : ifp->kind() == VhdlIfaceKind::SUBPROGRAM
+                                                 ? "subprogram"
+                                                 : "package";
+                    ifp->v3error("Generic " << what << " '" << ifp->name()
+                                            << "' of the top-level entity '" << entp->name()
+                                            << "' has no actual: only an instance can give one");
+                    break;
+                }
+            }
+            continue;
+        }
         lowerEntity(entities[key], builtArch[key]);
         // One module per configuration an instance names, each carrying that
         // configuration's own bindings (3.4, 11.7)

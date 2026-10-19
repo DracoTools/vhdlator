@@ -325,6 +325,9 @@ class VhdlSemVisitor final : public VNVisitor {
     // Constants synthesized for a package generic whose value is not static,
     // waiting to be added to the instantiation's declarations
     std::vector<AstNodeVhdl*> m_pendingPkgDecls;
+    // Where the actual a pending constant holds was written: its value is
+    // analyzed there, not in the copy, whose context is the package's own
+    std::map<const AstVhdlObjectDecl*, VhdlScope*> m_actualScopes;
     bool m_inSubprogInst = false;  // Binding the generics of a subprogram's copy
     bool m_archDecls = false;  // Analyzing an architecture's own declarations
     // Shared variables of a protected type that packages declare
@@ -2681,6 +2684,7 @@ public:
     }
     // Whether a subprogram may be called with no arguments at all (4.2.2.1)
     static bool allParamsDefaulted(const VhdlSymbol* symp) VL_MT_DISABLED;
+    static VhdlType* indexableResult(VhdlType* retp) VL_MT_DISABLED;
     // The subtype a string or bit string literal has where its context
     // leaves the length open (9.3.2)
     VhdlType* literalSubtype(AstNodeVhdlExpr* valuep, VhdlType* typep) VL_MT_DISABLED;
@@ -2726,6 +2730,9 @@ private:
     void visit(AstVhdlSubprogInst* nodep) override;
 
     void instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* intop) VL_MT_DISABLED;
+    void
+    reexportGenericOps(const AstVhdlPackage* pkgp, VhdlScope* intop, VhdlScope* savedp,
+                       const std::vector<const AstVhdlIfaceDecl*>& boxDefaults) VL_MT_DISABLED;
     void recordTemplateSyms(AstNode* origp, AstNode* copyp) VL_MT_DISABLED;
     void bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlExpr* actualp,
                             VhdlScope* outerp) VL_MT_DISABLED;
@@ -3085,11 +3092,13 @@ void VhdlSemVisitor::visit(AstVhdlTypeDecl* nodep) {
             // package body opens a region of its own around the body's
             // declarations, so what "use work.other_pkg.all" written before
             // "package body" makes visible is visible here too (nvc sem
-            // issue276)
+            // issue276) -- as far out as a copy of a generic package, whose
+            // context is its package's own (GHDL gna issue317)
             for (VhdlScope* sp = m_scopep; sp; sp = sp->parentp()) {
                 for (VhdlScope* const usedp : sp->uses()) {
                     declp->typep()->scopep()->addUse(usedp);
                 }
+                if (sp->ownContext()) break;
             }
             m_scopep = declp->typep()->scopep();
             iterateAndNextNull(protp->declsp());
@@ -3373,7 +3382,15 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
     if (nodep->fileOpenp()) analyzeExpr(nodep->fileOpenp(), nullptr);
     if (nodep->defaultp()) {
         const int errsBefore = V3Error::errorCount();
-        analyzeExpr(nodep->defaultp(), symp->typep());
+        {
+            VL_RESTORER(m_scopep);
+            const auto asIt = m_actualScopes.find(nodep);
+            if (asIt != m_actualScopes.end()) {
+                m_scopep = asIt->second;
+                m_actualScopes.erase(asIt);
+            }
+            analyzeExpr(nodep->defaultp(), symp->typep());
+        }
         VhdlType* const declaredp = symp->typep();
         // The initial value is of the object's type (6.4.2.2 - 6.4.2.4).
         // Where analyzing it said something already, that was the mistake.
@@ -3802,6 +3819,7 @@ void VhdlSemVisitor::visitSubprogDecl(AstVhdlSubprogDecl* nodep) {
             const AstVhdlObjectDecl* const odp = VN_CAST(declp, VhdlObjectDecl);
             const AstVhdlAliasDecl* const adp = VN_CAST(declp, VhdlAliasDecl);
             if ((odp && have.count(odp->name())) || (adp && have.count(adp->name()))) {
+                if (odp) m_actualScopes.erase(odp);
                 VL_DO_DANGLING(declp->deleteTree(), declp);
                 continue;
             }
@@ -6413,6 +6431,10 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     }
 
     VhdlScope* const savedp = m_scopep;
+    // Where the instantiation is written. A package instance that is a design
+    // unit of its own is analyzed in its own region, whose context clause is
+    // the region around it (4.9, 13.1)
+    VhdlScope* const sitep = savedp == intop && intop->parentp() ? intop->parentp() : savedp;
     m_scopep = intop;
     // The copy is analyzed where the *package* was written, not where it is
     // instantiated: its declarations name what its own context clause made
@@ -6422,6 +6444,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         const VhdlScope* const ctxp = scopeIt->second->parentp();
         for (VhdlScope* const usedp : ctxp->uses()) intop->addUse(usedp);
         for (const auto& pair : ctxp->named()) intop->addNamed(pair.first, pair.second);
+        intop->ownContext(true);
     }
     // A package nested in another names what that one declares, and may name
     // the outer package itself -- "subtype t is axi4s.axis_t(...)"
@@ -6458,9 +6481,8 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
             } else if (formalp->profilep() && formalp->profilep()->defaultsToVisible()) {
                 // "is <>": bound to whatever subprogram of that designator
                 // and profile is visible where the package is instantiated
-                // (6.5.6.2). Declaring nothing leaves the copy's region
-                // transparent to the instantiation site, which the addUse
-                // above has already made reachable.
+                // (6.5.6.2), which reexportGenericOps makes visible in the
+                // copy before it is analyzed.
                 boxDefaults.push_back(formalp);
                 continue;
             } else {
@@ -6469,7 +6491,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
                 continue;
             }
         }
-        bindPackageGeneric(formalp, actualp, savedp);
+        bindPackageGeneric(formalp, actualp, sitep);
     }
     // Every formal the map names is one of the package's generics (6.5.7.2)
     for (const AstVhdlAssoc* const asp : assocs) {
@@ -6490,6 +6512,8 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
     // the template and again in every copy of it, and the copies would
     // otherwise pile up one on top of another
     if (AstNode* const stalep = nodep->declsp()) {
+        stalep->foreachAndNext(
+            [this](const AstVhdlObjectDecl* odp) { m_actualScopes.erase(odp); });
         VL_DO_DANGLING(stalep->unlinkFrBackWithNext()->deleteTree(), stalep);
     }
     // A generic whose value is not static became a constant of its own, and
@@ -6542,6 +6566,7 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
             nodep->addDeclsp(copyp);
         }
     }
+    reexportGenericOps(pkgp, intop, sitep, boxDefaults);
     // The copy of the body is still a package body: a constant there gives a
     // deferred one its value rather than declaring a second (6.4.2.2)
     std::vector<AstNode*> declOrder;
@@ -6560,13 +6585,17 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
         iterate(p);
     }
     m_scopep = savedp;
-    // What the generics bring with them is part of the instance too, for a
-    // use clause of it to make visible (12.4): a generic type's "=" and "/="
-    // (6.5.3), and the subprogram an "is <>" generic took from where the
-    // package is instantiated (6.5.6.2). They are the declarations they
-    // stand for, so made visible as themselves; only now, after the copy is
-    // analyzed, since inside it they were reachable already (GHDL gna
-    // issue2561).
+}
+
+// What the generics bring with them is part of the instance too, for a use
+// clause of it to make visible (12.4), and for the copy itself, which sees
+// only its own package's context: a generic type's "=" and "/=" (6.5.3), and
+// the subprogram an "is <>" generic took from where the package is
+// instantiated (6.5.6.2). They are the declarations they stand for, so made
+// visible as themselves (GHDL gna issue2561, issue317).
+void VhdlSemVisitor::reexportGenericOps(const AstVhdlPackage* pkgp, VhdlScope* intop,
+                                        VhdlScope* savedp,
+                                        const std::vector<const AstVhdlIfaceDecl*>& boxDefaults) {
     std::map<std::string, const VhdlType*> genTypes;
     for (AstNode* p = pkgp->genericsp(); p; p = p->nextp()) {
         const AstVhdlIfaceDecl* const formalp = VN_AS(p, VhdlIfaceDecl);
@@ -6983,6 +7012,7 @@ void VhdlSemVisitor::bindPackageGeneric(AstVhdlIfaceDecl* formalp, AstNodeVhdlEx
         // A copy of a generic subprogram declares it among its own
         // declarations, ahead of the rest, which is where it is elaborated
         // on every call
+        m_actualScopes[declp] = outerp;
         std::vector<AstNodeVhdl*>& pendingp
             = m_inSubprogInst && !m_inPkgInst ? m_pendingSubprogDecls : m_pendingPkgDecls;
         pendingp.push_back(declp);
@@ -10637,6 +10667,17 @@ bool VhdlSemVisitor::allParamsDefaulted(const VhdlSymbol* symp) {
     return seen == static_cast<int>(symp->paramTypes().size());
 }
 
+// The array a following parenthesis indexes in the result of a function
+// called with no arguments: the result itself, or what an access result
+// designates, which is dereferenced without saying so (8.1; GHDL gna
+// bug08's paren10). Null where the result cannot be indexed
+VhdlType* VhdlSemVisitor::indexableResult(VhdlType* retp) {
+    if (retp && retp->base()->kind() == VhdlTypeKind::ACCESS && retp->base()->designatedp()) {
+        retp = retp->base()->designatedp();
+    }
+    return retp && retp->base()->kind() == VhdlTypeKind::ARRAY ? retp : nullptr;
+}
+
 VhdlType* VhdlSemVisitor::analyzeLiteral(AstVhdlLiteral* nodep, VhdlType* wantp) {
     switch (nodep->kind()) {
     case VhdlLitKind::INTEGER:
@@ -13208,9 +13249,7 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             const VhdlSymbol* const fp = symp->resolved();
             if (fp->kind() != VhdlSymKind::FUNCTION) continue;
             if (!fp->paramTypes().empty() && !allParamsDefaulted(fp)) continue;
-            const VhdlType* const retp = fp->returnTypep();
-            if (retp && retp->base()->kind() == VhdlTypeKind::ARRAY)
-                noArgs.insert(aliasRoot(symp));
+            if (indexableResult(fp->returnTypep())) noArgs.insert(aliasRoot(symp));
         }
         if (noArgs.size() > 1 && !m_inSpecialized && !parts.empty()) {
             err(nodep->fileline(), "'" + parts.back() + "' names " + std::to_string(noArgs.size())
@@ -13223,14 +13262,15 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             VhdlSymbol* const fp = symp->resolved();
             if (!fp->paramTypes().empty() && !allParamsDefaulted(fp)) continue;
             VhdlType* const retp = fp->returnTypep();
-            if (!retp || retp->base()->kind() != VhdlTypeKind::ARRAY) continue;
+            VhdlType* const arrayp = indexableResult(retp);
+            if (!arrayp) continue;
             AstNodeVhdlExpr* const oldPrefixp = nodep->prefixp()->unlinkFrBack();
             AstVhdlCall* const innerp = new AstVhdlCall{oldPrefixp->fileline(), oldPrefixp};
             innerp->vhdlSymp(fp);
             innerp->vhdlTypep(retp);
             nodep->prefixp(innerp);
             const bool isSlice = (nodep->argsp() && !VN_IS(nodep->argsp(), VhdlAssoc));
-            return isSlice ? analyzeSliceName(nodep, retp) : analyzeIndexedName(nodep, retp);
+            return isSlice ? analyzeSliceName(nodep, arrayp) : analyzeIndexedName(nodep, arrayp);
         }
         // A value of a generic type is not in error: it is of a type of its
         // own, which only its own operations take (6.5.3)

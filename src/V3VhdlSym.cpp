@@ -323,6 +323,14 @@ void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) c
             if (onlyIt != scopep->m_useOnly.end() && !onlyIt->second.count(name)) continue;
             addUnhidden(usedp, name, out, directCount);
         }
+        // A copy of a generic package sees what the package's own context
+        // clause made visible, not the use clauses where it is instantiated
+        // (4.9, 12.4): OSVVM's to_string(integer) is not ambiguous with
+        // PoC's to_string(integer, base) because the unit instantiating it
+        // uses both (GHDL gna issue317). Those are reached only for a name the
+        // package's context leaves unknown, which is what an actual copied
+        // into the instance names.
+        if (scopep->m_ownContext && !out.empty()) break;
     }
 
     // The same region may be reached by more than one route. Which one it
