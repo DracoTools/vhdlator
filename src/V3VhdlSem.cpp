@@ -246,10 +246,33 @@ class VhdlSemVisitor final : public VNVisitor {
     // begins where it does, so within it the name denotes nothing yet --
     // not the outer object it is about to hide (12.2, 12.3)
     std::set<std::string> m_declaring;
+    // An enumeration literal of a name being declared, visible from outside, is what the
+    // name denotes within the declaration -- "constant state1 : state := state1" -- as nvc,
+    // Questa and GHDL's relaxed rules take it; strict VHDL-93 refuses it (GHDL gna bug20767)
+    VhdlSymbol* outerLiteral(const AstVhdlName* namep) {
+        if (!m_scopep || !m_declaring.count(namep->name())) return nullptr;
+        if (namep->fileline()->language() < V3LangCode::L1076_2008
+            && !v3Global.opt.vhdlRelaxed93()) {
+            return nullptr;
+        }
+        // What the name would denote without this declaration, which is already in the
+        // region and hides the rest: an enclosing region's, or a use clause's
+        std::vector<VhdlSymbol*> outer;
+        if (m_scopep->parentp()) m_scopep->parentp()->lookup(namep->name(), outer);
+        m_scopep->lookupUsed(namep->name(), outer);
+        VhdlSymbol* litp = nullptr;
+        for (VhdlSymbol* const symp : outer) {
+            if (symp->resolved()->kind() != VhdlSymKind::ENUM_LITERAL) continue;
+            if (litp && litp->resolved() != symp->resolved()) return nullptr;  // Overloaded
+            litp = symp->resolved();
+        }
+        return litp;
+    }
     bool nameBeingDeclared(const AstVhdlName* namep) {
         if (m_inSpecialized || namep->isChar() || !m_declaring.count(namep->name())) {
             return false;
         }
+        if (outerLiteral(namep)) return false;
         err(namep->fileline(), "'" + namep->prettyName()
                                    + "' is being declared here, and a name is not visible"
                                      " within its own declaration");
@@ -917,6 +940,29 @@ class VhdlSemVisitor final : public VNVisitor {
         // written with it look four billion elements long (16.2.4).
         if (typep->unconstrained()) {
             VhdlType* const dimp = dimensionOf(attrp, typep);
+            // "f'range" of what elaboration alone gives -- a call that allocates, an access
+            // value -- is the range of the array it is, elaboration running it (16.2.3; GHDL
+            // gna issue2147). Not inside a subprogram, which is elaborated at each call.
+            const VhdlSymbol* const prefSymp
+                = attrp->prefixp() && attrp->prefixp()->vhdlSymp()
+                      ? attrp->prefixp()->vhdlSymp()->resolved()
+                      : nullptr;
+            const bool callPrefix = attrp->prefixp()
+                                    && (VN_IS(attrp->prefixp(), VhdlCall)
+                                        || (prefSymp && prefSymp->kind() == VhdlSymKind::FUNCTION));
+            if (m_elabBounds && dimp && callPrefix && !attrp->argp()) {
+                const VhdlValue val = V3VhdlEval::evalElabBound(attrp->prefixp());
+                if (val.isArray() || val.isStr()) {
+                    const int64_t n = val.isStr() ? static_cast<int64_t>(val.toStr().size())
+                                                  : static_cast<int64_t>(val.elements());
+                    const int64_t left = val.arrayLeft();
+                    const int64_t right = val.arrayAscending() ? left + n - 1 : left - n + 1;
+                    VhdlType* const fixedp = cloneSubtype(dimp, attrp->fileline());
+                    fixedp->setBounds(left, right, val.arrayAscending());
+                    ++m_elabFolds;
+                    return fixedp;
+                }
+            }
             VhdlType* const openp = cloneSubtype(dimp, attrp->fileline());
             if (openp) {
                 openp->unbound();
@@ -2714,6 +2760,7 @@ private:
     bool inGenericTemplate(const AstNode* nodep) const VL_MT_DISABLED;
     void visit(AstVhdlNext* nodep) override;
     void visit(AstVhdlInstance* nodep) override;
+    VhdlSymbol* expandedComponent(const AstNodeVhdlExpr* namep) VL_MT_DISABLED;
     void visit(AstVhdlConfigSpec* nodep) override;
     // A port whose subtype is left unconstrained takes its bounds from the
     // actual, which differ per instance (5.3.2.2, 6.5.6.3)
@@ -9599,6 +9646,9 @@ void VhdlSemVisitor::candidateTypesUncached(AstNodeVhdlExpr* nodep, CandSet& out
         out.types.erase(std::unique(out.types.begin(), out.types.end()), out.types.end());
         if (!out.types.empty()) return;
     } else if (AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+        // A lone subtype mark is a range where the prefix takes one, as analyzeCall reads it:
+        // "a(b)" is a slice of what "a" returns (GHDL gna bug08 paren9)
+        if (prefixTakesRange(callp->prefixp())) markAsRange(callp->argsp());
         // A call has as many possible types as it has applicable overloads,
         // and two functions may differ only in their result (12.5). Settling
         // it here would report an ambiguity the surrounding expression is
@@ -10203,6 +10253,10 @@ bool VhdlSemVisitor::conflictingPotentials(const std::vector<VhdlSymbol*>& found
 }
 
 VhdlType* VhdlSemVisitor::analyzeName(AstVhdlName* nodep, VhdlType* wantp) {
+    if (VhdlSymbol* const litp = outerLiteral(nodep)) {
+        nodep->vhdlSymp(litp);
+        return litp->typep();
+    }
     if (nameBeingDeclared(nodep)) return V3VhdlStd::errorType();
     const std::string key = nodep->isChar() ? vhdlCharLitName(nodep->name()) : nodep->name();
     std::vector<VhdlSymbol*> found;
@@ -11044,6 +11098,18 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
         for (const VhdlSymbol* const asymp : attrs) {
             if (asymp->resolved()->kind() == VhdlSymKind::ATTRIBUTE) userAttr = true;
         }
+        // Or one a design unit of the library gave its own name, though the attribute's
+        // declaration is not visible here (GHDL gna issue1528)
+        if (!userAttr && VN_IS(nodep->prefixp(), VhdlName)) {
+            const auto unitIt = m_unitScopes.find(m_libname + "." + lower(parts.back()));
+            if (unitIt != m_unitScopes.end()) {
+                std::vector<VhdlSymbol*> selves;
+                unitIt->second->lookupLocal(lower(parts.back()), selves);
+                for (const VhdlSymbol* const selfp : selves) {
+                    if (selfp->userAttr(attrName)) userAttr = true;
+                }
+            }
+        }
         if (userAttr) {
             // An expanded name says for itself what it denotes -- "p.'1''a",
             // where the literal is declared inside the process p -- and a
@@ -11103,6 +11169,24 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
                     const auto it = m_labelBearers.find(std::make_pair(sp, lower(parts.back())));
                     if (it != m_labelBearers.end() && it->second->userAttr(attrName)) {
                         bearers.push_back(it->second);
+                    }
+                }
+            }
+            // A design unit of the library, named by itself where "use work.all" makes it
+            // visible, whose own name was given the attribute (12.4, 7.2; GHDL gna
+            // issue1528): its value, where static, is read from outside the unit
+            if (bearers.empty() && prefs.empty() && !prefixIsBearer
+                && VN_IS(nodep->prefixp(), VhdlName)) {
+                const auto unitIt = m_unitScopes.find(m_libname + "." + lower(parts.back()));
+                if (unitIt != m_unitScopes.end()) {
+                    std::vector<VhdlSymbol*> selves;
+                    unitIt->second->lookupLocal(lower(parts.back()), selves);
+                    for (VhdlSymbol* const selfp : selves) {
+                        AstNodeVhdlExpr* const valp = selfp->userAttr(attrName);
+                        if (valp && V3VhdlEval::eval(valp).known()) {
+                            bearers.push_back(selfp);
+                            break;
+                        }
                     }
                 }
             }
@@ -11250,6 +11334,26 @@ VhdlType* VhdlSemVisitor::analyzeAttrName(AstVhdlAttrName* nodep, VhdlType* want
                 if (symp->kind() == VhdlSymKind::ATTRIBUTE) {
                     found.insert(found.begin(), symp);
                     any = true;
+                }
+            }
+            // An attribute declared elsewhere -- a package the unit uses, not this one --
+            // that the unit gave a value: the value says the attribute's type, and "use
+            // work.all; ... ent1'ent_name" reads it (7.2; GHDL gna issue1528, which nvc,
+            // GHDL and Questa take)
+            if (!any) {
+                std::vector<VhdlSymbol*> selves;
+                unitIt->second->lookupLocal(unit, selves);
+                for (VhdlSymbol* const selfp : selves) {
+                    AstNodeVhdlExpr* const valp = selfp->userAttr(attr);
+                    // Only a static value: one written with the unit's generics has none
+                    // outside an instance of it (gna issue1528 uattr4)
+                    if (!valp || !valp->vhdlTypep() || !V3VhdlEval::eval(valp).known()) continue;
+                    VhdlSymbol* const declp
+                        = VhdlSymTab::newSymbol(VhdlSymKind::ATTRIBUTE, attr, valp);
+                    declp->typep(valp->vhdlTypep());
+                    found.insert(found.begin(), declp);
+                    unitSymp = selfp;
+                    break;
                 }
             }
             // The unit's own name, declared in its own region, is what holds
@@ -13241,6 +13345,18 @@ bool VhdlSemVisitor::prefixTakesRange(AstNodeVhdlExpr* prefixp) {
     if (found.empty()) return false;
     for (const VhdlSymbol* const symp : found) {
         const VhdlSymbol* const realp = symp->resolved();
+        // A function whose every parameter can be left out, returning an array: "a(b)", b a
+        // subtype, is a slice of what "a" returns (8.5; GHDL gna bug08 paren9), since a type
+        // mark is no actual
+        if (realp->kind() == VhdlSymKind::FUNCTION && realp->returnTypep()
+            && realp->returnTypep()->base()->kind() == VhdlTypeKind::ARRAY) {
+            bool allDefault = true;
+            for (size_t i = 0; i < realp->paramTypes().size(); ++i) {
+                if (!realp->paramHasDefault(i)) allDefault = false;
+            }
+            if (allDefault) return true;
+            continue;
+        }
         if (realp->kind() == VhdlSymKind::FUNCTION || realp->kind() == VhdlSymKind::PROCEDURE) {
             continue;
         }
@@ -15786,7 +15902,16 @@ void VhdlSemVisitor::visit(AstVhdlInstance* nodep) {
             unitNamep = callp->prefixp();
         }
     }
-    if (flatten(unitNamep, parts) && !parts.empty()) {
+    VhdlSymbol* const expCompp
+        = nodep->kind() != "entity" && nodep->kind() != "configuration"
+              ? expandedComponent(unitNamep)
+              : nullptr;
+    if (expCompp) {
+        // A component named through the package that declares it (11.7.2)
+        unitNamep->vhdlSymp(expCompp);
+        unitScopep = expCompp->innerp();
+        flatten(unitNamep, parts);
+    } else if (flatten(unitNamep, parts) && !parts.empty()) {
         if (parts.size() > 1) {
             // "entity lib.name" names the entity directly (11.7)
             std::string lib = parts[0];
@@ -17297,6 +17422,84 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
         // bounds from the actual, as an unconstrained element would
         // (5.3.3); the elements it does constrain keep what it says (GHDL
         // gna bug0136)
+        // "bit_vec_vec(1 downto 0)", read as a call of the type mark: the index constrained
+        // and the element left to take its bounds from the actual (5.3.2.2 e; GHDL gna
+        // issue2417). Written as a mark and a constraint, the element's is added.
+        // "bit_vec_vec(open)(3 downto 0)": the index open and the element constrained, read
+        // as a call of a call. The index takes its bounds from the actual, as an open port's
+        // does, and the element keeps what is written.
+        if (subp && !subp->constraintp() && VN_IS(subp->typeMarkp(), VhdlCall)
+            && VN_IS(VN_AS(subp->typeMarkp(), VhdlCall)->prefixp(), VhdlCall)) {
+            AstVhdlCall* const outerp = VN_AS(subp->typeMarkp(), VhdlCall);
+            AstVhdlCall* const innerCallp = VN_AS(outerp->prefixp(), VhdlCall);
+            VhdlSymbol* const asymp = lookupTypeQuiet(innerCallp->prefixp());
+            VhdlType* const atypep = asymp ? asymp->typep() : nullptr;
+            bool allOpen = innerCallp->argsp() != nullptr;
+            for (AstNode* ap = innerCallp->argsp(); ap; ap = ap->nextp()) {
+                const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                const bool open = VN_IS(ap, VhdlOpen)
+                                  || (asp && !asp->formalp() && VN_IS(asp->actualp(), VhdlOpen));
+                if (!open) allOpen = false;
+            }
+            bool plainElem = outerp->argsp() != nullptr;
+            for (AstNode* ap = outerp->argsp(); ap; ap = ap->nextp()) {
+                if (!VN_IS(ap, VhdlRange)) plainElem = false;
+            }
+            if (atypep && atypep->base()->kind() == VhdlTypeKind::ARRAY && allOpen && plainElem) {
+                std::vector<std::string> path;
+                AstVhdlIndexConstraint* const consp
+                    = openConstraintFor(atypep->base(), ifp, entp, compp, scopep, path);
+                if (consp) {
+                    // The element's open constraint gives way to the one written
+                    for (AstNode* rp = consp->rangesp(); rp;) {
+                        AstNode* const nextp = rp->nextp();
+                        if (VN_IS(rp, VhdlIndexConstraint)) {
+                            VL_DO_DANGLING(pushDeletep(rp->unlinkFrBack()), rp);
+                        }
+                        rp = nextp;
+                    }
+                    AstVhdlIndexConstraint* const elemConsp
+                        = new AstVhdlIndexConstraint{outerp->fileline()};
+                    elemConsp->addRangesp(outerp->argsp()->unlinkFrBackWithNext());
+                    consp->addRangesp(elemConsp);
+                    AstNodeVhdlExpr* const namep = innerCallp->prefixp()->unlinkFrBack();
+                    outerp->replaceWith(namep);
+                    VL_DO_DANGLING(pushDeletep(outerp), outerp);
+                    subp->constraintp(consp);
+                }
+                continue;
+            }
+        }
+        if (subp && !subp->constraintp() && VN_IS(subp->typeMarkp(), VhdlCall)) {
+            AstVhdlCall* const markp = VN_AS(subp->typeMarkp(), VhdlCall);
+            VhdlSymbol* const asymp = lookupTypeQuiet(markp->prefixp());
+            VhdlType* const atypep = asymp ? asymp->typep() : nullptr;
+            VhdlType* const aelemp
+                = atypep && atypep->base()->kind() == VhdlTypeKind::ARRAY
+                      ? atypep->base()->elementp()
+                      : nullptr;
+            size_t ranges = 0;
+            bool plain = true;
+            for (AstNode* ap = markp->argsp(); ap; ap = ap->nextp(), ++ranges) {
+                if (!VN_IS(ap, VhdlRange)) plain = false;
+            }
+            if (aelemp && plain && ranges == atypep->base()->indexTypes().size()
+                && aelemp->base()->kind() == VhdlTypeKind::ARRAY && !aelemp->lengthEmittable()) {
+                std::vector<std::string> path{""};
+                if (AstVhdlIndexConstraint* const innerp
+                    = openConstraintFor(aelemp, ifp, entp, compp, scopep, path)) {
+                    AstVhdlIndexConstraint* const consp
+                        = new AstVhdlIndexConstraint{markp->fileline()};
+                    consp->addRangesp(markp->argsp()->unlinkFrBackWithNext());
+                    consp->addRangesp(innerp);
+                    AstNodeVhdlExpr* const namep = markp->prefixp()->unlinkFrBack();
+                    markp->replaceWith(namep);
+                    VL_DO_DANGLING(pushDeletep(markp), markp);
+                    subp->constraintp(consp);
+                }
+                continue;
+            }
+        }
         if (subp && !subp->constraintp() && VN_IS(subp->typeMarkp(), VhdlCall)) {
             AstVhdlCall* const markp = VN_AS(subp->typeMarkp(), VhdlCall);
             VhdlSymbol* const rsymp = lookupTypeQuiet(markp->prefixp());
@@ -17341,6 +17544,32 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
                     elemCallp->addArgsp(VN_AS(rangesp->unlinkFrBackWithNext(), NodeVhdl));
                 }
                 VL_DO_DANGLING(innerp->deleteTree(), innerp);
+            }
+            continue;
+        }
+        // "bit_vec_vec(1 downto 0)": the index constrained and the element left to take its
+        // bounds from the actual (5.3.2.2 e; GHDL gna issue2417)
+        if (subp && subp->typeMarkp() && VN_IS(subp->constraintp(), VhdlIndexConstraint)) {
+            AstVhdlIndexConstraint* const consp = VN_AS(subp->constraintp(), VhdlIndexConstraint);
+            VhdlSymbol* const csymp = lookupTypeQuiet(subp->typeMarkp());
+            VhdlType* const ctypep = csymp ? csymp->typep() : nullptr;
+            if (!ctypep || ctypep->base()->kind() != VhdlTypeKind::ARRAY) continue;
+            size_t ranges = 0;
+            bool nested = false;
+            for (AstNode* rp = consp->rangesp(); rp; rp = rp->nextp()) {
+                if (VN_IS(rp, VhdlIndexConstraint)) nested = true;
+                if (VN_IS(rp, VhdlOpen)) nested = true;  // Left as it is: the index is open
+                ++ranges;
+            }
+            VhdlType* const elemp = ctypep->base()->elementp();
+            if (nested || ranges != ctypep->base()->indexTypes().size() || !elemp
+                || elemp->base()->kind() != VhdlTypeKind::ARRAY || elemp->lengthEmittable()) {
+                continue;
+            }
+            std::vector<std::string> path{""};
+            if (AstVhdlIndexConstraint* const innerp
+                = openConstraintFor(elemp, ifp, entp, compp, scopep, path)) {
+                consp->addRangesp(innerp);
             }
             continue;
         }
@@ -18291,7 +18520,52 @@ VhdlType* VhdlSemVisitor::formalAt(VhdlScope* scopep, int position) {
     return symp->typep();
 }
 
+// The component an expanded name denotes through the package that declares it,
+// "work.some_package.some_component" (11.7.2), or null
+VhdlSymbol* VhdlSemVisitor::expandedComponent(const AstNodeVhdlExpr* namep) {
+    std::vector<std::string> parts;
+    if (!flatten(namep, parts) || parts.size() < 2) return nullptr;
+    VhdlScope* regionp = nullptr;
+    size_t first = 0;
+    // "lib.pkg.comp", or "pkg.comp" where a use clause made the package visible
+    if (parts.size() >= 3) {
+        const std::string lib = lower(parts[0]) == "work" ? m_libname : lower(parts[0]);
+        const auto it = m_unitScopes.find(lib + "." + lower(parts[1]));
+        if (it != m_unitScopes.end()) {
+            regionp = it->second;
+            first = 2;
+        }
+    }
+    if (!regionp) {
+        regionp = m_scopep ? m_scopep->findNamed(lower(parts[0])) : nullptr;
+        first = 1;
+    }
+    for (size_t i = first; regionp && i + 1 < parts.size(); ++i) {
+        regionp = regionp->findNamed(lower(parts[i]));
+    }
+    if (!regionp) return nullptr;
+    std::vector<VhdlSymbol*> found;
+    regionp->lookupLocal(lower(parts.back()), found);
+    for (VhdlSymbol* const symp : found) {
+        if (symp->resolved()->kind() == VhdlSymKind::COMPONENT) return symp->resolved();
+    }
+    return nullptr;
+}
+
 void VhdlSemVisitor::visit(AstVhdlProcCall* nodep) {
+    // "inst : work.pkg.comp;" with no maps is an instance of a component a package declares
+    // (11.7.2), which the parser took for a call as it takes any expanded name
+    // (GHDL gna bug21052)
+    if (!nodep->name().empty() && VN_IS(nodep->callp(), VhdlSelected)
+        && expandedComponent(nodep->callp())) {
+        AstVhdlInstance* const instp
+            = new AstVhdlInstance{nodep->fileline(), nodep->callp()->unlinkFrBack()};
+        instp->name(nodep->name());
+        nodep->replaceWith(instp);
+        VL_DO_DANGLING(pushDeletep(nodep), nodep);
+        iterate(instp);
+        return;
+    }
     // A procedure call statement can only mean a procedure, and an
     // expression can only mean a function, so the two never compete (4.3)
     VL_RESTORER(m_procCall);

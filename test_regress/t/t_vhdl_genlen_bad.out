@@ -1,0 +1,3 @@
+[0] %Error: t_vhdl_genlen_bad.vhd:25: Assertion failed in t_vhdl_genlen_bad.dut: Array lengths do not match
+%Error: t/t_vhdl_genlen_bad.vhd:25: Verilog $stop
+Aborting...

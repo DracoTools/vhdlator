@@ -402,7 +402,16 @@ public:
                 return VhdlValue::mkInt(0, V3VhdlStd::timeType());
             }
         }
-        if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) return evalSymbol(p->vhdlSymp());
+        if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) {
+            // A function named with no parentheses is called with none (4.2.2.1): "f'range"
+            // of what a parameterless f returns (GHDL gna issue2147)
+            const VhdlSymbol* const funcp = p->vhdlSymp() ? p->vhdlSymp()->resolved() : nullptr;
+            if (funcp && funcp->kind() == VhdlSymKind::FUNCTION && !funcp->predefined()
+                && funcp->paramTypes().empty()) {
+                return evalUserCall(nullptr, funcp);
+            }
+            return evalSymbol(p->vhdlSymp());
+        }
         if (AstVhdlSelected* const p = VN_CAST(nodep, VhdlSelected)) {
             // "p.all" is what an access value designates (8.3)
             if (p->isAll()) return m_allowImpure ? deref(eval(p->prefixp())) : VhdlValue{};
@@ -477,6 +486,10 @@ private:
     // A value handed out of the evaluation keeps no access value: the heap it
     // points into is gone
 public:
+    // What an access value designates, while this evaluation still holds it
+    VhdlValue derefIfAccess(const VhdlValue& val) {
+        return isAccessValue(val) ? deref(val) : val;
+    }
     static VhdlValue stripAccess(const VhdlValue& val) {
         if (isAccessValue(val)) return VhdlValue{};
         if (val.isRecord()) {
@@ -900,8 +913,43 @@ private:
         return out;
     }
 
+    // "(1 to n => '0')" of bits or characters: a string of that one character with the
+    // range's bounds (9.3.3.3), which is the form a bit string has here
+    VhdlValue evalCharRangeFill(AstVhdlAggregate* nodep, VhdlType* typep) {
+        if (typep->base()->indexTypes().size() != 1) return VhdlValue{};
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!elemp || elemp->base()->kind() != VhdlTypeKind::ENUM) return VhdlValue{};
+        const AstVhdlElemAssoc* const ap = nodep->elemsp();
+        if (!ap || ap->nextp() || !ap->choicesp() || ap->choicesp()->nextp()) return VhdlValue{};
+        const AstVhdlChoice* const cp = ap->choicesp();
+        const AstVhdlRange* const rp = cp ? cp->rangep() : nullptr;
+        const AstVhdlLiteral* const litp = VN_CAST(ap->valuep(), VhdlLiteral);
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown() || !litp
+            || litp->kind() != VhdlLitKind::CHARACTER) {
+            return VhdlValue{};
+        }
+        const std::string& text = litp->text();
+        const char c = text.size() == 3 && text[0] == '\'' ? text[1]
+                       : text.size() == 1                  ? text[0]
+                                                           : '\0';
+        if (!c) return VhdlValue{};
+        const VhdlValue lv = eval(rp->leftp());
+        const VhdlValue rv = eval(rp->rightp());
+        if (!lv.isInt() || !rv.isInt()) return VhdlValue{};
+        const bool ascending = rp->dir() == VhdlDir::TO;
+        const int64_t span = ascending ? rv.toInt() - lv.toInt() : lv.toInt() - rv.toInt();
+        if (span >= (int64_t{1} << 20)) return VhdlValue{};
+        const size_t length = span < 0 ? 0 : static_cast<size_t>(span + 1);
+        return VhdlValue::mkStrAt(std::string(length, c), lv.toInt(), ascending, typep);
+    }
+
     VhdlValue evalAggregate(AstVhdlAggregate* nodep) {
         VhdlType* const typep = nodep->vhdlTypep();
+        if (typep && !typep->isError() && typep->base()->kind() == VhdlTypeKind::ARRAY
+            && !numericElement(typep)) {
+            return evalCharRangeFill(nodep, typep);
+        }
         if (typep && !typep->isError() && typep->base()->kind() == VhdlTypeKind::ARRAY
             && numericElement(typep)) {
             return evalArrayAggregate(nodep, typep);
@@ -1488,12 +1536,34 @@ private:
         const AstVhdlAttrName* const pattrp = VN_CAST(nodep->prefixp(), VhdlAttrName);
         const bool userAttrPrefix
             = pattrp && pattrp->vhdlSymp() && pattrp->vhdlSymp()->kind() == VhdlSymKind::ATTRIBUTE;
-        if ((m_allowImpure || userAttrPrefix) && nodep->prefixp() && !nodep->argp()
+        // Or an element of what a pure call gives back, which is a value however it is asked
+        // of: "get_bv(5).bv'length" (GHDL gna issue1138). The record is built as elaboration
+        // builds one, since only scalars are held otherwise.
+        bool callValuePrefix = false;
+        for (const AstNodeVhdlExpr* p = nodep->prefixp(); p;) {
+            if (const AstVhdlSelected* const selp = VN_CAST(p, VhdlSelected)) {
+                p = selp->prefixp();
+                callValuePrefix = true;
+                continue;
+            }
+            const AstVhdlCall* const callp = VN_CAST(p, VhdlCall);
+            const VhdlSymbol* const csymp
+                = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+            const AstVhdlSubprogDecl* const cdeclp = csymp ? csymp->bodyp() : nullptr;
+            if (!callValuePrefix || !csymp || csymp->kind() != VhdlSymKind::FUNCTION || !cdeclp
+                || !cdeclp->vhdlPure()) {
+                callValuePrefix = false;
+            }
+            break;
+        }
+        if ((m_allowImpure || userAttrPrefix || callValuePrefix) && nodep->prefixp()
+            && !nodep->argp()
             && (attr == "left" || attr == "right" || attr == "high" || attr == "low"
                 || attr == "ascending" || attr == "length")) {
             const VhdlSymbol* const psymp = nodep->prefixp()->vhdlSymp();
             if (!psymp || psymp->kind() != VhdlSymKind::TYPE) {
-                VhdlValue val = eval(nodep->prefixp());
+                VhdlValue val = callValuePrefix && !m_allowImpure ? callElement(nodep->prefixp())
+                                                                  : eval(nodep->prefixp());
                 if (isAccessValue(val)) val = deref(val);
                 if (val.isStr() || val.isArray()) {
                     const int64_t left = val.arrayLeft();
@@ -2452,6 +2522,26 @@ private:
     // A call to a user-defined function, folded by running it. Null argsp is
     // a call written as a bare name, which is how a function taking no
     // parameters is called (4.2.2.1).
+    // "f(x).a.b": the record the call gives back, as elaboration builds it, and the element
+    // the names select from it
+    static VhdlValue callElement(AstNodeVhdlExpr* nodep) {
+        std::vector<std::string> names;
+        AstNodeVhdlExpr* p = nodep;
+        while (const AstVhdlSelected* const selp = VN_CAST(p, VhdlSelected)) {
+            const AstVhdlName* const namep = VN_CAST(selp->suffixp(), VhdlName);
+            if (!namep) return VhdlValue{};
+            names.push_back(namep->name());
+            p = selp->prefixp();
+        }
+        VhdlValue val = V3VhdlEval::evalElab(p);
+        for (size_t n = names.size(); n-- > 0;) {
+            if (!val.isRecord()) return VhdlValue{};
+            const VhdlValue elemv = val.field(names[n]);
+            val = elemv;
+        }
+        return val;
+    }
+
     VhdlValue evalUserCall(AstNode* argsp, const VhdlSymbol* funcp) {
         // A function bound to a C symbol has no body to run, and an impure
         // one may read a signal or a shared variable, so neither is static
@@ -2657,7 +2747,9 @@ VhdlValue V3VhdlEval::evalElab(AstNodeVhdlExpr* nodep) {
 
 VhdlValue V3VhdlEval::evalElabBound(AstNodeVhdlExpr* nodep) {
     VhdlEvaluator evaluator{nullptr, true, false};
-    return VhdlEvaluator::stripAccess(evaluator.eval(nodep));
+    // An access value is asked for the bounds of what it designates, which lives only as
+    // long as this evaluation: "f'range" of a function returning one (GHDL gna issue2147)
+    return VhdlEvaluator::stripAccess(evaluator.derefIfAccess(evaluator.eval(nodep)));
 }
 
 VhdlValue V3VhdlEval::evalElabWith(AstNodeVhdlExpr* nodep,

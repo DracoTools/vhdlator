@@ -1,0 +1,3 @@
+%Error: real'VALUE: "" is no literal of the type
+%Error: t/t_vhdl_valuegen_bad.vhd:16: Verilog $stop
+Aborting...

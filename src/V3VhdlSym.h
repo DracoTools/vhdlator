@@ -495,6 +495,8 @@ public:
     // innermost region that declares it wins, and only if no region declares
     // it are use clauses consulted.
     void lookup(const std::string& name, std::vector<VhdlSymbol*>& out) const VL_MT_DISABLED;
+    // Only what use clauses of this region and those enclosing it make potentially visible
+    void lookupUsed(const std::string& name, std::vector<VhdlSymbol*>& out) const VL_MT_DISABLED;
 
     // Make another region's declarations potentially visible (use ... .all)
     void addUse(VhdlScope* scopep) VL_MT_DISABLED;

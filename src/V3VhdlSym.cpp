@@ -284,6 +284,16 @@ static void addUnhidden(const VhdlScope* scopep, const std::string& name,
     }
 }
 
+void VhdlScope::lookupUsed(const std::string& name, std::vector<VhdlSymbol*>& out) const {
+    for (const VhdlScope* scopep = this; scopep; scopep = scopep->parentp()) {
+        for (const VhdlScope* const usedp : scopep->m_usedp) {
+            const auto onlyIt = scopep->m_useOnly.find(usedp);
+            if (onlyIt != scopep->m_useOnly.end() && !onlyIt->second.count(name)) continue;
+            usedp->lookupLocal(name, out);
+        }
+    }
+}
+
 void VhdlScope::lookup(const std::string& name, std::vector<VhdlSymbol*>& out) const {
     // Directly visible declarations first. The innermost region that declares
     // the name with something not overloadable wins outright, since that
