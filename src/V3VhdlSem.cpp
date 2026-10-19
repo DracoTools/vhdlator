@@ -3430,6 +3430,16 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
             V3VhdlEval::s_elabReportsp
                 = V3VhdlEval::s_elabNow && !inGenericTemplate(nodep) ? &reports : nullptr;
             VhdlValue val = V3VhdlEval::eval(nodep->defaultp());
+            // A package's scalar constant whose value comes from pure functions working on
+            // text or arrays, which only elaboration's evaluator holds: what elaborating the
+            // package gives (14.4.2). PoC's config derives its synthesis tool from a device
+            // string that way, and its strings package reads it (GHDL gna bug035).
+            if (!val.known() && nodep->defaultp() && VN_IS(parentOf(nodep), VhdlPackage)
+                && !m_inSpecialized && !inGenericTemplate(nodep) && symp->typep()
+                && symp->typep()->isScalar() && !callsImpure(nodep->defaultp())) {
+                const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
+                if (elab.known() && !elab.isComposite()) val = elab;
+            }
             V3VhdlEval::s_elabNow = savedElabNow;
             V3VhdlEval::s_elabReportsp = savedSinkp;
             if (val.known() && !reports.empty()) {

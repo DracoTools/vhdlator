@@ -729,6 +729,31 @@ private:
             if (m_allowImpure && symp->kind() == VhdlSymKind::GENERIC && !symp->value().known()) {
                 return rootGenericValue(symp);
             }
+            // At elaboration a constant analysis could not fold -- a table of records whose
+            // strings a function pads, PoC's board list (GHDL gna bug035) -- has the value its
+            // declaration gives, worked out once here and kept apart from what the emitted code
+            // is built from
+            if (m_allowImpure && symp->kind() == VhdlSymKind::CONSTANT && !symp->value().known()) {
+                const auto cIt = s_elabConstCache.find(symp);
+                if (cIt != s_elabConstCache.end()) return cIt->second;
+                // A deferred constant's value is written where its body completes it
+                const AstVhdlObjectDecl* const odp = VN_CAST(
+                    symp->fullDeclp() ? symp->fullDeclp() : symp->declp(), VhdlObjectDecl);
+                if (odp && odp->defaultp() && !s_elabConstBusy.count(symp)) {
+                    s_elabConstBusy.insert(symp);
+                    VhdlValue v;
+                    {
+                        // The declaration's own frame, not the caller's
+                        std::deque<Frame> saved;
+                        saved.swap(m_frames);
+                        v = eval(const_cast<AstNodeVhdlExpr*>(odp->defaultp()));
+                        saved.swap(m_frames);
+                    }
+                    s_elabConstBusy.erase(symp);
+                    if (v.known()) s_elabConstCache.emplace(symp, v);
+                    return v;
+                }
+            }
             return symp->value();
         case VhdlSymKind::PARAMETER:
             // A parameter has a value only in a copy of a subprogram made for
@@ -924,16 +949,50 @@ private:
         if (!ap || ap->nextp() || !ap->choicesp() || ap->choicesp()->nextp()) return VhdlValue{};
         const AstVhdlChoice* const cp = ap->choicesp();
         const AstVhdlRange* const rp = cp ? cp->rangep() : nullptr;
-        const AstVhdlLiteral* const litp = VN_CAST(ap->valuep(), VhdlLiteral);
-        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown() || !litp
-            || litp->kind() != VhdlLitKind::CHARACTER) {
+        // The one character, written as a literal or as a constant that folds to one
+        char c = '\0';
+        if (const AstVhdlLiteral* const litp = VN_CAST(ap->valuep(), VhdlLiteral)) {
+            const std::string& text = litp->text();
+            if (litp->kind() == VhdlLitKind::CHARACTER) {
+                c = text.size() == 3 && text[0] == '\'' ? text[1]
+                    : text.size() == 1                  ? text[0]
+                                                        : '\0';
+            }
+        } else {
+            const VhdlValue cv = eval(ap->valuep());
+            const VhdlType* const ctp = cv.typep();
+            if (cv.isInt() && ctp && ctp->base()->kind() == VhdlTypeKind::ENUM) {
+                const auto& lits = ctp->base()->literals();
+                for (const VhdlSymbol* const litsymp : lits) {
+                    if (litsymp->position() == cv.toInt() && litsymp->name().size() == 3
+                        && litsymp->name()[0] == '\'') {
+                        c = litsymp->name()[1];
+                    }
+                }
+                // CHARACTER's own literals past the printable ones have names, not quotes
+                if (!c && ctp->base() == V3VhdlStd::characterType()->base() && cv.toInt() > 0
+                    && cv.toInt() < 256) {
+                    c = static_cast<char>(cv.toInt());
+                }
+            }
+        }
+        if (!c) return VhdlValue{};
+        // Under two states a metavalue has no value of its own, and an aggregate of one is
+        // lowered as the aggregate it is, not as the text, which reads it otherwise
+        if (!v3Global.opt.vhdlMetavalues()
+            && (c == 'U' || c == 'X' || c == 'W' || c == '-' || c == 'Z')) {
             return VhdlValue{};
         }
-        const std::string& text = litp->text();
-        const char c = text.size() == 3 && text[0] == '\'' ? text[1]
-                       : text.size() == 1                  ? text[0]
-                                                           : '\0';
-        if (!c) return VhdlValue{};
+        // "others" fills the aggregate's own subtype, which its target gave it (9.3.3.3)
+        if (cp->isOthers()) {
+            if (!typep->isConstrainedArray() || !typep->indexTypes()[0]) return VhdlValue{};
+            const VhdlType* const idxp = typep->indexTypes()[0];
+            const int64_t len = idxp->length();
+            if (len < 0 || len >= (int64_t{1} << 20)) return VhdlValue{};
+            return VhdlValue::mkStrAt(std::string(static_cast<size_t>(len), c), idxp->left(),
+                                      idxp->ascending(), typep);
+        }
+        if (!rp || !rp->leftp() || !rp->rightp() || rp->dirUnknown()) return VhdlValue{};
         const VhdlValue lv = eval(rp->leftp());
         const VhdlValue rv = eval(rp->rightp());
         if (!lv.isInt() || !rv.isInt()) return VhdlValue{};
@@ -948,6 +1007,16 @@ private:
         VhdlType* const typep = nodep->vhdlTypep();
         if (typep && !typep->isError() && typep->base()->kind() == VhdlTypeKind::ARRAY
             && !numericElement(typep)) {
+            // Elaboration holds arrays of composites, each element a value of its own, with
+            // the bounds it was built with: a table of records -- PoC's board list, built
+            // from strings a function pads (GHDL gna bug035)
+            const VhdlType* const elemp
+                = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+            if (m_allowImpure && elemp && typep->base()->indexTypes().size() == 1
+                && (elemp->base()->kind() == VhdlTypeKind::RECORD
+                    || elemp->base()->kind() == VhdlTypeKind::ARRAY)) {
+                return evalArrayAggregate(nodep, typep);
+            }
             return evalCharRangeFill(nodep, typep);
         }
         if (typep && !typep->isError() && typep->base()->kind() == VhdlTypeKind::ARRAY
@@ -989,9 +1058,21 @@ private:
             }
         }
         if (othersp) {
-            const VhdlValue rest = eval(othersp);
+            // "others" stands for every element it covers, each of its own subtype:
+            // "(n => 4, others => (others => '1'))" over a record of a 3-bit and a 7-bit vector
+            // is three ones and seven ones (9.3.3.1), where analysis gave the one value one
+            // subtype (GHDL gna issue1323)
+            AstVhdlAggregate* const restAggp = VN_CAST(othersp, VhdlAggregate);
+            VhdlType* const givenp = othersp->vhdlTypep();
             for (const VhdlSymbol* const ep : elems) {
-                if (!named.count(ep->name())) out.setField(ep->name(), rest);
+                if (named.count(ep->name())) continue;
+                VhdlType* const etp = ep->typep();
+                const bool retype = restAggp && givenp && etp && etp != givenp
+                                    && etp->base() == givenp->base();
+                if (retype) othersp->vhdlTypep(etp);
+                const VhdlValue rest = eval(othersp);
+                if (retype) othersp->vhdlTypep(givenp);
+                out.setField(ep->name(), rest);
             }
         }
         return out;
@@ -1724,6 +1805,11 @@ private:
     // that needs an array or a record stops -- which is the ordinary "not
     // static" answer rather than an error. Two budgets bound the work: how
     // many activations may be nested, and how many statements may run in all.
+
+    // What elaboration worked out for a constant analysis left unfolded, and the ones being
+    // worked out, so that one reading itself is not followed round
+    static std::map<const VhdlSymbol*, VhdlValue> s_elabConstCache;
+    static std::set<const VhdlSymbol*> s_elabConstBusy;
 
     enum class Flow : uint8_t {
         NORMAL,  // Ran to the end of the statement list
@@ -2773,6 +2859,9 @@ VhdlValue V3VhdlEval::evalElab(AstNodeVhdlExpr* nodep) {
     VhdlEvaluator evaluator{nullptr, true};
     return VhdlEvaluator::stripAccess(evaluator.eval(nodep));
 }
+
+std::map<const VhdlSymbol*, VhdlValue> VhdlEvaluator::s_elabConstCache;
+std::set<const VhdlSymbol*> VhdlEvaluator::s_elabConstBusy;
 
 VhdlValue V3VhdlEval::evalElabBound(AstNodeVhdlExpr* nodep) {
     VhdlEvaluator evaluator{nullptr, true, false};
