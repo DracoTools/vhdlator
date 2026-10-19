@@ -6,7 +6,7 @@
 --
 -- "2 ** 31" of INTEGER has no value (5.2.3): an overflow, which a fold must
 -- not hide by working in sixty-four bits (GHDL gna issue683; nvc stops on the
--- overflow, GHDL and Questa fail the assertion).
+-- overflow, and so does GHDL 7.0.0-dev; Questa fails the assertion).
 
 entity t_vhdl_powfold_bad is
 end entity;

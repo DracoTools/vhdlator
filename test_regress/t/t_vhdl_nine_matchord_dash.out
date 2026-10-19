@@ -1,0 +1,5 @@
+t/t_vhdl_nine_matchord_dash.vhd:25:12:@0:(assertion error): STD_LOGIC_1164: '-' operand for matching ordering operator
+t/t_vhdl_nine_matchord_dash.vhd:27:12:@0:(assertion error): STD_LOGIC_1164: '-' operand for matching ordering operator
+t/t_vhdl_nine_matchord_dash.vhd:29:12:@0:(assertion error): STD_LOGIC_1164: '-' operand for matching ordering operator
+t/t_vhdl_nine_matchord_dash.vhd:31:12:@0:(assertion error): STD_LOGIC_1164: '-' operand for matching ordering operator
+t/t_vhdl_nine_matchord_dash.vhd:35:5:@0:(report note): done

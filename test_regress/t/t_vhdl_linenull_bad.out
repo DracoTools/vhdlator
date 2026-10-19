@@ -1,0 +1,6 @@
+abc
+def
+t/t_vhdl_linenull_bad.vhd:21:5:@0:(report note): show ''
+%Error: t/t_vhdl_linenull_bad.vhd:40: NULL access dereferenced
+%Error: t/t_vhdl_linenull_bad.vhd:40: Verilog $stop
+Aborting...

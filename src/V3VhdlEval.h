@@ -81,6 +81,7 @@ public:
         int severity;  // NOTE 0 .. FAILURE 3
         bool hasText;  // Else the default "Assertion violation."
         std::string text;
+        bool error = false;  // An error elaboration ran into, which stops the model: the text
     };
     static std::vector<ElabReport>* s_elabReportsp;
     static std::vector<std::pair<const VhdlSymbol*, std::vector<ElabReport>>> s_constReports;

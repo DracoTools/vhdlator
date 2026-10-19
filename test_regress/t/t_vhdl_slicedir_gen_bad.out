@@ -1,0 +1,4 @@
+t/t_vhdl_slicedir_gen_bad.vhd:22:5:@0:(report note): arg is 0 to 1
+[0] %Error: t_vhdl_slicedir_gen_bad.vhd:23: Assertion failed in t_vhdl_slicedir_gen_bad.u.low_two__V1: Slice runs 'downto' but its prefix runs 'to'
+%Error: t/t_vhdl_slicedir_gen_bad.vhd:23: Verilog $stop
+Aborting...

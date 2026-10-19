@@ -574,6 +574,30 @@ private:
         for (int64_t i = 0; i < len; ++i) elems.push_back(whole.elementAt(off + i));
         return VhdlValue::mkArray(std::move(elems), left, ascending, whole.typep());
     }
+    // A slice elaboration takes that is not null and runs against its prefix, or does not lie
+    // inside it, is an error (8.5) the model reports as it starts, where nvc, GHDL and Questa
+    // stop: "arg(1 downto 0)" of a generic's literal, which runs 0 to 1 (GHDL gna issue559)
+    static void elabSliceError(const AstVhdlCall* nodep, const VhdlValue& whole, int64_t left,
+                               int64_t right, bool ascending) {
+        std::vector<V3VhdlEval::ElabReport>* const sinkp = V3VhdlEval::s_elabReportsp;
+        if (!sinkp || V3VhdlEval::s_keepReports) return;
+        const int64_t len = ascending ? right - left + 1 : left - right + 1;
+        if (len <= 0) return;
+        const int64_t wleft = whole.arrayLeft();
+        const int64_t wlen = valLength(whole);
+        const bool wasc = whole.arrayAscending();
+        const std::string wright = std::to_string(wasc ? wleft + wlen - 1 : wleft - wlen + 1);
+        std::string msg;
+        if (ascending != wasc) {
+            msg = std::string{"Slice runs "} + (ascending ? "'to'" : "'downto'")
+                  + " but its prefix runs " + (wasc ? "'to'" : "'downto'");
+        } else {
+            msg = "Slice " + std::to_string(left) + (ascending ? " to " : " downto ")
+                  + std::to_string(right) + " is outside of the range " + std::to_string(wleft)
+                  + (wasc ? " to " : " downto ") + wright + " of the array";
+        }
+        sinkp->push_back(V3VhdlEval::ElabReport{nodep->fileline(), false, 3, true, msg, true});
+    }
     // The bounds of a constrained array type, working out any that did not
     // fold when it was declared -- "string(1 to s'length)" in a body run for
     // one call
@@ -1325,6 +1349,39 @@ private:
             }
             int64_t out = 0;
             if (!powOvf(lhs.toInt(), rhs.toInt(), out)) return VhdlValue{};
+            // A result its type cannot hold is an error the running model reports, not a value
+            // to fold: "2 ** v_exponent - 1" of a variable no statement writes, which is 31
+            // (9.2.8; GHDL gna issue2646). A universal result is held exactly, "2 ** n" with n
+            // a constant 40 in a type's range, unless an operand is not static -- a variable,
+            // a signal, a parameter or a loop's -- which makes it INTEGER's "**", as nvc and
+            // GHDL take it (Questa keeps it universal)
+            const auto notStatic = [](const AstNodeVhdlExpr* opp) {
+                bool any = false;
+                opp->foreach([&](const AstNodeVhdlExpr* ep) {
+                    const VhdlSymbol* const symp
+                        = ep->vhdlSymp() ? ep->vhdlSymp()->resolved() : nullptr;
+                    if (!symp) return;
+                    switch (symp->kind()) {
+                    case VhdlSymKind::VARIABLE:
+                    case VhdlSymKind::SHARED_VARIABLE:
+                    case VhdlSymKind::SIGNAL:
+                    case VhdlSymKind::PORT:
+                    case VhdlSymKind::PARAMETER:
+                    case VhdlSymKind::LOOP_PARAMETER: any = true; break;
+                    default: break;
+                    }
+                });
+                return any;
+            };
+            const bool running = notStatic(nodep->lhsp()) || notStatic(nodep->rhsp());
+            const VhdlType* rbasep = resp ? resp->base() : nullptr;
+            if (rbasep && rbasep->kind() == VhdlTypeKind::UNIVERSAL_INTEGER && running) {
+                rbasep = V3VhdlStd::integerType() ? V3VhdlStd::integerType()->base() : nullptr;
+            }
+            if (running && rbasep && rbasep->kind() == VhdlTypeKind::INTEGER && rbasep->bounded()
+                && (out < rbasep->low() || out > rbasep->high())) {
+                return VhdlValue{};
+            }
             return VhdlValue::mkInt(out, resp);
         }
         default: return VhdlValue{};  // Shifts and matching relationals, over array values
@@ -2765,7 +2822,9 @@ private:
                     int64_t right = 0;
                     bool ascending = true;
                     if (!rangeValues(rp, left, right, ascending)) return VhdlValue{};
-                    return sliceOf(whole, left, right, ascending);
+                    const VhdlValue outv = sliceOf(whole, left, right, ascending);
+                    if (!outv.known()) elabSliceError(nodep, whole, left, right, ascending);
+                    return outv;
                 }
                 AstVhdlAssoc* const idxp = VN_CAST(nodep->argsp(), VhdlAssoc);
                 if (idxp && !idxp->nextp() && !idxp->formalp() && idxp->actualp()) {

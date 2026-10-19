@@ -1,0 +1,5 @@
+t/t_vhdl_lineslice_bad.vhd:24:5:@0:(report note): here
+t/t_vhdl_lineslice_bad.vhd:25:5:@0:(report note): isastring
+%Error: t/t_vhdl_lineslice_bad.vhd:26: Slice 5 to 13 is outside of the range 1 to 9 of the text
+%Error: t/t_vhdl_lineslice_bad.vhd:26: Verilog $stop
+Aborting...

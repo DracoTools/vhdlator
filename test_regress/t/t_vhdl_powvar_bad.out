@@ -1,0 +1,4 @@
+t/t_vhdl_powvar_bad.vhd:19:5:@0:(report note): before
+%Error: t/t_vhdl_powvar_bad.vhd:20: The result 2.14748e+09 of ** cannot be represented as INTEGER
+%Error: t/t_vhdl_powvar_bad.vhd:20: Verilog $stop
+Aborting...

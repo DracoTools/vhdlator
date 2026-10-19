@@ -8800,6 +8800,9 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     // well have one driver once the design is elaborated: which branches are
     // taken is not known until the generics have values (11.8)
     std::set<const VhdlSymbol*> outsideGenerate;
+    // Driven from a for generate over a range only the instance settles, so resolved however
+    // few its statements are
+    std::set<const VhdlSymbol*> openLoopDriven;
     // A block statement is not a driver of its own: the statements inside it
     // are, and so are those of a block inside that one (11.2)
     // A port of a block associated whole with a signal is that signal
@@ -8975,7 +8978,44 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                         }
                     }
                 }
-                counts[symp] += ownSignal ? 1 : repeat;
+                // A range only the instance settles has however many iterations it gives, so
+                // a signal of the nine values it drives is resolved over them: two here, and
+                // the lowering gathers the iterations into the one slot (genLoopDrivers)
+                int times = repeat;
+                bool declaredInside = false;
+                if (genp && symp->declp()) {
+                    for (const AstNode* up = symp->declp()->backp(); up; up = up->backp()) {
+                        if (up == genp) {
+                            declaredInside = true;
+                            break;
+                        }
+                    }
+                }
+                if (genp && genp->kind() == VhdlLoopKind::FOR && !declaredInside && repeat == 1
+                    && v3Global.opt.vhdlMetavalues()) {
+                    const VhdlSymbol* const gsymp = genp->vhdlSymp();
+                    const VhdlType* const rangep = gsymp ? gsymp->typep() : nullptr;
+                    const VhdlType* leafp = symp->typep();
+                    for (int depth = 0;
+                         leafp && leafp->base()->kind() == VhdlTypeKind::ARRAY && depth < 8;
+                         ++depth) {
+                        leafp = leafp->elementp() ? leafp->elementp() : leafp->base()->elementp();
+                    }
+                    // By STD_LOGIC_1164's RESOLVED, which the lanes resolve
+                    const VhdlSymbol* resp = nullptr;
+                    for (const VhdlType* tp = symp->typep(); tp && !resp;) {
+                        resp = tp->resolutionp();
+                        if (resp || tp->base()->kind() != VhdlTypeKind::ARRAY) break;
+                        tp = tp->elementp() ? tp->elementp() : tp->base()->elementp();
+                    }
+                    if (rangep && !rangep->bounded() && leafp && logicShaped(leafp) && resp
+                        && resp->resolved()->name() == "resolved" && resp->resolved()->declScopep()
+                        && resp->resolved()->declScopep()->name() == "std_logic_1164") {
+                        times = 2;
+                        openLoopDriven.insert(symp);
+                    }
+                }
+                counts[symp] += ownSignal ? 1 : times;
                 if (!inGenerate) outsideGenerate.insert(symp);
                 if (!where.count(symp)) where[symp] = p->fileline();
             }
@@ -8997,6 +9037,7 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             partTargets.clear();
             partsInGenerate.clear();
             outsideGenerate.clear();
+            openLoopDriven.clear();
             portSignals.clear();
             walk(archp->stmtsp());
         }
@@ -9008,9 +9049,12 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     // does not assign as no value at all (14.7.2, finishNineResolves). Parts that are
     // apart, as "s(0) <= a; s(1) <= b;" are, stay what they were: each element has one
     // source, and nothing is resolved.
+    // So is an array of scalars of a subtype a resolution function of the design's own
+    // resolves, under either model: each element is resolved over the processes that drive it,
+    // whichever of them that is (NVC driver6's "y <= (1, 2)" beside "y(1) <= 5")
     for (const auto& pair : partTargets) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
-        if (!v3Global.opt.vhdlMetavalues() || partsInGenerate.count(symp)) continue;
+        if (partsInGenerate.count(symp)) continue;
         const VhdlType* const stp = symp->typep();
         if (!stp || stp->base()->kind() != VhdlTypeKind::ARRAY || !compositeResolved(stp)) {
             continue;
@@ -9021,7 +9065,12 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
              ++depth) {
             leafp = leafp->elementp() ? leafp->elementp() : leafp->base()->elementp();
         }
-        if (!leafp || !logicShaped(leafp)) continue;
+        if (!leafp) continue;
+        const VhdlType* const etp = stp->elementp() ? stp->elementp() : stp->base()->elementp();
+        const bool userElems = !logicShaped(leafp) && !stp->resolutionp() && etp
+                               && etp->base()->kind() != VhdlTypeKind::ARRAY
+                               && elementResolver(stp);
+        if (!userElems && (!v3Global.opt.vhdlMetavalues() || !logicShaped(leafp))) continue;
         if (symp->kind() != VhdlSymKind::SIGNAL) continue;
         const std::set<const AstNode*>& wholes = wholeStmts[symp];
         std::vector<std::pair<const AstNode*, const AstNodeVhdlExpr*>> parts;
@@ -9092,7 +9141,7 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
         // with one it may still change the value it is given (6.5.2). Only
         // the *absence* of one is an error, and only for several drivers.
         if (pair.second < 2 && !resolvep) continue;
-        if (!resolvep && !outsideGenerate.count(symp)) {
+        if (!resolvep && !outsideGenerate.count(symp) && !openLoopDriven.count(symp)) {
             // Every driver is inside a generate statement, so how many there
             // are is settled by elaboration rather than here. They are left
             // as ordinary assignments; if two really do elaborate, the back
@@ -9178,11 +9227,23 @@ void VhdlSemVisitor::specializeResolvers() {
             return it == made.end() ? nullptr : it->second;
         };
         const bool wantNull = guardedKindOf(need.symp) != VhdlSignalKind::NONE;
+        // Driven in parts element by element, each element by however many of the drivers
+        // drive it, so a copy for each number of them
+        const bool wantCounts
+            = !wantNull && need.symp->partsDriven() && need.symp->resolvePerElement();
         if (VhdlSymbol* const havep = cached(need.count)) {
             VhdlSymbol* const haveNullp = wantNull ? cached(0) : nullptr;
             bool haveAll = !wantNull || haveNullp;
             if (haveAll && wantNull && need.count <= 8) {
                 for (int k = 0; k <= need.count; ++k) haveAll = haveAll && cached(k);
+            }
+            if (haveAll && wantCounts && need.count <= 8) {
+                for (int k = 1; k < need.count; ++k) haveAll = haveAll && cached(k);
+                if (haveAll) {
+                    for (int k = 1; k < need.count; ++k) {
+                        need.symp->resolverForCount(k, cached(k));
+                    }
+                }
             }
             if (haveAll) {
                 need.symp->resolverp(havep);
@@ -9245,6 +9306,11 @@ void VhdlSemVisitor::specializeResolvers() {
             return newp;
         };
         if (VhdlSymbol* const newp = copyFor(need.count)) need.symp->resolverp(newp);
+        if (wantCounts && need.count <= 8) {
+            for (int k = 1; k < need.count; ++k) {
+                if (VhdlSymbol* const kp = copyFor(k)) need.symp->resolverForCount(k, kp);
+            }
+        }
         // A guarded signal's drivers may all be disconnected at once, and the
         // function is then called with no drivers at all (14.7.3.2). That
         // copy is made here, where the other one is, rather than at the point

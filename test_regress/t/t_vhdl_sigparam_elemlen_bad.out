@@ -1,0 +1,4 @@
+t/t_vhdl_sigparam_elemlen_bad.vhd:21:5:@0:(report note): w 3
+[0] %Error: t_vhdl_sigparam_elemlen_bad.vhd:34: Assertion failed in t_vhdl_sigparam_elemlen_bad: Array lengths do not match
+%Error: t/t_vhdl_sigparam_elemlen_bad.vhd:34: Verilog $stop
+Aborting...
