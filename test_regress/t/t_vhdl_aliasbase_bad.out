@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_aliasbase_bad.vhd:10:24: An alias names an object, but 'base gives a value: 'bit_base'
+        ... See the manual at https://verilator.org/verilator_doc.html?v=latest for more assistance.
+%Error: Exiting due to

@@ -10614,7 +10614,21 @@ private:
     // external name: what elaboration alone decides (9.4.3)
     static bool readsNoObject(AstNodeVhdlExpr* nodep) {
         if (nodep->exists([](const AstVhdlExternalName*) { return true; })) return false;
-        return !nodep->exists([](const AstVhdlName* namep) {
+        // An array attribute of an object is of its subtype, which elaboration fixes:
+        // "int_sum'length" (GHDL gna bug24065)
+        std::set<const AstNode*> boundPrefixes;
+        nodep->foreach([&](const AstVhdlAttrName* attrp) {
+            const std::string attr = VString::downcase(attrp->name());
+            if (attr == "length" || attr == "left" || attr == "right" || attr == "high"
+                || attr == "low" || attr == "ascending") {
+                if (attrp->prefixp()) {
+                    attrp->prefixp()->foreach(
+                        [&](const AstVhdlName* np) { boundPrefixes.insert(np); });
+                }
+            }
+        });
+        return !nodep->exists([&](const AstVhdlName* namep) {
+            if (boundPrefixes.count(namep)) return false;
             const VhdlSymbol* const symp
                 = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
             if (!symp) return false;
@@ -44906,12 +44920,16 @@ void VhdlLowerVisitor::encodeExtendedNames() {
         const std::string& name = nodep->name();
         if (name.find('\\') != std::string::npos) nodep->name(enc(name));
     };
+    // A module's port list entry keeps its name for good: it is made anew
+    std::vector<AstPort*> portps;
     m_netlistp->foreach([&](AstNode* nodep) {
         if (VN_IS(nodep, Var) || VN_IS(nodep, NodeModule) || VN_IS(nodep, Pin)
             || VN_IS(nodep, NodeFTask) || VN_IS(nodep, ParseRef) || VN_IS(nodep, NodeBlock)
             || VN_IS(nodep, GenBlock) || VN_IS(nodep, MemberDType) || VN_IS(nodep, MemberSel)
             || VN_IS(nodep, StructSel) || VN_IS(nodep, Typedef)) {
             rename(nodep);
+        } else if (AstPort* const portp = VN_CAST(nodep, Port)) {
+            if (portp->name().find('\\') != std::string::npos) portps.push_back(portp);
         } else if (AstCell* const cellp = VN_CAST(nodep, Cell)) {
             rename(cellp);
             cellp->modName(enc(cellp->modName()));
@@ -44923,6 +44941,10 @@ void VhdlLowerVisitor::encodeExtendedNames() {
             frefp->dotted(encDotted(frefp->dotted()));
         }
     });
+    for (AstPort* const portp : portps) {
+        portp->replaceWith(new AstPort{portp->fileline(), portp->pinNum(), enc(portp->name())});
+        VL_DO_DANGLING(portp->deleteTree(), portp);
+    }
 }
 
 // An index in an assignment's target may need statements of its own -- the

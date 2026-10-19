@@ -1253,6 +1253,12 @@ class VhdlSemVisitor final : public VNVisitor {
                 VhdlType* typep = analyzeExpr(attrp->prefixp(), nullptr);
                 if (!typep || typep->isError()) return V3VhdlStd::errorType();
                 if (attr == "base") typep = typep->base();
+                // Of an access value, of what it designates (8.1): "memarr'element" with
+                // memarr an access to an array (GHDL gna issue2166)
+                if (attr == "element" && typep->base()->kind() == VhdlTypeKind::ACCESS
+                    && typep->base()->designatedp()) {
+                    typep = typep->base()->designatedp();
+                }
                 if (attr == "element") {
                     if (typep->base()->kind() != VhdlTypeKind::ARRAY || !typep->elementp()) {
                         err(markp->fileline(),
@@ -4130,10 +4136,11 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         }
     }
     // "alias element_t is ram'element": a nonobject alias of the subtype the attribute denotes
-    // (6.6.3), usable as a type mark; nvc and GHDL take it, Questa refuses (GHDL gna issue3270)
+    // (6.6.3), usable as a type mark; nvc and GHDL take it, Questa refuses (GHDL gna issue3270).
+    // Not 'BASE, which only prefixes another attribute (16.2.2; gna bug23482)
     if (const AstVhdlAttrName* const attrp = VN_CAST(nodep->targetp(), VhdlAttrName)) {
         const std::string attr = lower(attrp->name());
-        if ((attr == "element" || attr == "subtype" || attr == "base") && !nodep->subtypep()
+        if ((attr == "element" || attr == "subtype") && !nodep->subtypep()
             && !nodep->signaturep()) {
             if (VhdlType* const tp = resolveTypeMark(nodep->targetp())) {
                 VhdlSymbol* const typeSymp
@@ -6601,10 +6608,31 @@ void VhdlSemVisitor::visit(AstVhdlSubprogInst* nodep) {
         }
     }
     if (!templp) {
+        // Each body once, and of several the one in the body of the package being analyzed,
+        // whose declaration is the one written here: an instantiation in a package before its
+        // body is analyzed (GHDL gna issue3090)
+        std::vector<AstVhdlSubprogDecl*> bodies;
         const auto range = m_genericBodies.equal_range(parts.back());
-        if (range.first != range.second) {
-            templp = range.first->second;
-            if (std::next(range.first) != range.second) {
+        for (auto it = range.first; it != range.second; ++it) {
+            if (std::find(bodies.begin(), bodies.end(), it->second) == bodies.end()) {
+                bodies.push_back(it->second);
+            }
+        }
+        if (bodies.size() > 1 && m_curUnitp) {
+            std::vector<AstVhdlSubprogDecl*> own;
+            for (AstVhdlSubprogDecl* const bodyp : bodies) {
+                for (const AstNode* up = parentOf(bodyp); up; up = parentOf(up)) {
+                    const AstVhdlPackageBody* const pbodyp = VN_CAST(up, VhdlPackageBody);
+                    if (!pbodyp) continue;
+                    if (lower(pbodyp->name()) == lower(m_curUnitp->name())) own.push_back(bodyp);
+                    break;
+                }
+            }
+            if (own.size() == 1) bodies = own;
+        }
+        if (!bodies.empty()) {
+            templp = bodies.front();
+            if (bodies.size() > 1) {
                 err(nodep->fileline(), "More than one generic subprogram '" + parts.back()
                                            + "' could be instantiated here");
             }
@@ -13472,6 +13500,12 @@ int64_t VhdlSemVisitor::staticLength(AstNodeVhdlExpr* nodep) {
     VhdlType* const typep = nodep->vhdlTypep();
     if (typep && typep->isConstrainedArray() && typep->dimensions() == 1) {
         return typep->dimLength(0);
+    }
+    // A value that folds is as long as it is, whatever its type says: a user-defined
+    // attribute of an unconstrained array type (7.2; GHDL gna issue543, issue10)
+    if (val.isArray() && typep && typep->base()->kind() == VhdlTypeKind::ARRAY
+        && typep->dimensions() == 1) {
+        return static_cast<int64_t>(val.elements());
     }
     return -1;
 }
