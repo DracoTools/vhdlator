@@ -1,0 +1,4 @@
+t/t_vhdl_rightof_bad.vhd:21:5:@0:(report note): rightof value1 is value2
+%Error: t/t_vhdl_rightof_bad.vhd:22: Position 2 is outside of the positions 0 to 1 of enum_t
+%Error: t/t_vhdl_rightof_bad.vhd:22: Verilog $stop
+Aborting...

@@ -1,0 +1,3 @@
+%Error: t/t_vhdl_elabindex_bad.vhd:18: Index 19 is outside of the range 0 to 15 of the array
+%Error: t/t_vhdl_elabindex_bad.vhd:18: Verilog $stop
+Aborting...

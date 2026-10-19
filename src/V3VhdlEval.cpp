@@ -1725,7 +1725,11 @@ private:
             } else {
                 if (!subOvf(pos, 1, out)) return VhdlValue{};
             }
-            return VhdlValue::mkInt(out, typep);
+            // No value past either end of the type: an error (16.2.2), which the running
+            // model reports, so nothing to fold ("t'rightof(t'right)", GHDL gna ticket65)
+            const VhdlValue res = VhdlValue::mkInt(out, typep);
+            if (typep->bounded() && !V3VhdlEval::inRange(res, typep)) return VhdlValue{};
+            return res;
         }
         if (attr == "image") {
             if (!nodep->argp()) return VhdlValue{};
@@ -2716,7 +2720,16 @@ private:
         const VhdlValue out = runBody(declp, parms, args, given);
         m_frames.pop_back();
         --m_calls;
-        return m_bail ? VhdlValue{} : out;
+        if (m_bail) return VhdlValue{};
+        // What a function returns is of its return subtype, or the return is an error the
+        // running model reports: "return 2 ** b" of an INTEGER function given 31 (GHDL gna
+        // issue683) is no value to fold
+        const VhdlType* const rtp = funcp->returnTypep();
+        if (out.known() && !out.isComposite() && rtp && rtp->isScalar() && rtp->bounded()
+            && (out.isInt() || out.isReal()) && !V3VhdlEval::inRange(out, rtp)) {
+            return VhdlValue{};
+        }
+        return out;
     }
 
     VhdlValue evalCall(AstVhdlCall* nodep) {
@@ -2812,7 +2825,12 @@ private:
         // which the conversion itself reports when it is evaluated: no value to fold, so that
         // the check is made ("t(3)" with t 0 to 1, GHDL gna issue618)
         const auto checked = [&](const VhdlValue& v) {
-            return top->bounded() && !V3VhdlEval::inRange(v, top) ? VhdlValue{} : v;
+            if (!top->bounded() || V3VhdlEval::inRange(v, top)) return v;
+            // Said, so that what requires the value to be in range -- an object's initial
+            // value -- reports it (NVC bounds/issue99, "natural(-1.5)")
+            fail("Value " + v.prettyName() + " is outside the range of the conversion to "
+                 + top->prettyName());
+            return VhdlValue{};
         };
         if (kind == VhdlTypeKind::FLOATING) return checked(VhdlValue::mkReal(arg.toReal(), top));
         if (kind == VhdlTypeKind::INTEGER || kind == VhdlTypeKind::UNIVERSAL_INTEGER) {

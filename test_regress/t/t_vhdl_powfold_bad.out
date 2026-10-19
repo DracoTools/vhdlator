@@ -1,0 +1,3 @@
+t/t_vhdl_powfold_bad.vhd:21:3:@0:(assertion failure): 2 ** 31 is not positive
+%Error: t/t_vhdl_powfold_bad.vhd:21: Verilog $stop
+Aborting...

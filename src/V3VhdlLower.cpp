@@ -5749,7 +5749,8 @@ private:
     // The range a check is against: its two ends as expressions, and which
     // way it runs. False where there is no such range to check against.
     bool checkRange(const VhdlType* arrayTypep, int dim, FileLine* flp, AstNodeExpr*& leftp,
-                    AstNodeExpr*& rightp, bool& ascending, const VhdlType*& idxpr) {
+                    AstNodeExpr*& rightp, bool& ascending, const VhdlType*& idxpr,
+                    bool inOrder = false) {
         if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return false;
         if (!arrayTypep || arrayTypep->base()->kind() != VhdlTypeKind::ARRAY
             || stringBehind(arrayTypep) || arrayTypep->dimOpen(dim)) {
@@ -5789,11 +5790,23 @@ private:
                 return !refp->varp() || !refp->varp()->isParam();
             });
         };
-        if (!dirKnown || !leftp->isPure() || !rightp->isPure() || !genericsOnly(leftp)
-            || !genericsOnly(rightp)) {
+        if ((!dirKnown && !inOrder) || !leftp->isPure() || !rightp->isPure()
+            || !genericsOnly(leftp) || !genericsOnly(rightp)) {
             VL_DO_DANGLING(leftp->deleteTree(), leftp);
             VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return false;
+        }
+        // Which way it runs only the instance says -- an open port's, the actual's -- and an
+        // index asks only whether it lies between the two ends: given as the lower and the
+        // higher, whichever is which (GHDL gna ticket9)
+        if (!dirKnown) {
+            AstNodeExpr* const lp = leftp;
+            AstNodeExpr* const rp = rightp;
+            leftp = new AstCond{flp, new AstLteS{flp, lp->cloneTree(false), rp->cloneTree(false)},
+                                lp->cloneTree(false), rp->cloneTree(false)};
+            rightp = new AstCond{flp, new AstLteS{flp, lp->cloneTree(false), rp->cloneTree(false)},
+                                 rp, lp};
+            ascending = true;
         }
         return true;
     }
@@ -5842,12 +5855,18 @@ private:
                               const VhdlType* arrayTypep, int dim, FileLine* flp) {
         if (!v3Global.opt.vhdlBoundCheck() || !checksHere()) return indexp;
         const AstConst* const constp = VN_CAST(indexp, Const);
-        if (!constp && elabOnly(indexp)) return indexp;
+        // An index only generics give is settled with the instance: checked as the model
+        // starts, as a slice of such ends is (elabSliceCheck; GHDL gna ticket9,
+        // "a(a'length + 3)" of an open port)
+        if (!constp && elabOnly(indexp)) {
+            elabIndexCheck(indexp, arrayTypep, dim, flp);
+            return indexp;
+        }
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool ascending = true;
         const VhdlType* idxp = nullptr;
-        if (!checkRange(arrayTypep, dim, flp, leftp, rightp, ascending, idxp)) return indexp;
+        if (!checkRange(arrayTypep, dim, flp, leftp, rightp, ascending, idxp, true)) return indexp;
         // A number is left to the static checks, but for one outside a range a copy of a
         // subprogram was given by its call: "x(1) := '1'" with x's actual null (NVC bounds27),
         // an error only once it runs
@@ -6504,6 +6523,44 @@ private:
         if (!checkRange(arrayTypep, 0, flp, leftp, rightp, ascending, idxp)) return sliceLeftp;
         return checkCall(true, sliceLeftp, sliceRightp->cloneTree(false), leftp, rightp, ascending,
                          flp);
+    }
+    // The check of an index only generics give, made when the model starts
+    void elabIndexCheck(AstNodeExpr* indexp, const VhdlType* arrayTypep, int dim, FileLine* flp) {
+        if (!m_modp || m_ftaskp || m_protClassp) return;
+        const std::string where = flp->filename() + ":" + std::to_string(flp->lineno());
+        if (!m_elabSliceChecked
+                 .emplace(m_modp, where + ":i" + std::to_string(flp->firstColumn()))
+                 .second) {
+            return;
+        }
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool ascending = true;
+        const VhdlType* idxp = nullptr;
+        if (!checkRange(arrayTypep, dim, flp, leftp, rightp, ascending, idxp, true)) return;
+        if (!elabOnly(leftp) || !elabOnly(rightp)) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return;
+        }
+        const auto i32c = [&](AstNodeExpr* p) { return intBound(p->cloneTree(false), flp); };
+        AstNodeExpr* const lop = ascending ? leftp : rightp;
+        AstNodeExpr* const hip = ascending ? rightp : leftp;
+        AstNodeExpr* const condp
+            = new AstLogOr{flp, new AstLtS{flp, i32c(indexp), i32c(lop)},
+                           new AstGtS{flp, i32c(indexp), i32c(hip)}};
+        AstDisplay* const reportp = new AstDisplay{
+            flp, VDisplayType::DT_DISPLAY,
+            "%%Error: " + where + ": Index %0d is outside of the range %0d"
+                + (ascending ? " to " : " downto ") + "%0d of the array",
+            nullptr, i32c(indexp)};
+        reportp->fmtp()->exprsp()->addNext(i32c(leftp));
+        reportp->fmtp()->exprsp()->addNext(i32c(rightp));
+        AstNode* const stmtsp = reportp;
+        stmtsp->addNext(new AstStop{flp, true});
+        VL_DO_DANGLING(leftp->deleteTree(), leftp);
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        addBesideSensitivity(nullptr, new AstInitial{flp, new AstIf{flp, condp, stmtsp}});
     }
     // The check of a slice whose ends only generics give, made when the model starts
     std::set<std::pair<const AstNodeModule*, std::string>> m_elabSliceChecked;
@@ -11063,7 +11120,9 @@ private:
                 // type is, not as wide as the position arithmetic
                 VhdlType* const totypep = nodep->vhdlTypep();
                 if (!totypep) return stepp;
-                return new AstCast{sflp, stepp, VFlagChildDType{}, lowerType(totypep, sflp)};
+                // A step past the type's last value is an error (16.2.2)
+                AstNodeExpr* const checkedp = valPositionChecked(stepp, totypep, sflp);
+                return new AstCast{sflp, checkedp, VFlagChildDType{}, lowerType(totypep, sflp)};
             }
         } else if (attr == "leftof" || attr == "rightof") {
             // A step toward one end of the prefix's range, which is a step
@@ -11075,11 +11134,21 @@ private:
                     ptypep = nodep->prefixp()->vhdlSymp()->typep();
                 }
                 const bool ascending = !ptypep || ptypep->ascending();
+                AstNodeExpr* stepp = nullptr;
                 if ((attr == "rightof") == ascending) {
-                    return new AstAdd{flp, argp,
-                                      new AstConst{flp, AstConst::Signed32{}, 1}};
+                    stepp = new AstAdd{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+                } else {
+                    stepp = new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
                 }
-                return new AstSub{flp, argp, new AstConst{flp, AstConst::Signed32{}, 1}};
+                // No value past either end of the range (16.2.2; GHDL gna ticket65), and the
+                // result as wide as the type, as 'SUCC's is
+                VhdlType* const totypep = nodep->vhdlTypep();
+                if (!totypep) return stepp;
+                FileLine* const sflp = new FileLine{flp};
+                sflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                sflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                AstNodeExpr* const checkedp = valPositionChecked(stepp, totypep, sflp);
+                return new AstCast{sflp, checkedp, VFlagChildDType{}, lowerType(totypep, sflp)};
             }
         }
         // The name attributes are about the name, which is always known here
@@ -14731,6 +14800,9 @@ private:
             symp, valuep && !m_protClassp && !highZ ? VVarType::LPARAM : VVarType::VAR, flp);
         varp->valuep(valuep);
         if (m_protClassp) {
+            // A method's own constant is the class's member, beside every other method's:
+            // two "C_MIN_RANGE" of two of UVVM's rand methods are two members
+            if (m_ftaskp) varp->name(varp->name() + "__Vk" + std::to_string(++m_tempNum));
             m_protClassp->addStmtsp(varp);
         } else if (!shareObjectIntoUnit(symp, varp)) {
             // A constant a package declares is one object for the design

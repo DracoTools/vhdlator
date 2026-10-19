@@ -8517,6 +8517,10 @@ static bool staticNames(const AstNode* exprp) {
 // static, or an element of a record, the prefix is the part named.
 bool V3VhdlSem::drivesWhole(const AstNodeVhdlExpr* targetp) {
     if (VN_IS(targetp, VhdlName)) return true;
+    // Under two states a part driver writes the signal directly, unresolved, which is the
+    // approximation that model makes; the rule is the nine values' (GHDL gna issue522's
+    // "res7(31 downto 32 - n) <= ..." would be two whole drivers resolved there)
+    if (!v3Global.opt.vhdlMetavalues()) return false;
     const AstNodeVhdlExpr* nearestp = nullptr;
     const AstNodeVhdlExpr* p = targetp;
     while (true) {
