@@ -32251,11 +32251,21 @@ private:
         if (bindingp->kind() == "open") return true;  // Deliberately left unbound
         if (!bindingp->unitp()) return false;
         AstNodeVhdlExpr* unitp = bindingp->unitp();
-        if (AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) unitp = callp->prefixp();
+        out.arch = bindingp->archName();
+        // "use entity work.sub(rca)", which the parser could not tell from a
+        // call, so the architecture arrives as its argument (GHDL gna issue123)
+        if (AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) {
+            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            std::vector<std::string> archParts;
+            if (out.arch.empty() && asp && !asp->nextp() && asp->actualp()
+                && flattenName(asp->actualp(), archParts) && !archParts.empty()) {
+                out.arch = archParts.back();
+            }
+            unitp = callp->prefixp();
+        }
         std::vector<std::string> parts;
         if (!flattenName(unitp, parts) || parts.empty()) return false;
         out.entity = parts.back();
-        out.arch = bindingp->archName();
         if (bindingp->kind() != "configuration") return true;
         const std::string cfgLib = parts.size() > 1 ? parts[parts.size() - 2] : lib;
         auto it = m_configOf.find(cfgLib + "." + out.entity);
@@ -32364,6 +32374,30 @@ private:
         if (!flattenName(callp->prefixp(), parts) || parts.empty()) return false;
         entName = parts.back();
         archName = archParts.back();
+        return true;
+    }
+
+    // The entity and architecture a binding indication "use entity
+    // work.sub(rca)" names (7.3.2.1). The parser could not tell that shape
+    // from a call, so the architecture may arrive as an argument. False where
+    // it names no architecture.
+    static bool bindingNamesArch(const AstVhdlBinding* bindingp, std::string& entName,
+                                 std::string& archName) {
+        if (!bindingp || bindingp->kind() != "entity" || !bindingp->unitp()) return false;
+        const AstNodeVhdlExpr* unitp = bindingp->unitp();
+        archName = bindingp->archName();
+        if (const AstVhdlCall* const callp = VN_CAST(unitp, VhdlCall)) {
+            const AstVhdlAssoc* const asp = VN_CAST(callp->argsp(), VhdlAssoc);
+            std::vector<std::string> archParts;
+            if (archName.empty() && asp && !asp->nextp() && asp->actualp()
+                && flattenName(asp->actualp(), archParts) && !archParts.empty()) {
+                archName = archParts.back();
+            }
+            unitp = callp->prefixp();
+        }
+        std::vector<std::string> parts;
+        if (archName.empty() || !flattenName(unitp, parts) || parts.empty()) return false;
+        entName = parts.back();
         return true;
     }
 
@@ -32501,16 +32535,33 @@ private:
             if (!cfgBindp->arch.empty()) archName = cfgBindp->arch;
         } else {
             const auto instIt = m_instanceBindings.find(label);
+            std::string boundBy;  // What the configuration specification named
             if (!label.empty() && instIt != m_instanceBindings.end()) {
                 modName = instIt->second;
+                boundBy = label;
             } else {
                 const auto compIt = m_bindings.find(modName);
-                if (compIt != m_bindings.end()) modName = compIt->second;
+                if (compIt != m_bindings.end()) {
+                    boundBy = modName;
+                    modName = compIt->second;
+                }
+            }
+            // "for u : sub use entity work.sub(rca)" chooses the architecture
+            // too (7.3.2.1)
+            const auto mapIt = boundBy.empty() ? m_bindingMaps.end() : m_bindingMaps.find(boundBy);
+            std::string specEnt;
+            std::string specArch;
+            if (mapIt != m_bindingMaps.end() && bindingNamesArch(mapIt->second, specEnt, specArch)
+                && archName.empty()) {
+                archName = specArch;
             }
         }
         // Where the entity had a generic type, this instance is of the copy
         // made for the types it named (6.5.5)
         if (!nodep->specModule().empty()) modName = nodep->specModule();
+        // The entity the instance is of, whichever of its architectures the
+        // module is built from
+        const std::string entityName = modName;
         // An entity may have several architectures, of which one is the
         // design's own choice; an instance that names another is of the
         // module built from that one instead (7.3.2)
@@ -32548,7 +32599,7 @@ private:
             // the entity, whose names need not be the component's (7.3.2.2)
             const std::string entLib
                 = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
-            const auto portIt = m_entityPortNames.find(entLib + "." + modName);
+            const auto portIt = m_entityPortNames.find(entLib + "." + entityName);
             size_t at = 0;
             for (AstNode* p = bindingp->portMapp(); p; p = p->nextp(), ++at) {
                 const AstVhdlAssoc* const asp = VN_CAST(p, VhdlAssoc);
@@ -33256,7 +33307,7 @@ private:
                 if (pinp && pinp->name().empty()) {
                     const std::string entLib
                         = m_modp && !m_modp->libname().empty() ? m_modp->libname() : "work";
-                    const auto genIt = m_entityGenericNames.find(entLib + "." + modName);
+                    const auto genIt = m_entityGenericNames.find(entLib + "." + entityName);
                     if (genIt != m_entityGenericNames.end()
                         && bindPos <= static_cast<int>(genIt->second.size())) {
                         pinp->name(genIt->second[bindPos - 1]);
@@ -33271,8 +33322,8 @@ private:
                 // port association here too, exactly as it does at the
                 // instance: the binding supplies the entity's generics, and
                 // one lowered as an input is not a parameter to override.
-                const bool bindData = pinp && m_dataGenericNamesOf.count(modName)
-                                      && m_dataGenericNamesOf[modName].count(pinp->name());
+                const bool bindData = pinp && m_dataGenericNamesOf.count(entityName)
+                                      && m_dataGenericNamesOf[entityName].count(pinp->name());
                 if (bindData && !pinNamed(pinsp, pinp->name())) {
                     pinsp = AstNode::addNext(pinsp, pinp);
                 } else if (bindData) {
@@ -33296,7 +33347,7 @@ private:
                       ? VN_CAST(compSymp->declp(), VhdlComponentDecl)
                       : nullptr;
             const std::string entLib = m_modp ? m_modp->libname() : "work";
-            if (declp && !m_knownEntities.count(entLib + "." + modName)) {
+            if (declp && !m_knownEntities.count(entLib + "." + entityName)) {
                 // A configuration declaration configures this entity, and
                 // the module built from *it* is what a design elaborates.
                 // This plain one is made beside it, and the components it
@@ -46421,7 +46472,16 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     // find which others some instance asks for; each of those becomes a
     // module of its own, so that both stand in the netlist at once.
     std::map<std::string, std::set<std::string>> alsoBuild;  // "lib.entity" -> architectures
+    // Only for a configuration the design is elaborated through: the top, or
+    // one an instance names. One beside the design binds nothing (3.4)
+    std::set<std::string> cfgInEffect{m_cfgTopEntity};
+    for (const std::string& cfgKey : m_cfgInstanced) {
+        const auto ofIt = m_configOf.find(cfgKey);
+        if (ofIt == m_configOf.end()) continue;
+        cfgInEffect.insert(cfgKey.substr(0, cfgKey.find('.')) + "." + ofIt->second.first);
+    }
     for (const auto& pair : m_cfgScopes) {
+        if (!cfgInEffect.count(pair.first)) continue;
         const std::string lib = pair.first.substr(0, pair.first.find('.'));
         std::vector<std::pair<std::string, std::string>> wanted;
         cfgScopeArchs(pair.second, wanted);
@@ -46442,6 +46502,22 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             std::string entName;
             std::string archName;
             if (!instanceNamesArch(instp, entName, archName)) return;
+            const std::string key = lib + "." + entName;
+            const auto builtIt = builtArch.find(key);
+            if (builtIt == builtArch.end() || !builtIt->second) return;
+            if (builtIt->second->name() == archName) return;
+            if (!namedArchs.count(key + "." + archName)) return;
+            if (hasUnboundGeneric(entities[key])) return;
+            alsoBuild[key].insert(archName);
+            m_altArchMods.insert(lib + "." + altArchName(entName, archName));
+        });
+        // And the architecture a configuration specification chooses
+        pair.second->foreach([&](const AstVhdlConfigSpec* specp) {
+            std::string entName;
+            std::string archName;
+            if (!bindingNamesArch(specp->bindingp(), entName, archName)) return;
+            entName = VString::downcase(entName);
+            archName = VString::downcase(archName);
             const std::string key = lib + "." + entName;
             const auto builtIt = builtArch.find(key);
             if (builtIt == builtArch.end() || !builtIt->second) return;
