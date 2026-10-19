@@ -6491,7 +6491,9 @@ void VhdlSemVisitor::instantiatePackage(AstVhdlPackageInst* nodep, VhdlScope* in
                 continue;
             }
         }
-        bindPackageGeneric(formalp, actualp, sitep);
+        // A default is written in the package, and names what its context
+        // made visible; an actual is written where the instantiation is
+        bindPackageGeneric(formalp, actualp, actualp == formalp->defaultp() ? intop : sitep);
     }
     // Every formal the map names is one of the package's generics (6.5.7.2)
     for (const AstVhdlAssoc* const asp : assocs) {
