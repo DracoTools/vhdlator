@@ -223,6 +223,7 @@ class VhdlSymbol final {
     // A composite whose element subtype names the resolution function: the
     // drivers are resolved one element at a time rather than whole (14.7.3.2)
     bool m_resolvePerElement = false;
+    bool m_partsDriven = false;
     // An unresolved signal with sources outside any generate, more than one: an error of
     // elaboration (14.7.2), which the analysis only warns of
     bool m_unresolvedSources = false;
@@ -279,6 +280,10 @@ public:
     void resolverForCount(int count, VhdlSymbol* symp) { m_resolverByCount[count] = symp; }
     bool resolvePerElement() const { return m_resolvePerElement; }
     void resolvePerElement(bool flag) { m_resolvePerElement = flag; }
+    // Driven in parts that may overlap, so that a process driving part of it is a driver
+    // of it, holding the elements it does not assign as 'no value' (14.7.2)
+    bool partsDriven() const { return m_partsDriven; }
+    void partsDriven(bool flag) { m_partsDriven = flag; }
     bool unresolvedSources() const { return m_unresolvedSources; }
     void unresolvedSources(bool flag) { m_unresolvedSources = flag; }
 

@@ -2691,6 +2691,28 @@ private:
                     if (idx.isInt()) return whole.element(idx.toInt());
                     return VhdlValue{};
                 }
+                // Text held for an array of characters -- a bit string, "0" given a
+                // one-element BIT_VECTOR -- is read as the literal of the element type
+                // that character is (GHDL gna issue1387: "zeros(0)")
+                const VhdlType* const ptypep = prefixp->vhdlTypep();
+                const VhdlType* const etypep
+                    = !ptypep                ? nullptr
+                      : ptypep->elementp()   ? ptypep->elementp()
+                                             : ptypep->base()->elementp();
+                if (whole.isStr() && etypep && etypep->base()->kind() == VhdlTypeKind::ENUM) {
+                    const VhdlValue idx = eval(idxp->actualp());
+                    const VhdlValue chr = idx.isInt() ? elementOf(whole, idx.toInt()) : VhdlValue{};
+                    if (!chr.isInt()) return VhdlValue{};
+                    const std::string lit = std::string{"'"}
+                                            + static_cast<char>(chr.toInt()) + "'";
+                    for (const VhdlSymbol* const litp : etypep->base()->literals()) {
+                        if (litp->name() == lit) {
+                            return VhdlValue::mkInt(litp->position(),
+                                                    const_cast<VhdlType*>(etypep));
+                        }
+                    }
+                    return VhdlValue{};
+                }
             }
         }
         if (!symp || symp->kind() != VhdlSymKind::TYPE || !symp->typep()) return VhdlValue{};

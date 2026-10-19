@@ -2529,6 +2529,7 @@ public:
     // and nothing after it runs (findReturnedType)
     bool m_returnSettled = false;
     static bool returnsACall(AstNode* stmtsp) VL_MT_DISABLED;
+    int actualOfGenericType(const AstNodeVhdlExpr* exprp) VL_MT_DISABLED;
     bool writtenWithGenericType(AstNode* subtypep) const VL_MT_DISABLED;
     static bool sameButForUniversal(const std::vector<VhdlSymbol*>& cands) VL_MT_DISABLED;
     VhdlType* intrinsicResultType(VhdlSymbol* symp, const std::vector<AstVhdlAssoc*>& assocs,
@@ -8465,6 +8466,74 @@ const VhdlSymbol* objectRootSym(const AstNode* nodep) {
     }
     return nullptr;
 }
+}  // namespace
+
+// Whether an expression is globally static (9.4.3) as far as naming goes: it reads no
+// variable, signal, loop parameter or subprogram parameter, and calls no function but a
+// predefined one. An attribute of an object's bounds reads only its subtype.
+static bool staticNames(const AstNode* exprp) {
+    if (!exprp) return true;
+    std::set<const AstNode*> boundsOf;
+    exprp->foreach([&](const AstVhdlAttrName* attrp) {
+        if (attrp->prefixp()) {
+            attrp->prefixp()->foreach(
+                [&](const AstNodeVhdlExpr* np) { boundsOf.insert(np); });
+        }
+    });
+    bool ok = true;
+    exprp->foreach([&](const AstNodeVhdlExpr* np) {
+        if (!ok || boundsOf.count(np)) return;
+        const VhdlSymbol* const symp = np->vhdlSymp() ? np->vhdlSymp()->resolved() : nullptr;
+        if (!symp) return;
+        switch (symp->kind()) {
+        case VhdlSymKind::GENERIC:
+        case VhdlSymKind::CONSTANT:
+        case VhdlSymKind::ENUM_LITERAL:
+        case VhdlSymKind::PHYSICAL_UNIT:
+        case VhdlSymKind::TYPE:
+        case VhdlSymKind::GENERATE_PARAMETER: break;
+        case VhdlSymKind::FUNCTION:
+            if (!symp->predefined()) ok = false;
+            break;
+        default: ok = false;
+        }
+    });
+    return ok;
+}
+// Whether a target's longest static prefix (8.1) is the whole object it names, so that
+// the statement assigning it drives every element of the object (14.7.2): written as
+// the object's name, or indexed or sliced next to it by what is not static -- "s(j)"
+// with j a variable or a loop parameter (GHDL gna bug23165). Indexed by something
+// static, or an element of a record, the prefix is the part named.
+bool V3VhdlSem::drivesWhole(const AstNodeVhdlExpr* targetp) {
+    if (VN_IS(targetp, VhdlName)) return true;
+    const AstNodeVhdlExpr* nearestp = nullptr;
+    const AstNodeVhdlExpr* p = targetp;
+    while (true) {
+        if (const AstVhdlCall* const callp = VN_CAST(p, VhdlCall)) {
+            nearestp = p;
+            p = callp->prefixp();
+        } else if (const AstVhdlSelected* const selp = VN_CAST(p, VhdlSelected)) {
+            nearestp = p;
+            p = selp->prefixp();
+        } else {
+            break;
+        }
+    }
+    if (!VN_IS(p, VhdlName) || !p->vhdlSymp()) return false;
+    const VhdlSymbol* const rootp = p->vhdlSymp()->resolved();
+    if (rootp->kind() != VhdlSymKind::SIGNAL && rootp->kind() != VhdlSymKind::PORT) {
+        return false;
+    }
+    const AstVhdlCall* const callp = VN_CAST(nearestp, VhdlCall);
+    if (!callp) return false;
+    for (const AstNode* ap = callp->argsp(); ap; ap = ap->nextp()) {
+        if (!staticNames(ap)) return true;
+    }
+    return false;
+}
+
+namespace {
 void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                        std::set<const VhdlSymbol*>& partial, bool follow,
                        std::set<const VhdlSymbol*>* partRootsp = nullptr) {
@@ -8496,7 +8565,7 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
             return;
         }
         if (const VhdlSymbol* const symp = driverRootSym(asgp->targetp())) {
-            if (VN_IS(asgp->targetp(), VhdlName)) {
+            if (V3VhdlSem::drivesWhole(asgp->targetp())) {
                 whole.insert(symp);
             } else {
                 partial.insert(symp);
@@ -8707,6 +8776,12 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     std::map<const VhdlSymbol*, int> counts;
     std::map<const VhdlSymbol*, FileLine*> where;
     std::set<const VhdlSymbol*> partial;
+    // The statements driving each signal whole, and the parts each other one drives: where
+    // parts can overlap one another or a whole driver, every one of them is a driver
+    std::map<const VhdlSymbol*, std::set<const AstNode*>> wholeStmts;
+    std::map<const VhdlSymbol*, std::vector<std::pair<const AstNode*, const AstNodeVhdlExpr*>>>
+        partTargets;
+    std::set<const VhdlSymbol*> partsInGenerate;
     // A signal every one of whose drivers is inside a generate statement may
     // well have one driver once the design is elaborated: which branches are
     // taken is not known until the generics have values (11.8)
@@ -8834,6 +8909,15 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             std::set<const VhdlSymbol*> partRoots;
             collectDrivenSyms(p, whole, partial, false, &partRoots);
             collectCallDrivers(p, whole, partial);
+            for (const VhdlSymbol* const symp : whole) wholeStmts[symp].insert(p);
+            p->foreach([&](const AstVhdlSigAssign* asgp) {
+                if (asgp->force() || asgp->release()) return;
+                if (V3VhdlSem::drivesWhole(asgp->targetp())) return;
+                const VhdlSymbol* const symp = driverRootSym(asgp->targetp());
+                if (!symp) return;
+                if (VN_IS(p, VhdlGenerate)) partsInGenerate.insert(symp);
+                partTargets[symp].emplace_back(p, asgp->targetp());
+            });
             for (const VhdlSymbol* const symp : partRoots) {
                 // A source of a signal whose composite subtype names a
                 // resolution function is a value of the whole composite, so
@@ -8895,10 +8979,93 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
             counts.clear();
             where.clear();
             partial.clear();
+            wholeStmts.clear();
+            partTargets.clear();
+            partsInGenerate.clear();
             outsideGenerate.clear();
             portSignals.clear();
             walk(archp->stmtsp());
         }
+    }
+    // A signal of the nine values resolved element by element, under --vhdl-metavalues,
+    // which processes drive in parts that may overlap -- a part beside a whole driver, as
+    // "s(0) <= ..." beside a process assigning "s(j)" (GHDL gna bug23165), or two parts
+    // that may be one -- has each of those processes for a driver, holding the elements it
+    // does not assign as no value at all (14.7.2, finishNineResolves). Parts that are
+    // apart, as "s(0) <= a; s(1) <= b;" are, stay what they were: each element has one
+    // source, and nothing is resolved.
+    for (const auto& pair : partTargets) {
+        VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
+        if (!v3Global.opt.vhdlMetavalues() || partsInGenerate.count(symp)) continue;
+        const VhdlType* const stp = symp->typep();
+        if (!stp || stp->base()->kind() != VhdlTypeKind::ARRAY || !compositeResolved(stp)) {
+            continue;
+        }
+        // Of the nine values at its scalar elements, which the lanes resolve
+        const VhdlType* leafp = stp;
+        for (int depth = 0; leafp && leafp->base()->kind() == VhdlTypeKind::ARRAY && depth < 8;
+             ++depth) {
+            leafp = leafp->elementp() ? leafp->elementp() : leafp->base()->elementp();
+        }
+        if (!leafp || !logicShaped(leafp)) continue;
+        if (symp->kind() != VhdlSymKind::SIGNAL) continue;
+        const std::set<const AstNode*>& wholes = wholeStmts[symp];
+        std::vector<std::pair<const AstNode*, const AstNodeVhdlExpr*>> parts;
+        for (const auto& part : pair.second) {
+            if (!wholes.count(part.first)) parts.push_back(part);
+        }
+        if (parts.empty()) continue;
+        // The indexes a part names at its first level, or false where they are not numbers
+        const auto span = [&](const AstNodeVhdlExpr* tp, int64_t& lo, int64_t& hi) {
+            const AstNodeVhdlExpr* p = tp;
+            const AstVhdlCall* firstp = nullptr;
+            while (true) {
+                if (const AstVhdlCall* const cp = VN_CAST(p, VhdlCall)) {
+                    firstp = cp;
+                    p = cp->prefixp();
+                } else if (const AstVhdlSelected* const sp = VN_CAST(p, VhdlSelected)) {
+                    firstp = nullptr;
+                    p = sp->prefixp();
+                } else {
+                    break;
+                }
+            }
+            if (!firstp || !firstp->argsp() || firstp->argsp()->nextp()) return false;
+            if (const AstVhdlAssoc* const ap = VN_CAST(firstp->argsp(), VhdlAssoc)) {
+                const VhdlValue v = V3VhdlEval::eval(ap->actualp());
+                if (!v.isInt()) return false;
+                lo = hi = v.toInt();
+                return true;
+            }
+            if (const AstVhdlRange* const rp = VN_CAST(firstp->argsp(), VhdlRange)) {
+                const VhdlValue l = V3VhdlEval::eval(rp->leftp());
+                const VhdlValue r = V3VhdlEval::eval(rp->rightp());
+                if (!l.isInt() || !r.isInt()) return false;
+                lo = std::min(l.toInt(), r.toInt());
+                hi = std::max(l.toInt(), r.toInt());
+                return true;
+            }
+            return false;
+        };
+        bool overlap = !wholes.empty();
+        for (size_t i = 0; i < parts.size() && !overlap; ++i) {
+            for (size_t j = i + 1; j < parts.size() && !overlap; ++j) {
+                if (parts[i].first == parts[j].first) continue;
+                int64_t alo = 0, ahi = 0, blo = 0, bhi = 0;
+                if (!span(parts[i].second, alo, ahi) || !span(parts[j].second, blo, bhi)
+                    || (alo <= bhi && blo <= ahi)) {
+                    overlap = true;
+                }
+            }
+        }
+        if (!overlap) continue;
+        std::set<const AstNode*> stmts;
+        for (const auto& part : parts) stmts.insert(part.first);
+        counts[symp] += static_cast<int>(stmts.size());
+        partial.erase(symp);
+        symp->partsDriven(true);
+        outsideGenerate.insert(symp);
+        if (!where.count(symp)) where[symp] = parts[0].second->fileline();
     }
     for (const auto& pair : counts) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
@@ -9303,6 +9470,46 @@ void V3VhdlSem::clear() {
 // this copy has bound. In the uninstantiated unit that name matches nothing
 // else, so a parameter of it cannot be what a call means unless the argument
 // is of the type the instantiation supplied for it (4.7).
+// Whether an actual is of a generic type this copy has bound: 1 where the object it names
+// was declared with that type's name (or it is qualified by it), 0 where it is of another
+// type -- a literal, an object declared otherwise -- and -1 where this cannot tell
+int VhdlSemVisitor::actualOfGenericType(const AstNodeVhdlExpr* exprp) {
+    if (!exprp) return -1;
+    if (VN_IS(exprp, VhdlLiteral)) return 0;
+    if (const AstVhdlQualified* const qp = VN_CAST(exprp, VhdlQualified)) {
+        const AstVhdlName* const markp = VN_CAST(qp->typeMarkp(), VhdlName);
+        if (!markp) return -1;
+        return m_boundGenTypes.count(markp->name()) || m_pkgGenTypeNames.count(markp->name())
+                   ? 1
+                   : 0;
+    }
+    const AstVhdlName* const namep = VN_CAST(exprp, VhdlName);
+    if (!namep) return -1;
+    // Not analyzed yet -- which reading of the call is meant is still being decided -- so
+    // the name is looked up as an object
+    const VhdlSymbol* symp = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+    if (!symp) {
+        std::vector<VhdlSymbol*> found;
+        lookup(namep->name(), found);
+        for (const VhdlSymbol* const fp : found) {
+            const VhdlSymbol* const rp = fp->resolved();
+            if (!rp->isOverloadable() && rp->isObject()) {
+                symp = rp;
+                break;
+            }
+        }
+    }
+    if (!symp) return -1;
+    AstNode* subtypep = nullptr;
+    if (const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl)) {
+        subtypep = ifp->subtypep();
+    } else if (const AstVhdlObjectDecl* const odp = VN_CAST(symp->declp(), VhdlObjectDecl)) {
+        subtypep = odp->subtypep();
+    }
+    if (!subtypep) return -1;
+    return writtenWithGenericType(subtypep) ? 1 : 0;
+}
+
 bool VhdlSemVisitor::writtenWithGenericType(AstNode* subtypep) const {
     if ((m_boundGenTypes.empty() && m_pkgGenTypeNames.empty()) || !subtypep) return false;
     bool found = false;
@@ -12733,6 +12940,7 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     std::vector<VhdlSymbol*> cands;
     std::vector<int> genOf;  // How many of each candidate's matched parameters
                              // were written with a generic type's name
+    std::vector<int> agreeOf;  // How many of them are of a generic type as their actual is
     std::vector<int> formalOf;
     std::vector<std::string> elemOf;
     std::vector<AstVhdlCall*> convOf;
@@ -12757,6 +12965,7 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
         bool ok = true;
         int score = 0;
         int viaGeneric = 0;
+        int agree = 0;
         for (size_t i = 0; i < argCands.size() && ok; ++i) {
             // A conversion on the formal converts between the two, so the
             // actual is not of the parameter's type and has nothing to be
@@ -12771,6 +12980,13 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             // Counted apart from the score: such a parameter is a good match,
             // and where it is the only candidate it is the answer.
             if (symp->resolved()->paramFromGeneric(formalOf[i])) ++viaGeneric;
+            if (m_inPackageInstance && assocs[i]) {
+                const int origin = actualOfGenericType(assocs[i]->actualp());
+                if (origin >= 0
+                    && (origin == 1) == symp->resolved()->paramFromGeneric(formalOf[i])) {
+                    ++agree;
+                }
+            }
         }
         if (!ok) continue;
         VhdlType* const resultp = symp->returnTypep() ? symp->returnTypep() : symp->typep();
@@ -12780,10 +12996,12 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
             best = score;
             cands.clear();
             genOf.clear();
+            agreeOf.clear();
         }
         if (fits == bestFits && score == best) {
             cands.push_back(symp);
             genOf.push_back(viaGeneric);
+            agreeOf.push_back(agree);
         }
     }
     // Among equals, the one that needs no parameter written with a generic
@@ -12791,6 +13009,23 @@ VhdlType* VhdlSemVisitor::analyzeCall(AstVhdlCall* nodep, VhdlType* wantp) {
     // unit, which the LRM analyzes against the formal generic type (4.7). A
     // call written where the package was instantiated sees the profiles the
     // instantiation made, and two of them alike is an ambiguous call there.
+    // First, the one whose parameters are of a generic type where the actuals are, and of
+    // another where they are not: "f(v)" with v of the generic type means "f(v : et)" in
+    // the template, not "f(i : natural)" beside it, whatever et is bound to (GHDL gna bug060)
+    if (m_inPackageInstance && cands.size() > 1 && cands.size() == agreeOf.size()) {
+        int most = agreeOf[0];
+        for (const int a : agreeOf) most = std::max(most, a);
+        std::vector<VhdlSymbol*> keep;
+        std::vector<int> keepGen;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (agreeOf[i] == most) {
+                keep.push_back(cands[i]);
+                keepGen.push_back(genOf[i]);
+            }
+        }
+        cands.swap(keep);
+        genOf.swap(keepGen);
+    }
     if (m_inPackageInstance && cands.size() > 1 && cands.size() == genOf.size()) {
         int least = genOf[0];
         for (const int g : genOf) least = std::min(least, g);
@@ -17483,8 +17718,23 @@ void VhdlSemVisitor::openPortGenerics(AstNode* portsp, AstNodeVhdl* unitp, VhdlS
             for (AstNode* ap = markp->argsp(); ap; ap = ap->nextp(), ++ranges) {
                 if (!VN_IS(ap, VhdlRange)) plain = false;
             }
+            // Or an element that is a record with open elements, each taking its bounds from
+            // the actual's: "t_arr_av_st(G_SINKS downto 1)" (GHDL gna issue1420)
+            bool openRecord = false;
+            if (aelemp && aelemp->base()->kind() == VhdlTypeKind::RECORD) {
+                for (const VhdlSymbol* const ep : aelemp->elements()) {
+                    const VhdlType* const etp = ep ? ep->typep() : nullptr;
+                    if (etp && etp->base()->kind() == VhdlTypeKind::ARRAY
+                        && !etp->lengthEmittable()) {
+                        openRecord = true;
+                    }
+                }
+                if (openRecord && !recordOpenSettles(aelemp)) openRecord = false;
+            }
             if (aelemp && plain && ranges == atypep->base()->indexTypes().size()
-                && aelemp->base()->kind() == VhdlTypeKind::ARRAY && !aelemp->lengthEmittable()) {
+                && ((aelemp->base()->kind() == VhdlTypeKind::ARRAY && !aelemp->lengthEmittable())
+                    || openRecord)) {
+                if (openRecord) markPortShaped(aelemp);
                 std::vector<std::string> path{""};
                 if (AstVhdlIndexConstraint* const innerp
                     = openConstraintFor(aelemp, ifp, entp, compp, scopep, path)) {

@@ -20,6 +20,7 @@
 
 #include "V3Global.h"
 #include "V3VhdlEval.h"
+#include "V3VhdlSem.h"
 #include "V3VhdlStd.h"
 #include "V3VhdlSym.h"
 
@@ -213,6 +214,7 @@ class VhdlLowerVisitor final {
     // The signals the process being lowered drives, which 'DRIVING asks
     // about (16.2.4); null outside a process
     const std::set<const VhdlSymbol*>* m_procDrivenp = nullptr;
+    const AstNode* m_procNodep = nullptr;  // The process m_procDrivenp is of
     // A protected type becomes a class, and a shared variable of it an
     // instance of that class (5.6). The class is built once, on first use.
     std::map<const VhdlType*, AstClass*> m_protClasses;
@@ -2801,13 +2803,13 @@ private:
         return reads;
     }
 
-    // Whether a value calls an impure function or allocates: what an
     // A subtype declaration is elaborated where it stands, and an impure function its
     // constraint calls is called then, once (6.3, 14.4.2), whether or not anything is ever
     // declared of the subtype (GHDL gna bug0117: "subtype word_rng is natural range seven
     // downto 0", seven counting its calls). Each such call is made into a value there --
-    // the initial value of one at the start, a statement of a subprogram's body each call
-    // -- and what reads the bound later reads that value.
+    // the initial value of one at the start, a statement of a subprogram's body each call.
+    // What reads the bound later is lowered as it was: a bound that sizes an object has to
+    // fold, which a variable read does not (GHDL gna bug24065's "input_bits - 1").
     std::map<const AstNodeVhdlExpr*, AstVar*> m_elabOnce;
     void elabSubtypeCalls(AstVhdlSubtypeDecl* nodep) {
         if (!m_modp || m_protClassp || !nodep->subtypep()) return;
@@ -2853,6 +2855,7 @@ private:
         }
     }
 
+    // Whether a value calls an impure function or allocates: what an
     // emitted constant cannot be a parameter for (valueFolds)
     static bool callsImpureOrAllocates(const AstNode* nodep) {
         bool found = false;
@@ -10782,13 +10785,6 @@ private:
     AstNodeExpr* lowerExprUnchecked(AstNodeVhdlExpr* nodep) {
         if (!nodep) return nullptr;
         FileLine* const flp = nodep->fileline();
-        // A call a subtype's elaboration made, read for its value (elabSubtypeCalls)
-        if (!m_elabOnce.empty()) {
-            const auto onceIt = m_elabOnce.find(nodep);
-            if (onceIt != m_elabOnce.end()) {
-                return new AstVarRef{flp, onceIt->second, VAccess::READ};
-            }
-        }
         // A bound hoisted into a parameter of the module is that parameter,
         // wherever it is read -- a slice in a port map as much as a type
         if (!m_hoistName.empty() && m_modp) {
@@ -13562,8 +13558,40 @@ private:
         // an error (16.2.4), where nvc and GHDL stop the run when it is
         // evaluated (NVC driver7). Not in a subprogram, whose signal may be
         // driven through the process that calls it.
+        // Which part of the signal this process's own assignments name: the whole of it
+        // (2), only parts (1), or none (0)
+        int procDrives = 0;
+        bool partsCover = false;
+        bool allStatic = true;
+        if (m_procNodep) {
+            std::set<int64_t> indices;
+            m_procNodep->foreach([&](const AstVhdlSigAssign* asgp) {
+                const VhdlSymbol* const tsymp = pkgAliasBase(rootSymOf(asgp->targetp()));
+                if (!tsymp || tsymp->resolved() != rsymp) return;
+                if (V3VhdlSem::drivesWhole(asgp->targetp())) {
+                    procDrives = 2;
+                    return;
+                }
+                if (procDrives < 1) procDrives = 1;
+                const AstVhdlCall* const callp = VN_CAST(asgp->targetp(), VhdlCall);
+                const AstVhdlAssoc* const ap
+                    = callp && VN_IS(callp->prefixp(), VhdlName) && callp->argsp()
+                              && !callp->argsp()->nextp()
+                          ? VN_CAST(callp->argsp(), VhdlAssoc)
+                          : nullptr;
+                const VhdlValue iv = ap ? V3VhdlEval::eval(ap->actualp()) : VhdlValue{};
+                if (iv.isInt()) {
+                    indices.insert(iv.toInt());
+                } else {
+                    allStatic = false;
+                }
+            });
+            const VhdlType* const stp = rsymp->typep();
+            partsCover = allStatic && stp && stp->isConstrainedArray() && stp->dimensions() == 1
+                         && static_cast<int64_t>(indices.size()) == stp->dimLength(0);
+        }
         if (m_procDrivenp && !m_ftaskp && rsymp->kind() == VhdlSymKind::SIGNAL
-            && !m_procDrivenp->count(rsymp) && !m_procDrivenp->count(symp)) {
+            && !m_procDrivenp->count(rsymp) && !m_procDrivenp->count(symp) && procDrives == 0) {
             AstNode* const stmtsp = new AstDisplay{
                 flp, VDisplayType::DT_DISPLAY,
                 "%%Error: " + flp->filename() + ":" + std::to_string(flp->lineno()) + ": '"
@@ -13584,7 +13612,17 @@ private:
         // A driver that only ever writes part of the signal is not driving
         // the whole of it, and which process wrote which part is not known
         // here, so it is refused rather than answered for the whole
-        if (s_partialDriven.count(rsymp)) return nullptr;
+        // Where some process drives only part of it: 'DRIVING says whether this process
+        // drives every element (16.2.4), which its own assignments decide when they all
+        // name the whole signal or elements at numbers (NVC driver6)
+        if (s_partialDriven.count(rsymp)) {
+            if (attr != "driving" || !m_procNodep || m_ftaskp || guardedSignal(rsymp)) {
+                return nullptr;
+            }
+            if (procDrives == 2 || partsCover) return new AstConst{flp, AstConst::BitTrue{}};
+            if (procDrives == 1 && allStatic) return new AstConst{flp, AstConst::BitFalse{}};
+            return nullptr;
+        }
         const auto it = m_drivers.find(rsymp);
         const VhdlDriver* drvp = nullptr;
         if (it != m_drivers.end()) {
@@ -20877,7 +20915,7 @@ private:
             nodep->foreach([&](AstVhdlSigAssign* asgp) {
                 const VhdlSymbol* const tsymp = targetSymbol(asgp->targetp());
                 if (!tsymp || tsymp->resolved() != symp) return;
-                if (VN_IS(asgp->targetp(), VhdlName)) {
+                if (V3VhdlSem::drivesWhole(asgp->targetp())) {
                     m_nineWhole.insert(key);
                 } else {
                     m_nineParts[key].push_back(asgp->targetp());
@@ -25359,7 +25397,11 @@ private:
         VL_RESTORER(m_countedDrivers);
         m_countedDrivers = false;
         VL_RESTORER(m_procDrivenp);
-        if (VN_IS(nodep, VhdlProcess)) m_procDrivenp = &driven;
+        VL_RESTORER(m_procNodep);
+        if (VN_IS(nodep, VhdlProcess)) {
+            m_procDrivenp = &driven;
+            m_procNodep = nodep;
+        }
         lowerConcurrent(nodep);
         // A generate written out once per iteration counted its own, since
         // how many there were is what made it write them out
@@ -27696,8 +27738,8 @@ private:
                 // here and another from there is not two drivers of the
                 // signal. Only a whole-signal assignment is counted, and a
                 // partial one takes the signal out of resolution altogether.
-                if (VN_IS(asgp->targetp(), VhdlName) || pkgResolved(symp) || resolvedAsWhole(symp)
-                    || nineRecordResolved(symp)) {
+                if (V3VhdlSem::drivesWhole(asgp->targetp()) || pkgResolved(symp)
+                    || resolvedAsWhole(symp) || nineRecordResolved(symp) || symp->partsDriven()) {
                     out.insert(symp);
                 } else {
                     s_partialDriven.insert(symp);

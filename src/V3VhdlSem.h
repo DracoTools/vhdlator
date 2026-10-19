@@ -47,6 +47,9 @@ public:
     // has to build alongside the units that were ordered before analysis
     static void addSpecializedUnit(AstNodeVhdlUnit* unitp) VL_MT_DISABLED;
     static const std::vector<AstNodeVhdlUnit*>& specializedUnits() VL_MT_DISABLED;
+    // Whether an assignment target's longest static prefix (8.1) is the whole signal it
+    // names, so that the statement drives every element of it (14.7.2)
+    static bool drivesWhole(const AstNodeVhdlExpr* targetp) VL_MT_DISABLED;
 };
 
 #endif  // Guard
