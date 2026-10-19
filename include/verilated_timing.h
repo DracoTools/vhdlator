@@ -173,6 +173,10 @@ class VlDelayScheduler final {
     std::vector<VlCoroutineHandle> m_zeroDelayed;  // Coroutines waiting for #0
     // Coroutines that waited for #0 and are being resumed now. As member to avoid reallocations
     std::vector<VlCoroutineHandle> m_zeroDelayesSwap;
+    // Coroutines waiting for the end of the time step, after the postponed region: a VHDL
+    // postponed process resumes there once the last delta cycle has run (IEEE 1076 14.7.5.3)
+    std::vector<VlCoroutineHandle> m_postponed;
+    std::vector<VlCoroutineHandle> m_postponedSwap;  // Being resumed now
     // Set when resumeZeroDelay() resumed a process. A process resumed in the
     // Inactive region may have scheduled a non-blocking assignment, and IEEE
     // 1800-2023 4.5 puts the NBA region after the Inactive region of the same
@@ -188,11 +192,13 @@ public:
     void resume();
     // Resume coroutines waiting for #0
     void resumeZeroDelay();
+    // Resume coroutines waiting for the end of the time step
+    void resumePostponed();
     // Returns the simulation time of the next time slot (aborts if there are no delayed
     // coroutines)
     uint64_t nextTimeSlot() const;
     // Are there no delayed coroutines awaiting?
-    bool empty() const { return m_queue.empty() && m_zeroDelayed.empty(); }
+    bool empty() const { return m_queue.empty() && m_zeroDelayed.empty() && m_postponed.empty(); }
     // Are there coroutines to resume at the current simulation time?
     bool awaitingCurrentTime() const {
         return !m_context.gotFinish()
@@ -204,6 +210,21 @@ public:
 #ifdef VL_DEBUG
     void dump() const;
 #endif
+    // Used by coroutines for co_awaiting the end of the time step
+    auto postponed(VlProcessRef process, const char* filename = VL_UNKNOWN, int lineno = 0) {
+        struct Awaitable final {
+            VlProcessRef process;  // Data of the suspended process, null if not needed
+            std::vector<VlCoroutineHandle>& queue;
+            const VlFileLineDebug fileline;
+
+            bool await_ready() const { return false; }  // Always suspend
+            void await_suspend(std::coroutine_handle<> coro) {
+                queue.emplace_back(VlCoroutineHandle{coro, process, fileline});
+            }
+            void await_resume() const {}
+        };
+        return Awaitable{process, m_postponed, VlFileLineDebug{filename, lineno}};
+    }
     // Used by coroutines for co_awaiting a certain simulation time
     auto delay(uint64_t delay, VlProcessRef process, const char* filename = VL_UNKNOWN,
                int lineno = 0) {

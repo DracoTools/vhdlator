@@ -586,6 +586,9 @@ class AstDelay final : public AstNodeStmt {
     // True if a #0 here need not resume before the logic of the NBA region runs: the delay comes
     // from a language with no inactive region (VHDL), whose processes all run in delta cycles
     bool m_unordered = false;
+    // True if this waits not for a time but for the end of the time step, after the postponed
+    // region: a VHDL postponed process resumes there, once the last delta has run (14.7.5.3)
+    bool m_postponed = false;
 
 public:
     AstDelay(FileLine* fl, AstNodeExpr* lhsp, bool isCycle)
@@ -603,6 +606,8 @@ public:
     bool isCycleDelay() const { return m_isCycle; }
     bool unordered() const { return m_unordered; }
     void unordered(bool flag) { m_unordered = flag; }
+    bool postponed() const { return m_postponed; }
+    void postponed(bool flag) { m_postponed = flag; }
     bool isRangeDelay() const { return m_isCycle && rhsp() != nullptr; }
     bool isUnbounded() const { return isRangeDelay() && VN_IS(rhsp(), Unbounded); }
     void fallDelay(AstNodeExpr* const fallDelayp) { rhsp(fallDelayp); }

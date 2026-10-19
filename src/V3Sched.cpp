@@ -959,6 +959,16 @@ void createEval(AstNetlist* netlistp,  //
     // Add the Postponed eval call
     if (postponedFuncp) funcp->addStmtsp(util::callVoidFunc(postponedFuncp));
 
+    // Then resume what waits for the end of the time step: a VHDL postponed process runs
+    // once the last delta cycle of the step has (IEEE 1076-2019 14.7.5.3)
+    if (v3Global.usesPostponedDelay() && delaySchedVscp) {
+        AstCMethodHard* const callp
+            = new AstCMethodHard{flp, new AstVarRef{flp, delaySchedVscp, VAccess::READWRITE},
+                                 VCMethod::SCHED_RESUME_POSTPONED};
+        callp->dtypeSetVoid();
+        funcp->addStmtsp(callp->makeStmt());
+    }
+
     if (v3Global.opt.profExec()) funcp->addStmtsp(AstCStmt::profExecSectionPop(flp, "eval"));
 }
 

@@ -1026,6 +1026,24 @@ class TimingControlVisitor final : public VNVisitor {
                     "Cycle delays should have been handled in V3AssertPre");
         FileLine* const flp = nodep->fileline();
 
+        // A wait for the end of the time step: 'co_await dlySched.postponed()'
+        if (nodep->postponed()) {
+            v3Global.setUsesPostponedDelay();
+            AstCMethodHard* const postMethodp = new AstCMethodHard{
+                flp, new AstVarRef{flp, getCreateDelayScheduler(), VAccess::WRITE},
+                VCMethod::SCHED_POSTPONED};
+            postMethodp->dtypeSetVoid();
+            addProcessInfo(postMethodp);
+            addDebugInfo(postMethodp);
+            AstNode* const awaitp = new AstCAwait{flp, postMethodp, getCreateDelaySenTree()};
+            if (AstNode* const stmtsp = nodep->stmtsp()) {
+                awaitp->addNext(stmtsp->unlinkFrBackWithNext());
+            }
+            nodep->replaceWith(awaitp);
+            VL_DO_DANGLING(nodep->deleteTree(), nodep);
+            return;
+        }
+
         AstNodeExpr* valuep = nodep->lhsp()->unlinkFrBack();
         if (VN_IS(valuep, Const) && VN_AS(valuep, Const)->num().is1Step()) {
             // #1step special case

@@ -191,6 +191,7 @@ class V3Global final {
     bool m_usesTiming = false;  // Design uses timing constructs
     bool m_usesForce = false;  // Design uses force/release statements
     bool m_usesZeroDelay = false;  // Design uses #0 delay (or non-constant delay)
+    bool m_usesPostponedDelay = false;  // Design waits for the end of a time step (VHDL)
     // A #0 delay of the design must resume before the logic of the NBA region runs
     bool m_zeroDelayOrdered = false;
     bool m_hasForceableSignals = false;  // Need to apply V3Force pass
@@ -273,6 +274,8 @@ public:
     void setUsesTiming() { m_usesTiming = true; }
     bool usesZeroDelay() const { return m_usesZeroDelay; }
     bool zeroDelayOrdered() const { return m_zeroDelayOrdered; }
+    bool usesPostponedDelay() const { return m_usesPostponedDelay; }
+    void setUsesPostponedDelay() { m_usesPostponedDelay = true; }
     void setUsesZeroDelay(bool ordered) {
         m_usesZeroDelay = true;
         if (ordered) m_zeroDelayOrdered = true;

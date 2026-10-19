@@ -919,7 +919,9 @@ public:
         SCHED_EVALUATE,
         SCHED_EVALUATION,
         SCHED_POST_UPDATE,
+        SCHED_POSTPONED,
         SCHED_RESUME,
+        SCHED_RESUME_POSTPONED,
         SCHED_RESUME_ZERO_DELAY,
         SCHED_RESUMPTION,
         SCHED_TRIGGER,
@@ -1073,7 +1075,9 @@ inline std::ostream& operator<<(std::ostream& os, const VCMethod& rhs) {
            {SCHED_EVALUATE, "evaluate", false}, \
            {SCHED_EVALUATION, "evaluation", false}, \
            {SCHED_POST_UPDATE, "postUpdate", false}, \
+           {SCHED_POSTPONED, "postponed", false}, \
            {SCHED_RESUME, "resume", false}, \
+           {SCHED_RESUME_POSTPONED, "resumePostponed", false}, \
            {SCHED_RESUME_ZERO_DELAY, "resumeZeroDelay", false}, \
            {SCHED_RESUMPTION, "resumption", false}, \
            {SCHED_TRIGGER, "trigger", false}, \

@@ -3862,10 +3862,12 @@ void AstDelay::dump(std::ostream& str) const {
     this->AstNodeStmt::dump(str);
     if (isCycleDelay()) str << " [CYCLE]";
     if (unordered()) str << " [UNORDERED]";
+    if (postponed()) str << " [POSTPONED]";
 }
 void AstDelay::dumpJson(std::ostream& str) const {
     dumpJsonBoolFuncIf(str, isCycleDelay);
     dumpJsonBoolFuncIf(str, unordered);
+    dumpJsonBoolFuncIf(str, postponed);
     dumpJsonGen(str);
 }
 

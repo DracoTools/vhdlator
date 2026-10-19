@@ -106,6 +106,18 @@ void VlDelayScheduler::resumeZeroDelay() {
     m_zeroDelayesSwap.clear();
 }
 
+void VlDelayScheduler::resumePostponed() {
+    if (VL_UNLIKELY(m_context.gotFinish())) {
+        m_postponed.clear();
+        m_postponedSwap.clear();
+        return;
+    }
+    // A process resumed here that waits for the end of a step again waits for the next one
+    m_postponedSwap.swap(m_postponed);
+    for (VlCoroutineHandle& handle : m_postponedSwap) handle.resume();
+    m_postponedSwap.clear();
+}
+
 uint64_t VlDelayScheduler::nextTimeSlot() const {
     if (!m_queue.empty()) return m_queue.cbegin()->first;
     if (m_zeroDelayed.empty())
@@ -115,10 +127,14 @@ uint64_t VlDelayScheduler::nextTimeSlot() const {
 
 #ifdef VL_DEBUG
 void VlDelayScheduler::dump() const {
-    if (m_queue.empty() && m_zeroDelayed.empty()) {
+    if (m_queue.empty() && m_zeroDelayed.empty() && m_postponed.empty()) {
         VL_DBG_MSGF("         No delayed processes:\n");
     } else {
         VL_DBG_MSGF("         Delayed processes:\n");
+        for (const auto& susp : m_postponed) {
+            VL_DBG_MSGF("             Awaiting the end of time %" PRIu64 ": ", m_context.time());
+            susp.dump();
+        }
         for (const auto& susp : m_zeroDelayed) {
             VL_DBG_MSGF("             Awaiting #0-delayed resumption, "
                         "time () %" PRIu64 ": ",
