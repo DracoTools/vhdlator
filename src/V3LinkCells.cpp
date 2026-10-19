@@ -31,6 +31,8 @@
 #include "V3Parse.h"
 #include "V3SymTable.h"
 
+#include <algorithm>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -236,6 +238,9 @@ class LinkCellsVisitor final : public VNVisitor {
     const V3GraphVertex* m_topVertexp = nullptr;  // Vertex of top module
     std::unordered_set<string> m_declfnWarned;  // Files we issued DECLFILENAME on
     string m_origTopModuleName;  // original name of the top module
+    // Cells of the top module found in other modules, decided once every cell is linked
+    std::vector<std::pair<AstCell*, AstNodeModule*>> m_topCells;
+    bool m_linkingTopCell = false;  // Linking such a cell after all
 
     // METHODS
     V3GraphVertex* vertex(AstNodeModule* nodep) {
@@ -448,6 +453,36 @@ class LinkCellsVisitor final : public VNVisitor {
             }
         }
 
+        // A cell of the top module in a module under the top is a recursion through other
+        // modules, which is linked so that it is reported as one; anywhere else the top is
+        // being chosen below the design's own root, and the cell goes
+        if (!m_topCells.empty()) {
+            std::set<const V3GraphVertex*> underTop;
+            if (m_topVertexp) {
+                std::vector<const V3GraphVertex*> todo{m_topVertexp};
+                while (!todo.empty()) {
+                    const V3GraphVertex* const vtxp = todo.back();
+                    todo.pop_back();
+                    if (!underTop.insert(vtxp).second) continue;
+                    for (const V3GraphEdge& edge : vtxp->outEdges()) todo.push_back(edge.top());
+                }
+            }
+            for (const auto& pair : m_topCells) {
+                AstCell* const cellp = pair.first;
+                AstNodeModule* const holderp = pair.second;
+                if (holderp->user1p() && underTop.count(vertex(holderp))) {
+                    VL_RESTORER(m_modp);
+                    VL_RESTORER(m_linkingTopCell);
+                    m_modp = holderp;
+                    m_linkingTopCell = true;
+                    iterate(cellp);
+                } else {
+                    VL_DO_DANGLING(pushDeletep(cellp->unlinkFrBack()), cellp);
+                }
+            }
+            m_topCells.clear();
+        }
+
         // Find levels in graph
         m_graph.removeRedundantEdgesMax(&V3GraphEdge::followAlwaysTrue);
         if (dumpGraphLevel()) m_graph.dumpDotFilePrefixed("linkcells");
@@ -622,13 +657,23 @@ class LinkCellsVisitor final : public VNVisitor {
         // m_mod, if 0 never did it, if !=, it is an unprocessed clone
         const bool cloned = (nodep->user1p() && nodep->user1p() != m_modp);
         if (nodep->user1p() == m_modp) return;  // AstBind and AstNodeModule may call a cell twice
-        if (nodep->modName() == m_origTopModuleName) {
+        if (nodep->modName() == m_origTopModuleName && !m_linkingTopCell) {
             if (v3Global.opt.hierChild() && nodep->modName() == m_modp->origName()) {
                 // Only the root of the recursive instantiation can be a hierarchical block.
                 nodep->modName(m_modp->name());
+            } else if (!v3Global.opt.hierChild()
+                       && (m_modp->origName() == m_origTopModuleName
+                           || m_modp->name() == m_origTopModuleName)) {
+                // The top module instantiating itself: a self-recursive module like any
+                // other, linked below
             } else {
-                // non-top module will be the top module of this run
-                VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
+                // non-top module will be the top module of this run -- unless the module
+                // holding the cell is itself under the top, which makes the cell a recursion
+                // through other modules. Which it is is known once every cell is linked.
+                if (std::find(m_topCells.begin(), m_topCells.end(), std::make_pair(nodep, m_modp))
+                    == m_topCells.end()) {
+                    m_topCells.emplace_back(nodep, m_modp);
+                }
                 return;
             }
         }
