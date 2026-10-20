@@ -8640,13 +8640,28 @@ bool VhdlSemVisitor::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordL
             return true;
         }
         if (basep->kind() != VhdlTypeKind::ARRAY) return false;
-        if (!tp->isConstrainedArray() || tp->dimensions() != 1) return false;
+        if (tp->indexTypes().size() != 1) return false;
         const VhdlType* const idxp = tp->indexTypes()[0];
+        const VhdlType* const elemp = tp->elementp() ? tp->elementp() : basep->elementp();
+        // Bounds that are expressions, of the generics an open port's actual gives it: one
+        // leaf, resolved over the range as the instance settles it, where the elements are
+        // scalars a function resolves
+        if (idxp && !idxp->bounded() && VN_IS(idxp->boundsp(), VhdlRange) && elemp
+            && elemp->resolutionp() && elemp->base()->kind() != VhdlTypeKind::ARRAY
+            && elemp->base()->kind() != VhdlTypeKind::RECORD
+            && !(isLogicValued(elemp) && elemp->resolutionp()->name() == "resolved")) {
+            at.typep = tp;
+            at.fnp = elemp->resolutionp();
+            at.loop = true;
+            leaves.push_back(at);
+            at.loop = false;
+            return true;
+        }
+        if (!tp->isConstrainedArray()) return false;
         const int64_t elems = tp->dimLength(0);
         if (!idxp || !idxp->bounded() || elems <= 0 || static_cast<size_t>(elems) > MAX_LEAVES) {
             return false;
         }
-        const VhdlType* const elemp = tp->elementp() ? tp->elementp() : basep->elementp();
         for (int64_t k = 0; k < elems; ++k) {
             at.path.emplace_back("", idxp->ascending() ? idxp->left() + k : idxp->left() - k);
             const bool ok = walk(elemp, depth + 1);
@@ -8957,6 +8972,16 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                && (stp->resolutionp() || (stp->elementp() && stp->elementp()->resolutionp()));
     };
     const auto throughPorts = [&](const VhdlSymbol* symp) {
+        // An alias of a whole signal or port is that object, whose drivers are counted:
+        // "alias WB is WishboneBus" in OSVVM's Wishbone manager, a process assigning WB.Stb
+        // being one of WishboneBus's drivers (6.6.2)
+        for (int depth = 0; symp && symp->kind() == VhdlSymKind::ALIAS && depth < 8; ++depth) {
+            const AstVhdlAliasDecl* const adp = VN_CAST(symp->declp(), VhdlAliasDecl);
+            const AstVhdlName* const tnp = adp ? VN_CAST(adp->targetp(), VhdlName) : nullptr;
+            const VhdlSymbol* const tp = tnp ? tnp->vhdlSymp() : nullptr;
+            if (!tp || !(tp->isObject() || tp->kind() == VhdlSymKind::ALIAS)) break;
+            symp = tp;
+        }
         for (int depth = 0; symp && depth < 32; ++depth) {
             const auto it = portSignals.find(symp);
             if (it == portSignals.end()) break;

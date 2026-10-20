@@ -47,6 +47,10 @@ struct VhdlRecordLeaf final {
     std::vector<std::pair<std::string, int64_t>> path;
     const VhdlType* typep = nullptr;
     VhdlSymbol* fnp = nullptr;
+    // An array of resolved elements whose bounds only elaboration settles -- an open port's,
+    // sized by its actual: the leaf is the array, its elements resolved one at a time over
+    // its range, and typep is the array's subtype
+    bool loop = false;
 };
 
 class V3VhdlSem final {

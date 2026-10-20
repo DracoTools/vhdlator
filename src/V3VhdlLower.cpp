@@ -2970,9 +2970,15 @@ private:
                 // it made it, and an attribute over one dereferences the
                 // pointer where it stands (8.6) -- so "p'length" answers
                 // only once p has a value, and that is not until it runs
-                if (psymp && psymp->isObject() && psymp->typep()
-                    && psymp->typep()->base()->kind() == VhdlTypeKind::ACCESS) {
-                    const VhdlType* const atp = psymp->typep()->base()->designatedp();
+                // So does one reached through a name that is not an object's own:
+                // "ParamPtr(i).SlvParam'length", an element of a record in an array an
+                // access value points at (OSVVM's ModelParametersSingletonPkg)
+                const VhdlType* const ptp
+                    = psymp && psymp->isObject() && psymp->typep()
+                          ? psymp->typep()
+                          : (attrp->prefixp() ? attrp->prefixp()->vhdlTypep() : nullptr);
+                if (ptp && ptp->base()->kind() == VhdlTypeKind::ACCESS) {
+                    const VhdlType* const atp = ptp->base()->designatedp();
                     if (atp && atp->base()->kind() == VhdlTypeKind::ARRAY
                         && !atp->isConstrainedArray()) {
                         return true;
@@ -3794,6 +3800,7 @@ private:
         // call returns is held as the copy made for it settles, which the
         // analysis's subtype does not say
         if (!viaAccess && !VN_IS(selp->prefixp(), VhdlName)) return nullptr;
+        if (!viaAccess && heldBySignal(selp)) return nullptr;
         const AstVhdlName* const sufp = VN_CAST(selp->suffixp(), VhdlName);
         if (!ptypep || !sufp || ptypep->base()->kind() != VhdlTypeKind::RECORD
             || !recordMayCarry(ptypep)) {
@@ -3881,6 +3888,10 @@ private:
         // integer_vector: each element made a carrier as it stands, and the
         // array numbered the way an aggregate is (9.3.3.3)
         if (AstNodeExpr* const aggp = dyn2OfAggregate(nodep, arrayTypep, flp)) return aggp;
+        // One value over a range only running settles, "MemBlockType'(0 to 2**BlockWidth - 1
+        // => BaseU)" in OSVVM's MemoryGenericPkg, BaseU an integer_vector as long as a
+        // parameter says: the value made a carrier once, and every place given it
+        if (AstNodeExpr* const fillp = dyn2OfRangeFill(nodep, arrayTypep, flp)) return fillp;
         // A value that carries its own bounds and whose elements have a
         // length of their own -- "t_slv_array(x'range)(7 downto 0)": the
         // array's bounds as they are, and each element made a carrier
@@ -3896,6 +3907,70 @@ private:
             if (const VhdlType* const boundp = boundTypeOf(nodep)) typep = boundp;
         }
         return dyn2OfFixed(typep, arrayTypep, [&]() { return lowerExpr(nodep); }, flp);
+    }
+
+    // "(l to r => v)" made into a value held two levels deep (9.3.3.3)
+    AstNodeExpr* dyn2OfRangeFill(AstNodeVhdlExpr* nodep, VhdlType* arrayTypep, FileLine* flp) {
+        while (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) nodep = qp->valuep();
+        AstVhdlAggregate* const aggp = VN_CAST(nodep, VhdlAggregate);
+        AstNodeVhdlExpr* const valuep = aggp ? uniformAggregateValue(aggp) : nullptr;
+        AstVhdlChoice* const chp = valuep ? aggp->elemsp()->choicesp() : nullptr;
+        AstVhdlRange* const rp = chp ? chp->rangep() : nullptr;
+        VhdlType* const elemCarrp = openCarriedElement(arrayTypep);
+        if (!rp || !elemCarrp) return nullptr;
+        AstNodeExpr* lftp = nullptr;
+        AstNodeExpr* rgtp = nullptr;
+        AstNodeExpr* dscp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rp, lftp, rgtp, asc, dirKnown, &dscp)) return nullptr;
+        if (!dirKnown && !dscp) {
+            VL_DO_DANGLING(lftp->deleteTree(), lftp);
+            VL_DO_DANGLING(rgtp->deleteTree(), rgtp);
+            return nullptr;
+        }
+        AstNodeExpr* const elemp = asDynCarrier(valuep, elemCarrp, flp, elemCarrp);
+        if (!elemp) {
+            VL_DO_DANGLING(lftp->deleteTree(), lftp);
+            VL_DO_DANGLING(rgtp->deleteTree(), rgtp);
+            if (dscp) VL_DO_DANGLING(dscp->deleteTree(), dscp);
+            return nullptr;
+        }
+        const auto num = [&](int32_t v) { return new AstConst{flp, AstConst::Signed32{}, v}; };
+        AstVar* const tmpp = newTempVar("__Vdyn2v", dyn2CarrierRef(arrayTypep, flp), flp);
+        AstVar* const elemVarp = newTempVar("__Vdyn2e", dynCarrierRef(elemCarrp, flp), flp);
+        AstVar* const kVarp = newTempVar("__Vdyn2k", newIntDType(flp), flp);
+        kVarp->usedLoopIdx(true);
+        const auto tw = [&]() { return new AstVarRef{flp, tmpp, VAccess::WRITE}; };
+        const auto k = [&]() { return new AstVarRef{flp, kVarp, VAccess::READ}; };
+        if (!dscp) dscp = new AstConst{flp, AstConst::BitTrue{}, !asc};
+        // How many places: none where the range is null (5.3.2.2)
+        AstNodeExpr* const countp = new AstCond{
+            flp, dscp->cloneTree(false),
+            new AstAdd{flp, new AstSub{flp, lftp->cloneTree(false), rgtp->cloneTree(false)},
+                       num(1)},
+            new AstAdd{flp, new AstSub{flp, rgtp->cloneTree(false), lftp->cloneTree(false)},
+                       num(1)}};
+        AstVar* const cntVarp = newTempVar("__Vdyn2n", newIntDType(flp), flp);
+        const auto cnt = [&]() { return new AstVarRef{flp, cntVarp, VAccess::READ}; };
+        AstNode* stmtsp = new AstAssign{flp, new AstVarRef{flp, elemVarp, VAccess::WRITE}, elemp};
+        const auto add = [&](AstNode* stmtp) { stmtsp = AstNode::addNext(stmtsp, stmtp); };
+        add(new AstAssign{flp, new AstVarRef{flp, cntVarp, VAccess::WRITE}, countp});
+        add(new AstIf{flp, new AstLtS{flp, cnt(), num(0)},
+                      new AstAssign{flp, new AstVarRef{flp, cntVarp, VAccess::WRITE}, num(0)}});
+        add(new AstAssign{flp, dynPart(tw(), "lft", flp), lftp});
+        add(new AstAssign{flp, dynPart(tw(), "rgt", flp), rgtp});
+        add(new AstAssign{flp, dynPart(tw(), "dsc", flp), dscp});
+        add(new AstAssign{flp, dynPart(tw(), "q", flp), new AstNewDynamic{flp, cnt(), nullptr}});
+        add(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE}, num(0)});
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{flp, loopp, new AstLtS{flp, k(), cnt()}});
+        loopp->addStmtsp(new AstAssign{flp, new AstSelBit{flp, dynPart(tw(), "q", flp), k()},
+                                       new AstVarRef{flp, elemVarp, VAccess::READ}});
+        loopp->addContsp(new AstAssign{flp, new AstVarRef{flp, kVarp, VAccess::WRITE},
+                                       new AstAdd{flp, k(), num(1)}});
+        add(loopp);
+        return new AstExprStmt{flp, stmtsp, new AstVarRef{flp, tmpp, VAccess::READ}};
     }
 
     // An array whose own length and its elements' are fixed, made into one
@@ -4230,10 +4305,13 @@ private:
         // function builds and gives back, "t_axistream_if(tdata(data_width
         // - 1 downto 0), ...)" in UVVM's init_axistream_if_signals, is held
         // the one way it can be
+        // So is the record type itself, whose elements have no bounds at all: what a
+        // function takes or gives back as it, "InitWishboneRec(WishboneBusRec :
+        // WishboneRecType) return WishboneRecType" in OSVVM's Wishbone and AXI4 packages
         for (const VhdlSymbol* const elemp : typep->elements()) {
             const VhdlType* const etp = elemp ? elemp->typep() : nullptr;
             if (etp && etp->base()->kind() == VhdlTypeKind::ARRAY && !isStringType(etp)
-                && lengthOnlyRunningDecides(etp)) {
+                && (lengthOnlyRunningDecides(etp) || !etp->isConstrainedArray())) {
                 return true;
             }
         }
@@ -8621,11 +8699,34 @@ private:
                 ptypep = ptypep->base()->designatedp();
             }
             if (ptypep && ptypep->base()->kind() == VhdlTypeKind::RECORD) {
-                return recordMayCarry(ptypep)
+                return recordMayCarry(ptypep) && !heldBySignal(selp)
                        && (elementCarried(selp->vhdlTypep()) || carriedTwoElementType(selp));
             }
         }
         return false;
+    }
+
+    // Whether a name reaches its object through a signal, a port or a formal of class signal:
+    // such an object has the shape its declaration or its actual gives it, and a record's
+    // elements are never carried there, whatever a constant or a variable of the record's
+    // type holds (recordMayCarry)
+    static bool heldBySignal(const AstNodeVhdlExpr* nodep) {
+        for (int depth = 0; nodep && depth < 32; ++depth) {
+            if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+                nodep = selp->prefixp();
+            } else if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
+                nodep = callp->prefixp();
+            } else {
+                break;
+            }
+        }
+        const AstVhdlName* const namep = VN_CAST(nodep, VhdlName);
+        const VhdlSymbol* const symp
+            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        if (!symp) return false;
+        if (symp->kind() == VhdlSymKind::SIGNAL || symp->kind() == VhdlSymKind::PORT) return true;
+        const AstVhdlIfaceDecl* const ifp = VN_CAST(symp->declp(), VhdlIfaceDecl);
+        return ifp && ifp->kind() == VhdlIfaceKind::SIGNAL;
     }
 
     static AstNodeExpr* dynIndex(AstNodeExpr* fromp, AstNodeExpr* indexp, FileLine* flp) {
@@ -9162,7 +9263,24 @@ private:
                         varp->valuep(valuep);
                     }
                 } else if (nodep->defaultp()) {
-                    varp->valuep(lowerExpr(nodep->defaultp()));
+                    AstNodeExpr* const dvalp = lowerExpr(nodep->defaultp());
+                    // A generic of an open array type is as long as its actual, and an instance
+                    // that gives one does not read the default at all (6.5.6.2): "INIT_ID :
+                    // std_logic_vector := """ given x"A5" is eight elements long, which the
+                    // null default need not be
+                    const VhdlType* const gtp = symp->typep();
+                    if (dvalp && gtp && gtp->base()->kind() == VhdlTypeKind::ARRAY
+                        && !gtp->isConstrainedArray()) {
+                        FileLine* const qflp = new FileLine{dvalp->fileline()};
+                        qflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        qflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                        dvalp->foreach([qflp](AstNode* np) { np->fileline(qflp); });
+                        FileLine* const vflp = new FileLine{varp->fileline()};
+                        vflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        vflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                        varp->fileline(vflp);
+                    }
+                    varp->valuep(dvalp);
                 } else if (v3Global.opt.lintOnly()) {
                     // A generic with no default is how VHDL says the
                     // instantiation must choose, so a reusable component
@@ -10594,6 +10712,14 @@ private:
                                   static_cast<int32_t>(idxp->right())};
             ascending = idxp->ascending();
             dirKnown = true;
+        } else if (!dirKnown && dscpp) {
+            // An open port's range runs the way its actual's does, which the instance binds
+            // to a generic of its own: "(TID'range => '0')" in OSVVM's AXI stream components
+            if (AstNodeExpr* const ascp = boundsAscendingExpr(indexSubtype(typep, dim), flp)) {
+                *dscpp = reverse ? ascp : static_cast<AstNodeExpr*>(new AstNot{flp, ascp});
+                if (reverse) std::swap(leftp, rightp);
+                return true;
+            }
         }
         if (reverse) {
             std::swap(leftp, rightp);
@@ -15427,14 +15553,24 @@ private:
     // the object both hold the elements from the left one up.
     AstNodeExpr* dynAllocFromCarrier(AstNodeVhdlExpr* valuep, const DynAccess* dynp,
                                      FileLine* flp) {
-        VhdlType* const carrp = dynValueType(valuep);
-        if (!carrp) {
+        // One held two levels deep -- what OSVVM's InitMemoryBlockType gives back, an array
+        // of integer_vector -- has the same ends and the same storage, of carriers of its
+        // elements, which are what the object holds (openCarriedElement)
+        VhdlType* const twop = isDyn2Value(valuep) ? valuep->vhdlTypep() : nullptr;
+        VhdlType* const carrp = twop ? nullptr : dynValueType(valuep);
+        AstNodeDType* const srcDtp = twop    ? dyn2CarrierRef(twop, flp)
+                                     : carrp ? dynCarrierRef(carrp, flp)
+                                             : nullptr;
+        if (!srcDtp) {
             unsup(flp, "allocator for a value whose bounds are not known");
             return nullptr;
         }
         AstNodeExpr* const srcp = lowerExpr(valuep);
-        if (!srcp) return nullptr;
-        AstVar* const srcVarp = newTempVar("__Vdynval", dynCarrierRef(carrp, flp), flp);
+        if (!srcp) {
+            VL_DO_DANGLING(srcDtp->deleteTree(), srcDtp);
+            return nullptr;
+        }
+        AstVar* const srcVarp = newTempVar("__Vdynval", srcDtp, flp);
         AstVar* const objVarp
             = newTempVar("__Vdynobj", new AstClassRefDType{flp, dynp->classp, nullptr}, flp);
         AstVar* const cntVarp = newTempVar("__Vdyncnt", newIntDType(flp), flp);
@@ -15522,7 +15658,9 @@ private:
             // the bounds may only be known while running
             if (AstNodeExpr* const outp = dynAllocFromRun(valuep, dynp, flp)) return outp;
             // A value that carries its own bounds says them while running
-            if (isDynValue(valuep)) return dynAllocFromCarrier(valuep, dynp, flp);
+            if (isDynValue(valuep) || isDyn2Value(valuep)) {
+                return dynAllocFromCarrier(valuep, dynp, flp);
+            }
             unsup(flp, "allocator for a value whose bounds are not known");
             return nullptr;
         }
@@ -21534,9 +21672,10 @@ private:
                     }
                     for (size_t l = 0; l < leaves.size(); ++l) {
                         const auto& lpath = leaves[l].path;
-                        if (path.size() > lpath.size()) continue;
+                        // An element of an array resolved in a loop drives the array
+                        if (path.size() > lpath.size() && !leaves[l].loop) continue;
                         bool under = true;
-                        for (size_t d = 0; d < path.size() && under; ++d) {
+                        for (size_t d = 0; d < std::min(path.size(), lpath.size()) && under; ++d) {
                             under = path[d].name.empty() ? lpath[d].first.empty()
                                                                && lpath[d].second == path[d].index
                                                          : lpath[d].first == path[d].name;
@@ -21596,24 +21735,71 @@ private:
                 for (const auto& step : leaf.path)
                     path.push_back(WavePathStep{step.first, step.second});
                 const VhdlType* const idxp = paramTypep->indexTypes()[0];
+                // The subelement, of a driver or of the signal, at the element the loop has
+                // reached where the leaf is an array resolved in one
+                AstVar* loopIdxp = nullptr;
+                const auto at = [&](AstNodeExpr* wholep) -> AstNodeExpr* {
+                    AstNodeExpr* const leafp = leafOf(wholep, path, flp);
+                    if (!loopIdxp) return leafp;
+                    return new AstSelBit{flp, leafp, new AstVarRef{flp, loopIdxp, VAccess::READ}};
+                };
+                AstNodeExpr* leftp = nullptr;
+                AstNodeExpr* rightp = nullptr;
+                AstNodeExpr* ascp = nullptr;
+                if (leaf.loop) {
+                    bool ascending = true;
+                    bool dirKnown = true;
+                    if (!dynamicBounds(leaf.typep, 0, flp, leftp, rightp, ascending, &dirKnown)) {
+                        ok = false;
+                        break;
+                    }
+                    if (!dirKnown) {
+                        ascp = boundsAscendingExpr(indexSubtype(leaf.typep, 0), flp);
+                        if (!ascp) ascp = ascendingOf(leftp, rightp, flp);
+                    } else {
+                        ascp = new AstConst{flp, AstConst::BitTrue{}, ascending};
+                    }
+                    loopIdxp = newTempVar("__Vresi", newIntDType(flp), flp);
+                }
+                AstNode* onep = nullptr;
                 for (int j = 0; j < k; ++j) {
-                    const int64_t at = idxp->ascending() ? idxp->left() + j : idxp->left() - j;
-                    bodyp = AstNode::addNextNull(
-                        bodyp, static_cast<AstNode*>(new AstAssign{
-                                   flp,
-                                   new AstSelBit{flp, new AstVarRef{flp, arrp, VAccess::WRITE},
-                                                 new AstConst{flp, AstConst::Signed32{},
-                                                              static_cast<int32_t>(at)}},
-                                   leafOf(new AstVarRef{flp, drivers[from[j]].valp, VAccess::READ},
-                                          path, flp)}));
+                    const int64_t slot = idxp->ascending() ? idxp->left() + j : idxp->left() - j;
+                    onep = AstNode::addNextNull(
+                        onep, static_cast<AstNode*>(new AstAssign{
+                                  flp,
+                                  new AstSelBit{flp, new AstVarRef{flp, arrp, VAccess::WRITE},
+                                                new AstConst{flp, AstConst::Signed32{},
+                                                             static_cast<int32_t>(slot)}},
+                                  at(new AstVarRef{flp, drivers[from[j]].valp, VAccess::READ})}));
                 }
                 AstFuncRef* const callp = new AstFuncRef{flp, ftaskp->name(), nullptr};
                 callp->taskp(ftaskp);
                 callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, arrp, VAccess::READ}});
-                bodyp = AstNode::addNextNull(
-                    bodyp, static_cast<AstNode*>(new AstAssign{
-                               flp, leafOf(new AstVarRef{flp, lp.netp, VAccess::WRITE}, path, flp),
-                               callp}));
+                onep = AstNode::addNextNull(
+                    onep, static_cast<AstNode*>(new AstAssign{
+                              flp, at(new AstVarRef{flp, lp.netp, VAccess::WRITE}), callp}));
+                if (loopIdxp) {
+                    // From the left end to the right, whichever way the range runs
+                    const auto ref
+                        = [&](VAccess access) { return new AstVarRef{flp, loopIdxp, access}; };
+                    AstNode* const initp = new AstAssign{flp, ref(VAccess::WRITE), leftp};
+                    AstLoop* const loopp = new AstLoop{flp};
+                    loopp->addStmtsp(new AstLoopTest{
+                        flp, loopp,
+                        new AstCond{
+                            flp, ascp, new AstLteS{flp, ref(VAccess::READ), rightp},
+                            new AstGteS{flp, ref(VAccess::READ), rightp->cloneTree(false)}}});
+                    loopp->addStmtsp(onep);
+                    loopp->addStmtsp(new AstAssign{
+                        flp, ref(VAccess::WRITE),
+                        new AstCond{flp, ascp->cloneTree(false),
+                                    new AstAdd{flp, ref(VAccess::READ),
+                                               new AstConst{flp, AstConst::Signed32{}, 1}},
+                                    new AstSub{flp, ref(VAccess::READ),
+                                               new AstConst{flp, AstConst::Signed32{}, 1}}}});
+                    onep = AstNode::addNext(initp, static_cast<AstNode*>(loopp));
+                }
+                bodyp = AstNode::addNextNull(bodyp, onep);
             }
             if (!ok) {
                 if (bodyp) VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
@@ -33654,6 +33840,33 @@ private:
                 = compSymp && compSymp->kind() == VhdlSymKind::COMPONENT
                       ? VN_CAST(compSymp->declp(), VhdlComponentDecl)
                       : nullptr;
+            // Such a default may name an earlier generic of the component, "tpd : time :=
+            // DEFAULT_DELAY" in OSVVM's DpRam and Ethernet components: that generic is what this
+            // instance gives it, or its own default (6.5.6.2)
+            std::vector<const VhdlSymbol*> boundGenerics;
+            if (compp) {
+                size_t position = 0;
+                for (AstNode* p = compp->genericsp(); p; p = p->nextp(), ++position) {
+                    const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+                    const VhdlSymbol* const gsymp = ifp->vhdlSymp();
+                    if (!gsymp || m_bindExprs.count(gsymp)) continue;
+                    AstNodeVhdlExpr* actualp = nullptr;
+                    size_t at = 0;
+                    for (AstNode* ap = nodep->genericMapp(); ap; ap = ap->nextp(), ++at) {
+                        const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                        if (!asp || !asp->actualp() || asp->isOpen()) continue;
+                        const AstVhdlName* const fnp = VN_CAST(asp->formalp(), VhdlName);
+                        if ((fnp && fnp->name() == ifp->name())
+                            || (!asp->formalp() && at == position)) {
+                            actualp = asp->actualp();
+                        }
+                    }
+                    if (!actualp) actualp = ifp->defaultp();
+                    if (!actualp) continue;
+                    m_bindExprs.emplace(gsymp, actualp);
+                    boundGenerics.push_back(gsymp);
+                }
+            }
             if (compp) {
                 for (AstNode* p = compp->genericsp(); p; p = p->nextp()) {
                     const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
@@ -33685,6 +33898,7 @@ private:
                     paramsp = AstNode::addNextNull(paramsp, defPinp);
                 }
             }
+            for (const VhdlSymbol* const gsymp : boundGenerics) m_bindExprs.erase(gsymp);
         }
         std::string instName
             = label.empty() ? "__Vinst" + std::to_string(++m_processNum) : label;
@@ -46246,6 +46460,33 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     // into the bounds instead, and the object itself travels
                     const VhdlValue actVal = V3VhdlEval::eval(asp->actualp());
                     if (actVal.known() && !actVal.isComposite()) continue;
+                    // An expression over such a constant, or over a generic that travels as
+                    // data, is no more a value the back end can fold: "MODEL_ID_NAME =>
+                    // MODEL_INSTANCE_NAME & ".Rx"" in OSVVM's Ethernet components, the
+                    // constant worked out from 'PATH_NAME by calls
+                    bool overData = false;
+                    if (VN_IS(asp->actualp(), VhdlBinary) || VN_IS(asp->actualp(), VhdlUnary)) {
+                        asp->actualp()->foreach([&](const AstVhdlName* np) {
+                            const VhdlSymbol* const nsymp
+                                = np->vhdlSymp() ? np->vhdlSymp()->resolved() : nullptr;
+                            if (!nsymp) return;
+                            if ((nsymp->kind() == VhdlSymKind::GENERIC
+                                 || nsymp->kind() == VhdlSymKind::CONSTANT)
+                                && m_dataGenerics.count(nsymp)) {
+                                overData = true;
+                            }
+                            if (nsymp->kind() != VhdlSymKind::CONSTANT || nsymp->hasValue()) {
+                                return;
+                            }
+                            const AstVhdlObjectDecl* const ndeclp
+                                = VN_CAST(nsymp->declp(), VhdlObjectDecl);
+                            if (ndeclp && ndeclp->isElabConstant()
+                                && V3VhdlEval::backEndFolds(ndeclp->defaultp())) {
+                                return;
+                            }
+                            overData = true;
+                        });
+                    }
                     // Only where the actual is a constant that has no value of
                     // its own. A generic reaching down from an enclosing
                     // instance has none here either, but elaboration gives it
@@ -46261,11 +46502,12 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                             || VN_IS(asp->actualp(), VhdlCall))) {
                         asymp = baseSymOf(asp->actualp());
                     }
-                    if (!asymp) continue;
-                    const VhdlSymbol* const constp = asymp->resolved();
-                    const bool fromData = (constp->kind() == VhdlSymKind::GENERIC
-                                           || constp->kind() == VhdlSymKind::CONSTANT)
-                                          && m_dataGenerics.count(constp);
+                    if (!asymp && !overData) continue;
+                    const VhdlSymbol* const constp = asymp ? asymp->resolved() : nullptr;
+                    const bool fromData = overData
+                                          || ((constp->kind() == VhdlSymKind::GENERIC
+                                               || constp->kind() == VhdlSymKind::CONSTANT)
+                                              && m_dataGenerics.count(constp));
                     if (!fromData
                         && (constp->kind() != VhdlSymKind::CONSTANT || constp->hasValue())) {
                         continue;
@@ -46276,7 +46518,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     // "WIDTH => WIDTH", with the width computed by a function,
                     // is how a design usually writes it.
                     const AstVhdlObjectDecl* const cdeclp
-                        = VN_CAST(constp->declp(), VhdlObjectDecl);
+                        = constp ? VN_CAST(constp->declp(), VhdlObjectDecl) : nullptr;
                     if (!fromData && cdeclp && cdeclp->isElabConstant()
                         && V3VhdlEval::backEndFolds(cdeclp->defaultp())) {
                         continue;
@@ -46294,7 +46536,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                     // instance's output feed back into itself -- and it is the
                     // generic's own type that says which of the two this is.
                     const AstVhdlObjectDecl* const fullp
-                        = VN_CAST(constp->fullDeclp(), VhdlObjectDecl);
+                        = constp ? VN_CAST(constp->fullDeclp(), VhdlObjectDecl) : nullptr;
                     if (!fromData && fullp && fullp != cdeclp
                         && scalarKind(gsymp->resolved()->typep())
                         && V3VhdlEval::backEndFolds(fullp->defaultp())) {
@@ -46826,6 +47068,17 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
         });
     }
     for (const std::string& key : order) {
+        // A VHDL name is the same name whatever its case (15.4.1), so "--top-module
+        // TbModelParameters1" names the entity tbmodelparameters1, whose module bears the
+        // name as analysis wrote it; the option is put as the module is named, as for a
+        // configuration named as the top (above)
+        if (const AstVhdlEntity* const entp = entities[key]) {
+            const std::string& top = v3Global.opt.topModule();
+            if (!top.empty() && top != entp->name()
+                && VString::downcase(top) == VString::downcase(entp->name())) {
+                v3Global.opt.topModule(entp->name());
+            }
+        }
         // An entity whose generic type nothing settled is not a design: it is
         // the template the copies were made from, and each instance of it is
         // an instance of one of those copies instead (6.5.5). As the top,
