@@ -9230,9 +9230,9 @@ private:
         case VhdlMode::INOUT:
             // Of the nine values, what the port reads comes in, and what the
             // instance drives goes out through a second port (below)
-            varp->direction(triPort                      ? VDirection::INOUT
-                            : nineInoutPort(nodep, symp) ? VDirection::INPUT
-                                                         : VDirection::OUTPUT);
+            varp->direction(triPort                       ? VDirection::INOUT
+                            : splitInoutPort(nodep, symp) ? VDirection::INPUT
+                                                          : VDirection::OUTPUT);
             break;
         case VhdlMode::LINKAGE:
             // A linkage port is there to be connected and nothing more: the
@@ -9267,7 +9267,7 @@ private:
         const bool unlowerableDefault = defaultByInstance(nodep, symp);
         if (nodep->defaultp() && !triPort && !unlowerableDefault) {
             varp->valuep(lowerExpr(nodep->defaultp()));
-        } else if (unlowerableDefault && !triPort && m_modp && !nineInoutPort(nodep, symp)) {
+        } else if (unlowerableDefault && !triPort && m_modp && !splitInoutPort(nodep, symp)) {
             // A default each instance works out (VhdlPortDefault), handed over as a parameter
             // of the port's own type, which the port starts at
             AstNodeDType* const dtp = varp->childDTypep() ? varp->childDTypep()->cloneTree(false)
@@ -9304,7 +9304,7 @@ private:
         // the port's default where it has none (14.7.3.2) -- which goes out
         // as one source of the actual, and what the actual resolves to,
         // which is what the port reads inside (14.7.3.3)
-        if (nineInoutPort(nodep, symp)) {
+        if (splitInoutPort(nodep, symp)) {
             // Of the port's own type, bounds and all: one the instance
             // constrains is not one lowerType can write alone
             AstNodeDType* const drvDtp = varp->childDTypep()
@@ -9337,9 +9337,24 @@ private:
             const int nDrv = symp->driverCount() >= 1            ? symp->driverCount()
                              : partIt != m_partDriverCount.end() ? partIt->second
                                                                  : 0;
-            if (nDrv >= 1) makeNineResolved(symp, drvp, flp, nDrv);
-            if (symp->driverCount() < 1 && nDrv >= 1) m_partDrivenPorts.insert(symp->resolved());
-            if (m_modp
+            if (ownInoutPort(nodep, symp) && leafResolved(symp)) {
+                // What the instance's own drivers resolve to, one subelement at a time
+                if (symp->driverCount() >= 1) makeLeafResolved(symp, drvp, flp);
+            } else if (ownInoutPort(nodep, symp)) {
+                // What the instance's own drivers resolve to, by the function itself
+                if (symp->driverCount() >= 1) {
+                    if (VhdlSymbol* const ownp = symp->resolverForCount(symp->driverCount())) {
+                        symp->resolverp(ownp);
+                    }
+                    makeResolvedByFunction(symp, drvp, flp);
+                }
+            } else if (nDrv >= 1) {
+                makeNineResolved(symp, drvp, flp, nDrv);
+            }
+            if (symp->driverCount() < 1 && nDrv >= 1 && !ownInoutPort(nodep, symp)) {
+                m_partDrivenPorts.insert(symp->resolved());
+            }
+            if (m_modp && !ownInoutPort(nodep, symp)
                 && (symp->typep()->base()->kind() == VhdlTypeKind::ENUM
                     || vectorWidth(symp->typep()) > 0)) {
                 m_nineBoundary.push_back(NineBoundaryPort{m_modp, varp, symp->typep(), flp, drvp});
@@ -10335,6 +10350,9 @@ private:
                            && nineLaneable(symp->typep())) {
                     // A record of elements each RESOLVED over the nine values
                     makeNineResolved(symp, varp, flp);
+                } else if (!symp->resolverp() && symp->driverCount() > 1 && leafResolved(symp)) {
+                    // A record of elements each resolved by a function of the design's own
+                    makeLeafResolved(symp, varp, flp);
                 } else if (symp->resolverp() && symp->driverCount() <= 1 && !guardedSignal(symp)
                            && ieeeResolved(symp->resolverp())) {
                     // STD_LOGIC_1164's RESOLVED gives one driver's value back
@@ -21314,6 +21332,9 @@ private:
         FileLine* flp;
     };
     std::vector<NinePending> m_ninePending;
+    // Records resolved one subelement at a time by functions of the design's own, built
+    // once the statements are lowered for the same reason (finishLeafResolves)
+    std::vector<NinePending> m_leafPending;
     // An array of a subtype a function of the design resolves, driven in parts: which
     // elements each driver drives, one bit each, set once the statements are lowered
     struct FuncPartsPending final {
@@ -21328,7 +21349,7 @@ private:
     // Which parts of a pending signal one concurrent statement drives, under
     // the driver it is about to take
     void noteNineParts(AstNodeVhdlStmt* nodep, const std::vector<const VhdlSymbol*>& resolved) {
-        if (m_ninePending.empty() && m_funcPartsPending.empty()) return;
+        if (m_ninePending.empty() && m_funcPartsPending.empty() && m_leafPending.empty()) return;
         // A generate counts its own drivers, one per iteration, and each of
         // those is taken to drive the whole signal
         if (nodep->exists([](const AstVhdlGenerate*) { return true; })) return;
@@ -21339,6 +21360,9 @@ private:
             }
             for (const FuncPartsPending& fp : m_funcPartsPending) {
                 if (fp.symp == symp) pending = true;
+            }
+            for (const NinePending& lp : m_leafPending) {
+                if (lp.symp == symp) pending = true;
             }
             if (!pending) continue;
             const auto key = std::make_pair(symp, m_driverUsed[symp]);
@@ -21450,8 +21474,164 @@ private:
         }
         m_funcPartsPending.clear();
     }
+    // A record whose subelements functions of the design's own resolve, its drivers each
+    // holding a value of the whole record: one per process driving any of it, as for a
+    // record of the nine values (finishNineResolves)
+    void makeLeafResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
+        AstNodeExpr* const initp = VN_CAST(netp->valuep(), NodeExpr);
+        netp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+        std::vector<VhdlDriver> drivers;
+        for (int i = 0; i < symp->driverCount(); ++i) {
+            VhdlDriver drv;
+            drv.valp = new AstVar{flp, VVarType::VAR,
+                                  "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name()
+                                      + "__val",
+                                  VFlagChildDType{},
+                                  netp->childDTypep() ? netp->childDTypep()->cloneTree(false)
+                                                      : lowerType(symp->typep(), flp)};
+            addStmt(drv.valp);
+            // Each driver starts at the declaration's initial value (14.7.2)
+            drv.valp->valuep(initp ? initp->cloneTree(false)
+                                   : defaultValueFor(symp->typep(), flp));
+            drivers.push_back(drv);
+        }
+        m_drivers.emplace(symp, drivers);
+        m_leafPending.push_back(NinePending{symp, netp, flp});
+    }
+    // Each subelement resolved over the drivers that drive it, by the copy of its function
+    // that takes that many (14.7.3.2): a driver drives the subelements its statements name,
+    // or all of them where it drives the whole record or hands it to a procedure; one no
+    // driver drives keeps its declared value
+    void finishLeafResolves() {
+        for (const NinePending& lp : m_leafPending) {
+            VhdlSymbol* const symp = lp.symp;
+            FileLine* const flp = lp.flp;
+            const auto drvIt = m_drivers.find(symp);
+            if (drvIt == m_drivers.end() || drvIt->second.empty()) continue;
+            std::vector<VhdlDriver> drivers = drvIt->second;
+            {
+                const auto usedIt = m_driverUsed.find(symp);
+                const int used = usedIt == m_driverUsed.end() ? 0 : usedIt->second;
+                if (used >= 1 && used < static_cast<int>(drivers.size())) drivers.resize(used);
+            }
+            std::vector<VhdlRecordLeaf> leaves;
+            if (!V3VhdlSem::recordLeaves(symp->typep(), &leaves)) continue;
+            // Which subelements each driver drives
+            std::vector<std::vector<bool>> drives(drivers.size(),
+                                                  std::vector<bool>(leaves.size(), true));
+            for (size_t i = 0; i < drivers.size(); ++i) {
+                const auto key
+                    = std::make_pair(static_cast<const VhdlSymbol*>(symp), static_cast<int>(i));
+                const auto partsIt = m_nineParts.find(key);
+                if (partsIt == m_nineParts.end() || m_nineWhole.count(key)) continue;
+                std::vector<bool> named(leaves.size(), false);
+                bool known = true;
+                for (const AstNodeVhdlExpr* const partp : partsIt->second) {
+                    WavePath path;
+                    if (!recordPartOf(partp, path)) {
+                        known = false;
+                        break;
+                    }
+                    for (size_t l = 0; l < leaves.size(); ++l) {
+                        const auto& lpath = leaves[l].path;
+                        if (path.size() > lpath.size()) continue;
+                        bool under = true;
+                        for (size_t d = 0; d < path.size() && under; ++d) {
+                            under = path[d].name.empty() ? lpath[d].first.empty()
+                                                               && lpath[d].second == path[d].index
+                                                         : lpath[d].first == path[d].name;
+                        }
+                        if (under) named[l] = true;
+                    }
+                }
+                if (known) drives[i] = named;
+            }
+            AstNode* bodyp = nullptr;
+            // One array per copy of a function, filled afresh for each subelement
+            std::map<const VhdlSymbol*, AstVar*> arrays;
+            bool ok = true;
+            for (size_t l = 0; l < leaves.size() && ok; ++l) {
+                const VhdlRecordLeaf& leaf = leaves[l];
+                std::vector<size_t> from;
+                for (size_t i = 0; i < drivers.size(); ++i) {
+                    if (drives[i][l]) from.push_back(i);
+                }
+                if (from.empty()) continue;
+                const int k = static_cast<int>(from.size());
+                VhdlSymbol* kfnp = symp->leafResolver(leaf.fnp, k);
+                if (!kfnp) {
+                    // Written against a fixed number of drivers, which is this one
+                    const VhdlType* const ptp
+                        = leaf.fnp->paramTypes().empty() ? nullptr : leaf.fnp->paramTypes()[0];
+                    if (ptp && ptp->isConstrainedArray() && ptp->dimensions() == 1
+                        && ptp->dimLength(0) == k) {
+                        kfnp = leaf.fnp;
+                    }
+                }
+                VhdlType* const paramTypep
+                    = kfnp && !kfnp->paramTypes().empty() ? kfnp->paramTypes()[0] : nullptr;
+                AstNodeFTask* ftaskp = nullptr;
+                if (paramTypep && paramTypep->isConstrainedArray()
+                    && !paramTypep->indexTypes().empty()) {
+                    const auto it = m_funcs.find(kfnp);
+                    ftaskp = it != m_funcs.end() && callableHere(it->second) ? it->second
+                                                                             : emitOnDemand(kfnp);
+                }
+                if (!ftaskp || !VN_IS(ftaskp, Func)) {
+                    ok = false;
+                    break;
+                }
+                AstVar*& arrp = arrays[kfnp];
+                if (!arrp) {
+                    FileLine* const aflp = new FileLine{flp};
+                    aflp->warnOff(V3ErrorCode::LATCH, true);
+                    arrp = new AstVar{aflp, VVarType::VAR,
+                                      "__Vres" + std::to_string(arrays.size()) + "__" + m_prefix
+                                          + symp->name(),
+                                      VFlagChildDType{}, lowerType(paramTypep, flp)};
+                    arrp->trace(false);
+                    addStmt(arrp);
+                }
+                WavePath path;
+                for (const auto& step : leaf.path)
+                    path.push_back(WavePathStep{step.first, step.second});
+                const VhdlType* const idxp = paramTypep->indexTypes()[0];
+                for (int j = 0; j < k; ++j) {
+                    const int64_t at = idxp->ascending() ? idxp->left() + j : idxp->left() - j;
+                    bodyp = AstNode::addNextNull(
+                        bodyp, static_cast<AstNode*>(new AstAssign{
+                                   flp,
+                                   new AstSelBit{flp, new AstVarRef{flp, arrp, VAccess::WRITE},
+                                                 new AstConst{flp, AstConst::Signed32{},
+                                                              static_cast<int32_t>(at)}},
+                                   leafOf(new AstVarRef{flp, drivers[from[j]].valp, VAccess::READ},
+                                          path, flp)}));
+                }
+                AstFuncRef* const callp = new AstFuncRef{flp, ftaskp->name(), nullptr};
+                callp->taskp(ftaskp);
+                callp->addArgsp(new AstArg{flp, "", new AstVarRef{flp, arrp, VAccess::READ}});
+                bodyp = AstNode::addNextNull(
+                    bodyp, static_cast<AstNode*>(new AstAssign{
+                               flp, leafOf(new AstVarRef{flp, lp.netp, VAccess::WRITE}, path, flp),
+                               callp}));
+            }
+            if (!ok) {
+                if (bodyp) VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
+                unsup(flp, "signal '" + symp->name()
+                               + "' of a record whose subelements are"
+                                 " resolved by functions with no copy for its drivers");
+                continue;
+            }
+            if (!bodyp) continue;
+            FileLine* const wflp = new FileLine{flp};
+            wflp->warnOff(V3ErrorCode::LATCH, true);
+            addStmt(new AstAlways{wflp, VAlwaysKwd::ALWAYS_COMB, nullptr, bodyp});
+        }
+        m_leafPending.clear();
+    }
     void finishNineResolves() {
         finishFuncParts();
+        finishLeafResolves();
         for (const NinePending& np : m_ninePending) {
             VhdlSymbol* const symp = np.symp;
             AstVar* const netp = np.netp;
@@ -28282,7 +28462,7 @@ private:
                 AstNodeVhdlExpr* const namedp = innerp ? innerp : asp->actualp();
                 if (const VhdlSymbol* const symp = pkgAliasBase(rootSymOf(namedp))) {
                     if (VN_IS(namedp, VhdlName) || pkgResolved(symp) || resolvedAsWhole(symp)
-                        || nineRecordResolved(symp)) {
+                        || nineRecordResolved(symp) || leafResolved(symp)) {
                         out.insert(symp);
                     } else {
                         s_partialDriven.insert(symp);
@@ -28324,7 +28504,8 @@ private:
                         // wherever it is driven from (makePkgDriver), so a
                         // part of it is a driver like the whole
                         if (VN_IS(asp->actualp(), VhdlName) || pkgResolved(symp)
-                            || resolvedAsWhole(symp) || nineRecordResolved(symp)) {
+                            || resolvedAsWhole(symp) || nineRecordResolved(symp)
+                            || leafResolved(symp)) {
                             out.insert(symp);
                         } else {
                             s_partialDriven.insert(symp);
@@ -28341,7 +28522,8 @@ private:
                 // signal. Only a whole-signal assignment is counted, and a
                 // partial one takes the signal out of resolution altogether.
                 if (V3VhdlSem::drivesWhole(asgp->targetp()) || pkgResolved(symp)
-                    || resolvedAsWhole(symp) || nineRecordResolved(symp) || symp->partsDriven()) {
+                    || resolvedAsWhole(symp) || nineRecordResolved(symp) || leafResolved(symp)
+                    || symp->partsDriven()) {
                     out.insert(symp);
                 } else {
                     s_partialDriven.insert(symp);
@@ -28550,6 +28732,38 @@ private:
             levelp = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
         }
         return false;
+    }
+    // An INOUT whose subtype names a resolution function of the design's own, under either
+    // model: what the port reads is the actual's resolved value, and what the instance drives
+    // is one source of the actual, so it is two ports as one of the nine values is. Emitted as
+    // one output the instance read its own driver and nothing the others drove, which inlining
+    // hid: OSVVM's barriers, and its transaction records, between components too large to
+    // inline (14.7.3.2, 14.7.3.3)
+    static bool ownInoutPort(const AstVhdlIfaceDecl* declp, const VhdlSymbol* symp) {
+        if (!declp || !symp || declp->mode() != VhdlMode::INOUT) return false;
+        const VhdlType* const typep = symp->typep();
+        // The nine values, or an array of them, are left to the logic tables or to
+        // nineInoutPort, whatever function resolves them, as analysis counts their sources
+        return typep && ownResolved(symp);
+    }
+    // A record each of whose subelements a function of the design's own resolves, and no
+    // function the whole: resolved one subelement at a time (makeLeafResolved)
+    static bool leafResolved(const VhdlSymbol* symp) {
+        return symp && V3VhdlSem::recordLeaves(symp->typep());
+    }
+    // A signal whose drivers a function of the design's own combines, as a whole or one
+    // subelement at a time, rather than the logic tables
+    static bool ownResolved(const VhdlSymbol* symp) {
+        const VhdlType* const stp = symp ? symp->typep() : nullptr;
+        if (!stp) return false;
+        const VhdlType* basep = stp->base();
+        if (basep->kind() == VhdlTypeKind::ARRAY && basep->elementp()) {
+            basep = basep->elementp()->base();
+        }
+        return (stp->resolutionp() && !enumIsStdUlogic(basep)) || leafResolved(symp);
+    }
+    bool splitInoutPort(const AstVhdlIfaceDecl* declp, const VhdlSymbol* symp) const {
+        return nineInoutPort(declp, symp) || ownInoutPort(declp, symp);
     }
     bool nineInoutPort(const AstVhdlIfaceDecl* declp, const VhdlSymbol* symp) const {
         if (!v3Global.opt.vhdlMetavalues() || !declp || !symp) return false;
@@ -32856,7 +33070,7 @@ private:
             // a connection.
             const AstVhdlIfaceDecl* const pdeclp = VN_CAST(symp->declp(), VhdlIfaceDecl);
             const VhdlMode pmode = pdeclp ? pdeclp->mode() : VhdlMode::IN;
-            const bool nineInout = nineInoutPort(pdeclp, symp);
+            const bool nineInout = splitInoutPort(pdeclp, symp);
             const VAccess pinAccess = pmode == VhdlMode::IN || nineInout ? VAccess::READ
                                       : pmode == VhdlMode::INOUT         ? VAccess::READWRITE
                                                                          : VAccess::WRITE;
@@ -32966,7 +33180,7 @@ private:
                     }
                     const AstVhdlIfaceDecl* const fdeclp
                         = fsymp ? VN_CAST(fsymp->declp(), VhdlIfaceDecl) : nullptr;
-                    if (fdeclp && nineInoutPort(fdeclp, fsymp) && asp->actualp() && !asp->isOpen()
+                    if (fdeclp && splitInoutPort(fdeclp, fsymp) && asp->actualp() && !asp->isOpen()
                         && !VN_IS(asp->actualp(), VhdlOpen)) {
                         pinp = lowerAssoc(asp, ++pinNum);
                         AstVar* savedp = nullptr;
@@ -33132,7 +33346,7 @@ private:
                 = declp
                   && (declp->mode() == VhdlMode::OUT || declp->mode() == VhdlMode::BUFFER
                       || (declp->mode() == VhdlMode::INOUT && v3Global.opt.vhdlMetavalues()
-                          && !nineInoutPort(declp, symp)));
+                          && !splitInoutPort(declp, symp)));
             // Both ways at once is one signal, not two wired together
             if (declp && declp->mode() == VhdlMode::INOUT && aliasableActual(asp, actp, partp)) {
                 AstVar* const actVarp = VN_AS(actp, VarRef)->varp();
@@ -40429,8 +40643,11 @@ private:
                     }
                 }
                 // So is a part of a signal of the nine values resolved by
-                // RESOLVED: its drivers hold all of it, every element
-                if (partSigp && !pkgResolved(partSigp) && !nineLaneable(partSigp->typep())) {
+                // RESOLVED: its drivers hold all of it, every element. And one of a record
+                // whose subelements functions resolve: OSVVM's WaitForTransaction is handed
+                // TransRec.Rdy and TransRec.Ack
+                if (partSigp && !pkgResolved(partSigp) && !nineLaneable(partSigp->typep())
+                    && !leafResolved(partSigp)) {
                     partSigp = nullptr;
                 }
                 if (partSigp) {
@@ -40546,8 +40763,10 @@ private:
                 // enable: a process that hands its signal to a procedure has
                 // that driver from elaboration on (14.7.2), so it is the one
                 // the copy writes
-                const bool nineDrv
-                    = nineValued(drivenp->typep()) || nineLaneable(drivenp->typep());
+                // So is one resolved by a function of the design's own, which every driver
+                // drives at all times, handed on from a procedure to another
+                const bool nineDrv = nineValued(drivenp->typep()) || nineLaneable(drivenp->typep())
+                                     || ownResolved(drivenp);
                 if (passedOn
                     && (idx >= static_cast<int>(drvIt->second.size())
                         || (!drvIt->second[idx].enp && !nineDrv))) {
@@ -40584,15 +40803,8 @@ private:
                 // elaborated rather than when the call was made.
                 // A function of the design's own that resolves the whole signal is given
                 // every driver at all times (14.7.2), so one with no enable is driven as it is
-                const VhdlType* const stp = signalp->typep();
-                const VhdlType* sbasep = stp ? stp->base() : nullptr;
-                if (sbasep && sbasep->kind() == VhdlTypeKind::ARRAY && sbasep->elementp()) {
-                    sbasep = sbasep->elementp()->base();
-                }
-                const bool ownResolved
-                    = stp && stp->resolutionp() && sbasep && !enumIsStdUlogic(sbasep);
                 if (!drvIt->second[idx].enp && !nineValued(signalp->typep())
-                    && !nineLaneable(signalp->typep()) && !ownResolved) {
+                    && !nineLaneable(signalp->typep()) && !ownResolved(signalp)) {
                     m_sigCopyWhy = ", where the signal '" + formals[i]->name()
                                    + "' is given is resolved by a function of the design's own";
                     return nullptr;
@@ -42092,7 +42304,12 @@ private:
         // value is not an expression the back end can watch -- a call is
         // worked out once and does not change by itself -- so the wait is
         // written as the loop the LRM describes: suspend, then look.
-        if (condp->exists([](const AstNodeFTaskRef*) { return true; })) {
+        // So is "wait on S until C": C is looked at only after an event on S, and a change of
+        // what C reads does not wake the process by itself. A Verilog wait(C) after the event
+        // would also wake on those: OSVVM's UART receiver, "wait on Uart16XClk until
+        // Uart16XClk = '1' and SampleBit = '1'", took each bit twice, once as SampleBit rose
+        // and again at the clock edge after.
+        if (nodep->sensp() || condp->exists([](const AstNodeFTaskRef*) { return true; })) {
             AstVar* const donep
                 = newTempVar("__Vwaitc", new AstBasicDType{flp, VBasicDTypeKwd::BIT}, flp);
             AstNode* const bodyp = AstNode::addNext(

@@ -31,9 +31,23 @@
 
 #include "V3Ast.h"
 
+#include <string>
 #include <vector>
 
+class VhdlSymbol;
+class VhdlType;
+
 //============================================================================
+
+// One scalar subelement of a record that a function of the design's own resolves, or a
+// composite one whose subtype names the function: where it is in the record, as element
+// names and indexes, outermost first (an empty name is an index), its subtype, and the
+// function as written
+struct VhdlRecordLeaf final {
+    std::vector<std::pair<std::string, int64_t>> path;
+    const VhdlType* typep = nullptr;
+    VhdlSymbol* fnp = nullptr;
+};
 
 class V3VhdlSem final {
 public:
@@ -50,6 +64,11 @@ public:
     // Whether an assignment target's longest static prefix (8.1) is the whole signal it
     // names, so that the statement drives every element of it (14.7.2)
     static bool drivesWhole(const AstNodeVhdlExpr* targetp) VL_MT_DISABLED;
+    // Whether a record no function resolves as a whole has every subelement resolved by a
+    // function of the design's own, so that its drivers are resolved one subelement at a
+    // time (6.3, 14.7.3.2); and if so, those subelements
+    static bool recordLeaves(const VhdlType* typep,
+                             std::vector<VhdlRecordLeaf>* leavesp = nullptr) VL_MT_DISABLED;
 };
 
 #endif  // Guard

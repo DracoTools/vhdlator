@@ -2809,6 +2809,8 @@ private:
 
 public:
     void rebindOpenGenerics() VL_MT_DISABLED;
+    static bool recordLeaves(const VhdlType* typep,
+                             std::vector<VhdlRecordLeaf>* leavesp) VL_MT_DISABLED;
 
 private:
     void fillOpenGenericDefaults(VhdlScope* scopep) VL_MT_DISABLED;
@@ -2887,6 +2889,7 @@ private:
         VhdlSymbol* resolvep;
         int count;
         FileLine* flp;
+        bool leaf = false;  // For a subelement of a record (VhdlSymbol::leafResolver)
     };
     std::vector<NeedResolve> m_needResolve;  // Signals awaiting a sized resolver
     static VhdlType* formalAt(VhdlScope* scopep, int position) VL_MT_DISABLED;
@@ -8592,6 +8595,71 @@ bool V3VhdlSem::drivesWhole(const AstNodeVhdlExpr* targetp) {
     return false;
 }
 
+bool V3VhdlSem::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordLeaf>* leavesp) {
+    return VhdlSemVisitor::recordLeaves(typep, leavesp);
+}
+
+// Every subelement down to the first one whose subtype names a function, through the
+// elements of records and of one-dimensional arrays whose bounds are known. The nine
+// values' own resolution is left to the paths that resolve it natively: a record of
+// them alone (driversCombined), and any of them under two states, where STD_LOGIC_1164's
+// RESOLVED is never run, though a function of the design's own over them is.
+bool VhdlSemVisitor::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordLeaf>* leavesp) {
+    static constexpr size_t MAX_LEAVES = 4096;
+    if (!typep || typep->resolutionp() || typep->base()->kind() != VhdlTypeKind::RECORD) {
+        return false;
+    }
+    if (driversCombined(typep)) return false;
+    std::vector<VhdlRecordLeaf> leaves;
+    VhdlRecordLeaf at;
+    const std::function<bool(const VhdlType*, int)> walk = [&](const VhdlType* tp, int depth) {
+        if (!tp || depth > 8 || leaves.size() > MAX_LEAVES) return false;
+        if (VhdlSymbol* const fnp = tp->resolutionp()) {
+            if (isLogicValued(tp) && fnp->name() == "resolved") {
+                for (const VhdlScope* scopep = fnp->declScopep(); scopep;
+                     scopep = scopep->parentp()) {
+                    if (scopep->name() == "std_logic_1164") return false;
+                }
+            }
+            at.typep = tp;
+            at.fnp = fnp;
+            leaves.push_back(at);
+            return true;
+        }
+        const VhdlType* const basep = tp->base();
+        if (basep->kind() == VhdlTypeKind::RECORD) {
+            const std::vector<VhdlSymbol*>& elems
+                = tp->elements().empty() ? basep->elements() : tp->elements();
+            if (elems.empty()) return false;
+            for (const VhdlSymbol* const elemp : elems) {
+                at.path.emplace_back(elemp->name(), 0);
+                const bool ok = walk(elemp->typep(), depth + 1);
+                at.path.pop_back();
+                if (!ok) return false;
+            }
+            return true;
+        }
+        if (basep->kind() != VhdlTypeKind::ARRAY) return false;
+        if (!tp->isConstrainedArray() || tp->dimensions() != 1) return false;
+        const VhdlType* const idxp = tp->indexTypes()[0];
+        const int64_t elems = tp->dimLength(0);
+        if (!idxp || !idxp->bounded() || elems <= 0 || static_cast<size_t>(elems) > MAX_LEAVES) {
+            return false;
+        }
+        const VhdlType* const elemp = tp->elementp() ? tp->elementp() : basep->elementp();
+        for (int64_t k = 0; k < elems; ++k) {
+            at.path.emplace_back("", idxp->ascending() ? idxp->left() + k : idxp->left() - k);
+            const bool ok = walk(elemp, depth + 1);
+            at.path.pop_back();
+            if (!ok) return false;
+        }
+        return true;
+    };
+    if (!walk(typep, 0) || leaves.empty()) return false;
+    if (leavesp) leavesp->swap(leaves);
+    return true;
+}
+
 namespace {
 void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
                        std::set<const VhdlSymbol*>& partial, bool follow,
@@ -8800,7 +8868,10 @@ void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbo
                 = v3Global.opt.vhdlMetavalues() && logicShaped(stp) && stp
                   && (stp->resolutionp() || (stp->elementp() && stp->elementp()->resolutionp()));
             const bool ownResolved = stp && stp->resolutionp() && !logicShaped(stp);
-            if (!driversCombined(stp) && !nineResolved && !ownResolved) continue;
+            if (!driversCombined(stp) && !nineResolved && !ownResolved
+                && !recordLeaves(stp, nullptr)) {
+                continue;
+            }
             if (VN_IS(asp->actualp(), VhdlName)) {
                 whole.insert(symp);
             } else {
@@ -8991,7 +9062,9 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
                 // So, under --vhdl-metavalues, is a process that drives part
                 // of a record of elements each RESOLVED, which the lowering
                 // resolves with each driver driving only what it assigns.
-                if (symp && (resolvedAsWhole(symp) || nineRecordResolved(symp))) {
+                if (symp
+                    && (resolvedAsWhole(symp) || nineRecordResolved(symp)
+                        || recordLeaves(symp->typep(), nullptr))) {
                     whole.insert(symp);
                 }
             }
@@ -9181,10 +9254,28 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
     for (const auto& pair : counts) {
         VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
         // Its elements are driven, not it
-        if (partial.count(symp) && !resolvedAsWhole(symp) && !nineRecordResolved(symp)) continue;
+        if (partial.count(symp) && !resolvedAsWhole(symp) && !nineRecordResolved(symp)
+            && !recordLeaves(symp->typep(), nullptr)) {
+            continue;
+        }
         symp->driverCount(pair.second);
         VhdlType* const typep = symp->typep();
         VhdlSymbol* const resolvep = typep ? typep->resolutionp() : nullptr;
+        // A record each of whose subelements a function resolves: each is resolved over the
+        // drivers that drive it, however few (6.5.2) -- and an INOUT of it is two ports in
+        // lowering, the one that goes out the instance's own drivers resolved
+        std::vector<VhdlRecordLeaf> leaves;
+        if (!resolvep && recordLeaves(typep, &leaves)) {
+            if (pair.second >= 2 || symp->kind() == VhdlSymKind::PORT) {
+                std::set<const VhdlSymbol*> fns;
+                for (const VhdlRecordLeaf& leaf : leaves) {
+                    if (!fns.insert(leaf.fnp).second) continue;
+                    m_needResolve.push_back(
+                        NeedResolve{symp, leaf.fnp, pair.second, where[symp], true});
+                }
+            }
+            continue;
+        }
         // A resolution function is run however many drivers there are, since
         // with one it may still change the value it is given (6.5.2). Only
         // the *absence* of one is an error, and only for several drivers.
@@ -9279,7 +9370,7 @@ void VhdlSemVisitor::specializeResolvers() {
         // drive it, so a copy for each number of them
         const bool wantCounts
             = !wantNull && need.symp->partsDriven() && need.symp->resolvePerElement();
-        if (VhdlSymbol* const havep = cached(need.count)) {
+        if (VhdlSymbol* const havep = need.leaf ? nullptr : cached(need.count)) {
             VhdlSymbol* const haveNullp = wantNull ? cached(0) : nullptr;
             bool haveAll = !wantNull || haveNullp;
             if (haveAll && wantNull && need.count <= 8) {
@@ -9305,7 +9396,7 @@ void VhdlSemVisitor::specializeResolvers() {
             }
         }
         const auto madeIt = made.find(std::make_pair(resolvep, need.count));
-        if (madeIt != made.end()) {
+        if (madeIt != made.end() && !need.leaf) {
             need.symp->resolverp(madeIt->second);
             continue;
         }
@@ -9353,6 +9444,15 @@ void VhdlSemVisitor::specializeResolvers() {
             if (newp) made.emplace(std::make_pair(resolvep, count), newp);
             return newp;
         };
+        // A subelement of a record is resolved over the drivers that drive it, which may be
+        // any number of them up to all
+        if (need.leaf) {
+            for (int k = 1; k <= need.count; ++k) {
+                if (k > 8 && k != need.count) continue;
+                if (VhdlSymbol* const kp = copyFor(k)) need.symp->leafResolver(resolvep, k, kp);
+            }
+            continue;
+        }
         if (VhdlSymbol* const newp = copyFor(need.count)) need.symp->resolverp(newp);
         if (wantCounts && need.count <= 8) {
             for (int k = 1; k < need.count; ++k) {
@@ -9380,7 +9480,7 @@ void VhdlSemVisitor::specializeResolvers() {
     // A port is counted for each architecture of its entity, and each count
     // wants its own copy, so the one for every count is kept by count
     for (const NeedResolve& need : m_needResolve) {
-        if (need.symp->kind() != VhdlSymKind::PORT) continue;
+        if (need.symp->kind() != VhdlSymKind::PORT || need.leaf) continue;
         const auto it = made.find(std::make_pair(need.resolvep, need.count));
         if (it != made.end()) need.symp->resolverForCount(need.count, it->second);
     }
@@ -16527,6 +16627,13 @@ void VhdlSemVisitor::markDrivingPorts(AstVhdlInstance* nodep, VhdlScope* unitSco
                     levelp = levelp->elementp() ? levelp->elementp() : levelp->base()->elementp();
                 }
             }
+        }
+        // So is an INOUT resolved by a function of the design's own, under either model: the
+        // instance is one source of the actual, as Lower's two ports for it say
+        if (declp->mode() == VhdlMode::INOUT && portp->typep()
+            && ((portp->typep()->resolutionp() && !logicShaped(portp->typep()))
+                || recordLeaves(portp->typep(), nullptr))) {
+            nineInout = true;
         }
         if (declp->mode() != VhdlMode::OUT && !nineInout) continue;
         // A part of an OUT is still written through the instance's own

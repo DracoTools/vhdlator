@@ -220,6 +220,11 @@ class VhdlSymbol final {
     // signal is resolved over those of its drivers that are connected and
     // any of them may be turned off on its own (14.7.3.2)
     std::map<int, VhdlSymbol*> m_resolverByCount;
+    // A record whose subelements name resolution functions of the design's own, and no
+    // function for the whole: each subelement is resolved over the drivers that drive it,
+    // so each function has a copy for every number of them (6.3, 14.7.3.2), keyed by the
+    // function as written and the count
+    std::map<std::pair<const VhdlSymbol*, int>, VhdlSymbol*> m_leafResolvers;
     // A composite whose element subtype names the resolution function: the
     // drivers are resolved one element at a time rather than whole (14.7.3.2)
     bool m_resolvePerElement = false;
@@ -278,6 +283,13 @@ public:
         return it == m_resolverByCount.end() ? nullptr : it->second;
     }
     void resolverForCount(int count, VhdlSymbol* symp) { m_resolverByCount[count] = symp; }
+    VhdlSymbol* leafResolver(const VhdlSymbol* fnp, int count) const {
+        const auto it = m_leafResolvers.find(std::make_pair(fnp, count));
+        return it == m_leafResolvers.end() ? nullptr : it->second;
+    }
+    void leafResolver(const VhdlSymbol* fnp, int count, VhdlSymbol* symp) {
+        m_leafResolvers[std::make_pair(fnp, count)] = symp;
+    }
     bool resolvePerElement() const { return m_resolvePerElement; }
     void resolvePerElement(bool flag) { m_resolvePerElement = flag; }
     // Driven in parts that may overlap, so that a process driving part of it is a driver
