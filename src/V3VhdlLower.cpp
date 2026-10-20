@@ -14797,8 +14797,11 @@ private:
             = targetp->vhdlSymp() ? targetp->vhdlSymp()->resolved() : nullptr;
         if (!tsymp) return;
         bool readOnly = tsymp->kind() == VhdlSymKind::CONSTANT;
+        // A formal of mode IN is read only whatever its class, and one written with no class
+        // is a constant (4.2.2.1): OSVVM's MemRead takes "Addr : in std_logic_vector" and
+        // renumbers it "alias aAddr : std_logic_vector(Addr'length - 1 downto 0) is Addr"
         if (const AstVhdlIfaceDecl* const ifp = VN_CAST(tsymp->declp(), VhdlIfaceDecl)) {
-            readOnly = ifp->kind() == VhdlIfaceKind::CONSTANT && ifp->mode() == VhdlMode::IN;
+            readOnly = ifp->mode() == VhdlMode::IN;
         }
         // Or one the subprogram never writes through the alias: OSVVM's
         // PushReadBurstByteData only reads "aReadData(DataIndex + 7 downto DataIndex)",
@@ -21712,7 +21715,9 @@ private:
             const auto key = std::make_pair(symp, m_driverUsed[symp]);
             // An assignment through an alias of a part drives that part
             const auto rootOf = [](const AstNodeVhdlExpr* exprp) -> const VhdlSymbol* {
-                const VhdlSymbol* const tsymp = targetSymbol(const_cast<AstNodeVhdlExpr*>(exprp));
+                const VhdlSymbol* tsymp = targetSymbol(const_cast<AstNodeVhdlExpr*>(exprp));
+                // An alias a package declares, selected from it: "Subordinate.Cyc"
+                if (!tsymp) tsymp = rootSymOf(exprp);
                 return tsymp ? aliasRootObject(tsymp) : nullptr;
             };
             const auto wholeName = [](const AstNodeVhdlExpr* exprp) {
@@ -21730,9 +21735,8 @@ private:
             // part (6.5.6.3)
             nodep->foreach([&](AstVhdlAssoc* asp) {
                 if (!asp->drives() || !asp->actualp()) return;
-                const VhdlSymbol* const asymp = rootSymOf(asp->actualp());
-                if (!asymp || asymp->resolved() != symp) return;
-                if (VN_IS(asp->actualp(), VhdlName)) {
+                if (rootOf(asp->actualp()) != symp) return;
+                if (wholeName(asp->actualp())) {
                     m_nineWhole.insert(key);
                 } else {
                     m_nineParts[key].push_back(asp->actualp());
@@ -21875,18 +21879,23 @@ private:
     // A record whose subelements functions of the design's own resolve, its drivers each
     // holding a value of the whole record: one per process driving any of it, as for a
     // record of the nine values (finishNineResolves)
+    // What a signal's drivers and resolution are named after in this module: two package
+    // instances' signals of one name may both be resolved here
+    std::string resolvedObjName(const VhdlSymbol* symp) {
+        return declaredInPackage(symp) ? pkgObjectName(symp) : m_prefix + symp->name();
+    }
     void makeLeafResolved(VhdlSymbol* symp, AstVar* netp, FileLine* flp) {
         AstNodeExpr* const initp = VN_CAST(netp->valuep(), NodeExpr);
         netp->fileline()->warnOff(V3ErrorCode::MULTIDRIVEN, true);
         std::vector<VhdlDriver> drivers;
         for (int i = 0; i < symp->driverCount(); ++i) {
             VhdlDriver drv;
-            drv.valp = new AstVar{flp, VVarType::VAR,
-                                  "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name()
-                                      + "__val",
-                                  VFlagChildDType{},
-                                  netp->childDTypep() ? netp->childDTypep()->cloneTree(false)
-                                                      : lowerType(symp->typep(), flp)};
+            drv.valp
+                = new AstVar{flp, VVarType::VAR,
+                             "__Vdrv" + std::to_string(i) + "__" + resolvedObjName(symp) + "__val",
+                             VFlagChildDType{},
+                             netp->childDTypep() ? netp->childDTypep()->cloneTree(false)
+                                                 : lowerType(symp->typep(), flp)};
             addStmt(drv.valp);
             // Each driver starts at the declaration's initial value (14.7.2)
             drv.valp->valuep(initp ? initp->cloneTree(false)
@@ -21985,8 +21994,8 @@ private:
                     FileLine* const aflp = new FileLine{flp};
                     aflp->warnOff(V3ErrorCode::LATCH, true);
                     arrp = new AstVar{aflp, VVarType::VAR,
-                                      "__Vres" + std::to_string(arrays.size()) + "__" + m_prefix
-                                          + symp->name(),
+                                      "__Vres" + std::to_string(arrays.size()) + "__"
+                                          + resolvedObjName(symp),
                                       VFlagChildDType{}, lowerType(paramTypep, flp)};
                     arrp->trace(false);
                     addStmt(arrp);
@@ -22128,7 +22137,7 @@ private:
                 // the same names its statements write
                 AstVar* const maskp = new AstVar{
                     nflp, VVarType::VAR,
-                    "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name() + "__lanes",
+                    "__Vdrv" + std::to_string(i) + "__" + resolvedObjName(symp) + "__lanes",
                     VFlagChildDType{}, lowerType(symp->typep(), np.flp)};
                 maskp->trace(false);
                 maskp->valuep(laneMask(0, countp, nflp));
@@ -22148,7 +22157,7 @@ private:
                 if (setp) addStmt(new AstInitial{nflp, setp});
                 AstVar* const effp = new AstVar{
                     nflp, VVarType::VAR,
-                    "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name() + "__eff",
+                    "__Vdrv" + std::to_string(i) + "__" + resolvedObjName(symp) + "__eff",
                     VFlagChildDType{}, lowerType(symp->typep(), np.flp)};
                 effp->trace(false);
                 addStmt(effp);
@@ -22166,7 +22175,7 @@ private:
                 effs.push_back(effp);
             }
             AstVar* const accp
-                = new AstVar{nflp, VVarType::VAR, "__Vresacc__" + m_prefix + symp->name(),
+                = new AstVar{nflp, VVarType::VAR, "__Vresacc__" + resolvedObjName(symp),
                              VFlagChildDType{}, lowerType(symp->typep(), np.flp)};
             accp->trace(false);
             addStmt(accp);
@@ -22324,12 +22333,12 @@ private:
         std::vector<VhdlDriver> drivers;
         for (int i = 0; i < count; ++i) {
             VhdlDriver drv;
-            drv.valp = new AstVar{flp, VVarType::VAR,
-                                  "__Vdrv" + std::to_string(i) + "__" + m_prefix + symp->name()
-                                      + "__val",
-                                  VFlagChildDType{},
-                                  netp->childDTypep() ? netp->childDTypep()->cloneTree(false)
-                                                      : lowerType(symp->typep(), flp)};
+            drv.valp
+                = new AstVar{flp, VVarType::VAR,
+                             "__Vdrv" + std::to_string(i) + "__" + resolvedObjName(symp) + "__val",
+                             VFlagChildDType{},
+                             netp->childDTypep() ? netp->childDTypep()->cloneTree(false)
+                                                 : lowerType(symp->typep(), flp)};
             addStmt(drv.valp);
             drv.valp->valuep(initp ? initp->cloneTree(false)
                                    : defaultValueFor(symp->typep(), flp));
@@ -28713,6 +28722,7 @@ private:
             if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
                 nodep = callp->prefixp();
             } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+                if (selectsFromPackage(selp)) return selp->vhdlSymp()->resolved();
                 nodep = selp->prefixp();
             } else if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
                 return vp->vhdlSymp() ? vp->vhdlSymp()->resolved() : nullptr;
@@ -28902,6 +28912,23 @@ private:
         return false;
     }
 
+    // Whether a selected name names an object of a package -- "Manager.TransRec", a signal
+    // of a package instance, or "work.pkg.s" -- rather than an element of a record
+    static bool selectsFromPackage(const AstVhdlSelected* selp) {
+        if (!selp->vhdlSymp()) return false;
+        // A package instance an architecture declares leaves its name without a symbol, but
+        // what is selected from it is the signal itself, or an alias the package declares --
+        // "Subordinate.Cyc" for "alias Cyc is WishboneBus.Cyc" -- where an element of a
+        // record is one of the record's elements
+        if (selp->vhdlSymp()->kind() == VhdlSymKind::SIGNAL
+            || selp->vhdlSymp()->kind() == VhdlSymKind::ALIAS) {
+            return true;
+        }
+        const VhdlSymbol* const prefixp = selp->prefixp() ? selp->prefixp()->vhdlSymp() : nullptr;
+        return prefixp
+               && (prefixp->resolved()->kind() == VhdlSymKind::PACKAGE
+                   || prefixp->resolved()->kind() == VhdlSymKind::LIBRARY);
+    }
     static const VhdlSymbol* rootSymOf(const AstNode* nodep) {
         // Descend before asking: an index or a selection carries a symbol of
         // its own -- the element it names -- and the object it is part of is
@@ -28910,6 +28937,7 @@ private:
             if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
                 nodep = callp->prefixp();  // An index or a slice
             } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+                if (selectsFromPackage(selp)) return selp->vhdlSymp();
                 nodep = selp->prefixp();
             } else if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
                 return vp->vhdlSymp();
@@ -29022,12 +29050,22 @@ private:
     void partDrivenBy(AstNode* nodep, std::set<const VhdlSymbol*>& out) {
         nodep->foreach([&](AstVhdlAssoc* asp) {
             if (!asp->drives() || !asp->actualp() || VN_IS(asp->actualp(), VhdlName)) return;
+            const AstVhdlSelected* const aselp = VN_CAST(asp->actualp(), VhdlSelected);
+            if (aselp && selectsFromPackage(aselp)
+                && aselp->vhdlSymp()->kind() == VhdlSymKind::SIGNAL) {
+                return;
+            }
             if (const VhdlSymbol* const symp = rootSymOf(asp->actualp())) {
                 out.insert(symp->resolved());
             }
         });
         nodep->foreach([&](AstVhdlSigAssign* ap) {
             if (!ap->targetp() || VN_IS(ap->targetp(), VhdlName)) return;
+            const AstVhdlSelected* const tselp = VN_CAST(ap->targetp(), VhdlSelected);
+            if (tselp && selectsFromPackage(tselp)
+                && tselp->vhdlSymp()->kind() == VhdlSymKind::SIGNAL) {
+                return;
+            }
             if (const VhdlSymbol* const symp = rootSymOf(ap->targetp())) {
                 out.insert(symp->resolved());
             }
@@ -29463,7 +29501,26 @@ private:
         // std_logic_vector(0 to pd'length - 1) is pd", pd an inout port of
         // the nine values its instances drive element by element (VESTS
         // ch_14_fg_14_05)
-        return curp && curp != symp && (pkgResolved(curp) || m_drivers.count(curp)) ? curp : symp;
+        // So is a record of a package each of whose subelements a function of the design's
+        // own resolves: OSVVM's "alias OsvvmTestDone : BarrierType is Barrier.TestDone",
+        // Barrier a signal of TbUtilPkg its TestCtrl's processes drive as a barrier
+        return curp && curp != symp
+                       && (pkgResolved(curp) || m_drivers.count(curp) || pkgRecordResolved(curp))
+                   ? curp
+                   : symp;
+    }
+
+    // A record a package declares whose drivers are resolved where they are, one subelement
+    // at a time (makePkgDrivers): by functions of the design's own, or each RESOLVED over
+    // the nine values
+    bool pkgRecordResolved(const VhdlSymbol* symp) const {
+        if (!symp || symp->kind() != VhdlSymKind::SIGNAL || !declaredInPackage(symp)) {
+            return false;
+        }
+        if (leafResolved(symp)) return true;
+        return v3Global.opt.vhdlMetavalues() && symp->typep() && !symp->resolverp()
+               && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
+               && nineLaneable(symp->typep());
     }
 
     // The logic values a value is made of, left to right, where it folds
@@ -29882,8 +29939,28 @@ private:
     void makePkgDrivers(FileLine* flp) {
         for (const auto& pair : m_driverCount) {
             VhdlSymbol* const symp = const_cast<VhdlSymbol*>(pair.first);
-            if (!pkgResolved(symp)) continue;
-            for (int k = 0; k < pair.second; ++k) makePkgDriver(symp, flp);
+            if (pkgResolved(symp)) {
+                for (int k = 0; k < pair.second; ++k) makePkgDriver(symp, flp);
+                continue;
+            }
+            // A record whose subelements functions of the design's own resolve, which this
+            // architecture drives: its drivers here are resolved here, as one of this
+            // architecture's own signals is. OSVVM's harnesses declare the transaction records
+            // in a package instance and hand each to two instances, whose drivers would
+            // otherwise each write the whole signal. Drivers in two architectures an
+            // elaboration instantiates are still resolved apart, each writing the signal.
+            // So is a record of elements each RESOLVED over the nine values: OSVVM's
+            // Wishbone harness hands the WishboneBus of a package instance to the DUT and to
+            // the subordinate model
+            if (!pkgRecordResolved(symp) || pair.second != symp->driverCount() || pair.second < 2
+                || m_drivers.count(symp)) {
+                continue;
+            }
+            if (leafResolved(symp)) {
+                makeLeafResolved(symp, pkgSignalVar(symp, flp), flp);
+            } else {
+                makeNineResolved(symp, pkgSignalVar(symp, flp), flp);
+            }
         }
     }
 

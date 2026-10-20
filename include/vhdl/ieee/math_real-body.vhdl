@@ -1172,6 +1172,14 @@ package body MATH_REAL is
         --        See function declaration in IEEE Std 1076.2-1996
         -- Notes:
         --        a) Returns REAL'LOW on error
+        --        b) Verilator: the power of two in X is taken out exactly,
+        --           halving and doubling being exact, so that a power of two
+        --           has its exact logarithm, as C's log2 gives it to GHDL and
+        --           nvc: "integer(ceil(log2(real(4))))" is 2, where
+        --           MATH_LOG2_OF_E*LOG(4.0) is a little over 2.0 and its
+        --           ceiling 3 (OSVVM's Wishbone subordinate)
+        variable Y : REAL := X;
+        variable K : INTEGER := 0;
     begin
         -- Check validity of arguments
         if ( X <= 0.0 )  then
@@ -1190,8 +1198,20 @@ package body MATH_REAL is
                 return 1.0;
         end if;
 
+        while Y >= 2.0 loop
+                Y := Y / 2.0;
+                K := K + 1;
+        end loop;
+        while Y < 1.0 loop
+                Y := Y * 2.0;
+                K := K - 1;
+        end loop;
+        if ( Y = 1.0 ) then
+                return REAL(K);
+        end if;
+
         -- Compute value for general case
-        return ( MATH_LOG2_OF_E*LOG(X) );
+        return ( REAL(K) + MATH_LOG2_OF_E*LOG(Y) );
     end function LOG2;
 
 

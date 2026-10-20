@@ -8508,13 +8508,28 @@ bool convertedFormalDrives(const AstNodeVhdlExpr* formalp) {
            || declp->mode() == VhdlMode::BUFFER;
 }
 
+// Whether a selected name names a signal itself -- "Manager.TransRec", a signal of a
+// package instance, or "work.pkg.s" -- rather than an element of a record, whose symbol
+// is the element's
+bool selectsSignal(const AstNode* nodep) {
+    const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected);
+    return selp && selp->vhdlSymp() && selp->vhdlSymp()->kind() == VhdlSymKind::SIGNAL;
+}
 // The object a name is part of: past every index, slice and selection, where
 // driverRootSym stops at the longest static prefix
-const VhdlSymbol* objectRootSym(const AstNode* nodep) {
+const VhdlSymbol* objectRootSym(const AstNode* nodep, int depth = 0) {
     while (nodep) {
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
             nodep = callp->prefixp();
         } else if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            if (selectsSignal(selp)) return selp->vhdlSymp();
+            // An alias a package declares, selected from the package -- "Subordinate.Cyc"
+            // for "alias Cyc is WishboneBus.Cyc" -- is part of what it denotes (6.6.2)
+            const VhdlSymbol* const asymp = selp->vhdlSymp();
+            if (asymp && asymp->kind() == VhdlSymKind::ALIAS && depth < 8) {
+                const AstVhdlAliasDecl* const adp = VN_CAST(asymp->declp(), VhdlAliasDecl);
+                if (adp && adp->targetp()) return objectRootSym(adp->targetp(), depth + 1);
+            }
             nodep = selp->prefixp();
         } else if (const AstNodeVhdlExpr* const vp = VN_CAST(nodep, NodeVhdlExpr)) {
             return vp->vhdlSymp();
@@ -8564,7 +8579,7 @@ static bool staticNames(const AstNode* exprp) {
 // with j a variable or a loop parameter (GHDL gna bug23165). Indexed by something
 // static, or an element of a record, the prefix is the part named.
 bool V3VhdlSem::drivesWhole(const AstNodeVhdlExpr* targetp) {
-    if (VN_IS(targetp, VhdlName)) return true;
+    if (VN_IS(targetp, VhdlName) || selectsSignal(targetp)) return true;
     // Under two states a part driver writes the signal directly, unresolved, which is the
     // approximation that model makes; the rule is the nine values' (GHDL gna issue522's
     // "res7(31 downto 32 - n) <= ..." would be two whole drivers resolved there)
@@ -8685,7 +8700,7 @@ void collectDrivenSyms(AstNode* nodep, std::set<const VhdlSymbol*>& whole,
         if (asp->drives() && asp->actualp()) {
             const AstNodeVhdlExpr* const namedp = actualThroughConversions(asp->actualp());
             if (const VhdlSymbol* const symp = driverRootSym(namedp)) {
-                if (VN_IS(namedp, VhdlName)) {
+                if (VN_IS(namedp, VhdlName) || selectsSignal(namedp)) {
                     whole.insert(symp);
                 } else {
                     partial.insert(symp);
@@ -13898,6 +13913,36 @@ bool VhdlSemVisitor::prefixTakesRange(AstNodeVhdlExpr* prefixp) {
     if (!VN_IS(prefixp, VhdlName) && !VN_IS(prefixp, VhdlSelected)) return true;
     std::vector<std::string> parts;
     if (!flatten(prefixp, parts) || parts.empty()) return true;
+    // An element of a record object, "WishboneBus.Adr", whose element is an array: its name
+    // is no name of this region, so it is found by walking the record from the object
+    if (VN_IS(prefixp, VhdlSelected) && parts.size() >= 2) {
+        std::vector<VhdlSymbol*> roots;
+        lookup(parts[0], roots);
+        for (const VhdlSymbol* const rootp : roots) {
+            const VhdlSymbol* const realp = rootp->resolved();
+            if (!realp->isObject() && realp->kind() != VhdlSymKind::ALIAS) continue;
+            const VhdlType* typep = realp->typep();
+            for (size_t i = 1; typep && i < parts.size(); ++i) {
+                if (typep->base()->kind() == VhdlTypeKind::ACCESS) {
+                    typep = typep->base()->designatedp();
+                    if (!typep) break;
+                }
+                if (typep->base()->kind() != VhdlTypeKind::RECORD) {
+                    typep = nullptr;
+                    break;
+                }
+                const VhdlType* elemp = nullptr;
+                for (const VhdlSymbol* const ep : typep->base()->elements()) {
+                    if (ep && lower(ep->name()) == lower(parts[i])) elemp = ep->typep();
+                }
+                typep = elemp;
+            }
+            if (typep && typep->base()->kind() == VhdlTypeKind::ACCESS) {
+                typep = typep->base()->designatedp();
+            }
+            if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY) return true;
+        }
+    }
     std::vector<VhdlSymbol*> found;
     lookup(parts.back(), found);
     if (found.empty()) return false;
@@ -14034,7 +14079,22 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
         // elaboration fixes -- "s(s'high downto f(2))" with s sized by a
         // function the analysis does not fold (GHDL gna issue2540). A
         // variable's or a loop parameter's value arrives only while running.
-        if (AstVhdlRange* const rp = VN_CAST(nodep->argsp(), VhdlRange)) {
+        AstVhdlRange* rp = VN_CAST(nodep->argsp(), VhdlRange);
+        // A slice by a subtype's name, which the analysis writes "v(T'range)", is as long as
+        // the range the subtype's declaration writes: OSVVM's "NormalizedAddr(WordAddrRange)",
+        // WordAddrRange "natural range WORD_ADDR_WIDTH - 1 downto BYTE_ADDR_WIDTH"
+        if (rp && !rp->leftp()) {
+            const AstVhdlAttrName* const attrp = VN_CAST(rp->attrp(), VhdlAttrName);
+            const AstVhdlName* const markp = attrp && attrp->name() == "range"
+                                                 ? VN_CAST(attrp->prefixp(), VhdlName)
+                                                 : nullptr;
+            const VhdlSymbol* const msymp
+                = markp && markp->vhdlSymp() ? markp->vhdlSymp()->resolved() : nullptr;
+            rp = msymp && msymp->kind() == VhdlSymKind::TYPE && msymp->typep()
+                     ? VN_CAST(msymp->typep()->boundsp(), VhdlRange)
+                     : nullptr;
+        }
+        if (rp) {
             bool onlyGenerics = true;
             bool anyName = false;
             const auto outsideSubprogram = [](const VhdlSymbol* symp) {
