@@ -8716,6 +8716,8 @@ bool VhdlSemVisitor::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordL
         }
         if (!tp->isConstrainedArray()) return false;
         const int64_t elems = tp->dimLength(0);
+        // A null vector has no subelements to resolve (OSVVM's "ParamToModel(NULL_RANGE_TYPE)")
+        if (idxp && idxp->bounded() && elems <= 0) return true;
         if (!idxp || !idxp->bounded() || elems <= 0 || static_cast<size_t>(elems) > MAX_LEAVES) {
             return false;
         }
@@ -8940,20 +8942,22 @@ void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbo
                 = v3Global.opt.vhdlMetavalues() && logicShaped(stp) && stp
                   && (stp->resolutionp() || (stp->elementp() && stp->elementp()->resolutionp()));
             const bool ownResolved = stp && stp->resolutionp() && !logicShaped(stp);
-            if (!driversCombined(stp) && !nineResolved && !ownResolved
-                && !recordLeaves(stp, nullptr)) {
-                continue;
-            }
+            const bool combined = driversCombined(stp) || nineResolved || ownResolved
+                                  || recordLeaves(stp, nullptr);
             if (VN_IS(asp->actualp(), VhdlName)) {
-                whole.insert(symp);
+                if (combined) whole.insert(symp);
             } else {
+                // A part given to the formal is driven as an assignment to it is
+                // (collectDrivenSyms), whatever its type: OSVVM's interrupt generator calls
+                // "Send(InterruptRecArray(0), ...)" on an open port of transaction records
                 partial.insert(symp);
                 // An element of a record whose elements are resolved one at a time, as an
                 // assignment to it counts (analyzeDrivers): OSVVM's WaitForTransaction given
                 // "Ack => TransRec.Ack" drives TransRec, whether or not the process assigns
-                // TransRec itself
+                // TransRec itself. The root may be the signal itself, given an element of an
+                // array of records
                 const VhdlSymbol* const rootp = objectRootSym(asp->actualp());
-                if (rootp && rootp != symp
+                if (rootp
                     && (rootp->kind() == VhdlSymKind::SIGNAL || rootp->kind() == VhdlSymKind::PORT)
                     && (resolvedAsWhole(rootp) || nineRecordResolved(rootp)
                         || recordLeaves(rootp->typep(), nullptr))) {

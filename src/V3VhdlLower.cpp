@@ -235,6 +235,7 @@ class VhdlLowerVisitor final {
     std::map<const VhdlSymbol*, AstNodeFTask*> m_pkgFuncs;
     bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
     bool m_asTarget = false;  // Lowering what an assignment writes, not what it reads
+    bool m_recordMember = false;  // Lowering the type of an element of a packed record
     // Lowering a built-in procedure's actuals, any of which it may write
     bool m_checkAsCall = false;
     bool m_inStmts = false;  // Lowering the statements of a process or subprogram
@@ -1936,6 +1937,10 @@ private:
     // An array whose element packs becomes a packed array, so that a
     // std_logic_vector is one machine word rather than a vector of them
     AstNodeDType* lowerArrayType(VhdlType* typep, FileLine* flp) {
+        // Only the element's own range, not those of the arrays inside it
+        const bool recordMember = m_recordMember;
+        VL_RESTORER(m_recordMember);
+        m_recordMember = false;
         VhdlType* const basep = typep->base();
         // A subtype may constrain the element as well as the index --
         // "t(1 to 3)(1 to 2)" -- so its own element is the one to emit
@@ -2014,8 +2019,14 @@ private:
                 // other, which is what a null value means. Its 'LENGTH still
                 // folds to zero, since that comes from the type and not from
                 // the width emitted here.
+                // A vector that is an element of a record keeps the ends it
+                // was written with, as one an instance's bounds give does:
+                // the record is one value, laid out alike on both sides of a
+                // port that leaves the element open (OSVVM's
+                // "ParamToModel(NULL_RANGE_TYPE)")
                 const int64_t left = idxp->left();
-                const int64_t right = idxp->length() <= 0 ? left : idxp->right();
+                const int64_t right
+                    = idxp->length() <= 0 && !(packed && recordMember) ? left : idxp->right();
                 if (wideIndexRange(typep)) {
                     // Bounds no int holds: counted from zero, the low bound
                     // first, which is how stringIndex indexes it
@@ -2303,10 +2314,46 @@ private:
 
     // A record element whose length nothing here settles carries its own
     // bounds, exactly as a value of that type does anywhere else (5.3.3)
-    AstNodeDType* memberDType(VhdlType* etp, FileLine* flp, bool noCarry = false) {
+    AstNodeDType* memberDType(VhdlType* etp, FileLine* flp, bool noCarry = false,
+                              bool spread = true) {
         if (!noCarry && elementCarried(etp)) return dynCarrierRef(etp, flp);
         if (!noCarry && elementCarriedTwo(etp)) return dyn2CarrierRef(etp, flp);
+        VL_RESTORER(m_recordMember);
+        m_recordMember = spread;
         return lowerType(etp, flp);
+    }
+    // Whether the record's own declaration leaves an element's bounds open, so that the
+    // two sides of a port may give it bounds in different ways
+    static bool openInBase(const VhdlType* recp, const VhdlSymbol* elemp) {
+        const VhdlType* const bep = baseElementType(recp, elemp);
+        return bep && bep->base()->kind() == VhdlTypeKind::ARRAY && !bep->isConstrainedArray();
+    }
+    // Whether an element of a record, open in the record's declaration, is a vector of no
+    // elements whose ends are numbers, held over the places between them (lowerArrayType)
+    bool nullMemberSpread(const VhdlType* recp, const VhdlSymbol* elemp) const {
+        if (!openInBase(recp, elemp)) return false;
+        const VhdlType* const etp = elementTypeIn(recp, elemp);
+        if (!etp || etp->base()->kind() != VhdlTypeKind::ARRAY || etp->dimensions() != 1
+            || !etp->isConstrainedArray() || etp->dimOpen(0)) {
+            return false;
+        }
+        const VhdlType* const idxp = indexSubtype(etp, 0);
+        const VhdlType* const leafp = etp->elementp() ? etp->elementp() : etp->base()->elementp();
+        return idxp && idxp->bounded() && idxp->length() <= 0 && idxp->left() != idxp->right()
+               && leafp && elementPacks(leafp) && !wideIndexRange(etp);
+    }
+    static int64_t nullMemberPlaces(const VhdlType* etp) {
+        const VhdlType* const idxp = indexSubtype(etp, 0);
+        return std::abs(idxp->left() - idxp->right()) + 1;
+    }
+    // A value of no elements is one place, which such an element is more than: the value
+    // is given the element's own type, so that the elements after it in the record keep
+    // their places
+    AstNodeExpr* fitNullMember(AstNodeExpr* valp, const VhdlType* recp, const VhdlSymbol* elemp,
+                               FileLine* flp) {
+        if (!valp || !nullMemberSpread(recp, elemp)) return valp;
+        VhdlType* const etp = elementTypeIn(recp, elemp);
+        return new AstCast{flp, valp, VFlagChildDType{}, memberDType(etp, flp, true)};
     }
     // A record element that is an array of arrays open at both levels --
     // "data : data_t" with data_t "array (natural range <>) of bit_vector"
@@ -2366,7 +2413,8 @@ private:
         structp->name(typep->name());
         for (VhdlSymbol* const elemp : typep->elements()) {
             AstMemberDType* const memberp = new AstMemberDType{
-                flp, elemp->name(), VFlagChildDType{}, memberDType(elemp->typep(), flp), nullptr};
+                flp, elemp->name(), VFlagChildDType{},
+                memberDType(elemp->typep(), flp, false, openInBase(typep, elemp)), nullptr};
             // Read and written over VPI as the nine characters, as a signal of its type is
             memberp->vhdlNine(nineValued(elemp->typep()) && !elementCarried(elemp->typep())
                               && !elementCarriedTwo(elemp->typep()));
@@ -2708,9 +2756,9 @@ private:
         if (unitp) structp->classOrPackagep(unitp);
         const bool noCarry = !recordMayCarry(keyp);
         for (VhdlSymbol* const elemp : keyp->elements()) {
-            AstMemberDType* const memberp
-                = new AstMemberDType{flp, elemp->name(), VFlagChildDType{},
-                                     memberDType(elemp->typep(), flp, noCarry), nullptr};
+            AstMemberDType* const memberp = new AstMemberDType{
+                flp, elemp->name(), VFlagChildDType{},
+                memberDType(elemp->typep(), flp, noCarry, openInBase(keyp, elemp)), nullptr};
             memberp->vhdlNine(
                 nineValued(elemp->typep())
                 && (noCarry
@@ -8879,11 +8927,12 @@ private:
                 if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
                 return nullptr;
             }
+            AstNodeExpr* const fitp = fitNullMember(onep, typep, elemp, flp);
             if (packed) {
-                outp = outp ? new AstConcat{flp, outp, onep} : onep;
+                outp = outp ? new AstConcat{flp, outp, fitp} : fitp;
             } else {
                 itemsp = AstNode::addNextNull(
-                    itemsp, new AstPatMember{flp, onep, new AstText{flp, elemp->name()}, nullptr});
+                    itemsp, new AstPatMember{flp, fitp, new AstText{flp, elemp->name()}, nullptr});
             }
         }
         if (packed) return outp;
@@ -10982,9 +11031,18 @@ private:
                 // it has
                 VL_DO_DANGLING(dtypep->deleteTree(), dtypep);
                 int64_t count = 1;
+                bool bounded = true;
                 for (const VhdlType* const idxp : typep->indexTypes()) {
+                    if (!idxp || !idxp->bounded()) bounded = false;
                     if (!idxp || !idxp->bounded()) count = 0;
                     if (count) count *= idxp->length();
+                }
+                // A null array is held as one element (lowerArrayType), whose default it
+                // starts with; without one a record of it had no default at all, and every
+                // element started at zero: OSVVM's Ack of a "ParamToModel(NULL_RANGE_TYPE)"
+                // record at 0, not AckType'LEFT
+                if (bounded && count <= 0 && typep->indexTypes().size() == 1) {
+                    return packedRepeat(elemp, 1, flp);
                 }
                 if (!count && typep->indexTypes().size() == 1) {
                     // A length that only elaboration fixes -- an array whose
@@ -11067,12 +11125,13 @@ private:
                     if (itemsp) VL_DO_DANGLING(itemsp->deleteTree(), itemsp);
                     return nullptr;  // One element with no default gives none
                 }
+                AstNodeExpr* const fitp = fitNullMember(onep, typep, elemp, flp);
                 if (packed) {
-                    outp = outp ? new AstConcat{flp, outp, onep} : onep;
+                    outp = outp ? new AstConcat{flp, outp, fitp} : fitp;
                 } else {
                     itemsp = AstNode::addNextNull(
-                        itemsp, new AstPatMember{flp, onep, new AstText{flp, elemp->name()},
-                                                 nullptr});
+                        itemsp,
+                        new AstPatMember{flp, fitp, new AstText{flp, elemp->name()}, nullptr});
                 }
             }
             if (packed) return outp;
@@ -16411,29 +16470,65 @@ private:
             prep = new AstAssign{flp, new AstVarRef{flp, tmpp, VAccess::WRITE}, arrp};
             arrp = new AstVarRef{flp, tmpp, VAccess::READ};
         }
-        AstNodeExpr* bestp = nullptr;
-        for (int64_t i = 0; i < count; ++i) {
-            AstNodeExpr* const elemp = new AstSelBit{
+        const auto elemAt = [&](int64_t i) {
+            return new AstSelBit{
                 flp, arrp->cloneTree(false),
                 new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(left + i * step)}};
-            if (!bestp) {
-                bestp = elemp;
-                continue;
+        };
+        // A few elements as one conditional over them, which a constant can be folded from
+        if (count <= 6) {
+            AstNodeExpr* bestp = nullptr;
+            for (int64_t i = 0; i < count; ++i) {
+                AstNodeExpr* const elemp = elemAt(i);
+                if (!bestp) {
+                    bestp = elemp;
+                    continue;
+                }
+                AstNodeExpr* const testp
+                    = signd ? static_cast<AstNodeExpr*>(new AstGtS{flp, elemp->cloneTree(false),
+                                                                   bestp->cloneTree(false)})
+                            : static_cast<AstNodeExpr*>(new AstGt{flp, elemp->cloneTree(false),
+                                                                  bestp->cloneTree(false)});
+                bestp = wantMax ? new AstCond{flp, testp, elemp, bestp}
+                                : new AstCond{flp, testp, bestp, elemp};
             }
+            VL_DO_DANGLING(arrp->deleteTree(), arrp);
+            // The statement that works the value out travels with the expression,
+            // since a call may appear anywhere an expression may
+            if (prep) return new AstExprStmt{flp, prep, bestp};
+            return bestp;
+        }
+        // More, as the best so far kept in a variable and each element compared with it in
+        // turn: the conditional nests itself twice over at each element, which a resolution
+        // function's copy for thirty drivers does not survive
+        VhdlType* const elemTypep
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        AstVar* const bestp = newTempVar("__Vextremebest", lowerType(elemTypep, flp), flp);
+        prep = AstNode::addNextNull(
+            prep, static_cast<AstNode*>(
+                      new AstAssign{flp, new AstVarRef{flp, bestp, VAccess::WRITE}, elemAt(0)}));
+        for (int64_t i = 1; i < count; ++i) {
+            AstNodeExpr* const elemp = elemAt(i);
+            AstNodeExpr* const bp = new AstVarRef{flp, bestp, VAccess::READ};
             AstNodeExpr* const testp
-                = signd ? static_cast<AstNodeExpr*>(new AstGtS{flp, elemp->cloneTree(false),
-                                                               bestp->cloneTree(false)})
-                        : static_cast<AstNodeExpr*>(new AstGt{flp, elemp->cloneTree(false),
-                                                              bestp->cloneTree(false)});
-            bestp = wantMax ? new AstCond{flp, testp, elemp, bestp}
-                            : new AstCond{flp, testp, bestp, elemp};
+                = wantMax ? (signd ? static_cast<AstNodeExpr*>(
+                                         new AstGtS{flp, elemp->cloneTree(false), bp})
+                                   : static_cast<AstNodeExpr*>(
+                                         new AstGt{flp, elemp->cloneTree(false), bp}))
+                          : (signd ? static_cast<AstNodeExpr*>(
+                                         new AstLtS{flp, elemp->cloneTree(false), bp})
+                                   : static_cast<AstNodeExpr*>(
+                                         new AstLt{flp, elemp->cloneTree(false), bp}));
+            prep = AstNode::addNextNull(
+                prep, static_cast<AstNode*>(new AstIf{
+                          flp, testp,
+                          new AstAssign{flp, new AstVarRef{flp, bestp, VAccess::WRITE}, elemp},
+                          nullptr}));
         }
         VL_DO_DANGLING(arrp->deleteTree(), arrp);
-        // The statement that works the value out travels with the expression,
-        // since a call may appear anywhere an expression may
-        if (prep && bestp) return new AstExprStmt{flp, prep, bestp};
-        if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
-        return bestp;
+        // The statements that work the value out travel with the expression, since a call
+        // may appear anywhere an expression may
+        return new AstExprStmt{flp, prep, new AstVarRef{flp, bestp, VAccess::READ}};
     }
 
     // "\"+\"(a, b)" means the same as "a + b" (4.5.3). An operator has no body
@@ -22340,7 +22435,10 @@ private:
         if (basep->kind() == VhdlTypeKind::RECORD) {
             AstNodeExpr* sump = nullptr;
             for (const VhdlSymbol* const elemp : typep->elements()) {
-                AstNodeExpr* const onep = nineLaneCount(elemp->typep(), flp, depth + 1);
+                // A null element is held over the places between its ends
+                AstNodeExpr* const onep = nullMemberSpread(typep, elemp)
+                                              ? i32(nullMemberPlaces(elemp->typep()), flp)
+                                              : nineLaneCount(elemp->typep(), flp, depth + 1);
                 if (!onep) {
                     if (sump) VL_DO_DANGLING(sump->deleteTree(), sump);
                     return nullptr;
@@ -26549,9 +26647,11 @@ private:
             }
             if (packed) {
                 memberp = elemLengthChecked(memberp, valuep, elems[i]->typep(), flp);
+                memberp = fitNullMember(memberp, typep, elems[i], flp);
                 if (retype) valuep->vhdlTypep(givenp);
                 outp = outp ? new AstConcat{flp, outp, memberp} : memberp;
             } else {
+                memberp = fitNullMember(memberp, typep, elems[i], flp);
                 if (retype) valuep->vhdlTypep(givenp);
                 itemsp = AstNode::addNextNull(
                     itemsp, new AstPatMember{flp, memberp,
@@ -47447,6 +47547,8 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     std::map<std::string, AstVhdlEntity*> entities;
     std::map<std::string, AstVhdlArchitecture*> archs;
     std::map<std::string, std::string> chosen;  // Entity -> architecture a configuration picked
+    std::string topCfg;  // "lib.config" of the configuration the design is elaborated through
+    std::string topArch;  // The architecture it picks
     std::map<std::string, AstVhdlArchitecture*> namedArchs;  // "lib.entity.arch" -> it
     std::vector<std::string> order;  // Entities, in the order they arrived
     for (AstNodeVhdlUnit* const unitp : unitsp) {
@@ -47487,6 +47589,8 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
                 // entity's is: a configuration declaration applies to the
                 // hierarchy elaborated through it and to nothing else (3.4).
                 m_cfgTopEntity = lib + "." + parts.back();
+                topCfg = lib + "." + VString::downcase(cfgp->name());
+                topArch = arch;
             }
             // The outermost block configuration is the architecture's; what
             // it holds configures the architecture's own statements, and the
@@ -47500,6 +47604,13 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
             continue;
         }
         unsup(unitp->fileline(), std::string{"design unit "} + unitp->typeName());
+    }
+    // Of the configurations of the top entity, the one the design is elaborated through says
+    // what it is built from, and none of the others: OSVVM's TbAxi4_Separate1 had its
+    // memories bound with the MEMORY_NAME TbAxi4_Shared1's configuration gives them
+    if (!topCfg.empty()) {
+        m_cfgScopes[m_cfgTopEntity] = m_cfgScopeByCfg[topCfg];
+        if (!topArch.empty()) chosen[m_cfgTopEntity] = topArch;
     }
     // Which architecture each entity is built from has to be settled before
     // any of them is lowered, since an instance asks for it by name
