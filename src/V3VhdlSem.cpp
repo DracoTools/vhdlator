@@ -8975,9 +8975,16 @@ void VhdlSemVisitor::analyzeDrivers(AstVhdlArchitecture* archp) {
         // An alias of a whole signal or port is that object, whose drivers are counted:
         // "alias WB is WishboneBus" in OSVVM's Wishbone manager, a process assigning WB.Stb
         // being one of WishboneBus's drivers (6.6.2)
+        // So is an alias of an element of one, "alias AW : AxiBus.WriteAddress'subtype is
+        // AxiBus.WriteAddress" in the AXI4 managers: a process assigning AW.Addr drives part of
+        // AxiBus, which is how a record of resolved elements counts its drivers
         for (int depth = 0; symp && symp->kind() == VhdlSymKind::ALIAS && depth < 8; ++depth) {
             const AstVhdlAliasDecl* const adp = VN_CAST(symp->declp(), VhdlAliasDecl);
-            const AstVhdlName* const tnp = adp ? VN_CAST(adp->targetp(), VhdlName) : nullptr;
+            const AstNodeVhdlExpr* tep = adp ? adp->targetp() : nullptr;
+            while (const AstVhdlSelected* const selp = VN_CAST(tep, VhdlSelected)) {
+                tep = selp->prefixp();
+            }
+            const AstVhdlName* const tnp = VN_CAST(tep, VhdlName);
             const VhdlSymbol* const tp = tnp ? tnp->vhdlSymp() : nullptr;
             if (!tp || !(tp->isObject() || tp->kind() == VhdlSymKind::ALIAS)) break;
             symp = tp;

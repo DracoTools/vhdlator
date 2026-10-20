@@ -8691,6 +8691,8 @@ private:
     bool isDynObj(const AstNodeVhdlExpr* nodep) const {
         if (const AstVhdlName* const namep = VN_CAST(nodep, VhdlName)) {
             if (!namep->vhdlSymp()) return false;
+            // An alias of a shape of its own over such a value is read in that shape
+            if (aliasReadInOwnShape(namep->vhdlSymp())) return false;
             if (m_dynSyms.count(namep->vhdlSymp()->resolved())) return true;
             // An alias given a carrier of its own (aliasCarrier)
             return m_ftaskp && m_aliasCarriers.count(std::make_pair(m_ftaskp, namep->vhdlSymp()));
@@ -14672,6 +14674,28 @@ private:
     std::map<std::pair<const AstNodeFTask*, const VhdlSymbol*>, AstVar*> m_aliasCarriers;
     // Whether the subprogram an alias is declared in may write through it: an assignment to
     // it or to a part of it, or the alias handed to a call, whatever the formal's mode
+    // Whether an alias whose subtype gives it a length elaboration settles denotes a value
+    // carried with its bounds, and is only read: it is then that value in the alias's shape
+    // (6.6.2) -- "alias ID : std_logic_vector(ID_LEN - 1 downto 0) is aParam(...)" in OSVVM's
+    // AXI stream receiver, aParam an alias carried with its bounds
+    mutable std::map<const VhdlSymbol*, bool> m_aliasWritten;
+    bool aliasReadInOwnShape(const VhdlSymbol* symp) const {
+        if (!symp || symp->kind() != VhdlSymKind::ALIAS) return false;
+        if (m_ftaskp && m_aliasCarriers.count(std::make_pair(m_ftaskp, symp))) return false;
+        const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!declp || !declp->targetp() || VN_IS(declp->targetp(), VhdlName)) return false;
+        const VhdlType* const atp = symp->typep();
+        if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY || !atp->lengthEmittable()
+            || lengthOnlyRunningDecides(atp) || carriedDynamically(atp)) {
+            return false;
+        }
+        if (!isDynValue(declp->targetp())) return false;
+        const auto it = m_aliasWritten.find(symp);
+        const bool written = it != m_aliasWritten.end()
+                                 ? it->second
+                                 : (m_aliasWritten[symp] = writtenThrough(declp, symp));
+        return !written;
+    }
     static bool writtenThrough(const AstVhdlAliasDecl* declp, const VhdlSymbol* aliasp) {
         const AstNode* bodyp = nullptr;
         for (const AstNode* up = declp->backp(); up; up = up->backp()) {
@@ -14825,6 +14849,30 @@ private:
             const bool plainName = declp && VN_IS(declp->targetp(), VhdlName);
             if (symp->aliasp() && (plainName || !declp || !declp->targetp())) {
                 return lowerRef(symp->aliasp(), name, flp);
+            }
+            // One of a shape of its own over a value carried with its bounds is that value
+            // converted to the shape
+            VhdlType* const atp = symp->typep();
+            if (aliasReadInOwnShape(symp)) {
+                // A slice of such a value is held as the value is (the slice's own lowering)
+                VhdlType* carrp = dynValueType(declp->targetp());
+                const AstVhdlCall* const slicep = VN_CAST(declp->targetp(), VhdlCall);
+                if (!carrp && slicep && VN_IS(slicep->argsp(), VhdlRange) && slicep->prefixp()
+                    && isDynObj(slicep->prefixp())) {
+                    carrp = dynValueType(slicep->prefixp()) ? dynValueType(slicep->prefixp())
+                                                            : slicep->prefixp()->vhdlTypep();
+                }
+                if (carrp) {
+                    AstNodeFTask* funcp = dynToFixedFunc(carrp, atp, flp);
+                    if (!funcp) funcp = dynToFixedExprFunc(carrp, atp, flp);
+                    AstNodeExpr* const srcp = funcp ? lowerExpr(declp->targetp()) : nullptr;
+                    if (srcp) {
+                        AstFuncRef* const refp
+                            = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", srcp}};
+                        refp->taskp(VN_AS(funcp, Func));
+                        return refp;
+                    }
+                }
             }
             if (declp && declp->targetp()) return lowerExpr(declp->targetp());
         }
