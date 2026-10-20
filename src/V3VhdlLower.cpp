@@ -12600,6 +12600,25 @@ private:
                 }
             }
             VhdlType* const ownp = callp->vhdlTypep();
+            // An element of an array formal is of the element subtype of what the formal is
+            // bound to where its own subtype leaves it open: "TransactionRec(Index)" in a copy
+            // of OSVVM's LocalSend made from inside one of Send, TransactionRec a
+            // StreamRecArrayType whose records' elements the caller's actual constrains
+            if (ownp && callp->prefixp() && !VN_IS(callp->argsp(), VhdlRange)
+                && (arrayStillOpen(ownp)
+                    || (ownp->base()->kind() == VhdlTypeKind::RECORD && partlyOpen(ownp)))) {
+                if (VhdlType* const arrp = boundTypeOf(callp->prefixp(), depth + 1)) {
+                    if (arrp->base()->kind() == VhdlTypeKind::ARRAY) {
+                        VhdlType* const elemp
+                            = arrp->elementp() ? arrp->elementp() : arrp->base()->elementp();
+                        if (elemp && !arrayStillOpen(elemp)
+                            && !(elemp->base()->kind() == VhdlTypeKind::RECORD
+                                 && partlyOpen(elemp))) {
+                            return elemp;
+                        }
+                    }
+                }
+            }
             if (ownp && callp->prefixp() && !arrayStillOpen(ownp)) return ownp;
         }
         VhdlSymbol* symp = exprp->vhdlSymp();
@@ -12613,7 +12632,19 @@ private:
         if (eIt != m_bindExprs.end() && eIt->second && eIt->second != exprp) {
             if (VhdlType* const outp = boundTypeOf(eIt->second, depth + 1)) return outp;
         }
-        return symp->typep() ? symp->typep() : exprp->vhdlTypep();
+        // The name's own subtype where the declaration's leaves open what the name's says: a
+        // port an instance sizes is written open, and its name has the subtype the instance
+        // gives it
+        VhdlType* const declTypep = symp->typep();
+        VhdlType* const nameTypep = exprp->vhdlTypep();
+        const auto stillOpen = [](const VhdlType* tp) {
+            return arrayStillOpen(tp)
+                   || (tp && tp->base()->kind() == VhdlTypeKind::RECORD && partlyOpen(tp));
+        };
+        if (declTypep && nameTypep && stillOpen(declTypep) && !stillOpen(nameTypep)) {
+            return nameTypep;
+        }
+        return declTypep ? declTypep : nameTypep;
     }
 
     // Whether such a type still says nothing about how long it is
@@ -37662,6 +37693,22 @@ private:
     // The assignment one value stands for, which is what each branch of a
     // conditional or selected variable assignment reduces to
     AstNode* lowerVarValue(AstVhdlVarAssign* nodep, AstNodeVhdlExpr* valuep, FileLine* flp) {
+        // A slice whose ends are numbers and whose range is null holds nothing, and nothing
+        // is written to it (5.3.2.1, 10.6.2.1): "LocalParam(Param'length - 1 downto 0) :=
+        // Param" in OSVVM's LocalSend, in the copy made for an empty Param. It was written as
+        // the places between its ends, two of them.
+        if (const AstVhdlCall* const slicep = VN_CAST(nodep->targetp(), VhdlCall)) {
+            const AstVhdlRange* const rp = VN_CAST(slicep->argsp(), VhdlRange);
+            if (rp && !rp->nextp() && rp->leftp() && rp->rightp() && !rp->dirUnknown()) {
+                const VhdlValue l = V3VhdlEval::eval(rp->leftp());
+                const VhdlValue r = V3VhdlEval::eval(rp->rightp());
+                if (l.isInt() && r.isInt()
+                    && (rp->dir() == VhdlDir::DOWNTO ? l.toInt() < r.toInt()
+                                                     : l.toInt() > r.toInt())) {
+                    return new AstBegin{flp, "", nullptr, false};
+                }
+            }
+        }
         // A record aggregate is built in the shape its target holds, which
         // may carry an element the aggregate gives as bits: "p.all := (n =>
         // 1, data => "101")" through an access to a record with an open one

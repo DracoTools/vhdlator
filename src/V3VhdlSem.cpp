@@ -8097,6 +8097,7 @@ private:
         std::vector<VhdlType*> actualTypes;
         std::vector<VhdlValue> actualValues;
         std::vector<AstNodeVhdlExpr*> standIns;
+        bool keptOpen = false;  // A parameter a procedure's copy leaves open
         for (size_t i = 0; i < nparams; ++i) {
             // A formal the call named part by part, down a path its own
             // subtype already gives the bounds for: the copy is made for
@@ -8202,9 +8203,12 @@ private:
                     if (!elemSpecp) {
                         // Nothing about its length to settle, but the copy
                         // may be wanted for a value another parameter has
-                        // (bodyNeedsParamValues): that one keeps the
-                        // declaration's own subtype, carried as ever
-                        if (!byValue || resultIsUnconstrained(symp)) return;
+                        // (bodyNeedsParamValues), or for the subtype another
+                        // one has -- OSVVM's Send given a StreamRecArrayType
+                        // and data whose length a port's sets: that one keeps
+                        // the declaration's own subtype, carried as ever
+                        if (byValue && resultIsUnconstrained(symp)) return;
+                        if (!byValue) keptOpen = true;
                         actualTypes.push_back(symp->paramTypes()[i]);
                         continue;
                     }
@@ -8245,6 +8249,22 @@ private:
             actualTypes.push_back(typep);
         }
         if (actualTypes.size() != symp->paramTypes().size()) return;
+        // A procedure one of whose parameters kept its open subtype is worth a copy only where
+        // another open one is given a subtype
+        if (keptOpen) {
+            bool anyOpenSettled = false;
+            for (size_t i = 0; i < nparams; ++i) {
+                const VhdlType* const ptp = symp->paramTypes()[i];
+                if (!ptp || actualTypes[i] == ptp) continue;
+                const VhdlTypeKind kind = ptp->base()->kind();
+                if ((kind == VhdlTypeKind::ARRAY && !ptp->isConstrainedArray())
+                    || (kind == VhdlTypeKind::RECORD
+                        && !VhdlSemVisitor::fullyConstrainedRecord(ptp))) {
+                    anyOpenSettled = true;
+                }
+            }
+            if (!anyOpenSettled) return;
+        }
         // A recursion that folds to a new value at every call has no last
         // copy, and each copy is made inside the one before it, so the series
         // ends when the stack does rather than at any count. "f(n + 1)" never
