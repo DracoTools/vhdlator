@@ -5467,10 +5467,18 @@ private:
         if (!rp || !callp->prefixp() || !carrierTypep || !rp->leftp() || !rp->rightp()) {
             return nullptr;
         }
-        // A plain name: an alias numbers its elements its own way
+        // A plain name. An alias numbers its elements its own way, which a carrier made from
+        // it keeps where elaboration settles its subtype's bounds: OSVVM's
+        // CalculateByteAddress slices "aAddr(AddrBitsPerWord downto 1)" of "alias aAddr :
+        // std_logic_vector(Address'length downto 1)", given a generic
         const VhdlSymbol* const psymp = callp->prefixp()->vhdlSymp();
-        if (!VN_IS(callp->prefixp(), VhdlName) || !psymp || psymp->kind() == VhdlSymKind::ALIAS) {
-            return nullptr;
+        if (!VN_IS(callp->prefixp(), VhdlName) || !psymp) return nullptr;
+        if (psymp->kind() == VhdlSymKind::ALIAS) {
+            const VhdlType* const atp = psymp->typep();
+            if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY || atp->indexTypes().size() != 1
+                || !atp->lengthEmittable() || lengthOnlyRunningDecides(atp)) {
+                return nullptr;
+            }
         }
         VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
         // So is a slice of an object whose length is a number, where the
@@ -5658,6 +5666,27 @@ private:
         }
         if (AstNodeExpr* const cutp = sliceOfGenericCarrier(nodep, carrierTypep, flp)) {
             return cutp;
+        }
+        // A conversion of such a slice of an alias is as long as the slice (9.3.6), whatever
+        // subtype the conversion was given: "unsigned(aAddr(AddrBitsPerWord downto 1))" in
+        // OSVVM's CalculateByteAddress, given a generic, took the alias's length
+        if (carrierTypep) {
+            const AstVhdlCall* const convp = VN_CAST(nodep, VhdlCall);
+            const VhdlSymbol* const csymp
+                = convp && convp->prefixp() ? convp->prefixp()->vhdlSymp() : nullptr;
+            AstVhdlAssoc* const argp = convp ? VN_CAST(convp->argsp(), VhdlAssoc) : nullptr;
+            AstVhdlCall* const slicep = argp && !argp->nextp() && !argp->formalp()
+                                            ? VN_CAST(argp->actualp(), VhdlCall)
+                                            : nullptr;
+            AstVhdlRange* const srp = slicep ? VN_CAST(slicep->argsp(), VhdlRange) : nullptr;
+            const VhdlSymbol* const ssymp
+                = slicep && slicep->prefixp() ? slicep->prefixp()->vhdlSymp() : nullptr;
+            if (csymp && csymp->kind() == VhdlSymKind::TYPE && srp && !constSliceSpan(srp) && ssymp
+                && ssymp->kind() == VhdlSymKind::ALIAS) {
+                if (AstNodeExpr* const cutp = sliceOfGenericCarrier(slicep, carrierTypep, flp)) {
+                    return cutp;
+                }
+            }
         }
         VhdlType* typep = nodep->vhdlTypep();
         // One element of the array standing where an array is wanted, which
@@ -15998,7 +16027,20 @@ private:
         // for them, lowered afresh wherever the shift is applied
         AstNodeVhdlExpr* fromLeftVp = nullptr;
         AstNodeVhdlExpr* toLeftVp = nullptr;
+        // And the ranges they were written with: one that runs the way an instance says --
+        // a record element's actual, in a copy made for it -- turns the step round when the
+        // design runs (step then guesses such a range descends, as boundsAscending does)
+        const AstVhdlRange* fromRangep = nullptr;
+        const AstVhdlRange* toRangep = nullptr;
     };
+    // Whether a range ascends, as an expression
+    AstNodeExpr* rangeAscendsExpr(const AstVhdlRange* rp, FileLine* flp) {
+        if (rp->dirUnknown() && rp->dirp()) {
+            return lowerExpr(const_cast<AstNodeVhdlExpr*>(rp->dirp()));
+        }
+        return new AstConst{flp, AstConst::BitTrue{}, rp->dir() == VhdlDir::TO};
+    }
+    static bool runningDir(const AstVhdlRange* rp) { return rp && rp->dirUnknown() && rp->dirp(); }
     AstNodeExpr* applyShifts(const std::vector<IndexShift>& shifts, AstNodeExpr* idxp,
                              FileLine* flp) {
         for (const IndexShift& shift : shifts) {
@@ -16012,6 +16054,28 @@ private:
                     return nullptr;
                 }
                 AstNodeExpr* offsetp = new AstSub{flp, idxp, fromp};
+                if (runningDir(shift.fromRangep) || runningDir(shift.toRangep)) {
+                    AstNodeExpr* const fromAscp = rangeAscendsExpr(shift.fromRangep, flp);
+                    AstNodeExpr* const toAscp = rangeAscendsExpr(shift.toRangep, flp);
+                    if (!fromAscp || !toAscp) {
+                        if (fromAscp) VL_DO_DANGLING(fromAscp->deleteTree(), fromAscp);
+                        if (toAscp) VL_DO_DANGLING(toAscp->deleteTree(), toAscp);
+                        VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                        VL_DO_DANGLING(top->deleteTree(), top);
+                        return nullptr;
+                    }
+                    // The same way round: as it is; the other way: negated
+                    const auto neg = [&](AstNodeExpr* ep) { return new AstNegate{flp, ep}; };
+                    AstNodeExpr* const sameDirp = new AstCond{
+                        flp, fromAscp,
+                        new AstCond{flp, toAscp, offsetp->cloneTree(false),
+                                    neg(offsetp->cloneTree(false))},
+                        new AstCond{flp, toAscp->cloneTree(false), neg(offsetp->cloneTree(false)),
+                                    offsetp->cloneTree(false)}};
+                    VL_DO_DANGLING(offsetp->deleteTree(), offsetp);
+                    idxp = new AstAdd{flp, top, sameDirp};
+                    continue;
+                }
                 if (shift.step < 0) offsetp = new AstNegate{flp, offsetp};
                 idxp = new AstAdd{flp, top, offsetp};
                 continue;
@@ -16061,7 +16125,12 @@ private:
         if (!arp->leftp() || !arp->rightp() || !trp->leftp() || !trp->rightp()) return false;
         shift.fromLeftVp = arp->leftp();
         shift.toLeftVp = trp->leftp();
-        shift.step = (arp->dir() == VhdlDir::DOWNTO) == (trp->dir() == VhdlDir::DOWNTO) ? 1 : -1;
+        shift.fromRangep = arp;
+        shift.toRangep = trp;
+        const auto descends = [](const AstVhdlRange* rp) {
+            return runningDir(rp) || rp->dir() == VhdlDir::DOWNTO;
+        };
+        shift.step = descends(arp) == descends(trp) ? 1 : -1;
         return true;
     }
     // Whether the shifts turn the direction round an odd number of times
@@ -16128,6 +16197,12 @@ private:
             if (symp->kind() == VhdlSymKind::ALIAS) {
                 const AstVhdlAliasDecl* const declp = VN_CAST(symp->declp(), VhdlAliasDecl);
                 if (!declp || !declp->targetp()) return done();
+                // One with a carrier of its own (aliasCarrier) holds its elements under its own
+                // bounds, so an index of it is already in its numbering: AlignDataBusToBytes's
+                // "aData(DATA_LEFT downto ByteAddr*8)" in a copy for a record element's actual
+                if (m_ftaskp && m_aliasCarriers.count(std::make_pair(m_ftaskp, symp))) {
+                    return done();
+                }
                 targetp = declp->targetp();
                 targetTypep = targetp->vhdlTypep();
                 shifted = aliasMapping(symp, declp, shift.fromLeft, shift.toLeft, shift.step);
@@ -21635,10 +21710,17 @@ private:
             }
             if (!pending) continue;
             const auto key = std::make_pair(symp, m_driverUsed[symp]);
+            // An assignment through an alias of a part drives that part
+            const auto rootOf = [](const AstNodeVhdlExpr* exprp) -> const VhdlSymbol* {
+                const VhdlSymbol* const tsymp = targetSymbol(const_cast<AstNodeVhdlExpr*>(exprp));
+                return tsymp ? aliasRootObject(tsymp) : nullptr;
+            };
+            const auto wholeName = [](const AstNodeVhdlExpr* exprp) {
+                return V3VhdlSem::drivesWhole(exprp) && !partAliasDecl(exprp);
+            };
             nodep->foreach([&](AstVhdlSigAssign* asgp) {
-                const VhdlSymbol* const tsymp = targetSymbol(asgp->targetp());
-                if (!tsymp || tsymp->resolved() != symp) return;
-                if (V3VhdlSem::drivesWhole(asgp->targetp())) {
+                if (rootOf(asgp->targetp()) != symp) return;
+                if (wholeName(asgp->targetp())) {
                     m_nineWhole.insert(key);
                 } else {
                     m_nineParts[key].push_back(asgp->targetp());
@@ -21656,8 +21738,55 @@ private:
                     m_nineParts[key].push_back(asp->actualp());
                 }
             });
-            // A procedure handed the signal drives it as a whole
-            nodep->foreach([&](AstVhdlProcCall*) { m_nineWhole.insert(key); });
+            // A procedure declared outside any process drives only what its signal formals of
+            // mode out or inout are given (4.2.2.3): the parts its actuals name, OSVVM's
+            // "DoAxiReadyHandshake(..., Ready => AxiBus.WriteAddress.Ready)". One whose
+            // formals are not known, or declared in a process, drives the whole.
+            nodep->foreach([&](AstVhdlProcCall* pcallp) {
+                const AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+                const VhdlSymbol* const csymp
+                    = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+                const AstVhdlSubprogDecl* const sdeclp
+                    = csymp ? (csymp->bodyp() ? csymp->bodyp()
+                                              : VN_CAST(csymp->declp(), VhdlSubprogDecl))
+                            : nullptr;
+                bool inProcess = !sdeclp;
+                for (const AstNode* up = sdeclp ? sdeclp->backp() : nullptr; up && !inProcess;
+                     up = up->backp()) {
+                    if (VN_IS(up, VhdlProcess)) inProcess = true;
+                }
+                if (inProcess) {
+                    m_nineWhole.insert(key);
+                    return;
+                }
+                std::vector<const AstVhdlIfaceDecl*> formals;
+                AstNode* fp = sdeclp->paramsp();
+                for (int i = 0; i < sdeclp->genericCount() && fp; ++i) fp = fp->nextp();
+                for (; fp; fp = fp->nextp()) formals.push_back(VN_CAST(fp, VhdlIfaceDecl));
+                size_t pos = 0;
+                for (const AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+                    const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                    if (!asp || !asp->actualp() || rootOf(asp->actualp()) != symp) continue;
+                    const AstVhdlIfaceDecl* formalp = nullptr;
+                    if (const AstVhdlName* const fnp = VN_CAST(asp->formalp(), VhdlName)) {
+                        for (const AstVhdlIfaceDecl* const one : formals) {
+                            if (one && one->name() == fnp->name()) formalp = one;
+                        }
+                    } else if (!asp->formalp() && pos < formals.size()) {
+                        formalp = formals[pos];
+                    }
+                    if (!formalp) {
+                        m_nineWhole.insert(key);
+                        return;
+                    }
+                    if (formalp->mode() == VhdlMode::IN) continue;
+                    if (wholeName(asp->actualp())) {
+                        m_nineWhole.insert(key);
+                    } else {
+                        m_nineParts[key].push_back(asp->actualp());
+                    }
+                }
+            });
         }
     }
 
@@ -21797,7 +21926,7 @@ private:
                 bool known = true;
                 for (const AstNodeVhdlExpr* const partp : partsIt->second) {
                     WavePath path;
-                    if (!recordPartOf(partp, path)) {
+                    if (!recordPartOf(partp, path, true)) {
                         known = false;
                         break;
                     }
@@ -30928,12 +31057,13 @@ private:
         }
     }
     // The record signal a target names a fixed part of -- "r.a", "r.v(3)",
-    // "r.n.code" -- and the path down to that part
-    static const VhdlSymbol* recordPartOf(const AstNodeVhdlExpr* targetp, WavePath& path) {
+    // "r.n.code" -- and the path down to that part; through aliases of parts too where asked
+    static const VhdlSymbol* recordPartOf(const AstNodeVhdlExpr* targetp, WavePath& path,
+                                          bool throughAliases = false) {
         if (const AstVhdlSelected* const selp = VN_CAST(targetp, VhdlSelected)) {
             const AstVhdlName* const namep = VN_CAST(selp->suffixp(), VhdlName);
             if (!namep) return nullptr;
-            const VhdlSymbol* const symp = recordPartOf(selp->prefixp(), path);
+            const VhdlSymbol* const symp = recordPartOf(selp->prefixp(), path, throughAliases);
             if (!symp) return nullptr;
             path.push_back(WavePathStep{namep->name(), 0});
             return symp;
@@ -30951,16 +31081,57 @@ private:
             if (!idxp) return nullptr;
             const VhdlValue val = V3VhdlEval::eval(idxp);
             if (!val.isInt()) return nullptr;
-            const VhdlSymbol* const symp = recordPartOf(callp->prefixp(), path);
+            const VhdlSymbol* const symp = recordPartOf(callp->prefixp(), path, throughAliases);
             if (!symp) return nullptr;
             path.push_back(WavePathStep{"", val.toInt()});
             return symp;
+        }
+        // An alias of a part is that part: "AW.Valid" for "alias AW : ... is
+        // AxiBus.WriteAddress" in OSVVM's AXI4 models is AxiBus.WriteAddress.Valid (6.6.2)
+        if (const AstVhdlAliasDecl* const adp
+            = throughAliases ? partAliasDecl(targetp) : nullptr) {
+            return recordPartOf(adp->targetp(), path, true);
         }
         const VhdlSymbol* const symp = wholeSignalOf(targetp);
         if (!symp || !symp->typep() || symp->typep()->base()->kind() != VhdlTypeKind::RECORD) {
             return nullptr;
         }
         return symp;
+    }
+    // The declaration of the alias a name is, where that alias denotes part of an object
+    static const AstVhdlAliasDecl* partAliasDecl(const AstNodeVhdlExpr* namep) {
+        if (!VN_IS(namep, VhdlName) || !namep->vhdlSymp()) return nullptr;
+        const VhdlSymbol* const symp = namep->vhdlSymp();
+        if (symp->kind() != VhdlSymKind::ALIAS) return nullptr;
+        const AstVhdlAliasDecl* const adp = VN_CAST(symp->declp(), VhdlAliasDecl);
+        if (!adp || !adp->targetp()) return nullptr;
+        if (!VN_IS(adp->targetp(), VhdlSelected) && !VN_IS(adp->targetp(), VhdlCall)) {
+            return nullptr;
+        }
+        return adp;
+    }
+    // The object an alias finally denotes part or all of, through aliases of parts too
+    static const VhdlSymbol* aliasRootObject(const VhdlSymbol* symp) {
+        for (int depth = 0; symp && symp->kind() == VhdlSymKind::ALIAS && depth < 16; ++depth) {
+            if (symp->resolved() != symp) {
+                symp = symp->resolved();
+                continue;
+            }
+            const AstVhdlAliasDecl* const adp = VN_CAST(symp->declp(), VhdlAliasDecl);
+            const AstNodeVhdlExpr* tep = adp ? adp->targetp() : nullptr;
+            for (;;) {
+                if (const AstVhdlSelected* const selp = VN_CAST(tep, VhdlSelected)) {
+                    tep = selp->prefixp();
+                } else if (const AstVhdlCall* const callp = VN_CAST(tep, VhdlCall)) {
+                    tep = callp->prefixp();
+                } else {
+                    break;
+                }
+            }
+            if (!tep || !tep->vhdlSymp()) return symp;
+            symp = tep->vhdlSymp();
+        }
+        return symp ? symp->resolved() : nullptr;
     }
     // The leaf a path names, built on an expression of the whole record
     static AstNodeExpr* leafOf(AstNodeExpr* basep, const WavePath& path, FileLine* flp) {
