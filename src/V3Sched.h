@@ -382,6 +382,8 @@ class TimingKit final {
 public:
     LogicByScope m_lbs;  // Actives that resume timing schedulers
     AstNodeStmt* m_postUpdates = nullptr;  // Post updates for the trigger eval function
+    // The trigger scheduler of the dynamic NBAs, which wait for the NBA event (V3Timing)
+    AstVarScope* m_nbaEventSchedp = nullptr;
 
     // Remaps external domains using the specified trigger map
     std::map<const AstVarScope*, std::vector<AstSenTree*>> remapDomains(

@@ -191,6 +191,8 @@ class AwaitVisitor final : public VNVisitor {
     AstScope* const m_scopeTopp;  // Scope at the top
     LogicByScope& m_lbs;  // Timing resume actives
     AstNodeStmt*& m_postUpdatesr;  // Post updates for the trigger eval function
+    AstVarScope* const m_nbaEventp;  // The event dynamic NBAs wait for, if any
+    AstVarScope*& m_nbaEventSchedr;  // The trigger scheduler of the processes waiting for it
     // Additional var sensitivities
     std::map<const AstVarScope*, std::set<AstSenTree*>>& m_externalDomains;
     std::set<AstSenTree*> m_processDomains;  // Sentrees from the current process
@@ -273,6 +275,16 @@ class AwaitVisitor final : public VNVisitor {
             auto* const postp = resumep->cloneTree(false);
             postp->method(VCMethod::SCHED_DO_POST_UPDATES);
             m_postUpdatesr = AstNode::addNext(m_postUpdatesr, postp->makeStmt());
+        }
+        // The processes that wait for the NBA event are dynamic NBAs (V3Timing), which the
+        // NBA region resumes itself (V3Sched)
+        if (m_nbaEventp && schedulerp->dtypep()->basicp()->isTriggerScheduler()) {
+            const AstSenItem* const itemp = sentreep->sensesp();
+            const AstVarRef* const refp = itemp ? VN_CAST(itemp->sensp(), VarRef) : nullptr;
+            if (itemp && !itemp->nextp() && itemp->edgeType() == VEdgeType::ET_EVENT && refp
+                && refp->varScopep() == m_nbaEventp) {
+                m_nbaEventSchedr = schedulerp;
+            }
         }
         // Put it in an active
         AstActive* const activep = new AstActive{flp, "_timing", sentreep};
@@ -371,10 +383,13 @@ class AwaitVisitor final : public VNVisitor {
 public:
     // CONSTRUCTORS
     explicit AwaitVisitor(AstNetlist* nodep, LogicByScope& lbs, AstNodeStmt*& postUpdatesr,
+                          AstVarScope*& nbaEventSchedr,
                           std::map<const AstVarScope*, std::set<AstSenTree*>>& externalDomains)
         : m_scopeTopp{nodep->topScopep()->scopep()}
         , m_lbs{lbs}
         , m_postUpdatesr{postUpdatesr}
+        , m_nbaEventp{nodep->nbaEventp()}
+        , m_nbaEventSchedr{nbaEventSchedr}
         , m_externalDomains{externalDomains} {
         iterate(nodep);
     }
@@ -388,9 +403,12 @@ TimingKit prepareTiming(AstNetlist* const netlistp) {
     if (!v3Global.usesTiming()) return {};
     LogicByScope lbs;
     AstNodeStmt* postUpdates = nullptr;
+    AstVarScope* nbaEventSchedp = nullptr;
     std::map<const AstVarScope*, std::set<AstSenTree*>> externalDomains;
-    { AwaitVisitor{netlistp, lbs, postUpdates, externalDomains}; }
-    return {std::move(lbs), postUpdates, std::move(externalDomains)};
+    { AwaitVisitor{netlistp, lbs, postUpdates, nbaEventSchedp, externalDomains}; }
+    TimingKit kit{std::move(lbs), postUpdates, std::move(externalDomains)};
+    kit.m_nbaEventSchedp = nbaEventSchedp;
+    return kit;
 }
 
 //============================================================================

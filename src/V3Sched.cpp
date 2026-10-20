@@ -852,6 +852,34 @@ void createEval(AstNetlist* netlistp,  //
             }());
     }
 
+    // A dynamic NBA -- one made in a function or task that is not inlined -- waits for the NBA
+    // event, then assigns. It is resumed here, at the start of the NBA region, so that its
+    // update is made along with the region's other updates and seen by the logic that reads
+    // them, before any process those updates resume runs (IEEE 1800-2023 4.4.2.2, 4.6).
+    // Fired as an event, its waiters would be resumed in the next Active region, in no
+    // particular order with the processes that region resumes, which then could read the
+    // variable before its update.
+    AstVarScope* dynamicDonep = nullptr;
+    AstNodeStmt* const nbaPrepp = [&]() -> AstNodeStmt* {
+        AstVarScope* const schedp = timingKit.m_nbaEventSchedp;
+        AstVarScope* const nbaEventTriggerp = netlistp->nbaEventTriggerp();
+        if (!schedp || !nbaEventTriggerp) return nullptr;
+        AstScope* const scopeTopp = netlistp->topScopep()->scopep();
+        dynamicDonep = scopeTopp->createTemp("__VnbaDynamicDone", 1);
+        dynamicDonep->varp()->noReset(true);
+        AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, nbaEventTriggerp, VAccess::READ}};
+        ifp->addThensp(util::setVar(nbaEventTriggerp, 0));
+        for (const VCMethod method : {VCMethod::SCHED_READY, VCMethod::SCHED_MOVE_TO_RESUME_QUEUE,
+                                      VCMethod::SCHED_RESUME}) {
+            AstCMethodHard* const callp
+                = new AstCMethodHard{flp, new AstVarRef{flp, schedp, VAccess::READWRITE}, method};
+            callp->dtypeSetVoid();
+            ifp->addThensp(callp->makeStmt());
+        }
+        ifp->addThensp(util::setVar(dynamicDonep, 1));
+        return ifp;
+    }();
+
     // Create the NBA eval loop, which is the default top level loop.
     topLoop = createEvalLoop(  //
         netlistp, "nba", "NBA", /* slow: */ false, trigKit,
@@ -860,7 +888,7 @@ void createEval(AstNetlist* netlistp,  //
         // Inner loop statements
         topLoop.stmtsp,
         // Prep statements
-        nullptr,
+        nbaPrepp,
         // Work statements
         [&]() {
             AstNodeStmt* workp = nullptr;
@@ -879,6 +907,16 @@ void createEval(AstNetlist* netlistp,  //
         }(),
         // Extra work (not conditional on having had a fired trigger)
         [&](AstVarScope* continuep) -> AstNodeStmt* {
+            // Dynamic NBAs made their updates in this iteration, which the Active region of the
+            // next one sees
+            if (dynamicDonep) {
+                netlistp->nbaEventp(nullptr);
+                netlistp->nbaEventTriggerp(nullptr);
+                AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, dynamicDonep, VAccess::READ}};
+                ifp->addThensp(util::setVar(continuep, 1));
+                ifp->addThensp(util::setVar(dynamicDonep, 0));
+                return ifp;
+            }
             // Check if any dynamic NBAs are pending, if there are any in the design
             if (!netlistp->nbaEventp()) return nullptr;
             AstVarScope* const nbaEventp = netlistp->nbaEventp();
