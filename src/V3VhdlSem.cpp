@@ -4131,6 +4131,19 @@ void VhdlSemVisitor::visit(AstVhdlAliasDecl* nodep) {
         } else {
             lookup(parts.back(), found);
         }
+        // "alias rd : def.ReadData'subtype is def.ReadData": the prefix is an
+        // object, so the name is an element of it, whatever else of that name
+        // is visible -- a procedure ReadData, in OSVVM's AXI4 models (8.3)
+        if (!viaScope && parts.size() > 1) {
+            std::vector<VhdlSymbol*> head;
+            lookup(parts[0], head);
+            const VhdlSymbol* const headp = head.size() == 1 ? head[0]->resolved() : nullptr;
+            if (headp
+                && (headp->isObject()
+                    || (headp->kind() == VhdlSymKind::ALIAS && headp->objectAlias()))) {
+                found.clear();
+            }
+        }
         // "alias inc is pt.increment []": the prefix is an object of a
         // protected type, so the name is one of that type's methods, and the
         // call the alias stands for runs on that object (5.6.2)
@@ -15294,6 +15307,21 @@ VhdlType* VhdlSemVisitor::aggregateTargetType(AstNodeVhdlExpr* valuep, AstNode* 
         if (cands.types.size() == 1 && cands.types[0] && !cands.types[0]->isError()) {
             return cands.types[0];
         }
+        // An aggregate is of a composite type (9.3.3.1), so of a value with
+        // several interpretations only a composite one can be the target's:
+        // "(burst, variance) := RandCovPoint(id)" of OSVVM's ClockResetPkg,
+        // whose RandCovPoint returns INTEGER or INTEGER_VECTOR
+        VhdlType* compositep = nullptr;
+        int composites = 0;
+        for (VhdlType* const typep : cands.types) {
+            if (!typep || typep->isError()) continue;
+            const VhdlTypeKind kind = typep->base()->kind();
+            if (kind != VhdlTypeKind::ARRAY && kind != VhdlTypeKind::RECORD) continue;
+            if (compositep && compositep->base() == typep->base()) continue;
+            compositep = typep;
+            ++composites;
+        }
+        if (composites == 1) return compositep;
         const AstVhdlLiteral* const litp = VN_CAST(vp, VhdlLiteral);
         const bool contextTyped = VN_IS(vp, VhdlAggregate)
                                   || (litp
@@ -15660,7 +15688,9 @@ bool VhdlSemVisitor::targetRangeOpen(const AstNodeVhdlExpr* targetp) {
         const VhdlSymbol* const markp = sip->typeMarkp()->vhdlSymp();
         const VhdlType* const typep = markp ? markp->typep() : nullptr;
         if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
-        for (const VhdlSymbol* const ep : typep->base()->elements()) {
+        // The subtype's own elements, which a record constraint narrows:
+        // "p : rec_t(data(0 downto 0))" -- OSVVM's InterruptGeneratorBit
+        for (const VhdlSymbol* const ep : typep->elements()) {
             if (ep->name() != elemNamep->name()) continue;
             const VhdlType* const etp = ep->typep();
             return etp && etp->base()->kind() == VhdlTypeKind::ARRAY && etp->unconstrained();
@@ -18197,7 +18227,18 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
                     || !ifp->defaultp() || !leftDflt.empty() || (enumIndex && attr[0] != 'a')) {
                     return nullptr;
                 }
-                return new AstVhdlAttrName{flp, ifp->defaultp()->cloneTree(false), attr};
+                // An operation on literals is of no type of its own -- '"-" &
+                // X"--_----"' for a std_logic_vector, OSVVM's
+                // WishboneRegisterSubordinate -- and as the prefix of an
+                // attribute it has no context, so it is qualified by the
+                // generic's type mark
+                AstNodeVhdlExpr* valuep = ifp->defaultp()->cloneTree(false);
+                AstNodeVhdlExpr* const markp
+                    = ifp->subtypep() ? ifp->subtypep()->typeMarkp() : nullptr;
+                if (markp && VN_IS(valuep, VhdlBinary)) {
+                    valuep = new AstVhdlQualified{flp, markp->cloneTree(false), valuep};
+                }
+                return new AstVhdlAttrName{flp, valuep, attr};
             };
             makeGeneric(leftName, "integer", leftDflt.empty() ? nullptr : leftDflt.c_str(),
                         boundOfDefault("left"));

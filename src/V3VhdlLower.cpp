@@ -33347,7 +33347,18 @@ private:
                       ? VN_CAST(compSymp->declp(), VhdlComponentDecl)
                       : nullptr;
             const std::string entLib = m_modp ? m_modp->libname() : "work";
-            if (declp && !m_knownEntities.count(entLib + "." + entityName)) {
+            // The library of the unit the component is declared in is searched too: a
+            // component of OSVVM's UartTxComponentPkg binds to osvvm_uart's UartTx
+            // whatever library instantiates it (7.3.3 c)
+            std::string compLib;
+            for (const AstNode* up = declp; up; up = up->backp()) {
+                if (const AstNodeVhdlUnit* const unitp = VN_CAST(up, NodeVhdlUnit)) {
+                    compLib = unitp->libname().empty() ? "work" : unitp->libname();
+                    break;
+                }
+            }
+            if (declp && !m_knownEntities.count(entLib + "." + entityName)
+                && (compLib.empty() || !m_knownEntities.count(compLib + "." + entityName))) {
                 // A configuration declaration configures this entity, and
                 // the module built from *it* is what a design elaborates.
                 // This plain one is made beside it, and the components it
@@ -44485,6 +44496,11 @@ private:
             AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
             VhdlType* const rettp = returnType(nodep, symp);
             m_retTypeOf.emplace(funcp, rettp);
+            // A result this cannot hold is the function's own refusal, reported only where
+            // the design calls it: OSVVM's ScoreboardGenericPkg has a matrix NewID, of two
+            // dimensions only running sizes, that no test calls
+            VL_RESTORER(m_ftaskp);
+            m_ftaskp = funcp;
             funcp->fvarp(newReturnVar(name,
                                       isDyn2Type(rettp)           ? dyn2CarrierRef(rettp, flp)
                                       : carriedDynamically(rettp) ? dynCarrierRef(rettp, flp)
@@ -47175,40 +47191,65 @@ void VhdlLowerVisitor::reportReachedRefusals() {
 // only it, rather than refused.
 void VhdlLowerVisitor::reportSubprogramRefusals() {
     if (m_ftaskRefusals.empty()) return;
+    // A call of a subprogram names it; a call of a method of a class names it by its name
+    // alone, which V3LinkDot resolves later. A subprogram may be reached when a call outside
+    // every subprogram names it, or a call in one that may be reached does -- a method nothing
+    // names is not: OSVVM's matrix NewID of ScoreboardPType, which no test calls
     std::map<const AstNodeFTask*, std::set<const AstNodeFTask*>> callees;
+    std::map<const AstNodeFTask*, std::set<std::string>> methodCalls;
+    std::map<std::string, std::vector<const AstNodeFTask*>> methodsNamed;
     std::set<const AstNodeFTask*> live;
+    std::set<std::string> liveNames;
     std::vector<const AstNodeFTask*> todo;
-    m_netlistp->foreach([&](const AstNodeFTaskRef* refp) {
-        const AstNodeFTask* const calleep = refp->taskp();
-        if (!calleep) return;
-        // The subprogram the call is in, if any; a class's methods are reached by other
-        // means, so a call in one counts as from outside
-        const AstNodeFTask* callerp = nullptr;
-        for (const AstNode* up = refp->aboveLoopp(); up; up = up->aboveLoopp()) {
-            if (VN_IS(up, Class)) break;
-            if (const AstNodeFTask* const ftp = VN_CAST(up, NodeFTask)) {
-                callerp = ftp;
-                break;
-            }
+    const auto reach = [&](const AstNodeFTask* ftp) {
+        if (live.insert(ftp).second) todo.push_back(ftp);
+    };
+    const auto reachName = [&](const std::string& name) {
+        if (!liveNames.insert(name).second) return;
+        for (const AstNodeFTask* const ftp : methodsNamed[name]) reach(ftp);
+    };
+    // The subprogram a call is in, if any, a method of a class among them
+    const auto callerOf = [](const AstNode* nodep) -> const AstNodeFTask* {
+        for (const AstNode* up = nodep->aboveLoopp(); up; up = up->aboveLoopp()) {
+            if (const AstNodeFTask* const ftp = VN_CAST(up, NodeFTask)) return ftp;
+            if (VN_IS(up, NodeModule)) return nullptr;
         }
-        if (callerp) {
-            callees[callerp].insert(calleep);
-        } else if (live.insert(calleep).second) {
-            todo.push_back(calleep);
-        }
-    });
-    // A method of a class, and what it calls, may be reached through the class
+        return nullptr;
+    };
     m_netlistp->foreach([&](const AstClass* classp) {
-        classp->foreach([&](const AstNodeFTask* ftp) {
-            if (live.insert(ftp).second) todo.push_back(ftp);
-        });
+        classp->foreach(
+            [&](const AstNodeFTask* ftp) { methodsNamed[ftp->name()].push_back(ftp); });
     });
+    std::vector<const AstNodeFTask*> seeds;
+    std::vector<std::string> seedNames{"new"};
+    for (AstNodeModule* modp = m_netlistp->modulesp(); modp;
+         modp = VN_AS(modp->nextp(), NodeModule)) {
+        modp->foreach([&](const AstNodeFTaskRef* refp) {
+            const AstNodeFTask* const callerp = callerOf(refp);
+            if (const AstMethodCall* const mcallp = VN_CAST(refp, MethodCall)) {
+                if (callerp) {
+                    methodCalls[callerp].insert(mcallp->name());
+                } else {
+                    seedNames.push_back(mcallp->name());
+                }
+                return;
+            }
+            const AstNodeFTask* const calleep = refp->taskp();
+            if (!calleep) return;
+            if (callerp) {
+                callees[callerp].insert(calleep);
+            } else {
+                seeds.push_back(calleep);
+            }
+        });
+    }
+    for (const AstNodeFTask* const ftp : seeds) reach(ftp);
+    for (const std::string& name : seedNames) reachName(name);
     while (!todo.empty()) {
         const AstNodeFTask* const ftp = todo.back();
         todo.pop_back();
-        for (const AstNodeFTask* const calleep : callees[ftp]) {
-            if (live.insert(calleep).second) todo.push_back(calleep);
-        }
+        for (const AstNodeFTask* const calleep : callees[ftp]) reach(calleep);
+        for (const std::string& name : methodCalls[ftp]) reachName(name);
     }
     // One the lowering itself has since taken out is reported, being past asking about
     std::set<const AstNodeFTask*> existing;
@@ -47216,16 +47257,27 @@ void VhdlLowerVisitor::reportSubprogramRefusals() {
     VL_RESTORER(m_reportingDeferred);
     m_reportingDeferred = true;
     std::set<AstNodeFTask*> dropped;
+    std::map<const AstNodeFTask*, std::vector<std::pair<FileLine*, std::string>>> refusalsOf;
     for (const auto& refusal : m_ftaskRefusals) {
         AstNodeFTask* const ftp = std::get<0>(refusal);
         if (!existing.count(ftp) || live.count(ftp)) {
             unsup(std::get<1>(refusal), std::get<2>(refusal));
         } else {
             dropped.insert(ftp);
+            refusalsOf[ftp].emplace_back(std::get<1>(refusal), std::get<2>(refusal));
         }
     }
     m_ftaskRefusals.clear();
     if (dropped.empty()) return;
+    // A method name each of whose methods is left out
+    const auto nameGone = [&](const std::string& name) {
+        const auto it = methodsNamed.find(name);
+        if (it == methodsNamed.end()) return false;
+        for (const AstNodeFTask* const ftp : it->second) {
+            if (!dropped.count(const_cast<AstNodeFTask*>(ftp))) return false;
+        }
+        return true;
+    };
     // With every subprogram that calls one left out, none of them is still named
     for (bool grew = true; grew;) {
         grew = false;
@@ -47236,6 +47288,74 @@ void VhdlLowerVisitor::reportSubprogramRefusals() {
                 dropped.insert(const_cast<AstNodeFTask*>(pair.first));
                 grew = true;
                 break;
+            }
+        }
+        for (const auto& pair : methodCalls) {
+            if (dropped.count(const_cast<AstNodeFTask*>(pair.first))) continue;
+            for (const std::string& name : pair.second) {
+                if (!nameGone(name)) continue;
+                dropped.insert(const_cast<AstNodeFTask*>(pair.first));
+                grew = true;
+                break;
+            }
+        }
+    }
+    // One holding an object named from outside what is left out stays, and is refused: a
+    // package constant may be made in the first subprogram that reads it, and read from
+    // elsewhere (OSVVM's SIM_RESOLUTION_DIGITS)
+    {
+        std::set<const AstVar*> inside;
+        std::set<const AstVarRef*> insideRefs;
+        for (AstNodeFTask* const ftp : dropped) {
+            ftp->foreach([&](const AstVar* varp) { inside.insert(varp); });
+            ftp->foreach([&](const AstVarRef* refp) { insideRefs.insert(refp); });
+        }
+        std::set<const AstVar*> namedOutside;
+        m_netlistp->foreach([&](const AstVarRef* refp) {
+            if (!insideRefs.count(refp) && inside.count(refp->varp())) {
+                namedOutside.insert(refp->varp());
+            }
+        });
+        std::vector<AstNodeFTask*> pinned;
+        for (AstNodeFTask* const ftp : dropped) {
+            if (ftp->exists([&](const AstVar* varp) { return namedOutside.count(varp) != 0; })) {
+                pinned.push_back(ftp);
+            }
+        }
+        // As does one something left in still calls, by name or not
+        std::set<const AstNodeFTaskRef*> insideCalls;
+        for (AstNodeFTask* const ftp : dropped) {
+            ftp->foreach([&](const AstNodeFTaskRef* refp) { insideCalls.insert(refp); });
+        }
+        m_netlistp->foreach([&](const AstNodeFTaskRef* refp) {
+            if (insideCalls.count(refp)) return;
+            if (const AstMethodCall* const mcallp = VN_CAST(refp, MethodCall)) {
+                const auto it = methodsNamed.find(mcallp->name());
+                if (it == methodsNamed.end()) return;
+                for (const AstNodeFTask* const mp : it->second) {
+                    AstNodeFTask* const cp = const_cast<AstNodeFTask*>(mp);
+                    if (dropped.count(cp)) pinned.push_back(cp);
+                }
+                return;
+            }
+            AstNodeFTask* const cp = refp->taskp();
+            if (cp && dropped.count(cp)) pinned.push_back(cp);
+        });
+        // And what one that stays calls stays with it
+        while (!pinned.empty()) {
+            AstNodeFTask* const ftp = pinned.back();
+            pinned.pop_back();
+            if (!dropped.erase(ftp)) continue;
+            for (const auto& refusal : refusalsOf[ftp]) unsup(refusal.first, refusal.second);
+            for (const AstNodeFTask* const calleep : callees[ftp]) {
+                AstNodeFTask* const cp = const_cast<AstNodeFTask*>(calleep);
+                if (dropped.count(cp)) pinned.push_back(cp);
+            }
+            for (const std::string& name : methodCalls[ftp]) {
+                for (const AstNodeFTask* const mp : methodsNamed[name]) {
+                    AstNodeFTask* const cp = const_cast<AstNodeFTask*>(mp);
+                    if (dropped.count(cp)) pinned.push_back(cp);
+                }
             }
         }
     }
