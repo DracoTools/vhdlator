@@ -538,6 +538,7 @@ public:
     void addTraceRequest() VL_MT_DISABLED;
     void reportReachedRefusals() VL_MT_DISABLED;
     void reportSubprogramRefusals() VL_MT_DISABLED;
+    void dedupeUnitObjects() VL_MT_DISABLED;
     void addLogicPosPins() VL_MT_DISABLED;
     void twoStateBoundaryPorts() VL_MT_DISABLED;
     void hoistTargetStatements() VL_MT_DISABLED;
@@ -1736,6 +1737,27 @@ private:
         if (!indexes.empty() && indexes[0] && indexes[0]->bounded()) return indexes[0]->left();
         return 1;
     }
+    // The left bound of a STRING whose bounds only running decides, as the expression its
+    // range was written with; null where its bounds are known here or not written out
+    AstNodeExpr* dynStringLeft(const VhdlType* typep, FileLine* flp) {
+        if (!typep || typep->indexTypes().empty()) return nullptr;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        if (!idxp || idxp->bounded() || !idxp->boundsp()) return nullptr;
+        const AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!rp || !rp->leftp() || !rp->rightp()) return nullptr;
+        (void)flp;
+        return lowerBound(rp->leftp());
+    }
+    // The same of its right bound
+    AstNodeExpr* dynStringRight(const VhdlType* typep) {
+        if (!typep || typep->indexTypes().empty()) return nullptr;
+        const VhdlType* const idxp = typep->indexTypes()[0];
+        if (!idxp || idxp->bounded() || !idxp->boundsp()) return nullptr;
+        const AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+        if (!rp || !rp->leftp() || !rp->rightp()) return nullptr;
+        return lowerBound(rp->rightp());
+    }
+
     // The text behind a type: a STRING itself, or an access to one, which is
     // emitted as a string of its own rather than as an object to dereference
     // (5.4). Asking the pointer's own type where text starts answers nothing,
@@ -1786,7 +1808,7 @@ private:
         return true;
     }
 
-    static AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
+    AstNodeExpr* stringIndex(const VhdlType* typep, AstNodeExpr* indexp, FileLine* flp) {
         int64_t wideLow = 0;
         if (!stringBehind(typep) && wideIndexRange(typep, &wideLow)) {
             // Worked out at 64 bits, then an INTEGER's width for the select
@@ -1809,6 +1831,18 @@ private:
         // below is done at an INTEGER's width
         indexp = new AstCast{flp, indexp, VFlagChildDType{},
                              new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED}};
+        // Bounds only running decides -- "string(n + 3 downto 1)" with n worked out from a
+        // parameter, OSVVM's format of a time -- are read from the range itself, whose
+        // direction is written out
+        if (AstNodeExpr* const leftp = dynStringLeft(typep, flp)) {
+            const VhdlType* const idxp = typep->indexTypes()[0];
+            const AstVhdlRange* const rp = VN_CAST(idxp->boundsp(), VhdlRange);
+            AstNodeExpr* const castLeftp
+                = new AstCast{flp, leftp, VFlagChildDType{},
+                              new AstBasicDType{flp, VBasicDTypeKwd::INTEGER, VSigning::SIGNED}};
+            if (rp->dir() == VhdlDir::DOWNTO) return new AstSub{flp, castLeftp, indexp};
+            return new AstSub{flp, indexp, castLeftp};
+        }
         const int64_t left = stringLow(typep);
         if (!stringAscending(typep)) {
             return new AstSub{
@@ -11426,6 +11460,27 @@ private:
             }
             if (typep && isStringType(typep) && !typep->isConstrainedArray()) {
                 if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
+                // Bounds written out though only running decides them -- "string(n + 3
+                // downto 1)" -- are the range's own, not those of STRING's 1 upwards
+                if (attr != "length") {
+                    const VhdlType* const idxp
+                        = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
+                    const AstVhdlRange* const rp
+                        = idxp && !idxp->bounded() ? VN_CAST(idxp->boundsp(), VhdlRange) : nullptr;
+                    if (rp && rp->leftp() && rp->rightp()) {
+                        const bool down = rp->dir() == VhdlDir::DOWNTO;
+                        if (attr == "ascending") {
+                            if (down) return new AstConst{flp, AstConst::BitFalse{}};
+                            return new AstConst{flp, AstConst::BitTrue{}};
+                        }
+                        const bool wantLeft = attr == "left" || (attr == "high" && down)
+                                              || (attr == "low" && !down);
+                        if (AstNodeExpr* const outp
+                            = wantLeft ? dynStringLeft(typep, flp) : dynStringRight(typep)) {
+                            return outp;
+                        }
+                    }
+                }
                 AstNodeExpr* const strp = lowerExpr(nodep->prefixp());
                 if (!strp) return nullptr;
                 if (attr == "ascending") return new AstConst{flp, AstConst::BitTrue{}};
@@ -40527,8 +40582,17 @@ private:
                 // and nothing to say whether it drives at all, and a copy
                 // that wrote to it would drive from the moment it was
                 // elaborated rather than when the call was made.
+                // A function of the design's own that resolves the whole signal is given
+                // every driver at all times (14.7.2), so one with no enable is driven as it is
+                const VhdlType* const stp = signalp->typep();
+                const VhdlType* sbasep = stp ? stp->base() : nullptr;
+                if (sbasep && sbasep->kind() == VhdlTypeKind::ARRAY && sbasep->elementp()) {
+                    sbasep = sbasep->elementp()->base();
+                }
+                const bool ownResolved
+                    = stp && stp->resolutionp() && sbasep && !enumIsStdUlogic(sbasep);
                 if (!drvIt->second[idx].enp && !nineValued(signalp->typep())
-                    && !nineLaneable(signalp->typep())) {
+                    && !nineLaneable(signalp->typep()) && !ownResolved) {
                     m_sigCopyWhy = ", where the signal '" + formals[i]->name()
                                    + "' is given is resolved by a function of the design's own";
                     return nullptr;
@@ -46596,6 +46660,7 @@ void VhdlLowerVisitor::lowerUnits(const std::vector<AstNodeVhdlUnit*>& unitsp) {
     dropLogicPosPins();
     emitPkgForces();
     markPackageSignalRefs();
+    dedupeUnitObjects();
     twoStateBoundaryPorts();
     addLogicPosPins();
     addOpenPortPins();
@@ -47361,6 +47426,33 @@ void VhdlLowerVisitor::reportSubprogramRefusals() {
     }
     for (AstNodeFTask* const ftp : dropped) {
         if (ftp->backp()) VL_DO_DANGLING(ftp->unlinkFrBack()->deleteTree(), ftp);
+    }
+}
+
+// A package's object is one object (4.3), and the unit holds it once by the name it is given
+// for its package. Reached through two symbols -- a package body analyzed again for a copy of
+// one of its subprograms -- it may have arrived twice, and V3LinkDot keeps one of two
+// declarations of a name, leaving what named the other naming nothing (OSVVM's
+// SIM_RESOLUTION_DIGITS). The first to arrive is the one.
+void VhdlLowerVisitor::dedupeUnitObjects() {
+    AstPackage* const unitp = m_netlistp ? m_netlistp->dollarUnitPkgAddp() : nullptr;
+    if (!unitp) return;
+    std::map<std::string, AstVar*> first;
+    std::map<const AstVar*, AstVar*> redirect;
+    for (AstNode* stmtp = unitp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
+        AstVar* const varp = VN_CAST(stmtp, Var);
+        if (!varp || varp->name().rfind("__Vpkg__", 0) != 0) continue;
+        const auto pair = first.emplace(varp->name(), varp);
+        if (!pair.second) redirect.emplace(varp, pair.first->second);
+    }
+    if (redirect.empty()) return;
+    m_netlistp->foreach([&](AstVarRef* refp) {
+        const auto it = redirect.find(refp->varp());
+        if (it != redirect.end()) refp->varp(it->second);
+    });
+    for (const auto& pair : redirect) {
+        AstVar* const varp = const_cast<AstVar*>(pair.first);
+        VL_DO_DANGLING(varp->unlinkFrBack()->deleteTree(), varp);
     }
 }
 

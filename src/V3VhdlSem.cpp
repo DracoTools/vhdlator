@@ -8788,16 +8788,19 @@ void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbo
             if (formalp->mode() == VhdlMode::IN) continue;
             const VhdlSymbol* const symp = driverRootSym(asp->actualp());
             if (!symp) continue;
-            // Only where the drivers are combined at all: a signal whose
-            // resolution is a function of the design's own is left as it
-            // was, since one driver per call site is not what it expects.
-            // RESOLVED over the nine values (--vhdl-metavalues) is the
-            // logic values' own, which takes them in any order.
+            // Only where the drivers are combined at all. RESOLVED over the
+            // nine values (--vhdl-metavalues) is the logic values' own, which
+            // takes them in any order. A function of the design's own that
+            // resolves the whole signal is given one driver per process that
+            // calls the procedure, as for an assignment the process makes
+            // itself (14.7.2): OSVVM's barriers count the drivers that are not
+            // zero, and WaitForBarrier drives the barrier through its formal
             const VhdlType* const stp = symp->typep();
             const bool nineResolved
                 = v3Global.opt.vhdlMetavalues() && logicShaped(stp) && stp
                   && (stp->resolutionp() || (stp->elementp() && stp->elementp()->resolutionp()));
-            if (!driversCombined(stp) && !nineResolved) continue;
+            const bool ownResolved = stp && stp->resolutionp() && !logicShaped(stp);
+            if (!driversCombined(stp) && !nineResolved && !ownResolved) continue;
             if (VN_IS(asp->actualp(), VhdlName)) {
                 whole.insert(symp);
             } else {
