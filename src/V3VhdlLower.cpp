@@ -10430,6 +10430,20 @@ private:
                 }
                 setLaterp = new AstAssign{flp, new AstVarRef{flp, varp, VAccess::WRITE}, valp};
             }
+            // A constant of the design worked out from a generic that travels as data is
+            // worked out once that input has its value, as the design settles, rather than
+            // before: "MODEL_INSTANCE_NAME := IfElse(MODEL_ID_NAME'length > 0, ...)" in
+            // OSVVM's verification components
+            if (!m_ftaskp && objp->kind() == VhdlObjKind::CONSTANT && varp->valuep()
+                && objp->defaultp() && readsDataGeneric(objp->defaultp())) {
+                m_dataDerived.insert(symp->resolved());
+                AstNodeExpr* const valp = VN_AS(varp->valuep(), NodeExpr)->unlinkFrBack();
+                FileLine* const cflp = new FileLine{flp};
+                cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
+                setLaterp = new AstAlways{
+                    cflp, VAlwaysKwd::ALWAYS_COMB, nullptr,
+                    new AstAssign{cflp, new AstVarRef{cflp, varp, VAccess::WRITE}, valp}};
+            }
             addStmt(varp);
             if (setLaterp) addStmt(setLaterp);
             if (fillp) {
@@ -46048,6 +46062,25 @@ private:
     // METHODS - design units
 
     // The module an entity and its architecture become
+    // Constants of the design worked out from a generic that travels as data (lowerDecl)
+    std::set<const VhdlSymbol*> m_dataDerived;
+    // Whether an expression reads such a generic, or such a constant
+    bool readsDataGeneric(const AstNodeVhdlExpr* exprp) const {
+        return exprp->exists([this](const AstVhdlName* np) {
+            const VhdlSymbol* const symp = np->vhdlSymp() ? np->vhdlSymp()->resolved() : nullptr;
+            return symp && (m_dataGenerics.count(symp) || m_dataDerived.count(symp));
+        });
+    }
+    // Whether one of an entity's generics travels as data, an input port of its module
+    bool entityHasDataGenerics(const AstVhdlEntity* entp) const {
+        for (const AstNode* p = entp ? entp->genericsp() : nullptr; p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (ifp && ifp->vhdlSymp() && m_dataGenerics.count(ifp->vhdlSymp()->resolved())) {
+                return true;
+            }
+        }
+        return false;
+    }
     void lowerEntity(AstVhdlEntity* entp, AstVhdlArchitecture* archp,
                      const std::string& asName = "", const CfgScope* cfgScopep = nullptr) {
         FileLine* const flp = entp->fileline();
@@ -46285,6 +46318,53 @@ private:
         finishNineResolves();
         markNineVars();
         settleExternalNames();
+        // A generic that travels as data is an input the parent drives, which takes its
+        // value as the design settles, after every process has started (V3Sched): a process
+        // that read it, or a constant worked out from it, before its first wait saw the
+        // default. Such a module's processes start a step later, after the settling but
+        // before any signal is updated, still among the processes of the initialization
+        // (14.7.5.2): OSVVM's Ethernet components named their alerts after the instance
+        // label, as if MODEL_ID_NAME had not been given
+        if (entityHasDataGenerics(entp)) {
+            const auto delayStarts = [this](AstNode* listp) {
+                for (AstNode* sp = listp; sp; sp = sp->nextp()) {
+                    // An initial block, or an always block with no sensitivity, which loops
+                    AstNodeProcedure* const procp = VN_CAST(sp, NodeProcedure);
+                    const AstAlways* const alwaysp = VN_CAST(sp, Always);
+                    if (!procp || !procp->stmtsp()) continue;
+                    if (!VN_IS(sp, Initial)
+                        && !(alwaysp && !alwaysp->sentreep()
+                             && alwaysp->keyword() == VAlwaysKwd::ALWAYS)) {
+                        continue;
+                    }
+                    FileLine* const zflp = new FileLine{procp->fileline()};
+                    zflp->warnOff(V3ErrorCode::ZERODLY, true);
+                    AstNode* const delayp
+                        = new AstDelay{zflp, new AstConst{zflp, AstConst::Unsized64{}, 0}, false};
+                    if (alwaysp) {
+                        // Only once, before the first pass: "initial #0;" would not hold it
+                        // back, so the loop waits on a flag the first pass sets
+                        AstVar* const startedp = new AstVar{
+                            zflp, VVarType::VAR, "__Vstarted" + std::to_string(++m_processNum),
+                            VFlagChildDType{}, new AstBasicDType{zflp, VBasicDTypeKwd::BIT}};
+                        startedp->valuep(new AstConst{zflp, AstConst::BitFalse{}});
+                        sp->addHereThisAsNext(startedp);
+                        AstNode* const thenp = AstNode::addNext(
+                            delayp, static_cast<AstNode*>(new AstAssign{
+                                        zflp, new AstVarRef{zflp, startedp, VAccess::WRITE},
+                                        new AstConst{zflp, AstConst::BitTrue{}}}));
+                        procp->stmtsp()->addHereThisAsNext(new AstIf{
+                            zflp,
+                            new AstLogNot{zflp, new AstVarRef{zflp, startedp, VAccess::READ}},
+                            thenp});
+                    } else {
+                        procp->stmtsp()->addHereThisAsNext(delayp);
+                    }
+                }
+            };
+            delayStarts(m_modp->stmtsp());
+            delayStarts(m_stmtsp);
+        }
         m_modp->addStmtsp(m_stmtsp);
         m_stmtsp = nullptr;
         driveTriDefaults();
