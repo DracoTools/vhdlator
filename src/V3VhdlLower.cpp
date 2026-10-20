@@ -29082,11 +29082,19 @@ private:
     // of its drivers, driving only what it assigns (see finishNineResolves)
     static bool nineRecordResolved(const VhdlSymbol* symp) {
         if (!v3Global.opt.vhdlMetavalues() || !symp) return false;
-        const VhdlType* const typep = symp->typep();
-        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        return nineRecordResolvedType(symp->typep());
+    }
+    // Or a record of such records, as analysis counts them (driversCombined): OSVVM's
+    // Axi4RecType, a record of one record per AXI channel
+    static bool nineRecordResolvedType(const VhdlType* typep, int depth = 0) {
+        if (!typep || depth > 8 || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
         if (typep->base()->elements().empty()) return false;
         for (const VhdlSymbol* const elemp : typep->base()->elements()) {
             const VhdlType* const etp = elemp->typep();
+            if (etp && etp->base()->kind() == VhdlTypeKind::RECORD) {
+                if (!nineRecordResolvedType(etp, depth + 1)) return false;
+                continue;
+            }
             if (!nineValued(etp)) return false;
             const bool resolved
                 = etp->resolutionp() || (etp->elementp() && etp->elementp()->resolutionp());
@@ -37124,6 +37132,18 @@ private:
             return !ashape.empty() && !bshape.empty() && ashape != bshape
                    && recordShape(ap, 0, true) == recordShape(bp, 0, true);
         };
+        // A record of records differs where one of its records does: the record type
+        // itself carries its open elements, a subtype that sizes them holds them as bits
+        // (recordMayCarry), so OSVVM's "AxiBus <= InitAxi4Rec(AxiBus)" assigns a record of
+        // carried records to one of sized ones, which recordShapeCopy converts record by record
+        for (size_t i = 0; i < ae.size(); ++i) {
+            const VhdlType* const eap = ae[i] ? ae[i]->typep() : nullptr;
+            const VhdlType* const ebp = be[i] ? be[i]->typep() : nullptr;
+            if (eap && ebp && eap->base()->kind() == VhdlTypeKind::RECORD
+                && recordShapesDiffer(eap, ebp)) {
+                return true;
+            }
+        }
         if (!recordMayCarry(ap) && !recordMayCarry(bp)) return sameLengthsOtherBounds();
         if (recordHasNestedOpen(ap) || recordHasNestedOpen(bp)) return false;
         // A shape that holds every element as bits has to know how many
