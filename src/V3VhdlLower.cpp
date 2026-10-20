@@ -1388,7 +1388,13 @@ private:
         } else if (!implicit) {
             return false;
         }
-        if (!accp || (!VN_IS(accp, VhdlName) && !VN_IS(accp, VhdlSelected))) return false;
+        // Dereferenced where it stands, the access value may be an element of an array of
+        // them: "MemArrayPtr(BlockAddr)(WordAddr)" in OSVVM's MemoryGenericPkg (8.1)
+        if (!accp
+            || (!VN_IS(accp, VhdlName) && !VN_IS(accp, VhdlSelected)
+                && !(implicit && VN_IS(accp, VhdlCall)))) {
+            return false;
+        }
         const VhdlType* typep = accp->vhdlTypep();
         if (!typep && accp->vhdlSymp()) typep = accp->vhdlSymp()->typep();
         return typep && isDynamicAccess(typep->base());
@@ -14650,6 +14656,62 @@ private:
     // writes: a write through the alias would reach the copy.
     // Per subprogram being emitted: a copy of one reaches the same alias
     std::map<std::pair<const AstNodeFTask*, const VhdlSymbol*>, AstVar*> m_aliasCarriers;
+    // Whether the subprogram an alias is declared in may write through it: an assignment to
+    // it or to a part of it, or the alias handed to a call, whatever the formal's mode
+    static bool writtenThrough(const AstVhdlAliasDecl* declp, const VhdlSymbol* aliasp) {
+        const AstNode* bodyp = nullptr;
+        for (const AstNode* up = declp->backp(); up; up = up->backp()) {
+            if (const AstVhdlSubprogDecl* const sp = VN_CAST(up, VhdlSubprogDecl)) {
+                bodyp = sp;
+                break;
+            }
+        }
+        if (!bodyp || !aliasp) return true;
+        const auto names = [aliasp](const AstNode* nodep) {
+            return nodep->exists([aliasp](const AstVhdlName* np) {
+                return np->vhdlSymp() && np->vhdlSymp() == aliasp;
+            });
+        };
+        if (bodyp->exists([&](const AstVhdlVarAssign* asgp) {
+                return asgp->targetp() && names(asgp->targetp());
+            })) {
+            return true;
+        }
+        // A call writes through it where the formal it is given has mode out or inout; a call
+        // whose subprogram or formals are not known is taken to
+        return bodyp->exists([&](const AstVhdlProcCall* pcallp) {
+            const AstVhdlCall* const callp = VN_CAST(pcallp->callp(), VhdlCall);
+            if (!callp) return pcallp->callp() && names(pcallp->callp());
+            const VhdlSymbol* const csymp
+                = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+            const AstVhdlSubprogDecl* const sdeclp
+                = csymp ? (csymp->bodyp() ? csymp->bodyp()
+                                          : VN_CAST(csymp->declp(), VhdlSubprogDecl))
+                        : nullptr;
+            std::vector<const AstVhdlIfaceDecl*> formals;
+            if (sdeclp) {
+                AstNode* fp = sdeclp->paramsp();
+                for (int i = 0; i < sdeclp->genericCount() && fp; ++i) fp = fp->nextp();
+                for (; fp; fp = fp->nextp()) formals.push_back(VN_CAST(fp, VhdlIfaceDecl));
+            }
+            size_t pos = 0;
+            for (const AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+                const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+                if (!asp || !asp->actualp() || !names(asp->actualp())) continue;
+                if (!sdeclp) return true;
+                const AstVhdlIfaceDecl* formalp = nullptr;
+                if (const AstVhdlName* const fnp = VN_CAST(asp->formalp(), VhdlName)) {
+                    for (const AstVhdlIfaceDecl* const one : formals) {
+                        if (one && one->name() == fnp->name()) formalp = one;
+                    }
+                } else if (!asp->formalp() && pos < formals.size()) {
+                    formalp = formals[pos];
+                }
+                if (!formalp || formalp->mode() != VhdlMode::IN) return true;
+            }
+            return false;
+        });
+    }
     void aliasCarrier(AstVhdlAliasDecl* declp) {
         if (!m_ftaskp || !declp->subtypep() || !declp->targetp()) return;
         VhdlSymbol* const symp = declp->vhdlSymp();
@@ -14671,6 +14733,10 @@ private:
         if (const AstVhdlIfaceDecl* const ifp = VN_CAST(tsymp->declp(), VhdlIfaceDecl)) {
             readOnly = ifp->kind() == VhdlIfaceKind::CONSTANT && ifp->mode() == VhdlMode::IN;
         }
+        // Or one the subprogram never writes through the alias: OSVVM's
+        // PushReadBurstByteData only reads "aReadData(DataIndex + 7 downto DataIndex)",
+        // ReadData an inout variable
+        if (!readOnly && fixedTarget) readOnly = !writtenThrough(declp, symp);
         if (!readOnly) return;
         FileLine* const flp = declp->fileline();
         AstNodeExpr* leftp = nullptr;
@@ -15640,7 +15706,10 @@ private:
             ascending = idxTypep->ascending();
         } else if (typep && typep->base()->kind() == VhdlTypeKind::ARRAY
                    && typep->indexTypes().size() == 1 && typep->indexTypes()[0]
-                   && typep->lengthEmittable()) {
+                   && typep->lengthEmittable() && !lengthOnlyRunningDecides(typep)) {
+            // Not where a parameter gives them: "new std_logic_vector'(SlvVal)" with SlvVal
+            // "std_logic_vector(Size - 1 downto 0)" in OSVVM's ModelParametersSingletonPkg is
+            // a value that carries its bounds, below
             const AstVhdlRange* const rp = VN_CAST(typep->indexTypes()[0]->boundsp(), VhdlRange);
             if (rp && rp->leftp() && rp->rightp() && !rp->dirUnknown()) {
                 AstNodeExpr* const lenp = boundsLength(typep, flp);
@@ -25775,6 +25844,32 @@ private:
         // that number rather than an expression to work it out again
         AstVhdlElemAssoc* const firstp = nodep->elemsp();
         const auto lengthOf = [&]() -> AstNodeExpr* {
+            // Assigned to an alias that renumbers a whole object, it is as long as that object
+            // (6.6.2), whose length elaboration may settle where the alias's own bounds are
+            // constants of a subprogram: "aWriteData := (others => 'U')" in OSVVM's
+            // Axi4ModelPkg, in a copy for an actual a generic sizes
+            if (lengthOnlyRunningDecides(typep)) {
+                for (const AstNode* upp = parentOf(nodep); upp; upp = parentOf(upp)) {
+                    const AstVhdlVarAssign* const vap = VN_CAST(upp, VhdlVarAssign);
+                    if (!vap) {
+                        if (VN_IS(upp, NodeVhdlStmt)) break;
+                        continue;
+                    }
+                    const AstVhdlName* const tnp = VN_CAST(vap->targetp(), VhdlName);
+                    const VhdlSymbol* const asymp = tnp ? tnp->vhdlSymp() : nullptr;
+                    const AstVhdlAliasDecl* const adp
+                        = asymp && asymp->kind() == VhdlSymKind::ALIAS
+                              ? VN_CAST(asymp->declp(), VhdlAliasDecl)
+                              : nullptr;
+                    const AstVhdlName* const onp
+                        = adp ? VN_CAST(adp->targetp(), VhdlName) : nullptr;
+                    const VhdlType* const otp = onp ? onp->vhdlTypep() : nullptr;
+                    if (otp && otp->lengthEmittable() && !lengthOnlyRunningDecides(otp)) {
+                        if (AstNodeExpr* const countp = boundsLength(otp, flp)) return countp;
+                    }
+                    break;
+                }
+            }
             if (AstNodeExpr* const countp = boundsLength(typep, flp)) return countp;
             if (knownCount > 0) {
                 return new AstConst{flp, AstConst::Unsized32{},
