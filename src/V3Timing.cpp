@@ -482,6 +482,9 @@ class TimingControlVisitor final : public VNVisitor {
     int m_forkCnt = 0;  // Number of forks inside a module
     bool m_underJumpBlock = false;  // True if we are inside of a jump-block
     bool m_underProcedure = false;  // True if we are under an always or initial
+    // Variables a nonblocking assignment in a function or task writes, which is made by a fork
+    // waiting for the NBA event (see visit(AstNodeAssign))
+    std::unordered_set<const AstVar*> m_dynNbaVars;
     bool m_underIfaceCFunc = false;  // True if we are under a CFunc owned by an interface scope
     bool m_hasStaticZeroDelay = false;  // True if we have a static #0 delay
     std::vector<FileLine*> m_unknownDelayFlps;  // Locations of AstDelay with non-constant value
@@ -1229,7 +1232,15 @@ class TimingControlVisitor final : public VNVisitor {
         // Transform if:
         // * there's a timing control in the assignment
         // * the assignment is an AssignDly and it's in a non-inlined function
-        if (!controlp && (!inAssignDly || m_underProcedure)) {
+        // A process that suspends may call such a function or task, and the nonblocking
+        // assignments it makes itself to the variables those write are made the same way, so
+        // that the updates are made in the order they were scheduled (IEEE 1800-2023 4.4.2.2,
+        // 10.4.2): made by V3Delayed, an earlier one was committed after the fork's
+        const bool dynamicNba
+            = inAssignDly
+              && (!m_underProcedure
+                  || (m_procp && hasFlags(m_procp, T_SUSPENDEE) && targetsDynNbaVar(nodep)));
+        if (!controlp && !dynamicNba && (!inAssignDly || m_underProcedure)) {
             iterateChildren(nodep);
             return;
         }
@@ -1254,7 +1265,7 @@ class TimingControlVisitor final : public VNVisitor {
                 // 1800-2023 9.6.3).
                 forkp->forDelayedAssign(true);
             }
-            if (!m_underProcedure) {
+            if (dynamicNba) {
                 // If it's in a function, it won't be handled by V3Delayed
                 // Put it behind an additional named event that gets triggered in the NBA region
                 AstEventControl* const nbaEventControlp = createNbaEventControl(flp);
@@ -1311,6 +1322,14 @@ class TimingControlVisitor final : public VNVisitor {
         }
         // Replace the RHS with an intermediate value var
         replaceWithIntermediate(nodep->rhsp(), m_intraValueNames.get(nodep));
+        // Made in a process, the update is made where the fork resumes, in the NBA region, as
+        // one in a function is; left nonblocking, V3Delayed would schedule it again
+        if (dynamicNba && m_underProcedure && !nodep->timingControlp()) {
+            AstAssign* const newp
+                = new AstAssign{flp, nodep->lhsp()->unlinkFrBack(), nodep->rhsp()->unlinkFrBack()};
+            nodep->replaceWith(newp);
+            VL_DO_DANGLING(pushDeletep(nodep), nodep);
+        }
     }
     void visit(AstAssignW* nodep) override {
         FileLine* const flp = nodep->fileline();
@@ -1531,10 +1550,26 @@ class TimingControlVisitor final : public VNVisitor {
     void visit(AstVar*) override {}  // Accelerate
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
 
+    bool targetsDynNbaVar(const AstNodeAssign* nodep) const {
+        if (m_dynNbaVars.empty()) return false;
+        bool found = false;
+        nodep->lhsp()->foreach([&](const AstNodeVarRef* refp) {
+            if (refp->access().isWriteOrRW() && m_dynNbaVars.count(refp->varp())) found = true;
+        });
+        return found;
+    }
+
 public:
     // CONSTRUCTORS
     explicit TimingControlVisitor(AstNetlist* nodep)
         : m_netlistp{nodep} {
+        nodep->foreach([&](const AstCFunc* funcp) {
+            funcp->foreach([&](const AstAssignDly* asgnp) {
+                asgnp->lhsp()->foreach([&](const AstNodeVarRef* refp) {
+                    if (refp->access().isWriteOrRW()) m_dynNbaVars.insert(refp->varp());
+                });
+            });
+        });
         iterate(nodep);
 
         // If there is no static #0 in the design, but an unknown delay was found,
