@@ -20448,6 +20448,10 @@ private:
         }
         if (op == "to_unsigned" || op == "to_signed") {
             if (args.size() != 2 || kindOf(args[0]) != 'i' || kindOf(args[1]) != 'i') return false;
+            // Spread into lanes, the integer is read once for each of them, so one an impure
+            // function gives is left to the package's body, which reads it once: OSVVM's
+            // RandUnsigned, "to_unsigned(RandInt(0, 2**Remain-1), Remain)", drew eleven times
+            if (callsImpureOrAllocates(args[0])) return false;
             const VhdlValue sizev = V3VhdlEval::eval(args[1]);
             if (!sizev.isInt()) {
                 // A size the elaboration settles: the integer is spread into
@@ -24927,9 +24931,11 @@ private:
                         new AstConst{flp, AstConst::Unsized32{},
                                      static_cast<uint32_t>(want < 1 ? 1 : want)}};
                 }
-                // "vector truncated" where the value does not fit (NVC ieee11)
+                // "vector truncated" where the value does not fit (NVC ieee11), which reads the
+                // integer again: not one an impure function gives, that is read once
                 if (name != "resize" && want >= 1 && args[0]->vhdlTypep()
-                    && args[0]->vhdlTypep()->base()->kind() != VhdlTypeKind::ARRAY) {
+                    && args[0]->vhdlTypep()->base()->kind() != VhdlTypeKind::ARRAY
+                    && !callsImpureOrAllocates(args[0])) {
                     AstNodeExpr* const countp = i32(want, flp);
                     sized = withTruncWarning(sized, args[0], name == "to_signed", countp, flp);
                     VL_DO_DANGLING(countp->deleteTree(), countp);
@@ -25067,6 +25073,15 @@ private:
             }
             return isSignedType(resultp) ? static_cast<AstNodeExpr*>(new AstSigned{flp, sized})
                                          : static_cast<AstNodeExpr*>(new AstUnsigned{flp, sized});
+        }
+        // A vector carried with its bounds -- what a protected type's function gives back,
+        // "shift_left(RV.RandUnsigned(n), 1)" -- is not a number to shift, so the package's
+        // own body is called instead
+        if ((name == "shift_left" || name == "shift_right" || name == "rotate_left"
+             || name == "rotate_right")
+            && isDynValue(args[0])) {
+            VL_DO_DANGLING(firstp->deleteTree(), firstp);
+            return nullptr;
         }
         if (name == "shift_left") {
             if (args.size() < 2) return nullptr;
