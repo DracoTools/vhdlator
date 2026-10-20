@@ -8621,12 +8621,19 @@ bool V3VhdlSem::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordLeaf>*
 // RESOLVED is never run, though a function of the design's own over them is.
 bool VhdlSemVisitor::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordLeaf>* leavesp) {
     static constexpr size_t MAX_LEAVES = 4096;
-    if (!typep || typep->resolutionp() || typep->base()->kind() != VhdlTypeKind::RECORD) {
+    if (!typep || typep->resolutionp()) return false;
+    // An array of such records, too: OSVVM's StreamRecArrayType of transaction records
+    if (typep->base()->kind() == VhdlTypeKind::ARRAY) {
+        const VhdlType* const ep
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!ep || ep->resolutionp() || ep->base()->kind() != VhdlTypeKind::RECORD) return false;
+    } else if (typep->base()->kind() != VhdlTypeKind::RECORD) {
         return false;
     }
     if (driversCombined(typep)) return false;
     std::vector<VhdlRecordLeaf> leaves;
     VhdlRecordLeaf at;
+    static constexpr size_t MAX_LOOPS = 2;
     const std::function<bool(const VhdlType*, int)> walk = [&](const VhdlType* tp, int depth) {
         if (!tp || depth > 8 || leaves.size() > MAX_LEAVES) return false;
         if (VhdlSymbol* const fnp = tp->resolutionp()) {
@@ -8665,12 +8672,27 @@ bool VhdlSemVisitor::recordLeaves(const VhdlType* typep, std::vector<VhdlRecordL
             && elemp->resolutionp() && elemp->base()->kind() != VhdlTypeKind::ARRAY
             && elemp->base()->kind() != VhdlTypeKind::RECORD
             && !(isLogicValued(elemp) && elemp->resolutionp()->name() == "resolved")) {
+            if (at.loops.size() >= MAX_LOOPS) return false;
             at.typep = tp;
             at.fnp = elemp->resolutionp();
             at.loop = true;
+            at.loops.push_back(VhdlRecordLeaf::Loop{at.path.size(), tp});
             leaves.push_back(at);
-            at.loop = false;
+            at.loops.pop_back();
+            at.loop = !at.loops.empty();
             return true;
+        }
+        // Records whose bounds the instance gives, likewise: each leaf of the record resolved
+        // over the array's range, the index before the rest of the leaf's path
+        if (idxp && !idxp->bounded() && VN_IS(idxp->boundsp(), VhdlRange) && elemp
+            && !elemp->resolutionp() && elemp->base()->kind() == VhdlTypeKind::RECORD
+            && at.loops.size() < MAX_LOOPS) {
+            at.loops.push_back(VhdlRecordLeaf::Loop{at.path.size(), tp});
+            at.loop = true;
+            const bool ok = walk(elemp, depth + 1);
+            at.loops.pop_back();
+            at.loop = !at.loops.empty();
+            return ok;
         }
         if (!tp->isConstrainedArray()) return false;
         const int64_t elems = tp->dimLength(0);
@@ -8906,6 +8928,17 @@ void VhdlSemVisitor::collectCallDrivers(AstNode* stmtp, std::set<const VhdlSymbo
                 whole.insert(symp);
             } else {
                 partial.insert(symp);
+                // An element of a record whose elements are resolved one at a time, as an
+                // assignment to it counts (analyzeDrivers): OSVVM's WaitForTransaction given
+                // "Ack => TransRec.Ack" drives TransRec, whether or not the process assigns
+                // TransRec itself
+                const VhdlSymbol* const rootp = objectRootSym(asp->actualp());
+                if (rootp && rootp != symp
+                    && (rootp->kind() == VhdlSymKind::SIGNAL || rootp->kind() == VhdlSymKind::PORT)
+                    && (resolvedAsWhole(rootp) || nineRecordResolved(rootp)
+                        || recordLeaves(rootp->typep(), nullptr))) {
+                    whole.insert(rootp);
+                }
             }
         }
     });

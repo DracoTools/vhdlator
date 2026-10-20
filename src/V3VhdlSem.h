@@ -51,6 +51,15 @@ struct VhdlRecordLeaf final {
     // sized by its actual: the leaf is the array, its elements resolved one at a time over
     // its range, and typep is the array's subtype
     bool loop = false;
+    // The loops a leaf is resolved in, outermost first: where in path each one's index goes,
+    // and the array it runs over, whose subtype gives its bounds. After the whole path for
+    // such an array; before the rest of it for an array of records an open port's actual
+    // sizes -- OSVVM's StreamRecArrayType, whose records hold such arrays in turn.
+    struct Loop final {
+        size_t at;
+        const VhdlType* arrayp;
+    };
+    std::vector<Loop> loops;
 };
 
 class V3VhdlSem final {

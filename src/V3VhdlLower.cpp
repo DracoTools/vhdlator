@@ -21940,14 +21940,30 @@ private:
                         break;
                     }
                     for (size_t l = 0; l < leaves.size(); ++l) {
-                        const auto& lpath = leaves[l].path;
-                        // An element of an array resolved in a loop drives the array
-                        if (path.size() > lpath.size() && !leaves[l].loop) continue;
+                        // An element of an array resolved in a loop is any of its elements:
+                        // the loop's index is a place in the leaf's path any index matches
+                        const VhdlRecordLeaf& leafl = leaves[l];
+                        // The leaf's path with a place for each loop's index, which any index
+                        // matches (a null name and the wildcard flag)
+                        std::vector<std::pair<const std::pair<std::string, int64_t>*, bool>> steps;
+                        size_t li = 0;
+                        for (size_t d = 0; d <= leafl.path.size(); ++d) {
+                            for (; li < leafl.loops.size() && leafl.loops[li].at == d; ++li) {
+                                steps.emplace_back(nullptr, true);
+                            }
+                            if (d < leafl.path.size()) steps.emplace_back(&leafl.path[d], false);
+                        }
+                        if (path.size() > steps.size()) continue;
                         bool under = true;
-                        for (size_t d = 0; d < std::min(path.size(), lpath.size()) && under; ++d) {
-                            under = path[d].name.empty() ? lpath[d].first.empty()
-                                                               && lpath[d].second == path[d].index
-                                                         : lpath[d].first == path[d].name;
+                        for (size_t d = 0; d < path.size() && under; ++d) {
+                            if (steps[d].second) {
+                                under = path[d].name.empty();
+                                continue;
+                            }
+                            const auto& lstep = *steps[d].first;
+                            under = path[d].name.empty()
+                                        ? lstep.first.empty() && lstep.second == path[d].index
+                                        : lstep.first == path[d].name;
                         }
                         if (under) named[l] = true;
                     }
@@ -22004,32 +22020,53 @@ private:
                 for (const auto& step : leaf.path)
                     path.push_back(WavePathStep{step.first, step.second});
                 const VhdlType* const idxp = paramTypep->indexTypes()[0];
-                // The subelement, of a driver or of the signal, at the element the loop has
-                // reached where the leaf is an array resolved in one
-                AstVar* loopIdxp = nullptr;
-                const auto at = [&](AstNodeExpr* wholep) -> AstNodeExpr* {
-                    AstNodeExpr* const leafp = leafOf(wholep, path, flp);
-                    if (!loopIdxp) return leafp;
-                    return new AstSelBit{flp, leafp, new AstVarRef{flp, loopIdxp, VAccess::READ}};
+                // The subelement, of a driver or of the signal, at the elements the loops have
+                // reached where the leaf is resolved in loops: each loop's index goes in the
+                // path where the loop says, outermost first
+                struct LoopVars final {
+                    AstVar* idxp;
+                    AstNodeExpr* leftp;
+                    AstNodeExpr* rightp;
+                    AstNodeExpr* ascp;
                 };
-                AstNodeExpr* leftp = nullptr;
-                AstNodeExpr* rightp = nullptr;
-                AstNodeExpr* ascp = nullptr;
-                if (leaf.loop) {
+                std::vector<LoopVars> loopVars;
+                const auto at = [&](AstNodeExpr* wholep) -> AstNodeExpr* {
+                    AstNodeExpr* outp = wholep;
+                    size_t done = 0;
+                    for (size_t li = 0; li < loopVars.size(); ++li) {
+                        const size_t cut = std::min(leaf.loops[li].at, path.size());
+                        if (cut > done) {
+                            outp = leafOf(outp, WavePath(path.begin() + done, path.begin() + cut),
+                                          flp);
+                            done = cut;
+                        }
+                        outp = new AstSelBit{flp, outp,
+                                             new AstVarRef{flp, loopVars[li].idxp, VAccess::READ}};
+                    }
+                    if (done < path.size()) {
+                        outp = leafOf(outp, WavePath(path.begin() + done, path.end()), flp);
+                    }
+                    return outp;
+                };
+                for (const VhdlRecordLeaf::Loop& loop : leaf.loops) {
+                    LoopVars lv{nullptr, nullptr, nullptr, nullptr};
                     bool ascending = true;
                     bool dirKnown = true;
-                    if (!dynamicBounds(leaf.typep, 0, flp, leftp, rightp, ascending, &dirKnown)) {
+                    if (!dynamicBounds(loop.arrayp, 0, flp, lv.leftp, lv.rightp, ascending,
+                                       &dirKnown)) {
                         ok = false;
                         break;
                     }
                     if (!dirKnown) {
-                        ascp = boundsAscendingExpr(indexSubtype(leaf.typep, 0), flp);
-                        if (!ascp) ascp = ascendingOf(leftp, rightp, flp);
+                        lv.ascp = boundsAscendingExpr(indexSubtype(loop.arrayp, 0), flp);
+                        if (!lv.ascp) lv.ascp = ascendingOf(lv.leftp, lv.rightp, flp);
                     } else {
-                        ascp = new AstConst{flp, AstConst::BitTrue{}, ascending};
+                        lv.ascp = new AstConst{flp, AstConst::BitTrue{}, ascending};
                     }
-                    loopIdxp = newTempVar("__Vresi", newIntDType(flp), flp);
+                    lv.idxp = newTempVar("__Vresi", newIntDType(flp), flp);
+                    loopVars.push_back(lv);
                 }
+                if (!ok) break;
                 AstNode* onep = nullptr;
                 for (int j = 0; j < k; ++j) {
                     const int64_t slot = idxp->ascending() ? idxp->left() + j : idxp->left() - j;
@@ -22047,21 +22084,23 @@ private:
                 onep = AstNode::addNextNull(
                     onep, static_cast<AstNode*>(new AstAssign{
                               flp, at(new AstVarRef{flp, lp.netp, VAccess::WRITE}), callp}));
-                if (loopIdxp) {
-                    // From the left end to the right, whichever way the range runs
+                // Innermost first: each loop runs from its left end to its right, whichever way
+                // its range runs
+                for (size_t li = loopVars.size(); li-- > 0;) {
+                    const LoopVars& lv = loopVars[li];
                     const auto ref
-                        = [&](VAccess access) { return new AstVarRef{flp, loopIdxp, access}; };
-                    AstNode* const initp = new AstAssign{flp, ref(VAccess::WRITE), leftp};
+                        = [&](VAccess access) { return new AstVarRef{flp, lv.idxp, access}; };
+                    AstNode* const initp = new AstAssign{flp, ref(VAccess::WRITE), lv.leftp};
                     AstLoop* const loopp = new AstLoop{flp};
                     loopp->addStmtsp(new AstLoopTest{
                         flp, loopp,
                         new AstCond{
-                            flp, ascp, new AstLteS{flp, ref(VAccess::READ), rightp},
-                            new AstGteS{flp, ref(VAccess::READ), rightp->cloneTree(false)}}});
+                            flp, lv.ascp, new AstLteS{flp, ref(VAccess::READ), lv.rightp},
+                            new AstGteS{flp, ref(VAccess::READ), lv.rightp->cloneTree(false)}}});
                     loopp->addStmtsp(onep);
                     loopp->addStmtsp(new AstAssign{
                         flp, ref(VAccess::WRITE),
-                        new AstCond{flp, ascp->cloneTree(false),
+                        new AstCond{flp, lv.ascp->cloneTree(false),
                                     new AstAdd{flp, ref(VAccess::READ),
                                                new AstConst{flp, AstConst::Signed32{}, 1}},
                                     new AstSub{flp, ref(VAccess::READ),
@@ -31170,10 +31209,16 @@ private:
             return recordPartOf(adp->targetp(), path, true);
         }
         const VhdlSymbol* const symp = wholeSignalOf(targetp);
-        if (!symp || !symp->typep() || symp->typep()->base()->kind() != VhdlTypeKind::RECORD) {
-            return nullptr;
+        if (!symp || !symp->typep()) return nullptr;
+        if (symp->typep()->base()->kind() == VhdlTypeKind::RECORD) return symp;
+        // An array of records, where its leaves are what is asked for (finishLeafResolves)
+        if (throughAliases && symp->typep()->base()->kind() == VhdlTypeKind::ARRAY) {
+            const VhdlType* const ep = symp->typep()->elementp()
+                                           ? symp->typep()->elementp()
+                                           : symp->typep()->base()->elementp();
+            if (ep && ep->base()->kind() == VhdlTypeKind::RECORD) return symp;
         }
-        return symp;
+        return nullptr;
     }
     // The declaration of the alias a name is, where that alias denotes part of an object
     static const AstVhdlAliasDecl* partAliasDecl(const AstNodeVhdlExpr* namep) {
