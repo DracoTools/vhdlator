@@ -2110,11 +2110,7 @@ private:
     AstNodeExpr* lowerBound(AstNodeVhdlExpr* nodep) {
         if (!nodep) return nullptr;
         const auto it = m_hoistName.find(nodep);
-        if (it == m_hoistName.end()) {
-            VL_RESTORER(m_inlineLocalConsts);
-            m_inlineLocalConsts = true;
-            return lowerExpr(nodep);
-        }
+        if (it == m_hoistName.end()) return lowerExpr(nodep);
         return new AstVarRef{nodep->fileline(), hoistVar(it->second, nodep->fileline()),
                              VAccess::READ};
     }
@@ -3016,7 +3012,7 @@ private:
     // and from nothing the call supplies: en_cl_fix's "constant ChunkCount_c : positive
     // := (cl_fix_width(result_fmt) + ChunkSize_c - 1) / ChunkSize_c" in a copy whose
     // result_fmt reads a unit constant in its place. It is the same on every call of
-    // the copy, so a bound naming it is written with its value (lowerBound): the
+    // the copy, so it is read as its value wherever it is read (lowerExpr): the
     // declaration, which a subtype cannot name, is a variable of the emitted function
     const AstVhdlObjectDecl* settledLocalConstant(const VhdlSymbol* symp, int depth = 0) const {
         if (!symp || depth > 32) return nullptr;
@@ -9315,7 +9311,6 @@ private:
     };
     std::map<std::string, std::vector<VhdlPortDefault>> m_portDefaults;  // By module name
     std::map<std::string, AstVar*> m_hoistVars;  // Those declared in this module
-    bool m_inlineLocalConsts = false;  // Lowering a bound (settledLocalConstant)
     int m_hoistNum = 0;
 
     // The variables such generics were lowered to, so their port entries can
@@ -11557,11 +11552,11 @@ private:
         }
 
         if (AstVhdlName* const p = VN_CAST(nodep, VhdlName)) {
-            // A bound names such a constant by its value (settledLocalConstant)
-            if (m_inlineLocalConsts) {
-                if (const AstVhdlObjectDecl* const declp = settledLocalConstant(p->vhdlSymp())) {
-                    return lowerExpr(declp->defaultp());
-                }
+            // Such a constant is read as its value (settledLocalConstant), wherever it is
+            // read: a width as much as a bound -- "resize(unsigned(a_v), ChunkSize_c *
+            // ChunkCount_c)" in en_cl_fix's cl_fix_to_real -- has to be the instance's
+            if (const AstVhdlObjectDecl* const declp = settledLocalConstant(p->vhdlSymp())) {
+                return lowerExpr(declp->defaultp());
             }
             if (p->vhdlSymp() && m_flatArrays.count(p->vhdlSymp()->resolved())) {
                 unsup(flp, "whole of an array of several dimensions whose bounds only running"
@@ -20385,10 +20380,17 @@ private:
             }
             AstNodeExpr* const widep
                 = intTo64(intp, name == "to_signed" || isSignedType(args[0]->vhdlTypep()), flp);
+            // A size of 0 gives a null vector, held as one element as any null
+            // array is: "to_unsigned(1, ClkDivBits_g)" in an instance with no
+            // clock divider (open-logic's olo_intf_i2c_master)
+            AstNodeExpr* const lanesCountp
+                = new AstCond{flp, new AstGtS{flp, sizep->cloneTree(false), i32(0, flp)},
+                              sizep->cloneTree(false), i32(1, flp)};
             AstNodeExpr* const lanesp
                 = new AstSelPlus{flp, laneSpread(widep, flp), i32(0, flp),
-                                 new AstMul{flp, i32(4, flp), sizep->cloneTree(false)}};
-            AstNodeExpr* outp = new AstOr{flp, lanesp, laneMask(2, sizep, flp)};
+                                 new AstMul{flp, i32(4, flp), lanesCountp->cloneTree(false)}};
+            AstNodeExpr* outp = new AstOr{flp, lanesp, laneMask(2, lanesCountp, flp)};
+            VL_DO_DANGLING(lanesCountp->deleteTree(), lanesCountp);
             // "vector truncated" where the value does not fit (NVC ieee11)
             outp = withTruncWarning(outp, args[0], name == "to_signed", sizep, flp);
             VL_DO_DANGLING(sizep->deleteTree(), sizep);
@@ -23613,7 +23615,13 @@ private:
                                  : m_vars.end();
         const bool isParam
             = paramIt != m_vars.end() && paramIt->second->varType() == VVarType::LPARAM;
+        // A constant of a subprogram that only what the instance settles gives a value
+        // (settledLocalConstant) is as settled as a generic: "res(pb_c - 1 downto 0)" with
+        // "pb_c := pbits(dw)", dw standing for a generic (open-logic's olo_ft_pkg_ecc)
+        const bool settledLocal
+            = termSymp && VN_IS(nodep, VhdlName) && settledLocalConstant(termSymp) != nullptr;
         const bool isGeneric = (termSymp && termSymp->kind() == VhdlSymKind::GENERIC) || isParam
+                               || settledLocal
                                || (namesAGeneric(nodep) && !boundsOnlyRunningDecides(nodep));
         // Measuring asks only whether the two ends cancel, so it matches
         // terms as they were written rather than building them
@@ -23640,6 +23648,7 @@ private:
                 return;
             }
         }
+        // Such a constant goes into the width by its value, as it is read anywhere
         AstNodeExpr* const exprp = lowerExpr(nodep);
         if (!exprp) {
             form.ok = false;
@@ -29577,7 +29586,9 @@ private:
     // The signals a statement drives a part of
     void partDrivenBy(AstNode* nodep, std::set<const VhdlSymbol*>& out) {
         nodep->foreach([&](AstVhdlAssoc* asp) {
-            if (!asp->drives() || !asp->actualp() || VN_IS(asp->actualp(), VhdlName)) return;
+            if (!associationDrives(asp) || !asp->actualp() || VN_IS(asp->actualp(), VhdlName)) {
+                return;
+            }
             const AstVhdlSelected* const aselp = VN_CAST(asp->actualp(), VhdlSelected);
             if (aselp && selectsFromPackage(aselp)
                 && aselp->vhdlSymp()->kind() == VhdlSymKind::SIGNAL) {
@@ -31167,10 +31178,25 @@ private:
     // Between this call and unbindPortDriver, the actual's name means that
     // driver's own value rather than the signal. Returns null, and binds
     // nothing, where the signal is not resolved.
+    // Whether an association drives its actual: one analysis marked, or one of part of an
+    // output, which drives as much as one of the whole -- "wr_port_out.awready =>
+    // axilite_if_2.write_address_channel.awready" (UVVM's axilite_th)
+    static bool associationDrives(AstVhdlAssoc* asp) {
+        if (asp->drives()) return true;
+        if (!asp->formalp() || VN_IS(asp->formalp(), VhdlName)) return false;
+        const AstVhdlName* const rootp = VN_CAST(individualRoot(asp->formalp()), VhdlName);
+        const VhdlSymbol* const fsymp = rootp ? rootp->vhdlSymp() : nullptr;
+        const AstVhdlIfaceDecl* const fdeclp
+            = fsymp ? VN_CAST(fsymp->declp(), VhdlIfaceDecl) : nullptr;
+        return fdeclp && fsymp->kind() == VhdlSymKind::PORT
+               && (fdeclp->mode() == VhdlMode::OUT || fdeclp->mode() == VhdlMode::INOUT
+                   || fdeclp->mode() == VhdlMode::BUFFER);
+    }
     VhdlSymbol* bindPortDriver(AstVhdlAssoc* asp, FileLine* flp, AstVar*& savedp) {
         // Through an alias, the object it denotes (6.6.2)
-        const VhdlSymbol* const symp
-            = asp->drives() && asp->actualp() ? pkgAliasBase(rootSymOf(asp->actualp())) : nullptr;
+        const VhdlSymbol* const symp = associationDrives(asp) && asp->actualp()
+                                           ? pkgAliasBase(rootSymOf(asp->actualp()))
+                                           : nullptr;
         const auto it = symp ? m_drivers.find(symp) : m_drivers.end();
         if (it == m_drivers.end()
             || m_driverUsed[symp] >= static_cast<int>(it->second.size())) {
@@ -34481,7 +34507,7 @@ private:
                     m_vars.erase(symp);
                 }
             }
-            AstNodeExpr* const actp = lowerExpr(asp->actualp());
+            AstNodeExpr* actp = lowerExpr(asp->actualp());
             if (!partp || !actp) {
                 if (partp) VL_DO_DANGLING(partp->deleteTree(), partp);
                 if (actp) VL_DO_DANGLING(actp->deleteTree(), actp);
@@ -34529,6 +34555,20 @@ private:
                 m_elemAliased.insert(actVarp);
                 VL_DO_DANGLING(actp->deleteTree(), actp);
                 continue;
+            }
+            // What goes outward is one driver of the actual, as a whole association's is:
+            // an element of an INOUT port of the module the actual is part of, split in two
+            // as a record of resolved records, is driven through its driving half (UVVM's
+            // axilite_th, "wr_port_out.awready => axilite_if_2.write_address_channel.awready")
+            if (outward) {
+                AstVar* savedp = nullptr;
+                VhdlSymbol* const keyp = bindPortDriver(asp, flp, savedp);
+                AstNodeExpr* const drvActp = lowerExpr(asp->actualp());
+                unbindPortDriver(keyp, savedp);
+                if (drvActp) {
+                    VL_DO_DANGLING(actp->deleteTree(), actp);
+                    actp = drvActp;
+                }
             }
             FileLine* const cflp = new FileLine{flp};
             cflp->warnOff(V3ErrorCode::MULTIDRIVEN, true);
