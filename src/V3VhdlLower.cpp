@@ -236,6 +236,7 @@ class VhdlLowerVisitor final {
     bool m_inPkgEmit = false;  // Inside the group a package's subprograms make
     bool m_asTarget = false;  // Lowering what an assignment writes, not what it reads
     bool m_recordMember = false;  // Lowering the type of an element of a packed record
+    bool m_elabCond = false;  // Lowering a generate's condition, static at elaboration
     // Lowering a built-in procedure's actuals, any of which it may write
     bool m_checkAsCall = false;
     bool m_inStmts = false;  // Lowering the statements of a process or subprogram
@@ -8061,6 +8062,19 @@ private:
         }
         VhdlType* const typep = nodep->vhdlTypep();
         if (carriedDynamically(typep)) return typep;
+        // A conversion between closely related array types of a value carried with its
+        // bounds is carried as that value is, whatever subtype analysis gave the conversion:
+        // "std_ulogic_vector(resize(signed(rnd.RandSlv(n)), 32)) & x\"00000000\"" in
+        // Microwatt's divider_tb
+        if (const AstVhdlCall* const convp = VN_CAST(nodep, VhdlCall)) {
+            const VhdlSymbol* const tsymp
+                = convp->prefixp() ? convp->prefixp()->vhdlSymp() : nullptr;
+            const AstVhdlAssoc* const argp = VN_CAST(convp->argsp(), VhdlAssoc);
+            if (tsymp && tsymp->resolved()->kind() == VhdlSymKind::TYPE && argp && !argp->nextp()
+                && argp->actualp() && isDynValue(argp->actualp())) {
+                if (VhdlType* const innerp = dynValueType(argp->actualp())) return innerp;
+            }
+        }
         if (const AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall)) {
             const VhdlSymbol* const symp
                 = callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
@@ -11319,6 +11333,20 @@ private:
     AstNodeExpr* lowerExprUnchecked(AstNodeVhdlExpr* nodep) {
         if (!nodep) return nullptr;
         FileLine* const flp = nodep->fileline();
+        // In a generate's condition, a call of a function is worked out at elaboration where
+        // it can be, the rest of the condition being left to the instance: PoC's "VENDOR /=
+        // VENDOR_XILINX or N < 6", VENDOR a function called with no arguments, so a name
+        if (m_elabCond && (VN_IS(nodep, VhdlCall) || VN_IS(nodep, VhdlName))) {
+            const VhdlSymbol* const fsymp
+                = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+            VhdlType* const rtp = nodep->vhdlTypep();
+            if (fsymp && fsymp->kind() == VhdlSymKind::FUNCTION && rtp
+                && (rtp->base()->kind() == VhdlTypeKind::ENUM
+                    || rtp->base()->kind() == VhdlTypeKind::INTEGER)) {
+                const VhdlValue v = V3VhdlEval::evalElab(nodep);
+                if (v.isInt()) return lowerValue(v, rtp, flp);
+            }
+        }
         // A bound hoisted into a parameter of the module is that parameter,
         // wherever it is read -- a slice in a port map as much as a type
         if (!m_hoistName.empty() && m_modp) {
@@ -17872,6 +17900,15 @@ private:
                                        nodep->rhsp()->vhdlTypep())) {
                     return false;
                 }
+                // Of the nine values and not emitted natively (ninePlanned, above), it is
+                // std_logic_1164's body that is called, and what that gives back carries its
+                // bounds whatever the operands do: PoC's "s(N downto 3) xnor ('1' & x(N-1
+                // downto 3))" over lengths a generic gives
+                if (v3Global.opt.vhdlMetavalues() && !symp->predefined()
+                    && inStdLogic1164(symp->resolved())
+                    && carriedDynamically(emittedReturnType(symp->resolved()))) {
+                    return true;
+                }
             }
             break;
         default: return false;
@@ -19116,7 +19153,8 @@ private:
         std::string base = op;
         bool invert = false;
         if (op == "nand" || op == "nor" || op == "xnor") {
-            base = op.substr(1);
+            // "xnor" is "not xor", which dropping its first letter does not give
+            base = op == "xnor" ? std::string{"xor"} : op.substr(1);
             invert = true;
         }
         AstNodeExpr* onep = nullptr;
@@ -35287,9 +35325,21 @@ private:
             // was hoisted into a parameter the instance works out
             AstVhdlGenerateBody* const altp = alts[i];
             const auto hoistIt = m_hoistName.find(altp->condp());
+            // A condition is static at elaboration (11.8), so it is worked out with the room
+            // elaboration has: PoC's "VENDOR /= VENDOR_XILINX" looks MY_BOARD up in its board
+            // list a character at a time, more than a fold at analysis may take, and what is
+            // left of the call the back end cannot work out either
+            const VhdlValue elabv
+                = hoistIt == m_hoistName.end() ? V3VhdlEval::evalElab(altp->condp()) : VhdlValue{};
             AstNodeExpr* const condp
-                = hoistIt == m_hoistName.end()
-                      ? lowerCondition(altp->condp())
+                = elabv.isInt()
+                      ? new AstConst{altp->fileline(), AstConst::BitTrue{}, elabv.toInt() != 0}
+                  : hoistIt == m_hoistName.end()
+                      ? [&]() {
+                            VL_RESTORER(m_elabCond);
+                            m_elabCond = true;
+                            return lowerCondition(altp->condp());
+                        }()
                       : new AstNeq{altp->fileline(),
                                    new AstVarRef{altp->fileline(),
                                                  hoistVar(hoistIt->second, altp->fileline()),
