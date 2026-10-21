@@ -1225,6 +1225,8 @@ private:
                                             + cvtToStr(offset));
             } else if (AstConst* const constp = VN_CAST(itemp, Const)) {
                 setValue(nodep, constp);
+            } else if (isHeldValue(itemp)) {
+                setValue(nodep, itemp);
             } else {
                 setValue(nodep, fetchValue(itemp));
             }
@@ -1233,6 +1235,15 @@ private:
         }
     }
 
+    // An unpacked array or structure held as a member's or an element's
+    // value is that value itself, as an initializer is its own (visit of
+    // AstInitArray). What its node would look up is not: a value written
+    // into a part is a clone of the one before (withPart), and a clone
+    // keeps the original's user1 slot, so the lookup finds the value from
+    // before the write.
+    static bool isHeldValue(const AstNodeExpr* nodep) {
+        return VN_IS(nodep, InitArray) || VN_IS(nodep, ConsPackUOrStruct);
+    }
     void visit(AstStructSel* nodep) override {
         checkNodeInfo(nodep);
         iterateChildrenConst(nodep);
@@ -1248,6 +1259,8 @@ private:
             clearOptimizable(nodep, "Struct member never assigned: " + nodep->name());
         } else if (AstConst* const constp = VN_CAST(memberp->rhsp(), Const)) {
             setValue(nodep, constp);
+        } else if (isHeldValue(memberp->rhsp())) {
+            setValue(nodep, memberp->rhsp());
         } else if (AstNodeExpr* const valuep = fetchValueNull(memberp->rhsp())) {
             setValue(nodep, valuep);
         } else {
