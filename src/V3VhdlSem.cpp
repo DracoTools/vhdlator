@@ -14207,6 +14207,17 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
             rp = msymp && msymp->kind() == VhdlSymKind::TYPE && msymp->typep()
                      ? VN_CAST(msymp->typep()->boundsp(), VhdlRange)
                      : nullptr;
+            // And by an object's, "DASH(Dest'range)", as long as the range of the subtype
+            // the object was declared with: OSVVM's AxiStream SetOptions tests, Dest a
+            // variable sized by a generic
+            if (!rp && msymp && msymp->typep()
+                && (msymp->kind() == VhdlSymKind::VARIABLE || msymp->kind() == VhdlSymKind::SIGNAL
+                    || msymp->kind() == VhdlSymKind::CONSTANT
+                    || msymp->kind() == VhdlSymKind::PORT)
+                && msymp->typep()->base()->kind() == VhdlTypeKind::ARRAY
+                && msymp->typep()->indexTypes().size() == 1 && msymp->typep()->indexTypes()[0]) {
+                rp = VN_CAST(msymp->typep()->indexTypes()[0]->boundsp(), VhdlRange);
+            }
         }
         if (rp) {
             bool onlyGenerics = true;

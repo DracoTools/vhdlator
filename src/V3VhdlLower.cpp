@@ -26911,6 +26911,14 @@ private:
             m_procDrivenp = &driven;
             m_procNodep = nodep;
         }
+        // What an if or case generate drives is counted here, once, for the
+        // statement as a whole, so a block inside it counts nothing of its own
+        // (open-logic's AXI master: a port driven in a block of one alternative
+        // and directly in the other)
+        VL_RESTORER(m_inCountedGenerate);
+        if (const AstVhdlGenerate* const genp = VN_CAST(nodep, VhdlGenerate)) {
+            if (genp->kind() != VhdlLoopKind::FOR) m_inCountedGenerate = true;
+        }
         lowerConcurrent(nodep);
         // A generate written out once per iteration counted its own, since
         // how many there were is what made it write them out
@@ -26967,8 +26975,14 @@ private:
             for (AstNode* p = blockp->declsp(); p; p = p->nextp()) lowerDecl(p);
             for (AstNode* p = blockp->stmtsp(); p; p = p->nextp()) {
                 // A block is transparent to resolution: each statement of it
-                // is a driver of its own, as it would be outside the block
-                lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
+                // is a driver of its own, as it would be outside the block --
+                // except in an if or case generate, which is counted as one
+                // driver of what its alternative drives (lowerConcurrentDriver)
+                if (m_inCountedGenerate) {
+                    lowerConcurrent(VN_AS(p, NodeVhdlStmt));
+                } else {
+                    lowerConcurrentDriver(VN_AS(p, NodeVhdlStmt));
+                }
             }
             return;
         }
@@ -35105,6 +35119,8 @@ private:
     // constant in each copy. Each copy is a driver of whatever it drives,
     // which is why the loop cannot be left for the back end to unroll.
     std::set<std::string> m_unrolledGens;  // For generates written out per iteration
+    // Lowering an if or case generate, whose drivers lowerConcurrentDriver counts as one
+    bool m_inCountedGenerate = false;
 
     void unrollGenerate(AstVhdlGenerate* nodep, VhdlSymbol* symp, VhdlType* rangep,
                         const std::string& label, FileLine* flp) {
