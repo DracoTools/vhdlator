@@ -853,32 +853,9 @@ void createEval(AstNetlist* netlistp,  //
     }
 
     // A dynamic NBA -- one made in a function or task that is not inlined -- waits for the NBA
-    // event, then assigns. It is resumed here, at the start of the NBA region, so that its
-    // update is made along with the region's other updates and seen by the logic that reads
-    // them, before any process those updates resume runs (IEEE 1800-2023 4.4.2.2, 4.6).
-    // Fired as an event, its waiters would be resumed in the next Active region, in no
-    // particular order with the processes that region resumes, which then could read the
-    // variable before its update.
-    AstVarScope* dynamicDonep = nullptr;
-    AstNodeStmt* const nbaPrepp = [&]() -> AstNodeStmt* {
-        AstVarScope* const schedp = timingKit.m_nbaEventSchedp;
-        AstVarScope* const nbaEventTriggerp = netlistp->nbaEventTriggerp();
-        if (!schedp || !nbaEventTriggerp) return nullptr;
-        AstScope* const scopeTopp = netlistp->topScopep()->scopep();
-        dynamicDonep = scopeTopp->createTemp("__VnbaDynamicDone", 1);
-        dynamicDonep->varp()->noReset(true);
-        AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, nbaEventTriggerp, VAccess::READ}};
-        ifp->addThensp(util::setVar(nbaEventTriggerp, 0));
-        for (const VCMethod method : {VCMethod::SCHED_READY, VCMethod::SCHED_MOVE_TO_RESUME_QUEUE,
-                                      VCMethod::SCHED_RESUME}) {
-            AstCMethodHard* const callp
-                = new AstCMethodHard{flp, new AstVarRef{flp, schedp, VAccess::READWRITE}, method};
-            callp->dtypeSetVoid();
-            ifp->addThensp(callp->makeStmt());
-        }
-        ifp->addThensp(util::setVar(dynamicDonep, 1));
-        return ifp;
-    }();
+    // event, then assigns. Where it has a trigger scheduler of its own, the NBA region resumes it
+    // among its logic (addDynamicNbaCommit), and nothing here fires the event.
+    const bool dynamicCommitted = timingKit.m_nbaEventSchedp && netlistp->nbaEventTriggerp();
 
     // Create the NBA eval loop, which is the default top level loop.
     topLoop = createEvalLoop(  //
@@ -888,7 +865,7 @@ void createEval(AstNetlist* netlistp,  //
         // Inner loop statements
         topLoop.stmtsp,
         // Prep statements
-        nbaPrepp,
+        nullptr,
         // Work statements
         [&]() {
             AstNodeStmt* workp = nullptr;
@@ -907,15 +884,11 @@ void createEval(AstNetlist* netlistp,  //
         }(),
         // Extra work (not conditional on having had a fired trigger)
         [&](AstVarScope* continuep) -> AstNodeStmt* {
-            // Dynamic NBAs made their updates in this iteration, which the Active region of the
-            // next one sees
-            if (dynamicDonep) {
+            // Dynamic NBAs made their updates in the region's logic
+            if (dynamicCommitted) {
                 netlistp->nbaEventp(nullptr);
                 netlistp->nbaEventTriggerp(nullptr);
-                AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, dynamicDonep, VAccess::READ}};
-                ifp->addThensp(util::setVar(continuep, 1));
-                ifp->addThensp(util::setVar(dynamicDonep, 0));
-                return ifp;
+                return nullptr;
             }
             // Check if any dynamic NBAs are pending, if there are any in the design
             if (!netlistp->nbaEventp()) return nullptr;
@@ -1008,6 +981,68 @@ void createEval(AstNetlist* netlistp,  //
     }
 
     if (v3Global.opt.profExec()) funcp->addStmtsp(AstCStmt::profExecSectionPop(flp, "eval"));
+}
+
+// A dynamic NBA -- one a function or task that is not inlined makes -- is a process waiting
+// for the NBA event, which then assigns (V3Timing). Its update belongs to the NBA region with
+// the region's other updates: after the logic of the same time step that reads the variable,
+// which this scheduler runs in the NBA region but which belongs to the Active region where the
+// NBA was made, and before the logic that settles from it, combinational logic and the
+// resolution of signals the VHDL frontend emits, which the next Active region's processes
+// read (IEEE 1800-2023 4.4.2.2, 10.4.2). So the processes are resumed by post logic of the
+// NBA region, which V3Order places as it places the commit of any other NBA: it is made to
+// write what those processes assign.
+void addDynamicNbaCommit(AstNetlist* netlistp, const TimingKit& timingKit,
+                         LogicRegions& logicRegions) {
+    AstVarScope* const schedp = timingKit.m_nbaEventSchedp;
+    AstVarScope* const triggerp = netlistp->nbaEventTriggerp();
+    if (!schedp || !triggerp) return;
+    // What the waiting processes assign, once resumed
+    std::set<AstVarScope*> targets;
+    netlistp->foreach([&](AstCAwait* awaitp) {
+        const AstCMethodHard* const methodp = VN_CAST(awaitp->exprp(), CMethodHard);
+        const AstVarRef* const fromp = methodp ? VN_CAST(methodp->fromp(), VarRef) : nullptr;
+        if (!fromp || fromp->varScopep() != schedp) return;
+        AstNode* stmtp = awaitp;
+        while (stmtp->backp() && !VN_IS(stmtp, NodeStmt)) stmtp = stmtp->backp();
+        for (AstNode* nextp = stmtp->nextp(); nextp; nextp = nextp->nextp()) {
+            nextp->foreach([&](const AstVarRef* refp) {
+                if (!refp->access().isWriteOrRW() || !refp->varScopep()) return;
+                if (refp->varp()->isFuncLocal()) return;
+                targets.insert(refp->varScopep());
+            });
+        }
+    });
+    AstScope* const scopeTopp = netlistp->topScopep()->scopep();
+    FileLine* const flp = scopeTopp->fileline();
+    AstSenTree* const senTreep = new AstSenTree{
+        flp, new AstSenItem{flp, VEdgeType::ET_TRUE, new AstVarRef{flp, triggerp, VAccess::READ}}};
+    netlistp->topScopep()->addSenTreesp(senTreep);
+    // The trigger says the processes are waiting, so the logic need not read it again; a post
+    // block that read what it writes would order after itself
+    AstAlwaysPost* const postp = new AstAlwaysPost{flp};
+    postp->addStmtsp(util::setVar(triggerp, 0));
+    schedp->varp()->setIgnorePostRead();
+    for (const VCMethod method :
+         {VCMethod::SCHED_READY, VCMethod::SCHED_MOVE_TO_RESUME_QUEUE, VCMethod::SCHED_RESUME}) {
+        AstCMethodHard* const callp
+            = new AstCMethodHard{flp, new AstVarRef{flp, schedp, VAccess::READWRITE}, method};
+        callp->dtypeSetVoid();
+        postp->addStmtsp(callp->makeStmt());
+    }
+    // Writes V3Order sees, never made: each from a variable of its own that nothing writes
+    if (!targets.empty()) {
+        AstIf* const markp = new AstIf{flp, new AstConst{flp, AstConst::BitFalse{}}};
+        for (AstVarScope* const vscp : targets) {
+            AstVarScope* const fromp = scopeTopp->createTemp(
+                "__VdynNbaOrder__" + vscp->varp()->shortName(), vscp->varp()->dtypep());
+            fromp->varp()->noReset(true);
+            markp->addThensp(new AstAssign{flp, new AstVarRef{flp, vscp, VAccess::WRITE},
+                                           new AstVarRef{flp, fromp, VAccess::READ}});
+        }
+        postp->addStmtsp(markp);
+    }
+    logicRegions.m_nba.add(scopeTopp, senTreep, postp);
 }
 
 }  // namespace
@@ -1142,6 +1177,9 @@ void schedule(AstNetlist* netlistp) {
     AstNode* const icoLoopp = createInputCombLoop(netlistp, staticp, senExprBuilder,
                                                   logicReplicas.m_ico, virtIfaceTriggers);
     if (v3Global.opt.stats()) V3Stats::statsStage("sched-create-ico");
+
+    // Dynamic NBAs commit among the NBA region's logic
+    addDynamicNbaCommit(netlistp, timingKit, logicRegions);
 
     // Step 8: Create the triggers
     AstVarScope* const dpiExportTriggerVscp = netlistp->dpiExportTriggerp();
