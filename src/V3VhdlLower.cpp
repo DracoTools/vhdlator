@@ -9484,7 +9484,17 @@ private:
         // lowering leaves out the default of every record it resolves
         const bool unlowerableDefault = defaultByInstance(nodep, symp);
         if (nodep->defaultp() && !triPort && !unlowerableDefault) {
-            varp->valuep(lowerExpr(nodep->defaultp()));
+            // One that carries its own bounds -- "Output : out
+            // std_logic_vector(BITS-1 downto 0) := resize(descend(INIT),
+            // BITS)" in PoC's io_Debounce -- is copied into the port's own
+            // shape, as a declaration's initial value is
+            AstNodeExpr* initp = nullptr;
+            if (isDynValue(nodep->defaultp()) && !isCarrierDType(varp->childDTypep())
+                && symp->typep() && symp->typep()->lengthEmittable()
+                && !lengthOnlyRunningDecides(symp->typep())) {
+                initp = dynAsFixed(nodep->defaultp(), symp->typep(), flp);
+            }
+            varp->valuep(initp ? initp : lowerExpr(nodep->defaultp()));
         } else if (unlowerableDefault && !triPort && m_modp && !splitInoutPort(nodep, symp)) {
             // A default each instance works out (VhdlPortDefault), handed over as a parameter
             // of the port's own type, which the port starts at
@@ -10183,6 +10193,11 @@ private:
             const bool dynDecl = objp->kind() != VhdlObjKind::FILE
                                  && carriedDynamically(symp->typep());
             if (dynDecl) m_dynSyms.insert(symp);
+            // A carrier is given its bounds and its value by statements,
+            // which a parameter cannot take: one a generic map names -- a
+            // component of a generate this instance leaves out, in PoC's
+            // sync_Bits -- stays an object given its value once
+            if (dynDecl && varType == VVarType::LPARAM) varType = VVarType::VAR;
             AstVar* const varp
                 = dynDecl ? newVarOfType(symp, varType, dynCarrierRef(symp->typep(), flp), flp)
                           : newVar(symp, varType, flp);
@@ -10292,6 +10307,18 @@ private:
                         later(dynCarrierAssign(new AstVarRef{flp, varp, VAccess::WRITE},
                                                objp->defaultp(), flp, symp->typep()));
                     }
+                }
+                // A constant of a design unit given a value nothing impure
+                // works out is elaborated with the declarations around it,
+                // in their order, before the design runs (14.4.2): a signal
+                // declared after it starts from what it holds -- "signal m
+                // : std_logic := INIT_I(i)" with "constant INIT_I :=
+                // resize(descend(INIT), BITS)" in PoC's sync_Bits -- and an
+                // initial value is given before any initial runs
+                if (setupp && !m_ftaskp && !m_protClassp && objp->kind() == VhdlObjKind::CONSTANT
+                    && objp->defaultp() && !callsImpureOrAllocates(objp->defaultp())) {
+                    addStmt(new AstInitialStatic{flp, setupp});
+                    return;
                 }
                 if (setupp) addStmt(m_ftaskp ? setupp : new AstInitial{flp, setupp});
                 return;
@@ -10589,6 +10616,15 @@ private:
                            && ieeeResolved(symp->resolverp())) {
                     // STD_LOGIC_1164's RESOLVED gives one driver's value back
                     // as it is, so a signal with one driver is that driver
+                } else if (v3Global.opt.vhdlMetavalues() && symp->resolverp()
+                           && symp->resolvePerElement() && ieeeResolved(symp->resolverp())
+                           && !guardedSignal(symp) && symp->driverCount() > 1
+                           && nineLaneable(symp->typep())) {
+                    // A vector of the nine values driven in parts whose bounds a generic gives,
+                    // "MovesUpCond(ELEMENTS downto 1) <= UnEqual; MovesUpCond(0) <= Free" in
+                    // PoC's sort_lru_cache: analysis cannot tell the parts apart, and RESOLVED
+                    // is the logic tables, lane by lane, whatever the length
+                    makeNineResolved(symp, varp, flp);
                 } else if (symp->resolverp()) {
                     // A guarded signal goes through its own function however
                     // few drivers it has and whatever its type: only the
@@ -11335,12 +11371,27 @@ private:
         FileLine* const flp = nodep->fileline();
         // In a generate's condition, a call of a function is worked out at elaboration where
         // it can be, the rest of the condition being left to the instance: PoC's "VENDOR /=
-        // VENDOR_XILINX or N < 6", VENDOR a function called with no arguments, so a name
-        if (m_elabCond && (VN_IS(nodep, VhdlCall) || VN_IS(nodep, VhdlName))) {
+        // VENDOR_XILINX or N < 6", VENDOR a function called with no arguments, so a name. So
+        // is an element of a constant such a function gives: "DEV_INFO.Vendor /=
+        // VENDOR_ALTERA" in sync_Bits, DEV_INFO a record DEVICE_INFO returns, which the
+        // model works out only once it runs
+        if (m_elabCond
+            && (VN_IS(nodep, VhdlCall) || VN_IS(nodep, VhdlName) || VN_IS(nodep, VhdlSelected))) {
             const VhdlSymbol* const fsymp
                 = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+            const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected);
+            const VhdlSymbol* rootp = nullptr;
+            for (const AstNodeVhdlExpr* p = selp ? selp->prefixp() : nullptr; p;) {
+                if (const AstVhdlSelected* const sp = VN_CAST(p, VhdlSelected)) {
+                    p = sp->prefixp();
+                    continue;
+                }
+                if (p->vhdlSymp()) rootp = p->vhdlSymp()->resolved();
+                break;
+            }
+            const bool ofConstant = rootp && rootp->kind() == VhdlSymKind::CONSTANT;
             VhdlType* const rtp = nodep->vhdlTypep();
-            if (fsymp && fsymp->kind() == VhdlSymKind::FUNCTION && rtp
+            if (((fsymp && fsymp->kind() == VhdlSymKind::FUNCTION) || ofConstant) && rtp
                 && (rtp->base()->kind() == VhdlTypeKind::ENUM
                     || rtp->base()->kind() == VhdlTypeKind::INTEGER)) {
                 const VhdlValue v = V3VhdlEval::evalElab(nodep);
@@ -17862,6 +17913,20 @@ private:
     // because one of its operands does
     bool dynBinaryCarries(const AstVhdlBinary* nodep) const {
         if (ninePlanned(nodep)) return false;
+        // Of the nine values and not emitted natively, an operator of std_logic_1164 or
+        // numeric_std is a call of the package's body, and what that gives back carries its
+        // bounds whatever the operands do: PoC's "s(N downto 3) xnor ('1' & x(N-1 downto
+        // 3))" and "q nand (q sll 1)" over lengths a generic gives
+        if (const VhdlSymbol* const symp = nodep->vhdlSymp()) {
+            const VhdlSymbol* const rp = symp->resolved();
+            if (v3Global.opt.vhdlMetavalues() && !rp->predefined()
+                && (inStdLogic1164(rp) || inPackageNamed(rp, "numeric_std")
+                    || inPackageNamed(rp, "numeric_std_unsigned"))
+                && isIeeeOperator(rp, nodep->lhsp()->vhdlTypep(), nodep->rhsp()->vhdlTypep())
+                && carriedDynamically(emittedReturnType(rp))) {
+                return true;
+            }
+        }
         // An operator the design declares is a call of its own copy (4.5.2),
         // and gives back what that copy returns, carried or not, whatever
         // its operands are (GHDL gna issue2536)
@@ -17899,15 +17964,6 @@ private:
                     && !isIeeeOperator(symp, nodep->lhsp()->vhdlTypep(),
                                        nodep->rhsp()->vhdlTypep())) {
                     return false;
-                }
-                // Of the nine values and not emitted natively (ninePlanned, above), it is
-                // std_logic_1164's body that is called, and what that gives back carries its
-                // bounds whatever the operands do: PoC's "s(N downto 3) xnor ('1' & x(N-1
-                // downto 3))" over lengths a generic gives
-                if (v3Global.opt.vhdlMetavalues() && !symp->predefined()
-                    && inStdLogic1164(symp->resolved())
-                    && carriedDynamically(emittedReturnType(symp->resolved()))) {
-                    return true;
                 }
             }
             break;
@@ -20460,6 +20516,21 @@ private:
         }
         return count <= 64 || v >= 0;
     }
+    std::string numericShiftName(const std::string& op, const std::vector<AstNodeVhdlExpr*>& args,
+                                 bool slvUnsigned) const {
+        if (args.size() != 2 || !args[0] || !args[0]->vhdlTypep()) return "";
+        if (op == "sll") return "shift_left";
+        if (op == "rol") return "rotate_left";
+        if (op == "ror") return "rotate_right";
+        if (op == "srl" && nineNumKind(args[0]->vhdlTypep(), slvUnsigned) == 'u') {
+            return "shift_right";
+        }
+        return "";
+    }
+    static bool numericLogicalOp(const std::string& op) {
+        return op == "and" || op == "or" || op == "xor" || op == "nand" || op == "nor"
+               || op == "xnor" || op == "not";
+    }
     bool ninePlan(const VhdlSymbol* symp, const std::string& op,
                   const std::vector<AstNodeVhdlExpr*>& args) const {
         if (!v3Global.opt.vhdlMetavalues() || !symp) return false;
@@ -20480,6 +20551,16 @@ private:
         const auto kindOf = [&](const AstNodeVhdlExpr* argp) {
             return nineNumKind(argp->vhdlTypep(), slvUnsigned);
         };
+        // The shift operators of numeric_std are its shifts and rotates (16.5): SLL is
+        // SHIFT_LEFT, ROL and ROR the rotates, and SRL SHIFT_RIGHT of an UNSIGNED (of a SIGNED
+        // it shifts in '0', which SHIFT_RIGHT does not)
+        if (const std::string named = numericShiftName(op, args, slvUnsigned); !named.empty()) {
+            return ninePlan(symp, named, args);
+        }
+        // numeric_std's logical operators over SIGNED and UNSIGNED are std_logic_1164's,
+        // element by element (16.5): "('0' & p) xor (('0' & p) + 1)" in PoC's
+        // arith_counter_bcd, whose body was called otherwise with values carrying bounds
+        if (numericLogicalOp(op) && !slvUnsigned) return nineLogicalPlan(op, args);
         if (op == "to_integer") {
             return args.size() == 1 && (kindOf(args[0]) == 'u' || kindOf(args[0]) == 's')
                    && nineOperandKnown(args[0]);
@@ -20631,8 +20712,16 @@ private:
     AstNodeExpr* nineOperator(const VhdlSymbol* symp, const std::string& op,
                               const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
         if (!ninePlan(symp, op, args)) return nullptr;
-        if (inStdLogic1164(symp->resolved()) || op == "?=" || op == "?/=") {
+        if (inStdLogic1164(symp->resolved()) || op == "?=" || op == "?/="
+            || (numericLogicalOp(op) && inPackageNamed(symp->resolved(), "numeric_std"))) {
             return nineLogical(op, args, flp);
+        }
+        {
+            const bool slvUnsigned = inPackageNamed(symp->resolved(), "numeric_std_unsigned");
+            if (const std::string named = numericShiftName(op, args, slvUnsigned);
+                !named.empty()) {
+                return nineConversion(symp->resolved(), named, args, flp);
+            }
         }
         return nineNumeric(symp->resolved(), op, args, flp);
     }
@@ -29383,8 +29472,15 @@ private:
                 if (foreign) return;
                 const VhdlSymbol* const gp
                     = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
-                if (gp && gp->kind() == VhdlSymKind::GENERIC && gp->declScopep()
-                    && gp->declScopep()->designRoot() && !m_vars.count(gp)
+                // -- or a constant of the architecture a call handed it
+                // as well (the stand-ins of the copy, specializeSubprogram),
+                // where the constant is an object rather than a value that
+                // reads the same anywhere
+                if (gp
+                    && (gp->kind() == VhdlSymKind::GENERIC
+                        || (gp->kind() == VhdlSymKind::CONSTANT && !gp->hasValue()
+                            && !V3VhdlEval::s_elabFolded.count(gp)))
+                    && gp->declScopep() && gp->declScopep()->designRoot() && !m_vars.count(gp)
                     && !m_bindExprs.count(gp)) {
                     foreign = true;
                 }
@@ -39936,11 +40032,34 @@ private:
                     VL_DO_DANGLING(instp->deleteTree(), instp);
                     return nullptr;
                 }
+                // An actual of a fixed length given to a parameter the
+                // method writes and carries with its bounds is copied back
+                // after the call, as for any other procedure: OSVVM's
+                // MemRead on a method its byte-sized Data reaches that way
+                // when the address leaves the method unspecialized
+                AstNode* prep = nullptr;
+                AstNode* postp = nullptr;
+                if (callp
+                    && (!elemPartRoundTrip(symp, callp, prep, postp, flp)
+                        || !convRoundTrip(symp, callp, prep, postp, flp)
+                        || !dynOutRoundTrip(symp, callp, prep, postp, flp))) {
+                    VL_DO_DANGLING(instp->deleteTree(), instp);
+                    if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
+                    if (postp) VL_DO_DANGLING(postp->deleteTree(), postp);
+                    return nullptr;
+                }
                 AstMethodCall* const mcallp
                     = new AstMethodCall{flp, instp, methodName(symp, protTypep), nullptr};
                 addCallArgs(mcallp, callp, symp);
-                if (callp && copyOutMethod(symp)) return copyOutCall(mcallp, callp, symp, flp);
-                return new AstStmtExpr{flp, mcallp};
+                AstNode* const callStmtp = callp && copyOutMethod(symp)
+                                               ? copyOutCall(mcallp, callp, symp, flp)
+                                               : new AstStmtExpr{flp, mcallp};
+                if (!callStmtp) {
+                    if (prep) VL_DO_DANGLING(prep->deleteTree(), prep);
+                    if (postp) VL_DO_DANGLING(postp->deleteTree(), postp);
+                    return nullptr;
+                }
+                return AstNode::addNextNull(AstNode::addNextNull(prep, callStmtp), postp);
             }
         }
         // A procedure with a signal parameter drives the caller's own signal,

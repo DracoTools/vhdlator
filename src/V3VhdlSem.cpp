@@ -166,6 +166,44 @@ static const AstNode* parentOf(const AstNode* nodep) {
     return nodep->backp();
 }
 
+// The generic a length is: "word_t'length" with word_t a subtype, or an
+// object of one, indexed "(G - 1 downto 0)", "(0 to G - 1)" or "(1 to G)",
+// is G exactly, where G cannot be negative (5.3.2.2). PoC's ocram hands its
+// memory's word length to mem_ReadMemoryFile that way.
+static AstVhdlName* lengthGeneric(AstNodeVhdlExpr* exprp) {
+    AstVhdlAttrName* const attrp = VN_CAST(exprp, VhdlAttrName);
+    if (!attrp || attrp->name() != "length" || attrp->argp()) return nullptr;
+    const VhdlType* const typep = attrp->prefixp()->vhdlTypep();
+    if (!typep || typep->base()->kind() != VhdlTypeKind::ARRAY || typep->indexTypes().size() != 1
+        || !typep->indexTypes()[0]) {
+        return nullptr;
+    }
+    const AstVhdlRange* const rangep = VN_CAST(typep->indexTypes()[0]->boundsp(), VhdlRange);
+    if (!rangep || !rangep->leftp() || !rangep->rightp()) return nullptr;
+    AstNodeVhdlExpr* const hip
+        = rangep->dir() == VhdlDir::DOWNTO ? rangep->leftp() : rangep->rightp();
+    AstNodeVhdlExpr* const lop
+        = rangep->dir() == VhdlDir::DOWNTO ? rangep->rightp() : rangep->leftp();
+    const VhdlValue lov = V3VhdlEval::eval(lop);
+    if (!lov.isInt()) return nullptr;
+    AstVhdlName* genp = VN_CAST(hip, VhdlName);
+    int64_t less = 0;
+    if (const AstVhdlBinary* const binp = VN_CAST(hip, VhdlBinary)) {
+        const VhdlValue kv = V3VhdlEval::eval(binp->rhsp());
+        if (binp->op() != VhdlBinaryOp::SUB || !kv.isInt()) return nullptr;
+        genp = VN_CAST(binp->lhsp(), VhdlName);
+        less = kv.toInt();
+    }
+    const VhdlSymbol* const gsymp
+        = genp && genp->vhdlSymp() ? genp->vhdlSymp()->resolved() : nullptr;
+    if (!gsymp || gsymp->kind() != VhdlSymKind::GENERIC || !gsymp->typep()
+        || gsymp->typep()->base()->kind() != VhdlTypeKind::INTEGER || !gsymp->typep()->bounded()
+        || gsymp->typep()->low() < 0 || less + lov.toInt() != 1) {
+        return nullptr;
+    }
+    return genp;
+}
+
 // The design unit a node is written in
 static const AstNodeVhdlUnit* unitOf(const AstNode* nodep) {
     for (const AstNode* upp = nodep; upp; upp = parentOf(upp)) {
@@ -3518,6 +3556,16 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
                 V3VhdlEval::s_objState = objectsBefore;
                 V3VhdlEval::s_objWritten = objWrittenBefore;
                 if (elab.isComposite()) symp->elabValue(elab);
+                // Where the value is pure and every element of it settled,
+                // it is the constant's value, not only its widths: PoC's
+                // "constant DEV_INFO : T_DEVICE_INFO := DEVICE_INFO", the
+                // device decoded from a string by functions only
+                // elaboration's evaluator runs
+                if (elab.isComposite() && allKnown(elab) && nodep->defaultp()
+                    && VN_IS(parentOf(nodep), VhdlArchitecture) && !m_inSpecialized
+                    && !inGenericTemplate(nodep) && !callsImpure(nodep->defaultp())) {
+                    V3VhdlEval::s_elabFolded.insert(symp);
+                }
             }
         }
         // A shared variable of a package holds its initial value while the
@@ -8150,13 +8198,22 @@ private:
                 // reads it where it reads the parameter, so that a bound the
                 // body writes in terms of the parameter is one the instance
                 // settles (issue820's "t_arr_property(0 to g_num_arr - 1)")
+                // -- or a length that is one (lengthGeneric), or a constant
+                // of the architecture worked out from the generics: PoC's
+                // ocram, "constant DEPTH : positive := 2**A_BITS"
+                AstNodeVhdlExpr* standp = actp;
+                if (AstVhdlName* const lengthp = lengthGeneric(actp)) standp = lengthp;
                 const VhdlSymbol* const asymp
-                    = actp->vhdlSymp() ? actp->vhdlSymp()->resolved() : nullptr;
-                if (!actualValues.back().known() && VN_IS(actp, VhdlName) && asymp
-                    && asymp->kind() == VhdlSymKind::GENERIC && symp->paramTypes()[i]
+                    = standp->vhdlSymp() ? standp->vhdlSymp()->resolved() : nullptr;
+                const bool unitConstant = asymp && asymp->kind() == VhdlSymKind::CONSTANT
+                                          && asymp->declScopep()
+                                          && asymp->declScopep()->designRoot();
+                if (!actualValues.back().known() && VN_IS(standp, VhdlName) && asymp
+                    && (asymp->kind() == VhdlSymKind::GENERIC || unitConstant)
+                    && symp->paramTypes()[i]
                     && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::INTEGER) {
                     standIns.resize(nparams, nullptr);
-                    standIns[i] = actp;
+                    standIns[i] = standp;
                 }
             }
             VhdlType* typep = actp->vhdlTypep();
@@ -18494,7 +18551,8 @@ AstVhdlIndexConstraint* VhdlSemVisitor::openConstraintFor(VhdlType* typep,
                 AstNodeVhdlExpr* valuep = ifp->defaultp()->cloneTree(false);
                 AstNodeVhdlExpr* const markp
                     = ifp->subtypep() ? ifp->subtypep()->typeMarkp() : nullptr;
-                if (markp && VN_IS(valuep, VhdlBinary)) {
+                // So is an aggregate: PoC's arith_scaler, "MULS : T_POSVEC := (0 => 1)"
+                if (markp && (VN_IS(valuep, VhdlBinary) || VN_IS(valuep, VhdlAggregate))) {
                     valuep = new AstVhdlQualified{flp, markp->cloneTree(false), valuep};
                 }
                 return new AstVhdlAttrName{flp, valuep, attr};

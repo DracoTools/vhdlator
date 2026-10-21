@@ -1808,6 +1808,21 @@ private:
         knownBadNodeType(nodep);
     }
     void visit(AstGetInitialRandomSeed* nodep) override { badNodeType(nodep); }
+    // A VHDL report a constant function makes while a parameter is worked
+    // out is made as the design elaborates, before time has started to
+    // advance (IEEE 1076-2008 14.4.2), and its time is zero. Verilog's
+    // constant functions may not ask for the time at all.
+    void visit(AstTime* nodep) override {
+        if (jumpingOver()) return;
+        if (!m_params || !nodep->fileline()->language().vhdl()) {
+            badNodeType(nodep);
+            return;
+        }
+        checkNodeInfo(nodep, /*ignorePredict:*/ true);
+        if (m_checkOnly || !optimizable()) return;
+        newConst(nodep)->num().setZero();
+    }
+
     // ====
     // default
     // These types are definitely not reducible
