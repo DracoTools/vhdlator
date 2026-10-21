@@ -7384,6 +7384,24 @@ static bool sameUnfoldedSpan(const VhdlType* ap, const VhdlType* bp) {
 }
 
 // The type of the first return statement that has a length of its own
+// Whether an expression in a copy of a subprogram is the same on every call of the copy:
+// a parameter it names is read only for its bounds, or holds the one value the copy was
+// made for, or stands for a generic (specializeSubprogram)
+static bool fixedForCopy(AstNode* exprp) {
+    bool fixed = true;
+    exprp->foreach([&](const AstVhdlName* namep) {
+        const VhdlSymbol* const symp = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        if (!symp || !VN_IS(symp->declp(), VhdlIfaceDecl)) return;
+        if (symp->kind() == VhdlSymKind::PARAMETER && symp->hasValue()) return;
+        // A generic a parameter stands for (m_specStandIns) is fixed for the instance; only
+        // the root's folds here, which there is one of
+        if (symp->kind() == VhdlSymKind::GENERIC) return;
+        const AstVhdlAttrName* const attrp = VN_CAST(namep->backp(), VhdlAttrName);
+        if (!attrp || attrp->prefixp() != namep) fixed = false;
+    });
+    return fixed;
+}
+
 void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& disagreep,
                                       bool skipZero, bool& sawOpen, bool& sawUnfolded, bool top) {
     if (top) m_returnSettled = false;
@@ -7503,19 +7521,13 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
                 const VhdlType* const ctp = altp->condp() ? altp->condp()->vhdlTypep() : nullptr;
                 // Only a condition on what the call fixes for every use of the copy: the
                 // lengths and bounds of its parameters, not their values, which one copy may
-                // be called with many of ("if n > 0", t_vhdl_retmix)
+                // be called with many of ("if n > 0", t_vhdl_retmix) -- unless the copy was
+                // made for the value too, which its parameter then holds (fixedForCopy)
                 bool byShape = ctp != nullptr;
-                if (byShape) {
-                    altp->condp()->foreach([&](const AstVhdlName* namep) {
-                        const VhdlSymbol* const symp
-                            = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
-                        if (!symp || !VN_IS(symp->declp(), VhdlIfaceDecl)) return;
-                        const AstVhdlAttrName* const attrp = VN_CAST(namep->backp(), VhdlAttrName);
-                        if (!attrp || attrp->prefixp() != namep) byShape = false;
-                    });
-                }
+                if (byShape) byShape = fixedForCopy(altp->condp());
                 if (byShape && ctp->base() == V3VhdlStd::booleanType()) {
-                    const VhdlValue cond = V3VhdlEval::eval(altp->condp());
+                    VhdlValue cond = V3VhdlEval::eval(altp->condp());
+                    if (!cond.known()) cond = V3VhdlEval::evalElab(altp->condp());
                     if (cond.isInt() && cond.toInt() == 0) continue;
                     if (cond.isInt()) {
                         AstNode* lastp = altp->stmtsp();
@@ -7541,6 +7553,51 @@ void VhdlSemVisitor::findReturnedType(AstNode* stmtsp, VhdlType*& foundp, bool& 
             continue;
         }
         if (AstVhdlCase* const casep = VN_CAST(p, VhdlCase)) {
+            // A selector the copy fixes runs one alternative, and one that returns is the
+            // result: open-logic's "case crcWidth is when 8 => return x"D5"; when 16 =>
+            // return x"0589"", called with the CRC width
+            if (casep->exprp() && fixedForCopy(casep->exprp())) {
+                // Where a parameter stands for a generic of the root, elaboration knows it
+                VhdlValue sel = V3VhdlEval::eval(casep->exprp());
+                if (!sel.known()) sel = V3VhdlEval::evalElab(casep->exprp());
+                AstVhdlAlternative* takenp = nullptr;
+                AstVhdlAlternative* othersp = nullptr;
+                bool unknownChoice = false;
+                for (AstNode* ap = sel.isInt() ? casep->altsp() : nullptr; ap && !takenp;
+                     ap = ap->nextp()) {
+                    AstVhdlAlternative* const altp = VN_AS(ap, VhdlAlternative);
+                    for (AstNode* cp = altp->choicesp(); cp; cp = cp->nextp()) {
+                        AstVhdlChoice* const choicep = VN_AS(cp, VhdlChoice);
+                        if (choicep->isOthers()) {
+                            othersp = altp;
+                            continue;
+                        }
+                        AstNodeVhdlExpr* const chexprp = VN_CAST(choicep->exprp(), NodeVhdlExpr);
+                        const VhdlValue cv = chexprp ? V3VhdlEval::eval(chexprp) : VhdlValue{};
+                        if (!cv.isInt()) {
+                            unknownChoice = true;
+                            continue;
+                        }
+                        if (cv.toInt() == sel.toInt()) takenp = altp;
+                    }
+                }
+                if (!takenp && !unknownChoice) takenp = othersp;
+                AstNode* lastp = takenp ? takenp->stmtsp() : nullptr;
+                while (lastp && lastp->nextp()) lastp = lastp->nextp();
+                if (VN_IS(lastp, VhdlReturn)) {
+                    VhdlType* settledp = nullptr;
+                    bool dis = false;
+                    bool open = false;
+                    bool unfolded = false;
+                    findReturnedType(takenp->stmtsp(), settledp, dis, false, open, unfolded,
+                                     false);
+                    if (settledp && !dis && !open) {
+                        foundp = settledp;
+                        m_returnSettled = true;
+                        return;
+                    }
+                }
+            }
             for (AstNode* ap = casep->altsp(); ap && !disagreep; ap = ap->nextp()) {
                 findReturnedType(VN_AS(ap, VhdlAlternative)->stmtsp(), foundp, disagreep, skipZero,
                                  sawOpen, sawUnfolded, false);

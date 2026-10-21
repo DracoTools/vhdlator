@@ -35724,10 +35724,84 @@ private:
         }
         return outp;
     }
+    // Where the target of an assignment is a slice whose ends only an
+    // instance or the run settles -- "RdValidPipe(2 to RdLatency_g) <=
+    // RdValidPipe(1 to RdLatency_g - 1)", null where the generic is 1 -- the
+    // assignment does something only where the slice has elements (5.2.1,
+    // 10.5.2.1); a part select the other way round would write one. Null where
+    // there is nothing to guard.
+    AstNodeExpr* nullSliceGuard(AstNodeVhdlExpr* targetp, FileLine* flp) {
+        const AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        const AstVhdlRange* const rangep = callp && callp->argsp() && !callp->argsp()->nextp()
+                                               ? VN_CAST(callp->argsp(), VhdlRange)
+                                               : nullptr;
+        if (!rangep || !rangep->leftp() || !rangep->rightp() || rangep->dirUnknown()) {
+            return nullptr;
+        }
+        if (V3VhdlEval::eval(rangep->leftp()).known()
+            && V3VhdlEval::eval(rangep->rightp()).known()) {
+            return nullptr;
+        }
+        // Only ends the instance settles: one a variable gives may be null
+        // where the value is not, which is an error the assignment reports
+        bool settled = true;
+        rangep->foreach([&](const AstNodeVhdlExpr* exprp) {
+            const VhdlSymbol* const symp
+                = exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+            if (!symp) return;
+            switch (symp->kind()) {
+            case VhdlSymKind::GENERIC:
+            case VhdlSymKind::GENERATE_PARAMETER:
+            case VhdlSymKind::ENUM_LITERAL: break;
+            case VhdlSymKind::CONSTANT:
+                if (m_ftaskp) settled = false;
+                break;
+            case VhdlSymKind::FUNCTION:
+                if (!symp->predefined()) settled = false;
+                break;
+            default: settled = false;
+            }
+        });
+        if (!settled) return nullptr;
+        const VhdlType* const ltp = rangep->leftp()->vhdlTypep();
+        if (!ltp || ltp->base()->kind() != VhdlTypeKind::INTEGER) return nullptr;
+        AstNodeExpr* const lp = lowerExpr(rangep->leftp());
+        AstNodeExpr* const rp = lp ? lowerExpr(rangep->rightp()) : nullptr;
+        if (!rp) {
+            if (lp) VL_DO_DANGLING(lp->deleteTree(), lp);
+            return nullptr;
+        }
+        return rangep->dir() == VhdlDir::TO ? static_cast<AstNodeExpr*>(new AstLteS{flp, lp, rp})
+                                            : new AstGteS{flp, lp, rp};
+    }
+    // The assignment under such a guard, where the slices it names are null
+    // in some instances: what the back end says about their places there is
+    // no finding, the assignment not being made
+    static AstNode* guardedBy(AstNodeExpr* guardp, AstNode* stmtsp, FileLine* flp) {
+        std::map<FileLine*, FileLine*> quiet;
+        for (AstNode* sp = stmtsp; sp; sp = sp->nextp()) {
+            sp->foreach([&](AstNode* np) {
+                FileLine*& qflp = quiet[np->fileline()];
+                if (!qflp) {
+                    qflp = new FileLine{np->fileline()};
+                    qflp->warnOff(V3ErrorCode::SELRANGE, true);
+                    qflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                    qflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                }
+                np->fileline(qflp);
+            });
+        }
+        return new AstIf{flp, guardp, stmtsp, nullptr};
+    }
     AstNode* lowerStmtInner(AstNodeVhdlStmt* nodep) {
         FileLine* const flp = nodep->fileline();
         if (AstVhdlSigAssign* const asgp = VN_CAST(nodep, VhdlSigAssign)) {
-            AstNode* const outp = lowerSeqAssign(asgp, true);
+            AstNode* outp = lowerSeqAssign(asgp, true);
+            if (outp && asgp->targetp()) {
+                if (AstNodeExpr* const guardp = nullSliceGuard(asgp->targetp(), flp)) {
+                    outp = guardedBy(guardp, outp, flp);
+                }
+            }
             // A postponed process that schedules a transaction for the next delta cycle is an
             // error (14.7.5.3), where nvc and GHDL stop the run and Questa reports one
             if (outp && m_postponed && v3Global.opt.vhdlBoundCheck() && zeroDelayWave(asgp)) {
@@ -35742,7 +35816,13 @@ private:
             return outp;
         }
         if (AstVhdlVarAssign* const asgp = VN_CAST(nodep, VhdlVarAssign)) {
-            return lowerVarAssign(asgp);
+            AstNode* outp = lowerVarAssign(asgp);
+            if (outp && asgp->targetp()) {
+                if (AstNodeExpr* const guardp = nullSliceGuard(asgp->targetp(), flp)) {
+                    outp = guardedBy(guardp, outp, flp);
+                }
+            }
+            return outp;
         }
         if (AstVhdlIf* const ifp = VN_CAST(nodep, VhdlIf)) return lowerIf(ifp);
         if (AstVhdlCase* const casep = VN_CAST(nodep, VhdlCase)) return lowerCase(casep);
@@ -35851,6 +35931,27 @@ private:
                 && vtypep->isConstrainedArray() && vtypep->dimLength(0) == 0
                 && !isStringType(vtypep) && (isLogicish(velemp) || nineValued(velemp))) {
                 return new AstReturn{flp, new AstConst{flp, AstConst::All0{}}};
+            }
+            // A literal whose length is a number other than the result's, where
+            // the copy's result was settled by the path its call takes: the
+            // return on another path is an error if it is ever reached (4.2.1,
+            // 10.5.2.1), and is no assignment of one width to another
+            const int64_t fixedLen = fixedRetp && fixedRetp->isConstrainedArray()
+                                             && fixedRetp->indexTypes().size() == 1
+                                             && fixedRetp->indexTypes()[0]
+                                             && fixedRetp->indexTypes()[0]->bounded()
+                                         ? fixedRetp->dimLength(0)
+                                         : -1;
+            // Only a literal's: what spells it is its length, where another
+            // value's subtype may be the whole type rather than its length
+            const int64_t valueLen = fixedLen >= 0 && VN_IS(retp->valuep(), VhdlLiteral) && vtypep
+                                         ? staticArrayLength(retp->valuep(), vtypep)
+                                         : -1;
+            if (fixedLen >= 0 && valueLen >= 0 && valueLen != fixedLen && VN_IS(m_ftaskp, Func)
+                && !isDynValue(retp->valuep())) {
+                AstNode* const outp = lengthMismatch(flp);
+                outp->addNext(new AstReturn{flp, new AstConst{flp, AstConst::All0{}}});
+                return outp;
             }
             // A function's result is of its return subtype: "return -3" from
             // one returning NATURAL is an error when it returns (4.2.1),
