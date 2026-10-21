@@ -37225,8 +37225,10 @@ private:
             if (AstNodeExpr* const outp = recordAsShape(valuep, shapep, flp)) return outp;
         }
         if (!valuep) return nullptr;
-        AstNodeExpr* const outp = rangeChecked(
-            lowerExpr(valuep), targetp ? targetp->vhdlTypep() : nullptr, valuep, flp);
+        AstNodeExpr* outp = rangeChecked(lowerExpr(valuep),
+                                         targetp ? targetp->vhdlTypep() : nullptr, valuep, flp);
+        // A signal that carries its bounds keeps them (reboundToTarget)
+        if (targetp && isDynValue(valuep)) outp = reboundToTarget(targetp, outp, flp);
         return targetp ? elabLengthChecked(outp, targetp->vhdlTypep(), valuep, flp) : outp;
     }
 
@@ -38697,9 +38699,10 @@ private:
             return lengthMismatch(flp);
         }
         AstNodeExpr* const lhsp = lowerDriveTarget(nodep->targetp());
-        AstNodeExpr* const rhsp
+        AstNodeExpr* rhsp
             = valuep ? rangeChecked(lowerExpr(valuep), nodep->targetp()->vhdlTypep(), valuep, flp)
                      : nullptr;
+        if (valuep && isDynValue(valuep)) rhsp = reboundToTarget(nodep->targetp(), rhsp, flp);
         if (!lhsp || !rhsp) return nullptr;
         if (textLengthUnsettled(nodep->targetp(), valuep, lhsp)) {
             return lengthCheckedTextAssign(VN_AS(lhsp, VarRef), rhsp, flp);
@@ -40601,6 +40604,74 @@ private:
         (void)namep;
         AstNode* outp = AstNode::addNextNull(prep, new AstStmtExpr{flp, refp});
         return AstNode::addNextNull(outp, postp);
+    }
+
+    // A value carried with its bounds, given those of the object it is
+    // assigned to: an assignment keeps the target's index range and matches
+    // the elements by position (10.6.2.1), so the value takes the target's
+    // ends and direction, the lengths checked where it runs. PoC's
+    // arith_addw, "s0 <= ('0' & aa) + bb", s0 "unsigned(HI+1 downto LO)" from
+    // generate constants: s0 took the sum's "5 downto 0".
+    std::map<const VhdlType*, AstNodeFTask*> m_dynReboundFuncs;
+    AstNodeFTask* dynReboundFunc(VhdlType* carrierTypep, FileLine* origFlp) {
+        const auto it = m_dynReboundFuncs.find(carrierTypep->base());
+        if (it != m_dynReboundFuncs.end() && usableHelper(it->second)) return it->second;
+        if (!m_modp) return nullptr;
+        FileLine* const flp = dynFl(origFlp);
+        AstFunc* const funcp
+            = newDynFunc("__Vdynrebound", carrierTypep, dynCarrierRef(carrierTypep, flp), flp);
+        AstVar* const vp = dynArg(funcp, "v", dynCarrierRef(carrierTypep, flp), flp);
+        AstVar* const lftp = dynArg(funcp, "lft", newIntDType(flp), flp);
+        AstVar* const rgtp = dynArg(funcp, "rgt", newIntDType(flp), flp);
+        AstVar* const dscp = dynArg(funcp, "dsc", bitDType(flp), flp);
+        const auto out
+            = [&]() { return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), VAccess::WRITE}; };
+        funcp->addStmtsp(new AstAssign{flp, out(), rd(vp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "lft", flp), rd(lftp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "rgt", flp), rd(rgtp, flp)});
+        funcp->addStmtsp(new AstAssign{flp, dynPart(out(), "dsc", flp), rd(dscp, flp)});
+        // As many elements as the target's ends say, or the assignment is an
+        // error (10.6.2.1)
+        AstNodeExpr* const spanp = new AstAdd{
+            flp,
+            new AstCond{flp, rd(dscp, flp), new AstSub{flp, rd(lftp, flp), rd(rgtp, flp)},
+                        new AstSub{flp, rd(rgtp, flp), rd(lftp, flp)}},
+            new AstConst{flp, AstConst::Signed32{}, 1}};
+        AstNodeExpr* const nlenp = new AstCond{
+            flp,
+            new AstGtS{flp, spanp->cloneTree(false), new AstConst{flp, AstConst::Signed32{}, 0}},
+            spanp, new AstConst{flp, AstConst::Signed32{}, 0}};
+        funcp->addStmtsp(new AstIf{flp, new AstNeq{flp, nlenp, dynCarrierLength(rd(vp, flp), flp)},
+                                   lengthMismatch(flp)});
+        addHelperFunc(funcp);
+        m_dynReboundFuncs.insert_or_assign(carrierTypep->base(), funcp);
+        return funcp;
+    }
+    // The value of an assignment to a declared object that carries its
+    // bounds, under that object's bounds (dynReboundFunc); the value as it is
+    // for any other target
+    AstNodeExpr* reboundToTarget(AstNodeVhdlExpr* targetp, AstNodeExpr* rhsp, FileLine* flp) {
+        if (!rhsp || !loweredIsCarrier(rhsp)) return rhsp;
+        const AstVhdlName* const namep = VN_CAST(targetp, VhdlName);
+        const VhdlSymbol* const symp
+            = namep && namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+        if (!symp
+            || (symp->kind() != VhdlSymKind::VARIABLE && symp->kind() != VhdlSymKind::SIGNAL)) {
+            return rhsp;
+        }
+        const auto vit = m_vars.find(symp);
+        AstVar* const varp = vit != m_vars.end() ? vit->second : nullptr;
+        if (!varp || !isCarrierDType(varp->childDTypep()) || !symp->typep()) return rhsp;
+        AstNodeFTask* const funcp = dynReboundFunc(symp->typep(), flp);
+        if (!funcp) return rhsp;
+        const auto tgt = [&]() { return new AstVarRef{flp, varp, VAccess::READ}; };
+        AstArg* const argsp = new AstArg{flp, "", rhsp};
+        argsp->addNext(new AstArg{flp, "", dynPart(tgt(), "lft", flp)});
+        argsp->addNext(new AstArg{flp, "", dynPart(tgt(), "rgt", flp)});
+        argsp->addNext(new AstArg{flp, "", dynPart(tgt(), "dsc", flp)});
+        AstFuncRef* const refp = new AstFuncRef{flp, funcp->name(), argsp};
+        refp->taskp(VN_AS(funcp, Func));
+        return refp;
     }
 
     // A slice of an object whose ends only running settles, as a value that
