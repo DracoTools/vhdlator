@@ -4930,6 +4930,20 @@ private:
         if (ninePlanned(nodep)) return false;
         if (isDynObj(nodep)) return true;
         if (carriedElementRead(nodep)) return true;
+        // An element of a record object held as a structure whose member for
+        // it is a carrier, whatever subtype the name was given: the record
+        // constant elaboration worked out, "CrcSettings_c.initialValue"
+        if (const AstVhdlSelected* const selp = VN_CAST(nodep, VhdlSelected)) {
+            const AstVhdlName* const pnp = VN_CAST(selp->prefixp(), VhdlName);
+            const AstVhdlName* const snp = VN_CAST(selp->suffixp(), VhdlName);
+            if (pnp && snp && pnp->vhdlSymp()) {
+                const auto vit = m_vars.find(pnp->vhdlSymp()->resolved());
+                if (vit != m_vars.end()
+                    && memberIsCarrier(vit->second, VString::downcase(snp->name()))) {
+                    return true;
+                }
+            }
+        }
         if (isAccessAll(nodep)) return true;
         if (runningRangeAggregate(nodep)) return true;
         if (dynResultCall(nodep)) return true;
@@ -6001,6 +6015,11 @@ private:
         if (!funcp) return nullptr;
         AstNodeExpr* const valuep = lowerExpr(nodep);
         if (!valuep) return nullptr;
+        // Already one, though its subtype says a length: an element of a
+        // record constant held with its bounds, the subtype taken from the
+        // value elaboration gave it (open-logic's olo_base_pkg_crc_tb,
+        // "CrcSettings_c.initialValue")
+        if (loweredIsCarrier(valuep)) return valuep;
         AstFuncRef* const refp
             = new AstFuncRef{flp, funcp->name(), new AstArg{flp, "", valuep}};
         refp->taskp(funcp);
@@ -24367,6 +24386,30 @@ private:
             const AstVar* const retp = funcp ? VN_CAST(funcp->fvarp(), Var) : nullptr;
             return retp && isCarrierDType(retp->childDTypep());
         }
+        // An element of a record held as a structure, where the element is
+        // one: "CrcSettings_c.initialValue" of a record with open elements
+        if (const AstMemberSel* const selp = VN_CAST(exprp, MemberSel)) {
+            const AstVarRef* const refp = VN_CAST(selp->fromp(), VarRef);
+            return refp && memberIsCarrier(refp->varp(), selp->name());
+        }
+        return false;
+    }
+    // Whether a variable held as a structure has a member of this name that
+    // is a carrier
+    static bool memberIsCarrier(const AstVar* varp, const std::string& name) {
+        const AstNodeDType* dtypep = varp ? varp->childDTypep() : nullptr;
+        for (int depth = 0; depth < 8 && dtypep; ++depth) {
+            const AstRefDType* const rdp = VN_CAST(dtypep, RefDType);
+            if (!rdp) break;
+            dtypep = rdp->refDTypep()  ? rdp->refDTypep()
+                     : rdp->typedefp() ? rdp->typedefp()->childDTypep()
+                                       : nullptr;
+        }
+        const AstNodeUOrStructDType* const sp = VN_CAST(dtypep, NodeUOrStructDType);
+        for (const AstMemberDType* mp = sp ? sp->membersp() : nullptr; mp;
+             mp = VN_CAST(mp->nextp(), MemberDType)) {
+            if (mp->name() == name) return isCarrierDType(mp->childDTypep());
+        }
         return false;
     }
 
@@ -34631,6 +34674,26 @@ private:
                 && !VN_IS(asp->actualp(), VhdlOpen)) {
                 if (AstNodeExpr* const posp = logicPosOf(asp->actualp(), flp)) {
                     m_logicPosPins[pinp] = posp;
+                }
+            }
+            // A constant elaboration settled whose declaration is a variable
+            // here -- its value calls an impure function -- hands the
+            // generic the value elaboration gave it: open-logic's
+            // olo_base_pkg_crc_tb, "Polynomial_g => CrcSettings_c.polynomial",
+            // the constant from a function that allocates and logs
+            if (asp->actualp() && pinp->exprp() && !valueFolds(pinp->exprp())) {
+                VhdlValue val = V3VhdlEval::eval(asp->actualp());
+                if (!val.known()) val = V3VhdlEval::evalElab(asp->actualp());
+                VhdlType* const vtypep
+                    = gsymp && gsymp->typep() && gsymp->typep()->isConstrainedArray()
+                          ? gsymp->typep()
+                          : asp->actualp()->vhdlTypep();
+                AstNodeExpr* const valp
+                    = val.known() && vtypep ? lowerWholeValue(val, vtypep, flp) : nullptr;
+                if (valp) {
+                    AstNode* const oldp = pinp->exprp();
+                    oldp->replaceWith(valp);
+                    VL_DO_DANGLING(oldp->deleteTree(), oldp);
                 }
             }
             pinp->name(boundGenericName(pinp->name()));
