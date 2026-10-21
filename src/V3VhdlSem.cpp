@@ -274,6 +274,9 @@ class VhdlSemVisitor final : public VNVisitor {
     // hands it a generic whose value only elaboration settles; null where
     // nothing (specializeSubprogram)
     std::vector<AstNodeVhdlExpr*> m_specStandIns;
+    // The parameters of the copies being analyzed now that read what they stand
+    // for once analyzed, so a bound naming one is as settled as the generic is
+    std::set<const AstVhdlIfaceDecl*> m_standInDecls;
     // A package body continues the package declaration's declarative region
     // (12.1), so what it declares completes an earlier declaration rather
     // than making a second one
@@ -7151,6 +7154,42 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     m_scopep = regionp;
     m_returnTypep = nullptr;
     m_specValues = actualValues;
+    // A parameter the call hands a generic of the region the subprogram is
+    // declared in is that generic wherever the copy reads it, bounds of its
+    // declarations included -- which is what lets the result's subtype be
+    // read off the body below as one the instance settles. Which ones is
+    // settled before the body is analyzed, so a bound naming one is taken as
+    // the generic's there (analyzeSliceName); the names are replaced after.
+    // Taken now, since a copy the body asks for sets its own.
+    std::map<const AstVhdlIfaceDecl*, const VhdlSymbol*> standDecls;
+    {
+        size_t k = 0;
+        for (AstNode* p = firstp; p; p = p->nextp(), ++k) {
+            const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
+            if (k >= m_specStandIns.size() || !m_specStandIns[k]) continue;
+            const VhdlSymbol* const genp = m_specStandIns[k]->vhdlSymp()->resolved();
+            // A generic of the instance calling a package's subprogram is not
+            // visible where the subprogram is declared, and the names below
+            // are bound to it directly, so that is no obstacle: the copy is
+            // then emitted where the call is (namesForeignGeneric). Only a
+            // name that means something else there is left alone -- and a
+            // protected type's method, which is one class however many
+            // instances call it, so cannot read any one instance's generic.
+            std::vector<VhdlSymbol*> found;
+            regionp->lookup(genp->name(), found);
+            if (!found.empty() && (found.size() != 1 || found[0]->resolved() != genp)) continue;
+            if (found.empty()) {
+                bool inProtected = false;
+                for (const AstNode* np = originalp; np && !inProtected; np = np->backp()) {
+                    if (VN_IS(np, VhdlProtectedType)) inProtected = true;
+                }
+                if (inProtected) continue;
+            }
+            standDecls.emplace(ifp, genp);
+        }
+    }
+    VL_RESTORER_COPY(m_standInDecls);
+    for (const auto& it : standDecls) m_standInDecls.insert(it.first);
     // A copy of a subprogram of an instantiated package is that package's own
     // source, wherever it is analyzed (4.7)
     VL_RESTORER(m_inPackageInstance);
@@ -7173,35 +7212,10 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
         VhdlScope::hide2008(savedHide);
     }
     m_specValues.clear();
-    // A parameter the call hands a generic of the region the subprogram is
-    // declared in is that generic wherever the copy reads it, bounds of its
-    // declarations included -- which is what lets the result's subtype be
-    // read off the body below as one the instance settles
-    if (!m_specStandIns.empty()) {
+    if (!standDecls.empty()) {
         std::map<const VhdlSymbol*, const VhdlSymbol*> stands;
-        size_t k = 0;
-        for (AstNode* p = firstp; p; p = p->nextp(), ++k) {
-            const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
-            if (k >= m_specStandIns.size() || !m_specStandIns[k] || !ifp->vhdlSymp()) continue;
-            const VhdlSymbol* const genp = m_specStandIns[k]->vhdlSymp()->resolved();
-            // A generic of the instance calling a package's subprogram is not
-            // visible where the subprogram is declared, and the names below
-            // are bound to it directly, so that is no obstacle: the copy is
-            // then emitted where the call is (namesForeignGeneric). Only a
-            // name that means something else there is left alone -- and a
-            // protected type's method, which is one class however many
-            // instances call it, so cannot read any one instance's generic.
-            std::vector<VhdlSymbol*> found;
-            regionp->lookup(genp->name(), found);
-            if (!found.empty() && (found.size() != 1 || found[0]->resolved() != genp)) continue;
-            if (found.empty()) {
-                bool inProtected = false;
-                for (const AstNode* np = originalp; np && !inProtected; np = np->backp()) {
-                    if (VN_IS(np, VhdlProtectedType)) inProtected = true;
-                }
-                if (inProtected) continue;
-            }
-            stands.emplace(ifp->vhdlSymp(), genp);
+        for (const auto& it : standDecls) {
+            if (it.first->vhdlSymp()) stands.emplace(it.first->vhdlSymp(), it.second);
         }
         if (!stands.empty()) {
             std::vector<AstVhdlName*> refs;
@@ -8178,6 +8192,20 @@ private:
         return true;
     }
 
+    // Whether a type is a record of integers alone, which a parameter can read
+    // a generic or a unit constant of in place of (specStandIns) as it reads an
+    // integer one: each element is one more integer the instance settles
+    static bool integerRecord(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        if (typep->elements().empty()) return false;
+        for (const VhdlSymbol* const ep : typep->elements()) {
+            if (!ep->typep() || ep->typep()->base()->kind() != VhdlTypeKind::INTEGER) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // How many copies of a subprogram are being made or walked, each inside
     // the one before
     size_t nestedCopies(const VhdlSymbol* symp) const {
@@ -8275,10 +8303,14 @@ private:
                 const bool unitConstant = asymp && asymp->kind() == VhdlSymKind::CONSTANT
                                           && asymp->declScopep()
                                           && asymp->declScopep()->designRoot();
+                // A record of integers too: en_cl_fix's "cl_fix_from_real(a,
+                // result_fmt)" returns "Result_v(cl_fix_width(result_fmt)-1 downto 0)"
+                // for a format an architecture works out from a string generic
                 if (!actualValues.back().known() && VN_IS(standp, VhdlName) && asymp
                     && (asymp->kind() == VhdlSymKind::GENERIC || unitConstant)
                     && symp->paramTypes()[i]
-                    && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::INTEGER) {
+                    && (symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::INTEGER
+                        || integerRecord(symp->paramTypes()[i]))) {
                     standIns.resize(nparams, nullptr);
                     standIns[i] = standp;
                 }
@@ -14261,6 +14293,8 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
         // function the analysis does not fold (GHDL gna issue2540). A
         // variable's or a loop parameter's value arrives only while running.
         AstVhdlRange* rp = VN_CAST(nodep->argsp(), VhdlRange);
+        // Whether the range is one a 'RANGE attribute names, a subtype's as declared
+        const bool fromAttr = rp && !rp->leftp();
         // A slice by a subtype's name, which the analysis writes "v(T'range)", is as long as
         // the range the subtype's declaration writes: OSVVM's "NormalizedAddr(WordAddrRange)",
         // WordAddrRange "natural range WORD_ADDR_WIDTH - 1 downto BYTE_ADDR_WIDTH"
@@ -14285,6 +14319,17 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
                 && msymp->typep()->indexTypes().size() == 1 && msymp->typep()->indexTypes()[0]) {
                 rp = VN_CAST(msymp->typep()->indexTypes()[0]->boundsp(), VhdlRange);
             }
+            // And by a record element's, "CmdRd_Addr(v.RdShift'range)", as long as the
+            // range of the subtype the element was declared with (open-logic's
+            // olo_axi_master_full): the whole of the object sliced, before
+            const AstVhdlSelected* const selp = attrp && attrp->name() == "range"
+                                                    ? VN_CAST(attrp->prefixp(), VhdlSelected)
+                                                    : nullptr;
+            const VhdlType* const etp = selp && selp->suffixp() ? selp->vhdlTypep() : nullptr;
+            if (!rp && etp && etp->base()->kind() == VhdlTypeKind::ARRAY
+                && etp->indexTypes().size() == 1 && etp->indexTypes()[0]) {
+                rp = VN_CAST(etp->indexTypes()[0]->boundsp(), VhdlRange);
+            }
         }
         if (rp) {
             bool onlyGenerics = true;
@@ -14298,8 +14343,16 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
             // Names other than generics only where the object sliced has no
             // numbers for its own range either: elsewhere a slice whose ends
             // do not fold keeps the path it always had
-            const bool prefixOpen = !indexp || !indexp->bounded();
+            // -- or where the range is a declared subtype's, which elaboration settles
+            // however the object sliced is constrained: "addr(v.shift'range)" with
+            // shift's subtype written in a constant of the generics
+            const bool prefixOpen = !indexp || !indexp->bounded() || fromAttr;
             rp->foreach([&](AstVhdlName* namep) {
+                // An element's name after the dot names no object: what it
+                // selects from is the name that counts
+                if (const AstVhdlSelected* const selp = VN_CAST(namep->backp(), VhdlSelected)) {
+                    if (selp->suffixp() == namep) return;
+                }
                 // The name a call is written on carries no symbol of its own;
                 // the call does
                 const AstVhdlCall* const callp = VN_CAST(namep->backp(), VhdlCall);
@@ -14314,6 +14367,13 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
                     return;
                 }
                 if (nsymp->kind() == VhdlSymKind::GENERIC) return;
+                // A parameter of this copy that reads a generic or a unit
+                // constant in its place (specializeSubprogram) is as settled:
+                // "Result_v(cl_fix_width(result_fmt) - 1 downto 0)"
+                if (nsymp->kind() == VhdlSymKind::PARAMETER
+                    && m_standInDecls.count(VN_CAST(nsymp->declp(), VhdlIfaceDecl))) {
+                    return;
+                }
                 if (!prefixOpen) {
                     onlyGenerics = false;
                     return;
@@ -14322,6 +14382,13 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
                 case VhdlSymKind::ENUM_LITERAL:
                 case VhdlSymKind::PHYSICAL_UNIT: return;
                 case VhdlSymKind::CONSTANT:
+                    if (!outsideSubprogram(nsymp)) onlyGenerics = false;
+                    return;
+                // A subtype's attribute, as a constant's value: "t(DatBeRange_c)"
+                // with "subtype DatBeRange_c is natural range AxiDataWidth_g/8 +
+                // DatDataRange_c'high downto DatDataRange_c'high + 1" in
+                // open-logic's olo_axi_master_simple_tb
+                case VhdlSymKind::TYPE:
                     if (!outsideSubprogram(nsymp)) onlyGenerics = false;
                     return;
                 case VhdlSymKind::FUNCTION: {
@@ -14334,10 +14401,21 @@ VhdlType* VhdlSemVisitor::analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp)
                 case VhdlSymKind::SIGNAL:
                 case VhdlSymKind::PORT:
                 case VhdlSymKind::VARIABLE: {
-                    // Only as the prefix of an attribute of its subtype
-                    const AstVhdlAttrName* const ap = VN_CAST(namep->backp(), VhdlAttrName);
+                    // Only as the prefix of an attribute of its subtype -- or of
+                    // an element's, reached through selections: "r.v'high" for a
+                    // record whose element v is sized by generics (open-logic's
+                    // olo_axi_master_full, "r.RdAlignByteVld'high downto DataBytes_c")
+                    const AstNode* prefixp = namep;
+                    while (const AstVhdlSelected* const selp
+                           = VN_CAST(prefixp->backp(), VhdlSelected)) {
+                        // Not ".all": what an access value points at is as long as
+                        // allocating it made it, which only running does
+                        if (selp->prefixp() != prefixp || !selp->suffixp()) break;
+                        prefixp = selp;
+                    }
+                    const AstVhdlAttrName* const ap = VN_CAST(prefixp->backp(), VhdlAttrName);
                     const bool subtypeAttr
-                        = ap && ap->prefixp() == namep && !ap->argp()
+                        = ap && ap->prefixp() == prefixp && !ap->argp()
                           && (ap->name() == "left" || ap->name() == "right" || ap->name() == "high"
                               || ap->name() == "low" || ap->name() == "length");
                     if (!subtypeAttr || !outsideSubprogram(nsymp)) onlyGenerics = false;
