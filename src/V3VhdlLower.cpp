@@ -9257,6 +9257,9 @@ private:
         const VhdlType* const typep = symp->typep();
         if (!typep || typep->isError()) return false;
         if (scalarKind(typep)) return true;
+        // A record of numbers, and a table of them: open-logic's fixed-point
+        // formats, "(0, 1, 13)", looked up by name in a package's table
+        if (numberRecord(typep)) return true;
         const VhdlType* const basep = typep->base();
         if (basep->kind() != VhdlTypeKind::ARRAY) return false;
         if (basep->indexTypes().size() != 1) return false;
@@ -9267,8 +9270,25 @@ private:
         case VhdlTypeKind::INTEGER:
         case VhdlTypeKind::PHYSICAL:
         case VhdlTypeKind::FLOATING: return true;
+        case VhdlTypeKind::RECORD: return numberRecord(elemp);
         default: return false;
         }
+    }
+    // A record whose elements are all integers or physical values: one that
+    // packs, which a parameter's value can be (a real has no packed form)
+    static bool numberRecord(const VhdlType* typep) {
+        if (!typep || typep->base()->kind() != VhdlTypeKind::RECORD) return false;
+        if (typep->base()->elements().empty()) return false;
+        for (const VhdlSymbol* const ep : typep->base()->elements()) {
+            const VhdlType* const etp = ep ? ep->typep() : nullptr;
+            if (!etp) return false;
+            switch (etp->base()->kind()) {
+            case VhdlTypeKind::INTEGER:
+            case VhdlTypeKind::PHYSICAL: break;
+            default: return false;
+            }
+        }
+        return true;
     }
 
     bool parameterizable(const VhdlType* typep) {
@@ -33986,7 +34006,18 @@ private:
             // Only where the formal names a slice of the port: "p.a => x"
             // names one element of a record, and the signal standing in for
             // the port is the whole record, not that element
-            if (VN_IS(asp->formalp(), VhdlCall) && dependsOnGeneric(standTypep)
+            // -- and only where that slice is the one part named: several
+            // parts together are the port, which the first of them is not
+            // ("i(3 downto 0) => d, i(4) => v", open-logic's flow control
+            // handler testbench wiring a delay)
+            size_t partsNamed = 0;
+            for (AstNode* q = nodep->portMapp(); q; q = q->nextp()) {
+                const AstVhdlAssoc* const qasp = VN_AS(q, VhdlAssoc);
+                AstNodeVhdlExpr* const qrootp = individualRoot(qasp->formalp());
+                const AstVhdlName* const qnamep = VN_CAST(qrootp, VhdlName);
+                if (qnamep && qnamep->vhdlSymp() == symp) ++partsNamed;
+            }
+            if (partsNamed == 1 && VN_IS(asp->formalp(), VhdlCall) && dependsOnGeneric(standTypep)
                 && asp->formalp()->vhdlTypep()
                 && asp->formalp()->vhdlTypep()->base() == standTypep->base()
                 && !dependsOnGeneric(asp->formalp()->vhdlTypep())) {
@@ -34669,6 +34700,42 @@ private:
         // can carry: elaboration works each out over what this instance
         // hands that generic, and the number goes over as a parameter
         paramsp = AstNode::addNextNull(paramsp, hoistedPins(modName, nodep, &pinNum));
+        // A signal standing for a port that formals name parts of has the
+        // port's type, whose bounds read those parameters: here they are what
+        // this instance hands them, not this module's own of the same name,
+        // which keep their defaults -- VUnit's axi_stream_master given
+        // "tdata(0) => next, tdata(1) => repeat" in open-logic's packet FIFO
+        // testbench, its width a function of the master's record
+        {
+            std::map<std::string, AstNodeExpr*> hoistVals;
+            for (AstNode* p = paramsp; p; p = p->nextp()) {
+                AstPin* const hpinp = VN_CAST(p, Pin);
+                AstNodeExpr* const hvalp = hpinp ? VN_CAST(hpinp->exprp(), NodeExpr) : nullptr;
+                if (hvalp && VString::startsWith(hpinp->name(), "__Vgb")) {
+                    hoistVals.emplace(hpinp->name(), hvalp);
+                }
+            }
+            const auto fixUp = [&](AstVar* varp) {
+                if (!varp || !varp->childDTypep()) return;
+                std::vector<AstVarRef*> refs;
+                varp->childDTypep()->foreach([&](AstVarRef* refp) {
+                    const auto hvIt = hoistVals.find(refp->varp()->name());
+                    const auto hvarIt = m_hoistVars.find(refp->varp()->name());
+                    if (hvIt != hoistVals.end() && hvarIt != m_hoistVars.end()
+                        && hvarIt->second == refp->varp()) {
+                        refs.push_back(refp);
+                    }
+                });
+                for (AstVarRef* const refp : refs) {
+                    refp->replaceWith(hoistVals.at(refp->varp()->name())->cloneTree(false));
+                    VL_DO_DANGLING(refp->deleteTree(), refp);
+                }
+            };
+            if (!hoistVals.empty()) {
+                for (const auto& pair : partial) fixUp(pair.second);
+                for (const auto& pair : partialDrv) fixUp(pair.second);
+            }
+        }
         paramsp = AstNode::addNextNull(paramsp, portDefaultPins(modName, nodep, &pinNum));
         // A copy made for a generic type sized by a generic of this unit
         // takes that generic's value here

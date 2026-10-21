@@ -3498,6 +3498,16 @@ void VhdlSemVisitor::visit(AstVhdlObjectDecl* nodep) {
                 const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
                 if (elab.known() && !elab.isComposite()) val = elab;
             }
+            // The same for an architecture's, from what elaboration knows: the
+            // generics of the root alone, which there is one of. open-logic's
+            // "constant FixedLimLo_c : real := real'value(FixedLimLo_g)", the
+            // generic a string the testbench is given.
+            if (!val.known() && nodep->defaultp() && VN_IS(parentOf(nodep), VhdlArchitecture)
+                && !m_inSpecialized && !inGenericTemplate(nodep) && symp->typep()
+                && symp->typep()->isScalar() && !callsImpure(nodep->defaultp())) {
+                const VhdlValue elab = V3VhdlEval::evalElab(nodep->defaultp());
+                if (elab.known() && !elab.isComposite()) val = elab;
+            }
             V3VhdlEval::s_elabNow = savedElabNow;
             V3VhdlEval::s_elabReportsp = savedSinkp;
             if (val.known() && !reports.empty()) {
