@@ -257,6 +257,7 @@ static bool vhdlSlicedFormal(const AstNodeVhdlExpr* formalp, std::string& root);
 class VhdlSemVisitor final : public VNVisitor {
     // STATE
     VhdlScope* m_scopep = nullptr;  // Region being filled
+    VhdlScope* m_lateRegionp = nullptr;  // Where an instance asked again is (rebindOpenGenerics)
     std::string m_genLabel;  // Label of the generate whose body is being filled
     VhdlScope* m_rootp = nullptr;  // Outermost region, holding library names
     std::map<std::string, VhdlScope*> m_libs;  // Library name -> its region
@@ -2846,7 +2847,8 @@ private:
                                bool late = false) VL_MT_DISABLED;
     // Instances whose unconstrained generic was given a value with no length
     // yet -- a call, or a constant whose own bounds come from one
-    std::vector<std::pair<AstVhdlInstance*, VhdlScope*>> m_lateOpenGenerics;
+    // An instance asked again, the entity's region, and the instance's own
+    std::vector<std::tuple<AstVhdlInstance*, VhdlScope*, VhdlScope*>> m_lateOpenGenerics;
 
 public:
     void rebindOpenGenerics() VL_MT_DISABLED;
@@ -4700,6 +4702,16 @@ void VhdlSemVisitor::recordUserAttr(AstVhdlAttrSpec* nodep) {
             if (!ofClass(symp)) continue;
             anyOfClass = true;
             if (symp->declScopep() == m_scopep) anyHere = true;
+            // A port or generic of the entity given an attribute in its
+            // architecture's own declarative part, as Vivado's IP integrator
+            // wrappers write "attribute X_INTERFACE_INFO of S_AXI_RREADY :
+            // signal is ..." (SLAC's surf): nvc 1.22.1 and Questa 2025.2 take
+            // it, GHDL 7.0.0-dev only relaxed
+            const VhdlSymKind kind = symp->resolved()->kind();
+            if ((kind == VhdlSymKind::PORT || kind == VhdlSymKind::GENERIC) && m_archEntityScopep
+                && m_scopep == m_archScopep && symp->declScopep() == m_archEntityScopep) {
+                anyHere = true;
+            }
         }
         if (!found.empty() && !anyOfClass && !m_inSpecialized) {
             err(namep->fileline(), "'" + parts.back() + "' is not of entity class " + cls
@@ -7161,13 +7173,24 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     // settled before the body is analyzed, so a bound naming one is taken as
     // the generic's there (analyzeSliceName); the names are replaced after.
     // Taken now, since a copy the body asks for sets its own.
-    std::map<const AstVhdlIfaceDecl*, const VhdlSymbol*> standDecls;
+    // A stand-in is a generic's or a unit constant's name, or an integer expression over
+    // them -- surf's RstSync, "slvAll(RELEASE_DELAY_G-1, OUT_POLARITY_G)" -- read as a
+    // copy of that expression
+    std::map<const AstVhdlIfaceDecl*, const AstNodeVhdlExpr*> standDecls;
     {
         size_t k = 0;
         for (AstNode* p = firstp; p; p = p->nextp(), ++k) {
             const AstVhdlIfaceDecl* const ifp = VN_AS(p, VhdlIfaceDecl);
             if (k >= m_specStandIns.size() || !m_specStandIns[k]) continue;
-            const VhdlSymbol* const genp = m_specStandIns[k]->vhdlSymp()->resolved();
+            const AstNodeVhdlExpr* const standp = m_specStandIns[k];
+            std::vector<const VhdlSymbol*> named;
+            if (VN_IS(standp, VhdlName)) {
+                named.push_back(standp->vhdlSymp()->resolved());
+            } else {
+                standp->foreach([&](const AstVhdlName* namep) {
+                    if (namep->vhdlSymp()) named.push_back(namep->vhdlSymp()->resolved());
+                });
+            }
             // A generic of the instance calling a package's subprogram is not
             // visible where the subprogram is declared, and the names below
             // are bound to it directly, so that is no obstacle: the copy is
@@ -7175,17 +7198,24 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
             // name that means something else there is left alone -- and a
             // protected type's method, which is one class however many
             // instances call it, so cannot read any one instance's generic.
-            std::vector<VhdlSymbol*> found;
-            regionp->lookup(genp->name(), found);
-            if (!found.empty() && (found.size() != 1 || found[0]->resolved() != genp)) continue;
-            if (found.empty()) {
-                bool inProtected = false;
-                for (const AstNode* np = originalp; np && !inProtected; np = np->backp()) {
-                    if (VN_IS(np, VhdlProtectedType)) inProtected = true;
+            bool usable = true;
+            for (const VhdlSymbol* const genp : named) {
+                if (genp->kind() != VhdlSymKind::GENERIC
+                    && genp->kind() != VhdlSymKind::CONSTANT) {
+                    continue;  // An operator's or a literal's
                 }
-                if (inProtected) continue;
+                std::vector<VhdlSymbol*> found;
+                regionp->lookup(genp->name(), found);
+                if (!found.empty() && (found.size() != 1 || found[0]->resolved() != genp)) {
+                    usable = false;
+                }
+                if (found.empty()) {
+                    for (const AstNode* np = originalp; np && usable; np = np->backp()) {
+                        if (VN_IS(np, VhdlProtectedType)) usable = false;
+                    }
+                }
             }
-            standDecls.emplace(ifp, genp);
+            if (usable) standDecls.emplace(ifp, standp);
         }
     }
     VL_RESTORER_COPY(m_standInDecls);
@@ -7213,7 +7243,7 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
     }
     m_specValues.clear();
     if (!standDecls.empty()) {
-        std::map<const VhdlSymbol*, const VhdlSymbol*> stands;
+        std::map<const VhdlSymbol*, const AstNodeVhdlExpr*> stands;
         for (const auto& it : standDecls) {
             if (it.first->vhdlSymp()) stands.emplace(it.first->vhdlSymp(), it.second);
         }
@@ -7231,11 +7261,18 @@ VhdlSymbol* VhdlSemVisitor::specializeSubprogram(AstVhdlSubprogDecl* originalp,
             collect(copyp->declsp());
             collect(copyp->stmtsp());
             for (AstVhdlName* const namep : refs) {
-                VhdlSymbol* const genp
-                    = const_cast<VhdlSymbol*>(stands.find(namep->vhdlSymp())->second);
-                AstVhdlName* const newp = new AstVhdlName{namep->fileline(), genp->name()};
-                newp->vhdlSymp(genp);
-                newp->vhdlTypep(genp->typep());
+                const AstNodeVhdlExpr* const standp = stands.find(namep->vhdlSymp())->second;
+                AstNodeVhdlExpr* newp = nullptr;
+                if (VN_IS(standp, VhdlName)) {
+                    VhdlSymbol* const genp
+                        = const_cast<VhdlSymbol*>(standp->vhdlSymp()->resolved());
+                    AstVhdlName* const gnamep = new AstVhdlName{namep->fileline(), genp->name()};
+                    gnamep->vhdlSymp(genp);
+                    gnamep->vhdlTypep(genp->typep());
+                    newp = gnamep;
+                } else {
+                    newp = const_cast<AstNodeVhdlExpr*>(standp)->cloneTree(false);
+                }
                 namep->replaceWith(newp);
                 VL_DO_DANGLING(pushDeletep(namep), namep);
             }
@@ -8192,6 +8229,44 @@ private:
         return true;
     }
 
+    // Whether an expression is integer arithmetic over generics and constants of a design
+    // unit, which a parameter can read in place of its value (specStandIns): each name in it
+    // one the instance settles, and every operator a predefined one
+    static bool genericArithmetic(const AstNodeVhdlExpr* exprp) {
+        if (!VN_IS(exprp, VhdlBinary) && !VN_IS(exprp, VhdlUnary)) return false;
+        if (!exprp->vhdlTypep() || exprp->vhdlTypep()->base()->kind() != VhdlTypeKind::INTEGER) {
+            return false;
+        }
+        bool ok = true;
+        bool anyName = false;
+        exprp->foreach([&](const AstNode* np) {
+            if (!ok) return;
+            if (const AstNodeVhdlExpr* const ep = VN_CAST(np, NodeVhdlExpr)) {
+                const VhdlSymbol* const symp
+                    = ep->vhdlSymp() ? ep->vhdlSymp()->resolved() : nullptr;
+                if (VN_IS(ep, VhdlLiteral)) return;
+                if (VN_IS(ep, VhdlBinary) || VN_IS(ep, VhdlUnary)) {
+                    if (symp && !symp->predefined()) ok = false;
+                    return;
+                }
+                if (const AstVhdlName* const namep = VN_CAST(ep, VhdlName)) {
+                    const bool unitConstant = symp && symp->kind() == VhdlSymKind::CONSTANT
+                                              && symp->declScopep()
+                                              && symp->declScopep()->designRoot();
+                    if (!symp || (symp->kind() != VhdlSymKind::GENERIC && !unitConstant)
+                        || !namep->vhdlTypep()
+                        || namep->vhdlTypep()->base()->kind() != VhdlTypeKind::INTEGER) {
+                        ok = false;
+                    }
+                    anyName = true;
+                    return;
+                }
+                ok = false;
+            }
+        });
+        return ok && anyName;
+    }
+
     // Whether a type is a record of integers alone, which a parameter can read
     // a generic or a unit constant of in place of (specStandIns) as it reads an
     // integer one: each element is one more integer the instance settles
@@ -8313,6 +8388,13 @@ private:
                         || integerRecord(symp->paramTypes()[i]))) {
                     standIns.resize(nparams, nullptr);
                     standIns[i] = standp;
+                } else if (!actualValues.back().known() && symp->paramTypes()[i]
+                           && symp->paramTypes()[i]->base()->kind() == VhdlTypeKind::INTEGER
+                           && genericArithmetic(actp)) {
+                    // Or integer arithmetic over them: surf's RstSync,
+                    // "slvAll(RELEASE_DELAY_G-1, OUT_POLARITY_G)"
+                    standIns.resize(nparams, nullptr);
+                    standIns[i] = actp;
                 }
             }
             VhdlType* typep = actp->vhdlTypep();
@@ -8462,10 +8544,13 @@ private:
             key += val.isInt() ? ("=" + std::to_string(val.toInt())) : "=?";
         }
         for (const AstNodeVhdlExpr* const standp : standIns) {
-            key += standp ? "@"
-                                + std::to_string(
-                                    reinterpret_cast<uintptr_t>(standp->vhdlSymp()->resolved()))
-                          : "@";
+            // An expression is this call's own
+            key += !standp ? "@"
+                   : VN_IS(standp, VhdlName)
+                       ? "@"
+                             + std::to_string(
+                                 reinterpret_cast<uintptr_t>(standp->vhdlSymp()->resolved()))
+                       : "@e" + std::to_string(reinterpret_cast<uintptr_t>(standp));
         }
         const auto it = m_specializations.find(key);
         if (it != m_specializations.end()) {
@@ -18031,6 +18116,31 @@ AstNodeVhdlExpr* VhdlSemVisitor::boundValue(FileLine* flp, const VhdlSymbol* gsy
     return litp;
 }
 
+// Whether a range names only generics and constants of a design unit, none of them the
+// instantiated entity's own, and predefined operators: bounds an instance's map can give
+static bool boundsReadUnit(const AstVhdlRange* rp, const VhdlScope* unitScopep) {
+    bool ok = true;
+    rp->foreach([&](const AstNodeVhdlExpr* exprp) {
+        if (!ok || VN_IS(exprp, VhdlLiteral)) return;
+        const VhdlSymbol* const symp = exprp->vhdlSymp() ? exprp->vhdlSymp()->resolved() : nullptr;
+        if (VN_IS(exprp, VhdlBinary) || VN_IS(exprp, VhdlUnary)) {
+            if (symp && !symp->predefined()) ok = false;
+            return;
+        }
+        if (!VN_IS(exprp, VhdlName) || !symp) {
+            ok = false;
+            return;
+        }
+        const bool unitConstant = symp->kind() == VhdlSymKind::CONSTANT && symp->declScopep()
+                                  && symp->declScopep()->designRoot();
+        if ((symp->kind() != VhdlSymKind::GENERIC && !unitConstant)
+            || symp->declScopep() == unitScopep) {
+            ok = false;
+        }
+    });
+    return ok;
+}
+
 // Whether the instance's generic map already names that formal, so that a
 // bound worked out here is not written into it twice
 static bool genericMapNames(const AstVhdlInstance* nodep, const std::string& name) {
@@ -18047,11 +18157,14 @@ static bool genericMapNames(const AstVhdlInstance* nodep, const std::string& nam
 // only once the whole design has been analyzed. An instance that hands either
 // to an unconstrained generic is asked again then.
 void VhdlSemVisitor::rebindOpenGenerics() {
-    const std::vector<std::pair<AstVhdlInstance*, VhdlScope*>> latep = m_lateOpenGenerics;
-    for (const auto& pair : latep) {
+    const std::vector<std::tuple<AstVhdlInstance*, VhdlScope*, VhdlScope*>> latep
+        = m_lateOpenGenerics;
+    for (const auto& late : latep) {
         VL_RESTORER(m_scopep);
-        m_scopep = pair.second;
-        bindOpenGenericBounds(pair.first, pair.second, true);
+        VL_RESTORER(m_lateRegionp);
+        m_scopep = std::get<1>(late);
+        m_lateRegionp = std::get<2>(late);
+        bindOpenGenericBounds(std::get<0>(late), std::get<1>(late), true);
     }
 }
 
@@ -18145,7 +18258,31 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
                     ascp = new AstVhdlAttrName{flp, navp, "ascending"};
                 }
             }
+            // Asked again, a call's result has the subtype its copy settled: bounds that
+            // name only generics and constants of the unit the instance is in go over
+            // as expressions -- surf's RstSync, "INIT_G => slvAll(RELEASE_DELAY_G-1,
+            // OUT_POLARITY_G)", is "RELEASE_DELAY_G-1-1 downto 0"
+            if (late && !fromDefault && bound.dim == 0 && bound.path.empty() && m_lateRegionp
+                && !genericMapNames(nodep, bound.leftName)) {
+                const VhdlType* const atypep = actualp->vhdlTypep();
+                const VhdlType* const idxp
+                    = atypep && atypep->base()->kind() == VhdlTypeKind::ARRAY
+                              && atypep->indexTypes().size() == 1
+                          ? atypep->indexTypes()[0]
+                          : nullptr;
+                const AstVhdlRange* const rp
+                    = idxp && !idxp->bounded() ? VN_CAST(idxp->boundsp(), VhdlRange) : nullptr;
+                if (rp && rp->leftp() && rp->rightp() && !rp->dirUnknown()
+                    && boundsReadUnit(rp, unitScopep)) {
+                    leftEndp = rp->leftp()->cloneTree(false);
+                    rightEndp = rp->rightp()->cloneTree(false);
+                    ascp = new AstVhdlName{flp, rp->dir() == VhdlDir::TO ? "true" : "false"};
+                }
+            }
             if (leftEndp) {
+                // Read where the instance is
+                VL_RESTORER(m_scopep);
+                if (late && m_lateRegionp) m_scopep = m_lateRegionp;
                 const auto bindOne
                     = [&](const std::string& name, AstNodeVhdlExpr* valuep, VhdlType* typep) {
                           if (name.empty() || genericMapNames(nodep, name)) {
@@ -18165,7 +18302,7 @@ void VhdlSemVisitor::bindOpenGenericBounds(AstVhdlInstance* nodep, VhdlScope* un
                 bindOne(bound.rightName, rightEndp, V3VhdlStd::integerType());
                 continue;
             }
-            if (!late) m_lateOpenGenerics.emplace_back(nodep, unitScopep);
+            if (!late) m_lateOpenGenerics.emplace_back(nodep, unitScopep, m_scopep);
             continue;
         }
         if (genericMapNames(nodep, bound.leftName)) continue;

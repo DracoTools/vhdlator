@@ -7305,7 +7305,90 @@ private:
     }
 
     // Such a value as one of a subtype that fixes its length
+    // A call of a function whose body is only "if c then return t; else return e;"
+    // over three of its parameters -- surf's ite, the selector of its StdRtlPkg --
+    // with the actuals for c, t and e. False for any other call.
+    bool selectorCall(AstNodeVhdlExpr* nodep, AstNodeVhdlExpr*& condp, AstNodeVhdlExpr*& thenp,
+                      AstNodeVhdlExpr*& elsep) const {
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        const VhdlSymbol* const symp
+            = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return false;
+        const AstVhdlSubprogDecl* const bodyp = symp->bodyp();
+        if (!bodyp || !bodyp->vhdlPure() || bodyp->declsp() || !bodyp->stmtsp()
+            || bodyp->stmtsp()->nextp()) {
+            return false;
+        }
+        const AstVhdlIf* const ifp = VN_CAST(bodyp->stmtsp(), VhdlIf);
+        const AstVhdlAlternative* const thenAltp = ifp ? ifp->altsp() : nullptr;
+        const AstVhdlAlternative* const elseAltp
+            = thenAltp ? VN_CAST(thenAltp->nextp(), VhdlAlternative) : nullptr;
+        if (!elseAltp || elseAltp->nextp() || !thenAltp->condp() || elseAltp->condp()) {
+            return false;
+        }
+        // Each a name of one of the function's parameters, by its place
+        const auto paramAt = [&](const AstNode* exprp) -> int {
+            const AstVhdlName* const namep = VN_CAST(exprp, VhdlName);
+            if (!namep) return -1;
+            return symp->paramIndex(VString::downcase(namep->name()));
+        };
+        const auto returned = [&](const AstVhdlAlternative* altp) -> int {
+            const AstVhdlReturn* const retp = VN_CAST(altp->stmtsp(), VhdlReturn);
+            if (!retp || retp->nextp()) return -1;
+            return paramAt(retp->valuep());
+        };
+        const int ci = paramAt(thenAltp->condp());
+        const int ti = returned(thenAltp);
+        const int ei = returned(elseAltp);
+        if (ci < 0 || ti < 0 || ei < 0) return false;
+        // The actuals, written by position or by name
+        std::vector<AstNodeVhdlExpr*> actuals(symp->paramTypes().size(), nullptr);
+        size_t pos = 0;
+        for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+            const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+            if (!asp || !asp->actualp()) return false;
+            const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+            const int at
+                = asp->formalp()
+                      ? (fnamep ? symp->paramIndex(VString::downcase(fnamep->name())) : -1)
+                      : static_cast<int>(pos);
+            if (at < 0 || at >= static_cast<int>(actuals.size())) return false;
+            actuals[at] = asp->actualp();
+        }
+        condp = actuals[ci];
+        thenp = actuals[ti];
+        elsep = actuals[ei];
+        return condp && thenp && elsep;
+    }
+
     AstNodeExpr* dynAsFixed(AstNodeVhdlExpr* nodep, VhdlType* fixedTypep, FileLine* flp) {
+        // A selector's result given at a fixed length is either actual at that
+        // length, which folds wherever both do: surf's "constant INIT_C :
+        // slv(DATA_WIDTH_G-1 downto 0) := ite(INIT_G = "0", slvZero(DATA_WIDTH_G),
+        // INIT_G)", handed on as a generic
+        {
+            AstNodeVhdlExpr* condp = nullptr;
+            AstNodeVhdlExpr* thenp = nullptr;
+            AstNodeVhdlExpr* elsep = nullptr;
+            if (selectorCall(nodep, condp, thenp, elsep)) {
+                // The arm not taken may be of another length -- surf's default
+                // INIT_G, "0" -- which is an error only where it is taken
+                // (elabLengthChecked); the back end has no width to warn about
+                FileLine* const cflp = new FileLine{flp};
+                cflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                cflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                const auto arm = [&](AstNodeVhdlExpr* armp) -> AstNodeExpr* {
+                    if (isDynValue(armp)) return dynAsFixed(armp, fixedTypep, flp);
+                    return elabLengthChecked(lowerExpr(armp), fixedTypep, armp, cflp);
+                };
+                AstNodeExpr* const cp = lowerExpr(condp);
+                AstNodeExpr* const tp = cp ? arm(thenp) : nullptr;
+                AstNodeExpr* const ep = tp ? arm(elsep) : nullptr;
+                if (ep) return new AstCond{cflp, cp, tp, ep};
+                if (tp) VL_DO_DANGLING(tp->deleteTree(), tp);
+                if (cp) VL_DO_DANGLING(cp->deleteTree(), cp);
+            }
+        }
         // What it is carried as, which its own subtype need not say
         VhdlType* const carrierp = dynValueType(nodep) ? dynValueType(nodep) : nodep->vhdlTypep();
         if (!carrierp) return nullptr;
@@ -9299,6 +9382,7 @@ private:
     // bound on, by instance and that bound's name
     std::map<std::pair<const AstVhdlInstance*, std::string>, std::string> m_hoistRelay;
     std::map<const AstNodeVhdlExpr*, std::string> m_hoistName;
+    std::string m_hoistEntity;  // The entity whose hoisted bounds this module declares
     std::map<std::string, std::vector<VhdlHoistedBound>> m_hoists;  // By module name
     // An INOUT record-of-records port given its default by a function of the generics, under
     // the nine values (bugs.md 388mb): no copy of the function gives back a value of that shape
@@ -19523,6 +19607,15 @@ private:
         if (name == "unresolved_signed" || name == "signed") return 's';
         return vectorsUnsigned ? 'u' : 0;
     }
+    // std_logic_unsigned's "=" and "/=" of two vectors, and std_logic_arith's of two
+    // UNSIGNED or two SIGNED: numeric_std's where no operand holds a metavalue ('L' and 'H'
+    // are '0' and '1'). surf's INIT_G = "0" chose a generic's value with one, whose
+    // compiled body elaboration could not run
+    static bool synopsysEquality(const VhdlSymbol* symp, const std::string& op) {
+        return (op == "=" || op == "/=")
+               && (inPackageNamed(symp, "std_logic_unsigned")
+                   || inPackageNamed(symp, "std_logic_arith"));
+    }
     static bool inPackageNamed(const VhdlSymbol* symp, const char* pkgp) {
         for (const VhdlScope* scopep = symp ? symp->declScopep() : nullptr; scopep;
              scopep = scopep->parentp()) {
@@ -20025,8 +20118,10 @@ private:
     }
     AstNodeExpr* nineNumeric(const VhdlSymbol* symp, const std::string& op,
                              const std::vector<AstNodeVhdlExpr*>& args, FileLine* flp) {
-        const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
-        if (!slvUnsigned && !inPackageNamed(symp, "numeric_std")) return nullptr;
+        const bool synopsys = synopsysEquality(symp, op);
+        const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned")
+                                 || (synopsys && inPackageNamed(symp, "std_logic_unsigned"));
+        if (!slvUnsigned && !synopsys && !inPackageNamed(symp, "numeric_std")) return nullptr;
         flp = nineFl(flp);
         const bool arith = op == "+" || op == "-";
         const bool relational
@@ -20073,6 +20168,7 @@ private:
         const bool elemArith = arith && ((lk == 'u' && rk == 'l') || (lk == 'l' && rk == 'u'));
         if (!elemArith && (lk == 'l' || rk == 'l')) return nullptr;
         if (!elemArith && lk != 'i' && rk != 'i' && lk != rk) return nullptr;
+        if (synopsys && (lk == 'i' || rk == 'i')) return nullptr;
         const bool sgn = lk == 's' || rk == 's';
         AstNode* stmtsp = nullptr;
         NineArg a;
@@ -20260,6 +20356,23 @@ private:
                 cmpp = new AstGt{flp, lp, rp};
             } else {
                 cmpp = new AstGte{flp, lp, rp};
+            }
+            if (synopsys) {
+                // Each operand is CONV_UNSIGNED'd (CONV_SIGNED'd) first, which makes one
+                // with a metavalue all 'X' and warns: two such compare equal
+                AstNodeExpr* const bothp
+                    = new AstLogAnd{flp, new AstLogNot{flp, laneAllDefined(a, flp)},
+                                    new AstLogNot{flp, laneAllDefined(b, flp)}};
+                outp = new AstCond{flp, validp, cmpp,
+                                   op == "=" ? bothp : new AstLogNot{flp, bothp}};
+                const std::string msg = "There is an 'U'|'X'|'W'|'Z'|'-' in an arithmetic "
+                                        "operand, the result will be 'X'(es).";
+                outp = withNineWarning(outp, b, nullptr, msg, flp);
+                outp = withNineWarning(outp, a, nullptr, msg, flp);
+                nineDrop(a);
+                nineDrop(b);
+                if (stmtsp) outp = new AstExprStmt{flp, stmtsp, outp};
+                return outp;
             }
             outp = new AstCond{flp, validp, cmpp,
                                new AstConst{flp, AstConst::BitTrue{}, op == "/="}};
@@ -20705,6 +20818,14 @@ private:
         }
         if (inStdLogic1164(symp) || (matchOp && symp->predefined())) {
             return nineLogicalPlan(op, args);
+        }
+        if (synopsysEquality(symp, op)) {
+            if (args.size() != 2) return false;
+            const bool slv = inPackageNamed(symp, "std_logic_unsigned");
+            const char lk = nineNumKind(args[0]->vhdlTypep(), slv);
+            const char rk = nineNumKind(args[1]->vhdlTypep(), slv);
+            return (lk == 'u' || lk == 's') && lk == rk && nineOperandKnown(args[0])
+                   && nineOperandKnown(args[1]);
         }
         const bool slvUnsigned = inPackageNamed(symp, "numeric_std_unsigned");
         if (!slvUnsigned && !inPackageNamed(symp, "numeric_std")) return false;
@@ -21965,6 +22086,36 @@ private:
                 return;
             }
             default: break;
+            }
+        }
+        // Two vectors compared as numbers where a length is one elaboration settles --
+        // a generic's, surf's Synchronizer "INIT_G = "0"" through std_logic_unsigned --
+        // are each made as long as the longer, written as the operands' own widths
+        if ((!lw || !rw) && isArray(ltypep) && isArray(rtypep)
+            && (nodep->op() == VhdlBinaryOp::EQ || nodep->op() == VhdlBinaryOp::NE
+                || nodep->op() == VhdlBinaryOp::LT || nodep->op() == VhdlBinaryOp::LE
+                || nodep->op() == VhdlBinaryOp::GT || nodep->op() == VhdlBinaryOp::GE)) {
+            const int asNumber = vectorAsNumber(nodep->vhdlSymp());
+            if (asNumber || (isNumericVector(ltypep) && isNumericVector(rtypep))) {
+                const bool signd = isSignedType(ltypep) || isSignedType(rtypep) || asNumber == 2;
+                const auto bitsOf = [&](AstNodeExpr* exprp) {
+                    return new AstAttrOf{flp, VAttrType::DIM_BITS, exprp->cloneTree(false)};
+                };
+                const auto castTo = [&](AstNodeExpr* exprp, AstNodeExpr* widthp) {
+                    AstNodeExpr* const fromp
+                        = signd ? static_cast<AstNodeExpr*>(new AstSigned{flp, exprp})
+                                : new AstUnsigned{flp, exprp};
+                    AstBasicDType* const dtp = new AstBasicDType{
+                        flp, VBasicDTypeKwd::LOGIC, signd ? VSigning::SIGNED : VSigning::UNSIGNED};
+                    dtp->rangep(
+                        new AstRange{flp, new AstSub{flp, widthp, i32(1, flp)}, i32(0, flp)});
+                    return new AstCast{flp, fromp, VFlagChildDType{}, dtp};
+                };
+                AstNodeExpr* const maxp = new AstCond{
+                    flp, new AstGt{flp, bitsOf(lhsp), bitsOf(rhsp)}, bitsOf(lhsp), bitsOf(rhsp)};
+                lhsp = castTo(lhsp, maxp->cloneTree(false));
+                rhsp = castTo(rhsp, maxp);
+                return;
             }
         }
         // A comparison against an integer is by value (16.5), so the two are
@@ -23649,7 +23800,14 @@ private:
             }
         }
         // Such a constant goes into the width by its value, as it is read anywhere
-        AstNodeExpr* const exprp = lowerExpr(nodep);
+        bool hoisted = false;
+        AstNodeExpr* const exprp = [&]() {
+            if (AstNodeExpr* const hp = hoistedTerm(nodep)) {
+                hoisted = true;
+                return hp;
+            }
+            return lowerExpr(nodep);
+        }();
         if (!exprp) {
             form.ok = false;
             return;
@@ -23663,7 +23821,49 @@ private:
         }
         AstNodeVhdlExpr* const writtenp = nodep->cloneTree(false);
         form.writtenp.push_back(writtenp);
-        form.terms.push_back(LinearForm::Term{exprp, scale, isGeneric, writtenp});
+        form.terms.push_back(LinearForm::Term{exprp, scale, isGeneric || hoisted, writtenp});
+    }
+
+    // A term naming a generic that travels as data, which a bound the entity
+    // declares an object with is written in -- "instance.max_trans_width" of
+    // "std_logic_vector(instance.max_trans_width - 1 downto 0)" -- read off the
+    // parameter that bound was hoisted into, so a width written with it is the
+    // instance's number: open-logic's SPI slave VC, "shift_reg_tx(
+    // instance.max_trans_width - 1 downto 1)". Only a bound of the entity's
+    // own, linear in the term with coefficient 1. Null where there is none.
+    AstNodeExpr* hoistedTerm(AstNodeVhdlExpr* nodep) {
+        bool data = false;
+        nodep->foreach([&](const AstNodeVhdlExpr* exprp) {
+            const VhdlSymbol* const symp = exprp->vhdlSymp();
+            if (symp && m_dataGenerics.count(symp->resolved())) data = true;
+        });
+        if (!data) return nullptr;
+        const auto hoistIt = m_hoists.find(m_hoistEntity);
+        if (hoistIt == m_hoists.end()) return nullptr;
+        for (const VhdlHoistedBound& hoist : hoistIt->second) {
+            if (!hoist.via.empty() || !hoist.exprp) continue;
+            LinearForm form;
+            linearAdd(form, hoist.exprp, 1, 0, true);
+            bool matches = form.ok;
+            int found = 0;
+            for (const auto& term : form.terms) {
+                if (term.coeff == 0) continue;
+                if (term.coeff == 1 && term.vhdlp && term.vhdlp->sameTree(nodep)) {
+                    ++found;
+                } else {
+                    matches = false;
+                }
+            }
+            const int64_t konst = form.konst;
+            form.clear();
+            if (!matches || found != 1) continue;
+            FileLine* const flp = nodep->fileline();
+            AstNodeExpr* const hp = new AstVarRef{flp, hoistVar(hoist.name, flp), VAccess::READ};
+            if (konst == 0) return hp;
+            return new AstSub{
+                flp, hp, new AstConst{flp, AstConst::Signed32{}, static_cast<int32_t>(konst)}};
+        }
+        return nullptr;
     }
 
     // "(a +/- b) * c" spread as "a*c +/- b*c", so that a width written with
@@ -47561,6 +47761,7 @@ private:
         // not the emitted code ends up reading it: an instance hands one
         // value per hoisted bound, and a value with no parameter to land on
         // is not a pin anything can bind
+        m_hoistEntity = entp->name();
         {
             const auto hoistIt = m_hoists.find(entp->name());
             if (hoistIt != m_hoists.end()) {
