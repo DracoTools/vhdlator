@@ -2875,6 +2875,10 @@ private:
     VhdlType* analyzeIndexedName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
     VhdlType* analyzeSliceName(AstVhdlCall* nodep, VhdlType* arrayp) VL_MT_DISABLED;
     int64_t staticLength(AstNodeVhdlExpr* nodep) VL_MT_DISABLED;
+    AstNodeVhdlExpr* settledCatLength(AstNodeVhdlExpr* nodep, const VhdlType* typep,
+                                      FileLine* flp) VL_MT_DISABLED;
+    VhdlType* constrainFromSettledCat(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                      FileLine* flp) VL_MT_DISABLED;
     void checkArrayValue(AstNodeVhdlExpr* nodep, VhdlType* typep,
                          const std::string& what) VL_MT_DISABLED;
     void checkAssignedValue(AstNodeVhdlExpr* nodep, VhdlType* targetp) VL_MT_DISABLED;
@@ -10854,22 +10858,27 @@ VhdlType* VhdlSemVisitor::pick(AstNodeVhdlExpr* nodep, std::vector<VhdlSymbol*>&
         }
         if (!explicits.empty() && explicits.size() < cands.size()) {
             // Only where they are homographs: a predefined one with a
-            // different profile is a real alternative, not a hidden one
-            bool sameProfile = true;
+            // different profile is a real alternative, not a hidden one --
+            // and stays one beside those that are hidden: surf's StdRtlPkg
+            // "maximum(integer, integer)" hides STANDARD's for INTEGER, and
+            // the one for universal_integer remains (mkQP's nested maximum)
+            std::vector<VhdlSymbol*> kept;
             for (VhdlSymbol* const symp : cands) {
-                if (!symp->resolved()->predefined()) continue;
                 bool matched = false;
-                for (VhdlSymbol* const exp : explicits) {
-                    if (exp->homographOf(symp)) matched = true;
-                    // Before VHDL-2008 STD_LOGIC_VECTOR's own predefined operation, which the
-                    // explicit one is a homograph of, stands here as STD_ULOGIC_VECTOR's: the
-                    // same profile but for that (std_logic_unsigned's ">=", as Questa and the
-                    // relaxed modes of nvc and GHDL take VHDL-93)
-                    if (!matched && sameBaseProfile(exp, symp)) matched = true;
+                if (symp->resolved()->predefined()) {
+                    for (VhdlSymbol* const exp : explicits) {
+                        if (exp->homographOf(symp)) matched = true;
+                        // Before VHDL-2008 STD_LOGIC_VECTOR's own predefined operation,
+                        // which the explicit one is a homograph of, stands here as
+                        // STD_ULOGIC_VECTOR's: the same profile but for that
+                        // (std_logic_unsigned's ">=", as Questa and the relaxed modes of nvc
+                        // and GHDL take VHDL-93)
+                        if (!matched && sameBaseProfile(exp, symp)) matched = true;
+                    }
                 }
-                if (!matched) sameProfile = false;
+                if (!matched) kept.push_back(symp);
             }
-            if (sameProfile) cands.swap(explicits);
+            if (kept.size() < cands.size()) cands.swap(kept);
         }
     }
     if (cands.size() > 1 && wantp) {
@@ -14989,6 +14998,77 @@ VhdlType* VhdlSemVisitor::constrainRecordFromParts(VhdlType* typep,
     return outp ? outp : typep;
 }
 
+// The length of a joining whose parts are names of arrays whose lengths the instance
+// settles, or elements, as an expression of their 'LENGTHs; null for any other
+AstNodeVhdlExpr* VhdlSemVisitor::settledCatLength(AstNodeVhdlExpr* nodep, const VhdlType* typep,
+                                                  FileLine* flp) {
+    const VhdlType* const elemp = typep->base()->elementp();
+    const VhdlType* const sidep = nodep ? nodep->vhdlTypep() : nullptr;
+    if (!sidep) return nullptr;
+    if (AstVhdlBinary* const catp = VN_CAST(nodep, VhdlBinary)) {
+        if (catp->op() != VhdlBinaryOp::CONCAT) return nullptr;
+        AstNodeVhdlExpr* const lp = settledCatLength(catp->lhsp(), typep, flp);
+        AstNodeVhdlExpr* const rp = lp ? settledCatLength(catp->rhsp(), typep, flp) : nullptr;
+        if (!rp) {
+            if (lp) VL_DO_DANGLING(lp->deleteTree(), lp);
+            return nullptr;
+        }
+        return new AstVhdlBinary{flp, VhdlBinaryOp::ADD, lp, rp};
+    }
+    if (elemp && sidep->base() == elemp->base() && sidep->base() != typep->base()) {
+        AstVhdlLiteral* const onep = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, "1"};
+        onep->intVal(1);
+        return onep;
+    }
+    const VhdlSymbol* const symp = nodep->vhdlSymp() ? nodep->vhdlSymp()->resolved() : nullptr;
+    if (!VN_IS(nodep, VhdlName) || !symp
+        || (symp->kind() != VhdlSymKind::GENERIC && symp->kind() != VhdlSymKind::CONSTANT)
+        || sidep->base() != typep->base() || sidep->dimensions() != 1
+        || !sidep->lengthEmittable()) {
+        return nullptr;
+    }
+    return new AstVhdlAttrName{flp, nodep->cloneTree(false), "length"};
+}
+VhdlType* VhdlSemVisitor::constrainFromSettledCat(VhdlType* typep, AstNodeVhdlExpr* valuep,
+                                                  FileLine* flp) {
+    AstVhdlBinary* const catp = VN_CAST(valuep, VhdlBinary);
+    if (!catp || catp->op() != VhdlBinaryOp::CONCAT || m_inSpecialized || typep->dimensions() != 1
+        || staticLength(valuep) >= 0) {
+        return nullptr;
+    }
+    const VhdlType* const idxp
+        = typep->base()->indexTypes().empty() ? nullptr : typep->base()->indexTypes()[0];
+    if (!idxp || !idxp->bounded() || idxp->base()->kind() != VhdlTypeKind::INTEGER) {
+        return nullptr;
+    }
+    AstNodeVhdlExpr* const lenp = settledCatLength(valuep, typep, flp);
+    if (!lenp) return nullptr;
+    const auto lit = [&](int64_t v) {
+        AstVhdlLiteral* const litp
+            = new AstVhdlLiteral{flp, VhdlLitKind::INTEGER, std::to_string(v)};
+        litp->intVal(v);
+        return litp;
+    };
+    // left + length - 1 going up, left - length + 1 going down
+    const bool asc = idxp->ascending();
+    AstNodeVhdlExpr* const endp
+        = new AstVhdlBinary{flp, asc ? VhdlBinaryOp::SUB : VhdlBinaryOp::ADD,
+                            new AstVhdlBinary{flp, asc ? VhdlBinaryOp::ADD : VhdlBinaryOp::SUB,
+                                              lit(idxp->left()), lenp},
+                            lit(1)};
+    analyzeExpr(endp, V3VhdlStd::integerType());
+    AstNodeVhdlExpr* const startp = lit(idxp->left());
+    analyzeExpr(startp, V3VhdlStd::integerType());
+    VhdlType* const outp = cloneSubtype(typep, flp);
+    VhdlType* const newIndexp = cloneSubtype(const_cast<VhdlType*>(idxp), flp);
+    newIndexp->unbound();
+    newIndexp->boundsp(new AstVhdlRange{flp, startp, asc ? VhdlDir::TO : VhdlDir::DOWNTO, endp});
+    outp->clearIndexTypes();
+    outp->addIndexType(newIndexp);
+    outp->unconstrained(false);
+    return outp;
+}
+
 VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* valuep,
                                              FileLine* flp) {
     if (!typep || !valuep) return typep;
@@ -15042,6 +15122,13 @@ VhdlType* VhdlSemVisitor::constrainFromValue(VhdlType* typep, AstNodeVhdlExpr* v
                 }
             }
         }
+    }
+    // A joining of values whose lengths the instance settles -- "(PROG_INIT_G &
+    // PROG_HDLR_G)" of two open generics, surf's MdioLinkIrqHandler -- is as long as
+    // they are together, from the index subtype's left in its direction (9.2.5), and
+    // that is written out for elaboration to work out
+    if (VhdlType* const catTypep = constrainFromSettledCat(typep, valuep, flp)) {
+        return catTypep;
     }
     // A value that is itself constrained hands over its index ranges
     // directly, whether it says its length as a number or as an expression

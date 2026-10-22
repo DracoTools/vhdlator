@@ -3105,8 +3105,28 @@ private:
             // An element that elaboration worked out is settled, whatever
             // the rest of the record is: "cfg.data_width" where a call built
             // cfg and gave that element as a number
+            // -- unless the element is reached through a loop's parameter or another name
+            // whose value only running gives, which the evaluator may answer for one value
+            // of it: surf's AxiLiteCrossbar, "MASTERS_CONFIG_G(m).addrBits" in a loop over m
             if (const AstVhdlSelected* const selp = VN_CAST(p, VhdlSelected)) {
-                if (V3VhdlEval::eval(const_cast<AstVhdlSelected*>(selp)).known()) continue;
+                bool running = false;
+                selp->foreach([&](const AstVhdlName* namep) {
+                    const VhdlSymbol* const nsymp
+                        = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+                    if (!nsymp) return;
+                    switch (nsymp->kind()) {
+                    case VhdlSymKind::VARIABLE:
+                    case VhdlSymKind::SHARED_VARIABLE:
+                    case VhdlSymKind::SIGNAL:
+                    case VhdlSymKind::PORT:
+                    case VhdlSymKind::LOOP_PARAMETER:
+                    case VhdlSymKind::PARAMETER: running = true; break;
+                    default: break;
+                    }
+                });
+                if (!running && V3VhdlEval::eval(const_cast<AstVhdlSelected*>(selp)).known()) {
+                    continue;
+                }
             }
             if (const AstNodeVhdlExpr* const exprp = VN_CAST(p, NodeVhdlExpr)) {
                 if (const VhdlSymbol* const symp = exprp->vhdlSymp()) {
@@ -5576,9 +5596,15 @@ private:
         // it keeps where elaboration settles its subtype's bounds: OSVVM's
         // CalculateByteAddress slices "aAddr(AddrBitsPerWord downto 1)" of "alias aAddr :
         // std_logic_vector(Address'length downto 1)", given a generic
+        // Or an element of a record whose length the text fixes, sliced with ends only the
+        // instance settles: surf's AxiStreamGearbox,
+        // "conv_integer(sAxisMaster.tKeep(bitSize(SLV_BYTES_C)-1 downto 0))"
         const VhdlSymbol* const psymp = callp->prefixp()->vhdlSymp();
-        if (!VN_IS(callp->prefixp(), VhdlName) || !psymp) return nullptr;
-        if (psymp->kind() == VhdlSymKind::ALIAS) {
+        const bool fixedElement = VN_IS(callp->prefixp(), VhdlSelected)
+                                  && callp->prefixp()->vhdlTypep()
+                                  && callp->prefixp()->vhdlTypep()->isConstrainedArray();
+        if (!fixedElement && (!VN_IS(callp->prefixp(), VhdlName) || !psymp)) return nullptr;
+        if (psymp && psymp->kind() == VhdlSymKind::ALIAS) {
             const VhdlType* const atp = psymp->typep();
             if (!atp || atp->base()->kind() != VhdlTypeKind::ARRAY || atp->indexTypes().size() != 1
                 || !atp->lengthEmittable() || lengthOnlyRunningDecides(atp)) {
@@ -7361,7 +7387,76 @@ private:
         return condp && thenp && elsep;
     }
 
+    // A call of a pure function whose body is only "return f(...);", with f a selector
+    // (selectorCall) -- surf's fillVectorArray, "return ite(INPUT = "1", slvOne(WIDTH_G),
+    // ite(INPUT = "0", slvZero(WIDTH_G), INPUT))" -- the call it returns, and each of the
+    // function's parameters with its actual. Null for any other call, or one whose body
+    // reads a parameter other than as its value.
+    AstNodeVhdlExpr*
+    returnedSelector(AstNodeVhdlExpr* nodep,
+                     std::vector<std::pair<const VhdlSymbol*, AstNodeVhdlExpr*>>& binds) const {
+        AstVhdlCall* const callp = VN_CAST(nodep, VhdlCall);
+        const VhdlSymbol* const symp
+            = callp && callp->vhdlSymp() ? callp->vhdlSymp()->resolved() : nullptr;
+        if (!symp || symp->kind() != VhdlSymKind::FUNCTION) return nullptr;
+        const AstVhdlSubprogDecl* const bodyp = symp->bodyp();
+        if (!bodyp || !bodyp->vhdlPure() || bodyp->declsp() || !bodyp->stmtsp()
+            || bodyp->stmtsp()->nextp() || bodyp->genericCount() != 0) {
+            return nullptr;
+        }
+        const AstVhdlReturn* const retp = VN_CAST(bodyp->stmtsp(), VhdlReturn);
+        AstVhdlCall* const innerp = retp ? VN_CAST(retp->valuep(), VhdlCall) : nullptr;
+        AstNodeVhdlExpr* condp = nullptr;
+        AstNodeVhdlExpr* thenp = nullptr;
+        AstNodeVhdlExpr* elsep = nullptr;
+        if (!innerp || !selectorCall(innerp, condp, thenp, elsep)) return nullptr;
+        // The parameters, in their places
+        std::vector<const VhdlSymbol*> params;
+        for (const AstNode* p = bodyp->paramsp(); p; p = p->nextp()) {
+            const AstVhdlIfaceDecl* const ifp = VN_CAST(p, VhdlIfaceDecl);
+            if (!ifp || !ifp->vhdlSymp()) return nullptr;
+            params.push_back(ifp->vhdlSymp()->resolved());
+        }
+        std::vector<AstNodeVhdlExpr*> actuals(params.size(), nullptr);
+        size_t pos = 0;
+        for (AstNode* ap = callp->argsp(); ap; ap = ap->nextp(), ++pos) {
+            const AstVhdlAssoc* const asp = VN_CAST(ap, VhdlAssoc);
+            if (!asp || !asp->actualp()) return nullptr;
+            const AstVhdlName* const fnamep = VN_CAST(asp->formalp(), VhdlName);
+            const int at
+                = asp->formalp()
+                      ? (fnamep ? symp->paramIndex(VString::downcase(fnamep->name())) : -1)
+                      : static_cast<int>(pos);
+            if (at < 0 || at >= static_cast<int>(actuals.size())) return nullptr;
+            actuals[at] = asp->actualp();
+        }
+        for (const AstNodeVhdlExpr* const actp : actuals) {
+            if (!actp) return nullptr;
+        }
+        // Read only as values: an attribute of a parameter asks about the formal's
+        // subtype, which the actual does not have
+        bool plain = true;
+        innerp->foreach([&](const AstVhdlName* namep) {
+            const VhdlSymbol* const nsymp
+                = namep->vhdlSymp() ? namep->vhdlSymp()->resolved() : nullptr;
+            if (!nsymp || std::find(params.begin(), params.end(), nsymp) == params.end()) return;
+            if (VN_IS(namep->backp(), VhdlAttrName)) plain = false;
+        });
+        if (!plain) return nullptr;
+        for (size_t i = 0; i < params.size(); ++i) binds.emplace_back(params[i], actuals[i]);
+        return innerp;
+    }
+
     AstNodeExpr* dynAsFixed(AstNodeVhdlExpr* nodep, VhdlType* fixedTypep, FileLine* flp) {
+        // The selector a function returns, read with the function's actuals
+        {
+            std::vector<std::pair<const VhdlSymbol*, AstNodeVhdlExpr*>> binds;
+            if (AstNodeVhdlExpr* const innerp = returnedSelector(nodep, binds)) {
+                VL_RESTORER_COPY(m_bindExprs);
+                for (const auto& bind : binds) m_bindExprs[bind.first] = bind.second;
+                if (AstNodeExpr* const outp = dynAsFixed(innerp, fixedTypep, flp)) return outp;
+            }
+        }
         // A selector's result given at a fixed length is either actual at that
         // length, which folds wherever both do: surf's "constant INIT_C :
         // slv(DATA_WIDTH_G-1 downto 0) := ite(INIT_G = "0", slvZero(DATA_WIDTH_G),
@@ -10365,6 +10460,16 @@ private:
                 // call, so it stays a variable however it is used elsewhere
                 varType = objp->isElabConstant() && !m_ftaskp && !m_protClassp ? VVarType::LPARAM
                                                                               : VVarType::VAR;
+                // A record whose elements pack is a parameter too, so a function the
+                // back end works out for another constant may read it: AxiStreamDepacketizer's
+                // AXIS_CONFIG_C, "axiStreamMasterInit(AXIS_CONFIG_C)" in its REG_INIT_C.
+                // One whose value does not fold is demoted below.
+                if (varType == VVarType::VAR && !m_ftaskp && !m_protClassp && m_modp
+                    && objp->defaultp() && symp->typep()
+                    && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
+                    && recordPacks(symp->typep())) {
+                    varType = VVarType::LPARAM;
+                }
                 break;
             case VhdlObjKind::VARIABLE:
             case VhdlObjKind::SHARED_VARIABLE: varType = VVarType::VAR; break;
@@ -12095,9 +12200,17 @@ private:
             bool ascending = true;
             bool dirKnown = true;
             // A signal parameter's bounds came from the signal the call
-            // passed, and those folded long ago: the answer is a number
+            // passed, and those folded long ago: the answer is a number. So
+            // is one dimension that is a number beside another an instance
+            // settles: surf's muxSlVectorArray, "vec'length(1)" of a
+            // "SlVectorArray(17 downto 0, ERROR_CNT_WIDTH_G-1 downto 0)"
             if (const VhdlType* const idxp
-                = typep && typep->isConstrainedArray() ? indexSubtype(typep, dim) : nullptr) {
+                = typep
+                          && (typep->isConstrainedArray()
+                              || (typep->base()->kind() == VhdlTypeKind::ARRAY
+                                  && typep->lengthEmittable()))
+                      ? indexSubtype(typep, dim)
+                      : nullptr) {
                 if (idxp->bounded() && !idxp->boundsp()) {
                     if (argp) VL_DO_DANGLING(argp->deleteTree(), argp);
                     const int64_t lo = idxp->left();
@@ -14884,9 +14997,32 @@ private:
         // over it: a function may read a parameter and not a variable, so a
         // table emitted as an object stops every bound worked out from it.
         // Where the value does not fold, the object is demoted below.
-        const VVarType varType = (declp->isElabConstant() || isTableConstant(symp))
-                                     ? VVarType::LPARAM
-                                     : VVarType::VAR;
+        // So is a record whose elements pack, made here because something reads it as an
+        // object: surf's AXI_STREAM_MASTER_INIT_C, read by axiStreamMasterInit, which a
+        // constant of AxiStreamSplitter calls as the back end works the constant out, and
+        // AxiStreamDepacketizer's AXIS_CONFIG_C handed to that call
+        const bool packedRecord = symp->kind() == VhdlSymKind::CONSTANT && symp->typep()
+                                  && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
+                                  && recordPacks(symp->typep());
+        // And a package's table of enumeration values, which packs: std_logic_arith's
+        // IS_X, "array (std_ulogic) of boolean", read by MAKE_BINARY as a compiled
+        // operator is worked out for a constant. Over the nine values only, where a
+        // STD_ULOGIC index is the lane it reads as: in two states std_logic_1164's
+        // MVL9_to_char, so held, read the wrong entries (t_vhdl_aliascarried's to_hstring)
+        const VhdlType* const ctypep = symp->typep();
+        const VhdlType* const celemp
+            = ctypep && ctypep->base()->kind() == VhdlTypeKind::ARRAY
+                  ? (ctypep->elementp() ? ctypep->elementp() : ctypep->base()->elementp())
+                  : nullptr;
+        const bool enumTable
+            = v3Global.opt.vhdlMetavalues() && symp->kind() == VhdlSymKind::CONSTANT
+              && declaredInPackage(symp) && ctypep && ctypep->isConstrainedArray()
+              && ctypep->dimensions() == 1 && !isStringType(ctypep) && celemp
+              && celemp->base()->kind() == VhdlTypeKind::ENUM && elementPacks(celemp);
+        const VVarType varType
+            = (declp->isElabConstant() || isTableConstant(symp) || packedRecord || enumTable)
+                  ? VVarType::LPARAM
+                  : VVarType::VAR;
         AstVar* const varp = newVarOfType(symp, varType, dtypep, flp);
         // What working out its value needed -- a copy of a subprogram made
         // for that one call -- belongs wherever the object ends up, so it is
@@ -15004,6 +15140,9 @@ private:
     // elaboration, so a constant whose value calls one is still a constant; an
     // impure one reads what only running settles (4.2.1), and a constant whose
     // value calls one is an object given its value once, not a parameter.
+    // Helpers emitted here that compute from their arguments alone, so a value calling
+    // one folds where its arguments do (valueFolds)
+    std::set<const AstNodeFTask*> m_pureHelpers;
     bool valueFolds(const AstNode* nodep) const {
         if (!nodep) return true;
         bool folds = true;
@@ -15015,6 +15154,7 @@ private:
                 return;
             }
             if (const AstNodeFTaskRef* const callp = VN_CAST(itemp, NodeFTaskRef)) {
+                if (m_pureHelpers.count(callp->taskp())) return;
                 const auto it = m_taskSym.find(callp->taskp());
                 const AstVhdlSubprogDecl* const declp
                     = it == m_taskSym.end()
@@ -16741,10 +16881,95 @@ private:
         shifts.push_back(shift);
     }
 
+    // The same over an array of integers whose bounds the instance settles -- surf's
+    // Scrambler, "maximum(TAPS_G)" of an open generic -- by a helper that walks the
+    // elements between the two bounds, lower to higher, which the order of a maximum
+    // does not change. It starts from the element type's own limit at the other end, so
+    // a null range gives that (5.3.2.4). Null for anything else; takes arrp only then.
+    AstNodeExpr* arrayExtremeSettled(AstNodeExpr* arrp, const VhdlType* typep,
+                                     const VhdlType* idxp, bool wantMax, FileLine* flp) {
+        const VhdlType* const elemp
+            = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        if (!m_modp || !elemp || elemp->base()->kind() != VhdlTypeKind::INTEGER
+            || !elemp->bounded() || !typep->lengthEmittable() || lengthOnlyRunningDecides(typep)) {
+            return nullptr;
+        }
+        AstNodeDType* const argDTypep = lowerType(const_cast<VhdlType*>(typep), flp);
+        AstNodeDType* const elemDTypep
+            = argDTypep ? lowerType(const_cast<VhdlType*>(elemp), flp) : nullptr;
+        AstRange* const rangep = elemDTypep ? boundsRange(idxp, flp) : nullptr;
+        if (!rangep) {
+            if (argDTypep) VL_DO_DANGLING(argDTypep->deleteTree(), argDTypep);
+            if (elemDTypep) VL_DO_DANGLING(elemDTypep->deleteTree(), elemDTypep);
+            return nullptr;
+        }
+        AstNodeExpr* const leftp = rangep->leftp()->unlinkFrBack();
+        AstNodeExpr* const rightp = rangep->rightp()->unlinkFrBack();
+        VL_DO_DANGLING(rangep->deleteTree(), rangep);
+        AstNodeExpr* ascp = boundsAscendingExpr(idxp, flp);
+        if (!ascp) ascp = new AstConst{flp, AstConst::BitTrue{}, boundsAscending(idxp)};
+        const std::string name = "__Vextreme" + std::to_string(++m_nameNum);
+        AstFunc* const funcp = new AstFunc{flp, name, nullptr, nullptr};
+        funcp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        funcp->fvarp(newReturnVar(name, elemDTypep, flp));
+        AstVar* const vp = new AstVar{flp, VVarType::PORT, "v", VFlagChildDType{}, argDTypep};
+        vp->direction(VDirection::INPUT);
+        vp->declDirection(VDirection::INPUT);
+        vp->funcLocal(true);
+        vp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
+        vp->trace(false);
+        funcp->addStmtsp(vp);
+        AstVar* const lop = newFuncLocal("lo", newIntDType(flp), flp);
+        AstVar* const hip = newFuncLocal("hi", newIntDType(flp), flp);
+        AstVar* const kp = newFuncLocal("k", newIntDType(flp), flp);
+        funcp->addStmtsp(lop);
+        funcp->addStmtsp(hip);
+        funcp->addStmtsp(kp);
+        const auto ret = [&](VAccess access) {
+            return new AstVarRef{flp, VN_AS(funcp->fvarp(), Var), access};
+        };
+        funcp->addStmtsp(
+            new AstAssign{flp, ret(VAccess::WRITE),
+                          lowerValue(VhdlValue::mkInt(wantMax ? elemp->low() : elemp->high(),
+                                                      const_cast<VhdlType*>(elemp)),
+                                     const_cast<VhdlType*>(elemp), flp)});
+        // An ascending range runs left to right, a descending one right to left; a
+        // null one has nothing between
+        funcp->addStmtsp(
+            new AstAssign{flp, wr(lop, flp),
+                          new AstCond{flp, ascp->cloneTree(false), leftp->cloneTree(false),
+                                      rightp->cloneTree(false)}});
+        funcp->addStmtsp(new AstAssign{flp, wr(hip, flp), new AstCond{flp, ascp, rightp, leftp}});
+        funcp->addStmtsp(new AstAssign{flp, wr(kp, flp), rd(lop, flp)});
+        const auto elemAt = [&]() {
+            return new AstSelBit{flp, new AstVarRef{flp, vp, VAccess::READ}, rd(kp, flp)};
+        };
+        AstNodeExpr* const betterp
+            = wantMax ? static_cast<AstNodeExpr*>(new AstGtS{flp, elemAt(), ret(VAccess::READ)})
+                      : new AstLtS{flp, elemAt(), ret(VAccess::READ)};
+        AstLoop* const loopp = new AstLoop{flp};
+        loopp->addStmtsp(new AstLoopTest{flp, loopp, new AstLteS{flp, rd(kp, flp), rd(hip, flp)}});
+        loopp->addStmtsp(
+            new AstIf{flp, betterp, new AstAssign{flp, ret(VAccess::WRITE), elemAt()}});
+        loopp->addContsp(
+            new AstAssign{flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}});
+        funcp->addStmtsp(loopp);
+        addHelperFunc(funcp);
+        m_pureHelpers.insert(funcp);
+        AstFuncRef* const refp = new AstFuncRef{flp, name, new AstArg{flp, "", arrp}};
+        refp->taskp(funcp);
+        return refp;
+    }
+
     // "maximum(v)" or "minimum(v)" over a whole array (5.3.2.4)
     AstNodeExpr* lowerArrayExtreme(AstNodeExpr* arrp, const VhdlType* typep, bool wantMax,
                                    FileLine* flp) {
         const VhdlType* const idxp = indexSubtype(typep, 0);
+        if (typep && typep->dimensions() == 1 && idxp && !idxp->bounded()) {
+            if (AstNodeExpr* const outp = arrayExtremeSettled(arrp, typep, idxp, wantMax, flp)) {
+                return outp;
+            }
+        }
         if (!typep || typep->dimensions() != 1 || !idxp || !idxp->bounded()) {
             VL_DO_DANGLING(arrp->deleteTree(), arrp);
             unsup(flp, std::string{wantMax ? "maximum" : "minimum"}
@@ -17911,6 +18136,59 @@ private:
     // Writing into such a slice: the elements are put back where the whole
     // keeps them, one at a time, since which places those are is only known
     // when it runs
+    // What a call wrote into a carrier made of a slice of a carrier, put back into that
+    // slice when the call returns (dynOutRoundTrip): surf's AxiLitePkg hands
+    // "reg(highbit downto (32*i)+reg'low)" of a register parameter carried with its bounds
+    // to an inout formal. Null where the slice is not one of those.
+    AstNode* dynSliceWriteBack(AstNodeVhdlExpr* targetp, AstVar* srcVarp, FileLine* flp) {
+        AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
+        AstVhdlRange* const rangep = dynSliceRange(targetp);
+        if (!rangep) return nullptr;
+        VhdlSymbol* const objSymp = callp->vhdlSymp();
+        AstNodeVhdlExpr* const prefixExprp = aliasBase(objSymp, callp->prefixp());
+        AstNodeExpr* leftp = nullptr;
+        AstNodeExpr* rightp = nullptr;
+        bool asc = true;
+        bool dirKnown = true;
+        if (!rangeParts(rangep, leftp, rightp, asc, dirKnown) || !dirKnown) {
+            if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        leftp = aliasShift(objSymp, leftp, flp);
+        rightp = aliasShift(objSymp, rightp, flp);
+        AstNodeExpr* const objp = lowerDriveTarget(prefixExprp);
+        if (!objp) {
+            VL_DO_DANGLING(leftp->deleteTree(), leftp);
+            VL_DO_DANGLING(rightp->deleteTree(), rightp);
+            return nullptr;
+        }
+        AstVar* const lp = newTempVar("__Vdynwl", newIntDType(flp), flp);
+        AstVar* const dp = newTempVar("__Vdynwd", bitDType(flp), flp);
+        AstVar* const kp = newTempVar("__Vdynwk", newIntDType(flp), flp);
+        AstNode* outp = new AstAssign{flp, wr(lp, flp), leftp};
+        VL_DO_DANGLING(rightp->deleteTree(), rightp);
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAssign{
+                      flp, wr(dp, flp), new AstConst{flp, AstConst::BitTrue{}, !asc}}));
+        outp = AstNode::addNext(
+            outp, static_cast<AstNode*>(new AstAssign{flp, wr(kp, flp), i32(0, flp)}));
+        AstNode* bodyp = new AstAssign{
+            flp,
+            new AstSelBit{flp, dynPart(objp->cloneTree(false), "q", flp),
+                          dynOffset(objp->cloneTree(false), dynSliceIndex(lp, dp, kp, flp), flp)},
+            new AstSelBit{flp, dynPart(rd(srcVarp, flp), "q", flp), rd(kp, flp)}};
+        bodyp = AstNode::addNext(
+            bodyp, static_cast<AstNode*>(new AstAssign{
+                       flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+        outp = AstNode::addNext(
+            outp,
+            whileLoop(flp, new AstLtS{flp, rd(kp, flp), dynCarrierLength(rd(srcVarp, flp), flp)},
+                      bodyp));
+        VL_DO_DANGLING(objp->deleteTree(), objp);
+        return outp;
+    }
+
     AstNode* dynSliceAssign(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep, FileLine* flp) {
         AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
         AstVhdlRange* const rangep = dynSliceRange(targetp);
@@ -19064,7 +19342,20 @@ private:
             m_concHolds.emplace(arg.varp, valp);
             addStmt(new AstAlways{new AstAssignW{flp, wr(arg.varp, flp), valp}});
         } else {
-            stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), valp});
+            // An operand that is itself statements and a value -- an operation of these
+            // on a held operand -- gives its statements here, ahead of the assignment, so
+            // that a chain of them is a sequence and not a nesting: the back end looks at
+            // an assignment's value twice over, which a nesting made 2^n times, so surf's
+            // CrcPkg, thirty "xor"s to a line, never finished
+            AstNodeExpr* heldp = valp;
+            if (AstExprStmt* const esp = VN_CAST(valp, ExprStmt)) {
+                if (esp->stmtsp()) {
+                    stmtsp = AstNode::addNextNull(stmtsp, esp->stmtsp()->unlinkFrBackWithNext());
+                }
+                heldp = esp->resultp()->unlinkFrBack();
+                VL_DO_DANGLING(esp->deleteTree(), esp);
+            }
+            stmtsp = AstNode::addNextNull(stmtsp, new AstAssign{flp, wr(arg.varp, flp), heldp});
         }
         return true;
     }
@@ -19606,6 +19897,16 @@ private:
         if (name == "unresolved_unsigned" || name == "unsigned") return 'u';
         if (name == "unresolved_signed" || name == "signed") return 's';
         return vectorsUnsigned ? 'u' : 0;
+    }
+    // Whether two emitted expressions are the same. A count may hold nodes the back end
+    // has typed beside ones it has not (surf's AxiMemTester, a slice of a generic's length
+    // compared with "/="), which sameTree refuses to compare: two such are not the same.
+    static bool sameLowered(const AstNode* ap, const AstNode* bp) {
+        std::vector<bool> aTyped;
+        std::vector<bool> bTyped;
+        ap->foreach([&](const AstNode* np) { aTyped.push_back(np->dtypep() != nullptr); });
+        bp->foreach([&](const AstNode* np) { bTyped.push_back(np->dtypep() != nullptr); });
+        return aTyped == bTyped && ap->sameTree(bp);
     }
     // std_logic_unsigned's "=" and "/=" of two vectors, and std_logic_arith's of two
     // UNSIGNED or two SIGNED: numeric_std's where no operand holds a metavalue ('L' and 'H'
@@ -20255,7 +20556,7 @@ private:
             const int64_t ac = constCount(a.countp);
             const int64_t bc = constCount(b.countp);
             const bool same
-                = (ac > 0 && ac == bc) || (ac < 0 && bc < 0 && a.countp->sameTree(b.countp));
+                = (ac > 0 && ac == bc) || (ac < 0 && bc < 0 && sameLowered(a.countp, b.countp));
             if (!same) {
                 AstNodeExpr* const maxp
                     = ac > 0 && bc > 0
@@ -23771,8 +24072,11 @@ private:
         // "pb_c := pbits(dw)", dw standing for a generic (open-logic's olo_ft_pkg_ecc)
         const bool settledLocal
             = termSymp && VN_IS(nodep, VhdlName) && settledLocalConstant(termSymp) != nullptr;
-        const bool isGeneric = (termSymp && termSymp->kind() == VhdlSymKind::GENERIC) || isParam
-                               || settledLocal
+        // A generic reached through a name only running gives a value is not:
+        // "MASTERS_CONFIG_G(m).addrBits" in a loop over m (surf's AxiLiteCrossbar)
+        const bool isGeneric = (termSymp && termSymp->kind() == VhdlSymKind::GENERIC
+                                && (VN_IS(nodep, VhdlName) || !boundsOnlyRunningDecides(nodep)))
+                               || isParam || settledLocal
                                || (namesAGeneric(nodep) && !boundsOnlyRunningDecides(nodep));
         // Measuring asks only whether the two ends cancel, so it matches
         // terms as they were written rather than building them
@@ -41158,7 +41462,15 @@ private:
         AstVhdlRange* const rangep = callp ? VN_CAST(callp->argsp(), VhdlRange) : nullptr;
         if (!rangep || !callp->prefixp()) return false;
         VhdlType* const objTypep = callp->prefixp()->vhdlTypep();
-        if (!objTypep || !objTypep->isConstrainedArray()) return false;
+        // An object whose length the elaboration fixes has places to slice as one the text
+        // fixes does: surf's AxiLitePkg slices a register "reg(highbit downto (32*i) +
+        // reg'low)" in the copy made for a variable of "slv(reg'length-1 downto 0)", the
+        // length a generic's
+        const bool settled = objTypep && objTypep->base()->kind() == VhdlTypeKind::ARRAY
+                             && objTypep->indexTypes().size() == 1 && objTypep->lengthEmittable()
+                             && !lengthOnlyRunningDecides(objTypep)
+                             && !carriedDynamically(objTypep);
+        if (!objTypep || (!objTypep->isConstrainedArray() && !settled)) return false;
         AstNodeExpr* leftp = nullptr;
         AstNodeExpr* rightp = nullptr;
         bool ascending = true;
@@ -41784,6 +42096,22 @@ private:
             if (!paramCarried(symp, at, herep)) continue;
             if (paramModeOf(symp, at) == VhdlMode::IN) continue;
             if (isDynObj(asp->actualp())) continue;
+            // A slice of a carrier: the slice made a carrier for the call, and what the
+            // call wrote put back into it after
+            if (isDynSlice(asp->actualp()) && carriedDynamically(symp->paramTypes()[at])) {
+                VhdlType* const carrp = symp->paramTypes()[at];
+                AstNodeExpr* const inp = lowerDynValue(asp->actualp(), carrp, flp);
+                AstVar* const tp
+                    = inp ? newTempVar("__Vdynsrt", dynCarrierRef(carrp, flp), flp) : nullptr;
+                AstNode* const backp = tp ? dynSliceWriteBack(asp->actualp(), tp, flp) : nullptr;
+                if (backp) {
+                    prep = AstNode::addNextNull(prep, new AstAssign{flp, wr(tp, flp), inp});
+                    postp = AstNode::addNextNull(postp, backp);
+                    m_argCarrier.emplace(asp, tp);
+                    continue;
+                }
+                if (inp) VL_DO_DANGLING(inp->deleteTree(), inp);
+            }
             VhdlType* const atypep = asp->actualp()->vhdlTypep();
             // A length an instance settles counts as one: it is written in
             // terms this module can emit, and folds with the instance. A
