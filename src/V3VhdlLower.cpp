@@ -10464,10 +10464,12 @@ private:
                 // back end works out for another constant may read it: AxiStreamDepacketizer's
                 // AXIS_CONFIG_C, "axiStreamMasterInit(AXIS_CONFIG_C)" in its REG_INIT_C.
                 // One whose value does not fold is demoted below.
+                // Only one whose value elaboration has: VUnit's bus2memory gives "my_memory :
+                // memory_t := to_vc_interface(memory)" its value by a statement as it starts
                 if (varType == VVarType::VAR && !m_ftaskp && !m_protClassp && m_modp
                     && objp->defaultp() && symp->typep()
                     && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
-                    && recordPacks(symp->typep())) {
+                    && recordPacks(symp->typep()) && V3VhdlEval::eval(objp->defaultp()).known()) {
                     varType = VVarType::LPARAM;
                 }
                 break;
@@ -15003,7 +15005,8 @@ private:
         // AxiStreamDepacketizer's AXIS_CONFIG_C handed to that call
         const bool packedRecord = symp->kind() == VhdlSymKind::CONSTANT && symp->typep()
                                   && symp->typep()->base()->kind() == VhdlTypeKind::RECORD
-                                  && recordPacks(symp->typep());
+                                  && recordPacks(symp->typep()) && declp->defaultp()
+                                  && V3VhdlEval::eval(declp->defaultp()).known();
         // And a package's table of enumeration values, which packs: std_logic_arith's
         // IS_X, "array (std_ulogic) of boolean", read by MAKE_BINARY as a compiled
         // operator is worked out for a constant. Over the nine values only, where a
@@ -18074,6 +18077,18 @@ private:
     // whose ends only running settles. The value goes in as a carrier and
     // the ends as numbers, and the helper puts the elements back where the
     // object keeps them.
+    // Whether a name reaches its object through an alias, which numbers the elements its
+    // own way (6.6.2): the same index of the alias and of what it denotes are different
+    // elements -- "bv_norm(n - 1 downto 0)" of "alias bv_norm : bit_vector(bv'length - 1
+    // downto 0) is bv" over an ascending bv (t_vhdl_aliasnorm)
+    static bool namesAlias(const AstNodeVhdlExpr* nodep) {
+        bool found = false;
+        nodep->foreach([&](const AstNodeVhdlExpr* exprp) {
+            const VhdlSymbol* const symp = exprp->vhdlSymp();
+            if (symp && symp->kind() == VhdlSymKind::ALIAS) found = true;
+        });
+        return found;
+    }
     AstNode* runningSliceAssign(AstNodeVhdlExpr* targetp, AstNodeVhdlExpr* valuep,
                                 FileLine* flp) {
         AstVhdlCall* const callp = VN_CAST(targetp, VhdlCall);
@@ -18091,6 +18106,41 @@ private:
             if (leftp) VL_DO_DANGLING(leftp->deleteTree(), leftp);
             if (rightp) VL_DO_DANGLING(rightp->deleteTree(), rightp);
             return nullptr;
+        }
+        // A slice of another object of a length the text fixes, written with the same
+        // range: the elements are copied over that range one by one, which needs no
+        // value carrying its bounds -- surf's resize, "ret(top downto 0) := tmp(top downto
+        // 0)", worked out for a constant, where a carrier is what the back end cannot run
+        if (AstVhdlCall* const srcCallp = VN_CAST(valuep, VhdlCall)) {
+            AstVhdlRange* const srcRangep = VN_CAST(srcCallp->argsp(), VhdlRange);
+            const VhdlType* const srcObjTypep
+                = srcCallp->prefixp() ? srcCallp->prefixp()->vhdlTypep() : nullptr;
+            if (srcRangep && sameLowered(srcRangep, rangep) && srcObjTypep
+                && srcObjTypep->isConstrainedArray() && objTypep->isConstrainedArray()
+                && srcObjTypep->dimensions() == 1 && objTypep->dimensions() == 1
+                && srcObjTypep->base() == objTypep->base() && !isDynValue(srcCallp->prefixp())
+                && !isDynObj(callp->prefixp()) && !namesAlias(srcCallp->prefixp())
+                && !namesAlias(callp->prefixp())) {
+                AstNodeExpr* const dstp = lowerDriveTarget(callp->prefixp());
+                AstNodeExpr* const srcp = dstp ? lowerExpr(srcCallp->prefixp()) : nullptr;
+                if (srcp) {
+                    AstVar* const kp = newTempVar("__Vsamek", newIntDType(flp), flp);
+                    AstVar* const hip = newTempVar("__Vsameh", newIntDType(flp), flp);
+                    AstNode* outp = new AstAssign{flp, wr(kp, flp),
+                                                  intBound(ascending ? leftp : rightp, flp)};
+                    outp = AstNode::addNext(
+                        outp, static_cast<AstNode*>(new AstAssign{
+                                  flp, wr(hip, flp), intBound(ascending ? rightp : leftp, flp)}));
+                    AstNode* bodyp = new AstAssign{flp, new AstSelBit{flp, dstp, rd(kp, flp)},
+                                                   new AstSelBit{flp, srcp, rd(kp, flp)}};
+                    bodyp = AstNode::addNext(
+                        bodyp, static_cast<AstNode*>(new AstAssign{
+                                   flp, wr(kp, flp), new AstAdd{flp, rd(kp, flp), i32(1, flp)}}));
+                    return AstNode::addNext(
+                        outp, whileLoop(flp, new AstLteS{flp, rd(kp, flp), rd(hip, flp)}, bodyp));
+                }
+                if (dstp) VL_DO_DANGLING(dstp->deleteTree(), dstp);
+            }
         }
         AstNodeFTask* const outFuncp = dynToSliceFunc(carrp, objTypep, ascending, flp);
         if (!outFuncp) {
