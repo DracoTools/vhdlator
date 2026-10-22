@@ -830,11 +830,11 @@ private:
             // part written into it, then the element written back
             AstUnpackArrayDType* const arrayp
                 = VN_AS(varrefp->varp()->dtypeSkipRefp(), UnpackArrayDType);
-            AstBasicDType* const basicp = VN_AS(arrayp->subDTypep()->skipRefp(), BasicDType);
-            AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, basicp);  // A basic type
+            AstNodeDType* const elemDTypep = arrayp->subDTypep()->skipRefp();  // A packed type
+            AstInitArray* const initp = arrayValue(nodep, vscp, arrayp, elemDTypep);
             const uint32_t index = fetchConst(arraySelp->bitp())->toUInt();
-            AstConst* const elemp
-                = new AstConst{nodep->fileline(), AstConst::WidthedValue{}, basicp->widthMin(), 0};
+            AstConst* const elemp = new AstConst{nodep->fileline(), AstConst::WidthedValue{},
+                                                 elemDTypep->widthMin(), 0};
             m_reclaimValuesp.push_back(elemp);
             if (const AstConst* const oldp
                 = VN_CAST(initp->getIndexDefaultedValuep(index), Const)) {
@@ -887,12 +887,21 @@ private:
             lsbRef = fetchConst(selp->lsbp())->num();
             return;  // And presumably still optimizable()
         }
-        // An element of an unpacked array of a basic type, written in part
+        // An element of an unpacked array of a packed type -- a basic type, a packed
+        // array, or a packed structure whose member is assigned -- written in part
         if (AstArraySel* const arraySelp = VN_CAST(selp->fromp(), ArraySel)) {
             AstVarRef* const varrefp = VN_CAST(arraySelp->fromp(), VarRef);
             const AstUnpackArrayDType* const arrayp
                 = varrefp ? VN_CAST(varrefp->varp()->dtypeSkipRefp(), UnpackArrayDType) : nullptr;
-            if (arrayp && VN_IS(arrayp->subDTypep()->skipRefp(), BasicDType)) {
+            const AstNodeDType* const elemDTypep
+                = arrayp ? arrayp->subDTypep()->skipRefp() : nullptr;
+            const AstNodeUOrStructDType* const structp
+                = elemDTypep ? VN_CAST(elemDTypep, NodeUOrStructDType) : nullptr;
+            const bool packedElem
+                = elemDTypep
+                  && (VN_IS(elemDTypep, BasicDType) || VN_IS(elemDTypep, PackArrayDType)
+                      || (structp && structp->packed()));
+            if (packedElem) {
                 checkNodeInfo(arraySelp);
                 iterateAndNextConstNull(arraySelp->bitp());  // Element index
                 outVarrefpRef = varrefp;
