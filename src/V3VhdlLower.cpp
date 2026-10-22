@@ -24132,7 +24132,7 @@ private:
         // terms as they were written rather than building them
         if (measure) {
             for (auto& term : form.terms) {
-                if (term.vhdlp && term.vhdlp->sameTree(nodep)) {
+                if (term.vhdlp && sameLowered(term.vhdlp, nodep)) {
                     term.coeff += scale;
                     return;
                 }
@@ -24148,7 +24148,7 @@ private:
         // * 8)". The writing is kept by the form, since a spread product's is
         // deleted once it is added.
         for (auto& term : form.terms) {
-            if (term.vhdlp && term.vhdlp->sameTree(nodep)) {
+            if (term.vhdlp && sameLowered(term.vhdlp, nodep)) {
                 term.coeff += scale;
                 return;
             }
@@ -24167,7 +24167,7 @@ private:
             return;
         }
         for (auto& term : form.terms) {
-            if (term.exprp && term.exprp->sameTree(exprp)) {
+            if (term.exprp && sameLowered(term.exprp, exprp)) {
                 term.coeff += scale;
                 VL_DO_DANGLING(exprp->deleteTree(), exprp);
                 return;
@@ -24202,7 +24202,7 @@ private:
             int found = 0;
             for (const auto& term : form.terms) {
                 if (term.coeff == 0) continue;
-                if (term.coeff == 1 && term.vhdlp && term.vhdlp->sameTree(nodep)) {
+                if (term.coeff == 1 && term.vhdlp && sameLowered(term.vhdlp, nodep)) {
                     ++found;
                 } else {
                     matches = false;
@@ -38509,6 +38509,20 @@ private:
         VhdlType* const elemp
             = typep->elementp() ? typep->elementp() : typep->base()->elementp();
         const bool isString = isStringType(typep);
+        // Lengths an instance settles: each name takes its run of the value as
+        // expressions the back end folds
+        {
+            bool unknown = false;
+            for (AstVhdlElemAssoc* const ap : assocs) {
+                if (!ap->choicesp() && elementSpan(ap->valuep(), typep) < 0) unknown = true;
+            }
+            if (unknown && !isString) {
+                if (AstNode* const settledp = spreadSettledAggregate(
+                        assocs, srcp, typep, signalAssign, sequential, flp, delayp)) {
+                    return AstNode::addNextNull(outp, settledp);
+                }
+            }
+        }
         int64_t used = 0;
         for (size_t i = 0; i < assocs.size(); ++i) {
             // "(1 => a, 4 to 8 => k)" says where in the value each name
@@ -38576,6 +38590,87 @@ private:
             err(flp, "The aggregate on the left covers " + std::to_string(used)
                          + " element(s), but the value has " + std::to_string(length));
         }
+        return outp;
+    }
+
+    // A positional aggregate target over a value whose range is written in terms the
+    // instance settles, with names whose lengths are too: GHDL gna issue2516,
+    // "(bid_extension, master_bid) <= master_bid_extended" with each length a generic's.
+    // The names take their runs from the value's left bound in its direction, each run as
+    // long as the name. Null, taking nothing, where that is not the shape; takes srcp
+    // otherwise.
+    AstNode* spreadSettledAggregate(const std::vector<AstVhdlElemAssoc*>& assocs,
+                                    AstNodeExpr* srcp, VhdlType* typep, bool signalAssign,
+                                    bool sequential, FileLine* flp, AstNode* delayp) {
+        // The value's own left bound and direction: numbers where its length is one --
+        // the names' lengths may still be only expressions -- or as written
+        const VhdlType* const idxp
+            = typep->indexTypes().empty() ? nullptr : typep->indexTypes()[0];
+        const AstVhdlRange* const rp = idxp ? VN_CAST(idxp->boundsp(), VhdlRange) : nullptr;
+        const bool numeric = idxp && idxp->bounded() && typep->isConstrainedArray();
+        if (!numeric && (!rp || !rp->leftp() || rp->dirUnknown() || !typep->lengthEmittable())) {
+            return nullptr;
+        }
+        const bool asc = numeric ? idxp->ascending() : rp->dir() == VhdlDir::TO;
+        VhdlType* const elemp = typep->elementp() ? typep->elementp() : typep->base()->elementp();
+        // Each name, a run of the value's type whose length is written, or one element
+        std::vector<AstNodeExpr*> spans;
+        const auto dropSpans = [&]() {
+            for (AstNodeExpr* const sp : spans) {
+                if (sp) VL_DO_DANGLING(sp->deleteTree(), sp);
+            }
+        };
+        for (AstVhdlElemAssoc* const ap : assocs) {
+            const VhdlType* const ntp = ap->valuep() ? ap->valuep()->vhdlTypep() : nullptr;
+            if (ap->choicesp() || !ntp || VN_IS(ap->valuep(), VhdlAggregate)) {
+                dropSpans();
+                return nullptr;
+            }
+            if (elemp && ntp->base() == elemp->base() && ntp->base() != typep->base()) {
+                spans.push_back(nullptr);  // One element
+                continue;
+            }
+            AstNodeExpr* const lenp
+                = ntp->base() == typep->base() && ntp->dimensions() == 1 && ntp->lengthEmittable()
+                      ? boundsLength(ntp, flp)
+                      : nullptr;
+            if (!lenp) {
+                dropSpans();
+                return nullptr;
+            }
+            spans.push_back(lenp);
+        }
+        AstNodeExpr* indexp = numeric ? i32(idxp->left(), flp) : lowerExpr(rp->leftp());
+        if (!indexp) {
+            dropSpans();
+            return nullptr;
+        }
+        const auto step = [&](AstNodeExpr* fromp, AstNodeExpr* byp) -> AstNodeExpr* {
+            return asc ? static_cast<AstNodeExpr*>(new AstAdd{flp, fromp, byp})
+                       : new AstSub{flp, fromp, byp};
+        };
+        AstNode* outp = nullptr;
+        for (size_t i = 0; i < assocs.size(); ++i) {
+            AstNodeExpr* fromp = nullptr;
+            const bool run = spans[i] != nullptr;
+            if (!run) {
+                fromp = new AstSelBit{flp, srcp->cloneTree(false), indexp->cloneTree(false)};
+                indexp = step(indexp, i32(1, flp));
+            } else {
+                AstNodeExpr* const lastp
+                    = step(indexp->cloneTree(false),
+                           new AstSub{flp, spans[i]->cloneTree(false), i32(1, flp)});
+                fromp = new AstSelExtract{flp, srcp->cloneTree(false), indexp->cloneTree(false),
+                                          lastp};
+                indexp = step(indexp, spans[i]);
+                spans[i] = nullptr;
+            }
+            outp = AstNode::addNextNull(outp, oneTarget(assocs[i]->valuep(), fromp,
+                                                        run || !elemp ? typep : elemp,
+                                                        signalAssign, sequential, flp, delayp));
+        }
+        VL_DO_DANGLING(indexp->deleteTree(), indexp);
+        VL_DO_DANGLING(srcp->deleteTree(), srcp);
         return outp;
     }
 
