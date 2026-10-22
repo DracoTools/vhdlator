@@ -5809,6 +5809,34 @@ private:
     AstNodeExpr* asDynCarrier(AstNodeVhdlExpr* nodep, VhdlType* carrierTypep, FileLine* flp,
                               VhdlType* asLongAsp = nullptr) {
         if (isDynValue(nodep)) return lowerDynValue(nodep, carrierTypep, flp);
+        // A selector's result is whichever actual it chooses, each made one of these: surf's
+        // generated RoCEv2 mkQP, "ite(c, slv'(("0000" & ite(c2, slv'("01"), slv'("00")))),
+        // d(9 downto 4))" handed to an open parameter
+        if (carrierTypep) {
+            AstNodeVhdlExpr* condp = nullptr;
+            AstNodeVhdlExpr* thenp = nullptr;
+            AstNodeVhdlExpr* elsep = nullptr;
+            if (selectorCall(nodep, condp, thenp, elsep)) {
+                AstNodeExpr* const cp = lowerExpr(condp);
+                AstNodeExpr* const tp = cp ? asDynCarrier(thenp, carrierTypep, flp) : nullptr;
+                AstNodeExpr* const ep = tp ? asDynCarrier(elsep, carrierTypep, flp) : nullptr;
+                if (ep) return new AstCond{flp, cp, tp, ep};
+                if (tp) VL_DO_DANGLING(tp->deleteTree(), tp);
+                if (cp) VL_DO_DANGLING(cp->deleteTree(), cp);
+            }
+        }
+        // A qualified expression of an open type is its value, as long as that is:
+        // "slv'(("0000" & ite(...)))" is the joining it qualifies (9.3.5)
+        if (AstVhdlQualified* const qp = VN_CAST(nodep, VhdlQualified)) {
+            const VhdlType* const qtp = qp->vhdlTypep();
+            if (carrierTypep && qp->valuep() && (!qtp || !qtp->isConstrainedArray())
+                && VN_IS(qp->valuep(), VhdlBinary)) {
+                if (AstNodeExpr* const innerp
+                    = asDynCarrier(qp->valuep(), carrierTypep, flp, asLongAsp)) {
+                    return innerp;
+                }
+            }
+        }
         if (isDyn2Value(nodep)) return carrierOfDyn2(nodep, carrierTypep, flp);
         // What an operation emitted natively over the nine values gives back
         // is as long as its operands make it, which its open type does not
