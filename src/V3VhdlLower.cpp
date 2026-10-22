@@ -11019,6 +11019,37 @@ private:
                 addStmt(lengthMismatch(flp));
             }
             aliasCarrier(aliasp);
+            // The object an external name denotes has to exist when the alias is
+            // elaborated (8.7), read or not: GHDL gna issue2508's alias of
+            // "<<signal .tb.th.clk : std_logic>>", with no th, is refused by nvc 1.22.1,
+            // Questa and GHDL's pre-elaboration. The name is read once as the design
+            // starts, into a probe of its own, so that a path naming nothing is an error
+            // here too.
+            if (!m_ftaskp && !m_protClassp && m_modp && !m_inStmts) {
+                AstVhdlExternalName* const extp = VN_CAST(aliasp->targetp(), VhdlExternalName);
+                // Only of a subtype with a length: an open array's alias takes its
+                // bounds from the object, and a probe would have to be told them
+                const VhdlType* const etp = extp ? extp->vhdlTypep() : nullptr;
+                const bool shaped
+                    = etp
+                      && (etp->base()->kind() != VhdlTypeKind::ARRAY || etp->isConstrainedArray());
+                if (extp && !extp->package() && shaped) {
+                    if (AstNodeExpr* const readp = lowerExternalName(extp, false)) {
+                        FileLine* const pflp = new FileLine{flp};
+                        pflp->warnOff(V3ErrorCode::UNUSEDSIGNAL, true);
+                        pflp->warnOff(V3ErrorCode::WIDTHTRUNC, true);
+                        pflp->warnOff(V3ErrorCode::WIDTHEXPAND, true);
+                        AstVar* const probep = new AstVar{
+                            pflp, VVarType::VAR, "__Vextprobe" + std::to_string(++m_tempNum),
+                            VFlagChildDType{}, lowerType(extp->vhdlTypep(), flp)};
+                        probep->trace(false);
+                        addStmt(probep);
+                        addStmt(new AstInitial{
+                            pflp, new AstAssign{pflp, new AstVarRef{pflp, probep, VAccess::WRITE},
+                                                readp}});
+                    }
+                }
+            }
             return;  // Names, not storage
         }
         if (AstVhdlSubprogDecl* const subp = VN_CAST(nodep, VhdlSubprogDecl)) {
@@ -45005,9 +45036,12 @@ private:
         }
         std::string format = radix.empty() ? formatFor(args[1]->vhdlTypep()) : radix;
         // A real written with DIGITS places after the point is written
-        // without an exponent (16.4)
+        // without an exponent (16.4); with DIGITS 0, the default, in
+        // exponential form, which nvc 1.22.1 and Questa 2025.2 write as C's
+        // "%e" does, "7.142857e-01" (GHDL its shortest form; gna issue20)
         if (radix.empty() && args[1]->vhdlTypep()
             && args[1]->vhdlTypep()->base()->kind() == VhdlTypeKind::FLOATING) {
+            format = "%e";
             const auto digIt = m_txtArgs.find("digits");
             if (digIt != m_txtArgs.end()) {
                 const VhdlValue dv = V3VhdlEval::eval(digIt->second);
